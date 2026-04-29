@@ -7,7 +7,7 @@
 
 import { execSync } from "node:child_process";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import type { ForgeStore, TaskRecord, TaskStatus } from "./store.js";
+import type { ForgeStore, TaskRecord, TaskStatus, Snapshot } from "./store.js";
 import type { RepoProfile } from "./repo.js";
 import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
 
@@ -74,6 +74,13 @@ function padEnd(s: string, len: number): string {
 
 function sep(width: number, char = "─"): string {
   return char.repeat(width);
+}
+
+function fmtTokens(n: number): string {
+  if (n < 1000) return n.toString();
+  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
+  if (n < 1000000) return `${Math.round(n / 1000)}k`;
+  return `${(n / 1000000).toFixed(1)}M`;
 }
 
 function statusIcon(theme: Theme, status: TaskStatus, tmuxSession: string | null): string {
@@ -505,16 +512,76 @@ export class ForgeDashboard {
     const titleColor = selected ? "text" : "dim";
     lines.push(truncateToWidth(`       ${theme.fg(titleColor, task.title.slice(0, width - 10))}`, width));
 
-    // Row 3: PR link or last log line if running
+    // Row 3+: PR link or progress lines
     if (task.prUrl) {
       lines.push(truncateToWidth(`       ${theme.fg("accent", "→ " + task.prUrl)}`, width));
-    } else if (task.status === "running" || task.status === "quality_check") {
-      const tail = this.store.tailLog(task.id, 1);
-      if (tail[0]) {
-        lines.push(truncateToWidth(`       ${theme.fg("dim", tail[0].slice(0, width - 10))}`, width));
-      }
+    } else if (task.status === "running" || task.status === "quality_check" || task.status === "creating_pr") {
+      const progress = this.progressLines(task, width);
+      for (const pl of progress) lines.push(pl);
     }
     lines.push("");
+  }
+
+  // ── Progress line for running tasks ─────────────────────────────────────────
+
+  private progressLines(task: TaskRecord, width: number): string[] {
+    const { theme } = this;
+
+    // pi-runtime tasks: try snapshot first
+    if (task.agent === "pi") {
+      const snap = this.store.readSnapshot(task.id);
+      if (snap) return this.snapshotLines(snap, width);
+      // No snapshot — pre-supervisor task, fall through to tailLog
+      const tail = this.store.tailLog(task.id, 1);
+      if (tail[0]) return [truncateToWidth(`       ${theme.fg("dim", tail[0].slice(0, width - 10))}`, width)];
+      return [];
+    }
+
+    // claude / codex: tailLog with limited-progress suffix
+    const tail = this.store.tailLog(task.id, 1);
+    if (tail[0]) {
+      const line = tail[0].slice(0, width - 30);
+      return [truncateToWidth(`       ${theme.fg("dim", line)} ${theme.fg("dim", "(limited progress)")}`, width)];
+    }
+    return [];
+  }
+
+  private snapshotLines(snap: Snapshot, width: number): string[] {
+    const { theme } = this;
+    const lines: string[] = [];
+    const phaseIcons: Record<string, string> = {
+      starting: "○", agent: "⟳", quality_check: "✔", committing: "↑", creating_pr: "↗", done: "✓", failed: "✗",
+    };
+    const icon = phaseIcons[snap.phase] ?? "·";
+    const secAgo = Math.round((Date.now() - snap.lastEventAt) / 1000);
+
+    if (snap.phase === "agent") {
+      const tool = snap.currentTool?.toolName ?? "thinking";
+      const preview = snap.currentTool?.argsPreview ?? "";
+      const line1 = `${icon} ${snap.phase} · ${tool} ${preview}`;
+      lines.push(truncateToWidth(`       ${line1.slice(0, width - 10)}`, width));
+
+      const inp = fmtTokens(snap.usage.inputTokens);
+      const out = fmtTokens(snap.usage.outputTokens);
+      const badge = this.healthBadge(snap.health);
+      const line2 = `↑${inp} ↓${out} · turn ${snap.usage.turns} · ${secAgo}s ago · ${badge}`;
+      lines.push(truncateToWidth(`       ${line2}`, width));
+    } else {
+      const line1 = `${icon} ${snap.phase} · ${secAgo}s ago`;
+      lines.push(truncateToWidth(`       ${theme.fg("dim", line1)}`, width));
+    }
+    return lines;
+  }
+
+  private healthBadge(health: string): string {
+    const { theme } = this;
+    switch (health) {
+      case "active":  return theme.fg("success", "active");
+      case "idle":    return theme.fg("dim", "idle");
+      case "stalled": return theme.fg("warning", "stalled");
+      case "error":   return theme.fg("error", "error");
+      default:        return theme.fg("dim", health);
+    }
   }
 
   // ── Drawing: PR Panel ────────────────────────────────────────────────────────

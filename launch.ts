@@ -9,6 +9,7 @@
 import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { fileURLToPath } from "node:url";
 import type { LaunchTarget } from "./store.js";
 import { ForgeStore } from "./store.js";
 
@@ -101,6 +102,44 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const promptFile = store.getPromptFile(config.taskId);
   const specFile = path.join(store.specsDir, `${config.taskId}.md`);
 
+  // ── pi runtime: supervisor-based runner ──────────────────────────────
+  if (config.target === "pi") {
+    const extDir = path.dirname(fileURLToPath(import.meta.url));
+    const supervisorPath = path.join(extDir, "supervisor.ts");
+    const argsJsonPath = path.join(runDir, "supervisor-args.json");
+    const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
+    const supervisorArgs = JSON.stringify({
+      taskId: config.taskId,
+      runDir,
+      promptFile,
+      worktreePath: config.worktreePath,
+      repoName: config.repoName,
+      branch: config.branch,
+      defaultBranch: config.defaultBranch,
+      qualityCommands: config.qualityCommands,
+      model: config.model,
+      specTitle: safeTitle,
+      commitMessage: `${conventionalCommitPrefix(config.branch)}(${config.repoName}): ${safeTitle}`,
+      specFile,
+      skipGit: false,
+    }, null, 2);
+    return `#!/usr/bin/env bash
+# Forge runner (pi supervisor) — task: ${config.taskId}
+set -uo pipefail
+
+LOG_FILE="${logFile}"
+mkdir -p "$(dirname "$LOG_FILE")"
+: > "$LOG_FILE"
+
+cat > '${argsJsonPath}' << 'FORGE_SUPERVISOR_ARGS_EOF'
+${supervisorArgs}
+FORGE_SUPERVISOR_ARGS_EOF
+
+exec node --experimental-strip-types '${supervisorPath}' '${argsJsonPath}'
+`;
+  }
+
+  // ── claude / codex: existing bash runner (byte-identical) ────────────
   const agentCmd = agentCommand(config.target, config.model, promptFile);
   // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
   // because long titles render badly in GitHub's PR list.

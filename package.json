@@ -1,6 +1,6 @@
 {
   "name": "forge",
-  "version": "0.2.0",
+  "version": "0.3.0",
   "description": "Mission control for agentic coding workflows — spec, launch, track, review, PR",
   "keywords": ["pi-package"],
   "type": "module",

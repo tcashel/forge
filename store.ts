@@ -8,6 +8,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Snapshot } from "./progress.js";
+
+export type { Snapshot, ProgressEvent, Phase, Health, ToolActivity, UsageTotals, Alert, AlertKind } from "./progress.js";
 
 export type TaskStatus =
   | "draft"
@@ -217,6 +220,29 @@ export class ForgeStore {
       .slice(0, 36);
     const ts = Date.now().toString(36);
     return `${slug}-${ts}`;
+  }
+
+  // ── Snapshot helpers ──────────────────────────────────────────────────────
+
+  getSnapshotFile(taskId: string): string {
+    return path.join(this.runsDir, taskId, "snapshot.json");
+  }
+
+  getProgressFile(taskId: string): string {
+    return path.join(this.runsDir, taskId, "progress.jsonl");
+  }
+
+  /** Returns null on missing file, parse error, or unsupported schemaVersion. Never throws. */
+  readSnapshot(taskId: string): Snapshot | null {
+    const p = this.getSnapshotFile(taskId);
+    if (!fs.existsSync(p)) return null;
+    try {
+      const parsed = JSON.parse(fs.readFileSync(p, "utf-8"));
+      if (parsed?.schemaVersion !== 1) return null;
+      return parsed as Snapshot;
+    } catch {
+      return null;
+    }
   }
 
   /** Read the last N lines of a log file */
