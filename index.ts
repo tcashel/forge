@@ -66,14 +66,28 @@ async function enterSpecModeFlow(
   let raw = arg?.trim() ?? "";
   if (!raw && ctx.ui.input) {
     const jiraOn = jira.isJiraAvailable();
-    const prompt = jiraOn
-      ? "JIRA ticket key, rough idea, or leave blank to start from scratch:"
-      : "Rough idea, or leave blank to start from scratch:";
-    const placeholder = jiraOn
-      ? "PROJ-123  /  add Redis caching to user sessions"
-      : "add Redis caching to user sessions";
-    const input = await ctx.ui.input(prompt, { placeholder });
-    raw = input?.trim() ?? "";
+
+    let result: string | undefined;
+    if (typeof ctx.ui.editor === "function") {
+      const title = jiraOn
+        ? "JIRA ticket key, rough idea, or leave blank to start from scratch \u2014 e.g. PROJ-123, or 'add Redis caching to user sessions'"
+        : "Rough idea, or leave blank to start from scratch \u2014 e.g. 'add Redis caching to user sessions'";
+      result = await ctx.ui.editor(title);
+    } else {
+      const prompt = jiraOn
+        ? "JIRA ticket key, rough idea, or leave blank to start from scratch:"
+        : "Rough idea, or leave blank to start from scratch:";
+      const placeholder = jiraOn
+        ? "PROJ-123  /  add Redis caching to user sessions"
+        : "add Redis caching to user sessions";
+      result = (await ctx.ui.input(prompt, { placeholder })) ?? undefined;
+    }
+
+    if (result === undefined) {
+      ctx.ui.notify("Spec creation cancelled.", "info");
+      return;
+    }
+    raw = result.trim();
   }
 
   if (jira.isJiraKey(raw)) {
