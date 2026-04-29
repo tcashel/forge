@@ -259,6 +259,8 @@ async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
   }
 }
 
+const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
 // ─── Dashboard Component ──────────────────────────────────────────────────────
 
 export type DashboardAction =
@@ -283,6 +285,9 @@ export class ForgeDashboard {
   private cached?: string[];
   private cachedWidth?: number;
   private refreshTimer?: ReturnType<typeof setInterval>;
+  private spinnerFrame = 0;
+  private spinnerTimer?: ReturnType<typeof setInterval>;
+  private refreshInFlight = false;
 
   onAction: (action: DashboardAction) => void = () => {};
   onClose: () => void = () => {};
@@ -304,6 +309,7 @@ export class ForgeDashboard {
 
   stop(): void {
     if (this.refreshTimer) clearInterval(this.refreshTimer);
+    this.stopSpinner();
   }
 
   handleInput(data: string): void {
@@ -372,35 +378,63 @@ export class ForgeDashboard {
   // ── Data loading ────────────────────────────────────────────────────────────
 
   private async refresh(): Promise<void> {
+    if (this.refreshInFlight) return;
+    this.refreshInFlight = true;
     this.loading = true;
-    this.invalidate();
-    this.tui.requestRender();
+    this.startSpinner();
+    try {
+      // Sync statuses from meta.json
+      this.syncStatuses();
 
-    // Sync statuses from meta.json
-    this.syncStatuses();
+      // Load tasks
+      this.tasks = this.store.getTasks(this.repo.root);
+      this.otherTasks = this.store.getRunningTasks(this.repo.root);
 
-    // Load tasks
-    this.tasks = this.store.getTasks(this.repo.root);
-    this.otherTasks = this.store.getRunningTasks(this.repo.root);
+      // Yield so the spinner paints before the network call
+      await Promise.resolve();
 
-    // Fetch PRs (async, non-blocking)
-    this.prs = await fetchPrs(this.repo.root);
-
-    this.lastRefresh = new Date();
-    this.loading = false;
-    this.invalidate();
-    this.tui.requestRender();
+      // Fetch PRs (async, non-blocking)
+      this.prs = await fetchPrs(this.repo.root);
+    } finally {
+      this.lastRefresh = new Date();
+      this.loading = false;
+      this.refreshInFlight = false;
+      this.stopSpinner();
+    }
   }
 
   private async refreshPrsOnly(): Promise<void> {
+    if (this.refreshInFlight) return;
+    this.refreshInFlight = true;
     this.loading = true;
+    this.startSpinner();
+    try {
+      this.prs = await fetchPrs(this.repo.root);
+      this.prSelectedIdx = Math.min(this.prSelectedIdx, Math.max(0, this.visiblePrs().length - 1));
+    } finally {
+      this.loading = false;
+      this.refreshInFlight = false;
+      this.stopSpinner();
+    }
+  }
+
+  private startSpinner(): void {
+    if (this.spinnerTimer) return;
     this.invalidate();
     this.tui.requestRender();
+    this.spinnerTimer = setInterval(() => {
+      this.spinnerFrame++;
+      this.invalidate();
+      this.tui.requestRender();
+    }, 100);
+  }
 
-    this.prs = await fetchPrs(this.repo.root);
-    this.prSelectedIdx = Math.min(this.prSelectedIdx, Math.max(0, this.visiblePrs().length - 1));
-
-    this.loading = false;
+  private stopSpinner(): void {
+    if (this.spinnerTimer) {
+      clearInterval(this.spinnerTimer);
+      this.spinnerTimer = undefined;
+    }
+    this.spinnerFrame = 0;
     this.invalidate();
     this.tui.requestRender();
   }
@@ -471,7 +505,7 @@ export class ForgeDashboard {
 
   private drawHeader(lines: string[], width: number): void {
     const { theme } = this;
-    const spin = this.loading ? theme.fg("accent", " ⟳") : "";
+    const spin = this.loading ? " " + theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length]) : "";
     const left = `  ${theme.bold("⚙ FORGE")}${spin}   ${theme.fg("accent", this.repo.name)}  ${theme.fg("dim", this.repo.currentBranch)}`;
     const runningCount = this.tasks.filter(
       (t) => t.status === "running" || t.status === "quality_check" || t.status === "creating_pr",
@@ -641,12 +675,16 @@ export class ForgeDashboard {
     );
     lines.push(`  ${sep(width - 2)}`);
 
-    if (visible.length === 0) {
+    if (this.loading && this.prs.length === 0) {
+      lines.push("");
+      const frame = SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length];
+      lines.push(`  ${theme.fg("accent", frame)} ${theme.fg("dim", "Loading PRs…")}`);
+    } else if (visible.length === 0) {
       lines.push("");
       const msg = this.prFilterMine
         ? me
           ? `No open PRs by @${me}.`
-          : "Could not detect your gh login. Run `gh auth status`."
+          : "Could not detect your gh login. Run \`gh auth status\`."
         : "No open PRs.";
       lines.push(`  ${theme.fg("dim", msg)}`);
     } else {
