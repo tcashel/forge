@@ -145,25 +145,64 @@ async function runLaunchWizard(
   const modelChoice = await ctx.ui.select("Model:", modelDefaults[agent]);
   if (!modelChoice) return false;
 
-  // 3. Branch name
+  // 3. Workspace — in place, create new worktree, or attach to existing
+  //
+  // "in place" runs the agent directly in the current repo root on the
+  // current branch. Useful when you've already cut a branch locally, want
+  // to iterate without the worktree dance, or are working on a small repo
+  // where worktree bootstrap is overkill.
   let branch = task.branch;
-  if (ctx.ui.input) {
-    const branchInput = await ctx.ui.input("Branch name:", { value: branch });
-    if (!branchInput) return false;
-    branch = branchInput.trim();
-  }
-
-  // 4. Worktree — existing or create new
   const existingWorktrees = getWorktrees(repoProfile.root);
+  const IN_PLACE_LABEL = `in place: ${repoProfile.currentBranch} (current repo, no worktree)`;
   const worktreeOptions = [
+    IN_PLACE_LABEL,
     `create new: ${branch}`,
     ...existingWorktrees.map((wt) => `use existing: ${wt.branch} (${wt.path})`),
   ];
-  const worktreeChoice = await ctx.ui.select("Worktree:", worktreeOptions);
+  const worktreeChoice = await ctx.ui.select("Workspace:", worktreeOptions);
   if (!worktreeChoice) return false;
 
   let worktreePath: string;
-  if (worktreeChoice.startsWith("create new:")) {
+  if (worktreeChoice === IN_PLACE_LABEL) {
+    // Run in place. Use the current branch as-is — the user is responsible
+    // for being on the branch they want the agent to commit/push to.
+    branch = repoProfile.currentBranch;
+
+    // Hard guard: never let the agent commit/push to the default branch.
+    if (branch === repoProfile.defaultBranch) {
+      ctx.ui.notify(
+        `Refusing to run in place on default branch "${branch}". Switch to a feature branch first.`,
+        "error",
+      );
+      return false;
+    }
+
+    // Soft warn on dirty working tree. Forge no longer auto-stages, so
+    // these files won't be swept into the PR — but they will sit on disk
+    // alongside whatever the agent writes, which can be confusing if the
+    // agent edits the same files.
+    const dirty = sh("git status --porcelain", repoProfile.root).trim();
+    const ok = await ctx.ui.confirm(
+      "Run agent in place?",
+      [
+        `The agent will run directly in:\n  ${repoProfile.root}\n  branch: ${branch}`,
+        dirty
+          ? `\n\n⚠ Working tree has uncommitted changes. Forge will NOT auto-stage them — the agent owns its commits. Existing edits will sit alongside whatever the agent writes; consider stashing or committing first if you don't want them mixed in.`
+          : "",
+        `\n\nContinue?`,
+      ].join(""),
+    );
+    if (!ok) return false;
+
+    worktreePath = repoProfile.root;
+  } else if (worktreeChoice.startsWith("create new:")) {
+    // Branch name prompt only matters for "create new" — skip it otherwise.
+    if (ctx.ui.input) {
+      const branchInput = await ctx.ui.input("Branch name:", { value: branch });
+      if (!branchInput) return false;
+      branch = branchInput.trim();
+    }
+
     // Live progress via the footer status badge — worktree creation +
     // dependency bootstrap can take 30–90s and was previously a silent hang.
     const setStatus = (ctx as any).ui.setStatus as ((k: string, msg?: string) => void) | undefined;
@@ -185,7 +224,9 @@ async function runLaunchWizard(
     }
     worktreePath = wtp;
   } else {
-    const idx = worktreeOptions.indexOf(worktreeChoice) - 1;
+    // "use existing: <branch> (<path>)" — index into the existing list.
+    // Account for the two synthetic options at the top of worktreeOptions.
+    const idx = worktreeOptions.indexOf(worktreeChoice) - 2;
     worktreePath = existingWorktrees[idx].path;
     branch = existingWorktrees[idx].branch;
   }

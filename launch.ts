@@ -102,14 +102,9 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const specFile = path.join(store.specsDir, `${config.taskId}.md`);
 
   const agentCmd = agentCommand(config.target, config.model, promptFile);
-  const commitType = conventionalCommitPrefix(config.branch);
-  // Scope: branch name after the type prefix, up to 30 chars
-  const scope = config.branch
-    .replace(/^[^/]*\//, "")
-    .replace(/-[a-z0-9]{6,}$/, "") // trim trailing id
-    .slice(0, 30);
+  // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
+  // because long titles render badly in GitHub's PR list.
   const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
-  const commitMsg = `${commitType}(${scope}): ${safeTitle}`;
 
   const qualityBlock =
     config.qualityCommands.length > 0
@@ -197,17 +192,44 @@ if [ "$QUALITY_FAILED" -ne 0 ]; then
   set_status "quality_failed"
 fi
 
-# ── Commit & push ─────────────────────────────────────────────────────────────
+# ── Verify commits & push ─────────────────────────────────────────────────────────────
 
 log ""
-log "═══ COMMIT & PUSH ═══"
+log "═══ VERIFY COMMITS & PUSH ═══"
 
-git add -A 2>&1 | tee -a "$LOG_FILE"
-if git diff --cached --quiet 2>/dev/null; then
-  log "No staged changes to commit (agent may have already committed)"
-else
-  git commit -m '${commitMsg.replace(/'/g, "'\\''")}' 2>&1 | tee -a "$LOG_FILE" || log "commit failed — continuing"
+# Forge does NOT auto-stage or auto-commit. The agent owns its commits so
+# build artifacts, scratch files, generated lockfile noise, etc. don't get
+# swept into the PR by a blanket \`git add -A\`.
+
+LEFTOVER=$(git status --porcelain)
+if [ -n "$LEFTOVER" ]; then
+  log "⚠  Uncommitted changes left in working tree (NOT auto-added):"
+  echo "$LEFTOVER" | tee -a "$LOG_FILE"
+  log ""
+  log "   These files were intentionally NOT staged. If they should be part"
+  log "   of the PR, the agent should have committed them. If they're build"
+  log "   artifacts or temp files, add them to .gitignore."
+  log ""
 fi
+
+# Pick the best base ref to diff against. Prefer origin/<default> so this
+# works correctly in fresh worktrees that haven't pulled the local branch.
+BASE_REF="$DEFAULT_BRANCH"
+if git rev-parse --verify "origin/$DEFAULT_BRANCH" >/dev/null 2>&1; then
+  BASE_REF="origin/$DEFAULT_BRANCH"
+fi
+
+COMMITS_AHEAD=$(git rev-list --count "$BASE_REF..HEAD" 2>/dev/null || echo 0)
+if [ "$COMMITS_AHEAD" -eq 0 ]; then
+  log "✗ No commits ahead of $BASE_REF — agent did not commit any work."
+  log "  Skipping push and PR creation. Inspect the worktree, commit"
+  log "  manually if appropriate, then re-run /forge-launch."
+  set_status "failed"
+  exit 1
+fi
+
+log "✓ $COMMITS_AHEAD commit(s) ahead of $BASE_REF"
+git log --oneline "$BASE_REF..HEAD" 2>&1 | tee -a "$LOG_FILE" || true
 
 git push -u origin "$BRANCH" 2>&1 | tee -a "$LOG_FILE" || log "push failed — PR creation may fail"
 
@@ -266,9 +288,22 @@ ${config.specContent}
 1. Implement the task described above. Read the existing codebase to understand patterns before writing code.
 2. Write clean code consistent with the existing style — no excessive comments, no slop.
 3. Run quality checks as you go (${config.qualityCommands.join(", ") || "none configured"}).
-4. Commit your changes with conventional commit format: ${conventionalCommitPrefix(config.branch)}(...): ...
-5. Exit successfully (exit code 0) when the task is complete.
-6. Do NOT create a PR — the forge system handles that automatically.
+4. **You own all commits.** Forge does NOT run \`git add\` for you. Stage and
+   commit ONLY the files you intentionally changed for this task:
+     - Use \`git add <path>\` (or \`git add -p\`) on the specific files you wrote/edited.
+     - Do NOT \`git add -A\` or \`git add .\` blindly.
+     - Do NOT commit build artifacts, generated files, dependency caches,
+       editor scratch files, debug logs, or temporary code.
+     - If a generated file (e.g. a lockfile) legitimately needs to update,
+       commit it in its own commit with a clear message.
+     - Use conventional commit format: \`${conventionalCommitPrefix(config.branch)}(scope): summary\`.
+     - Multiple small commits are fine and often preferable to one mega-commit.
+5. Before exiting, run \`git status\` and confirm the working tree is clean
+   (or contains only files you intentionally chose not to commit, e.g. local
+   experiments). Anything left uncommitted will be surfaced as a warning
+   and will NOT make it into the PR.
+6. Exit successfully (exit code 0) when the task is complete and committed.
+7. Do NOT push or create a PR — the forge system handles that automatically.
 `;
 }
 
