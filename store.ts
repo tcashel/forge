@@ -54,9 +54,20 @@ export interface ForgeIndex {
  * repo root path. Currently used to remember the default JIRA project
  * and ticket type so we don't have to ask every save.
  */
+export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
+
 export interface RepoConfig {
   jiraProject?: string;
   jiraType?: string;
+  critiqueAgentA?: string;
+  critiqueModelA?: string;
+  critiqueReasoningA?: ReasoningEffort;
+  critiqueAgentB?: string;
+  critiqueModelB?: string;
+  critiqueReasoningB?: ReasoningEffort;
+  critiqueAgentSynth?: string;
+  critiqueModelSynth?: string;
+  critiqueReasoningSynth?: ReasoningEffort;
 }
 
 export interface RepoConfigFile {
@@ -64,10 +75,36 @@ export interface RepoConfigFile {
   repos: Record<string, RepoConfig>;
 }
 
+export interface CritiqueAgentMeta {
+  agent: LaunchTarget;
+  model: string;
+  reasoningEffort?: ReasoningEffort;
+  status: "pending" | "done" | "failed";
+  durationMs: number | null;
+}
+
+export interface CritiqueMeta {
+  schemaVersion: 1;
+  taskId: string;
+  critiqueId: string;
+  specTitle: string;
+  repoRoot: string;
+  repoName: string;
+  status: "running_critics" | "running_synth" | "done" | "failed";
+  startedAt: string;
+  completedAt: string | null;
+  viewedAt: string | null;
+  tmuxSession: string;
+  criticA: CritiqueAgentMeta;
+  criticB: CritiqueAgentMeta;
+  synthesizer: CritiqueAgentMeta;
+}
+
 export class ForgeStore {
   readonly forgeDir: string;
   readonly specsDir: string;
   readonly runsDir: string;
+  readonly critiquesDir: string;
   readonly indexFile: string;
 
   readonly repoConfigFile: string;
@@ -76,10 +113,12 @@ export class ForgeStore {
     this.forgeDir = path.join(os.homedir(), ".forge");
     this.specsDir = path.join(this.forgeDir, "specs");
     this.runsDir = path.join(this.forgeDir, "runs");
+    this.critiquesDir = path.join(this.forgeDir, "critiques");
     this.indexFile = path.join(this.forgeDir, "index.json");
     this.repoConfigFile = path.join(this.forgeDir, "repo-config.json");
     fs.mkdirSync(this.specsDir, { recursive: true });
     fs.mkdirSync(this.runsDir, { recursive: true });
+    fs.mkdirSync(this.critiquesDir, { recursive: true });
   }
 
   // ── Per-repo config (JIRA defaults, etc.) ───────────────────────────────
@@ -255,5 +294,93 @@ export class ForgeStore {
     } catch {
       return [];
     }
+  }
+
+  // ── Critique helpers ────────────────────────────────────────────────────────
+
+  generateCritiqueId(): string {
+    return `crit-${Date.now().toString(36)}`;
+  }
+
+  getCritiqueDir(taskId: string, critiqueId: string): string {
+    return path.join(this.critiquesDir, taskId, critiqueId);
+  }
+
+  listCritiques(taskId: string): string[] {
+    const dir = path.join(this.critiquesDir, taskId);
+    if (!fs.existsSync(dir)) return [];
+    try {
+      return fs
+        .readdirSync(dir, { withFileTypes: true })
+        .filter((d) => d.isDirectory() && d.name.startsWith("crit-"))
+        .map((d) => d.name)
+        .sort((a, b) => b.localeCompare(a));
+    } catch {
+      return [];
+    }
+  }
+
+  getLatestCritique(taskId: string): string | null {
+    const ids = this.listCritiques(taskId);
+    return ids[0] ?? null;
+  }
+
+  readCritiqueMeta(taskId: string, critiqueId: string): CritiqueMeta | null {
+    const p = path.join(this.getCritiqueDir(taskId, critiqueId), "critique-meta.json");
+    if (!fs.existsSync(p)) return null;
+    try {
+      return JSON.parse(fs.readFileSync(p, "utf-8")) as CritiqueMeta;
+    } catch {
+      return null;
+    }
+  }
+
+  writeCritiqueMeta(taskId: string, critiqueId: string, meta: CritiqueMeta): void {
+    const dir = this.getCritiqueDir(taskId, critiqueId);
+    fs.mkdirSync(dir, { recursive: true });
+    fs.writeFileSync(path.join(dir, "critique-meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf-8");
+  }
+
+  markCritiqueViewed(taskId: string, critiqueId: string): void {
+    const meta = this.readCritiqueMeta(taskId, critiqueId);
+    if (!meta || meta.viewedAt) return;
+    meta.viewedAt = new Date().toISOString();
+    this.writeCritiqueMeta(taskId, critiqueId, meta);
+  }
+
+  getRecommendationsFile(taskId: string, critiqueId: string): string {
+    return path.join(this.getCritiqueDir(taskId, critiqueId), "recommendations.md");
+  }
+
+  getPendingCritiques(repoRoot?: string): Array<{ taskId: string; critiqueId: string; meta: CritiqueMeta }> {
+    const results: Array<{ taskId: string; critiqueId: string; meta: CritiqueMeta }> = [];
+    if (!fs.existsSync(this.critiquesDir)) return results;
+    try {
+      for (const taskEntry of fs.readdirSync(this.critiquesDir, { withFileTypes: true })) {
+        if (!taskEntry.isDirectory()) continue;
+        const taskDir = path.join(this.critiquesDir, taskEntry.name);
+        for (const critEntry of fs.readdirSync(taskDir, { withFileTypes: true })) {
+          if (!critEntry.isDirectory() || !critEntry.name.startsWith("crit-")) continue;
+          const metaPath = path.join(taskDir, critEntry.name, "critique-meta.json");
+          if (!fs.existsSync(metaPath)) continue;
+          try {
+            const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as CritiqueMeta;
+            const isPending =
+              meta.status === "running_critics" ||
+              meta.status === "running_synth" ||
+              (meta.status === "done" && !meta.viewedAt) ||
+              meta.status === "failed";
+            if (!isPending) continue;
+            if (repoRoot && meta.repoRoot !== repoRoot) continue;
+            results.push({ taskId: taskEntry.name, critiqueId: critEntry.name, meta });
+          } catch {
+            /* corrupted meta — skip */
+          }
+        }
+      }
+    } catch {
+      /* dir read error */
+    }
+    return results.sort((a, b) => b.meta.startedAt.localeCompare(a.meta.startedAt));
   }
 }
