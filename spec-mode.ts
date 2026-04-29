@@ -141,6 +141,8 @@ interface SpecModeState {
   jiraKey: string | null;
   /** Cached JIRA ticket content for the planner's context, fetched once on entry. */
   jiraContent: string | null;
+  /** JIRA ticket URL, captured from acli for the PR body footer. */
+  jiraUrl: string | null;
   /** Pre-resolved task id so the spec file location is stable across the conversation. */
   taskId: string | null;
   /** Title of the most recent draft, derived from the spec body. Used for status badge + save flow defaults. */
@@ -169,6 +171,7 @@ const state: SpecModeState = {
   repo: null,
   jiraKey: null,
   jiraContent: null,
+  jiraUrl: null,
   taskId: null,
   lastDraftTitle: null,
   promptedThisCycle: false,
@@ -431,6 +434,7 @@ export async function enterSpecMode(
           ticket.summary ? `Summary: ${ticket.summary}` : null,
           ticket.description ? `\nDescription:\n${ticket.description}` : null,
         ].filter(Boolean).join("\n");
+        state.jiraUrl = ticket.url;
       }
     }
   }
@@ -496,6 +500,7 @@ export function exitSpecMode(
   state.repo = null;
   state.jiraKey = null;
   state.jiraContent = null;
+  state.jiraUrl = null;
   state.taskId = null;
   state.lastDraftTitle = null;
   state.promptedThisCycle = false;
@@ -599,7 +604,10 @@ export async function saveSpec(
       ]);
       if (choice?.startsWith("Yes")) {
         const created = await promptCreateJira(ctx, store, repo, title, specBody);
-        if (created) jiraKey = created;
+        if (created) {
+          jiraKey = created.key;
+          state.jiraUrl = created.url ?? null;
+        }
       } else if (choice?.startsWith("Link")) {
         const linked = ctx.ui.input
           ? await ctx.ui.input("JIRA ticket key:", { placeholder: "e.g. PROJ-123" })
@@ -607,6 +615,9 @@ export async function saveSpec(
         if (linked && jira.isJiraKey(linked.trim())) {
           const newKey = linked.trim();
           jiraKey = newKey;
+          // Fetch the ticket to capture its URL for the PR footer
+          const linkedTicket = jira.fetchTicket(newKey);
+          if (linkedTicket?.url) state.jiraUrl = linkedTicket.url;
           // Add a comment so the JIRA side knows about the spec
           const res = jira.addComment(newKey, `Forge spec drafted (${taskId}):\n\n${specBody}`);
           if ("error" in res) ctx.ui.notify(`JIRA comment failed: ${res.error}`, "warning");
@@ -634,6 +645,7 @@ export async function saveSpec(
     `suggestedModel: ${editing?.model ?? "claude-opus-4-6"}`,
     `suggestedBranch: ${suggestedBranch}`,
     jiraKey ? `jiraTicket: ${jiraKey}` : null,
+    state.jiraUrl ? `jiraUrl: ${state.jiraUrl}` : null,
     "---",
   ]
     .filter(Boolean)
@@ -698,7 +710,7 @@ async function promptCreateJira(
   repo: RepoProfile,
   title: string,
   specBody: string,
-): Promise<string | null> {
+): Promise<{ key: string; url?: string } | null> {
   if (!ctx.ui.input) {
     ctx.ui.notify("Cannot create JIRA ticket — interactive input not available.", "warning");
     return null;
@@ -735,7 +747,7 @@ async function promptCreateJira(
   // Remember preferences for this repo
   store.setRepoConfig(repo.root, { jiraProject: project, jiraType: type });
   ctx.ui.notify(`Created ${res.key}.`, "success");
-  return res.key;
+  return { key: res.key, url: res.url };
 }
 
 // ─── Wire-up: register hooks, commands, shortcut ──────────────────────────────

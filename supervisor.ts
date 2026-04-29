@@ -30,6 +30,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { Phase, ProgressEvent, Snapshot } from "./progress.ts";
 import { emptySnapshot, applyEvent } from "./progress.ts";
+import { buildPrBody, stripFrontmatter, type PrBodyInput } from "./pr-body.ts";
 import type { TaskStatus } from "./store.ts";
 
 // ─── Node 22 preflight (only when running as entry point) ─────────────────────
@@ -562,8 +563,90 @@ async function main() {
   emit({ t: Date.now(), type: "phase_change", from: "committing", to: "creating_pr" });
   log("═══ CREATING DRAFT PR ═══");
 
+  // ── Build structured PR body ──────────────────────────────────────────
+  const prBodyFile = path.join(runDir, "pr-body.md");
+  let usePrBodyFile = false;
+  try {
+    // Determine base ref
+    let baseRef = defaultBranch;
+    try {
+      execFileSync("git", ["rev-parse", "--verify", `origin/${defaultBranch}`], { cwd: worktreePath, stdio: "pipe" });
+      baseRef = `origin/${defaultBranch}`;
+    } catch { /* use defaultBranch as-is */ }
+
+    // Gather commits
+    const commitLog = execFileSync(
+      "git", ["log", "--no-merges", `--format=%h %s`, `${baseRef}..HEAD`],
+      { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+    ).trim();
+    const commits = commitLog
+      ? commitLog.split("\n").map((line) => {
+          const spaceIdx = line.indexOf(" ");
+          return { sha: line.slice(0, spaceIdx), subject: line.slice(spaceIdx + 1) };
+        })
+      : [];
+
+    // Gather diff stats
+    let additions: number | null = null;
+    let deletions: number | null = null;
+    let filesChanged: number | null = null;
+    try {
+      const shortstat = execFileSync(
+        "git", ["diff", "--shortstat", `${baseRef}..HEAD`],
+        { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+      ).trim();
+      const sm = shortstat.match(/(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/);
+      if (sm) {
+        filesChanged = parseInt(sm[1], 10);
+        if (sm[2]) additions = parseInt(sm[2], 10);
+        if (sm[3]) deletions = parseInt(sm[3], 10);
+      }
+    } catch { /* stats unavailable — not fatal */ }
+
+    // Read spec body
+    const specBody = fs.existsSync(specFile) ? fs.readFileSync(specFile, "utf-8") : "";
+
+    // Parse jiraTicket and jiraUrl from frontmatter
+    const jiraTicketMatch = specBody.match(/^jiraTicket:\s*(\S+)/m);
+    const jiraUrlMatch = specBody.match(/^jiraUrl:\s*(\S+)/m);
+
+    // Read agent summary if present
+    const agentSummaryPath = path.join(runDir, "agent-summary.md");
+    let agentSummary: string | null = null;
+    try {
+      agentSummary = fs.readFileSync(agentSummaryPath, "utf-8").trim() || null;
+    } catch { /* file doesn't exist — fine */ }
+
+    const prBodyInput: PrBodyInput = {
+      taskId,
+      specBody,
+      branch,
+      baseRef,
+      commits,
+      additions,
+      deletions,
+      filesChanged,
+      qualityResults: snapshot.qualityResults,
+      agent: "pi",
+      model,
+      jiraTicket: jiraTicketMatch?.[1] ?? null,
+      jiraUrl: jiraUrlMatch?.[1] ?? null,
+      agentSummary,
+    };
+
+    const body = buildPrBody(prBodyInput);
+    fs.writeFileSync(prBodyFile, body, "utf-8");
+    usePrBodyFile = true;
+    log("✓ PR body built");
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    log(`⚠ PR body build failed, falling back to spec file: ${msg}`);
+  }
+
   const ghArgs = ["pr", "create", "--draft", "--title", specTitle, "--base", defaultBranch, "--head", branch];
-  if (fs.existsSync(specFile)) {
+  if (usePrBodyFile) {
+    ghArgs.push("--body-file", prBodyFile);
+  } else if (fs.existsSync(specFile)) {
     ghArgs.push("--body-file", specFile);
   } else {
     ghArgs.push("--body", `Forge task ${taskId}`);
