@@ -5,7 +5,7 @@
  * and open PRs from gh. Keyboard-driven for all common actions.
  */
 
-import { execSync } from "node:child_process";
+import { execSync, spawn } from "node:child_process";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import type { ForgeStore, TaskRecord, TaskStatus, Snapshot } from "./store.js";
 import type { RepoProfile } from "./repo.js";
@@ -42,20 +42,40 @@ interface Tui {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function sh(cmd: string): string {
-  try {
-    // 32 MB buffer + 20 s timeout. The previous 1 MB / 8 s defaults caused
-    // ENOBUFS / TIMEOUT failures on large `gh pr list --json comments,reviews`
-    // responses, which silently surfaced as "no PRs".
-    return execSync(cmd, {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 20000,
-      maxBuffer: 32 * 1024 * 1024,
-    }).trim();
-  } catch {
-    return "";
-  }
+function runGh(args: string[], opts?: { timeoutMs?: number }): Promise<{ stdout: string; ok: boolean }> {
+  const timeout = opts?.timeoutMs ?? 20000;
+  return new Promise((resolve) => {
+    const ac = new AbortController();
+    const timer = setTimeout(() => ac.abort(), timeout);
+    let stdout = "";
+    let stderr = "";
+    let settled = false;
+    const settle = (result: { stdout: string; ok: boolean }) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(result);
+    };
+
+    let child;
+    try {
+      child = spawn("gh", args, {
+        stdio: ["ignore", "pipe", "pipe"],
+        signal: ac.signal,
+      });
+    } catch {
+      settle({ stdout: "", ok: false });
+      return;
+    }
+
+    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.on("error", () => settle({ stdout: "", ok: false }));
+    child.on("close", (code) => {
+      void stderr; // captured for diagnostics, discarded on success
+      settle({ stdout: stdout.trim(), ok: code === 0 });
+    });
+  });
 }
 
 function timeAgo(iso: string | null | undefined): string {
@@ -148,30 +168,30 @@ function reviewCell(theme: Theme, decision: string | null | undefined): string {
 }
 
 let cachedLogin: string | null = null;
-function currentLogin(): string {
+async function currentLogin(): Promise<string> {
   if (cachedLogin !== null) return cachedLogin;
-  cachedLogin = sh(`gh api user --jq .login`) || "";
+  const { stdout, ok } = await runGh(["api", "user", "--jq", ".login"]);
+  cachedLogin = ok ? stdout : "";
   return cachedLogin;
 }
 
-function fetchMinePrNumbers(): Set<number> {
+async function fetchMinePrNumbers(): Promise<Set<number>> {
   // Use gh's own "@me" resolution so this works even when the local gh login
   // (e.g. an org-aliased account like "foo-org") differs from the PR author
   // login on the host (e.g. "foo"). Strict string equality on logins is
   // unreliable across SAML/enterprise account mappings.
-  const raw = sh(`gh pr list --author "@me" --json number --limit 100`);
-  if (!raw) return new Set();
+  const { stdout, ok } = await runGh(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"]);
+  if (!ok || !stdout) return new Set();
   try {
-    const arr = JSON.parse(raw) as Array<{ number: number }>;
+    const arr = JSON.parse(stdout) as Array<{ number: number }>;
     return new Set(arr.map((p) => p.number));
   } catch {
     return new Set();
   }
 }
 
-function fetchPrs(_repoRoot: string): GhPr[] {
-  const me = currentLogin();
-  const mineNumbers = fetchMinePrNumbers();
+async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
+  const [me, mineNumbers] = await Promise.all([currentLogin(), fetchMinePrNumbers()]);
   // Use gh's built-in `--jq` to project the (potentially huge) `comments`
   // and `reviews` arrays down to scalar counts on gh's side. Without this,
   // the full review/comment bodies blow past execSync's default maxBuffer
@@ -183,12 +203,15 @@ function fetchPrs(_repoRoot: string): GhPr[] {
     "additions,deletions,changedFiles," +
     "commentsCount:(.comments|length),reviewsCount:(.reviews|length)" +
     "}]";
-  const raw = sh(
-    `gh pr list --json number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews --jq '${jq}' --limit 30`,
-  );
-  if (!raw) return [];
+  const { stdout, ok } = await runGh([
+    "pr", "list",
+    "--json", "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
+    "--jq", jq,
+    "--limit", "30",
+  ]);
+  if (!ok || !stdout) return [];
   try {
-    const prs = JSON.parse(raw) as Array<{
+    const prs = JSON.parse(stdout) as Array<{
       number: number;
       title: string;
       headRefName: string;
@@ -274,7 +297,7 @@ export class ForgeDashboard {
   // ── Public API ──────────────────────────────────────────────────────────────
 
   start(): void {
-    this.refresh();
+    void this.refresh();
     // Poll every 8s to sync running task statuses
     this.refreshTimer = setInterval(() => this.syncAndRender(), 8000);
   }
@@ -320,7 +343,7 @@ export class ForgeDashboard {
       this.invalidate();
       this.tui.requestRender();
     } else if (matchesKey(data, "r")) {
-      this.refresh();
+      void this.refresh();
     } else if (matchesKey(data, Key.escape) || data === "q" || data === "Q") {
       this.stop();
       this.onClose();
@@ -348,7 +371,7 @@ export class ForgeDashboard {
 
   // ── Data loading ────────────────────────────────────────────────────────────
 
-  private refresh(): void {
+  private async refresh(): Promise<void> {
     this.loading = true;
     this.invalidate();
     this.tui.requestRender();
@@ -360,10 +383,23 @@ export class ForgeDashboard {
     this.tasks = this.store.getTasks(this.repo.root);
     this.otherTasks = this.store.getRunningTasks(this.repo.root);
 
-    // Fetch PRs (quick, from gh CLI)
-    this.prs = fetchPrs(this.repo.root);
+    // Fetch PRs (async, non-blocking)
+    this.prs = await fetchPrs(this.repo.root);
 
     this.lastRefresh = new Date();
+    this.loading = false;
+    this.invalidate();
+    this.tui.requestRender();
+  }
+
+  private async refreshPrsOnly(): Promise<void> {
+    this.loading = true;
+    this.invalidate();
+    this.tui.requestRender();
+
+    this.prs = await fetchPrs(this.repo.root);
+    this.prSelectedIdx = Math.min(this.prSelectedIdx, Math.max(0, this.visiblePrs().length - 1));
+
     this.loading = false;
     this.invalidate();
     this.tui.requestRender();
@@ -397,10 +433,7 @@ export class ForgeDashboard {
       this.invalidate();
       this.tui.requestRender();
     } else if (matchesKey(data, "r")) {
-      this.prs = fetchPrs(this.repo.root);
-      this.prSelectedIdx = Math.min(this.prSelectedIdx, Math.max(0, this.visiblePrs().length - 1));
-      this.invalidate();
-      this.tui.requestRender();
+      void this.refreshPrsOnly();
     } else if (matchesKey(data, "m")) {
       this.prFilterMine = !this.prFilterMine;
       this.prSelectedIdx = 0;
@@ -589,7 +622,7 @@ export class ForgeDashboard {
   private drawPrPanel(lines: string[], width: number): void {
     const { theme } = this;
     const visible = this.visiblePrs();
-    const me = currentLogin();
+    const me = cachedLogin ?? "";
     const total = this.prs.length;
     const mineCount = this.prs.filter((p) => p.isMine).length;
 
