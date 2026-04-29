@@ -631,7 +631,11 @@ export class ForgeDashboard {
       const inp = fmtTokens(snap.usage.inputTokens);
       const out = fmtTokens(snap.usage.outputTokens);
       const badge = this.healthBadge(snap.health);
-      const line2 = `↑${inp} ↓${out} · turn ${snap.usage.turns} · ${secAgo}s ago · ${badge}`;
+      const errs = snap.consecutiveToolErrors ?? 0;
+      const struggle = errs > 0
+        ? ` · ${theme.fg(errs >= 3 ? "error" : "warning", `${errs}✗ in a row`)}`
+        : "";
+      const line2 = `↑${inp} ↓${out} · turn ${snap.usage.turns}${struggle} · ${secAgo}s ago · ${badge}`;
       lines.push(truncateToWidth(`       ${line2}`, width));
     } else {
       const line1 = `${icon} ${snap.phase} · ${secAgo}s ago`;
