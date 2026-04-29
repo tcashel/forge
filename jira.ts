@@ -58,6 +58,7 @@ export interface JiraTicket {
   key: string;
   summary: string;
   description: string;
+  url: string | null;
   /** Raw fetched text, in case JSON parsing failed and we want to surface it. */
   raw?: string;
 }
@@ -76,7 +77,10 @@ export function fetchTicket(key: string): JiraTicket | null {
     try {
       const parsed = JSON.parse(jsonResult.stdout) as {
         key?: string;
-        fields?: { summary?: string; description?: string | { content?: any[] } };
+        fields?: { summary?: string; description?: string | { content?: any[] }; url?: string };
+        url?: string;
+        self?: string;
+        _links?: { web?: string };
       };
       const summary = parsed.fields?.summary ?? "";
       // Description can be an Atlassian Document Format (ADF) object.
@@ -89,8 +93,9 @@ export function fetchTicket(key: string): JiraTicket | null {
       } else if (rawDesc && typeof rawDesc === "object") {
         description = JSON.stringify(rawDesc, null, 2);
       }
+      const url = parsed.url ?? parsed.self ?? parsed._links?.web ?? parsed.fields?.url ?? null;
       if (summary || description) {
-        return { key, summary, description, raw: jsonResult.stdout };
+        return { key, summary, description, url, raw: jsonResult.stdout };
       }
     } catch {
       // fall through to text fallback
@@ -102,7 +107,7 @@ export function fetchTicket(key: string): JiraTicket | null {
   if (!textResult.ok) return null;
   const cleaned = textResult.stdout.replace(/\x1b\[[0-9;]*m/g, "").trim();
   if (!cleaned) return null;
-  return { key, summary: "", description: cleaned, raw: cleaned };
+  return { key, summary: "", description: cleaned, url: null, raw: cleaned };
 }
 
 export interface CreateTicketRequest {
