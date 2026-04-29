@@ -101,10 +101,11 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const metaFile = path.join(runDir, "meta.json");
   const promptFile = store.getPromptFile(config.taskId);
   const specFile = path.join(store.specsDir, `${config.taskId}.md`);
+  const extDir = path.dirname(fileURLToPath(import.meta.url));
+  const prBodyTsPath = path.join(extDir, "pr-body.ts");
 
   // ── pi runtime: supervisor-based runner ──────────────────────────────
   if (config.target === "pi") {
-    const extDir = path.dirname(fileURLToPath(import.meta.url));
     const supervisorPath = path.join(extDir, "supervisor.ts");
     const argsJsonPath = path.join(runDir, "supervisor-args.json");
     const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
@@ -148,7 +149,15 @@ exec node --experimental-strip-types '${supervisorPath}' '${argsJsonPath}'
   const qualityBlock =
     config.qualityCommands.length > 0
       ? config.qualityCommands
-          .map((cmd) => `  run_cmd "${cmd.replace(/"/g, '\\"')}" || QUALITY_FAILED=1`)
+          .map((cmd) => {
+            const escaped = cmd.replace(/"/g, '\\"');
+            return `  QUAL_START=$SECONDS
+  run_cmd "${escaped}"
+  QUAL_OK=$?
+  QUAL_DUR=$(( (SECONDS - QUAL_START) * 1000 ))
+  if [ "$QUAL_OK" -ne 0 ]; then QUALITY_FAILED=1; fi
+  echo '{"command":"${escaped}","ok":'$([ "$QUAL_OK" -eq 0 ] && echo true || echo false)',"durationMs":'$QUAL_DUR'}' >> "${runDir}/quality.jsonl"`;
+          })
           .join("\n")
       : '  echo "No quality commands configured — skipping."';
 
@@ -272,6 +281,112 @@ git log --oneline "$BASE_REF..HEAD" 2>&1 | tee -a "$LOG_FILE" || true
 
 git push -u origin "$BRANCH" 2>&1 | tee -a "$LOG_FILE" || log "push failed — PR creation may fail"
 
+# ── Build structured PR body ──────────────────────────────────────────────────
+
+log ""
+log "═══ BUILD PR BODY ═══"
+
+PR_BODY_FILE="${runDir}/pr-body.md"
+PR_BODY_BUILT=0
+
+# Use python3 to safely build pr-body-args.json with proper escaping
+python3 -c "
+import json, subprocess, os, sys
+
+base_ref = '$BASE_REF'
+branch = '$BRANCH'
+spec_file = '$SPEC_FILE'
+run_dir = '${runDir}'
+task_id = '${config.taskId}'
+agent = '${config.target}'
+model = '${config.model}'
+
+# Gather commits
+commits = []
+try:
+    log = subprocess.check_output(
+        ['git', 'log', '--no-merges', '--format=%h %s', base_ref + '..HEAD'],
+        text=True, stderr=subprocess.DEVNULL
+    ).strip()
+    for line in log.split('\n'):
+        if line.strip():
+            sha, _, subj = line.partition(' ')
+            commits.append({'sha': sha, 'subject': subj})
+except Exception:
+    pass
+
+# Gather shortstat
+additions = None
+deletions = None
+files_changed = None
+try:
+    stat = subprocess.check_output(
+        ['git', 'diff', '--shortstat', base_ref + '..HEAD'],
+        text=True, stderr=subprocess.DEVNULL
+    ).strip()
+    import re
+    m = re.search(r'(\\d+) files? changed', stat)
+    if m:
+        files_changed = int(m.group(1))
+    m = re.search(r'(\\d+) insertions?', stat)
+    if m:
+        additions = int(m.group(1))
+    m = re.search(r'(\\d+) deletions?', stat)
+    if m:
+        deletions = int(m.group(1))
+except Exception:
+    pass
+
+# Read quality results
+quality = []
+qpath = os.path.join(run_dir, 'quality.jsonl')
+if os.path.exists(qpath):
+    with open(qpath) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try:
+                    quality.append(json.loads(line))
+                except Exception:
+                    pass
+
+args = {
+    'specPath': spec_file,
+    'agentSummaryPath': os.path.join(run_dir, 'agent-summary.md'),
+    'outputPath': os.path.join(run_dir, 'pr-body.md'),
+    'input': {
+        'taskId': task_id,
+        'specBody': '',
+        'branch': branch,
+        'baseRef': base_ref,
+        'commits': commits,
+        'additions': additions,
+        'deletions': deletions,
+        'filesChanged': files_changed,
+        'qualityResults': quality,
+        'agent': agent,
+        'model': model,
+        'jiraTicket': None,
+        'jiraUrl': None,
+        'agentSummary': None,
+    }
+}
+with open(os.path.join(run_dir, 'pr-body-args.json'), 'w') as f:
+    json.dump(args, f, indent=2)
+" 2>&1 | tee -a "$LOG_FILE"
+
+if node --experimental-strip-types '${prBodyTsPath}' "${runDir}/pr-body-args.json" 2>&1 | tee -a "$LOG_FILE"; then
+  if [ -f "$PR_BODY_FILE" ]; then
+    PR_BODY_BUILT=1
+    log "✓ PR body built"
+  fi
+fi
+
+if [ "$PR_BODY_BUILT" -eq 0 ]; then
+  log "⚠  PR body build failed — falling back to spec file"
+  PR_BODY_FILE="$SPEC_FILE"
+fi
+
 # ── Create draft PR ───────────────────────────────────────────────────────────
 
 log ""
@@ -281,7 +396,7 @@ set_status "creating_pr"
 PR_URL=$(gh pr create \\
   --draft \\
   --title '${safeTitle}' \\
-  --body-file "$SPEC_FILE" \\
+  --body-file "$PR_BODY_FILE" \\
   --base "$DEFAULT_BRANCH" \\
   --head "$BRANCH" 2>&1 | tee -a "$LOG_FILE" | grep -Eo 'https://github[^ ]+' | tail -1 || true)
 
@@ -307,7 +422,7 @@ log "═══ DONE: $(date -u +%Y-%m-%dT%H:%M:%SZ) ═══"
 
 // ─── Agent prompt ─────────────────────────────────────────────────────────────
 
-function buildAgentPrompt(config: LaunchConfig): string {
+function buildAgentPrompt(config: LaunchConfig, store: ForgeStore): string {
   const ctxSection = config.contextContent
     ? `## Repository Context\n\n${config.contextContent.slice(0, 4000)}\n\n---\n\n`
     : "";
@@ -341,8 +456,15 @@ ${config.specContent}
    (or contains only files you intentionally chose not to commit, e.g. local
    experiments). Anything left uncommitted will be surfaced as a warning
    and will NOT make it into the PR.
-6. Exit successfully (exit code 0) when the task is complete and committed.
-7. Do NOT push or create a PR — the forge system handles that automatically.
+6. Before exiting (after committing), write a short PR summary to
+   \`${path.join(store.runsDir, config.taskId, "agent-summary.md")}\` — 3–6 sentences in plain prose,
+   describing what you actually did and any noteworthy decisions or
+   follow-ups. Skip implementation details that are obvious from
+   the diff. If the change is trivial (one-line fix, typo, etc.),
+   a single sentence is fine. Do NOT write the file if you didn't
+   complete the task.
+7. Exit successfully (exit code 0) when the task is complete and committed.
+8. Do NOT push or create a PR — the forge system handles that automatically.
 `;
 }
 
@@ -360,7 +482,7 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
   const logFile = store.getLogFile(config.taskId);
 
   // Write agent prompt
-  const prompt = buildAgentPrompt(config);
+  const prompt = buildAgentPrompt(config, store);
   fs.writeFileSync(store.getPromptFile(config.taskId), prompt, "utf-8");
 
   // Write runner script
