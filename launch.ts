@@ -75,16 +75,22 @@ export function tmuxSessionName(taskId: string): string {
 
 // ─── Agent command builder ────────────────────────────────────────────────────
 
-function agentCommand(target: LaunchTarget, model: string, promptFile: string): string {
+export function agentCommand(
+  target: LaunchTarget,
+  model: string,
+  promptFile: string,
+  opts?: { reasoningEffort?: "low" | "medium" | "high" | "xhigh" },
+): string {
   switch (target) {
     case "pi":
       // pi --print reads the trailing message args; for long prompts pipe via stdin
       return `pi --print --model "${model}" --no-session < "${promptFile}"`;
     case "claude":
       return `claude --print --model "${model}" < "${promptFile}"`;
-    case "codex":
-      // codex exec reads from arg; we write a concise prompt to avoid shell quoting issues
-      return `codex exec --model "${model}" -a never --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')"`;
+    case "codex": {
+      const reasoningFlag = opts?.reasoningEffort ? ` --config reasoning_effort=${opts.reasoningEffort}` : "";
+      return `codex exec --model "${model}"${reasoningFlag} -a never --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')"`;
+    }
   }
 }
 
