@@ -22,7 +22,7 @@ Pi auto-loads extensions that declare a `pi` block in `package.json` — no furt
 
 ## Usage
 
-`/forge` opens the mission-control dashboard. From there, press `n` (or run `/forge-spec`) to start a new task — the bundled planner skill will research the repo and draft a spec conversationally. When the spec looks right, `Alt+S` saves it and offers to launch. Forge spins up the chosen agent (`pi`, `claude`, or `codex`) in a tmux session inside a fresh git worktree. `/forge-attach` lets you watch (or detach with `Ctrl-B d`). On completion the runner executes the repo's quality gates, pushes the branch, and opens a draft PR. `/forge-review <n>` runs the bundled reviewer skill against the PR diff and linked spec.
+`/forge` opens the mission-control dashboard. From there, press `n` (or run `/forge-spec`) to start a new task — the bundled planner skill will research the repo and draft a spec conversationally. When the spec looks right, `Alt+S` saves it and offers to launch. Press `v` on any task to open its saved spec in your default `.md` viewer (or set `FORGE_SPEC_VIEWER=zed` to pick a specific editor). Forge spins up the chosen agent (`pi`, `claude`, or `codex`) in a tmux session inside a fresh git worktree. `/forge-attach` lets you watch (or detach with `Ctrl-B d`). On completion the runner executes the repo's quality gates, pushes the branch, and opens a draft PR. `/forge-review <n>` runs the bundled reviewer skill against the PR diff and linked spec.
 
 ## Commands
 
