@@ -56,6 +56,7 @@ export interface Snapshot {
   taskId: string;
   phase: Phase;
   health: Health;
+  consecutiveToolErrors: number;
   startedAt: number;
   lastEventAt: number;
   agentPid: number | null;
@@ -88,6 +89,7 @@ export function emptySnapshot(taskId: string, startedAt: number): Snapshot {
     taskId,
     phase: "starting",
     health: "active",
+    consecutiveToolErrors: 0,
     startedAt,
     lastEventAt: startedAt,
     agentPid: null,
@@ -113,15 +115,17 @@ export function emptySnapshot(taskId: string, startedAt: number): Snapshot {
 
 // ─── Reducer ──────────────────────────────────────────────────────────────────
 
+function recover(h: Health): Health {
+  return h === "error" || h === "stalled" ? "active" : h;
+}
+
 export function applyEvent(prev: Snapshot, ev: ProgressEvent): Snapshot {
   const base = { ...prev, lastEventAt: ev.t };
 
   switch (ev.type) {
     case "phase_change": {
       let health = base.health;
-      if (ev.to === "agent" && base.health !== "error") {
-        health = "active";
-      }
+      if (ev.to === "agent") health = "active";
       return { ...base, phase: ev.to, health };
     }
 
@@ -154,20 +158,22 @@ export function applyEvent(prev: Snapshot, ev: ProgressEvent): Snapshot {
             isError: ev.isError,
           };
       const recentTools = [...prev.recentTools, completed].slice(-RECENT_TOOLS_LIMIT);
-      const health = ev.isError ? "error" as Health : base.health;
+      const consecutiveToolErrors = ev.isError ? prev.consecutiveToolErrors + 1 : 0;
+      const health = ev.isError ? ("error" as Health) : recover(base.health);
       return {
         ...base,
         currentTool: matched ? null : base.currentTool,
         recentTools,
         health,
+        consecutiveToolErrors,
       };
     }
 
     case "assistant_text":
-      return { ...base, lastAssistantText: ev.preview };
+      return { ...base, lastAssistantText: ev.preview, consecutiveToolErrors: 0, health: recover(base.health) };
 
     case "usage":
-      return { ...base, usage: { ...ev.usage } };
+      return { ...base, usage: { ...ev.usage }, consecutiveToolErrors: 0, health: recover(base.health) };
 
     case "alert": {
       const alerts = [...prev.alerts, ev.alert];

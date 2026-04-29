@@ -2,16 +2,26 @@
   "name": "forge",
   "version": "0.3.0",
   "description": "Mission control for agentic coding workflows — spec, launch, track, review, PR",
-  "keywords": ["pi-package"],
+  "keywords": [
+    "pi-package"
+  ],
   "type": "module",
   "scripts": {
-    "test": "node --import tsx --test tests/*.test.ts"
+    "test": "node --import tsx --test tests/*.test.ts",
+    "lint": "biome check .",
+    "format": "biome format --write .",
+    "check": "biome check --write ."
   },
   "pi": {
-    "extensions": ["./index.ts"],
-    "skills": ["./skills"]
+    "extensions": [
+      "./index.ts"
+    ],
+    "skills": [
+      "./skills"
+    ]
   },
   "devDependencies": {
+    "@biomejs/biome": "2.4.13",
     "tsx": "^4.19.0"
   }
 }
