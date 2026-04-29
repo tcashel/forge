@@ -4,8 +4,14 @@
   "description": "Mission control for agentic coding workflows — spec, launch, track, review, PR",
   "keywords": ["pi-package"],
   "type": "module",
+  "scripts": {
+    "test": "node --import tsx --test tests/*.test.ts"
+  },
   "pi": {
     "extensions": ["./index.ts"],
     "skills": ["./skills"]
+  },
+  "devDependencies": {
+    "tsx": "^4.19.0"
   }
 }
