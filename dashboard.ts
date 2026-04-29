@@ -7,6 +7,7 @@
 
 import { execSync, spawn } from "node:child_process";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
+import * as fs from "node:fs";
 import type { ForgeStore, TaskRecord, TaskStatus, Snapshot } from "./store.js";
 import type { RepoProfile } from "./repo.js";
 import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
@@ -269,6 +270,9 @@ export type DashboardAction =
   | { type: "launch"; task: TaskRecord }
   | { type: "attach"; task: TaskRecord }
   | { type: "kill"; task: TaskRecord }
+  | { type: "run_critique"; task: TaskRecord }
+  | { type: "view_critique"; task: TaskRecord; critiqueId: string }
+  | { type: "discuss_critique"; task: TaskRecord; critiqueId: string }
   | { type: "close" };
 
 export class ForgeDashboard {
@@ -344,6 +348,9 @@ export class ForgeDashboard {
     } else if (data === "K") {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "kill", task });
+    } else if (matchesKey(data, "c")) {
+      const task = allTasks[this.selectedIdx];
+      if (task) this.onAction({ type: "run_critique", task });
     } else if (matchesKey(data, "p")) {
       this.prMode = true;
       this.invalidate();
@@ -544,6 +551,29 @@ export class ForgeDashboard {
         }
       }
 
+      // Pending critiques panel (cross-repo)
+      const pending = this.store.getPendingCritiques();
+      if (pending.length > 0) {
+        lines.push("");
+        lines.push(`  ${theme.fg("accent", theme.bold("PENDING CRITIQUES"))}`);
+        lines.push(`  ${sep(width - 2, "·")}`);
+        for (const entry of pending) {
+          const m = entry.meta;
+          let statusStr: string;
+          if (m.status === "running_critics" || m.status === "running_synth") {
+            statusStr = theme.fg("warning", "running");
+          } else if (m.status === "done" && !m.viewedAt) {
+            statusStr = theme.fg("accent", "ready");
+          } else if (m.status === "failed") {
+            statusStr = theme.fg("error", "failed");
+          } else {
+            continue;
+          }
+          const age = timeAgo(m.startedAt);
+          lines.push(truncateToWidth(`    🤔 [${statusStr}] ${m.specTitle}  (${m.repoName})  ${theme.fg("dim", age)}`, width));
+        }
+      }
+
       // Other running tasks
       if (this.otherTasks.length > 0) {
         lines.push("");
@@ -586,6 +616,11 @@ export class ForgeDashboard {
       const progress = this.progressLines(task, width);
       for (const pl of progress) lines.push(pl);
     }
+
+    // Critique progress sub-line
+    const critLine = this.critiqueSubLine(task, width);
+    if (critLine) lines.push(critLine);
+
     lines.push("");
   }
 
@@ -653,6 +688,34 @@ export class ForgeDashboard {
       case "error":   return theme.fg("error", "error");
       default:        return theme.fg("dim", health);
     }
+  }
+
+  // ── Critique sub-line for tasks ───────────────────────────────────────────
+
+  private critiqueSubLine(task: TaskRecord, width: number): string | null {
+    const { theme } = this;
+    const latestId = this.store.getLatestCritique(task.id);
+    if (!latestId) return null;
+    const meta = this.store.readCritiqueMeta(task.id, latestId);
+    if (!meta) return null;
+
+    if (meta.status === "running_critics" || meta.status === "running_synth") {
+      const label = `🤔 critique · A:${meta.criticA.status} B:${meta.criticB.status} · synth:${meta.synthesizer.status}`;
+      return truncateToWidth(`       ${theme.fg("warning", label)}`, width);
+    }
+    if (meta.status === "done" && !meta.viewedAt) {
+      return truncateToWidth(
+        `       ${theme.fg("accent", "🤔 critique ready · press c to review")}`,
+        width,
+      );
+    }
+    if (meta.status === "failed") {
+      return truncateToWidth(
+        `       ${theme.fg("error", "🤔 critique failed · press c for details")}`,
+        width,
+      );
+    }
+    return null;
   }
 
   // ── Drawing: PR Panel ────────────────────────────────────────────────────────
@@ -821,12 +884,13 @@ export class ForgeDashboard {
     const canLaunch = selected?.status === "draft" || selected?.status === "failed";
     const canKill = selected?.tmuxSession && isTmuxSessionAlive(selected.tmuxSession);
 
-    // "e" only makes sense when there's a saved spec we can re-open.
     const canEdit = !!selected;
+    const canCritique = !!(selected?.specFile && fs.existsSync(selected.specFile));
     const parts = [
       `[${theme.fg("accent", "n")}] New spec`,
       canEdit ? `[${theme.fg("accent", "e")}] Edit spec` : "",
       canLaunch ? `[${theme.fg("accent", "l")}] Launch` : "",
+      canCritique ? `[${theme.fg("accent", "c")}] Critique` : "",
       canAttach ? `[${theme.fg("accent", "↵")}] Attach` : "",
       canKill ? `[${theme.fg("error", "K")}] Kill` : "",
       `[${theme.fg("accent", "p")}] PRs`,
