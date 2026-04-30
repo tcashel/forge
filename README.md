@@ -79,6 +79,36 @@ All persistent state lives under `~/.forge/`:
 
 Edit files in place under `~/.pi/agent/extensions/forge/` — pi reloads extensions on agent restart. Run the quality gate with `pnpm run lint`. Run tests with `node --test --experimental-strip-types tests/*.test.ts`.
 
+## Ideas — deferred work
+
+The current scope ends at one-shot review and run capture. Tracked for future
+sessions:
+
+- **Reviewer → implementer iteration loop.** Up to 3 rounds, fix-via-new-commit
+  (no amend), implementer instructed to push back on bogus findings. Convergence
+  guard: bail if iteration N's findings aren't strictly better than N-1.
+- **Spec decomposer skill.** Turns one ambitious spec into a DAG of small
+  sub-specs that each leave the branch green. Default execution: sequential in
+  one worktree, one PR with N commits. `parallel: true` annotation only for
+  proven-independent leaves (no file overlap). Avoids stacked-PR tooling cost.
+- **`/forge-reflect` skill.** Reads run history across all repos, surfaces
+  patterns: which specs needed iteration, which models hold up best on this
+  repo, which acceptance criteria the reviewer flags most often. Feeds back
+  into improving the planner skill. Requires a few weeks of captured data.
+- **Synthesizer apply-recommendations picker.** Parse `forge-spec-recommendations`
+  blocks into items; checkbox picker in dashboard; selecting one opens spec-mode
+  with the recommendation pre-loaded as the opening turn (discuss, don't
+  auto-apply).
+- **Markdown-lint on spec save.** Catch structural breakage (broken headings,
+  unclosed fences) without trying to enforce writing style.
+- **Token / $ capture per run.** Per-runtime parsing of cost output. Engineering
+  rabbit hole — punt until reflect needs it.
+- **Pre-PR self-check by the implementer.** Walk acceptance criteria, mark
+  met/partial/missing, refuse PR open on any BLOCKER-equivalent gap. Possibly
+  redundant with the reviewer loop once that lands.
+- **Centralized cross-repo run dashboard view.** Summary across `~/.forge/runs/`
+  for "what ran today", time-to-PR trends, etc.
+
 ## License
 
 TBD (pre-1.0)

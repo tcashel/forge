@@ -37,6 +37,7 @@ import { ForgeDashboard } from "./dashboard.js";
 import * as jira from "./jira.js";
 import { attachToSession, isTmuxAvailable, isTmuxSessionAlive, killTmuxSession, launchAgent } from "./launch.js";
 import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./repo.js";
+import { buildReviewerPrompt } from "./reviewer.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
 import { ForgeStore, type LaunchTarget, type ReasoningEffort, type TaskRecord } from "./store.js";
 
@@ -139,6 +140,19 @@ async function enterSpecModeFlow(
   } else {
     await enterSpecMode(pi, ctx, store, { repo });
   }
+}
+
+// ─── Shared wizard helpers ─────────────────────────────────────────────────────
+
+const REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+
+/** Put " (default)" suffix on the matching option so the user sees the pre-selected value. */
+function highlightDefault(options: string[], defaultVal: string): string[] {
+  return options.map((o) => (o === defaultVal ? `${o} (default)` : o));
+}
+
+function stripDefault(choice: string): string {
+  return choice.replace(/ \(default\)$/, "");
 }
 
 // ─── Launch wizard ────────────────────────────────────────────────────────────
@@ -287,10 +301,58 @@ async function runLaunchWizard(
     branch = existingWorktrees[idx].branch;
   }
 
-  // No redundant "Launch agent?" confirm — the user just answered four
-  // explicit prompts (agent, model, branch, worktree). Echo the summary and go.
+  // 4. Choose reviewer agent, model, reasoning effort
+  const remembered = store.getRepoConfig(repoProfile.root);
+  const reviewerModelDefaults: Record<LaunchTarget, string[]> = {
+    pi: ["claude-opus-4-6", "claude-sonnet-4-6", "gemini-2.5-pro", "claude-haiku-4-5"],
+    claude: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    codex: ["o3", "o4-mini", "codex-mini-latest"],
+  };
+  const defaultReviewerAgent: LaunchTarget =
+    (remembered.reviewerAgent as LaunchTarget) ?? (agent === "pi" ? "claude" : "pi");
+  const reviewerAgentChoice = await ctx.ui.select(
+    "Reviewer runtime:",
+    highlightDefault(["pi", "claude", "codex"], defaultReviewerAgent),
+  );
+  if (!reviewerAgentChoice) return false;
+  const reviewerAgent = stripDefault(reviewerAgentChoice) as LaunchTarget;
+
+  const defaultReviewerModel = remembered.reviewerModel ?? reviewerModelDefaults[reviewerAgent][0];
+  const reviewerModelChoice = await ctx.ui.select(
+    "Reviewer model:",
+    highlightDefault(reviewerModelDefaults[reviewerAgent], defaultReviewerModel),
+  );
+  if (!reviewerModelChoice) return false;
+  const reviewerModel = stripDefault(reviewerModelChoice);
+
+  let reviewerReasoningEffort: ReasoningEffort | undefined;
+  if (reviewerAgent === "codex") {
+    const rChoice = await ctx.ui.select(
+      "Reviewer reasoning effort:",
+      highlightDefault(REASONING_EFFORTS, (remembered.reviewerReasoningEffort as string) ?? "xhigh"),
+    );
+    if (!rChoice) return false;
+    reviewerReasoningEffort = stripDefault(rChoice) as ReasoningEffort;
+  }
+
+  // Reject identical implementer/reviewer (agent, model) pairs
+  if (agent === reviewerAgent && modelChoice === reviewerModel) {
+    ctx.ui.notify(
+      "Implementer and reviewer must use different models or runtimes \u2014 pick something else for the reviewer.",
+      "error",
+    );
+    return false;
+  }
+
+  // Persist reviewer choices
+  store.setRepoConfig(repoProfile.root, {
+    reviewerAgent,
+    reviewerModel,
+    reviewerReasoningEffort,
+  });
+
   ctx.ui.notify(
-    `Launching ${agent} (${modelChoice}) in tmux…\n  branch:   ${branch}\n  worktree: ${worktreePath}`,
+    `Launching ${agent} (${modelChoice}) in tmux…\n  branch:   ${branch}\n  worktree: ${worktreePath}\n  reviewer: ${reviewerAgent} / ${reviewerModel}`,
     "info",
   );
   const result = await launchAgent(
@@ -307,6 +369,9 @@ async function runLaunchWizard(
       repoRoot: repoProfile.root,
       repoName: repoProfile.name,
       contextContent: repoProfile.contextContent,
+      reviewerTarget: reviewerAgent,
+      reviewerModel,
+      reviewerReasoningEffort,
     },
     store,
   );
@@ -343,17 +408,6 @@ const critiqueModelDefaults: Record<LaunchTarget, string[]> = {
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
   codex: ["gpt-5.5", "o3", "o4-mini", "codex-mini-latest"],
 };
-
-const REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
-
-/** Put " (default)" suffix on the matching option so the user sees the pre-selected value. */
-function highlightDefault(options: string[], defaultVal: string): string[] {
-  return options.map((o) => (o === defaultVal ? `${o} (default)` : o));
-}
-
-function stripDefault(choice: string): string {
-  return choice.replace(/ \(default\)$/, "");
-}
 
 async function runCritiqueWizard(
   store: ForgeStore,
@@ -911,59 +965,18 @@ export default function (pi: ExtensionAPI) {
         /* ignore */
       }
 
-      // Read the bundled reviewer SKILL.md inline so the model has it on
-      // turn 1 without needing to use a tool first.
-      const path = await import("node:path");
       const { fileURLToPath } = await import("node:url");
       const skillsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "skills", "forge-reviewer");
-      const skillBody = (() => {
-        try {
-          return fs.readFileSync(path.join(skillsDir, "SKILL.md"), "utf-8");
-        } catch {
-          return "";
-        }
-      })();
 
-      const truncated = diff.length > 60_000;
-      const trimmedDiff = truncated
-        ? diff.slice(0, 60_000) + "\n\n...(diff truncated for context budget; use `gh pr diff <num>` to see more)"
-        : diff;
-
-      const userMessage = [
-        `Please review PR #${prNum} in ${repo.name}.`,
-        "",
-        "## forge-reviewer skill",
-        "",
-        "Use these instructions. Companion files (severity, scoring) sit alongside this SKILL.md and you can `read` them at:",
-        `- ${path.join(skillsDir, "severity.md")}`,
-        `- ${path.join(skillsDir, "scoring.md")}`,
-        "",
-        skillBody.trim(),
-        "",
-        "## PR metadata",
-        "",
-        "```json",
-        prInfo,
-        "```",
-        "",
-        "## CI checks",
-        "",
-        "```",
-        checks,
-        "```",
-        "",
-        linkedSpec
-          ? "## Linked Forge spec\n\n```markdown\n" + linkedSpec + "\n```\n"
-          : "## Linked Forge spec\n\n(no forge spec linked to this branch \u2014 review against general engineering criteria)\n",
-        "",
-        "## Diff",
-        "",
-        "```diff",
-        trimmedDiff,
-        "```",
-        "",
-        "Now produce the review in a single ```forge-review fenced block per the skill instructions.",
-      ].join("\n");
+      const userMessage = buildReviewerPrompt({
+        prNum,
+        repoName: repo.name,
+        skillsDir,
+        prInfoJson: prInfo,
+        ciChecks: checks,
+        diff,
+        linkedSpec,
+      });
 
       pi.sendUserMessage(userMessage);
     },

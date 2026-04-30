@@ -27,7 +27,7 @@ import { fileURLToPath } from "node:url";
 import { buildPrBody, type PrBodyInput, stripFrontmatter } from "./pr-body.ts";
 import type { Phase, ProgressEvent, Snapshot } from "./progress.ts";
 import { applyEvent, emptySnapshot } from "./progress.ts";
-import type { TaskStatus } from "./store.ts";
+import type { LaunchTarget, ReasoningEffort, ReviewVerdict, TaskStatus } from "./store.ts";
 
 // ─── Node 22 preflight (only when running as entry point) ─────────────────────
 
@@ -47,6 +47,9 @@ interface SupervisorArgs {
   commitMessage: string;
   specFile: string;
   skipGit: boolean;
+  reviewerTarget?: LaunchTarget;
+  reviewerModel?: string;
+  reviewerReasoningEffort?: ReasoningEffort;
 }
 
 // ─── Pure helpers (exported for tests) ────────────────────────────────────────
@@ -264,7 +267,17 @@ async function main() {
     commitMessage,
     specFile,
     skipGit,
+    reviewerTarget,
+    reviewerModel,
+    reviewerReasoningEffort,
   } = args;
+
+  // Track SHAs and timing for meta.json
+  let baseSha: string | undefined;
+  let finalSha: string | undefined;
+  let prNumber: number | undefined;
+  let reviewVerdict: ReviewVerdict | null | undefined;
+  let reviewError: string | null | undefined;
 
   // Ensure runDir exists
   fs.mkdirSync(runDir, { recursive: true });
@@ -297,6 +310,8 @@ async function main() {
   }
 
   function writeMetaDual(): void {
+    const now = Date.now();
+    const isDone = snapshot.phase === "done" || snapshot.phase === "failed";
     const meta: Record<string, unknown> = {
       taskId,
       tmuxSession: `forge-${taskId.slice(-14)}`,
@@ -307,6 +322,17 @@ async function main() {
       status: phaseToMetaStatus(snapshot.phase),
       startedAt: new Date(snapshot.startedAt).toISOString(),
       prUrl: snapshot.prUrl,
+      ...(baseSha != null && { baseSha }),
+      ...(finalSha != null && { finalSha }),
+      ...(prNumber != null && { prNumber }),
+      ...(isDone && { endedAt: new Date(now).toISOString() }),
+      ...(isDone && { durationMs: now - snapshot.startedAt }),
+      ...(snapshot.qualityResults.length > 0 && { qualityResults: snapshot.qualityResults }),
+      ...(reviewerTarget != null && { reviewerAgent: reviewerTarget }),
+      ...(reviewerModel != null && { reviewerModel }),
+      ...(reviewerReasoningEffort != null && { reviewerReasoningEffort }),
+      ...(reviewVerdict !== undefined && { reviewVerdict }),
+      ...(reviewError !== undefined && { reviewError }),
     };
     atomicWriteJson(metaFile, meta);
   }
@@ -579,13 +605,22 @@ async function main() {
   const prBodyFile = path.join(runDir, "pr-body.md");
   let usePrBodyFile = false;
   try {
-    // Determine base ref
+    // Determine base ref and capture baseSha
     let baseRef = defaultBranch;
     try {
       execFileSync("git", ["rev-parse", "--verify", `origin/${defaultBranch}`], { cwd: worktreePath, stdio: "pipe" });
       baseRef = `origin/${defaultBranch}`;
     } catch {
       /* use defaultBranch as-is */
+    }
+    try {
+      baseSha = execFileSync("git", ["rev-parse", baseRef], {
+        cwd: worktreePath,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+    } catch {
+      /* baseSha unavailable — not fatal */
     }
 
     // Gather commits
@@ -663,6 +698,17 @@ async function main() {
     log(`⚠ PR body build failed, falling back to spec file: ${msg}`);
   }
 
+  // Capture finalSha before creating the PR
+  try {
+    finalSha = execFileSync("git", ["rev-parse", "HEAD"], {
+      cwd: worktreePath,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+  } catch {
+    /* finalSha unavailable — not fatal */
+  }
+
   const ghArgs = ["pr", "create", "--draft", "--title", specTitle, "--base", defaultBranch, "--head", branch];
   if (usePrBodyFile) {
     ghArgs.push("--body-file", prBodyFile);
@@ -677,9 +723,155 @@ async function main() {
 
   if (prUrl) {
     snapshot = { ...snapshot, prUrl };
+    // Parse PR number from URL
+    const prNumMatch = prUrl.match(/\/pull\/(\d+)$/);
+    if (prNumMatch) prNumber = parseInt(prNumMatch[1], 10);
+
     log(`✓ Draft PR: ${prUrl}`);
     emit({ t: Date.now(), type: "phase_change", from: "creating_pr", to: "done" });
     emit({ t: Date.now(), type: "stopped", exitCode: 0, reason: "completed" });
+    flushSnapshot();
+
+    // ── Reviewer ──────────────────────────────────────────────────────────
+    if (reviewerTarget && reviewerModel && prNumber) {
+      log("");
+      log("═══ REVIEWER ═══");
+      // Temporarily set status to reviewing (doesn't change snapshot phase)
+      const prevMeta = JSON.parse(fs.readFileSync(metaFile, "utf-8"));
+      prevMeta.status = "reviewing";
+      atomicWriteJson(metaFile, prevMeta);
+
+      try {
+        // Compose reviewer prompt from prefix + dynamic gh output
+        const prefixFile = path.join(runDir, "review-prompt-prefix.txt");
+        const prefix = fs.existsSync(prefixFile) ? fs.readFileSync(prefixFile, "utf-8") : "";
+
+        let prInfoJson = "{}";
+        try {
+          prInfoJson = execFileSync(
+            "gh",
+            [
+              "pr",
+              "view",
+              String(prNumber),
+              "--json",
+              "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url",
+            ],
+            { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+          ).trim();
+        } catch {
+          /* gh unavailable */
+        }
+
+        let ciChecks = "(no check status available)";
+        try {
+          ciChecks =
+            execFileSync("gh", ["pr", "checks", String(prNumber)], {
+              cwd: worktreePath,
+              encoding: "utf-8",
+              stdio: ["pipe", "pipe", "pipe"],
+            }).trim() || ciChecks;
+        } catch {
+          /* gh unavailable or no checks */
+        }
+
+        let diff = "";
+        try {
+          diff = execFileSync("gh", ["pr", "diff", String(prNumber)], {
+            cwd: worktreePath,
+            encoding: "utf-8",
+            stdio: ["pipe", "pipe", "pipe"],
+            maxBuffer: 80 * 1024 * 1024,
+          });
+          if (diff.length > 60_000) diff = diff.slice(0, 60_000);
+        } catch {
+          /* gh unavailable */
+        }
+
+        const specSnapshot = (() => {
+          const p = path.join(runDir, "spec-snapshot.md");
+          return fs.existsSync(p) ? fs.readFileSync(p, "utf-8") : "(no spec snapshot)";
+        })();
+
+        const reviewPrompt = [
+          prefix,
+          "",
+          "## PR metadata",
+          "",
+          "```json",
+          prInfoJson,
+          "```",
+          "",
+          "## CI checks",
+          "",
+          "```",
+          ciChecks,
+          "```",
+          "",
+          "## Linked Forge spec",
+          "",
+          "```markdown",
+          specSnapshot,
+          "```",
+          "",
+          "## Diff",
+          "",
+          "```diff",
+          diff,
+          "```",
+          "",
+          "Now produce the review in a single ```forge-review fenced block per the skill instructions.",
+        ].join("\n");
+
+        const reviewPromptPath = path.join(runDir, "review-prompt.txt");
+        fs.writeFileSync(reviewPromptPath, reviewPrompt, "utf-8");
+
+        log(`Running reviewer: ${reviewerTarget} / ${reviewerModel}`);
+        const { agentCommand } = await import("./launch.js");
+        const cmd = agentCommand(reviewerTarget, reviewerModel, reviewPromptPath, {
+          reasoningEffort: reviewerReasoningEffort,
+        });
+
+        const reviewResult = await runShell("bash", ["-c", cmd], { cwd: worktreePath });
+        const rawOutput = reviewResult.stdout + reviewResult.stderr;
+        fs.writeFileSync(path.join(runDir, "review-raw.md"), rawOutput, "utf-8");
+
+        if (reviewResult.code === 0) {
+          // Extract forge-review fenced block
+          const blockMatch = rawOutput.match(/```forge-review\s*\n([\s\S]*?)\n```/);
+          if (blockMatch) {
+            const block = blockMatch[1];
+            fs.writeFileSync(path.join(runDir, "review.md"), block, "utf-8");
+            const verdictMatch = block.match(/^##\s*Verdict\s*\n\s*(\S+)/m);
+            const v = verdictMatch?.[1]?.trim().toLowerCase();
+            if (v === "approve" || v === "request-changes" || v === "block") {
+              reviewVerdict = v;
+              log(`✓ Review verdict: ${v}`);
+            } else {
+              reviewVerdict = null;
+              reviewError = "verdict line missing or unrecognised";
+              log("⚠ Verdict line missing or unrecognised");
+            }
+          } else {
+            reviewVerdict = null;
+            reviewError = "no fenced forge-review block in reviewer output";
+            log("⚠ No fenced forge-review block in reviewer output");
+          }
+        } else {
+          reviewVerdict = null;
+          reviewError = `reviewer process exited with code ${reviewResult.code}`;
+          log(`⚠ Reviewer process failed (exit ${reviewResult.code})`);
+        }
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        reviewVerdict = null;
+        reviewError = `reviewer error: ${msg}`;
+        log(`⚠ Reviewer error: ${msg}`);
+      }
+
+      // Restore status to done — reviewer failure doesn't poison the run
+      writeMetaDual();
+    }
   } else {
     log("✗ PR creation failed");
     emit({ t: Date.now(), type: "phase_change", from: "creating_pr", to: "failed" });
@@ -690,9 +882,9 @@ async function main() {
       reason: "error",
       errorMessage: "PR creation failed",
     });
+    flushSnapshot();
   }
 
-  flushSnapshot();
   log(`═══ DONE: ${new Date().toISOString()} ═══`);
   process.exit(snapshot.phase === "failed" ? 1 : 0);
 }

@@ -10,7 +10,8 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ForgeStore, LaunchTarget } from "./store.js";
+import { buildReviewerPromptPrefix } from "./reviewer.js";
+import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
 
 export interface LaunchConfig {
   taskId: string;
@@ -25,6 +26,9 @@ export interface LaunchConfig {
   repoRoot: string;
   repoName: string;
   contextContent: string | null;
+  reviewerTarget: LaunchTarget;
+  reviewerModel: string;
+  reviewerReasoningEffort?: ReasoningEffort;
 }
 
 // ─── tmux utilities ───────────────────────────────────────────────────────────
@@ -129,6 +133,9 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
         commitMessage: `${conventionalCommitPrefix(config.branch)}(${config.repoName}): ${safeTitle}`,
         specFile,
         skipGit: false,
+        reviewerTarget: config.reviewerTarget,
+        reviewerModel: config.reviewerModel,
+        reviewerReasoningEffort: config.reviewerReasoningEffort,
       },
       null,
       2,
@@ -170,6 +177,11 @@ exec node --experimental-strip-types '${supervisorPath}' '${argsJsonPath}'
           .join("\n")
       : '  echo "No quality commands configured — skipping."';
 
+  // Build the reviewer agent command for the bash script
+  const reviewerCmd = agentCommand(config.reviewerTarget, config.reviewerModel, `${runDir}/review-prompt.txt`, {
+    reasoningEffort: config.reviewerReasoningEffort,
+  });
+
   return `#!/usr/bin/env bash
 # Forge runner — task: ${config.taskId}
 set -uo pipefail
@@ -179,9 +191,11 @@ WORKTREE="${config.worktreePath}"
 META_FILE="${metaFile}"
 LOG_FILE="${logFile}"
 SPEC_FILE="${specFile}"
+RUN_DIR="${runDir}"
 DEFAULT_BRANCH="${config.defaultBranch}"
 BRANCH="${config.branch}"
 QUALITY_FAILED=0
+RUN_STARTED_EPOCH=$(date +%s)
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -194,14 +208,18 @@ run_cmd() {
   return $?  # pipefail makes $? the pipeline's first nonzero exit
 }
 
-set_status() {
+set_meta_field() {
   python3 -c "
 import json, sys
 with open('$META_FILE') as f: d = json.load(f)
-d['status'] = sys.argv[1]
+key = sys.argv[1]
+val_json = sys.argv[2]
+d[key] = json.loads(val_json)
 with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
-" "$1" 2>/dev/null || true
+" "$1" "$2" 2>/dev/null || true
 }
+
+set_status() { set_meta_field "status" ""$1""; }
 
 # ── Init ──────────────────────────────────────────────────────────────────────
 
@@ -218,6 +236,10 @@ log ""
 
 cd "$WORKTREE"
 set_status "running"
+
+# Capture base SHA for run metadata
+BASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || git rev-parse HEAD)
+set_meta_field "baseSha" ""$BASE_SHA""
 
 # ── Run Agent ─────────────────────────────────────────────────────────────────
 
@@ -248,6 +270,23 @@ if [ "$QUALITY_FAILED" -ne 0 ]; then
   log "⚠  Quality checks had failures — PR will be created as draft for CI"
   set_status "quality_failed"
 fi
+
+# Write qualityResults into meta.json
+python3 -c "
+import json, os, sys
+qpath = os.path.join('${runDir}', 'quality.jsonl')
+results = []
+if os.path.exists(qpath):
+    with open(qpath) as f:
+        for line in f:
+            line = line.strip()
+            if line:
+                try: results.append(json.loads(line))
+                except: pass
+with open('$META_FILE') as f: d = json.load(f)
+d['qualityResults'] = results
+with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
+" 2>/dev/null || true
 
 # ── Verify commits & push ─────────────────────────────────────────────────────────────
 
@@ -287,6 +326,10 @@ fi
 
 log "✓ $COMMITS_AHEAD commit(s) ahead of $BASE_REF"
 git log --oneline "$BASE_REF..HEAD" 2>&1 | tee -a "$LOG_FILE" || true
+
+# Capture final SHA before pushing
+FINAL_SHA=$(git rev-parse HEAD)
+set_meta_field "finalSha" ""$FINAL_SHA""
 
 git push -u origin "$BRANCH" 2>&1 | tee -a "$LOG_FILE" || log "push failed — PR creation may fail"
 
@@ -409,19 +452,106 @@ PR_URL=$(gh pr create \\
   --base "$DEFAULT_BRANCH" \\
   --head "$BRANCH" 2>&1 | tee -a "$LOG_FILE" | grep -Eo 'https://github[^ ]+' | tail -1 || true)
 
+PR_NUMBER=""
 if [ -n "$PR_URL" ]; then
   log ""
   log "✓ Draft PR: $PR_URL"
+  PR_NUMBER=$(python3 -c "import sys, re; m = re.search(r'/pull/(\\d+)$', sys.argv[1]); print(m.group(1) if m else '')" "$PR_URL" 2>/dev/null || true)
+  ENDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
+  DURATION_MS=$(( ($(date +%s) - RUN_STARTED_EPOCH) * 1000 ))
   python3 -c "
 import json, sys
 with open('$META_FILE') as f: d = json.load(f)
 d['status'] = 'done'
 d['prUrl'] = sys.argv[1]
+d['endedAt'] = sys.argv[2]
+d['durationMs'] = int(sys.argv[3])
+pr_num = sys.argv[4]
+if pr_num: d['prNumber'] = int(pr_num)
 with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
-" "$PR_URL" 2>/dev/null || true
+" "$PR_URL" "$ENDED_AT" "$DURATION_MS" "$PR_NUMBER" 2>/dev/null || true
 else
   log "✗ PR creation failed — check log above"
   set_status "failed"
+fi
+
+# ── Reviewer ──────────────────────────────────────────────────────────────────
+
+if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
+  log ""
+  log "═══ REVIEWER ═══"
+  set_status "reviewing"
+
+  # Compose the full reviewer prompt from prefix + dynamic gh output
+  {
+    cat "$RUN_DIR/review-prompt-prefix.txt"
+    echo
+    echo "## PR metadata"
+    echo
+    echo '\`\`\`json'
+    gh pr view "$PR_NUMBER" --json number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url 2>/dev/null || echo '{}'
+    echo '\`\`\`'
+    echo
+    echo "## CI checks"
+    echo
+    echo '\`\`\`'
+    gh pr checks "$PR_NUMBER" 2>&1 || echo "(no check status available)"
+    echo '\`\`\`'
+    echo
+    echo "## Linked Forge spec"
+    echo
+    echo '\`\`\`markdown'
+    cat "$RUN_DIR/spec-snapshot.md"
+    echo '\`\`\`'
+    echo
+    echo "## Diff"
+    echo
+    echo '\`\`\`diff'
+    gh pr diff "$PR_NUMBER" 2>/dev/null | head -c 60000
+    echo '\`\`\`'
+    echo
+    echo 'Now produce the review in a single \`\`\`forge-review fenced block per the skill instructions.'
+  } > "$RUN_DIR/review-prompt.txt"
+
+  log "Running reviewer: ${config.reviewerTarget} / ${config.reviewerModel}"
+  if ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1; then
+    # Extract the forge-review fenced block and verdict
+    VERDICT=$(python3 -c "
+import re, sys, json
+raw = open(sys.argv[1]).read()
+m = re.search(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL)
+if not m:
+    sys.exit(2)
+block = m.group(1)
+open(sys.argv[2], 'w').write(block)
+verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
+verdict = verdict_match.group(1).strip().lower() if verdict_match else None
+if verdict not in ('approve', 'request-changes', 'block'):
+    verdict = None
+print(json.dumps(verdict))
+" "$RUN_DIR/review-raw.md" "$RUN_DIR/review.md" 2>/dev/null)
+    EXTRACT_EXIT=$?
+
+    if [ "$EXTRACT_EXIT" -eq 2 ]; then
+      log "⚠  No fenced forge-review block in reviewer output"
+      set_meta_field "reviewVerdict" "null"
+      set_meta_field "reviewError" '"no fenced forge-review block in reviewer output"'
+    elif [ -z "$VERDICT" ] || [ "$VERDICT" = "null" ]; then
+      log "⚠  Verdict line missing or unrecognised"
+      set_meta_field "reviewVerdict" "null"
+      set_meta_field "reviewError" '"verdict line missing or unrecognised"'
+    else
+      log "✓ Review verdict: $VERDICT"
+      set_meta_field "reviewVerdict" "$VERDICT"
+    fi
+  else
+    REVIEWER_EXIT=$?
+    log "⚠  Reviewer process failed (exit $REVIEWER_EXIT)"
+    set_meta_field "reviewVerdict" "null"
+    set_meta_field "reviewError" ""reviewer process exited with code $REVIEWER_EXIT""
+  fi
+
+  set_status "done"
 fi
 
 log ""
@@ -494,13 +624,24 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
   const prompt = buildAgentPrompt(config, store);
   fs.writeFileSync(store.getPromptFile(config.taskId), prompt, "utf-8");
 
+  // Snapshot the spec body so it's preserved alongside run artifacts
+  const runDir = store.ensureRunDir(config.taskId);
+  fs.writeFileSync(path.join(runDir, "spec-snapshot.md"), config.specContent, "utf-8");
+
+  // Write reviewer prompt prefix for the post-PR reviewer step
+  const reviewPrefix = buildReviewerPromptPrefix({
+    repoName: config.repoName,
+    skillsDir: path.join(path.dirname(fileURLToPath(import.meta.url)), "skills", "forge-reviewer"),
+  });
+  fs.writeFileSync(path.join(runDir, "review-prompt-prefix.txt"), reviewPrefix, "utf-8");
+
   // Write runner script
   const script = generateRunnerScript(config, store);
   const runnerPath = store.getRunnerScript(config.taskId);
   fs.writeFileSync(runnerPath, script, { mode: 0o755 });
 
   // Seed meta.json so bash script can update it
-  store.writeRunMeta(config.taskId, {
+  const meta: RunMeta = {
     taskId: config.taskId,
     tmuxSession,
     logFile,
@@ -510,7 +651,11 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     status: "running",
     startedAt: new Date().toISOString(),
     prUrl: null,
-  });
+    reviewerAgent: config.reviewerTarget,
+    reviewerModel: config.reviewerModel,
+    reviewerReasoningEffort: config.reviewerReasoningEffort,
+  };
+  store.writeRunMeta(config.taskId, meta);
 
   // Kill any stale session with the same name
   killTmuxSession(tmuxSession);
