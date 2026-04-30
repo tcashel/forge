@@ -1184,7 +1184,10 @@ export default function (pi: ExtensionAPI) {
         return;
       }
 
-      const options = tasks.map((t) => `[${t.status}] ${t.title}`);
+      // Include task ID so identical-titled tasks (common after retries)
+      // don't collide on options.indexOf(choice) and resolve to the
+      // wrong row.
+      const options = tasks.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
       const choice = await ctx.ui.select("Select task to launch:", options);
       if (!choice) return;
 
@@ -1370,7 +1373,10 @@ export default function (pi: ExtensionAPI) {
           task = matches[options.indexOf(choice)];
         }
       } else {
-        const options = tasks.map((t) => `[${t.status}] ${t.title}`);
+        // Include task ID so identical-titled failures (common when
+        // re-launching the same spec multiple times) don't collide on
+        // options.indexOf(choice) and resume the wrong run.
+        const options = tasks.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
         const choice = await ctx.ui.select("Pick a failed task to resume:", options);
         if (!choice) return;
         task = tasks[options.indexOf(choice)];

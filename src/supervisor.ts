@@ -479,15 +479,37 @@ async function main() {
   ];
   for (const line of bannerLines) log(line);
 
-  // Surface gh override status up-front so users see it in the log even
-  // if everything else proceeds normally.
+  // gh override pre-flight. If the user configured an override but we
+  // can't resolve it (token missing / keyring locked / account logged
+  // out), we MUST abort before the agent runs — otherwise gh falls back
+  // to whichever account is currently active and the run silently
+  // commits/creates-PRs under the wrong identity. Mirrors the launch-time
+  // check in runLaunchWizard so resume / token-expiry / hand-edited
+  // supervisor-args.json all fail safely with the same error path.
   if (ghUser || ghHost) {
     if (ghResolved.error) {
-      log(`⚠  gh override misconfigured: ${ghResolved.error}`);
-      log("   PR creation will fail unless this is fixed before then.");
-    } else {
-      log(`✓ Using gh override: ${ghUser ?? "(default user)"} @ ${ghHost ?? "github.com"}`);
+      const msg = `gh override unresolvable: ${ghResolved.error}`;
+      log(`✗ ${msg}`);
+      log("  Refusing to run — the configured account is required for this repo.");
+      log(`  Fix and re-launch (or /forge-resume) once \`gh auth status\` is healthy.`);
+      emit({
+        t: Date.now(),
+        type: "phase_change",
+        from: snapshot.phase,
+        to: "failed",
+      });
+      emit({
+        t: Date.now(),
+        type: "stopped",
+        exitCode: 1,
+        reason: "error",
+        errorMessage: msg,
+      });
+      flushSnapshot();
+      log(`═══ DONE: ${new Date().toISOString()} ═══`);
+      process.exit(1);
     }
+    log(`✓ Using gh override: ${ghUser ?? "(default user)"} @ ${ghHost ?? "github.com"}`);
   }
 
   // ── Spawn pi ────────────────────────────────────────────────────────────
