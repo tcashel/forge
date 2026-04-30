@@ -38,7 +38,10 @@ export function isJiraKey(s: string): boolean {
   return JIRA_KEY_PATTERN.test(s.trim());
 }
 
-function runAcli(args: string[], opts: { input?: string; timeoutMs?: number } = {}): { ok: true; stdout: string } | { ok: false; error: string } {
+function runAcli(
+  args: string[],
+  opts: { input?: string; timeoutMs?: number } = {},
+): { ok: true; stdout: string } | { ok: false; error: string } {
   try {
     const stdout = execSync(`acli ${args.map((a) => `"${a.replace(/"/g, '\\"')}"`).join(" ")}`, {
       encoding: "utf-8",
@@ -105,6 +108,7 @@ export function fetchTicket(key: string): JiraTicket | null {
   // always readable.
   const textResult = runAcli(["jira", "workitem", "view", key, "--fields", "summary,description"]);
   if (!textResult.ok) return null;
+  // biome-ignore lint/suspicious/noControlCharactersInRegex: stripping ANSI escapes from acli stdout requires the ESC (\x1b) control char.
   const cleaned = textResult.stdout.replace(/\x1b\[[0-9;]*m/g, "").trim();
   if (!cleaned) return null;
   return { key, summary: "", description: cleaned, url: null, raw: cleaned };
@@ -186,7 +190,11 @@ export function createTicket(req: CreateTicketRequest): CreateTicketResult | { e
 
     return { error: `Could not parse new ticket key from acli output: ${result.stdout.slice(0, 200)}` };
   } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -199,14 +207,17 @@ export function addComment(key: string, body: string): { ok: true } | { error: s
   const tmpFile = path.join(os.tmpdir(), `forge-jira-comment-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
   fs.writeFileSync(tmpFile, body, "utf-8");
   try {
-    const result = runAcli(
-      ["jira", "workitem", "comment", "create", "--key", key, "--body-file", tmpFile],
-      { timeoutMs: 20_000 },
-    );
+    const result = runAcli(["jira", "workitem", "comment", "create", "--key", key, "--body-file", tmpFile], {
+      timeoutMs: 20_000,
+    });
     if (!result.ok) return { error: `acli comment failed: ${result.error}` };
     return { ok: true };
   } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
   }
 }
 
@@ -220,14 +231,17 @@ export function updateDescription(key: string, body: string): { ok: true } | { e
   const tmpFile = path.join(os.tmpdir(), `forge-jira-update-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
   fs.writeFileSync(tmpFile, body, "utf-8");
   try {
-    const result = runAcli(
-      ["jira", "workitem", "edit", "--key", key, "--description-file", tmpFile, "--yes"],
-      { timeoutMs: 20_000 },
-    );
+    const result = runAcli(["jira", "workitem", "edit", "--key", key, "--description-file", tmpFile, "--yes"], {
+      timeoutMs: 20_000,
+    });
     if (!result.ok) return { error: `acli edit failed: ${result.error}` };
     return { ok: true };
   } finally {
-    try { fs.unlinkSync(tmpFile); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(tmpFile);
+    } catch {
+      /* ignore */
+    }
   }
 }
 

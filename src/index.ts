@@ -32,11 +32,11 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { launchCritique, type CritiqueConfig } from "./critique.js";
+import { type CritiqueConfig, launchCritique } from "./critique.js";
 import { ForgeDashboard } from "./dashboard.js";
 import * as jira from "./jira.js";
-import { launchAgent, isTmuxAvailable, isTmuxSessionAlive, attachToSession, killTmuxSession } from "./launch.js";
-import { detectRepo, getWorktrees, createWorktree, type RepoProfile } from "./repo.js";
+import { attachToSession, isTmuxAvailable, isTmuxSessionAlive, killTmuxSession, launchAgent } from "./launch.js";
+import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./repo.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
 import { ForgeStore, type LaunchTarget, type ReasoningEffort, type TaskRecord } from "./store.js";
 
@@ -432,10 +432,7 @@ async function runCritiqueWizard(
 
   // Reject identical (agent, model) pairs
   if (agentA === agentB && modelA === modelB) {
-    ctx.ui.notify(
-      "Critic A and Critic B must use different models or runtimes — pick something else for B.",
-      "error",
-    );
+    ctx.ui.notify("Critic A and Critic B must use different models or runtimes — pick something else for B.", "error");
     return false;
   }
 
@@ -547,12 +544,7 @@ export default function (pi: ExtensionAPI) {
       }
 
       await ctx.ui.custom<void>((tui, theme, _kb, done) => {
-        const dash = new ForgeDashboard(
-          theme as unknown as any,
-          tui as unknown as any,
-          store,
-          repo,
-        );
+        const dash = new ForgeDashboard(theme as unknown as any, tui as unknown as any, store, repo);
 
         dash.onClose = () => done(undefined);
 
@@ -611,10 +603,7 @@ export default function (pi: ExtensionAPI) {
               if (latestId) {
                 const meta = store.readCritiqueMeta(action.task.id, latestId);
                 if (meta?.status === "running_critics" || meta?.status === "running_synth") {
-                  ctx.ui.notify(
-                    `Critique still running — check tmux session forge-crit-${latestId}`,
-                    "info",
-                  );
+                  ctx.ui.notify(`Critique still running — check tmux session forge-crit-${latestId}`, "info");
                   break;
                 }
                 if (meta?.status === "done") {
@@ -858,9 +847,7 @@ export default function (pi: ExtensionAPI) {
     handler: async (_args, ctx) => {
       const repo = detectRepo(process.cwd());
       const allTasks = store.getTasks(repo?.root);
-      const running = allTasks.filter(
-        (t) => t.tmuxSession && isTmuxSessionAlive(t.tmuxSession),
-      );
+      const running = allTasks.filter((t) => t.tmuxSession && isTmuxSessionAlive(t.tmuxSession));
 
       if (running.length === 0) {
         ctx.ui.notify("No active tmux sessions found.", "info");
@@ -926,17 +913,21 @@ export default function (pi: ExtensionAPI) {
 
       // Read the bundled reviewer SKILL.md inline so the model has it on
       // turn 1 without needing to use a tool first.
-      const fs = await import("node:fs");
       const path = await import("node:path");
       const { fileURLToPath } = await import("node:url");
       const skillsDir = path.join(path.dirname(fileURLToPath(import.meta.url)), "skills", "forge-reviewer");
       const skillBody = (() => {
-        try { return fs.readFileSync(path.join(skillsDir, "SKILL.md"), "utf-8"); }
-        catch { return ""; }
+        try {
+          return fs.readFileSync(path.join(skillsDir, "SKILL.md"), "utf-8");
+        } catch {
+          return "";
+        }
       })();
 
       const truncated = diff.length > 60_000;
-      const trimmedDiff = truncated ? diff.slice(0, 60_000) + "\n\n...(diff truncated for context budget; use `gh pr diff <num>` to see more)" : diff;
+      const trimmedDiff = truncated
+        ? diff.slice(0, 60_000) + "\n\n...(diff truncated for context budget; use `gh pr diff <num>` to see more)"
+        : diff;
 
       const userMessage = [
         `Please review PR #${prNum} in ${repo.name}.`,
@@ -961,7 +952,9 @@ export default function (pi: ExtensionAPI) {
         checks,
         "```",
         "",
-        linkedSpec ? "## Linked Forge spec\n\n```markdown\n" + linkedSpec + "\n```\n" : "## Linked Forge spec\n\n(no forge spec linked to this branch \u2014 review against general engineering criteria)\n",
+        linkedSpec
+          ? "## Linked Forge spec\n\n```markdown\n" + linkedSpec + "\n```\n"
+          : "## Linked Forge spec\n\n(no forge spec linked to this branch \u2014 review against general engineering criteria)\n",
         "",
         "## Diff",
         "",

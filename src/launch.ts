@@ -10,12 +10,11 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import type { LaunchTarget } from "./store.js";
-import { ForgeStore } from "./store.js";
+import type { ForgeStore, LaunchTarget } from "./store.js";
 
 export interface LaunchConfig {
   taskId: string;
-  specContent: string;   // raw spec markdown (body only, no frontmatter)
+  specContent: string; // raw spec markdown (body only, no frontmatter)
   specTitle: string;
   target: LaunchTarget;
   model: string;
@@ -115,21 +114,25 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
     const supervisorPath = path.join(extDir, "supervisor.ts");
     const argsJsonPath = path.join(runDir, "supervisor-args.json");
     const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
-    const supervisorArgs = JSON.stringify({
-      taskId: config.taskId,
-      runDir,
-      promptFile,
-      worktreePath: config.worktreePath,
-      repoName: config.repoName,
-      branch: config.branch,
-      defaultBranch: config.defaultBranch,
-      qualityCommands: config.qualityCommands,
-      model: config.model,
-      specTitle: safeTitle,
-      commitMessage: `${conventionalCommitPrefix(config.branch)}(${config.repoName}): ${safeTitle}`,
-      specFile,
-      skipGit: false,
-    }, null, 2);
+    const supervisorArgs = JSON.stringify(
+      {
+        taskId: config.taskId,
+        runDir,
+        promptFile,
+        worktreePath: config.worktreePath,
+        repoName: config.repoName,
+        branch: config.branch,
+        defaultBranch: config.defaultBranch,
+        qualityCommands: config.qualityCommands,
+        model: config.model,
+        specTitle: safeTitle,
+        commitMessage: `${conventionalCommitPrefix(config.branch)}(${config.repoName}): ${safeTitle}`,
+        specFile,
+        skipGit: false,
+      },
+      null,
+      2,
+    );
     return `#!/usr/bin/env bash
 # Forge runner (pi supervisor) — task: ${config.taskId}
 set -uo pipefail

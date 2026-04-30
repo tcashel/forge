@@ -24,9 +24,7 @@ import { fileURLToPath } from "node:url";
 
 const major = parseInt(process.versions.node.split(".")[0], 10);
 if (major < 22) {
-  console.error(
-    "forge smoke test requires Node 22+; got " + process.versions.node + ". Run `nvm use 22` and retry.",
-  );
+  console.error("forge smoke test requires Node 22+; got " + process.versions.node + ". Run `nvm use 22` and retry.");
   process.exit(2);
 }
 
@@ -165,7 +163,15 @@ async function main() {
   check(fs.existsSync(progressFile), "progress.jsonl does not exist");
   if (fs.existsSync(progressFile)) {
     const lines = fs.readFileSync(progressFile, "utf-8").split("\n").filter(Boolean);
-    const events = lines.map((l) => { try { return JSON.parse(l); } catch { return null; } }).filter(Boolean);
+    const events = lines
+      .map((l) => {
+        try {
+          return JSON.parse(l);
+        } catch {
+          return null;
+        }
+      })
+      .filter(Boolean);
     const types = events.map((e: any) => e.type);
     check(types.includes("phase_change"), "progress.jsonl missing phase_change event");
     check(types.includes("usage"), "progress.jsonl missing usage event");
@@ -201,7 +207,9 @@ async function main() {
 function cleanup(dir: string): void {
   try {
     fs.rmSync(dir, { recursive: true, force: true });
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
 }
 
 main().catch((err) => {

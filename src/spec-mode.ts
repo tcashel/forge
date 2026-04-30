@@ -34,8 +34,8 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { Key } from "@mariozechner/pi-tui";
 import * as jira from "./jira.js";
 import { isTmuxAvailable } from "./launch.js";
-import { type RepoProfile } from "./repo.js";
-import { ForgeStore, type TaskRecord } from "./store.js";
+import type { RepoProfile } from "./repo.js";
+import type { ForgeStore, TaskRecord } from "./store.js";
 
 // ─── Bash allowlist for spec-mode / review-mode ───────────────────────────────
 
@@ -51,28 +51,65 @@ import { ForgeStore, type TaskRecord } from "./store.js";
  */
 const SPEC_BASH_ALLOWLIST = new Set([
   // file inspection
-  "cat", "head", "tail", "less", "more", "wc", "file",
+  "cat",
+  "head",
+  "tail",
+  "less",
+  "more",
+  "wc",
+  "file",
   // search
-  "grep", "rg", "find", "fd", "ag",
+  "grep",
+  "rg",
+  "find",
+  "fd",
+  "ag",
   // dir listing
-  "ls", "pwd", "tree", "stat",
+  "ls",
+  "pwd",
+  "tree",
+  "stat",
   // text utils
-  "echo", "printf", "tr", "cut", "sort", "uniq", "awk", "sed",
+  "echo",
+  "printf",
+  "tr",
+  "cut",
+  "sort",
+  "uniq",
+  "awk",
+  "sed",
   // env / system info
-  "uname", "whoami", "date", "uptime", "which", "type", "env",
+  "uname",
+  "whoami",
+  "date",
+  "uptime",
+  "which",
+  "type",
+  "env",
   // markdown / json
-  "jq", "yq",
+  "jq",
+  "yq",
 ]);
 
 const SPEC_GIT_ALLOWLIST = new Set([
-  "status", "log", "show", "diff", "branch", "blame", "ls-files",
-  "ls-tree", "cat-file", "rev-parse", "describe", "tag", "config",
-  "remote", "worktree",  // worktree subcommand allowed for `git worktree list` etc - not `git worktree add` (that creates dirs).
+  "status",
+  "log",
+  "show",
+  "diff",
+  "branch",
+  "blame",
+  "ls-files",
+  "ls-tree",
+  "cat-file",
+  "rev-parse",
+  "describe",
+  "tag",
+  "config",
+  "remote",
+  "worktree", // worktree subcommand allowed for `git worktree list` etc - not `git worktree add` (that creates dirs).
 ]);
 
-const SPEC_GH_ALLOWLIST = new Set([
-  "pr", "issue", "repo", "api", "auth", "browse", "label",
-]);
+const SPEC_GH_ALLOWLIST = new Set(["pr", "issue", "repo", "api", "auth", "browse", "label"]);
 
 /**
  * Decide whether a bash command may run in spec-mode. We consider only
@@ -87,9 +124,35 @@ export function checkSpecBash(command: string): string | null {
   if (!trimmed) return null;
 
   // Reject explicit writes upfront with a clearer message.
-  const banned = [/\brm\s/, /\bmv\s/, /\bcp\s/, /\bmkdir\s/, /\btouch\s/, /\bchmod\s/, /\bchown\s/, /\bln\s+-s/, /\b>\s*\S/, /\b>>\s*\S/, /\btee\s/, /\bdd\b/, /\bsudo\b/, /\bnpm\s+install/, /\bnpm\s+i\b/, /\bpnpm\s+install/, /\byarn\s+(install|add)/, /\bpip\s+install/, /\buv\s+(sync|install|add)/, /\bcargo\s+(build|install|add|run)/, /\bgo\s+(get|install|build|run)/, /\bmake\b/, /\bmvn\b/, /\bgradle\b/];
+  const banned = [
+    /\brm\s/,
+    /\bmv\s/,
+    /\bcp\s/,
+    /\bmkdir\s/,
+    /\btouch\s/,
+    /\bchmod\s/,
+    /\bchown\s/,
+    /\bln\s+-s/,
+    /\b>\s*\S/,
+    /\b>>\s*\S/,
+    /\btee\s/,
+    /\bdd\b/,
+    /\bsudo\b/,
+    /\bnpm\s+install/,
+    /\bnpm\s+i\b/,
+    /\bpnpm\s+install/,
+    /\byarn\s+(install|add)/,
+    /\bpip\s+install/,
+    /\buv\s+(sync|install|add)/,
+    /\bcargo\s+(build|install|add|run)/,
+    /\bgo\s+(get|install|build|run)/,
+    /\bmake\b/,
+    /\bmvn\b/,
+    /\bgradle\b/,
+  ];
   for (const re of banned) {
-    if (re.test(trimmed)) return `spec-mode is read-only - "${trimmed.slice(0, 60)}" looks like a mutating command. Exit spec-mode (save or cancel) before running it.`;
+    if (re.test(trimmed))
+      return `spec-mode is read-only - "${trimmed.slice(0, 60)}" looks like a mutating command. Exit spec-mode (save or cancel) before running it.`;
   }
 
   // Take the first token of the first command (before any |, ;, &&, ||).
@@ -228,11 +291,7 @@ function readSkillFile(relPath: string): string {
 function buildPlannerContext(): string {
   const skillBody = readSkillFile("forge-planner/SKILL.md");
   const dir = path.join(skillsDir(), "forge-planner");
-  const companions = [
-    path.join(dir, "research.md"),
-    path.join(dir, "schema.md"),
-    path.join(dir, "checklist.md"),
-  ];
+  const companions = [path.join(dir, "research.md"), path.join(dir, "schema.md"), path.join(dir, "checklist.md")];
 
   const repo = state.repo;
   const lines: string[] = [
@@ -276,7 +335,9 @@ function buildPlannerContext(): string {
     lines.push("");
     lines.push(`## JIRA Ticket - ${state.jiraKey}`);
     lines.push("");
-    lines.push("This is the source of truth for what the user wants. Read carefully before drafting. If anything is ambiguous or contradicts what you find in the codebase, ask the user.");
+    lines.push(
+      "This is the source of truth for what the user wants. Read carefully before drafting. If anything is ambiguous or contradicts what you find in the codebase, ask the user.",
+    );
     lines.push("");
     lines.push(state.jiraContent.slice(0, 4000));
     if (state.jiraContent.length > 4000) {
@@ -294,43 +355,63 @@ function buildPlannerContext(): string {
     lines.push(`Branch: \`${state.editingTask.branch}\``);
     if (state.editingTask.prUrl) lines.push(`Existing PR: ${state.editingTask.prUrl}`);
     lines.push("");
-    lines.push("The user is refining a saved spec. Don't rewrite from scratch unless they explicitly ask. On turn 1: read the draft, point out specific weak spots (vague criteria, undefined behavior, missing files), ask what to change.");
+    lines.push(
+      "The user is refining a saved spec. Don't rewrite from scratch unless they explicitly ask. On turn 1: read the draft, point out specific weak spots (vague criteria, undefined behavior, missing files), ask what to change.",
+    );
   }
 
   lines.push("");
   lines.push("## Working Draft File");
   lines.push("");
-  lines.push("To save tokens on long iterations, **the draft lives in a file**, not in the chat. Read and mutate this file directly with the `read`, `edit`, and `write` tools. Do NOT paste the full spec into chat - the user will read the file directly.");
+  lines.push(
+    "To save tokens on long iterations, **the draft lives in a file**, not in the chat. Read and mutate this file directly with the `read`, `edit`, and `write` tools. Do NOT paste the full spec into chat - the user will read the file directly.",
+  );
   lines.push("");
   lines.push(`**Draft path:** \`${state.draftPath ?? "(not set)"}\``);
   lines.push("");
   lines.push("Workflow on each turn:");
   lines.push("  1. If you haven't seen the current draft this turn, `read` it.");
-  lines.push("  2. Make the changes the user asked for using `edit` (preferred for surgical changes) or `write` (for full rewrites of the whole file).");
-  lines.push("  3. In your chat reply, write **a brief change summary** - 1-3 lines, like a commit message. Do NOT paste the whole spec body. Examples:");
-  lines.push("     - \"Added 2 acceptance criteria for the cache miss path; tightened the validation bullet to quote the exact ValidationError string.\"");
-  lines.push("     - \"Drafted initial spec at the path above. Research findings: <one-paragraph summary>. Open questions: <bullets>.\"");
-  lines.push("  4. The `edit` and `write` tools are restricted to the draft path; you cannot write anywhere else. If you try, the call is blocked.");
+  lines.push(
+    "  2. Make the changes the user asked for using `edit` (preferred for surgical changes) or `write` (for full rewrites of the whole file).",
+  );
+  lines.push(
+    "  3. In your chat reply, write **a brief change summary** - 1-3 lines, like a commit message. Do NOT paste the whole spec body. Examples:",
+  );
+  lines.push(
+    '     - "Added 2 acceptance criteria for the cache miss path; tightened the validation bullet to quote the exact ValidationError string."',
+  );
+  lines.push(
+    '     - "Drafted initial spec at the path above. Research findings: <one-paragraph summary>. Open questions: <bullets>."',
+  );
+  lines.push(
+    "  4. The `edit` and `write` tools are restricted to the draft path; you cannot write anywhere else. If you try, the call is blocked.",
+  );
   lines.push("");
   lines.push("## Reminders");
   lines.push("");
   lines.push("- Research before drafting. Cite exact file paths.");
   lines.push("- The draft file is the source of truth, not the chat.");
-  lines.push("- When the user is satisfied, tell them to press Alt+S or run /forge-save-spec to promote the draft to ~/.forge/specs/.");
+  lines.push(
+    "- When the user is satisfied, tell them to press Alt+S or run /forge-save-spec to promote the draft to ~/.forge/specs/.",
+  );
 
   if (state.seedCritiqueRecommendations) {
     lines.push("");
     lines.push("## Critique Recommendations");
     lines.push("");
     lines.push("An adversarial critique was run on this spec. The synthesized recommendations are below.");
-    lines.push("Use these to guide your refinement of the draft. Do NOT auto-apply them - the user will tell you how to proceed.");
+    lines.push(
+      "Use these to guide your refinement of the draft. Do NOT auto-apply them - the user will tell you how to proceed.",
+    );
     lines.push("");
     try {
       const content = fs.readFileSync(state.seedCritiqueRecommendations, "utf-8");
       lines.push(content.slice(0, 6000));
       if (content.length > 6000) {
         lines.push("");
-        lines.push(`(${content.length - 6000} more chars omitted - read the file at \`${state.seedCritiqueRecommendations}\` for the full recommendations)`);
+        lines.push(
+          `(${content.length - 6000} more chars omitted - read the file at \`${state.seedCritiqueRecommendations}\` for the full recommendations)`,
+        );
       }
     } catch {
       lines.push(`(Could not read recommendations at \`${state.seedCritiqueRecommendations}\`)`);
@@ -458,7 +539,9 @@ export async function enterSpecMode(
         state.jiraContent = [
           ticket.summary ? `Summary: ${ticket.summary}` : null,
           ticket.description ? `\nDescription:\n${ticket.description}` : null,
-        ].filter(Boolean).join("\n");
+        ]
+          .filter(Boolean)
+          .join("\n");
         state.jiraUrl = ticket.url;
       }
     }
@@ -514,17 +597,17 @@ export async function enterSpecMode(
   }
 }
 
-export function exitSpecMode(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  options: { deleteDraft?: boolean } = {},
-): void {
+export function exitSpecMode(pi: ExtensionAPI, ctx: ExtensionContext, options: { deleteDraft?: boolean } = {}): void {
   if (!state.active) return;
 
   // Optionally clean up the draft file. Default is to KEEP it so the
   // user can resume an in-progress draft (cancel != throw away).
   if (options.deleteDraft && state.draftPath) {
-    try { fs.unlinkSync(state.draftPath); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(state.draftPath);
+    } catch {
+      /* ignore */
+    }
   }
 
   state.active = false;
@@ -560,11 +643,7 @@ export function exitSpecMode(
  * Returns the saved TaskRecord, or null if the draft was empty / save
  * was cancelled.
  */
-export async function saveSpec(
-  pi: ExtensionAPI,
-  ctx: ExtensionContext,
-  store: ForgeStore,
-): Promise<TaskRecord | null> {
+export async function saveSpec(pi: ExtensionAPI, ctx: ExtensionContext, store: ForgeStore): Promise<TaskRecord | null> {
   if (!state.active) {
     ctx.ui.notify("Not in spec-mode.", "error");
     return null;
@@ -641,9 +720,7 @@ export async function saveSpec(
           state.jiraUrl = created.url ?? null;
         }
       } else if (choice?.startsWith("Link")) {
-        const linked = ctx.ui.input
-          ? await ctx.ui.input("JIRA ticket key:", { placeholder: "e.g. PROJ-123" })
-          : null;
+        const linked = ctx.ui.input ? await ctx.ui.input("JIRA ticket key:", { placeholder: "e.g. PROJ-123" }) : null;
         if (linked && jira.isJiraKey(linked.trim())) {
           const newKey = linked.trim();
           jiraKey = newKey;
@@ -722,7 +799,11 @@ export async function saveSpec(
   // The draft has been promoted; remove it from drafts/ to keep that
   // directory clean. The canonical spec lives in ~/.forge/specs/.
   if (state.draftPath) {
-    try { fs.unlinkSync(state.draftPath); } catch { /* ignore */ }
+    try {
+      fs.unlinkSync(state.draftPath);
+    } catch {
+      /* ignore */
+    }
   }
 
   // Exit spec-mode before launch (which will use full tools).
@@ -841,10 +922,7 @@ export function installSpecMode(pi: ExtensionAPI, store: ForgeStore): void {
     return {
       messages: event.messages.filter((m: any) => {
         const msg = m as { customType?: string };
-        return (
-          msg.customType !== "forge-spec-mode-context" &&
-          msg.customType !== "forge-spec-mode-banner"
-        );
+        return msg.customType !== "forge-spec-mode-context" && msg.customType !== "forge-spec-mode-banner";
       }),
     };
   });
@@ -880,10 +958,7 @@ export function installSpecMode(pi: ExtensionAPI, store: ForgeStore): void {
         return;
       }
       const draftPath = state.draftPath;
-      const choice = await ctx.ui.select("What about the working draft?", [
-        "Keep draft for later",
-        "Delete draft",
-      ]);
+      const choice = await ctx.ui.select("What about the working draft?", ["Keep draft for later", "Delete draft"]);
       const deleteDraft = choice === "Delete draft";
       exitSpecMode(pi, ctx as ExtensionContext, { deleteDraft });
       ctx.ui.notify(
@@ -936,11 +1011,13 @@ async function maybeLaunch(
     return;
   }
 
-  const repo = state.repo ?? { root: task.repoRoot, name: task.repoName } as any;
+  const repo = state.repo ?? ({ root: task.repoRoot, name: task.repoName } as any);
   // We let runLaunchWizard ask the agent / model questions. For maximum
   // smoothness later we could carry suggestedAgent/suggestedModel and
   // skip those prompts; for now keep the existing wizard.
-  const { runLaunchWizardOrFail } = await import("./index.js").catch(() => ({ runLaunchWizardOrFail: undefined as any }));
+  const { runLaunchWizardOrFail } = await import("./index.js").catch(() => ({
+    runLaunchWizardOrFail: undefined as any,
+  }));
   if (runLaunchWizardOrFail) {
     await runLaunchWizardOrFail(store, ctx as any, task, repo);
   } else {

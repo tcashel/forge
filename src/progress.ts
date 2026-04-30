@@ -14,11 +14,11 @@ export const RECENT_TOOLS_LIMIT = 5;
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export type Phase =
-  | "starting"        // supervisor booted, agent not yet spawned
-  | "agent"           // agent CLI is running (most events arrive here)
-  | "quality_check"   // post-agent quality commands running
-  | "committing"      // git add/commit/push
-  | "creating_pr"     // gh pr create
+  | "starting" // supervisor booted, agent not yet spawned
+  | "agent" // agent CLI is running (most events arrive here)
+  | "quality_check" // post-agent quality commands running
+  | "committing" // git add/commit/push
+  | "creating_pr" // gh pr create
   | "done"
   | "failed";
 
@@ -27,8 +27,8 @@ export type Health = "active" | "idle" | "stalled" | "error";
 export interface ToolActivity {
   toolCallId: string;
   toolName: string;
-  argsPreview: string;     // ≤ 80 chars, single-line
-  startedAt: number;       // epoch ms
+  argsPreview: string; // ≤ 80 chars, single-line
+  startedAt: number; // epoch ms
   endedAt: number | null;
   isError: boolean | null; // null while running
 }
@@ -39,16 +39,16 @@ export interface UsageTotals {
   cacheReadTokens: number;
   cacheWriteTokens: number;
   costUsd: number;
-  contextTokens: number;   // latest assistant message's totalTokens
+  contextTokens: number; // latest assistant message's totalTokens
   turns: number;
 }
 
-export type AlertKind = "stalled";   // future: tool_error_loop, context_bloat, runaway_turns
+export type AlertKind = "stalled"; // future: tool_error_loop, context_bloat, runaway_turns
 
 export interface Alert {
   kind: AlertKind;
-  at: number;              // epoch ms
-  message: string;         // human-readable, ≤ 160 chars
+  at: number; // epoch ms
+  message: string; // human-readable, ≤ 160 chars
 }
 
 export interface Snapshot {
@@ -61,13 +61,13 @@ export interface Snapshot {
   lastEventAt: number;
   agentPid: number | null;
   currentTool: ToolActivity | null;
-  recentTools: ToolActivity[];      // bounded to last 5, oldest → newest
+  recentTools: ToolActivity[]; // bounded to last 5, oldest → newest
   lastAssistantText: string | null; // ≤ 240 chars, single-line
   usage: UsageTotals;
-  alerts: Alert[];                  // sticky; cleared only when supervisor exits
+  alerts: Alert[]; // sticky; cleared only when supervisor exits
   qualityResults: { command: string; ok: boolean; durationMs: number }[];
   prUrl: string | null;
-  exitCode: number | null;          // null while running
+  exitCode: number | null; // null while running
   errorMessage: string | null;
 }
 
@@ -191,7 +191,7 @@ export function applyEvent(prev: Snapshot, ev: ProgressEvent): Snapshot {
       } else {
         phase = "failed";
       }
-      const health = ev.exitCode !== 0 ? "error" as Health : base.health;
+      const health = ev.exitCode !== 0 ? ("error" as Health) : base.health;
       return {
         ...base,
         phase,

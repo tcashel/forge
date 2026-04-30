@@ -1,5 +1,22 @@
 {
   "$schema": "https://biomejs.dev/schemas/2.4.13/schema.json",
+  "vcs": {
+    "enabled": true,
+    "clientKind": "git",
+    "useIgnoreFile": true
+  },
+  "files": {
+    "includes": [
+      "**/*.ts",
+      "**/*.json",
+      "!**/node_modules",
+      "!**/dist",
+      "!tests/fixtures/**",
+      "!**/*-lock.json",
+      "!**/pnpm-lock.yaml",
+      "!**/package-lock.json"
+    ]
+  },
   "assist": {
     "actions": { "source": { "organizeImports": "on" } }
   },
@@ -16,7 +33,16 @@
   "javascript": {
     "formatter": { "quoteStyle": "double", "semicolons": "always" }
   },
-  "files": {
-    "includes": ["**/*.ts", "**/*.json"]
-  }
+  "overrides": [
+    {
+      "includes": ["tests/**/*.ts"],
+      "linter": {
+        "rules": {
+          "style": {
+            "noNonNullAssertion": "off"
+          }
+        }
+      }
+    }
+  ]
 }
