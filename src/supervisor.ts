@@ -2,10 +2,6 @@
  * Forge Supervisor — structured progress tracker for pi-runtime tasks.
  *
  * Runner: `node --experimental-strip-types` from Node 22.
- *   The user's standard is `nvm use 22`. No tsx, no Node 20.
- *
- * Expected pi version: @mariozechner/pi-coding-agent >= 0.70.6
- *   (whatever is installed at the user's global npm root).
  *
  * Observed pi event stream notes (from captured fixture):
  *   - `tool_execution_start` and `tool_execution_end` carry `toolCallId`,
@@ -23,14 +19,14 @@
  *   - Migrating forge to its own GitHub repo (separate effort).
  */
 
-import { spawn, execFileSync, type ChildProcess } from "node:child_process";
+import { type ChildProcess, execFileSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { buildPrBody, type PrBodyInput, stripFrontmatter } from "./pr-body.ts";
 import type { Phase, ProgressEvent, Snapshot } from "./progress.ts";
-import { emptySnapshot, applyEvent } from "./progress.ts";
-import { buildPrBody, stripFrontmatter, type PrBodyInput } from "./pr-body.ts";
+import { applyEvent, emptySnapshot } from "./progress.ts";
 import type { TaskStatus } from "./store.ts";
 
 // ─── Node 22 preflight (only when running as entry point) ─────────────────────
@@ -99,10 +95,7 @@ export function extractGithubPrUrl(stdout: string): string | null {
   return last;
 }
 
-export function mapPiEvent(
-  piEvent: unknown,
-  ctx: { currentToolStartedAt: number | null },
-): ProgressEvent | null {
+export function mapPiEvent(piEvent: unknown, ctx: { currentToolStartedAt: number | null }): ProgressEvent | null {
   if (!piEvent || typeof piEvent !== "object") return null;
   const ev = piEvent as Record<string, unknown>;
   const t = Date.now();
@@ -250,13 +243,28 @@ async function main() {
       failSnap.phase = "failed" as any;
       failSnap.errorMessage = `Invalid supervisor args: ${e?.message ?? e}`;
       atomicWriteJson(path.join(runDir, "snapshot.json"), failSnap);
-    } catch { /* best effort */ }
+    } catch {
+      /* best effort */
+    }
     console.error(`Invalid supervisor args: ${e?.message ?? e}`);
     process.exit(2);
   }
 
-  const { taskId, runDir, promptFile, worktreePath, repoName, branch, defaultBranch,
-    qualityCommands, model, specTitle, commitMessage, specFile, skipGit } = args;
+  const {
+    taskId,
+    runDir,
+    promptFile,
+    worktreePath,
+    repoName,
+    branch,
+    defaultBranch,
+    qualityCommands,
+    model,
+    specTitle,
+    commitMessage,
+    specFile,
+    skipGit,
+  } = args;
 
   // Ensure runDir exists
   fs.mkdirSync(runDir, { recursive: true });
@@ -414,10 +422,10 @@ async function main() {
         if (usage) {
           turnCount++;
           cumulativeUsage = {
-            inputTokens: cumulativeUsage.inputTokens + (usage.input as number ?? 0),
-            outputTokens: cumulativeUsage.outputTokens + (usage.output as number ?? 0),
-            cacheReadTokens: cumulativeUsage.cacheReadTokens + (usage.cacheRead as number ?? 0),
-            cacheWriteTokens: cumulativeUsage.cacheWriteTokens + (usage.cacheWrite as number ?? 0),
+            inputTokens: cumulativeUsage.inputTokens + ((usage.input as number) ?? 0),
+            outputTokens: cumulativeUsage.outputTokens + ((usage.output as number) ?? 0),
+            cacheReadTokens: cumulativeUsage.cacheReadTokens + ((usage.cacheRead as number) ?? 0),
+            cacheWriteTokens: cumulativeUsage.cacheWriteTokens + ((usage.cacheWrite as number) ?? 0),
             costUsd: cumulativeUsage.costUsd + ((usage.cost as Record<string, number>)?.total ?? 0),
             contextTokens: (usage.totalTokens as number) ?? 0,
             turns: turnCount,
@@ -428,7 +436,9 @@ async function main() {
             turn: turnCount,
             usage: { ...cumulativeUsage },
           });
-          log(`usage: ↑${formatTokens(cumulativeUsage.inputTokens)} ↓${formatTokens(cumulativeUsage.outputTokens)} turn ${turnCount}`);
+          log(
+            `usage: ↑${formatTokens(cumulativeUsage.inputTokens)} ↓${formatTokens(cumulativeUsage.outputTokens)} turn ${turnCount}`,
+          );
         }
         return;
       }
@@ -542,7 +552,9 @@ async function main() {
   // git add + commit (suppress non-zero if nothing staged)
   try {
     execFileSync("git", ["add", "-A"], { cwd: worktreePath, stdio: "pipe" });
-  } catch { /* ignore */ }
+  } catch {
+    /* ignore */
+  }
   try {
     execFileSync("git", ["commit", "-m", commitMessage], { cwd: worktreePath, stdio: "pipe" });
     log("✓ Committed");
@@ -572,13 +584,16 @@ async function main() {
     try {
       execFileSync("git", ["rev-parse", "--verify", `origin/${defaultBranch}`], { cwd: worktreePath, stdio: "pipe" });
       baseRef = `origin/${defaultBranch}`;
-    } catch { /* use defaultBranch as-is */ }
+    } catch {
+      /* use defaultBranch as-is */
+    }
 
     // Gather commits
-    const commitLog = execFileSync(
-      "git", ["log", "--no-merges", `--format=%h %s`, `${baseRef}..HEAD`],
-      { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-    ).trim();
+    const commitLog = execFileSync("git", ["log", "--no-merges", `--format=%h %s`, `${baseRef}..HEAD`], {
+      cwd: worktreePath,
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
     const commits = commitLog
       ? commitLog.split("\n").map((line) => {
           const spaceIdx = line.indexOf(" ");
@@ -591,17 +606,20 @@ async function main() {
     let deletions: number | null = null;
     let filesChanged: number | null = null;
     try {
-      const shortstat = execFileSync(
-        "git", ["diff", "--shortstat", `${baseRef}..HEAD`],
-        { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
-      ).trim();
+      const shortstat = execFileSync("git", ["diff", "--shortstat", `${baseRef}..HEAD`], {
+        cwd: worktreePath,
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
       const sm = shortstat.match(/(\d+) files? changed(?:, (\d+) insertions?\(\+\))?(?:, (\d+) deletions?\(-\))?/);
       if (sm) {
         filesChanged = parseInt(sm[1], 10);
         if (sm[2]) additions = parseInt(sm[2], 10);
         if (sm[3]) deletions = parseInt(sm[3], 10);
       }
-    } catch { /* stats unavailable — not fatal */ }
+    } catch {
+      /* stats unavailable — not fatal */
+    }
 
     // Read spec body
     const specBody = fs.existsSync(specFile) ? fs.readFileSync(specFile, "utf-8") : "";
@@ -615,7 +633,9 @@ async function main() {
     let agentSummary: string | null = null;
     try {
       agentSummary = fs.readFileSync(agentSummaryPath, "utf-8").trim() || null;
-    } catch { /* file doesn't exist — fine */ }
+    } catch {
+      /* file doesn't exist — fine */
+    }
 
     const prBodyInput: PrBodyInput = {
       taskId,
@@ -685,9 +705,7 @@ const isEntry = process.argv[1] && path.resolve(process.argv[1]) === path.resolv
 if (isEntry) {
   const nodeMajor = parseInt(process.versions.node.split(".")[0], 10);
   if (nodeMajor < 22) {
-    console.error(
-      "forge supervisor requires Node 22+; got " + process.versions.node + ". Run `nvm use 22` and retry.",
-    );
+    console.error("forge supervisor requires Node 22+; got " + process.versions.node + ". Run `nvm use 22` and retry.");
     process.exit(2);
   }
   main().catch((err) => {

@@ -58,25 +58,26 @@ All persistent state lives under `~/.forge/`:
 
 | File | Role |
 |---|---|
-| `index.ts` | Extension entry point — registers all slash commands |
-| `dashboard.ts` | TUI mission-control view (keyboard-driven task list) |
-| `spec-mode.ts` | Conversational spec drafting with the planner skill |
-| `launch.ts` | tmux-based background agent execution and runner script generation |
-| `repo.ts` | Repo detection — stack, quality commands, worktree helpers |
-| `store.ts` | `~/.forge/` state management (index, specs, run metadata) |
-| `jira.ts` | JIRA integration via `acli` CLI |
-| `progress.ts` | Structured snapshot types and reducer (WIP — not yet wired into `launch.ts`) |
-| `supervisor.ts` | Structured progress tracker for pi-runtime tasks (WIP — not yet wired into `launch.ts`) |
-| `critique.ts` | Adversarial spec critique runner (tmux-based, parallel critics + synthesizer) |
+| `src/index.ts` | Extension entry point — registers all slash commands |
+| `src/dashboard.ts` | TUI mission-control view (keyboard-driven task list) |
+| `src/spec-mode.ts` | Conversational spec drafting with the planner skill |
+| `src/launch.ts` | tmux-based background agent execution and runner script generation |
+| `src/repo.ts` | Repo detection — stack, quality commands, worktree helpers |
+| `src/store.ts` | `~/.forge/` state management (index, specs, run metadata) |
+| `src/jira.ts` | JIRA integration via `acli` CLI |
+| `src/pr-body.ts` | PR body builder (frontmatter parsing + summary/test plan) |
+| `src/progress.ts` | Structured snapshot types and reducer (WIP — not yet wired into `launch.ts`) |
+| `src/supervisor.ts` | Structured progress tracker for pi-runtime tasks (WIP — not yet wired into `launch.ts`) |
+| `src/critique.ts` | Adversarial spec critique runner (tmux-based, parallel critics + synthesizer) |
 | `skills/forge-planner/` | Planner skill — drafts specs from ideas or JIRA tickets |
 | `skills/forge-reviewer/` | Reviewer skill — severity + scoring rubrics for PR review |
 | `skills/forge-critic/` | Critic skill — adversarial spec review with severity labels |
 | `skills/forge-synthesizer/` | Synthesizer skill — merges two critiques into recommendations |
-| `tests/` | Tests (`supervisor.test.ts`, `progress.test.ts`, fixtures) |
+| `tests/` | Tests (`pr-body.test.ts`, `progress.test.ts`, `supervisor.test.ts`, fixtures) |
 
 ## Development
 
-Edit files in place under `~/.pi/agent/extensions/forge/` — pi reloads extensions on agent restart. Run the quality gate with `npm run lint`. Run tests with `node --test --experimental-strip-types tests/*.test.ts`.
+Edit files in place under `~/.pi/agent/extensions/forge/` — pi reloads extensions on agent restart. Run the quality gate with `pnpm run lint`. Run tests with `node --test --experimental-strip-types tests/*.test.ts`.
 
 ## License
 

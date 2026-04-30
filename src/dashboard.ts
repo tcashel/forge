@@ -9,10 +9,9 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import * as fs from "node:fs";
-import type { ForgeStore, TaskRecord, TaskStatus, Snapshot } from "./store.js";
-import type { RepoProfile } from "./repo.js";
 import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
+import type { RepoProfile } from "./repo.js";
+import type { ForgeStore, Snapshot, TaskRecord, TaskStatus } from "./store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -60,7 +59,7 @@ function runGh(args: string[], opts?: { timeoutMs?: number }): Promise<{ stdout:
       resolve(result);
     };
 
-    let child;
+    let child: ReturnType<typeof spawn>;
     try {
       child = spawn("gh", args, {
         stdio: ["ignore", "pipe", "pipe"],
@@ -71,8 +70,12 @@ function runGh(args: string[], opts?: { timeoutMs?: number }): Promise<{ stdout:
       return;
     }
 
-    child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
-    child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+    child.stdout.on("data", (chunk: Buffer) => {
+      stdout += chunk.toString();
+    });
+    child.stderr.on("data", (chunk: Buffer) => {
+      stderr += chunk.toString();
+    });
     child.on("error", () => settle({ stdout: "", ok: false }));
     child.on("close", (code) => {
       void stderr; // captured for diagnostics, discarded on success
@@ -207,10 +210,14 @@ async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
     "commentsCount:(.comments|length),reviewsCount:(.reviews|length)" +
     "}]";
   const { stdout, ok } = await runGh([
-    "pr", "list",
-    "--json", "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
-    "--jq", jq,
-    "--limit", "30",
+    "pr",
+    "list",
+    "--json",
+    "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
+    "--jq",
+    jq,
+    "--limit",
+    "30",
   ]);
   if (!ok || !stdout) return [];
   try {
@@ -465,9 +472,9 @@ export class ForgeDashboard {
   private syncStatuses(): void {
     // Read meta.json for all running tasks and sync back to index
     const allRunning = this.store.getRunningTasks();
-    const repoRunning = this.store.getTasks(this.repo.root).filter(
-      (t) => t.status === "running" || t.status === "quality_check" || t.status === "creating_pr",
-    );
+    const repoRunning = this.store
+      .getTasks(this.repo.root)
+      .filter((t) => t.status === "running" || t.status === "quality_check" || t.status === "creating_pr");
     for (const task of [...allRunning, ...repoRunning]) {
       this.store.syncTaskStatus(task);
     }
@@ -500,7 +507,10 @@ export class ForgeDashboard {
       const pr = visible[this.prSelectedIdx];
       if (pr) {
         try {
-          execSync(`gh pr view ${pr.number} --web`, { stdio: "ignore", timeout: 5000 });
+          execSync(`gh pr view ${pr.number} --web`, {
+            stdio: "ignore",
+            timeout: 5000,
+          });
         } catch {
           /* no-op */
         }
@@ -520,15 +530,16 @@ export class ForgeDashboard {
 
   private drawHeader(lines: string[], width: number): void {
     const { theme } = this;
-    const spin = this.loading ? " " + theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length]) : "";
+    const spin = this.loading
+      ? " " + theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length])
+      : "";
     const left = `  ${theme.bold("⚙ FORGE")}${spin}   ${theme.fg("accent", this.repo.name)}  ${theme.fg("dim", this.repo.currentBranch)}`;
     const runningCount = this.tasks.filter(
       (t) => t.status === "running" || t.status === "quality_check" || t.status === "creating_pr",
     ).length;
     const refreshed = this.lastRefresh ? theme.fg("dim", `refreshed ${this.lastRefresh.toLocaleTimeString()}`) : "";
-    const right = runningCount > 0
-      ? `${theme.fg("warning", `${runningCount} running`)}  ${refreshed}  `
-      : `${refreshed}  `;
+    const right =
+      runningCount > 0 ? `${theme.fg("warning", `${runningCount} running`)}  ${refreshed}  ` : `${refreshed}  `;
 
     const lw = visibleWidth(left);
     const rw = visibleWidth(right);
@@ -546,7 +557,9 @@ export class ForgeDashboard {
 
     if (this.tasks.length === 0 && this.otherTasks.length === 0) {
       lines.push("");
-      lines.push(`  ${theme.fg("dim", "No tasks yet — press")} ${theme.fg("accent", "n")} ${theme.fg("dim", "to create a spec.")}`);
+      lines.push(
+        `  ${theme.fg("dim", "No tasks yet — press")} ${theme.fg("accent", "n")} ${theme.fg("dim", "to create a spec.")}`,
+      );
       lines.push("");
     } else {
       // Current repo tasks
@@ -578,7 +591,9 @@ export class ForgeDashboard {
             continue;
           }
           const age = timeAgo(m.startedAt);
-          lines.push(truncateToWidth(`    🤔 [${statusStr}] ${m.specTitle}  (${m.repoName})  ${theme.fg("dim", age)}`, width));
+          lines.push(
+            truncateToWidth(`    🤔 [${statusStr}] ${m.specTitle}  (${m.repoName})  ${theme.fg("dim", age)}`, width),
+          );
         }
       }
 
@@ -606,7 +621,9 @@ export class ForgeDashboard {
     const statusLbl = padEnd(statusLabel(theme, task.status, task.tmuxSession), 12);
     const branch = padEnd(truncateToWidth(task.branch, 30), 32);
     const when = theme.fg("dim", timeAgo(task.launchedAt ?? task.createdAt));
-    const agentLbl = task.agent ? theme.fg("dim", `${task.agent}·${(task.model ?? "").split("-").slice(-1)[0]}`) : theme.fg("dim", "draft");
+    const agentLbl = task.agent
+      ? theme.fg("dim", `${task.agent}·${(task.model ?? "").split("-").slice(-1)[0]}`)
+      : theme.fg("dim", "draft");
     const repoLbl = task.repoName !== this.repo.name ? theme.fg("dim", `  [${task.repoName}]`) : "";
 
     // Row 1: cursor icon status branch agent when
@@ -660,7 +677,13 @@ export class ForgeDashboard {
     const { theme } = this;
     const lines: string[] = [];
     const phaseIcons: Record<string, string> = {
-      starting: "○", agent: "⟳", quality_check: "✔", committing: "↑", creating_pr: "↗", done: "✓", failed: "✗",
+      starting: "○",
+      agent: "⟳",
+      quality_check: "✔",
+      committing: "↑",
+      creating_pr: "↗",
+      done: "✓",
+      failed: "✗",
     };
     const icon = phaseIcons[snap.phase] ?? "·";
     const secAgo = Math.round((Date.now() - snap.lastEventAt) / 1000);
@@ -675,9 +698,7 @@ export class ForgeDashboard {
       const out = fmtTokens(snap.usage.outputTokens);
       const badge = this.healthBadge(snap.health);
       const errs = snap.consecutiveToolErrors ?? 0;
-      const struggle = errs > 0
-        ? ` · ${theme.fg(errs >= 3 ? "error" : "warning", `${errs}✗ in a row`)}`
-        : "";
+      const struggle = errs > 0 ? ` · ${theme.fg(errs >= 3 ? "error" : "warning", `${errs}✗ in a row`)}` : "";
       const line2 = `↑${inp} ↓${out} · turn ${snap.usage.turns}${struggle} · ${secAgo}s ago · ${badge}`;
       lines.push(truncateToWidth(`       ${line2}`, width));
     } else {
@@ -690,11 +711,16 @@ export class ForgeDashboard {
   private healthBadge(health: string): string {
     const { theme } = this;
     switch (health) {
-      case "active":  return theme.fg("success", "active");
-      case "idle":    return theme.fg("dim", "idle");
-      case "stalled": return theme.fg("warning", "stalled");
-      case "error":   return theme.fg("error", "error");
-      default:        return theme.fg("dim", health);
+      case "active":
+        return theme.fg("success", "active");
+      case "idle":
+        return theme.fg("dim", "idle");
+      case "stalled":
+        return theme.fg("warning", "stalled");
+      case "error":
+        return theme.fg("error", "error");
+      default:
+        return theme.fg("dim", health);
     }
   }
 
@@ -712,16 +738,10 @@ export class ForgeDashboard {
       return truncateToWidth(`       ${theme.fg("warning", label)}`, width);
     }
     if (meta.status === "done" && !meta.viewedAt) {
-      return truncateToWidth(
-        `       ${theme.fg("accent", "🤔 critique ready · press c to review")}`,
-        width,
-      );
+      return truncateToWidth(`       ${theme.fg("accent", "🤔 critique ready · press c to review")}`, width);
     }
     if (meta.status === "failed") {
-      return truncateToWidth(
-        `       ${theme.fg("error", "🤔 critique failed · press c for details")}`,
-        width,
-      );
+      return truncateToWidth(`       ${theme.fg("error", "🤔 critique failed · press c for details")}`, width);
     }
     return null;
   }
@@ -759,7 +779,7 @@ export class ForgeDashboard {
       const msg = this.prFilterMine
         ? me
           ? `No open PRs by @${me}.`
-          : "Could not detect your gh login. Run \`gh auth status\`."
+          : "Could not detect your gh login. Run `gh auth status`."
         : "No open PRs.";
       lines.push(`  ${theme.fg("dim", msg)}`);
     } else {
@@ -767,17 +787,25 @@ export class ForgeDashboard {
       // Compute width budget: cursor(2) + #(6) + ci(2) + rv(2) + draft(7)
       //   + author(varies) + age(8) + diff(varies) + title(rest)
       const showAuthor = !this.prFilterMine;
-      const authorW = showAuthor
-        ? Math.min(
-            14,
-            Math.max(6, ...visible.map((p) => p.author.length + 1)),
-          )
-        : 0;
+      const authorW = showAuthor ? Math.min(14, Math.max(6, ...visible.map((p) => p.author.length + 1))) : 0;
       const numW = Math.max(4, ...visible.map((p) => `#${p.number}`.length));
       const ageW = 7;
       const diffW = 10;
-      const fixed = 2 /*cursor*/ + 1 + numW + 2 + 1 /*ci*/ + 1 + 1 /*rv*/ + 2 +
-        (showAuthor ? authorW + 2 : 0) + ageW + 2 + diffW + 2 + 7 /*draft tag space*/;
+      const fixed =
+        2 /*cursor*/ +
+        1 +
+        numW +
+        2 +
+        1 /*ci*/ +
+        1 +
+        1 /*rv*/ +
+        2 +
+        (showAuthor ? authorW + 2 : 0) +
+        ageW +
+        2 +
+        diffW +
+        2 +
+        7; /*draft tag space*/
       const titleW = Math.max(20, width - 2 - fixed);
 
       // Header row
@@ -816,12 +844,7 @@ export class ForgeDashboard {
         const title = selected ? theme.bold(titleStr) : titleStr;
 
         const author = showAuthor
-          ? padEnd(
-              pr.author === me
-                ? theme.fg("accent", `@${pr.author}`)
-                : theme.fg("dim", `@${pr.author}`),
-              authorW,
-            )
+          ? padEnd(pr.author === me ? theme.fg("accent", `@${pr.author}`) : theme.fg("dim", `@${pr.author}`), authorW)
           : "";
         const age = theme.fg("dim", padEnd(timeAgo(pr.updatedAt), ageW));
         const diff = padEnd(
@@ -829,20 +852,7 @@ export class ForgeDashboard {
           diffW,
         );
 
-        const row1: string[] = [
-          "  ",
-          cursor,
-          " ",
-          num,
-          "  ",
-          ci,
-          " ",
-          rv,
-          draftTag,
-          " ",
-          title,
-          "  ",
-        ];
+        const row1: string[] = ["  ", cursor, " ", num, "  ", ci, " ", rv, draftTag, " ", title, "  "];
         if (showAuthor) row1.push(author, "  ");
         row1.push(age, "  ", diff);
         lines.push(truncateToWidth(row1.join(""), width));

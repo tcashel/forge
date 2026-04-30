@@ -68,7 +68,8 @@ function detectStack(root: string): Stack {
   if (fs.existsSync(path.join(root, "Cargo.toml"))) return "rust";
   if (fs.existsSync(path.join(root, "pyproject.toml")) || fs.existsSync(path.join(root, "setup.py"))) return "python";
   // Nuxt check before generic js-ts
-  if (fs.existsSync(path.join(root, "nuxt.config.ts")) || fs.existsSync(path.join(root, "nuxt.config.js"))) return "nuxt";
+  if (fs.existsSync(path.join(root, "nuxt.config.ts")) || fs.existsSync(path.join(root, "nuxt.config.js")))
+    return "nuxt";
   if (fs.existsSync(path.join(root, "package.json"))) return "js-ts";
   return "unknown";
 }

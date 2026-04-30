@@ -1,13 +1,13 @@
-import { test } from "node:test";
 import { strict as assert } from "node:assert";
+import { test } from "node:test";
 import {
   applyEvent,
   emptySnapshot,
-  SCHEMA_VERSION,
-  RECENT_TOOLS_LIMIT,
   type ProgressEvent,
+  RECENT_TOOLS_LIMIT,
+  SCHEMA_VERSION,
   type Snapshot,
-} from "../progress.ts";
+} from "../src/progress.ts";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -119,7 +119,14 @@ test("tool_end appends to recentTools, clears currentTool, respects RECENT_TOOLS
 test("tool_end with isError sets health=error", () => {
   let s = snap({ phase: "agent" });
   s = applyEvent(s, { t: 3000, type: "tool_start", toolCallId: "tc-1", toolName: "bash", argsPreview: "fail" });
-  s = applyEvent(s, { t: 3100, type: "tool_end", toolCallId: "tc-1", toolName: "bash", isError: true, durationMs: 100 });
+  s = applyEvent(s, {
+    t: 3100,
+    type: "tool_end",
+    toolCallId: "tc-1",
+    toolName: "bash",
+    isError: true,
+    durationMs: 100,
+  });
   assert.equal(s.health, "error");
 });
 
@@ -127,7 +134,14 @@ test("tool_end with mismatched toolCallId does not clear currentTool but still a
   let s = snap({ phase: "agent" });
   s = applyEvent(s, { t: 3000, type: "tool_start", toolCallId: "tc-1", toolName: "read", argsPreview: "file.ts" });
   // End a different tool (lost start event)
-  s = applyEvent(s, { t: 3100, type: "tool_end", toolCallId: "tc-2", toolName: "bash", isError: false, durationMs: 50 });
+  s = applyEvent(s, {
+    t: 3100,
+    type: "tool_end",
+    toolCallId: "tc-2",
+    toolName: "bash",
+    isError: false,
+    durationMs: 50,
+  });
   // currentTool should still be tc-1
   assert.notEqual(s.currentTool, null);
   assert.equal(s.currentTool!.toolCallId, "tc-1");
@@ -144,12 +158,22 @@ test("assistant_text updates lastAssistantText", () => {
 
 test("usage replaces totals atomically (not additive)", () => {
   const usage1 = {
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 10,
-    cacheWriteTokens: 5, costUsd: 0.01, contextTokens: 200, turns: 1,
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheReadTokens: 10,
+    cacheWriteTokens: 5,
+    costUsd: 0.01,
+    contextTokens: 200,
+    turns: 1,
   };
   const usage2 = {
-    inputTokens: 300, outputTokens: 150, cacheReadTokens: 30,
-    cacheWriteTokens: 15, costUsd: 0.03, contextTokens: 600, turns: 3,
+    inputTokens: 300,
+    outputTokens: 150,
+    cacheReadTokens: 30,
+    cacheWriteTokens: 15,
+    costUsd: 0.03,
+    contextTokens: 600,
+    turns: 3,
   };
   let s = applyEvent(snap(), { t: 4000, type: "usage", turn: 1, usage: usage1 });
   assert.equal(s.usage.inputTokens, 100);
@@ -162,7 +186,7 @@ test("usage replaces totals atomically (not additive)", () => {
 test("alert appends and stalled sets health=stalled unless health is error", () => {
   // Sub-case 1: stalled when health is active
   const alert1 = { kind: "stalled" as const, at: 5000, message: "No events for 120s" };
-  let s = applyEvent(snap({ health: "active" }), { t: 5000, type: "alert", alert: alert1 });
+  const s = applyEvent(snap({ health: "active" }), { t: 5000, type: "alert", alert: alert1 });
   assert.equal(s.alerts.length, 1);
   assert.equal(s.health, "stalled");
 
@@ -173,7 +197,14 @@ test("alert appends and stalled sets health=stalled unless health is error", () 
   assert.equal(s2.health, "error");
 
   // Sub-case 3: a successful tool_end after error recovers health
-  const s3 = applyEvent(s2, { t: 7000, type: "tool_end", toolCallId: "tc-r", toolName: "bash", isError: false, durationMs: 10 });
+  const s3 = applyEvent(s2, {
+    t: 7000,
+    type: "tool_end",
+    toolCallId: "tc-r",
+    toolName: "bash",
+    isError: false,
+    durationMs: 10,
+  });
   assert.equal(s3.health, "active");
 });
 
@@ -201,12 +232,26 @@ test("emptySnapshot returns consecutiveToolErrors === 0", () => {
 test("tool_end isError:false after isError:true recovers health and resets counter", () => {
   let s = snap({ phase: "agent" });
   s = applyEvent(s, { t: 1000, type: "tool_start", toolCallId: "tc-1", toolName: "bash", argsPreview: "bad" });
-  s = applyEvent(s, { t: 1100, type: "tool_end", toolCallId: "tc-1", toolName: "bash", isError: true, durationMs: 100 });
+  s = applyEvent(s, {
+    t: 1100,
+    type: "tool_end",
+    toolCallId: "tc-1",
+    toolName: "bash",
+    isError: true,
+    durationMs: 100,
+  });
   assert.equal(s.health, "error");
   assert.equal(s.consecutiveToolErrors, 1);
 
   s = applyEvent(s, { t: 1200, type: "tool_start", toolCallId: "tc-2", toolName: "bash", argsPreview: "ok" });
-  s = applyEvent(s, { t: 1300, type: "tool_end", toolCallId: "tc-2", toolName: "bash", isError: false, durationMs: 100 });
+  s = applyEvent(s, {
+    t: 1300,
+    type: "tool_end",
+    toolCallId: "tc-2",
+    toolName: "bash",
+    isError: false,
+    durationMs: 100,
+  });
   assert.equal(s.health, "active");
   assert.equal(s.consecutiveToolErrors, 0);
 });
@@ -214,8 +259,21 @@ test("tool_end isError:false after isError:true recovers health and resets count
 test("three consecutive tool_end isError:true ⇒ consecutiveToolErrors === 3", () => {
   let s = snap({ phase: "agent" });
   for (let i = 0; i < 3; i++) {
-    s = applyEvent(s, { t: 1000 + i * 100, type: "tool_start", toolCallId: `tc-${i}`, toolName: "bash", argsPreview: "fail" });
-    s = applyEvent(s, { t: 1050 + i * 100, type: "tool_end", toolCallId: `tc-${i}`, toolName: "bash", isError: true, durationMs: 50 });
+    s = applyEvent(s, {
+      t: 1000 + i * 100,
+      type: "tool_start",
+      toolCallId: `tc-${i}`,
+      toolName: "bash",
+      argsPreview: "fail",
+    });
+    s = applyEvent(s, {
+      t: 1050 + i * 100,
+      type: "tool_end",
+      toolCallId: `tc-${i}`,
+      toolName: "bash",
+      isError: true,
+      durationMs: 50,
+    });
   }
   assert.equal(s.consecutiveToolErrors, 3);
   assert.equal(s.health, "error");
@@ -224,11 +282,31 @@ test("three consecutive tool_end isError:true ⇒ consecutiveToolErrors === 3", 
 test("three consecutive errors then one success ⇒ reset", () => {
   let s = snap({ phase: "agent" });
   for (let i = 0; i < 3; i++) {
-    s = applyEvent(s, { t: 1000 + i * 100, type: "tool_start", toolCallId: `tc-${i}`, toolName: "bash", argsPreview: "fail" });
-    s = applyEvent(s, { t: 1050 + i * 100, type: "tool_end", toolCallId: `tc-${i}`, toolName: "bash", isError: true, durationMs: 50 });
+    s = applyEvent(s, {
+      t: 1000 + i * 100,
+      type: "tool_start",
+      toolCallId: `tc-${i}`,
+      toolName: "bash",
+      argsPreview: "fail",
+    });
+    s = applyEvent(s, {
+      t: 1050 + i * 100,
+      type: "tool_end",
+      toolCallId: `tc-${i}`,
+      toolName: "bash",
+      isError: true,
+      durationMs: 50,
+    });
   }
   s = applyEvent(s, { t: 2000, type: "tool_start", toolCallId: "tc-ok", toolName: "bash", argsPreview: "ok" });
-  s = applyEvent(s, { t: 2050, type: "tool_end", toolCallId: "tc-ok", toolName: "bash", isError: false, durationMs: 50 });
+  s = applyEvent(s, {
+    t: 2050,
+    type: "tool_end",
+    toolCallId: "tc-ok",
+    toolName: "bash",
+    isError: false,
+    durationMs: 50,
+  });
   assert.equal(s.consecutiveToolErrors, 0);
   assert.equal(s.health, "active");
 });
@@ -236,7 +314,14 @@ test("three consecutive errors then one success ⇒ reset", () => {
 test("assistant_text after failing tool_end resets counter and recovers health", () => {
   let s = snap({ phase: "agent" });
   s = applyEvent(s, { t: 1000, type: "tool_start", toolCallId: "tc-1", toolName: "bash", argsPreview: "fail" });
-  s = applyEvent(s, { t: 1100, type: "tool_end", toolCallId: "tc-1", toolName: "bash", isError: true, durationMs: 100 });
+  s = applyEvent(s, {
+    t: 1100,
+    type: "tool_end",
+    toolCallId: "tc-1",
+    toolName: "bash",
+    isError: true,
+    durationMs: 100,
+  });
   assert.equal(s.consecutiveToolErrors, 1);
   assert.equal(s.health, "error");
 
@@ -247,8 +332,13 @@ test("assistant_text after failing tool_end resets counter and recovers health",
 
 test("usage event after stalled health recovers to active", () => {
   const usage = {
-    inputTokens: 100, outputTokens: 50, cacheReadTokens: 0,
-    cacheWriteTokens: 0, costUsd: 0.01, contextTokens: 200, turns: 1,
+    inputTokens: 100,
+    outputTokens: 50,
+    cacheReadTokens: 0,
+    cacheWriteTokens: 0,
+    costUsd: 0.01,
+    contextTokens: 200,
+    turns: 1,
   };
   let s = snap({ health: "stalled", consecutiveToolErrors: 2 });
   s = applyEvent(s, { t: 5000, type: "usage", turn: 1, usage });
@@ -258,14 +348,21 @@ test("usage event after stalled health recovers to active", () => {
 
 test("stopped with exitCode:0 does not flip active to error", () => {
   const s = applyEvent(snap({ health: "active", phase: "agent" }), {
-    t: 9000, type: "stopped", exitCode: 0, reason: "completed",
+    t: 9000,
+    type: "stopped",
+    exitCode: 0,
+    reason: "completed",
   });
   assert.equal(s.health, "active");
 });
 
 test("stopped with exitCode:2 sets health=error (terminal)", () => {
   const s = applyEvent(snap({ phase: "agent" }), {
-    t: 9000, type: "stopped", exitCode: 2, reason: "error", errorMessage: "crash",
+    t: 9000,
+    type: "stopped",
+    exitCode: 2,
+    reason: "error",
+    errorMessage: "crash",
   });
   assert.equal(s.health, "error");
 });
@@ -277,10 +374,20 @@ test("every applyEvent branch updates lastEventAt", () => {
     { t: 1003, type: "tool_start", toolCallId: "tc-1", toolName: "bash", argsPreview: "ls" },
     { t: 1004, type: "tool_end", toolCallId: "tc-1", toolName: "bash", isError: false, durationMs: 1 },
     { t: 1005, type: "assistant_text", preview: "hi" },
-    { t: 1006, type: "usage", turn: 1, usage: {
-      inputTokens: 0, outputTokens: 0, cacheReadTokens: 0,
-      cacheWriteTokens: 0, costUsd: 0, contextTokens: 0, turns: 1,
-    }},
+    {
+      t: 1006,
+      type: "usage",
+      turn: 1,
+      usage: {
+        inputTokens: 0,
+        outputTokens: 0,
+        cacheReadTokens: 0,
+        cacheWriteTokens: 0,
+        costUsd: 0,
+        contextTokens: 0,
+        turns: 1,
+      },
+    },
     { t: 1007, type: "alert", alert: { kind: "stalled", at: 1007, message: "stall" } },
     { t: 1008, type: "stopped", exitCode: 0, reason: "completed" },
   ];

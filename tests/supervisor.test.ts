@@ -1,16 +1,16 @@
-import { test } from "node:test";
 import { strict as assert } from "node:assert";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { test } from "node:test";
 import { fileURLToPath } from "node:url";
 import {
-  formatArgsPreview,
   extractGithubPrUrl,
+  formatArgsPreview,
+  formatTokens,
   mapPiEvent,
   phaseToMetaStatus,
-  formatTokens,
-} from "../supervisor.ts";
+} from "../src/supervisor.ts";
 
 const __dirname = path.dirname(fileURLToPath(import.meta.url));
 

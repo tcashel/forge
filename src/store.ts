@@ -10,16 +10,18 @@ import * as os from "node:os";
 import * as path from "node:path";
 import type { Snapshot } from "./progress.js";
 
-export type { Snapshot, ProgressEvent, Phase, Health, ToolActivity, UsageTotals, Alert, AlertKind } from "./progress.js";
+export type {
+  Alert,
+  AlertKind,
+  Health,
+  Phase,
+  ProgressEvent,
+  Snapshot,
+  ToolActivity,
+  UsageTotals,
+} from "./progress.js";
 
-export type TaskStatus =
-  | "draft"
-  | "running"
-  | "quality_check"
-  | "creating_pr"
-  | "done"
-  | "failed"
-  | "quality_failed";
+export type TaskStatus = "draft" | "running" | "quality_check" | "creating_pr" | "done" | "failed" | "quality_failed";
 
 export type LaunchTarget = "pi" | "claude" | "codex";
 
