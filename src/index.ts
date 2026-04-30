@@ -37,15 +37,7 @@ import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-age
 import { type CritiqueConfig, launchCritique } from "./core/critique.js";
 import { listGhAccounts, resolveGhEnv } from "./core/gh.js";
 import * as jira from "./core/jira.js";
-import {
-  attachToSession,
-  isTmuxAvailable,
-  isTmuxSessionAlive,
-  killTmuxSession,
-  launchAgent,
-  type ResumeFrom,
-  resumeAgentRun,
-} from "./core/launch.js";
+import { attachToSession, isTmuxAvailable, isTmuxSessionAlive, killTmuxSession, launchAgent } from "./core/launch.js";
 import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./core/repo.js";
 import { buildReviewerPrompt } from "./core/reviewer.js";
 import { ForgeStore, type LaunchTarget, type ReasoningEffort, type RepoConfig, type TaskRecord } from "./core/store.js";
@@ -213,13 +205,12 @@ async function runLaunchWizard(
   const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
 
   // 1. Choose agent
-  const agentChoice = await ctx.ui.select("Agent runtime:", ["pi", "claude", "codex"]);
+  const agentChoice = await ctx.ui.select("Agent runtime:", ["claude", "codex"]);
   if (!agentChoice) return false;
   const agent = agentChoice as LaunchTarget;
 
   // 2. Choose model (sensible defaults per agent)
   const modelDefaults: Record<LaunchTarget, string[]> = {
-    pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
     claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
     codex: ["o3", "o4-mini", "codex-mini-latest"],
   };
@@ -315,15 +306,14 @@ async function runLaunchWizard(
   // 4. Choose reviewer agent, model, reasoning effort
   const remembered = store.getRepoConfig(repoProfile.root);
   const reviewerModelDefaults: Record<LaunchTarget, string[]> = {
-    pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
     claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
     codex: ["o3", "o4-mini", "codex-mini-latest"],
   };
   const defaultReviewerAgent: LaunchTarget =
-    (remembered.reviewerAgent as LaunchTarget) ?? (agent === "pi" ? "claude" : "pi");
+    (remembered.reviewerAgent as LaunchTarget) ?? (agent === "claude" ? "codex" : "claude");
   const reviewerAgentChoice = await ctx.ui.select(
     "Reviewer runtime:",
-    highlightDefault(["pi", "claude", "codex"], defaultReviewerAgent),
+    highlightDefault(["claude", "codex"], defaultReviewerAgent),
   );
   if (!reviewerAgentChoice) return false;
   const reviewerAgent = stripDefault(reviewerAgentChoice) as LaunchTarget;
@@ -447,7 +437,6 @@ async function runLaunchWizard(
 // ─── Critique wizard ───────────────────────────────────────────────────────────
 
 const critiqueModelDefaults: Record<LaunchTarget, string[]> = {
-  pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
   codex: ["gpt-5.5", "o3", "o4-mini", "codex-mini-latest"],
 };
@@ -480,7 +469,7 @@ async function runCritiqueWizard(
   // ── Critic A ─────────────────────────────────────────────────────────────
   const agentAChoice = await ctx.ui.select(
     "Critic A runtime:",
-    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentA as string) ?? "pi"),
+    highlightDefault(["claude", "codex"], (remembered.critiqueAgentA as string) ?? "claude"),
   );
   if (!agentAChoice) return false;
   const agentA = stripDefault(agentAChoice) as LaunchTarget;
@@ -505,7 +494,7 @@ async function runCritiqueWizard(
   // ── Critic B ─────────────────────────────────────────────────────────────
   const agentBChoice = await ctx.ui.select(
     "Critic B runtime:",
-    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentB as string) ?? "codex"),
+    highlightDefault(["claude", "codex"], (remembered.critiqueAgentB as string) ?? "codex"),
   );
   if (!agentBChoice) return false;
   const agentB = stripDefault(agentBChoice) as LaunchTarget;
@@ -536,7 +525,7 @@ async function runCritiqueWizard(
   // ── Synthesizer ──────────────────────────────────────────────────────────
   const agentSynthChoice = await ctx.ui.select(
     "Synthesizer runtime:",
-    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentSynth as string) ?? "pi"),
+    highlightDefault(["claude", "codex"], (remembered.critiqueAgentSynth as string) ?? "claude"),
   );
   if (!agentSynthChoice) return false;
   const agentSynth = stripDefault(agentSynthChoice) as LaunchTarget;
@@ -607,154 +596,10 @@ async function runCritiqueWizard(
 }
 
 // ─── Resume wizard ───────────────────────────────────────────────────────────────────────────
-//
-// Resume a failed pi-runtime task from a chosen post-agent phase.
-// Reads the existing meta.json to render a status summary so the user
-// can see exactly what's already done, then offers the resume points
-// that make sense given that state (e.g. "reviewer only" only appears
-// when a PR already exists).
-
-async function runResumeWizard(
-  store: ForgeStore,
-  ctx: {
-    ui: {
-      select: (p: string, o: string[]) => Promise<string | null>;
-      input?: (p: string, o?: object) => Promise<string | null>;
-      notify: (m: string, t: string) => void;
-      confirm: (title: string, msg: string) => Promise<boolean>;
-    };
-  },
-  task: TaskRecord,
-): Promise<boolean> {
-  if (task.agent !== "pi") {
-    ctx.ui.notify(
-      `Resume currently supports pi-runtime tasks only. This task ran on ${task.agent}.\nFollow-up: synthesize supervisor-args.json from meta.json so claude/codex resume can reuse the same path.`,
-      "error",
-    );
-    return false;
-  }
-  const runDir = store.ensureRunDir(task.id);
-  const argsPath = path.join(runDir, "supervisor-args.json");
-  if (!fs.existsSync(argsPath)) {
-    ctx.ui.notify(
-      "No supervisor-args.json on disk — the run dir was deleted, or this task pre-dates resume support.",
-      "error",
-    );
-    return false;
-  }
-
-  // Build state summary from meta.json (with snapshot.json fallback for
-  // older runs that pre-date the meta.errorMessage fix).
-  const meta = (store.readRunMeta(task.id) ?? {}) as Record<string, unknown>;
-  const snap = store.readSnapshot(task.id);
-  const qualityResults = (meta.qualityResults as { command: string; ok: boolean }[] | undefined) ?? [];
-  const qualityAllOk = qualityResults.length > 0 && qualityResults.every((r) => r.ok);
-  const qualityAnyFail = qualityResults.some((r) => !r.ok);
-  const finalSha = (meta.finalSha as string | undefined) ?? null;
-  const prUrl = (meta.prUrl as string | undefined) ?? null;
-  const prNumber = (meta.prNumber as number | undefined) ?? null;
-  const reviewVerdict = (meta.reviewVerdict as string | null | undefined) ?? null;
-  const errorMessage = (meta.errorMessage as string | undefined) ?? snap?.errorMessage ?? null;
-
-  const fmt = (label: string, ok: boolean | null, detail: string) => {
-    const icon = ok === true ? "✓" : ok === false ? "✗" : "·";
-    return `  ${icon} ${label.padEnd(12)} ${detail}`;
-  };
-  const summary = [
-    `Resume "${task.title}"`,
-    `  branch: ${task.branch}`,
-    `  worktree: ${meta.worktree ?? task.worktree ?? "(unknown)"}`,
-    "",
-    "Pipeline state:",
-    fmt("agent", true, `— ran in the original launch (we never re-run the agent on resume)`),
-    fmt(
-      "quality",
-      qualityResults.length === 0 ? null : qualityAllOk ? true : false,
-      qualityResults.length === 0
-        ? "— no results recorded"
-        : `${qualityResults.length} check(s)${
-            qualityAnyFail
-              ? `, ${qualityResults
-                  .filter((r) => !r.ok)
-                  .map((r) => r.command)
-                  .join(", ")} failed`
-              : ", all passed"
-          }`,
-    ),
-    fmt("commits", finalSha != null, finalSha != null ? `head: ${finalSha.slice(0, 7)}` : "(no finalSha recorded)"),
-    fmt("pr", prUrl != null, prUrl != null ? `${prUrl}${prNumber != null ? ` (#${prNumber})` : ""}` : "(not created)"),
-    fmt(
-      "review",
-      reviewVerdict != null && reviewVerdict !== "null" ? true : null,
-      reviewVerdict != null && reviewVerdict !== "null" ? `verdict: ${reviewVerdict}` : "(no verdict)",
-    ),
-    "",
-    errorMessage ? `Last error: ${errorMessage.slice(0, 200)}` : "",
-  ]
-    .filter((line) => line !== "")
-    .join("\n");
-
-  ctx.ui.notify(summary, "info");
-
-  // Offer resume points based on what's already done.
-  type Option = { label: string; resumeFrom: ResumeFrom };
-  const options: Option[] = [];
-  options.push({
-    label: "Re-run quality checks → commit & push → PR → review",
-    resumeFrom: "quality_check",
-  });
-  options.push({
-    label: "Skip quality → commit & push → PR → review",
-    resumeFrom: "committing",
-  });
-  options.push({
-    label: "Skip to PR creation (commits already pushed) → review",
-    resumeFrom: "creating_pr",
-  });
-  if (prUrl != null && prNumber != null) {
-    options.push({
-      label: "Run reviewer only (PR exists, no commits/push needed)",
-      resumeFrom: "reviewing",
-    });
-  }
-
-  const choice = await ctx.ui.select(
-    "Resume from:",
-    options.map((o) => o.label),
-  );
-  if (!choice) return false;
-  const picked = options.find((o) => o.label === choice);
-  if (!picked) return false;
-
-  const repoConfig = store.getRepoConfig(task.repoRoot);
-  const result = await resumeAgentRun(
-    {
-      taskId: task.id,
-      resumeFrom: picked.resumeFrom,
-      ghUser: repoConfig.ghUser,
-      ghHost: repoConfig.ghHost,
-    },
-    store,
-  );
-  if (result.error) {
-    ctx.ui.notify(`Resume failed: ${result.error}`, "error");
-    return false;
-  }
-
-  // Move the task back into a running state so the dashboard reflects it.
-  store.upsertTask({
-    ...task,
-    status: "running",
-    tmuxSession: result.tmuxSession,
-    completedAt: null,
-  });
-
-  ctx.ui.notify(
-    `✓ Resumed in tmux session "${result.tmuxSession}" (from ${picked.resumeFrom}).\n  Attach: tmux attach -t ${result.tmuxSession}`,
-    "success",
-  );
-  return true;
-}
+// Resume support deleted with the pi-runtime supervisor. The pi
+// extension's `/forge-resume` command and dashboard "resume" action are
+// stubbed out below until the bash runner gains the structured state
+// capture needed to resume claude/codex tasks.
 
 // ─── Settings wizard ────────────────────────────────────────────────────────
 //
@@ -1076,9 +921,10 @@ export default function (pi: ExtensionAPI) {
               break;
             }
             case "resume": {
-              await runResumeWizard(store, ctx as any, action.task);
-              dash.invalidate();
-              tui.requestRender();
+              ctx.ui.notify(
+                "Resume disabled — supervisor was removed with the pi runtime. Re-launch the spec instead.",
+                "error",
+              );
               break;
             }
           }
@@ -1331,61 +1177,9 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  // ── /forge-resume — resume a failed task from a chosen post-agent phase ────────────────────
-  //
-  // The most common failure mode is `gh pr create` blowing up *after* the
-  // agent succeeded — 5 commits and a green test suite, but no PR. Re-running
-  // the whole task wastes the agent's tokens and time. Resume reuses the
-  // existing run dir and lets you pick which phase to restart from.
-
-  pi.registerCommand("forge-resume", {
-    description: "Resume a failed Forge task from a chosen phase (skip the agent, re-run quality / push / PR / review)",
-    handler: async (args, ctx) => {
-      const repo = detectRepo(process.cwd());
-      if (!repo) {
-        ctx.ui.notify("Not in a git repository.", "error");
-        return;
-      }
-      const arg = (typeof args === "string" ? args : Array.isArray(args) ? args.join(" ") : "").trim();
-
-      // Resume is only useful for failed/quality_failed tasks. Filter to those.
-      const tasks = store.getTasks(repo.root).filter((t) => t.status === "failed" || t.status === "quality_failed");
-      if (tasks.length === 0) {
-        ctx.ui.notify("No failed tasks to resume.", "info");
-        return;
-      }
-
-      let task: TaskRecord | undefined;
-      if (arg) {
-        const lower = arg.toLowerCase();
-        const matches = tasks.filter(
-          (t) => t.id === arg || t.id.includes(lower) || t.title.toLowerCase().includes(lower),
-        );
-        if (matches.length === 1) {
-          task = matches[0];
-        } else if (matches.length === 0) {
-          ctx.ui.notify(`No failed task matched "${arg}".`, "error");
-          return;
-        } else {
-          const options = matches.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
-          const choice = await ctx.ui.select("Multiple matches — pick one:", options);
-          if (!choice) return;
-          task = matches[options.indexOf(choice)];
-        }
-      } else {
-        // Include task ID so identical-titled failures (common when
-        // re-launching the same spec multiple times) don't collide on
-        // options.indexOf(choice) and resume the wrong run.
-        const options = tasks.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
-        const choice = await ctx.ui.select("Pick a failed task to resume:", options);
-        if (!choice) return;
-        task = tasks[options.indexOf(choice)];
-      }
-      if (!task) return;
-
-      await runResumeWizard(store, ctx as any, task);
-    },
-  });
+  // /forge-resume removed — supervisor was deleted with the pi runtime.
+  // Phase 6 deletes this whole file; until then, the command is gone and
+  // the dashboard "resume" action returns a "Resume disabled" notify.
 
   // ── /forge-settings — view/edit per-repo settings ────────────────────────
   //

@@ -34,7 +34,7 @@ const EFFORT_KEYS = [
   "critiqueReasoningSynth",
 ] as const;
 
-const VALID_AGENTS: LaunchTarget[] = ["pi", "claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 type ConfigKey = (typeof STRING_KEYS)[number] | (typeof AGENT_KEYS)[number] | (typeof EFFORT_KEYS)[number];

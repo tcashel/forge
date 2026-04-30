@@ -118,52 +118,7 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const extDir = path.dirname(fileURLToPath(import.meta.url));
   const prBodyTsPath = path.join(extDir, "pr-body.ts");
 
-  // ── pi runtime: supervisor-based runner ──────────────────────────────
-  if (config.target === "pi") {
-    const supervisorPath = path.join(extDir, "..", "supervisor.ts");
-    const argsJsonPath = path.join(runDir, "supervisor-args.json");
-    const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
-    const supervisorArgs = JSON.stringify(
-      {
-        taskId: config.taskId,
-        runDir,
-        promptFile,
-        worktreePath: config.worktreePath,
-        repoName: config.repoName,
-        branch: config.branch,
-        defaultBranch: config.defaultBranch,
-        qualityCommands: config.qualityCommands,
-        model: config.model,
-        specTitle: safeTitle,
-        commitMessage: `${conventionalCommitPrefix(config.branch)}(${config.repoName}): ${safeTitle}`,
-        specFile,
-        skipGit: false,
-        reviewerTarget: config.reviewerTarget,
-        reviewerModel: config.reviewerModel,
-        reviewerReasoningEffort: config.reviewerReasoningEffort,
-        ghUser: config.ghUser,
-        ghHost: config.ghHost,
-      },
-      null,
-      2,
-    );
-    return `#!/usr/bin/env bash
-# Forge runner (pi supervisor) — task: ${config.taskId}
-set -uo pipefail
-
-LOG_FILE="${logFile}"
-mkdir -p "$(dirname "$LOG_FILE")"
-: > "$LOG_FILE"
-
-cat > '${argsJsonPath}' << 'FORGE_SUPERVISOR_ARGS_EOF'
-${supervisorArgs}
-FORGE_SUPERVISOR_ARGS_EOF
-
-exec node --experimental-strip-types '${supervisorPath}' '${argsJsonPath}'
-`;
-  }
-
-  // ── claude / codex: existing bash runner (byte-identical) ────────────
+  // ── claude / codex bash runner ──────────────────────────────
   const agentCmd = agentCommand(config.target, config.model, promptFile);
   // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
   // because long titles render badly in GitHub's PR list.
@@ -623,110 +578,10 @@ export interface LaunchResult {
   error: string | null;
 }
 
-// ─── Resume API ──────────────────────────────────────────────────────────────────
-//
-// Re-launches the supervisor in resume mode for a previously-failed run.
-// Reuses the existing supervisor-args.json + runDir so per-task state
-// (baseSha, qualityResults, prUrl, etc.) carries forward. The agent.log
-// is appended to (not truncated) so the resume attempt's output is
-// stitched onto the original failure trace — you can read both in one
-// place.
-//
-// Pi-runtime only for v1: the bash runner used for claude/codex doesn't
-// write a supervisor-args.json, so resuming claude/codex tasks would
-// require synthesizing one. Deferred to a follow-up.
-
-export type ResumeFrom = "quality_check" | "committing" | "creating_pr" | "reviewing";
-
-export interface ResumeConfig {
-  taskId: string;
-  resumeFrom: ResumeFrom;
-  /** Optional: refresh per-repo gh override at resume time (in case the user just changed /forge-settings). */
-  ghUser?: string;
-  ghHost?: string;
-}
-
-export async function resumeAgentRun(config: ResumeConfig, store: ForgeStore): Promise<LaunchResult> {
-  const runDir = store.ensureRunDir(config.taskId);
-  const argsPath = path.join(runDir, "supervisor-args.json");
-  const logFile = store.getLogFile(config.taskId);
-  const tmuxSession = tmuxSessionName(config.taskId);
-
-  if (!fs.existsSync(argsPath)) {
-    return {
-      tmuxSession,
-      logFile,
-      error:
-        "No supervisor-args.json on disk — this task wasn't launched with the pi runtime, or the run dir was deleted. Resume currently supports pi-runtime tasks only.",
-    };
-  }
-
-  // Patch supervisor-args.json with resumeFrom + (optionally) refreshed gh override.
-  let original: Record<string, unknown>;
-  try {
-    original = JSON.parse(fs.readFileSync(argsPath, "utf-8"));
-  } catch (e: unknown) {
-    return {
-      tmuxSession,
-      logFile,
-      error: `supervisor-args.json is unreadable: ${e instanceof Error ? e.message : String(e)}`,
-    };
-  }
-  original.resumeFrom = config.resumeFrom;
-  // Always overwrite gh override fields so clearing /forge-settings
-  // actually clears them on resume. JSON.stringify drops undefined
-  // values, so writing `undefined` here removes the key from the
-  // persisted file — next read sees no override, which is what we
-  // want when the user has cleared the setting.
-  original.ghUser = config.ghUser;
-  original.ghHost = config.ghHost;
-  fs.writeFileSync(argsPath, `${JSON.stringify(original, null, 2)}\n`, "utf-8");
-
-  // Generate a tiny resume wrapper that appends to the log instead of
-  // truncating, then execs the supervisor. (The original run.sh
-  // truncates with `: > "$LOG_FILE"` which would erase the failed
-  // run's history.)
-  const extDir = path.dirname(fileURLToPath(import.meta.url));
-  const supervisorPath = path.join(extDir, "supervisor.ts");
-  const resumeRunnerPath = path.join(runDir, "run-resume.sh");
-  const worktreePath = String(original.worktreePath ?? "");
-  const banner = `=== RESUMING from ${config.resumeFrom} at $(date -u +%Y-%m-%dT%H:%M:%SZ) ===`;
-  const resumeScript = `#!/usr/bin/env bash
-# Forge resume runner — task: ${config.taskId}, resumeFrom: ${config.resumeFrom}
-set -uo pipefail
-
-LOG_FILE="${logFile}"
-mkdir -p "$(dirname "$LOG_FILE")"
-# Append (not truncate) so the original failure trace is preserved.
-{
-  echo ""
-  echo "${banner}"
-  echo ""
-} >> "$LOG_FILE"
-
-exec node --experimental-strip-types '${supervisorPath}' '${argsPath}'
-`;
-  fs.writeFileSync(resumeRunnerPath, resumeScript, { mode: 0o755 });
-
-  // Kill any stale session with the same name and re-create.
-  killTmuxSession(tmuxSession);
-  if (!isTmuxAvailable()) {
-    return { tmuxSession, logFile, error: "tmux not found — install with: brew install tmux" };
-  }
-  try {
-    execSync(
-      `tmux new-session -d -s "${tmuxSession}" -c "${worktreePath}" "bash '${resumeRunnerPath}'; read -p 'Press Enter to close...' "`,
-      { stdio: "pipe" },
-    );
-    await new Promise((r) => setTimeout(r, 500));
-    if (!isTmuxSessionAlive(tmuxSession)) {
-      return { tmuxSession, logFile, error: "tmux session died immediately — check resume runner script" };
-    }
-    return { tmuxSession, logFile, error: null };
-  } catch (e: any) {
-    return { tmuxSession, logFile, error: `Failed to start tmux: ${e.message ?? e}` };
-  }
-}
+// Resume support deleted with the pi-runtime supervisor — claude/codex
+// runs don't carry a supervisor-args.json, so resume can't repoint at
+// them without first synthesizing one. Re-add later if and when the bash
+// runner gains structured state capture.
 
 export async function launchAgent(config: LaunchConfig, store: ForgeStore): Promise<LaunchResult> {
   const tmuxSession = tmuxSessionName(config.taskId);

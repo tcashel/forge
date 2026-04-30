@@ -25,7 +25,7 @@ import { createWorktree, detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
-const VALID_AGENTS: LaunchTarget[] = ["pi", "claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 function asAgent(v: unknown, field: string): LaunchTarget {
