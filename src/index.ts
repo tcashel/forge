@@ -18,6 +18,7 @@
  *   /forge-launch      Launch an agent on an existing spec.
  *   /forge-attach      Attach to a running task's tmux session.
  *   /forge-review <n>  Review PR #n with the bundled forge-reviewer skill.
+ *   /forge-settings    View / edit per-repo settings (gh user, gh host, …).
  *   /forge-status      Show task status summary in chat.
  *
  * Bundled skills (loaded via package.json's pi.skills entry):
@@ -28,18 +29,19 @@
  * Works in any git repo — no per-repo config required.
  */
 
-import { execSync, spawn } from "node:child_process";
+import { execFileSync, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { type CritiqueConfig, launchCritique } from "./critique.js";
 import { ForgeDashboard } from "./dashboard.js";
+import { listGhAccounts, resolveGhEnv } from "./gh.js";
 import * as jira from "./jira.js";
 import { attachToSession, isTmuxAvailable, isTmuxSessionAlive, killTmuxSession, launchAgent } from "./launch.js";
 import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./repo.js";
 import { buildReviewerPrompt } from "./reviewer.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
-import { ForgeStore, type LaunchTarget, type ReasoningEffort, type TaskRecord } from "./store.js";
+import { ForgeStore, type LaunchTarget, type ReasoningEffort, type RepoConfig, type TaskRecord } from "./store.js";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -208,8 +210,8 @@ async function runLaunchWizard(
 
   // 2. Choose model (sensible defaults per agent)
   const modelDefaults: Record<LaunchTarget, string[]> = {
-    pi: ["claude-opus-4-6", "claude-sonnet-4-6", "gemini-2.5-pro", "claude-haiku-4-5"],
-    claude: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
+    claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
     codex: ["o3", "o4-mini", "codex-mini-latest"],
   };
   const modelChoice = await ctx.ui.select("Model:", modelDefaults[agent]);
@@ -304,8 +306,8 @@ async function runLaunchWizard(
   // 4. Choose reviewer agent, model, reasoning effort
   const remembered = store.getRepoConfig(repoProfile.root);
   const reviewerModelDefaults: Record<LaunchTarget, string[]> = {
-    pi: ["claude-opus-4-6", "claude-sonnet-4-6", "gemini-2.5-pro", "claude-haiku-4-5"],
-    claude: ["claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+    pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
+    claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
     codex: ["o3", "o4-mini", "codex-mini-latest"],
   };
   const defaultReviewerAgent: LaunchTarget =
@@ -351,6 +353,36 @@ async function runLaunchWizard(
     reviewerReasoningEffort,
   });
 
+  // Pre-flight: if a per-repo gh override is configured, validate it now
+  // so we fail fast instead of running for 20 minutes only to hit
+  // "Could not resolve to a Repository" at PR creation time.
+  if (remembered.ghUser || remembered.ghHost) {
+    const probe = resolveGhEnv({ user: remembered.ghUser, host: remembered.ghHost });
+    if (probe.error) {
+      ctx.ui.notify(
+        `gh override is misconfigured — not launching:\n${probe.error}\n\nRun /forge-settings to fix.`,
+        "error",
+      );
+      return false;
+    }
+    // Sanity-check the configured account can actually see the repo.
+    try {
+      execFileSync("gh", ["repo", "view", "--json", "name"], {
+        cwd: repoProfile.root,
+        stdio: ["pipe", "pipe", "pipe"],
+        env: { ...process.env, ...probe.env },
+      });
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      const firstLine = msg.split("\n").find((l) => l.trim()) ?? msg;
+      ctx.ui.notify(
+        `gh override (${remembered.ghUser ?? "default user"} @ ${remembered.ghHost ?? "github.com"}) cannot access this repo:\n${firstLine}\n\nRun /forge-settings to change the account.`,
+        "error",
+      );
+      return false;
+    }
+  }
+
   ctx.ui.notify(
     `Launching ${agent} (${modelChoice}) in tmux…\n  branch:   ${branch}\n  worktree: ${worktreePath}\n  reviewer: ${reviewerAgent} / ${reviewerModel}`,
     "info",
@@ -372,6 +404,8 @@ async function runLaunchWizard(
       reviewerTarget: reviewerAgent,
       reviewerModel,
       reviewerReasoningEffort,
+      ghUser: remembered.ghUser,
+      ghHost: remembered.ghHost,
     },
     store,
   );
@@ -404,7 +438,7 @@ async function runLaunchWizard(
 // ─── Critique wizard ───────────────────────────────────────────────────────────
 
 const critiqueModelDefaults: Record<LaunchTarget, string[]> = {
-  pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-2.5-pro", "claude-haiku-4-5"],
+  pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-3.1-pro", "claude-haiku-4-5"],
   claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
   codex: ["gpt-5.5", "o3", "o4-mini", "codex-mini-latest"],
 };
@@ -561,6 +595,147 @@ async function runCritiqueWizard(
     "success",
   );
   return true;
+}
+
+// ─── Settings wizard ────────────────────────────────────────────────────────
+//
+// Per-repo settings live in ~/.forge/repo-config.json keyed by absolute repo
+// root. The wizard exposes the fields that are useful to set explicitly
+// (mostly gh account/host — the originator of this feature). Reviewer and
+// critic preferences are remembered automatically by their respective
+// wizards, so they're shown read-only here for visibility.
+
+const CLEAR_SENTINEL = "— clear (use gh default) —";
+const CUSTOM_SENTINEL = "— enter custom… —";
+
+async function editGhUser(
+  ctx: {
+    ui: {
+      select: (p: string, o: string[]) => Promise<string | null>;
+      input?: (p: string, o?: object) => Promise<string | null>;
+      notify: (m: string, t: string) => void;
+    };
+  },
+  current: string | undefined,
+  host: string,
+): Promise<{ updated: boolean; value: string | undefined }> {
+  const accounts = listGhAccounts(host);
+  const options = [...accounts.map((a) => `${a.user}${a.active ? " (active)" : ""}`), CUSTOM_SENTINEL, CLEAR_SENTINEL];
+  const prompt = current
+    ? `gh user (currently "${current}"). Pick one:`
+    : "gh user (currently using gh's active account). Pick one:";
+  const choice = await ctx.ui.select(prompt, options);
+  if (!choice) return { updated: false, value: current };
+  if (choice === CLEAR_SENTINEL) return { updated: true, value: undefined };
+  if (choice === CUSTOM_SENTINEL) {
+    if (!ctx.ui.input) return { updated: false, value: current };
+    const typed = await ctx.ui.input("gh user:", { value: current ?? "" });
+    if (typed === null) return { updated: false, value: current };
+    const trimmed = typed.trim();
+    return { updated: true, value: trimmed || undefined };
+  }
+  // Strip trailing " (active)" suffix if present.
+  const user = choice.replace(/ \(active\)$/, "");
+  return { updated: true, value: user };
+}
+
+async function editGhHost(
+  ctx: {
+    ui: {
+      select: (p: string, o: string[]) => Promise<string | null>;
+      input?: (p: string, o?: object) => Promise<string | null>;
+      notify: (m: string, t: string) => void;
+    };
+  },
+  current: string | undefined,
+): Promise<{ updated: boolean; value: string | undefined }> {
+  if (!ctx.ui.input) return { updated: false, value: current };
+  const typed = await ctx.ui.input("gh host (e.g. github.com or github.example.com). Empty to clear:", {
+    value: current ?? "",
+  });
+  if (typed === null) return { updated: false, value: current };
+  const trimmed = typed.trim();
+  return { updated: true, value: trimmed || undefined };
+}
+
+async function runSettingsWizard(
+  store: ForgeStore,
+  ctx: {
+    ui: {
+      select: (p: string, o: string[]) => Promise<string | null>;
+      input?: (p: string, o?: object) => Promise<string | null>;
+      notify: (m: string, t: string) => void;
+    };
+  },
+  repo: RepoProfile,
+): Promise<void> {
+  while (true) {
+    const cfg = store.getRepoConfig(repo.root);
+    const ghHost = cfg.ghHost ?? "github.com";
+
+    // Live status of the gh override so the user can see if it's broken.
+    let ghStatus = "";
+    if (cfg.ghUser || cfg.ghHost) {
+      const probe = resolveGhEnv({ user: cfg.ghUser, host: cfg.ghHost });
+      ghStatus = probe.error ? "  ✖ broken" : "  ✓ ok";
+    }
+
+    const fmt = (label: string, value: string | undefined, hint?: string) =>
+      `${label}: ${value ?? "(default)"}${hint ? `  — ${hint}` : ""}`;
+
+    const items = [
+      fmt("gh user", cfg.ghUser, "GitHub CLI account used for PRs") + ghStatus,
+      fmt("gh host", cfg.ghHost, "defaults to github.com"),
+      fmt(
+        "reviewer",
+        cfg.reviewerAgent ? `${cfg.reviewerAgent} / ${cfg.reviewerModel ?? "?"}` : undefined,
+        "set automatically by /forge-launch",
+      ),
+      fmt(
+        "critic A",
+        cfg.critiqueAgentA ? `${cfg.critiqueAgentA} / ${cfg.critiqueModelA ?? "?"}` : undefined,
+        "set automatically by /forge-critique",
+      ),
+      fmt(
+        "critic B",
+        cfg.critiqueAgentB ? `${cfg.critiqueAgentB} / ${cfg.critiqueModelB ?? "?"}` : undefined,
+        "set automatically by /forge-critique",
+      ),
+      fmt("jira project", cfg.jiraProject, "set automatically by /forge-spec"),
+      "── done ──",
+    ];
+
+    const choice = await ctx.ui.select(`Settings for ${repo.name} (${repo.root})`, items);
+    if (!choice || choice === items[items.length - 1]) return;
+
+    if (choice.startsWith("gh user:")) {
+      const result = await editGhUser(ctx, cfg.ghUser, ghHost);
+      if (!result.updated) continue;
+      const patch: Partial<RepoConfig> = { ghUser: result.value };
+      store.setRepoConfig(repo.root, patch);
+      // Validate the new value if non-empty.
+      if (result.value) {
+        const probe = resolveGhEnv({ user: result.value, host: cfg.ghHost });
+        if (probe.error) {
+          ctx.ui.notify(`⚠ ${probe.error}`, "warning");
+        } else {
+          ctx.ui.notify(`✓ gh user set to "${result.value}"`, "success");
+        }
+      } else {
+        ctx.ui.notify("gh user cleared (will use gh's active account).", "info");
+      }
+      continue;
+    }
+    if (choice.startsWith("gh host:")) {
+      const result = await editGhHost(ctx, cfg.ghHost);
+      if (!result.updated) continue;
+      store.setRepoConfig(repo.root, { ghHost: result.value });
+      ctx.ui.notify(result.value ? `✓ gh host set to "${result.value}"` : "gh host cleared.", "success");
+      continue;
+    }
+    // Read-only fields just close the inner loop
+    ctx.ui.notify("Read-only here — set automatically by the relevant wizard.", "info");
+  }
 }
 
 /** Open a file in the user's preferred viewer (or system default). */
@@ -733,6 +908,12 @@ export default function (pi: ExtensionAPI) {
                 editingTask: action.task,
                 seedCritiqueRecommendations: store.getRecommendationsFile(action.task.id, action.critiqueId),
               });
+              break;
+            }
+            case "settings": {
+              await runSettingsWizard(store, ctx as any, repo);
+              dash.invalidate();
+              tui.requestRender();
               break;
             }
           }
@@ -979,6 +1160,24 @@ export default function (pi: ExtensionAPI) {
       });
 
       pi.sendUserMessage(userMessage);
+    },
+  });
+
+  // ── /forge-settings — view/edit per-repo settings ────────────────────────
+  //
+  // Stored in ~/.forge/repo-config.json keyed by repo root. Useful for
+  // making things like "which gh account does forge use here" explicit
+  // per repo, instead of relying on gh's global active-account state.
+
+  pi.registerCommand("forge-settings", {
+    description: "View / edit per-repo Forge settings (gh account, host, …)",
+    handler: async (_args, ctx) => {
+      const repo = detectRepo(process.cwd());
+      if (!repo) {
+        ctx.ui.notify("Not in a git repository.", "error");
+        return;
+      }
+      await runSettingsWizard(store, ctx as any, repo);
     },
   });
 

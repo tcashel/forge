@@ -10,6 +10,7 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { bashGhEnvExport } from "./gh.js";
 import { buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
 
@@ -29,6 +30,10 @@ export interface LaunchConfig {
   reviewerTarget: LaunchTarget;
   reviewerModel: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  /** Per-repo gh account override (see gh.ts). Falls back to gh's active account. */
+  ghUser?: string;
+  /** Per-repo gh host override. Falls back to github.com. */
+  ghHost?: string;
 }
 
 // ─── tmux utilities ───────────────────────────────────────────────────────────
@@ -136,6 +141,8 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
         reviewerTarget: config.reviewerTarget,
         reviewerModel: config.reviewerModel,
         reviewerReasoningEffort: config.reviewerReasoningEffort,
+        ghUser: config.ghUser,
+        ghHost: config.ghHost,
       },
       null,
       2,
@@ -237,6 +244,7 @@ log ""
 cd "$WORKTREE"
 set_status "running"
 
+${bashGhEnvExport({ user: config.ghUser, host: config.ghHost })}
 # Capture base SHA for run metadata
 BASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || git rev-parse HEAD)
 set_meta_field "baseSha" ""$BASE_SHA""

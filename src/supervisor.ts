@@ -24,6 +24,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { resolveGhEnv } from "./gh.ts";
 import { buildPrBody, type PrBodyInput, stripFrontmatter } from "./pr-body.ts";
 import type { Phase, ProgressEvent, Snapshot } from "./progress.ts";
 import { applyEvent, emptySnapshot } from "./progress.ts";
@@ -50,6 +51,10 @@ interface SupervisorArgs {
   reviewerTarget?: LaunchTarget;
   reviewerModel?: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  /** Per-repo gh account override (see gh.ts). */
+  ghUser?: string;
+  /** Per-repo gh host override. */
+  ghHost?: string;
 }
 
 // ─── Pure helpers (exported for tests) ────────────────────────────────────────
@@ -208,13 +213,14 @@ function logLine(msg: string): string {
 function runShell(
   cmd: string,
   args: string[],
-  opts: { cwd: string; shell?: boolean },
+  opts: { cwd: string; shell?: boolean; env?: NodeJS.ProcessEnv },
 ): Promise<{ code: number; stdout: string; stderr: string }> {
   return new Promise((resolve) => {
     const proc = spawn(cmd, args, {
       cwd: opts.cwd,
       shell: opts.shell ?? false,
       stdio: ["ignore", "pipe", "pipe"],
+      env: opts.env ?? process.env,
     });
     let stdout = "";
     let stderr = "";
@@ -270,7 +276,17 @@ async function main() {
     reviewerTarget,
     reviewerModel,
     reviewerReasoningEffort,
+    ghUser,
+    ghHost,
   } = args;
+
+  // Resolve gh env once. If the override is misconfigured we still let the
+  // agent run — the user will at least get the agent's work in commits —
+  // but we record the resolution failure so PR creation surfaces it loudly
+  // instead of failing with a swallowed gh stderr (the original bug that
+  // motivated the per-repo settings feature).
+  const ghResolved = resolveGhEnv({ user: ghUser, host: ghHost });
+  const ghEnv: NodeJS.ProcessEnv = { ...process.env, ...ghResolved.env };
 
   // Track SHAs and timing for meta.json
   let baseSha: string | undefined;
@@ -369,6 +385,17 @@ async function main() {
     "",
   ];
   for (const line of bannerLines) log(line);
+
+  // Surface gh override status up-front so users see it in the log even
+  // if everything else proceeds normally.
+  if (ghUser || ghHost) {
+    if (ghResolved.error) {
+      log(`⚠  gh override misconfigured: ${ghResolved.error}`);
+      log("   PR creation will fail unless this is fixed before then.");
+    } else {
+      log(`✓ Using gh override: ${ghUser ?? "(default user)"} @ ${ghHost ?? "github.com"}`);
+    }
+  }
 
   // ── Spawn pi ────────────────────────────────────────────────────────────
 
@@ -718,7 +745,7 @@ async function main() {
     ghArgs.push("--body", `Forge task ${taskId}`);
   }
 
-  const prResult = await runShell("gh", ghArgs, { cwd: worktreePath });
+  const prResult = await runShell("gh", ghArgs, { cwd: worktreePath, env: ghEnv });
   const prUrl = extractGithubPrUrl(prResult.stdout + "\n" + prResult.stderr);
 
   if (prUrl) {
@@ -757,7 +784,7 @@ async function main() {
               "--json",
               "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url",
             ],
-            { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] },
+            { cwd: worktreePath, encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"], env: ghEnv },
           ).trim();
         } catch {
           /* gh unavailable */
@@ -770,6 +797,7 @@ async function main() {
               cwd: worktreePath,
               encoding: "utf-8",
               stdio: ["pipe", "pipe", "pipe"],
+              env: ghEnv,
             }).trim() || ciChecks;
         } catch {
           /* gh unavailable or no checks */
@@ -782,6 +810,7 @@ async function main() {
             encoding: "utf-8",
             stdio: ["pipe", "pipe", "pipe"],
             maxBuffer: 80 * 1024 * 1024,
+            env: ghEnv,
           });
           if (diff.length > 60_000) diff = diff.slice(0, 60_000);
         } catch {
@@ -832,7 +861,7 @@ async function main() {
           reasoningEffort: reviewerReasoningEffort,
         });
 
-        const reviewResult = await runShell("bash", ["-c", cmd], { cwd: worktreePath });
+        const reviewResult = await runShell("bash", ["-c", cmd], { cwd: worktreePath, env: ghEnv });
         const rawOutput = reviewResult.stdout + reviewResult.stderr;
         fs.writeFileSync(path.join(runDir, "review-raw.md"), rawOutput, "utf-8");
 
@@ -873,14 +902,54 @@ async function main() {
       writeMetaDual();
     }
   } else {
-    log("✗ PR creation failed");
+    // Capture full gh stdout/stderr so the user can see *why* the PR
+    // creation failed without rerunning gh by hand. The previous
+    // implementation logged "✗ PR creation failed" with no detail —
+    // see ~/.forge/runs/<task>/agent.log for the empty trace this fixes.
+    const errorLog = path.join(runDir, "pr-create-error.log");
+    const cmdLine = `gh ${ghArgs.map((a) => (/[\s'"]/.test(a) ? `'${a.replace(/'/g, "'\\''")}'` : a)).join(" ")}`;
+    const errorBody = [
+      `# gh pr create failed`,
+      `# command:    ${cmdLine}`,
+      `# cwd:        ${worktreePath}`,
+      `# exit code:  ${prResult.code}`,
+      ghUser || ghHost ? `# gh override: ${ghUser ?? "(default user)"} @ ${ghHost ?? "github.com"}` : "",
+      ghResolved.error ? `# gh resolve error: ${ghResolved.error}` : "",
+      "",
+      "---- stdout ----",
+      prResult.stdout || "(empty)",
+      "",
+      "---- stderr ----",
+      prResult.stderr || "(empty)",
+      "",
+    ]
+      .filter((line) => line !== "")
+      .join("\n");
+    try {
+      fs.writeFileSync(errorLog, errorBody, "utf-8");
+    } catch {
+      /* best-effort */
+    }
+
+    // First non-empty line of stderr (then stdout) is usually the most
+    // useful summary — e.g. "Could not resolve to a Repository...".
+    const firstLine =
+      (prResult.stderr || prResult.stdout || "")
+        .split("\n")
+        .map((s) => s.trim())
+        .find(Boolean) ?? `gh pr create exited ${prResult.code}`;
+    const summary = ghResolved.error ?? firstLine.slice(0, 240);
+
+    log(`✗ PR creation failed: ${summary}`);
+    log(`  Full output: ${errorLog}`);
+
     emit({ t: Date.now(), type: "phase_change", from: "creating_pr", to: "failed" });
     emit({
       t: Date.now(),
       type: "stopped",
       exitCode: 1,
       reason: "error",
-      errorMessage: "PR creation failed",
+      errorMessage: `PR creation failed: ${summary}`,
     });
     flushSnapshot();
   }
