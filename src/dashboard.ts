@@ -284,6 +284,7 @@ export type DashboardAction =
   | { type: "view_critique"; task: TaskRecord; critiqueId: string }
   | { type: "discuss_critique"; task: TaskRecord; critiqueId: string }
   | { type: "settings" }
+  | { type: "resume"; task: TaskRecord }
   | { type: "close" };
 
 export class ForgeDashboard {
@@ -364,6 +365,14 @@ export class ForgeDashboard {
     } else if (data === "K") {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "kill", task });
+    } else if (data === "R") {
+      // Capital R — resume a failed task. Lowercase r is reserved for
+      // refresh below; using a different binding keeps the muscle
+      // memory clear.
+      const task = allTasks[this.selectedIdx];
+      if (task && (task.status === "failed" || task.status === "quality_failed")) {
+        this.onAction({ type: "resume", task });
+      }
     } else if (matchesKey(data, "c")) {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "run_critique", task });
@@ -964,11 +973,13 @@ export class ForgeDashboard {
 
     const canEdit = !!selected;
     const canCritique = !!(selected?.specFile && fs.existsSync(selected.specFile));
+    const canResume = selected?.status === "failed" || selected?.status === "quality_failed";
     const parts = [
       `[${theme.fg("accent", "n")}] New spec`,
       canEdit ? `[${theme.fg("accent", "e")}] Edit spec` : "",
       canView ? `[${theme.fg("accent", "v")}] View spec` : "",
       canLaunch ? `[${theme.fg("accent", "l")}] Launch` : "",
+      canResume ? `[${theme.fg("accent", "R")}] Resume` : "",
       canCritique ? `[${theme.fg("accent", "c")}] Critique` : "",
       canAttach ? `[${theme.fg("accent", "↵")}] Attach` : "",
       canKill ? `[${theme.fg("error", "K")}] Kill` : "",
