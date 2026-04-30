@@ -6,6 +6,8 @@
  */
 
 import { execSync, spawn } from "node:child_process";
+import * as fs from "node:fs";
+import * as path from "node:path";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
 import * as fs from "node:fs";
 import type { ForgeStore, TaskRecord, TaskStatus, Snapshot } from "./store.js";
@@ -267,6 +269,7 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export type DashboardAction =
   | { type: "new_spec" }
   | { type: "edit_spec"; task: TaskRecord }
+  | { type: "view_spec"; task: TaskRecord }
   | { type: "launch"; task: TaskRecord }
   | { type: "attach"; task: TaskRecord }
   | { type: "kill"; task: TaskRecord }
@@ -337,6 +340,11 @@ export class ForgeDashboard {
       // Re-enter spec-mode pre-loaded with this task's saved spec.
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "edit_spec", task });
+    } else if (matchesKey(data, "v")) {
+      const task = allTasks[this.selectedIdx];
+      if (task && fs.existsSync(this.resolveSpecPath(task))) {
+        this.onAction({ type: "view_spec", task });
+      }
     } else if (matchesKey(data, "l")) {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "launch", task });
@@ -876,6 +884,12 @@ export class ForgeDashboard {
     );
   }
 
+  // ── Helpers ──────────────────────────────────────────────────────────────────
+
+  resolveSpecPath(task: TaskRecord): string {
+    return task.specFile || path.join(this.store.specsDir, `${task.id}.md`);
+  }
+
   // ── Drawing: Action bar ──────────────────────────────────────────────────────
 
   private drawActionBar(lines: string[], width: number, selected: TaskRecord | undefined): void {
@@ -883,12 +897,14 @@ export class ForgeDashboard {
     const canAttach = selected?.tmuxSession && isTmuxSessionAlive(selected.tmuxSession);
     const canLaunch = selected?.status === "draft" || selected?.status === "failed";
     const canKill = selected?.tmuxSession && isTmuxSessionAlive(selected.tmuxSession);
+    const canView = selected && fs.existsSync(this.resolveSpecPath(selected));
 
     const canEdit = !!selected;
     const canCritique = !!(selected?.specFile && fs.existsSync(selected.specFile));
     const parts = [
       `[${theme.fg("accent", "n")}] New spec`,
       canEdit ? `[${theme.fg("accent", "e")}] Edit spec` : "",
+      canView ? `[${theme.fg("accent", "v")}] View spec` : "",
       canLaunch ? `[${theme.fg("accent", "l")}] Launch` : "",
       canCritique ? `[${theme.fg("accent", "c")}] Critique` : "",
       canAttach ? `[${theme.fg("accent", "↵")}] Attach` : "",

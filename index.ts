@@ -50,6 +50,45 @@ function sh(cmd: string, cwd?: string): string {
   }
 }
 
+function openSpecInViewer(specFile: string, ctx: ExtensionContext): void {
+  if (!fs.existsSync(specFile)) {
+    ctx.ui.notify(`Spec file not found: ${specFile}`, "error");
+    return;
+  }
+
+  const envViewer = process.env.FORGE_SPEC_VIEWER;
+  let cmd: string;
+  let args: string[];
+
+  if (envViewer) {
+    cmd = envViewer;
+    args = [specFile];
+  } else if (process.platform === "darwin") {
+    cmd = "open";
+    args = [specFile];
+  } else if (process.platform === "linux") {
+    cmd = "xdg-open";
+    args = [specFile];
+  } else if (process.platform === "win32") {
+    cmd = "cmd";
+    args = ["/c", "start", "", specFile];
+  } else {
+    ctx.ui.notify(
+      "No spec viewer available \u2014 set $FORGE_SPEC_VIEWER (e.g. 'zed') or run on macOS/Linux/Windows.",
+      "error",
+    );
+    return;
+  }
+
+  try {
+    const child = spawn(cmd, args, { detached: true, stdio: "ignore" });
+    child.on("error", (err) => ctx.ui.notify(`Could not launch viewer "${cmd}": ${err.message}`, "error"));
+    child.unref();
+  } catch (err: unknown) {
+    ctx.ui.notify(`Could not launch viewer "${cmd}": ${err instanceof Error ? err.message : String(err)}`, "error");
+  }
+}
+
 // ─── Spec entry ────────────────────────────────────────────────────────────────────
 
 /**
@@ -543,6 +582,13 @@ export default function (pi: ExtensionAPI) {
               // Small delay then attach — gives pi TUI time to restore terminal
               await new Promise((r) => setTimeout(r, 300));
               attachToSession(session);
+              break;
+            }
+            case "view_spec": {
+              const specPath = dash.resolveSpecPath(action.task);
+              openSpecInViewer(specPath, ctx as ExtensionContext);
+              dash.invalidate();
+              tui.requestRender();
               break;
             }
             case "kill": {
