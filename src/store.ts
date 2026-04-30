@@ -58,6 +58,31 @@ export interface ForgeIndex {
  */
 export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 
+export type ReviewVerdict = "approve" | "request-changes" | "block";
+
+export interface RunMeta {
+  taskId: string;
+  tmuxSession: string;
+  logFile: string;
+  agent: LaunchTarget;
+  model: string;
+  worktree: string;
+  status: TaskStatus | "reviewing";
+  startedAt: string;
+  prUrl: string | null;
+  endedAt?: string;
+  durationMs?: number;
+  baseSha?: string;
+  finalSha?: string;
+  prNumber?: number;
+  qualityResults?: { command: string; ok: boolean; durationMs: number }[];
+  reviewerAgent?: LaunchTarget;
+  reviewerModel?: string;
+  reviewerReasoningEffort?: ReasoningEffort;
+  reviewVerdict?: ReviewVerdict | null;
+  reviewError?: string | null;
+}
+
 export interface RepoConfig {
   jiraProject?: string;
   jiraType?: string;
@@ -70,6 +95,9 @@ export interface RepoConfig {
   critiqueAgentSynth?: string;
   critiqueModelSynth?: string;
   critiqueReasoningSynth?: ReasoningEffort;
+  reviewerAgent?: LaunchTarget;
+  reviewerModel?: string;
+  reviewerReasoningEffort?: ReasoningEffort;
 }
 
 export interface RepoConfigFile {
@@ -225,7 +253,7 @@ export class ForgeStore {
     }
   }
 
-  writeRunMeta(taskId: string, meta: Record<string, unknown>): void {
+  writeRunMeta(taskId: string, meta: RunMeta): void {
     const p = path.join(this.runsDir, taskId, "meta.json");
     fs.writeFileSync(p, JSON.stringify(meta, null, 2) + "\n", "utf-8");
   }
