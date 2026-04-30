@@ -730,6 +730,13 @@ async function main() {
 
   // ── Draft PR ────────────────────────────────────────────────────────────
 
+  // Hoisted out of `if (!skipPrCreate)` because the post-block check at
+  // `if (prCreationFailed)` reads it unconditionally; declaring it inside
+  // the block crashed every successful PR-creation path with a
+  // ReferenceError. Initialised to false so resume paths that skip PR
+  // creation entirely (e.g. resume-from "reviewing") see a defined value.
+  let prCreationFailed = false;
+
   if (!skipPrCreate) {
     if (snapshot.phase !== "creating_pr") {
       emit({ t: Date.now(), type: "phase_change", from: snapshot.phase, to: "creating_pr" });
@@ -739,7 +746,6 @@ async function main() {
     // ── Build structured PR body ──────────────────────────────────────────
     const prBodyFile = path.join(runDir, "pr-body.md");
     let usePrBodyFile = false;
-    let prCreationFailed = false;
     try {
       // Determine base ref and capture baseSha
       let baseRef = defaultBranch;
