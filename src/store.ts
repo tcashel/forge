@@ -8,6 +8,8 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { atomicWriteJSON, atomicWriteText } from "./atomic-write.js";
+import { withFileLock } from "./file-lock.js";
 import type { Snapshot } from "./progress.js";
 
 export type {
@@ -168,7 +170,7 @@ export class ForgeStore {
   }
 
   private writeRepoConfigFile(file: RepoConfigFile): void {
-    fs.writeFileSync(this.repoConfigFile, JSON.stringify(file, null, 2) + "\n", "utf-8");
+    atomicWriteJSON(this.repoConfigFile, file);
   }
 
   getRepoConfig(repoRoot: string): RepoConfig {
@@ -176,9 +178,11 @@ export class ForgeStore {
   }
 
   setRepoConfig(repoRoot: string, patch: Partial<RepoConfig>): void {
-    const file = this.readRepoConfigFile();
-    file.repos[repoRoot] = { ...(file.repos[repoRoot] ?? {}), ...patch };
-    this.writeRepoConfigFile(file);
+    withFileLock(`${this.repoConfigFile}.lock`, () => {
+      const file = this.readRepoConfigFile();
+      file.repos[repoRoot] = { ...(file.repos[repoRoot] ?? {}), ...patch };
+      this.writeRepoConfigFile(file);
+    });
   }
 
   readIndex(): ForgeIndex {
@@ -191,7 +195,7 @@ export class ForgeStore {
   }
 
   writeIndex(index: ForgeIndex): void {
-    fs.writeFileSync(this.indexFile, JSON.stringify(index, null, 2) + "\n", "utf-8");
+    atomicWriteJSON(this.indexFile, index);
   }
 
   getTask(id: string): TaskRecord | null {
@@ -199,9 +203,11 @@ export class ForgeStore {
   }
 
   upsertTask(task: TaskRecord): void {
-    const index = this.readIndex();
-    index.tasks[task.id] = task;
-    this.writeIndex(index);
+    withFileLock(`${this.indexFile}.lock`, () => {
+      const index = this.readIndex();
+      index.tasks[task.id] = task;
+      this.writeIndex(index);
+    });
   }
 
   getTasks(repoRoot?: string): TaskRecord[] {
@@ -226,7 +232,7 @@ export class ForgeStore {
 
   writeSpec(taskId: string, content: string): string {
     const p = path.join(this.specsDir, `${taskId}.md`);
-    fs.writeFileSync(p, content, "utf-8");
+    atomicWriteText(p, content);
     return p;
   }
 
@@ -260,7 +266,7 @@ export class ForgeStore {
 
   writeRunMeta(taskId: string, meta: RunMeta): void {
     const p = path.join(this.runsDir, taskId, "meta.json");
-    fs.writeFileSync(p, JSON.stringify(meta, null, 2) + "\n", "utf-8");
+    atomicWriteJSON(p, meta);
   }
 
   /** Read meta.json status and sync back to index if changed. Returns updated task or null. */
@@ -373,7 +379,7 @@ export class ForgeStore {
   writeCritiqueMeta(taskId: string, critiqueId: string, meta: CritiqueMeta): void {
     const dir = this.getCritiqueDir(taskId, critiqueId);
     fs.mkdirSync(dir, { recursive: true });
-    fs.writeFileSync(path.join(dir, "critique-meta.json"), JSON.stringify(meta, null, 2) + "\n", "utf-8");
+    atomicWriteJSON(path.join(dir, "critique-meta.json"), meta);
   }
 
   markCritiqueViewed(taskId: string, critiqueId: string): void {
