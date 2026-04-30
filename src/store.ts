@@ -98,6 +98,11 @@ export interface RepoConfig {
   reviewerAgent?: LaunchTarget;
   reviewerModel?: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  // ── GitHub CLI overrides ────────────────────────────────────────────────
+  /** gh account to use for this repo (e.g. "tcashelmgni"). Falls back to gh's active account. */
+  ghUser?: string;
+  /** gh hostname (e.g. "github.com" or an Enterprise host). Falls back to github.com. */
+  ghHost?: string;
 }
 
 export interface RepoConfigFile {

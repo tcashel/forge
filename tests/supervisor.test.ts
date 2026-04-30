@@ -81,6 +81,31 @@ test("extractGithubPrUrl returns null when no URL is present", () => {
   assert.equal(extractGithubPrUrl(""), null);
 });
 
+// Regression: matcher used to require literal "https://github" prefix,
+// which broke GitHub Enterprise Server hosts (e.g. git.internal.corp).
+// We now match by URL shape (`/pull/<digits>`) so any GHES host works.
+test("extractGithubPrUrl matches GitHub Enterprise Server URLs", () => {
+  const stdout = `
+Creating pull request for feat/x into main in org/repo
+https://git.internal.corp/org/repo/pull/7
+`;
+  assert.equal(extractGithubPrUrl(stdout), "https://git.internal.corp/org/repo/pull/7");
+});
+
+test("extractGithubPrUrl matches *.ghe.com URLs", () => {
+  const stdout = "created: https://acme.ghe.com/team/repo/pull/123\n";
+  assert.equal(extractGithubPrUrl(stdout), "https://acme.ghe.com/team/repo/pull/123");
+});
+
+test("extractGithubPrUrl ignores non-PR github URLs", () => {
+  // A repo or release URL shouldn't be misread as a PR URL.
+  const stdout = `
+repo: https://github.com/org/repo
+release: https://github.com/org/repo/releases/tag/v1.0
+`;
+  assert.equal(extractGithubPrUrl(stdout), null);
+});
+
 // ─── mapPiEvent ───────────────────────────────────────────────────────────────
 
 test("mapPiEvent converts tool_execution_start to tool_start with correct fields", () => {

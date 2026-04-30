@@ -283,6 +283,8 @@ export type DashboardAction =
   | { type: "run_critique"; task: TaskRecord }
   | { type: "view_critique"; task: TaskRecord; critiqueId: string }
   | { type: "discuss_critique"; task: TaskRecord; critiqueId: string }
+  | { type: "settings" }
+  | { type: "resume"; task: TaskRecord }
   | { type: "close" };
 
 export class ForgeDashboard {
@@ -363,9 +365,19 @@ export class ForgeDashboard {
     } else if (data === "K") {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "kill", task });
+    } else if (data === "R") {
+      // Capital R — resume a failed task. Lowercase r is reserved for
+      // refresh below; using a different binding keeps the muscle
+      // memory clear.
+      const task = allTasks[this.selectedIdx];
+      if (task && (task.status === "failed" || task.status === "quality_failed")) {
+        this.onAction({ type: "resume", task });
+      }
     } else if (matchesKey(data, "c")) {
       const task = allTasks[this.selectedIdx];
       if (task) this.onAction({ type: "run_critique", task });
+    } else if (matchesKey(data, "s")) {
+      this.onAction({ type: "settings" });
     } else if (matchesKey(data, "p")) {
       this.prMode = true;
       this.invalidate();
@@ -636,10 +648,18 @@ export class ForgeDashboard {
 
     // Row 3+: PR link or progress lines
     if (task.prUrl) {
-      lines.push(truncateToWidth(`       ${theme.fg("accent", "→ " + task.prUrl)}`, width));
+      lines.push(truncateToWidth(`       ${theme.fg("accent", `→ ${task.prUrl}`)}`, width));
     } else if (task.status === "running" || task.status === "quality_check" || task.status === "creating_pr") {
       const progress = this.progressLines(task, width);
       for (const pl of progress) lines.push(pl);
+    } else if (task.status === "failed" || task.status === "quality_failed") {
+      // Surface the failure reason on the row itself so users don't have to
+      // attach to tmux or grep agent.log to figure out why a run died. The
+      // supervisor writes errorMessage into snapshot.json (via stopped
+      // events) and mirrors it into meta.json on terminal-error paths;
+      // failedSubLines reads meta first and falls back to snapshot for
+      // older runs that pre-date the mirror.
+      for (const fl of this.failedSubLines(task, width)) lines.push(fl);
     }
 
     // Critique progress sub-line
@@ -650,6 +670,50 @@ export class ForgeDashboard {
   }
 
   // ── Progress line for running tasks ─────────────────────────────────────────
+
+  // Failure sub-line for failed / quality_failed tasks. See description in
+  // failedSubLines() below — surfaces meta.errorMessage on the row so the
+  // user doesn't have to attach to tmux just to learn why a run died.
+  private failedSubLines(task: TaskRecord, width: number): string[] {
+    const { theme } = this;
+    const out: string[] = [];
+
+    // Try meta.json first (written by both bash + supervisor runners),
+    // then snapshot.json (supervisor only). Both are best-effort.
+    const meta = this.store.readRunMeta(task.id);
+    const snap = this.store.readSnapshot(task.id);
+
+    if (task.status === "quality_failed") {
+      const results =
+        (meta?.qualityResults as { command: string; ok: boolean }[] | undefined) ?? snap?.qualityResults ?? [];
+      const failed = results.filter((r) => !r.ok).map((r) => r.command);
+      const summary = failed.length ? `quality failed: ${failed.join(", ")}` : "quality failed";
+      out.push(truncateToWidth(`       ${theme.fg("warning", summary.slice(0, width - 10))}`, width));
+      return out;
+    }
+
+    // status === "failed"
+    const errMsg = (meta?.errorMessage as string | undefined) ?? snap?.errorMessage ?? null;
+    if (errMsg) {
+      // Squeeze whitespace + cap so multi-line errors stay on one row.
+      const flat = errMsg.replace(/\s+/g, " ").trim();
+      out.push(truncateToWidth(`       ${theme.fg("error", `✖ ${flat.slice(0, width - 12)}`)}`, width));
+    } else {
+      // No structured error — fall back to the last log line so the user
+      // at least sees *something* without attaching to tmux.
+      const tail = this.store.tailLog(task.id, 1);
+      if (tail[0]) {
+        out.push(truncateToWidth(`       ${theme.fg("error", `✖ ${tail[0].slice(0, width - 12)}`)}`, width));
+      }
+    }
+
+    // If a PR-creation error log was written, point the user at it.
+    const errorLog = path.join(this.store.runsDir, task.id, "pr-create-error.log");
+    if (fs.existsSync(errorLog)) {
+      out.push(truncateToWidth(`       ${theme.fg("dim", `see ${errorLog}`)}`, width));
+    }
+    return out;
+  }
 
   private progressLines(task: TaskRecord, width: number): string[] {
     const { theme } = this;
@@ -911,15 +975,18 @@ export class ForgeDashboard {
 
     const canEdit = !!selected;
     const canCritique = !!(selected?.specFile && fs.existsSync(selected.specFile));
+    const canResume = selected?.status === "failed" || selected?.status === "quality_failed";
     const parts = [
       `[${theme.fg("accent", "n")}] New spec`,
       canEdit ? `[${theme.fg("accent", "e")}] Edit spec` : "",
       canView ? `[${theme.fg("accent", "v")}] View spec` : "",
       canLaunch ? `[${theme.fg("accent", "l")}] Launch` : "",
+      canResume ? `[${theme.fg("accent", "R")}] Resume` : "",
       canCritique ? `[${theme.fg("accent", "c")}] Critique` : "",
       canAttach ? `[${theme.fg("accent", "↵")}] Attach` : "",
       canKill ? `[${theme.fg("error", "K")}] Kill` : "",
       `[${theme.fg("accent", "p")}] PRs`,
+      `[${theme.fg("accent", "s")}] Settings`,
       `[${theme.fg("accent", "r")}] Refresh`,
       `[${theme.fg("accent", "q")}] Close`,
     ]
