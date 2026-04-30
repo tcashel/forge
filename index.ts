@@ -30,13 +30,15 @@
 
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import { launchCritique, type CritiqueConfig } from "./critique.js";
 import { ForgeDashboard } from "./dashboard.js";
 import * as jira from "./jira.js";
 import { launchAgent, isTmuxAvailable, isTmuxSessionAlive, attachToSession, killTmuxSession } from "./launch.js";
 import { detectRepo, getWorktrees, createWorktree, type RepoProfile } from "./repo.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
-import { ForgeStore, type LaunchTarget, type TaskRecord } from "./store.js";
+import { ForgeStore, type LaunchTarget, type ReasoningEffort, type TaskRecord } from "./store.js";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
@@ -334,6 +336,189 @@ async function runLaunchWizard(
   return true;
 }
 
+// ─── Critique wizard ───────────────────────────────────────────────────────────
+
+const critiqueModelDefaults: Record<LaunchTarget, string[]> = {
+  pi: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "gemini-2.5-pro", "claude-haiku-4-5"],
+  claude: ["claude-opus-4-7", "claude-opus-4-6", "claude-sonnet-4-6", "claude-haiku-4-5"],
+  codex: ["gpt-5.5", "o3", "o4-mini", "codex-mini-latest"],
+};
+
+const REASONING_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+
+/** Put " (default)" suffix on the matching option so the user sees the pre-selected value. */
+function highlightDefault(options: string[], defaultVal: string): string[] {
+  return options.map((o) => (o === defaultVal ? `${o} (default)` : o));
+}
+
+function stripDefault(choice: string): string {
+  return choice.replace(/ \(default\)$/, "");
+}
+
+async function runCritiqueWizard(
+  store: ForgeStore,
+  ctx: {
+    ui: {
+      select: (prompt: string, options: string[]) => Promise<string | null>;
+      input?: (prompt: string, opts?: object) => Promise<string | null>;
+      notify: (msg: string, type: string) => void;
+    };
+  },
+  task: TaskRecord,
+  repo: RepoProfile,
+): Promise<boolean> {
+  if (!isTmuxAvailable()) {
+    ctx.ui.notify("tmux not found — install with: brew install tmux", "error");
+    return false;
+  }
+
+  const fullSpec = store.getSpec(task.id);
+  if (!fullSpec) {
+    ctx.ui.notify("Spec file not found.", "error");
+    return false;
+  }
+  const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
+  const remembered = store.getRepoConfig(repo.root);
+
+  // ── Critic A ─────────────────────────────────────────────────────────────
+  const agentAChoice = await ctx.ui.select(
+    "Critic A runtime:",
+    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentA as string) ?? "pi"),
+  );
+  if (!agentAChoice) return false;
+  const agentA = stripDefault(agentAChoice) as LaunchTarget;
+
+  const modelAChoice = await ctx.ui.select(
+    "Critic A model:",
+    highlightDefault(critiqueModelDefaults[agentA], remembered.critiqueModelA ?? critiqueModelDefaults[agentA][0]),
+  );
+  if (!modelAChoice) return false;
+  const modelA = stripDefault(modelAChoice);
+
+  let reasoningA: ReasoningEffort | undefined;
+  if (agentA === "codex") {
+    const rChoice = await ctx.ui.select(
+      "Critic A reasoning effort:",
+      highlightDefault(REASONING_EFFORTS, (remembered.critiqueReasoningA as string) ?? "xhigh"),
+    );
+    if (!rChoice) return false;
+    reasoningA = stripDefault(rChoice) as ReasoningEffort;
+  }
+
+  // ── Critic B ─────────────────────────────────────────────────────────────
+  const agentBChoice = await ctx.ui.select(
+    "Critic B runtime:",
+    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentB as string) ?? "codex"),
+  );
+  if (!agentBChoice) return false;
+  const agentB = stripDefault(agentBChoice) as LaunchTarget;
+
+  const modelBChoice = await ctx.ui.select(
+    "Critic B model:",
+    highlightDefault(critiqueModelDefaults[agentB], remembered.critiqueModelB ?? critiqueModelDefaults[agentB][0]),
+  );
+  if (!modelBChoice) return false;
+  const modelB = stripDefault(modelBChoice);
+
+  let reasoningB: ReasoningEffort | undefined;
+  if (agentB === "codex") {
+    const rChoice = await ctx.ui.select(
+      "Critic B reasoning effort:",
+      highlightDefault(REASONING_EFFORTS, (remembered.critiqueReasoningB as string) ?? "xhigh"),
+    );
+    if (!rChoice) return false;
+    reasoningB = stripDefault(rChoice) as ReasoningEffort;
+  }
+
+  // Reject identical (agent, model) pairs
+  if (agentA === agentB && modelA === modelB) {
+    ctx.ui.notify(
+      "Critic A and Critic B must use different models or runtimes — pick something else for B.",
+      "error",
+    );
+    return false;
+  }
+
+  // ── Synthesizer ──────────────────────────────────────────────────────────
+  const agentSynthChoice = await ctx.ui.select(
+    "Synthesizer runtime:",
+    highlightDefault(["pi", "claude", "codex"], (remembered.critiqueAgentSynth as string) ?? "pi"),
+  );
+  if (!agentSynthChoice) return false;
+  const agentSynth = stripDefault(agentSynthChoice) as LaunchTarget;
+
+  const modelSynthChoice = await ctx.ui.select(
+    "Synthesizer model:",
+    highlightDefault(
+      critiqueModelDefaults[agentSynth],
+      remembered.critiqueModelSynth ?? critiqueModelDefaults[agentSynth][0],
+    ),
+  );
+  if (!modelSynthChoice) return false;
+  const modelSynth = stripDefault(modelSynthChoice);
+
+  let reasoningSynth: ReasoningEffort | undefined;
+  if (agentSynth === "codex") {
+    const rChoice = await ctx.ui.select(
+      "Synthesizer reasoning effort:",
+      highlightDefault(REASONING_EFFORTS, (remembered.critiqueReasoningSynth as string) ?? "xhigh"),
+    );
+    if (!rChoice) return false;
+    reasoningSynth = stripDefault(rChoice) as ReasoningEffort;
+  }
+
+  // Remember choices
+  store.setRepoConfig(repo.root, {
+    critiqueAgentA: agentA,
+    critiqueModelA: modelA,
+    critiqueReasoningA: reasoningA,
+    critiqueAgentB: agentB,
+    critiqueModelB: modelB,
+    critiqueReasoningB: reasoningB,
+    critiqueAgentSynth: agentSynth,
+    critiqueModelSynth: modelSynth,
+    critiqueReasoningSynth: reasoningSynth,
+  });
+
+  const critiqueId = store.generateCritiqueId();
+  const config: CritiqueConfig = {
+    taskId: task.id,
+    critiqueId,
+    specBody,
+    specTitle: task.title,
+    repoRoot: repo.root,
+    repoName: repo.name,
+    contextContent: repo.contextContent,
+    criticA: { agent: agentA, model: modelA, reasoningEffort: reasoningA },
+    criticB: { agent: agentB, model: modelB, reasoningEffort: reasoningB },
+    synthesizer: { agent: agentSynth, model: modelSynth, reasoningEffort: reasoningSynth },
+  };
+
+  ctx.ui.notify(
+    `Launching critique in tmux…\n  Critic A: ${agentA}/${modelA}\n  Critic B: ${agentB}/${modelB}\n  Synth: ${agentSynth}/${modelSynth}`,
+    "info",
+  );
+
+  const result = await launchCritique(config, store);
+  if (result.error) {
+    ctx.ui.notify(`Critique launch failed: ${result.error}`, "error");
+    return false;
+  }
+
+  ctx.ui.notify(
+    `✓ Critique launched in tmux session "${result.tmuxSession}"\n  Attach: tmux attach -t ${result.tmuxSession}`,
+    "success",
+  );
+  return true;
+}
+
+/** Open a file in the user's preferred viewer (or system default). */
+function openInViewer(file: string): void {
+  const opener = process.env.FORGE_VIEWER ?? (process.platform === "darwin" ? "open" : "xdg-open");
+  const child = spawn(opener, [file], { detached: true, stdio: "ignore" });
+  child.unref();
+}
+
 // ─── Extension entry ──────────────────────────────────────────────────────────
 
 export default function (pi: ExtensionAPI) {
@@ -418,6 +603,93 @@ export default function (pi: ExtensionAPI) {
                 dash.invalidate();
                 tui.requestRender();
               }
+              break;
+            }
+            case "run_critique": {
+              // Smart dispatch based on existing critique state
+              const latestId = store.getLatestCritique(action.task.id);
+              if (latestId) {
+                const meta = store.readCritiqueMeta(action.task.id, latestId);
+                if (meta?.status === "running_critics" || meta?.status === "running_synth") {
+                  ctx.ui.notify(
+                    `Critique still running — check tmux session forge-crit-${latestId}`,
+                    "info",
+                  );
+                  break;
+                }
+                if (meta?.status === "done") {
+                  const choice = await ctx.ui.select("Critique available:", [
+                    "View latest recommendations",
+                    "Discuss latest in spec-mode",
+                    "Run a new critique",
+                  ]);
+                  if (choice === "View latest recommendations") {
+                    const recFile = store.getRecommendationsFile(action.task.id, latestId);
+                    if (fs.existsSync(recFile)) {
+                      openInViewer(recFile);
+                      store.markCritiqueViewed(action.task.id, latestId);
+                    } else {
+                      openInViewer(path.join(store.getCritiqueDir(action.task.id, latestId), "critique-meta.json"));
+                    }
+                    dash.invalidate();
+                    tui.requestRender();
+                    break;
+                  }
+                  if (choice === "Discuss latest in spec-mode") {
+                    done(undefined);
+                    await enterSpecMode(pi, ctx as ExtensionContext, store, {
+                      repo,
+                      editingTask: action.task,
+                      seedCritiqueRecommendations: store.getRecommendationsFile(action.task.id, latestId),
+                    });
+                    break;
+                  }
+                  if (choice !== "Run a new critique") break;
+                  // fall through to launch new critique
+                }
+                if (meta?.status === "failed") {
+                  const choice = await ctx.ui.select("Last critique failed:", [
+                    "View partial output (logs)",
+                    "Run a new critique",
+                  ]);
+                  if (choice === "View partial output (logs)") {
+                    const recFile = store.getRecommendationsFile(action.task.id, latestId);
+                    const target = fs.existsSync(recFile)
+                      ? recFile
+                      : path.join(store.getCritiqueDir(action.task.id, latestId), "critique-meta.json");
+                    openInViewer(target);
+                    dash.invalidate();
+                    tui.requestRender();
+                    break;
+                  }
+                  if (choice !== "Run a new critique") break;
+                  // fall through to launch new critique
+                }
+              }
+              await runCritiqueWizard(store, ctx as any, action.task, repo);
+              dash.invalidate();
+              tui.requestRender();
+              break;
+            }
+            case "view_critique": {
+              const recFile = store.getRecommendationsFile(action.task.id, action.critiqueId);
+              if (fs.existsSync(recFile)) {
+                openInViewer(recFile);
+              } else {
+                openInViewer(path.join(store.getCritiqueDir(action.task.id, action.critiqueId), "critique-meta.json"));
+              }
+              store.markCritiqueViewed(action.task.id, action.critiqueId);
+              dash.invalidate();
+              tui.requestRender();
+              break;
+            }
+            case "discuss_critique": {
+              done(undefined);
+              await enterSpecMode(pi, ctx as ExtensionContext, store, {
+                repo,
+                editingTask: action.task,
+                seedCritiqueRecommendations: store.getRecommendationsFile(action.task.id, action.critiqueId),
+              });
               break;
             }
           }
@@ -529,6 +801,53 @@ export default function (pi: ExtensionAPI) {
 
       const task = tasks[options.indexOf(choice)];
       await runLaunchWizard(store, ctx as any, task, repo);
+    },
+  });
+
+  // ── /forge-critique — adversarial spec critique ──────────────────────────
+
+  pi.registerCommand("forge-critique", {
+    description: "Run adversarial critique on a Forge spec (arg: optional task id substring)",
+    handler: async (args, ctx) => {
+      const repo = detectRepo(process.cwd());
+      if (!repo) {
+        ctx.ui.notify("Not in a git repository.", "error");
+        return;
+      }
+      const arg = (typeof args === "string" ? args : Array.isArray(args) ? args.join(" ") : "").trim();
+
+      const tasks = store.getTasks(repo.root).filter((t) => t.specFile && fs.existsSync(t.specFile));
+      if (tasks.length === 0) {
+        ctx.ui.notify("No specs found for this repo. Use /forge-spec to create one.", "info");
+        return;
+      }
+
+      let task: TaskRecord | undefined;
+      if (arg) {
+        const lower = arg.toLowerCase();
+        const matches = tasks.filter(
+          (t) => t.id === arg || t.id.includes(lower) || t.title.toLowerCase().includes(lower),
+        );
+        if (matches.length === 1) {
+          task = matches[0];
+        } else if (matches.length === 0) {
+          ctx.ui.notify(`No spec matched "${arg}".`, "error");
+          return;
+        } else {
+          const options = matches.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
+          const choice = await ctx.ui.select("Multiple matches — pick one:", options);
+          if (!choice) return;
+          task = matches[options.indexOf(choice)];
+        }
+      } else {
+        const options = tasks.map((t) => `[${t.status}] ${t.title}  (${t.id})`);
+        const choice = await ctx.ui.select("Pick a spec to critique:", options);
+        if (!choice) return;
+        task = tasks[options.indexOf(choice)];
+      }
+      if (!task) return;
+
+      await runCritiqueWizard(store, ctx as any, task, repo);
     },
   });
 

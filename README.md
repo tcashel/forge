@@ -24,6 +24,8 @@ Pi auto-loads extensions that declare a `pi` block in `package.json` — no furt
 
 `/forge` opens the mission-control dashboard. From there, press `n` (or run `/forge-spec`) to start a new task — the bundled planner skill will research the repo and draft a spec conversationally. When the spec looks right, `Alt+S` saves it and offers to launch. Press `v` on any task to open its saved spec in your default `.md` viewer (or set `FORGE_SPEC_VIEWER=zed` to pick a specific editor). Forge spins up the chosen agent (`pi`, `claude`, or `codex`) in a tmux session inside a fresh git worktree. `/forge-attach` lets you watch (or detach with `Ctrl-B d`). On completion the runner executes the repo's quality gates, pushes the branch, and opens a draft PR. `/forge-review <n>` runs the bundled reviewer skill against the PR diff and linked spec.
 
+Before launching, you can pressure-test a spec with `/forge-critique` (or press `c` in the dashboard). This sends the spec to two different models for independent adversarial review, then a third model synthesizes both critiques into a prioritized recommendations document. The whole flow runs in the background via tmux. When it's done, press `c` again to view the recommendations or enter spec-mode with them pre-loaded so you can selectively apply changes.
+
 ## Commands
 
 | Command | Description |
@@ -31,6 +33,7 @@ Pi auto-loads extensions that declare a `pi` block in `package.json` — no furt
 | `/forge` | Open mission-control dashboard |
 | `/forge-spec [arg]` | Enter spec-mode (arg: JIRA key, idea, or blank) |
 | `/forge-edit-spec [arg]` | Re-enter spec-mode on an existing spec |
+| `/forge-critique [arg]` | Run adversarial critique on a spec |
 | `/forge-save-spec` | Promote working draft and optionally launch |
 | `/forge-cancel-spec` | Exit spec-mode (draft preserved on disk) |
 | `/forge-launch` | Launch an agent on an existing spec |
@@ -64,8 +67,11 @@ All persistent state lives under `~/.forge/`:
 | `jira.ts` | JIRA integration via `acli` CLI |
 | `progress.ts` | Structured snapshot types and reducer (WIP — not yet wired into `launch.ts`) |
 | `supervisor.ts` | Structured progress tracker for pi-runtime tasks (WIP — not yet wired into `launch.ts`) |
+| `critique.ts` | Adversarial spec critique runner (tmux-based, parallel critics + synthesizer) |
 | `skills/forge-planner/` | Planner skill — drafts specs from ideas or JIRA tickets |
 | `skills/forge-reviewer/` | Reviewer skill — severity + scoring rubrics for PR review |
+| `skills/forge-critic/` | Critic skill — adversarial spec review with severity labels |
+| `skills/forge-synthesizer/` | Synthesizer skill — merges two critiques into recommendations |
 | `tests/` | Tests (`supervisor.test.ts`, `progress.test.ts`, fixtures) |
 
 ## Development
