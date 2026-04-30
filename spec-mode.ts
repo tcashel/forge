@@ -1,5 +1,5 @@
 /**
- * Forge spec-mode — conversational spec drafting with the bundled
+ * Forge spec-mode - conversational spec drafting with the bundled
  * forge-planner skill.
  *
  * Spec-mode is a session-scoped toggle (one at a time, like pi's
@@ -41,12 +41,12 @@ import { ForgeStore, type TaskRecord } from "./store.js";
 
 /**
  * Allowed bash command prefixes during spec-mode. Spec-mode is read-only
- * by design — the planner shouldn't be touching the working tree, only
+ * by design - the planner shouldn't be touching the working tree, only
  * exploring it.
  *
  * We match on the first token (and second token for `git`/`gh`) so that
  * pipelines like `cat foo | head` still pass once the leading command is
- * approved. The allowlist is deliberately narrow — additions should be
+ * approved. The allowlist is deliberately narrow - additions should be
  * deliberate and discussed.
  */
 const SPEC_BASH_ALLOWLIST = new Set([
@@ -67,7 +67,7 @@ const SPEC_BASH_ALLOWLIST = new Set([
 const SPEC_GIT_ALLOWLIST = new Set([
   "status", "log", "show", "diff", "branch", "blame", "ls-files",
   "ls-tree", "cat-file", "rev-parse", "describe", "tag", "config",
-  "remote", "worktree",  // worktree subcommand allowed for `git worktree list` etc — not `git worktree add` (that creates dirs).
+  "remote", "worktree",  // worktree subcommand allowed for `git worktree list` etc - not `git worktree add` (that creates dirs).
 ]);
 
 const SPEC_GH_ALLOWLIST = new Set([
@@ -89,7 +89,7 @@ export function checkSpecBash(command: string): string | null {
   // Reject explicit writes upfront with a clearer message.
   const banned = [/\brm\s/, /\bmv\s/, /\bcp\s/, /\bmkdir\s/, /\btouch\s/, /\bchmod\s/, /\bchown\s/, /\bln\s+-s/, /\b>\s*\S/, /\b>>\s*\S/, /\btee\s/, /\bdd\b/, /\bsudo\b/, /\bnpm\s+install/, /\bnpm\s+i\b/, /\bpnpm\s+install/, /\byarn\s+(install|add)/, /\bpip\s+install/, /\buv\s+(sync|install|add)/, /\bcargo\s+(build|install|add|run)/, /\bgo\s+(get|install|build|run)/, /\bmake\b/, /\bmvn\b/, /\bgradle\b/];
   for (const re of banned) {
-    if (re.test(trimmed)) return `spec-mode is read-only — "${trimmed.slice(0, 60)}" looks like a mutating command. Exit spec-mode (save or cancel) before running it.`;
+    if (re.test(trimmed)) return `spec-mode is read-only - "${trimmed.slice(0, 60)}" looks like a mutating command. Exit spec-mode (save or cancel) before running it.`;
   }
 
   // Take the first token of the first command (before any |, ;, &&, ||).
@@ -164,6 +164,8 @@ interface SpecModeState {
    * to the canonical specs/ location.
    */
   draftPath: string | null;
+  /** Path to critique recommendations file, used for discuss_critique flow. */
+  seedCritiqueRecommendations: string | null;
 }
 
 const state: SpecModeState = {
@@ -177,11 +179,12 @@ const state: SpecModeState = {
   promptedThisCycle: false,
   editingTask: null,
   draftPath: null,
+  seedCritiqueRecommendations: null,
 };
 
 /**
  * Tools allowed during spec-mode. We allow `edit` and `write` so the
- * planner can mutate the draft file in place — but the tool_call hook
+ * planner can mutate the draft file in place - but the tool_call hook
  * below pins those tools to draftPath only, so the planner can't write
  * anywhere else in the working tree.
  */
@@ -236,7 +239,7 @@ function buildPlannerContext(): string {
     "[FORGE SPEC MODE ACTIVE]",
     "",
     "You are using the forge-planner skill. Its full instructions follow.",
-    "Companion files referenced in the SKILL.md sit at these absolute paths — load them with `read` when the workflow says so:",
+    "Companion files referenced in the SKILL.md sit at these absolute paths - load them with `read` when the workflow says so:",
     ...companions.map((p) => `- ${p}`),
     "",
     "## Skill",
@@ -262,7 +265,7 @@ function buildPlannerContext(): string {
       lines.push(repo.contextContent.slice(0, 4000));
       if (repo.contextContent.length > 4000) {
         lines.push("");
-        lines.push(`(${repo.contextContent.length - 4000} more chars omitted — read the file directly if you need it)`);
+        lines.push(`(${repo.contextContent.length - 4000} more chars omitted - read the file directly if you need it)`);
       }
     }
   } else {
@@ -271,7 +274,7 @@ function buildPlannerContext(): string {
 
   if (state.jiraKey && state.jiraContent) {
     lines.push("");
-    lines.push(`## JIRA Ticket — ${state.jiraKey}`);
+    lines.push(`## JIRA Ticket - ${state.jiraKey}`);
     lines.push("");
     lines.push("This is the source of truth for what the user wants. Read carefully before drafting. If anything is ambiguous or contradicts what you find in the codebase, ask the user.");
     lines.push("");
@@ -284,7 +287,7 @@ function buildPlannerContext(): string {
 
   if (state.editingTask) {
     lines.push("");
-    lines.push(`## Editing existing spec — not a fresh draft`);
+    lines.push(`## Editing existing spec - not a fresh draft`);
     lines.push("");
     lines.push(`Task id: \`${state.editingTask.id}\``);
     lines.push(`Status: \`${state.editingTask.status}\``);
@@ -297,14 +300,14 @@ function buildPlannerContext(): string {
   lines.push("");
   lines.push("## Working Draft File");
   lines.push("");
-  lines.push("To save tokens on long iterations, **the draft lives in a file**, not in the chat. Read and mutate this file directly with the `read`, `edit`, and `write` tools. Do NOT paste the full spec into chat — the user will read the file directly.");
+  lines.push("To save tokens on long iterations, **the draft lives in a file**, not in the chat. Read and mutate this file directly with the `read`, `edit`, and `write` tools. Do NOT paste the full spec into chat - the user will read the file directly.");
   lines.push("");
   lines.push(`**Draft path:** \`${state.draftPath ?? "(not set)"}\``);
   lines.push("");
   lines.push("Workflow on each turn:");
   lines.push("  1. If you haven't seen the current draft this turn, `read` it.");
   lines.push("  2. Make the changes the user asked for using `edit` (preferred for surgical changes) or `write` (for full rewrites of the whole file).");
-  lines.push("  3. In your chat reply, write **a brief change summary** — 1–3 lines, like a commit message. Do NOT paste the whole spec body. Examples:");
+  lines.push("  3. In your chat reply, write **a brief change summary** - 1-3 lines, like a commit message. Do NOT paste the whole spec body. Examples:");
   lines.push("     - \"Added 2 acceptance criteria for the cache miss path; tightened the validation bullet to quote the exact ValidationError string.\"");
   lines.push("     - \"Drafted initial spec at the path above. Research findings: <one-paragraph summary>. Open questions: <bullets>.\"");
   lines.push("  4. The `edit` and `write` tools are restricted to the draft path; you cannot write anywhere else. If you try, the call is blocked.");
@@ -314,6 +317,25 @@ function buildPlannerContext(): string {
   lines.push("- Research before drafting. Cite exact file paths.");
   lines.push("- The draft file is the source of truth, not the chat.");
   lines.push("- When the user is satisfied, tell them to press Alt+S or run /forge-save-spec to promote the draft to ~/.forge/specs/.");
+
+  if (state.seedCritiqueRecommendations) {
+    lines.push("");
+    lines.push("## Critique Recommendations");
+    lines.push("");
+    lines.push("An adversarial critique was run on this spec. The synthesized recommendations are below.");
+    lines.push("Use these to guide your refinement of the draft. Do NOT auto-apply them - the user will tell you how to proceed.");
+    lines.push("");
+    try {
+      const content = fs.readFileSync(state.seedCritiqueRecommendations, "utf-8");
+      lines.push(content.slice(0, 6000));
+      if (content.length > 6000) {
+        lines.push("");
+        lines.push(`(${content.length - 6000} more chars omitted - read the file at \`${state.seedCritiqueRecommendations}\` for the full recommendations)`);
+      }
+    } catch {
+      lines.push(`(Could not read recommendations at \`${state.seedCritiqueRecommendations}\`)`);
+    }
+  }
 
   return lines.join("\n");
 }
@@ -370,6 +392,8 @@ export interface EnterSpecModeOptions {
    * than rewrite.
    */
   editingTask?: TaskRecord;
+  /** When set, seeds the planner with critique recommendations for discussion. */
+  seedCritiqueRecommendations?: string;
 }
 
 export async function enterSpecMode(
@@ -392,6 +416,7 @@ export async function enterSpecMode(
   state.taskId = editing?.id ?? null;
   state.lastDraftTitle = editing?.title ?? null;
   state.promptedThisCycle = false;
+  state.seedCritiqueRecommendations = options.seedCritiqueRecommendations ?? null;
 
   // ── Set up the working draft file ─────────────────────────────────────
   // For new specs, use a timestamp-keyed draft path until save (when
@@ -423,12 +448,12 @@ export async function enterSpecMode(
   // planner sees it on turn 1.
   if (state.jiraKey) {
     if (!jira.isJiraAvailable()) {
-      ctx.ui.notify(`acli not available — entering spec-mode without JIRA context for ${state.jiraKey}`, "warning");
+      ctx.ui.notify(`acli not available - entering spec-mode without JIRA context for ${state.jiraKey}`, "warning");
     } else {
-      ctx.ui.notify(`Fetching ${state.jiraKey}…`, "info");
+      ctx.ui.notify(`Fetching ${state.jiraKey}...`, "info");
       const ticket = jira.fetchTicket(state.jiraKey);
       if (!ticket) {
-        ctx.ui.notify(`Could not fetch ${state.jiraKey} — entering spec-mode without ticket context`, "warning");
+        ctx.ui.notify(`Could not fetch ${state.jiraKey} - entering spec-mode without ticket context`, "warning");
       } else {
         state.jiraContent = [
           ticket.summary ? `Summary: ${ticket.summary}` : null,
@@ -445,14 +470,14 @@ export async function enterSpecMode(
   // Welcome message in chat scrollback so the user knows mode is active.
   const repoLabel = ctx.ui.theme.fg("accent", options.repo.name);
   const jiraLabel = state.jiraKey ? ` linked to ${ctx.ui.theme.fg("accent", state.jiraKey)}` : "";
-  const editLabel = editing ? ` (editing “${ctx.ui.theme.fg("accent", editing.title)}”)` : "";
+  const editLabel = editing ? ` (editing "${ctx.ui.theme.fg("accent", editing.title)}")` : "";
   pi.sendMessage(
     {
       customType: "forge-spec-mode-banner",
       content:
         `📝 **Forge spec-mode** active for ${repoLabel}${jiraLabel}${editLabel}.\n\n` +
         `Working draft: \`${state.draftPath}\`\n\n` +
-        `The planner edits this file directly via the \`edit\` and \`write\` tools — no need to re-emit the whole spec in chat each turn (saves tokens, faster iteration). Open the file in another editor any time to see the rendered draft.\n\n` +
+        `The planner edits this file directly via the \`edit\` and \`write\` tools - no need to re-emit the whole spec in chat each turn (saves tokens, faster iteration). Open the file in another editor any time to see the rendered draft.\n\n` +
         `Press **Alt+S** or run **\`/forge-save-spec\`** to promote the draft. **\`/forge-cancel-spec\`** to exit (the draft file stays on disk so you can resume).`,
       display: true,
     },
@@ -460,9 +485,15 @@ export async function enterSpecMode(
   );
 
   // Seed the first user turn.
+  if (editing && state.seedCritiqueRecommendations) {
+    pi.sendUserMessage(
+      `Refine the spec at \`${state.draftPath}\` using the critique recommendations at \`${state.seedCritiqueRecommendations}\`. Read the recommendations first. Then ask me up front whether I want to apply **all** of them, **most** of them (you propose which to skip), or go **one-at-a-time**. After I pick a mode, proceed accordingly \u2014 in all-mode, edit the draft and summarize what you changed; in most-mode, list the ones you'd skip and ask me to confirm before editing; in one-at-a-time mode, walk through them in priority order and ask before each edit. Never edit the draft without my acknowledgement of the mode (or of the individual edit, in one-at-a-time mode).`,
+    );
+    return;
+  }
   if (editing) {
     pi.sendUserMessage(
-      `I want to refine the existing spec for “${editing.title}”. The current draft is at \`${state.draftPath}\`. Read it first, then point out specific weak spots (vague criteria, undefined behavior, missing files, wrong file paths). Ask me what to change. Don't rewrite the whole thing on turn 1.`,
+      `I want to refine the existing spec for "${editing.title}". The current draft is at \`${state.draftPath}\`. Read it first, then point out specific weak spots (vague criteria, undefined behavior, missing files, wrong file paths). Ask me what to change. Don't rewrite the whole thing on turn 1.`,
     );
     return;
   }
@@ -474,7 +505,7 @@ export async function enterSpecMode(
   if (options.idea?.trim()) {
     const seed = options.idea.trim();
     pi.sendUserMessage(
-      `Idea: ${seed}\n\nResearch the repo, then write the initial draft to \`${state.draftPath}\` using the \`write\` tool. In your reply, summarize what you found and what you drafted (1–3 lines), and ask me about anything ambiguous before refining further.`,
+      `Idea: ${seed}\n\nResearch the repo, then write the initial draft to \`${state.draftPath}\` using the \`write\` tool. In your reply, summarize what you found and what you drafted (1-3 lines), and ask me about anything ambiguous before refining further.`,
     );
   } else if (state.jiraKey && state.jiraContent) {
     pi.sendUserMessage(
@@ -506,6 +537,7 @@ export function exitSpecMode(
   state.promptedThisCycle = false;
   state.editingTask = null;
   state.draftPath = null;
+  state.seedCritiqueRecommendations = null;
 
   if (savedToolsBeforeSpecMode) {
     pi.setActiveTools(savedToolsBeforeSpecMode);
@@ -539,7 +571,7 @@ export async function saveSpec(
   }
   const repo = state.repo;
   if (!repo || !state.draftPath) {
-    ctx.ui.notify("Spec-mode lost its repo or draft reference — exiting without save.", "error");
+    ctx.ui.notify("Spec-mode lost its repo or draft reference - exiting without save.", "error");
     exitSpecMode(pi, ctx);
     return null;
   }
@@ -563,7 +595,7 @@ export async function saveSpec(
   // Strip any frontmatter the planner accidentally wrote in.
   specBody = specBody.replace(/^---\n[\s\S]*?\n---\n*/, "").trim();
   if (!specBody) {
-    ctx.ui.notify(`Draft has only frontmatter — no spec body to save.`, "error");
+    ctx.ui.notify(`Draft has only frontmatter - no spec body to save.`, "error");
     return null;
   }
 
@@ -580,7 +612,7 @@ export async function saveSpec(
   let jiraKey = state.jiraKey;
   if (jira.isJiraAvailable()) {
     if (jiraKey) {
-      // Flow B exit — ticket already linked. Offer to update.
+      // Flow B exit - ticket already linked. Offer to update.
       const choice = await ctx.ui.select(`JIRA ${jiraKey} is linked. What should I do with it?`, [
         "Add a comment linking the spec",
         "Replace ticket description with the spec body",
@@ -596,11 +628,11 @@ export async function saveSpec(
         else ctx.ui.notify(`${jiraKey} description updated.`, "success");
       }
     } else {
-      // Flow A exit — no ticket yet. Offer to create one.
+      // Flow A exit - no ticket yet. Offer to create one.
       const choice = await ctx.ui.select("Create a JIRA ticket from this spec?", [
-        "Yes — create new ticket",
+        "Yes - create new ticket",
         "Link to an existing ticket",
-        "No — skip JIRA",
+        "No - skip JIRA",
       ]);
       if (choice?.startsWith("Yes")) {
         const created = await promptCreateJira(ctx, store, repo, title, specBody);
@@ -622,7 +654,7 @@ export async function saveSpec(
           const res = jira.addComment(newKey, `Forge spec drafted (${taskId}):\n\n${specBody}`);
           if ("error" in res) ctx.ui.notify(`JIRA comment failed: ${res.error}`, "warning");
         } else if (linked) {
-          ctx.ui.notify(`"${linked}" is not a valid JIRA key — skipping link.`, "warning");
+          ctx.ui.notify(`"${linked}" is not a valid JIRA key - skipping link.`, "warning");
         }
       }
     }
@@ -630,7 +662,7 @@ export async function saveSpec(
 
   // ── Build frontmatter and write to disk ──────────────────────────────
   // When editing, preserve original createdAt + lifecycle status. For new
-  // specs, mint fresh ones. Either way the planner doesn't see frontmatter —
+  // specs, mint fresh ones. Either way the planner doesn't see frontmatter -
   // forge owns it.
   const createdAt = editing?.createdAt ?? new Date().toISOString();
   const taskStatus = editing?.status ?? "draft";
@@ -712,7 +744,7 @@ async function promptCreateJira(
   specBody: string,
 ): Promise<{ key: string; url?: string } | null> {
   if (!ctx.ui.input) {
-    ctx.ui.notify("Cannot create JIRA ticket — interactive input not available.", "warning");
+    ctx.ui.notify("Cannot create JIRA ticket - interactive input not available.", "warning");
     return null;
   }
   const remembered = store.getRepoConfig(repo.root);
@@ -732,7 +764,7 @@ async function promptCreateJira(
       })
     )?.trim() || "Task";
 
-  ctx.ui.notify(`Creating ${project} ${type} from spec…`, "info");
+  ctx.ui.notify(`Creating ${project} ${type} from spec...`, "info");
   const res = jira.createTicket({
     project,
     type,
@@ -753,7 +785,7 @@ async function promptCreateJira(
 // ─── Wire-up: register hooks, commands, shortcut ──────────────────────────────
 
 /**
- * Install all spec-mode hooks. Idempotent — call once at extension load.
+ * Install all spec-mode hooks. Idempotent - call once at extension load.
  *
  * Hooks check `state.active` at the top so they're free when spec-mode
  * is off. The plan-mode pattern.
@@ -784,7 +816,7 @@ export function installSpecMode(pi: ExtensionAPI, store: ForgeStore): void {
   });
 
   // After each agent turn, peek at the draft file to update the status
-  // badge title. We DON'T auto-save — the user has to press Alt+S or
+  // badge title. We DON'T auto-save - the user has to press Alt+S or
   // /forge-save-spec. The chat history no longer carries the spec body
   // (planner edits the file directly), so we read the file.
   pi.on("agent_end", async (_event, ctx) => {
@@ -797,12 +829,12 @@ export function installSpecMode(pi: ExtensionAPI, store: ForgeStore): void {
         setStatus(ctx);
       }
     } catch {
-      /* draft may not exist yet on turn 1 — fine */
+      /* draft may not exist yet on turn 1 - fine */
     }
   });
 
   // Filter out spec-mode context messages from being sent back as
-  // history when spec-mode exits — they're large and irrelevant once
+  // history when spec-mode exits - they're large and irrelevant once
   // we're back in normal chat.
   pi.on("context", async (event) => {
     if (state.active) return;
@@ -818,7 +850,7 @@ export function installSpecMode(pi: ExtensionAPI, store: ForgeStore): void {
   });
 
   // Restore state on session start (e.g. resume a session that was
-  // mid-draft). We don't auto-resume the active flag — the user has to
+  // mid-draft). We don't auto-resume the active flag - the user has to
   // explicitly re-enter spec-mode if they want to continue. We just
   // restore preferences.
   pi.on("session_start", async (_event, ctx) => {
@@ -889,7 +921,7 @@ async function maybeLaunch(
 ): Promise<void> {
   if (!isTmuxAvailable()) {
     ctx.ui.notify(
-      `Spec saved. tmux not available, so cannot launch — install tmux and run /forge-launch later.`,
+      `Spec saved. tmux not available, so cannot launch - install tmux and run /forge-launch later.`,
       "info",
     );
     return;
