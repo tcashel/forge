@@ -34,10 +34,9 @@ import { execFileSync, execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
-import { type CritiqueConfig, launchCritique } from "./critique.js";
-import { ForgeDashboard } from "./dashboard.js";
-import { listGhAccounts, resolveGhEnv } from "./gh.js";
-import * as jira from "./jira.js";
+import { type CritiqueConfig, launchCritique } from "./core/critique.js";
+import { listGhAccounts, resolveGhEnv } from "./core/gh.js";
+import * as jira from "./core/jira.js";
 import {
   attachToSession,
   isTmuxAvailable,
@@ -46,11 +45,12 @@ import {
   launchAgent,
   type ResumeFrom,
   resumeAgentRun,
-} from "./launch.js";
-import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./repo.js";
-import { buildReviewerPrompt } from "./reviewer.js";
+} from "./core/launch.js";
+import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./core/repo.js";
+import { buildReviewerPrompt } from "./core/reviewer.js";
+import { ForgeStore, type LaunchTarget, type ReasoningEffort, type RepoConfig, type TaskRecord } from "./core/store.js";
+import { ForgeDashboard } from "./dashboard.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
-import { ForgeStore, type LaunchTarget, type ReasoningEffort, type RepoConfig, type TaskRecord } from "./store.js";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 

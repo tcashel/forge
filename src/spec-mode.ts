@@ -32,10 +32,10 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import type { ExtensionAPI, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { Key } from "@mariozechner/pi-tui";
-import * as jira from "./jira.js";
-import { isTmuxAvailable } from "./launch.js";
-import type { RepoProfile } from "./repo.js";
-import type { ForgeStore, TaskRecord } from "./store.js";
+import * as jira from "./core/jira.js";
+import { isTmuxAvailable } from "./core/launch.js";
+import type { RepoProfile } from "./core/repo.js";
+import type { ForgeStore, TaskRecord } from "./core/store.js";
 
 // ─── Bash allowlist for spec-mode / review-mode ───────────────────────────────
 

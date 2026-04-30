@@ -120,7 +120,7 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
 
   // ── pi runtime: supervisor-based runner ──────────────────────────────
   if (config.target === "pi") {
-    const supervisorPath = path.join(extDir, "supervisor.ts");
+    const supervisorPath = path.join(extDir, "..", "supervisor.ts");
     const argsJsonPath = path.join(runDir, "supervisor-args.json");
     const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
     const supervisorArgs = JSON.stringify(

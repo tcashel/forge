@@ -24,11 +24,11 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { resolveGhEnv } from "./gh.ts";
-import { buildPrBody, type PrBodyInput, stripFrontmatter } from "./pr-body.ts";
+import { resolveGhEnv } from "./core/gh.ts";
+import { buildPrBody, type PrBodyInput, stripFrontmatter } from "./core/pr-body.ts";
+import type { LaunchTarget, ReasoningEffort, ReviewVerdict, TaskStatus } from "./core/store.ts";
 import type { Phase, ProgressEvent, Snapshot } from "./progress.ts";
 import { applyEvent, emptySnapshot } from "./progress.ts";
-import type { LaunchTarget, ReasoningEffort, ReviewVerdict, TaskStatus } from "./store.ts";
 
 // ─── Node 22 preflight (only when running as entry point) ─────────────────────
 
@@ -1097,7 +1097,7 @@ async function main() {
       fs.writeFileSync(reviewPromptPath, reviewPrompt, "utf-8");
 
       log(`Running reviewer: ${reviewerTarget} / ${reviewerModel}`);
-      const { agentCommand } = await import("./launch.js");
+      const { agentCommand } = await import("./core/launch.js");
       const cmd = agentCommand(reviewerTarget, reviewerModel, reviewPromptPath, {
         reasoningEffort: reviewerReasoningEffort,
       });

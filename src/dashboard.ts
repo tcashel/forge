@@ -9,9 +9,9 @@ import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
-import type { RepoProfile } from "./repo.js";
-import type { ForgeStore, Snapshot, TaskRecord, TaskStatus } from "./store.js";
+import { isTmuxSessionAlive, killTmuxSession } from "./core/launch.js";
+import type { RepoProfile } from "./core/repo.js";
+import type { ForgeStore, Snapshot, TaskRecord, TaskStatus } from "./core/store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 

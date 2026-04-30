@@ -5,7 +5,7 @@
  * a tempdir. Calls upsertTask once with the id passed via argv.
  */
 
-import { ForgeStore, type TaskRecord } from "../../src/store.ts";
+import { ForgeStore, type TaskRecord } from "../../src/core/store.ts";
 
 const id = process.argv[2];
 if (!id) {

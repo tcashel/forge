@@ -8,9 +8,9 @@
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import type { Snapshot } from "../progress.js";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.js";
 import { withFileLock } from "./file-lock.js";
-import type { Snapshot } from "./progress.js";
 
 export type {
   Alert,
@@ -21,7 +21,7 @@ export type {
   Snapshot,
   ToolActivity,
   UsageTotals,
-} from "./progress.js";
+} from "../progress.js";
 
 export type TaskStatus = "draft" | "running" | "quality_check" | "creating_pr" | "done" | "failed" | "quality_failed";
 
