@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { bashGhEnvExport, resolveGhEnv } from "../src/gh.ts";
+import { bashGhEnvExport, resolveGhEnv, tokenEnvVarForHost } from "../src/gh.ts";
 
 // ─── resolveGhEnv: no-op path ────────────────────────────────────────────────
 //
@@ -57,4 +57,52 @@ test("bashGhEnvExport quotes single quotes in user/host safely", () => {
   // Each literal apostrophe becomes '\'' inside the quoted string.
   assert.ok(out.includes("'weird'\\''name'"), `actual: ${out}`);
   assert.ok(out.includes("'host'\\''.com'"), `actual: ${out}`);
+});
+
+// ─── tokenEnvVarForHost ──────────────────────────────────────────────────────────
+//
+// Per `gh help environment`: GH_TOKEN is the right variable for github.com
+// or any *.ghe.com subdomain (GitHub-hosted Enterprise Cloud).
+// GH_ENTERPRISE_TOKEN is required for self-hosted Enterprise Server hosts.
+// If we pick the wrong one, gh silently ignores the override and falls
+// back to whichever account is active for the host — which is exactly
+// the multi-account confusion this feature is meant to prevent.
+
+test("tokenEnvVarForHost returns GH_TOKEN for github.com", () => {
+  assert.equal(tokenEnvVarForHost("github.com"), "GH_TOKEN");
+  assert.equal(tokenEnvVarForHost("GitHub.com"), "GH_TOKEN"); // case-insensitive
+  assert.equal(tokenEnvVarForHost("  github.com  "), "GH_TOKEN"); // tolerant of whitespace
+});
+
+test("tokenEnvVarForHost returns GH_TOKEN for *.ghe.com", () => {
+  assert.equal(tokenEnvVarForHost("foo.ghe.com"), "GH_TOKEN");
+  assert.equal(tokenEnvVarForHost("acme.corp.ghe.com"), "GH_TOKEN");
+});
+
+test("tokenEnvVarForHost returns GH_ENTERPRISE_TOKEN for self-hosted GHES", () => {
+  assert.equal(tokenEnvVarForHost("github.example.com"), "GH_ENTERPRISE_TOKEN");
+  assert.equal(tokenEnvVarForHost("git.internal.corp"), "GH_ENTERPRISE_TOKEN");
+  // Trick host that contains "ghe.com" but isn't a subdomain of it — must NOT match.
+  assert.equal(tokenEnvVarForHost("ghe.com.evil.example"), "GH_ENTERPRISE_TOKEN");
+  // Bare "ghe.com" isn't documented as github-handled; treat as enterprise.
+  assert.equal(tokenEnvVarForHost("ghe.com"), "GH_ENTERPRISE_TOKEN");
+});
+
+test("bashGhEnvExport uses GH_TOKEN for github.com", () => {
+  const out = bashGhEnvExport({ user: "alice", host: "github.com" });
+  assert.match(out, /export GH_TOKEN="\$_FORGE_GH_TOKEN"/);
+  assert.ok(!out.includes("GH_ENTERPRISE_TOKEN"));
+});
+
+test("bashGhEnvExport uses GH_TOKEN for *.ghe.com", () => {
+  const out = bashGhEnvExport({ user: "alice", host: "acme.ghe.com" });
+  assert.match(out, /export GH_TOKEN="\$_FORGE_GH_TOKEN"/);
+  assert.ok(!out.includes("GH_ENTERPRISE_TOKEN"));
+});
+
+test("bashGhEnvExport uses GH_ENTERPRISE_TOKEN for GHES hosts", () => {
+  const out = bashGhEnvExport({ user: "alice", host: "github.example.com" });
+  assert.match(out, /export GH_ENTERPRISE_TOKEN="\$_FORGE_GH_TOKEN"/);
+  // Ensure we don't *also* leak GH_TOKEN.
+  assert.ok(!/export GH_TOKEN=/.test(out), `actual: ${out}`);
 });

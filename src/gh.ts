@@ -34,6 +34,25 @@ export interface GhEnv {
 const DEFAULT_HOST = "github.com";
 
 /**
+ * Per `gh help environment`, gh routes auth tokens differently by host:
+ *
+ *   GH_TOKEN              → used for github.com or any *.ghe.com subdomain
+ *                            (GitHub-hosted Enterprise Cloud).
+ *   GH_ENTERPRISE_TOKEN   → used for GitHub Enterprise Server (self-hosted,
+ *                            arbitrary hostnames like github.example.com).
+ *
+ * If we set the wrong variable, gh silently ignores it and falls back to
+ * whichever account is currently active in `gh auth status` for that host
+ * — which is exactly the multi-account confusion this whole feature is
+ * meant to prevent. Choose the right variable based on host shape.
+ */
+export function tokenEnvVarForHost(host: string): "GH_TOKEN" | "GH_ENTERPRISE_TOKEN" {
+  const h = host.trim().toLowerCase();
+  if (h === "github.com" || h.endsWith(".ghe.com")) return "GH_TOKEN";
+  return "GH_ENTERPRISE_TOKEN";
+}
+
+/**
  * Resolve a token + host for gh subprocesses. Returns `{ env: {}, error: null }`
  * when no override is configured so callers can pass it through unchanged
  * and gh will use its built-in active account.
@@ -57,7 +76,7 @@ export function resolveGhEnv(target: GhTarget | undefined): GhEnv {
           error: `gh auth token returned empty for user "${target.user}" on host "${host}". Run: gh auth login --hostname ${host}`,
         };
       }
-      env.GH_TOKEN = token;
+      env[tokenEnvVarForHost(host)] = token;
     } catch (e: unknown) {
       const msg = e instanceof Error ? e.message : String(e);
       return {
@@ -139,6 +158,7 @@ export function listGhAccounts(host: string = DEFAULT_HOST): { user: string; act
 export function bashGhEnvExport(target: GhTarget | undefined): string {
   if (!target || (!target.user && !target.host)) return "";
   const host = target.host?.trim() || DEFAULT_HOST;
+  const tokenVar = tokenEnvVarForHost(host);
   const lines: string[] = [
     "# ── Forge: per-repo gh account override ────────────────────────────",
     `export GH_HOST=${shellQuote(host)}`,
@@ -151,8 +171,11 @@ export function bashGhEnvExport(target: GhTarget | undefined): string {
       `  set_status "failed"`,
       `  exit 1`,
       `fi`,
-      `export GH_TOKEN="$_FORGE_GH_TOKEN"`,
-      `log "✓ Forge: using gh account '${target.user}' on '${host}'"`,
+      // Per `gh help environment`: GH_TOKEN is for github.com/*.ghe.com,
+      // GH_ENTERPRISE_TOKEN for GitHub Enterprise Server. Picking the
+      // wrong one makes gh silently ignore the override.
+      `export ${tokenVar}="$_FORGE_GH_TOKEN"`,
+      `log "✓ Forge: using gh account '${target.user}' on '${host}' (via ${tokenVar})"`,
     );
   } else {
     lines.push(`log "✓ Forge: using gh host '${host}'"`);
