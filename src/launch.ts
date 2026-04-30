@@ -673,8 +673,13 @@ export async function resumeAgentRun(config: ResumeConfig, store: ForgeStore): P
     };
   }
   original.resumeFrom = config.resumeFrom;
-  if (config.ghUser !== undefined) original.ghUser = config.ghUser;
-  if (config.ghHost !== undefined) original.ghHost = config.ghHost;
+  // Always overwrite gh override fields so clearing /forge-settings
+  // actually clears them on resume. JSON.stringify drops undefined
+  // values, so writing `undefined` here removes the key from the
+  // persisted file — next read sees no override, which is what we
+  // want when the user has cleared the setting.
+  original.ghUser = config.ghUser;
+  original.ghHost = config.ghHost;
   fs.writeFileSync(argsPath, `${JSON.stringify(original, null, 2)}\n`, "utf-8");
 
   // Generate a tiny resume wrapper that appends to the log instead of

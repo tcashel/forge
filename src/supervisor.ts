@@ -113,11 +113,23 @@ export function formatArgsPreview(toolName: string, args: unknown): string {
   }
 }
 
+/**
+ * Extract a PR URL from `gh pr create` output.
+ *
+ * Matches by URL *shape* rather than host so it works for GitHub
+ * Enterprise Server hosts (e.g. https://git.internal.corp/.../pull/42).
+ * `gh pr create` always emits a `https?://<host>/<owner>/<repo>/pull/<n>`
+ * URL on a line of its own; we just look for that pattern in any token.
+ *
+ * Name retained for backward compatibility with callers/tests — the
+ * function works correctly for any GitHub-flavored host (github.com,
+ * *.ghe.com, GHES).
+ */
 export function extractGithubPrUrl(stdout: string): string | null {
   const tokens = stdout.split(/\s+/);
   let last: string | null = null;
   for (const tok of tokens) {
-    if (tok.startsWith("https://github")) last = tok;
+    if (/^https?:\/\/[^\s/]+\/[^\s]+\/pull\/\d+/.test(tok)) last = tok;
   }
   return last;
 }
@@ -424,6 +436,12 @@ async function main() {
       ...(reviewerReasoningEffort != null && { reviewerReasoningEffort }),
       ...(reviewVerdict !== undefined && { reviewVerdict }),
       ...(reviewError !== undefined && { reviewError }),
+      // errorMessage lives on snapshot (set via emit{type:"stopped"}).
+      // Mirror it into meta.json so consumers like the resume wizard,
+      // dashboard, and external tools can read failure context from a
+      // single place. Previously meta.json was always missing this and
+      // callers had to fall back to snapshot.json.
+      ...(snapshot.errorMessage != null && { errorMessage: snapshot.errorMessage }),
     };
     atomicWriteJson(metaFile, meta);
   }

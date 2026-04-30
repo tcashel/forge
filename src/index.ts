@@ -643,8 +643,10 @@ async function runResumeWizard(
     return false;
   }
 
-  // Build state summary from meta.json.
+  // Build state summary from meta.json (with snapshot.json fallback for
+  // older runs that pre-date the meta.errorMessage fix).
   const meta = (store.readRunMeta(task.id) ?? {}) as Record<string, unknown>;
+  const snap = store.readSnapshot(task.id);
   const qualityResults = (meta.qualityResults as { command: string; ok: boolean }[] | undefined) ?? [];
   const qualityAllOk = qualityResults.length > 0 && qualityResults.every((r) => r.ok);
   const qualityAnyFail = qualityResults.some((r) => !r.ok);
@@ -652,7 +654,7 @@ async function runResumeWizard(
   const prUrl = (meta.prUrl as string | undefined) ?? null;
   const prNumber = (meta.prNumber as number | undefined) ?? null;
   const reviewVerdict = (meta.reviewVerdict as string | null | undefined) ?? null;
-  const errorMessage = (meta.errorMessage as string | undefined) ?? null;
+  const errorMessage = (meta.errorMessage as string | undefined) ?? snap?.errorMessage ?? null;
 
   const fmt = (label: string, ok: boolean | null, detail: string) => {
     const icon = ok === true ? "✓" : ok === false ? "✗" : "·";

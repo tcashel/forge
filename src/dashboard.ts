@@ -655,8 +655,10 @@ export class ForgeDashboard {
     } else if (task.status === "failed" || task.status === "quality_failed") {
       // Surface the failure reason on the row itself so users don't have to
       // attach to tmux or grep agent.log to figure out why a run died. The
-      // supervisor writes errorMessage into meta.json + snapshot.json on
-      // PR-creation failures (and any other terminal error path).
+      // supervisor writes errorMessage into snapshot.json (via stopped
+      // events) and mirrors it into meta.json on terminal-error paths;
+      // failedSubLines reads meta first and falls back to snapshot for
+      // older runs that pre-date the mirror.
       for (const fl of this.failedSubLines(task, width)) lines.push(fl);
     }
 
