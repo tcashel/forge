@@ -14,6 +14,17 @@ import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, TaskRecord, TaskStatus } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge ls [...flags]
+
+List tasks (default: current repo).
+
+Flags:
+  --repo <path>             Limit to a specific repo root (default: cwd's repo)
+  --all                     Show every task across every repo
+  --status <comma-list>     Filter by status (draft,running,done,failed,...)
+  --json                    Machine-readable output
+`;
+
 export interface TaskSummary {
   id: string;
   title: string;

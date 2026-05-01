@@ -18,6 +18,30 @@ import { CliError, emitOk } from "../output.ts";
 import { readStdin } from "../pickers.ts";
 import { renderMarkdown } from "../render-md.ts";
 
+export const HELP = `forge spec <save|ls|show> [...flags]
+
+Manage Forge specs.
+
+forge spec save [...flags]
+  Reads body from stdin (or --from-file), generates YAML frontmatter, writes
+  to ~/.forge/specs/<id>.md, registers a draft task in ~/.forge/index.json.
+
+  Flags:
+    --title <name>          Override title (default: first H1 in body)
+    --branch <name>          Override branch slug (default: forge/<title>)
+    --agent <claude|codex>   Pin implementer agent on the task
+    --model <model-id>       Pin implementer model on the task
+    --jira <key>             Attach a Jira ticket
+    --from-file <path>       Read body from a file instead of stdin
+    --json
+
+forge spec ls [--all] [--json]
+  List draft specs (current repo by default).
+
+forge spec show <task-id> [--raw] [--json]
+  Print a saved spec. --raw strips frontmatter.
+`;
+
 function deriveTitle(body: string, override?: string): string {
   if (override) return override.trim();
   const m = body.match(/^#\s+(.+)$/m);

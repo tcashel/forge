@@ -15,11 +15,39 @@ import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge config <get|set|list> [...flags]
+
+Read/write per-repo settings (stored in ~/.forge/repo-config.json keyed by
+repo root path).
+
+forge config get <key> [--repo <path>] [--json]
+forge config set <key> <value> [--repo <path>] [--json]
+forge config set <key> --clear [--repo <path>]
+forge config list [--repo <path>] [--json]
+
+Common keys:
+  defaultAgent, defaultModel             Implementer fallback for forge launch
+  reviewerAgent, reviewerModel           Reviewer pair (must differ from impl)
+  reviewerReasoningEffort                low|medium|high|xhigh (codex only)
+  fixerAgent, fixerModel, fixerReasoningEffort
+  autoFix (true|false), autoFixRounds (int)
+  ghUser, ghHost                         gh-cli account / host overrides
+  jiraProject, jiraType
+  critiqueAgentA / critiqueModelA / critiqueReasoningA  (and B / Synth)
+
+Examples:
+  forge config set defaultAgent codex
+  forge config set defaultModel gpt-5-codex
+  forge config set reviewerAgent claude
+  forge config set reviewerModel claude-opus-4-7
+`;
+
 const STRING_KEYS = [
   "ghUser",
   "ghHost",
   "jiraProject",
   "jiraType",
+  "defaultModel",
   "reviewerModel",
   "fixerModel",
   "critiqueModelA",
@@ -27,7 +55,14 @@ const STRING_KEYS = [
   "critiqueModelSynth",
 ] as const;
 
-const AGENT_KEYS = ["reviewerAgent", "fixerAgent", "critiqueAgentA", "critiqueAgentB", "critiqueAgentSynth"] as const;
+const AGENT_KEYS = [
+  "defaultAgent",
+  "reviewerAgent",
+  "fixerAgent",
+  "critiqueAgentA",
+  "critiqueAgentB",
+  "critiqueAgentSynth",
+] as const;
 const EFFORT_KEYS = [
   "reviewerReasoningEffort",
   "fixerReasoningEffort",
@@ -140,6 +175,22 @@ async function runSet(argv: string[], store: ForgeStore): Promise<void> {
   const validated = validateValue(key, rawValue);
   const patch = { [key]: validated } as Partial<RepoConfig>;
   store.setRepoConfig(repoRoot, patch);
+
+  if (key === "defaultAgent" || key === "defaultModel") {
+    const after = store.getRepoConfig(repoRoot);
+    if (
+      after.defaultAgent &&
+      after.defaultModel &&
+      after.defaultAgent === after.reviewerAgent &&
+      after.defaultModel === after.reviewerModel
+    ) {
+      process.stderr.write(
+        `warning: defaultAgent/defaultModel now match reviewerAgent/reviewerModel — ` +
+          `every launch will fail REVIEWER_SAME_AS_IMPL until one is changed.\n`,
+      );
+    }
+  }
+
   emitOk({ repoRoot, key, value: validated }, values.json === true, () => `set ${key} = ${rawValue}`);
 }
 

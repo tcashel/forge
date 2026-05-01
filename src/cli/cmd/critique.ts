@@ -22,6 +22,24 @@ import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge critique <task-id> [...flags]
+
+Spawn two independent critic agents and a synthesizer in tmux for an
+adversarial spec review. Defaults are read from per-repo critique config;
+CLI flags override.
+
+Required (via repo-config or flags):
+  --critic-a-agent <claude|codex|opencode|gemini>   --critic-a-model <id>
+  --critic-b-agent <claude|codex|opencode|gemini>   --critic-b-model <id>
+  --synth-agent    <claude|codex|opencode|gemini>   --synth-model    <id>
+
+Optional:
+  --critic-a-reasoning <low|medium|high|xhigh>   (codex only)
+  --critic-b-reasoning <low|medium|high|xhigh>   (codex only)
+  --synth-reasoning    <low|medium|high|xhigh>   (codex only)
+  --json
+`;
+
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
