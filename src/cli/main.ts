@@ -9,6 +9,7 @@
 import { ForgeStore } from "../core/store.ts";
 import * as attach from "./cmd/attach.ts";
 import * as config from "./cmd/config.ts";
+import * as dash from "./cmd/dash.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
@@ -39,6 +40,8 @@ Commands:
   config get <k>           Read a per-repo setting
   config set <k> <v>       Write a per-repo setting
   config list              List per-repo settings
+
+  dash                     Open the mission-control TUI dashboard
 
 Global flags:
   --json                   Machine-readable output
@@ -93,6 +96,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "config":
         await config.run(rest, store);
+        return;
+      case "dash":
+        await dash.run(rest, store);
         return;
       default: {
         const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, { exitCode: 1 });

@@ -41,8 +41,8 @@ import { attachToSession, isTmuxAvailable, isTmuxSessionAlive, killTmuxSession, 
 import { createWorktree, detectRepo, getWorktrees, type RepoProfile } from "./core/repo.js";
 import { buildReviewerPrompt } from "./core/reviewer.js";
 import { ForgeStore, type LaunchTarget, type ReasoningEffort, type RepoConfig, type TaskRecord } from "./core/store.js";
-import { ForgeDashboard } from "./dashboard.js";
 import { enterSpecMode, installSpecMode } from "./spec-mode.js";
+import { ForgeDashboard } from "./tui/dashboard.js";
 
 // ─── Utilities ────────────────────────────────────────────────────────────────
 
