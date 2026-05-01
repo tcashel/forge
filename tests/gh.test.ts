@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { bashGhEnvExport, resolveGhEnv, tokenEnvVarForHost } from "../src/gh.ts";
+import { bashGhEnvExport, resolveGhEnv, tokenEnvVarForHost } from "../src/core/gh.ts";
 
 // ─── resolveGhEnv: no-op path ────────────────────────────────────────────────
 //

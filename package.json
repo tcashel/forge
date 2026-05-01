@@ -1,33 +1,28 @@
 {
   "name": "forge",
-  "version": "0.3.0",
-  "description": "Mission control for agentic coding workflows — spec, launch, track, review, PR",
+  "version": "0.4.0-dev",
+  "description": "Agentic coding workflow control plane — CLI + Claude Code plugin",
   "private": true,
   "type": "module",
   "keywords": [
-    "pi-package"
+    "claude-code-plugin",
+    "agentic-coding",
+    "tmux",
+    "git-worktree"
   ],
   "engines": {
-    "node": ">=22"
+    "bun": ">=1.3"
   },
-  "packageManager": "pnpm@10.30.3",
+  "bin": {
+    "forge": "./bin/forge.ts"
+  },
   "scripts": {
-    "test": "node --test --experimental-strip-types tests/*.test.ts",
+    "test": "bun test",
     "lint": "biome check .",
     "format": "biome format --write .",
     "check": "biome check --write ."
   },
-  "pi": {
-    "extensions": [
-      "./index.ts"
-    ],
-    "skills": [
-      "./skills"
-    ]
-  },
   "devDependencies": {
-    "@biomejs/biome": "2.4.13",
-    "@mariozechner/pi-coding-agent": "^0.70.6",
-    "@mariozechner/pi-tui": "^0.70.6"
+    "@biomejs/biome": "2.4.13"
   }
 }

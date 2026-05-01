@@ -8,10 +8,12 @@
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { Key, matchesKey, truncateToWidth, visibleWidth } from "@mariozechner/pi-tui";
-import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
-import type { RepoProfile } from "./repo.js";
-import type { ForgeStore, Snapshot, TaskRecord, TaskStatus } from "./store.js";
+import { type GhTarget, resolveGhEnv } from "../core/gh.js";
+import { isTmuxSessionAlive, killTmuxSession } from "../core/launch.js";
+import type { RepoProfile } from "../core/repo.js";
+import type { ForgeStore, TaskRecord, TaskStatus } from "../core/store.js";
+import { Key, matchesKey } from "./keys.js";
+import { truncateToWidth, visibleWidth } from "./width.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -44,7 +46,20 @@ interface Tui {
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
-function runGh(args: string[], opts?: { timeoutMs?: number }): Promise<{ stdout: string; ok: boolean }> {
+/**
+ * Spawn `gh` with optional per-repo account/host overrides.
+ *
+ * Bare `gh` always uses gh's globally-active account regardless of the
+ * per-repo `ghUser`/`ghHost` configured in repo-config.json — that made
+ * forge show an empty PR list (or the wrong @me) for any repo whose
+ * configured account differs from gh's active one. We mirror what the
+ * runner scripts do: resolve a token via `gh auth token --user …` and
+ * inject GH_HOST + GH_TOKEN/GH_ENTERPRISE_TOKEN into the child env.
+ */
+function runGh(
+  args: string[],
+  opts?: { timeoutMs?: number; cwd?: string; ghTarget?: GhTarget },
+): Promise<{ stdout: string; ok: boolean }> {
   const timeout = opts?.timeoutMs ?? 20000;
   return new Promise((resolve) => {
     const ac = new AbortController();
@@ -59,11 +74,24 @@ function runGh(args: string[], opts?: { timeoutMs?: number }): Promise<{ stdout:
       resolve(result);
     };
 
+    // resolveGhEnv returns {} when no override is configured, so the
+    // child inherits gh's default behaviour in that case.
+    const resolved = resolveGhEnv(opts?.ghTarget);
+    if (resolved.error) {
+      // Configured account isn't logged in — fail fast rather than
+      // silently falling back to the wrong account.
+      settle({ stdout: "", ok: false });
+      return;
+    }
+    const env = { ...process.env, ...resolved.env };
+
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn("gh", args, {
         stdio: ["ignore", "pipe", "pipe"],
         signal: ac.signal,
+        cwd: opts?.cwd,
+        env,
       });
     } catch {
       settle({ stdout: "", ok: false });
@@ -100,13 +128,6 @@ function padEnd(s: string, len: number): string {
 
 function sep(width: number, char = "─"): string {
   return char.repeat(width);
-}
-
-function fmtTokens(n: number): string {
-  if (n < 1000) return n.toString();
-  if (n < 10000) return `${(n / 1000).toFixed(1)}k`;
-  if (n < 1000000) return `${Math.round(n / 1000)}k`;
-  return `${(n / 1000000).toFixed(1)}M`;
 }
 
 function statusIcon(theme: Theme, status: TaskStatus, tmuxSession: string | null): string {
@@ -173,20 +194,21 @@ function reviewCell(theme: Theme, decision: string | null | undefined): string {
   }
 }
 
-let cachedLogin: string | null = null;
-async function currentLogin(): Promise<string> {
-  if (cachedLogin !== null) return cachedLogin;
-  const { stdout, ok } = await runGh(["api", "user", "--jq", ".login"]);
-  cachedLogin = ok ? stdout : "";
-  return cachedLogin;
+// Login is recomputed per refresh on the dashboard instance — see
+// ForgeDashboard.myLogin. A module-level cache would leak the login from
+// one repo into another when the user switches repos with different
+// ghUser overrides.
+async function currentLogin(opts: { cwd: string; ghTarget?: GhTarget }): Promise<string> {
+  const { stdout, ok } = await runGh(["api", "user", "--jq", ".login"], opts);
+  return ok ? stdout : "";
 }
 
-async function fetchMinePrNumbers(): Promise<Set<number>> {
+async function fetchMinePrNumbers(opts: { cwd: string; ghTarget?: GhTarget }): Promise<Set<number>> {
   // Use gh's own "@me" resolution so this works even when the local gh login
   // (e.g. an org-aliased account like "foo-org") differs from the PR author
   // login on the host (e.g. "foo"). Strict string equality on logins is
   // unreliable across SAML/enterprise account mappings.
-  const { stdout, ok } = await runGh(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"]);
+  const { stdout, ok } = await runGh(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"], opts);
   if (!ok || !stdout) return new Set();
   try {
     const arr = JSON.parse(stdout) as Array<{ number: number }>;
@@ -196,8 +218,8 @@ async function fetchMinePrNumbers(): Promise<Set<number>> {
   }
 }
 
-async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
-  const [me, mineNumbers] = await Promise.all([currentLogin(), fetchMinePrNumbers()]);
+async function fetchPrs(opts: { cwd: string; ghTarget?: GhTarget }): Promise<{ prs: GhPr[]; me: string }> {
+  const [me, mineNumbers] = await Promise.all([currentLogin(opts), fetchMinePrNumbers(opts)]);
   // Use gh's built-in `--jq` to project the (potentially huge) `comments`
   // and `reviews` arrays down to scalar counts on gh's side. Without this,
   // the full review/comment bodies blow past execSync's default maxBuffer
@@ -209,17 +231,20 @@ async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
     "additions,deletions,changedFiles," +
     "commentsCount:(.comments|length),reviewsCount:(.reviews|length)" +
     "}]";
-  const { stdout, ok } = await runGh([
-    "pr",
-    "list",
-    "--json",
-    "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
-    "--jq",
-    jq,
-    "--limit",
-    "30",
-  ]);
-  if (!ok || !stdout) return [];
+  const { stdout, ok } = await runGh(
+    [
+      "pr",
+      "list",
+      "--json",
+      "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
+      "--jq",
+      jq,
+      "--limit",
+      "30",
+    ],
+    opts,
+  );
+  if (!ok || !stdout) return { prs: [], me };
   try {
     const prs = JSON.parse(stdout) as Array<{
       number: number;
@@ -238,7 +263,7 @@ async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
       commentsCount: number;
       reviewsCount: number;
     }>;
-    return prs.map((pr) => {
+    const mapped = prs.map((pr) => {
       const checks = pr.statusCheckRollup ?? [];
       const hasFailure = checks.some((c) => c.state === "FAILURE" || c.conclusion === "FAILURE");
       const allSuccess = checks.length > 0 && checks.every((c) => c.state === "SUCCESS" || c.conclusion === "SUCCESS");
@@ -264,8 +289,9 @@ async function fetchPrs(_repoRoot: string): Promise<GhPr[]> {
         isMine: mineNumbers.has(pr.number) || (me !== "" && author === me),
       };
     });
+    return { prs: mapped, me };
   } catch {
-    return [];
+    return { prs: [], me };
   }
 }
 
@@ -304,6 +330,9 @@ export class ForgeDashboard {
   private spinnerFrame = 0;
   private spinnerTimer?: ReturnType<typeof setInterval>;
   private refreshInFlight = false;
+  // Per-instance login cache. Recomputed on every refresh so it stays
+  // in sync with the per-repo ghUser override and any auth changes.
+  private myLogin = "";
 
   onAction: (action: DashboardAction) => void = () => {};
   onClose: () => void = () => {};
@@ -315,6 +344,17 @@ export class ForgeDashboard {
     private readonly repo: RepoProfile,
   ) {}
 
+  /** Resolve gh account/host overrides from the per-repo config, if any. */
+  private ghTarget(): GhTarget | undefined {
+    const cfg = this.store.getRepoConfig(this.repo.root);
+    if (!cfg.ghUser && !cfg.ghHost) return undefined;
+    return { user: cfg.ghUser, host: cfg.ghHost };
+  }
+
+  private fetchOpts() {
+    return { cwd: this.repo.root, ghTarget: this.ghTarget() };
+  }
+
   // ── Public API ──────────────────────────────────────────────────────────────
 
   start(): void {
@@ -324,7 +364,10 @@ export class ForgeDashboard {
   }
 
   stop(): void {
-    if (this.refreshTimer) clearInterval(this.refreshTimer);
+    if (this.refreshTimer) {
+      clearInterval(this.refreshTimer);
+      this.refreshTimer = undefined;
+    }
     this.stopSpinner();
   }
 
@@ -428,7 +471,9 @@ export class ForgeDashboard {
       await Promise.resolve();
 
       // Fetch PRs (async, non-blocking)
-      this.prs = await fetchPrs(this.repo.root);
+      const result = await fetchPrs(this.fetchOpts());
+      this.prs = result.prs;
+      this.myLogin = result.me;
     } finally {
       this.lastRefresh = new Date();
       this.loading = false;
@@ -443,7 +488,9 @@ export class ForgeDashboard {
     this.loading = true;
     this.startSpinner();
     try {
-      this.prs = await fetchPrs(this.repo.root);
+      const result = await fetchPrs(this.fetchOpts());
+      this.prs = result.prs;
+      this.myLogin = result.me;
       this.prSelectedIdx = Math.min(this.prSelectedIdx, Math.max(0, this.visiblePrs().length - 1));
     } finally {
       this.loading = false;
@@ -678,14 +725,11 @@ export class ForgeDashboard {
     const { theme } = this;
     const out: string[] = [];
 
-    // Try meta.json first (written by both bash + supervisor runners),
-    // then snapshot.json (supervisor only). Both are best-effort.
+    // meta.json carries quality results + error message for the bash runner.
     const meta = this.store.readRunMeta(task.id);
-    const snap = this.store.readSnapshot(task.id);
 
     if (task.status === "quality_failed") {
-      const results =
-        (meta?.qualityResults as { command: string; ok: boolean }[] | undefined) ?? snap?.qualityResults ?? [];
+      const results = (meta?.qualityResults as { command: string; ok: boolean }[] | undefined) ?? [];
       const failed = results.filter((r) => !r.ok).map((r) => r.command);
       const summary = failed.length ? `quality failed: ${failed.join(", ")}` : "quality failed";
       out.push(truncateToWidth(`       ${theme.fg("warning", summary.slice(0, width - 10))}`, width));
@@ -693,7 +737,7 @@ export class ForgeDashboard {
     }
 
     // status === "failed"
-    const errMsg = (meta?.errorMessage as string | undefined) ?? snap?.errorMessage ?? null;
+    const errMsg = (meta?.errorMessage as string | undefined) ?? null;
     if (errMsg) {
       // Squeeze whitespace + cap so multi-line errors stay on one row.
       const flat = errMsg.replace(/\s+/g, " ").trim();
@@ -717,75 +761,12 @@ export class ForgeDashboard {
 
   private progressLines(task: TaskRecord, width: number): string[] {
     const { theme } = this;
-
-    // pi-runtime tasks: try snapshot first
-    if (task.agent === "pi") {
-      const snap = this.store.readSnapshot(task.id);
-      if (snap) return this.snapshotLines(snap, width);
-      // No snapshot — pre-supervisor task, fall through to tailLog
-      const tail = this.store.tailLog(task.id, 1);
-      if (tail[0]) return [truncateToWidth(`       ${theme.fg("dim", tail[0].slice(0, width - 10))}`, width)];
-      return [];
-    }
-
-    // claude / codex: tailLog with limited-progress suffix
     const tail = this.store.tailLog(task.id, 1);
     if (tail[0]) {
       const line = tail[0].slice(0, width - 30);
-      return [truncateToWidth(`       ${theme.fg("dim", line)} ${theme.fg("dim", "(limited progress)")}`, width)];
+      return [truncateToWidth(`       ${theme.fg("dim", line)} ${theme.fg("dim", "(log tail)")}`, width)];
     }
     return [];
-  }
-
-  private snapshotLines(snap: Snapshot, width: number): string[] {
-    const { theme } = this;
-    const lines: string[] = [];
-    const phaseIcons: Record<string, string> = {
-      starting: "○",
-      agent: "⟳",
-      quality_check: "✔",
-      committing: "↑",
-      creating_pr: "↗",
-      done: "✓",
-      failed: "✗",
-    };
-    const icon = phaseIcons[snap.phase] ?? "·";
-    const secAgo = Math.round((Date.now() - snap.lastEventAt) / 1000);
-
-    if (snap.phase === "agent") {
-      const tool = snap.currentTool?.toolName ?? "thinking";
-      const preview = snap.currentTool?.argsPreview ?? "";
-      const line1 = `${icon} ${snap.phase} · ${tool} ${preview}`;
-      lines.push(truncateToWidth(`       ${line1.slice(0, width - 10)}`, width));
-
-      const inp = fmtTokens(snap.usage.inputTokens);
-      const out = fmtTokens(snap.usage.outputTokens);
-      const badge = this.healthBadge(snap.health);
-      const errs = snap.consecutiveToolErrors ?? 0;
-      const struggle = errs > 0 ? ` · ${theme.fg(errs >= 3 ? "error" : "warning", `${errs}✗ in a row`)}` : "";
-      const line2 = `↑${inp} ↓${out} · turn ${snap.usage.turns}${struggle} · ${secAgo}s ago · ${badge}`;
-      lines.push(truncateToWidth(`       ${line2}`, width));
-    } else {
-      const line1 = `${icon} ${snap.phase} · ${secAgo}s ago`;
-      lines.push(truncateToWidth(`       ${theme.fg("dim", line1)}`, width));
-    }
-    return lines;
-  }
-
-  private healthBadge(health: string): string {
-    const { theme } = this;
-    switch (health) {
-      case "active":
-        return theme.fg("success", "active");
-      case "idle":
-        return theme.fg("dim", "idle");
-      case "stalled":
-        return theme.fg("warning", "stalled");
-      case "error":
-        return theme.fg("error", "error");
-      default:
-        return theme.fg("dim", health);
-    }
   }
 
   // ── Critique sub-line for tasks ───────────────────────────────────────────
@@ -815,7 +796,7 @@ export class ForgeDashboard {
   private drawPrPanel(lines: string[], width: number): void {
     const { theme } = this;
     const visible = this.visiblePrs();
-    const me = cachedLogin ?? "";
+    const me = this.myLogin;
     const total = this.prs.length;
     const mineCount = this.prs.filter((p) => p.isMine).length;
 

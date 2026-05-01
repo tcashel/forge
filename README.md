@@ -1,114 +1,144 @@
 # forge
 
-A [pi](https://github.com/badlogic/pi) extension that wraps a spec → launch → review → PR workflow behind a few slash commands.
+A control plane for one-shot agentic coding runs. You hand it a spec; it spins up `claude` or `codex` in a fresh git worktree under tmux, runs your quality gates, opens a draft PR, and sends a different model in to review the diff.
+
+Two artifacts ship from this repo:
+
+- **`forge` CLI** — a `bun`-runtime binary you run from any shell.
+- **Claude Code plugin** (`cc-plugin/`) — slash commands and skills that drive the CLI from inside Claude Code.
 
 ## Prerequisites
 
-- `pi` — the host agent (forge is a pi extension)
-- Node 22+ — required by `supervisor.ts` (`node --experimental-strip-types`)
-- `tmux` — agent runs execute in background tmux sessions
-- `git` — worktree management, branch operations
-- `gh` — PR create, view, diff, checks
+- `bun` 1.3+
+- `tmux`
+- `git`
+- `gh` (GitHub CLI, authenticated)
+- `claude` and/or `codex` on PATH (only the runtimes you'll actually launch)
 
 ## Install
 
-Clone into the pi extensions directory:
-
+```bash
+git clone <repo-url> ~/code/forge
+cd ~/code/forge
+bun install
+bun link        # puts ./bin/forge.ts on PATH as `forge`
+forge --version
 ```
-git clone <your-remote>:tcashel/forge.git ~/.pi/agent/extensions/forge
+
+For non-developer install once we publish:
+
+```bash
+bun install -g <git-url>
 ```
 
-Pi auto-loads extensions that declare a `pi` block in `package.json` — no further config needed.
+### Claude Code plugin
 
-## Usage
+Symlink `cc-plugin/` into wherever your Claude Code install loads plugins from (typically `~/.claude/plugins/forge/` — exact path depends on your Claude Code version). The plugin assumes `forge` is on `PATH`.
 
-`/forge` opens the mission-control dashboard. From there, press `n` (or run `/forge-spec`) to start a new task — the bundled planner skill will research the repo and draft a spec conversationally. When the spec looks right, `Alt+S` saves it and offers to launch. Press `v` on any task to open its saved spec in your default `.md` viewer (or set `FORGE_SPEC_VIEWER=zed` to pick a specific editor). Forge spins up the chosen agent (`pi`, `claude`, or `codex`) in a tmux session inside a fresh git worktree. `/forge-attach` lets you watch (or detach with `Ctrl-B d`). On completion the runner executes the repo's quality gates, pushes the branch, and opens a draft PR. `/forge-review <n>` runs the bundled reviewer skill against the PR diff and linked spec.
+## Quickstart
 
-Before launching, you can pressure-test a spec with `/forge-critique` (or press `c` in the dashboard). This sends the spec to two different models for independent adversarial review, then a third model synthesizes both critiques into a prioritized recommendations document. The whole flow runs in the background via tmux. When it's done, press `c` again to view the recommendations or enter spec-mode with them pre-loaded so you can selectively apply changes.
+Set per-repo defaults once:
 
-## Commands
+```bash
+cd <some-repo>
+forge config set reviewerAgent codex
+forge config set reviewerModel o3
+```
 
-| Command | Description |
+Save a spec from stdin and launch:
+
+```bash
+cat plan.md | forge spec save - --title "Add Redis caching" --json
+# → { "taskId": "add-redis-caching-mok…", "specPath": "...", "branch": "forge/add-redis-caching" }
+
+forge launch <task-id> --agent claude --model claude-opus-4-7 --json
+forge wait <task-id> --until done,failed,quality_failed --json
+```
+
+Or drive the same flow from Claude Code: enter plan mode, produce a plan, exit plan mode, run `/forge-ship-plan`. The planner skill reshapes your plan into the Forge schema and the slash command pipes it into `forge spec save -` for you.
+
+Open the standalone TUI dashboard:
+
+```bash
+forge dash
+```
+
+## Subcommand reference
+
+| Command | Purpose |
 |---|---|
-| `/forge` | Open mission-control dashboard |
-| `/forge-spec [arg]` | Enter spec-mode (arg: JIRA key, idea, or blank) |
-| `/forge-edit-spec [arg]` | Re-enter spec-mode on an existing spec |
-| `/forge-critique [arg]` | Run adversarial critique on a spec |
-| `/forge-save-spec` | Promote working draft and optionally launch |
-| `/forge-cancel-spec` | Exit spec-mode (draft preserved on disk) |
-| `/forge-launch` | Launch an agent on an existing spec |
-| `/forge-attach` | Attach to a running agent's tmux session |
-| `/forge-review <pr>` | Review a PR with the forge-reviewer skill |
-| `/forge-status` | Show task status summary in chat |
+| `forge spec save [-/--from-file]` | Save a draft from stdin or file. Generates frontmatter + task id. |
+| `forge spec ls` | List draft specs. |
+| `forge spec show <id> [--raw]` | Print a saved spec. |
+| `forge launch <id>` | Launch a draft (claude/codex) into tmux + worktree. Defaults from `forge config`. |
+| `forge attach <id>` | Exec into the task's tmux session. |
+| `forge ls` | List tasks (current repo by default; `--all` for global). |
+| `forge status <id>` | Status, run meta, optional log tail. |
+| `forge logs <id> [-f]` | Tail or follow agent.log. |
+| `forge wait <id>` | Block until terminal status (`--until done,failed,quality_failed`). NDJSON heartbeats to stderr. |
+| `forge critique <id>` | Two-critic + synth adversarial spec critique. |
+| `forge config get/set/list <key> [<value>]` | Per-repo settings (reviewer/critique pairs, gh user/host, JIRA project). |
+| `forge dash` | Mission-control TUI. |
+
+Every command supports `--json` and a stable error envelope:
+
+```json
+{ "ok": false, "error": { "code": "NO_TMUX", "message": "tmux not found on PATH", "hint": "brew install tmux" } }
+```
+
+Exit codes: `0` ok, `1` user error, `2` precondition (no tmux/gh/git/TTY), `3` runtime failure, `4` `forge wait` timeout.
 
 ## State
 
-All persistent state lives under `~/.forge/`:
+Forge keeps everything in `~/.forge/`:
 
 ```
 ~/.forge/
-  specs/            # saved spec markdown per task
-  runs/             # per-task run dir (logs, meta, runner script, prompt)
-  drafts/           # working drafts during spec-mode
-  index.json        # task index (all repos)
-  repo-config.json  # per-repo settings (JIRA defaults, etc.)
+  specs/             # saved spec markdown per task
+  runs/<task-id>/    # per-run logs, meta.json, runner script, prompt
+  critiques/<id>/    # critic+synth output per critique invocation
+  index.json         # task index (locked atomically on writes)
+  repo-config.json   # per-repo settings keyed by absolute repo root
 ```
 
-## Source map
+Writes are atomic (temp + fsync + rename). Read-modify-writes on `index.json` and `repo-config.json` use an `O_EXCL` lockfile so concurrent writers don't lose updates.
 
-| File | Role |
-|---|---|
-| `src/index.ts` | Extension entry point — registers all slash commands |
-| `src/dashboard.ts` | TUI mission-control view (keyboard-driven task list) |
-| `src/spec-mode.ts` | Conversational spec drafting with the planner skill |
-| `src/launch.ts` | tmux-based background agent execution and runner script generation |
-| `src/repo.ts` | Repo detection — stack, quality commands, worktree helpers |
-| `src/store.ts` | `~/.forge/` state management (index, specs, run metadata) |
-| `src/jira.ts` | JIRA integration via `acli` CLI |
-| `src/pr-body.ts` | PR body builder (frontmatter parsing + summary/test plan) |
-| `src/progress.ts` | Structured snapshot types and reducer (WIP — not yet wired into `launch.ts`) |
-| `src/supervisor.ts` | Structured progress tracker for pi-runtime tasks (WIP — not yet wired into `launch.ts`) |
-| `src/critique.ts` | Adversarial spec critique runner (tmux-based, parallel critics + synthesizer) |
-| `skills/forge-planner/` | Planner skill — drafts specs from ideas or JIRA tickets |
-| `skills/forge-reviewer/` | Reviewer skill — severity + scoring rubrics for PR review |
-| `skills/forge-critic/` | Critic skill — adversarial spec review with severity labels |
-| `skills/forge-synthesizer/` | Synthesizer skill — merges two critiques into recommendations |
-| `tests/` | Tests (`pr-body.test.ts`, `progress.test.ts`, `supervisor.test.ts`, fixtures) |
+## Repo layout
+
+```
+forge/
+├── bin/forge.ts              # bun shebang shim
+├── src/
+│   ├── cli/                  # subcommand dispatch + per-command files
+│   ├── core/                 # store, launch, critique, gh, jira, repo, reviewer, pr-body
+│   └── tui/                  # theme, keys, width, render-loop, dashboard
+├── skills/                   # 4 skills used by the CLI and the cc-plugin
+│   ├── forge-planner/
+│   ├── forge-reviewer/
+│   ├── forge-critic/
+│   └── forge-synthesizer/
+├── cc-plugin/                # Claude Code plugin (in tree)
+│   ├── .claude-plugin/plugin.json
+│   ├── commands/             # 7 slash commands
+│   ├── skills -> ../skills   # symlink so the plugin loader sees the same skills
+│   └── README.md
+└── tests/                    # bun test
+```
 
 ## Development
 
-Edit files in place under `~/.pi/agent/extensions/forge/` — pi reloads extensions on agent restart. Run the quality gate with `pnpm run lint`. Run tests with `node --test --experimental-strip-types tests/*.test.ts`.
+```bash
+bun test              # tests
+bun run lint          # biome check .
+bun run check         # biome check --write .
+```
 
-## Ideas — deferred work
+## Status
 
-The current scope ends at one-shot review and run capture. Tracked for future
-sessions:
-
-- **Reviewer → implementer iteration loop.** Up to 3 rounds, fix-via-new-commit
-  (no amend), implementer instructed to push back on bogus findings. Convergence
-  guard: bail if iteration N's findings aren't strictly better than N-1.
-- **Spec decomposer skill.** Turns one ambitious spec into a DAG of small
-  sub-specs that each leave the branch green. Default execution: sequential in
-  one worktree, one PR with N commits. `parallel: true` annotation only for
-  proven-independent leaves (no file overlap). Avoids stacked-PR tooling cost.
-- **`/forge-reflect` skill.** Reads run history across all repos, surfaces
-  patterns: which specs needed iteration, which models hold up best on this
-  repo, which acceptance criteria the reviewer flags most often. Feeds back
-  into improving the planner skill. Requires a few weeks of captured data.
-- **Synthesizer apply-recommendations picker.** Parse `forge-spec-recommendations`
-  blocks into items; checkbox picker in dashboard; selecting one opens spec-mode
-  with the recommendation pre-loaded as the opening turn (discuss, don't
-  auto-apply).
-- **Markdown-lint on spec save.** Catch structural breakage (broken headings,
-  unclosed fences) without trying to enforce writing style.
-- **Token / $ capture per run.** Per-runtime parsing of cost output. Engineering
-  rabbit hole — punt until reflect needs it.
-- **Pre-PR self-check by the implementer.** Walk acceptance criteria, mark
-  met/partial/missing, refuse PR open on any BLOCKER-equivalent gap. Possibly
-  redundant with the reviewer loop once that lands.
-- **Centralized cross-repo run dashboard view.** Summary across `~/.forge/runs/`
-  for "what ran today", time-to-PR trends, etc.
+- Pre-release (0.4.0-dev). API and config keys may change.
+- Pi (the previous host) is removed entirely. The pre-rip snapshot is tagged `pre-rip-v0.3.0`.
+- `forge resume` is not yet wired — the supervisor that backed it was pi-specific. Re-launching a failed spec from scratch is the current path.
 
 ## License
 
-TBD (pre-1.0)
+TBD.
