@@ -53,6 +53,10 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
       "reviewer-model": { type: "string" },
       reasoning: { type: "string" },
       "reviewer-reasoning": { type: "string" },
+      "fixer-agent": { type: "string" },
+      "fixer-model": { type: "string" },
+      "fixer-reasoning": { type: "string" },
+      "no-auto-fix": { type: "boolean", default: false },
       "in-place": { type: "boolean", default: false },
       worktree: { type: "string" },
       branch: { type: "string" },
@@ -90,6 +94,12 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
   const reasoning = asEffort(values.reasoning, "--reasoning");
   const reviewerReasoning = asEffort(values["reviewer-reasoning"], "--reviewer-reasoning");
+
+  const fixerAgent = asAgent(values["fixer-agent"] ?? repoConfig.fixerAgent ?? reviewerAgent, "--fixer-agent");
+  const fixerModel = (values["fixer-model"] as string | undefined) ?? repoConfig.fixerModel ?? reviewerModel;
+  const fixerReasoning = asEffort(values["fixer-reasoning"] ?? repoConfig.fixerReasoningEffort, "--fixer-reasoning");
+  const autoFix = !(values["no-auto-fix"] as boolean) && (repoConfig.autoFix ?? true);
+  const autoFixRounds = repoConfig.autoFixRounds ?? 1;
 
   if (agent === reviewerAgent && model === reviewerModel) {
     throw new CliError("REVIEWER_SAME_AS_IMPL", "Implementer and reviewer must differ on agent or model.", {
@@ -142,6 +152,11 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
       reviewerTarget: reviewerAgent,
       reviewerModel,
       reviewerReasoningEffort: reviewerReasoning,
+      autoFix,
+      autoFixRounds,
+      fixerTarget: fixerAgent,
+      fixerModel,
+      fixerReasoningEffort: fixerReasoning,
       ghUser: repoConfig.ghUser,
       ghHost: repoConfig.ghHost,
     },
