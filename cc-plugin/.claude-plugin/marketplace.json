@@ -1,0 +1,19 @@
+{
+  "name": "forge",
+  "owner": { "name": "tcashel" },
+  "description": "Forge — agentic coding workflow control plane for Claude Code",
+  "version": "1.0.0",
+  "repository": "https://github.com/tcashel/forge",
+  "license": "UNLICENSED",
+  "plugins": [
+    {
+      "name": "forge",
+      "source": "cc-plugin",
+      "description": "Slash commands and skills for launching background coding agents, reviewing PRs, and critiquing specs.",
+      "version": "0.4.0-dev",
+      "author": "tcashel",
+      "keywords": ["forge", "agents", "workflow", "coding", "tmux", "worktree", "review", "spec"],
+      "category": "developer-tools"
+    }
+  ]
+}

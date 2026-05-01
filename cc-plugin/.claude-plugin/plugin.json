@@ -3,7 +3,11 @@
   "version": "0.4.0-dev",
   "description": "Agentic coding workflow control plane — drives the forge CLI from inside Claude Code.",
   "author": {
-    "name": "Tripp Cashel"
+    "name": "Tripp Cashel",
+    "github": "tcashel"
   },
-  "homepage": "https://github.com/tcashel/forge"
+  "homepage": "https://github.com/tcashel/forge",
+  "repository": "https://github.com/tcashel/forge",
+  "license": "UNLICENSED",
+  "keywords": ["forge", "agents", "workflow", "coding", "tmux", "worktree", "review", "spec"]
 }
