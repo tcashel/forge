@@ -13,8 +13,10 @@ import * as fs from "node:fs";
 import { parseArgs } from "node:util";
 import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, TaskRecord } from "../../core/store.ts";
+import { makeTheme } from "../../tui/theme.ts";
 import { CliError, emitOk } from "../output.ts";
 import { readStdin } from "../pickers.ts";
+import { renderMarkdown } from "../render-md.ts";
 
 function deriveTitle(body: string, override?: string): string {
   if (override) return override.trim();
@@ -177,7 +179,19 @@ async function runShow(argv: string[], store: ForgeStore): Promise<void> {
     return;
   }
 
-  emitOk({ taskId: id, body: spec }, values.json === true, () => spec);
+  if (values.json) {
+    emitOk({ taskId: id, body: spec }, true);
+    return;
+  }
+
+  // Pipes / redirects get raw markdown; only render in a real TTY.
+  if (!process.stdout.isTTY) {
+    process.stdout.write(spec);
+    return;
+  }
+
+  const theme = makeTheme();
+  process.stdout.write(`${renderMarkdown(spec, theme)}\n`);
 }
 
 export async function run(argv: string[], store: ForgeStore): Promise<void> {
