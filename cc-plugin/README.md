@@ -29,7 +29,7 @@ forge --version  # 0.4.0-dev
 
 ## Skills
 
-Bundled (via the `skills/` symlink to `../skills`):
+Bundled in `cc-plugin/skills/`:
 
 - `forge-planner` — drafts a spec from an idea or a plan-mode plan.
 - `forge-reviewer` — produces a structured verdict against a PR diff + linked spec.
@@ -69,7 +69,26 @@ claude --plugin-dir ./cc-plugin
 
 `~/.claude/plugins/` is owned by Claude Code itself and only stores marketplace-installed plugins; don't symlink into it.
 
-**For distribution (TODO):** create a `.claude-plugin/marketplace.json` so others can `/plugin install forge@<marketplace>`. Not yet set up.
+**Marketplace install — local clone (fastest, works for private repos):**
+
+```bash
+/plugin marketplace add /path/to/forge
+/plugin install forge
+```
+
+**Marketplace install — private git repo via SSH:**
+
+```bash
+/plugin marketplace add git@github.com:tcashel/forge
+/plugin install forge
+```
+
+**Marketplace install — public HTTPS:**
+
+```bash
+/plugin marketplace add https://github.com/tcashel/forge
+/plugin install forge
+```
 
 ## Notes
 
