@@ -13,7 +13,7 @@ repo: /tmp/repo
 repoName: my-repo
 createdAt: 2025-01-01T00:00:00Z
 status: draft
-suggestedAgent: pi
+suggestedAgent: claude
 suggestedModel: claude-opus-4-6
 suggestedBranch: feat/test
 jiraTicket: PROJ-123
@@ -49,7 +49,7 @@ database layer. Cache invalidation uses TTL with tag-based purging.
       { command: "npm run lint", ok: true, durationMs: 1200 },
       { command: "npm run test", ok: true, durationMs: 8400 },
     ],
-    agent: "pi",
+    agent: "claude",
     model: "claude-opus-4-6",
     jiraTicket: "PROJ-123",
     jiraUrl: "https://jira.example.com/browse/PROJ-123",
@@ -88,7 +88,7 @@ test("happy path: all sections present with agent summary, commits, quality, JIR
   // Footer with JIRA link
   assert.ok(body.includes("🔗 [PROJ-123](https://jira.example.com/browse/PROJ-123)"), "JIRA markdown link in footer");
   assert.ok(body.includes("🤖 forge `task-abc123`"), "forge task id in footer");
-  assert.ok(body.includes("`pi` / `claude-opus-4-6`"), "agent/model in footer");
+  assert.ok(body.includes("`claude` / `claude-opus-4-6`"), "agent/model in footer");
 });
 
 // ─── Summary fallback: Context ────────────────────────────────────────────────

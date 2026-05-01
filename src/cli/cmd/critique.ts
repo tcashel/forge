@@ -5,9 +5,9 @@
  * Defaults are read from the per-repo critique config; CLI flags override.
  *
  * Required (via repo-config or flags):
- *   --critic-a-agent <pi|claude|codex>   --critic-a-model <id>
- *   --critic-b-agent <pi|claude|codex>   --critic-b-model <id>
- *   --synth-agent    <pi|claude|codex>   --synth-model    <id>
+ *   --critic-a-agent <claude|codex|opencode|gemini>   --critic-a-model <id>
+ *   --critic-b-agent <claude|codex|opencode|gemini>   --critic-b-model <id>
+ *   --synth-agent    <claude|codex|opencode|gemini>   --synth-model    <id>
  *
  * Optional:
  *   --critic-a-reasoning <low|medium|high|xhigh>  (codex only)
@@ -22,7 +22,7 @@ import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
-const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 function asAgent(v: unknown, field: string): LaunchTarget {

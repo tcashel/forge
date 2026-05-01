@@ -38,7 +38,7 @@ const EFFORT_KEYS = [
 const BOOLEAN_KEYS = ["autoFix"] as const;
 const NUMBER_KEYS = ["autoFixRounds"] as const;
 
-const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 type ConfigKey =

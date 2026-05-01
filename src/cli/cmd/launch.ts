@@ -2,9 +2,9 @@
  * forge launch <task-id> — kick off a background agent run.
  *
  * Required flags (or RepoConfig defaults):
- *   --agent <pi|claude|codex>
+ *   --agent <claude|codex|opencode|gemini>
  *   --model <model-id>
- *   --reviewer-agent <pi|claude|codex>
+ *   --reviewer-agent <claude|codex|opencode|gemini>
  *   --reviewer-model <model-id>
  *
  * Optional flags:
@@ -25,7 +25,7 @@ import { createWorktree, detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
-const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 function asAgent(v: unknown, field: string): LaunchTarget {
