@@ -131,6 +131,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
       specTitle: task.title,
       target: agent,
       model,
+      reasoningEffort: reasoning,
       worktreePath,
       qualityCommands: repo.qualityCommands,
       defaultBranch: repo.defaultBranch,

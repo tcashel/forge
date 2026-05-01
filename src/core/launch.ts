@@ -20,6 +20,7 @@ export interface LaunchConfig {
   specTitle: string;
   target: LaunchTarget;
   model: string;
+  reasoningEffort?: ReasoningEffort;
   worktreePath: string;
   qualityCommands: string[];
   defaultBranch: string;
@@ -119,7 +120,9 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const prBodyTsPath = path.join(extDir, "pr-body.ts");
 
   // ── claude / codex bash runner ──────────────────────────────
-  const agentCmd = agentCommand(config.target, config.model, promptFile);
+  const agentCmd = agentCommand(config.target, config.model, promptFile, {
+    reasoningEffort: config.reasoningEffort,
+  });
   // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
   // because long titles render badly in GitHub's PR list.
   const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
@@ -620,6 +623,7 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     status: "running",
     startedAt: new Date().toISOString(),
     prUrl: null,
+    reasoningEffort: config.reasoningEffort,
     reviewerAgent: config.reviewerTarget,
     reviewerModel: config.reviewerModel,
     reviewerReasoningEffort: config.reviewerReasoningEffort,

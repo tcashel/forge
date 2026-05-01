@@ -66,6 +66,7 @@ export interface RunMeta {
   finalSha?: string;
   prNumber?: number;
   qualityResults?: { command: string; ok: boolean; durationMs: number }[];
+  reasoningEffort?: ReasoningEffort;
   reviewerAgent?: LaunchTarget;
   reviewerModel?: string;
   reviewerReasoningEffort?: ReasoningEffort;

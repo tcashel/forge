@@ -9,6 +9,7 @@
 import { ForgeStore } from "../core/store.ts";
 import * as attach from "./cmd/attach.ts";
 import * as config from "./cmd/config.ts";
+import * as critique from "./cmd/critique.ts";
 import * as dash from "./cmd/dash.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
@@ -31,6 +32,7 @@ Commands:
   spec show <id>   Print a saved spec
 
   launch <id>      Kick off a background agent run for a spec
+  critique <id>    Run two-critic + synthesizer adversarial critique on a spec
   attach <id>      Exec into the task's tmux session
   ls               List tasks (current repo by default)
   status <id>      Show task and run state
@@ -78,6 +80,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "launch":
         await launch.run(rest, store);
+        return;
+      case "critique":
+        await critique.run(rest, store);
         return;
       case "attach":
         await attach.run(rest, store);
