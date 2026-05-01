@@ -8,7 +8,7 @@
   "plugins": [
     {
       "name": "forge",
-      "source": "cc-plugin",
+      "source": "./cc-plugin",
       "description": "Slash commands and skills for launching background coding agents, reviewing PRs, and critiquing specs.",
       "version": "0.4.0-dev",
       "author": "tcashel",
