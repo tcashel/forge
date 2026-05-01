@@ -20,6 +20,7 @@ const STRING_KEYS = [
   "ghHost",
   "jiraProject",
   "jiraType",
+  "defaultModel",
   "reviewerModel",
   "fixerModel",
   "critiqueModelA",
@@ -27,7 +28,14 @@ const STRING_KEYS = [
   "critiqueModelSynth",
 ] as const;
 
-const AGENT_KEYS = ["reviewerAgent", "fixerAgent", "critiqueAgentA", "critiqueAgentB", "critiqueAgentSynth"] as const;
+const AGENT_KEYS = [
+  "defaultAgent",
+  "reviewerAgent",
+  "fixerAgent",
+  "critiqueAgentA",
+  "critiqueAgentB",
+  "critiqueAgentSynth",
+] as const;
 const EFFORT_KEYS = [
   "reviewerReasoningEffort",
   "fixerReasoningEffort",
@@ -140,6 +148,22 @@ async function runSet(argv: string[], store: ForgeStore): Promise<void> {
   const validated = validateValue(key, rawValue);
   const patch = { [key]: validated } as Partial<RepoConfig>;
   store.setRepoConfig(repoRoot, patch);
+
+  if (key === "defaultAgent" || key === "defaultModel") {
+    const after = store.getRepoConfig(repoRoot);
+    if (
+      after.defaultAgent &&
+      after.defaultModel &&
+      after.defaultAgent === after.reviewerAgent &&
+      after.defaultModel === after.reviewerModel
+    ) {
+      process.stderr.write(
+        `warning: defaultAgent/defaultModel now match reviewerAgent/reviewerModel — ` +
+          `every launch will fail REVIEWER_SAME_AS_IMPL until one is changed.\n`,
+      );
+    }
+  }
+
   emitOk({ repoRoot, key, value: validated }, values.json === true, () => `set ${key} = ${rawValue}`);
 }
 

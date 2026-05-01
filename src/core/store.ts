@@ -85,6 +85,10 @@ export interface RunMeta {
 export interface RepoConfig {
   jiraProject?: string;
   jiraType?: string;
+  /** Default implementer agent for `forge launch` when no flag/task value is set. */
+  defaultAgent?: LaunchTarget;
+  /** Default implementer model for `forge launch` when no flag/task value is set. */
+  defaultModel?: string;
   critiqueAgentA?: string;
   critiqueModelA?: string;
   critiqueReasoningA?: ReasoningEffort;
