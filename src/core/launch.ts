@@ -596,10 +596,11 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
   const runDir = store.ensureRunDir(config.taskId);
   fs.writeFileSync(path.join(runDir, "spec-snapshot.md"), config.specContent, "utf-8");
 
-  // Write reviewer prompt prefix for the post-PR reviewer step
+  // Write reviewer prompt prefix for the post-PR reviewer step.
+  // launch.ts now lives at src/core/, but skills/ is at the repo root.
   const reviewPrefix = buildReviewerPromptPrefix({
     repoName: config.repoName,
-    skillsDir: path.join(path.dirname(fileURLToPath(import.meta.url)), "skills", "forge-reviewer"),
+    skillsDir: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills", "forge-reviewer"),
   });
   fs.writeFileSync(path.join(runDir, "review-prompt-prefix.txt"), reviewPrefix, "utf-8");
 

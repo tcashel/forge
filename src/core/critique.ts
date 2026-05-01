@@ -44,7 +44,8 @@ export interface CritiqueResult {
 // ─── Skill loading ────────────────────────────────────────────────────────────
 
 function skillDir(): string {
-  return path.join(path.dirname(fileURLToPath(import.meta.url)), "skills");
+  // critique.ts lives at src/core/, but skills/ is at the repo root.
+  return path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills");
 }
 
 function readSkillFile(relPath: string): string {
