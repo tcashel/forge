@@ -25,6 +25,26 @@ import { isTmuxSessionAlive } from "../../core/launch.ts";
 import type { ForgeStore, TaskStatus } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 
+export const HELP = `forge wait <task-id> [...flags]
+
+Block until the task reaches a terminal state. Used by the cc-plugin to
+turn launch + outcome into a single conversational round.
+
+Flags:
+  --until <csv>     Comma-separated terminal states. Default:
+                    "done,failed,quality_failed".
+                    Special: "pr_ready" → status=done AND prUrl != null.
+  --timeout <d>     Duration like "30m", "2h", "90s" (default: 30m).
+  --poll <d>        Polling interval (default: 3s).
+  --json
+
+Heartbeats: in JSON mode, NDJSON \`{type:"heartbeat",...}\` to stderr each
+poll; in human mode, one summary line per poll. Final terminal status to
+stdout as a single JSON object.
+
+Exit codes: 0 satisfied, 3 stalled, 4 timeout, 1 unknown task.
+`;
+
 const TERMINAL_DEFAULT: TaskStatus[] = ["done", "failed", "quality_failed"];
 
 function parseDuration(s: string): number {

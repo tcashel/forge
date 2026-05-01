@@ -20,6 +20,13 @@ import { runTui } from "../../tui/render-loop.ts";
 import { makeTheme } from "../../tui/theme.ts";
 import { CliError } from "../output.ts";
 
+export const HELP = `forge dash
+
+Open the standalone mission-control TUI. Read-only navigation: select tasks,
+attach to tmux sessions, view specs, kill runs. Exits 2 if stdout is not a
+TTY.
+`;
+
 function openSpecInViewer(specFile: string): void {
   if (!fs.existsSync(specFile)) return;
   const opener =

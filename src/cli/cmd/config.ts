@@ -15,6 +15,33 @@ import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge config <get|set|list> [...flags]
+
+Read/write per-repo settings (stored in ~/.forge/repo-config.json keyed by
+repo root path).
+
+forge config get <key> [--repo <path>] [--json]
+forge config set <key> <value> [--repo <path>] [--json]
+forge config set <key> --clear [--repo <path>]
+forge config list [--repo <path>] [--json]
+
+Common keys:
+  defaultAgent, defaultModel             Implementer fallback for forge launch
+  reviewerAgent, reviewerModel           Reviewer pair (must differ from impl)
+  reviewerReasoningEffort                low|medium|high|xhigh (codex only)
+  fixerAgent, fixerModel, fixerReasoningEffort
+  autoFix (true|false), autoFixRounds (int)
+  ghUser, ghHost                         gh-cli account / host overrides
+  jiraProject, jiraType
+  critiqueAgentA / critiqueModelA / critiqueReasoningA  (and B / Synth)
+
+Examples:
+  forge config set defaultAgent codex
+  forge config set defaultModel gpt-5-codex
+  forge config set reviewerAgent claude
+  forge config set reviewerModel claude-opus-4-7
+`;
+
 const STRING_KEYS = [
   "ghUser",
   "ghHost",

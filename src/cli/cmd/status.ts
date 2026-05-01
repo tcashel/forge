@@ -11,6 +11,15 @@ import { isTmuxSessionAlive } from "../../core/launch.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge status <task-id> [...flags]
+
+Show task and run state.
+
+Flags:
+  --json
+  --tail N    Lines of agent.log to include (default: 0 in --json, 8 human)
+`;
+
 export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
