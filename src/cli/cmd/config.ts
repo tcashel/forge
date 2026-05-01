@@ -21,23 +21,32 @@ const STRING_KEYS = [
   "jiraProject",
   "jiraType",
   "reviewerModel",
+  "fixerModel",
   "critiqueModelA",
   "critiqueModelB",
   "critiqueModelSynth",
 ] as const;
 
-const AGENT_KEYS = ["reviewerAgent", "critiqueAgentA", "critiqueAgentB", "critiqueAgentSynth"] as const;
+const AGENT_KEYS = ["reviewerAgent", "fixerAgent", "critiqueAgentA", "critiqueAgentB", "critiqueAgentSynth"] as const;
 const EFFORT_KEYS = [
   "reviewerReasoningEffort",
+  "fixerReasoningEffort",
   "critiqueReasoningA",
   "critiqueReasoningB",
   "critiqueReasoningSynth",
 ] as const;
+const BOOLEAN_KEYS = ["autoFix"] as const;
+const NUMBER_KEYS = ["autoFixRounds"] as const;
 
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
-type ConfigKey = (typeof STRING_KEYS)[number] | (typeof AGENT_KEYS)[number] | (typeof EFFORT_KEYS)[number];
+type ConfigKey =
+  | (typeof STRING_KEYS)[number]
+  | (typeof AGENT_KEYS)[number]
+  | (typeof EFFORT_KEYS)[number]
+  | (typeof BOOLEAN_KEYS)[number]
+  | (typeof NUMBER_KEYS)[number];
 
 function repoRootFromArgs(values: Record<string, unknown>): string {
   if (typeof values.repo === "string") return values.repo;
@@ -60,6 +69,19 @@ function validateValue(key: ConfigKey, value: string): unknown {
       throw new CliError("BAD_VALUE", `${key} must be one of: ${VALID_EFFORTS.join(", ")}`, { exitCode: 1 });
     }
     return value;
+  }
+  if ((BOOLEAN_KEYS as readonly string[]).includes(key)) {
+    if (value !== "true" && value !== "false") {
+      throw new CliError("BAD_VALUE", `${key} must be "true" or "false"`, { exitCode: 1 });
+    }
+    return value === "true";
+  }
+  if ((NUMBER_KEYS as readonly string[]).includes(key)) {
+    const n = Number(value);
+    if (!Number.isInteger(n) || n < 1) {
+      throw new CliError("BAD_VALUE", `${key} must be a positive integer`, { exitCode: 1 });
+    }
+    return n;
   }
   return value;
 }

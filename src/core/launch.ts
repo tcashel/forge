@@ -11,7 +11,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { bashGhEnvExport } from "./gh.js";
-import { buildReviewerPromptPrefix } from "./reviewer.js";
+import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
 
 export interface LaunchConfig {
@@ -31,6 +31,11 @@ export interface LaunchConfig {
   reviewerTarget: LaunchTarget;
   reviewerModel: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  autoFix: boolean;
+  autoFixRounds: number;
+  fixerTarget: LaunchTarget;
+  fixerModel: string;
+  fixerReasoningEffort?: ReasoningEffort;
   /** Per-repo gh account override (see gh.ts). Falls back to gh's active account. */
   ghUser?: string;
   /** Per-repo gh host override. Falls back to github.com. */
@@ -110,6 +115,163 @@ function conventionalCommitPrefix(branch: string): string {
   return m ? m[1] : "feat";
 }
 
+function generateAutoFixBlock(config: LaunchConfig, runDir: string, fixerCmd: string, reviewerCmd: string): string {
+  const qualityCheck = fixQualityBlock(config.qualityCommands);
+  return `  # ── Auto-fix ────────────────────────────────────────────────────────────────
+  CURRENT_VERDICT=$(python3 -c "
+import json
+try:
+    d = json.load(open('${runDir}/meta.json'))
+    print(d.get('reviewVerdict', '') or '')
+except Exception:
+    print('')
+" 2>/dev/null || echo "")
+  FIX_ROUND=0
+  while [ "$CURRENT_VERDICT" = "request-changes" ] && [ $FIX_ROUND -lt ${config.autoFixRounds} ]; do
+    FIX_ROUND=$(( FIX_ROUND + 1 ))
+    log ""
+    log "═══ AUTO-FIX round $FIX_ROUND / ${config.autoFixRounds} ═══"
+    set_status "fixing"
+
+    # Build fixer prompt: skill header + spec + review findings
+    {
+      cat "$RUN_DIR/fixer-prompt-prefix.txt"
+      echo
+      echo "## Spec"
+      echo
+      cat "$RUN_DIR/spec-snapshot.md"
+      echo
+      echo "## Review findings to address"
+      echo "(Fix BLOCKER and HIGH severity findings only. Leave MEDIUM and LOW for the human reviewer.)"
+      echo
+      cat "$RUN_DIR/review.md"
+    } > "$RUN_DIR/fix-prompt.txt"
+
+    # Run fixer agent
+    if ${fixerCmd} > "$RUN_DIR/fix-raw-$FIX_ROUND.md" 2>&1; then
+      log "✓ Fixer completed"
+
+      # Re-run quality gates
+      FIX_QUALITY_OK=1
+${qualityCheck}
+
+      if [ "$FIX_QUALITY_OK" = "1" ]; then
+        # Commit and push fixes if there are changes
+        if git -C "$WORKTREE" diff --quiet && git -C "$WORKTREE" diff --cached --quiet; then
+          log "  (no changes to commit after fix)"
+        else
+          git -C "$WORKTREE" add -A
+          git -C "$WORKTREE" commit -m "fix(review): address reviewer feedback (round $FIX_ROUND)"
+          git -C "$WORKTREE" push 2>&1 | tee -a "$LOG_FILE"
+          log "✓ Fix committed and pushed"
+        fi
+
+        # Re-run reviewer with fresh diff
+        log ""
+        log "═══ RE-REVIEW after fix $FIX_ROUND ═══"
+        set_status "reviewing"
+
+        {
+          cat "$RUN_DIR/review-prompt-prefix.txt"
+          echo
+          echo "## PR metadata"
+          echo
+          echo '\`\`\`json'
+          gh pr view "$PR_NUMBER" --json number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url 2>/dev/null || echo '{}'
+          echo '\`\`\`'
+          echo
+          echo "## CI checks"
+          echo
+          echo '\`\`\`'
+          gh pr checks "$PR_NUMBER" 2>&1 || echo "(no check status available)"
+          echo '\`\`\`'
+          echo
+          echo "## Linked Forge spec"
+          echo
+          echo '\`\`\`markdown'
+          cat "$RUN_DIR/spec-snapshot.md"
+          echo '\`\`\`'
+          echo
+          echo "## Diff"
+          echo
+          echo '\`\`\`diff'
+          gh pr diff "$PR_NUMBER" 2>/dev/null | head -c 60000
+          echo '\`\`\`'
+          echo
+          echo 'Now produce the review in a single \`\`\`forge-review fenced block per the skill instructions.'
+        } > "$RUN_DIR/review-prompt.txt"
+
+        if ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1; then
+          NEW_VERDICT=$(python3 -c "
+import re, sys, json
+raw = open(sys.argv[1]).read()
+m = re.search(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL)
+if not m:
+    sys.exit(2)
+block = m.group(1)
+open(sys.argv[2], 'w').write(block)
+verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
+verdict = verdict_match.group(1).strip().lower() if verdict_match else None
+if verdict not in ('approve', 'request-changes', 'block'):
+    verdict = None
+print(json.dumps(verdict))
+" "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>/dev/null)
+          RE_EXTRACT=$?
+
+          if [ "$RE_EXTRACT" -eq 2 ]; then
+            log "⚠  No forge-review block in re-review output"
+            set_meta_field "reviewVerdict" "null"
+            set_meta_field "reviewError" '"no forge-review block in re-review"'
+            CURRENT_VERDICT=""
+          elif [ -z "$NEW_VERDICT" ] || [ "$NEW_VERDICT" = "null" ]; then
+            log "⚠  Verdict missing from re-review"
+            set_meta_field "reviewVerdict" "null"
+            CURRENT_VERDICT=""
+          else
+            log "✓ Re-review verdict: $NEW_VERDICT"
+            set_meta_field "reviewVerdict" "$NEW_VERDICT"
+            CURRENT_VERDICT=$(echo "$NEW_VERDICT" | tr -d '"')
+          fi
+        else
+          RE_EXIT=$?
+          log "⚠  Re-reviewer failed (exit $RE_EXIT) — stopping auto-fix"
+          set_meta_field "reviewError" '"re-reviewer process failed"'
+          break
+        fi
+      else
+        log "⚠  Quality gates failed after fix — stopping auto-fix"
+        break
+      fi
+    else
+      FIX_EXIT=$?
+      log "⚠  Fixer agent failed (exit $FIX_EXIT) — stopping auto-fix"
+      set_meta_field "reviewError" '"fixer agent failed"'
+      break
+    fi
+  done
+
+  if [ "$CURRENT_VERDICT" = "approve" ]; then
+    log ""
+    log "✓ Auto-fix complete — reviewer approved"
+  elif [ $FIX_ROUND -ge ${config.autoFixRounds} ] && [ $FIX_ROUND -gt 0 ]; then
+    log ""
+    log "↩  Auto-fix reached max rounds (${config.autoFixRounds}) — final verdict: $CURRENT_VERDICT"
+  fi`;
+}
+
+function fixQualityBlock(qualityCommands: string[]): string {
+  if (qualityCommands.length === 0) return "        : # no quality commands";
+  return qualityCommands
+    .map((cmd) => {
+      const escaped = cmd.replace(/"/g, '\\"');
+      return `        if ! (cd "$WORKTREE" && eval "${escaped}" >> "$LOG_FILE" 2>&1); then
+          log "  ✗ quality gate failed after fix"
+          FIX_QUALITY_OK=0
+        fi`;
+    })
+    .join("\n");
+}
+
 function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const runDir = store.ensureRunDir(config.taskId);
   const logFile = store.getLogFile(config.taskId);
@@ -146,6 +308,15 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const reviewerCmd = agentCommand(config.reviewerTarget, config.reviewerModel, `${runDir}/review-prompt.txt`, {
     reasoningEffort: config.reviewerReasoningEffort,
   });
+
+  // Build the fixer agent command for the bash script
+  const fixerCmd = agentCommand(config.fixerTarget, config.fixerModel, `${runDir}/fix-prompt.txt`, {
+    reasoningEffort: config.fixerReasoningEffort,
+  });
+
+  const autoFixBash = config.autoFix
+    ? generateAutoFixBlock(config, runDir, fixerCmd, reviewerCmd)
+    : "  # auto-fix disabled";
 
   return `#!/usr/bin/env bash
 # Forge runner — task: ${config.taskId}
@@ -517,6 +688,8 @@ print(json.dumps(verdict))
     set_meta_field "reviewError" ""reviewer process exited with code $REVIEWER_EXIT""
   fi
 
+${autoFixBash}
+
   set_status "done"
 fi
 
@@ -601,11 +774,16 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
 
   // Write reviewer prompt prefix for the post-PR reviewer step.
   // launch.ts now lives at src/core/, but skills/ is at the repo root.
+  const skillsRoot = path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills");
   const reviewPrefix = buildReviewerPromptPrefix({
     repoName: config.repoName,
-    skillsDir: path.join(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "skills", "forge-reviewer"),
+    skillsDir: path.join(skillsRoot, "forge-reviewer"),
   });
   fs.writeFileSync(path.join(runDir, "review-prompt-prefix.txt"), reviewPrefix, "utf-8");
+
+  // Write fixer prompt prefix for the auto-fix step (if enabled).
+  const fixerPrefix = buildFixerPromptPrefix({ skillsDir: path.join(skillsRoot, "forge-fixer") });
+  fs.writeFileSync(path.join(runDir, "fixer-prompt-prefix.txt"), fixerPrefix, "utf-8");
 
   // Write runner script
   const script = generateRunnerScript(config, store);

@@ -11,8 +11,8 @@
       "**/*.json",
       "!**/node_modules",
       "!**/dist",
-      "!.claude/**",
-      "!tests/fixtures/**",
+      "!.claude",
+      "!tests/fixtures",
       "!**/*-lock.json",
       "!**/pnpm-lock.yaml",
       "!**/package-lock.json"
