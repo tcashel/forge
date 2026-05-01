@@ -58,7 +58,18 @@ forge config set ghUser my-personal-account
 
 ## Install
 
-The plugin lives at `cc-plugin/` in the same repo as the CLI. Point Claude Code at it however your install supports plugins (symlink into `~/.claude/plugins/`, marketplace publish, etc.).
+The plugin lives at `cc-plugin/` in the same repo as the CLI.
+
+**For iterative use (current dev workflow):** load the local directory directly with `claude`'s `--plugin-dir` flag — no copy or symlink, edits take effect on `/reload-plugins`.
+
+```bash
+cd <forge-repo>
+claude --plugin-dir ./cc-plugin
+```
+
+`~/.claude/plugins/` is owned by Claude Code itself and only stores marketplace-installed plugins; don't symlink into it.
+
+**For distribution (TODO):** create a `.claude-plugin/marketplace.json` so others can `/plugin install forge@<marketplace>`. Not yet set up.
 
 ## Notes
 

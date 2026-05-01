@@ -14,6 +14,7 @@ import * as dash from "./cmd/dash.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
+import * as review from "./cmd/review.ts";
 import * as spec from "./cmd/spec.ts";
 import * as status from "./cmd/status.ts";
 import * as wait from "./cmd/wait.ts";
@@ -33,6 +34,7 @@ Commands:
 
   launch <id>      Kick off a background agent run for a spec
   critique <id>    Run two-critic + synthesizer adversarial critique on a spec
+  review <pr>      Compose the reviewer prompt for a PR (pipe to claude/codex)
   attach <id>      Exec into the task's tmux session
   ls               List tasks (current repo by default)
   status <id>      Show task and run state
@@ -83,6 +85,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "critique":
         await critique.run(rest, store);
+        return;
+      case "review":
+        await review.run(rest, store);
         return;
       case "attach":
         await attach.run(rest, store);

@@ -5,18 +5,16 @@ argument-hint: <pr-number>
 
 You are reviewing PR #$1.
 
-Use the **forge-reviewer** skill — pull in `skills/forge-reviewer/SKILL.md`, `severity.md`, and `scoring.md` before producing the verdict.
+Compose the reviewer prompt (PR metadata + CI checks + diff + linked Forge spec, with the forge-reviewer skill body embedded):
 
-PR overview:
-!`gh pr view $1 --json number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url`
+!`forge review $1`
 
-CI status:
-!`gh pr checks $1`
+The output above already embeds the **forge-reviewer** skill instructions (SKILL.md is loaded inline; companion files `severity.md` and `scoring.md` are referenced by absolute path — `read` them if you need the rubric tables).
 
-PR diff (truncate if huge — call out truncation):
-!`gh pr diff $1`
+Now produce the review:
 
-Linked Forge spec (if this PR was launched by Forge):
-!`gh pr view $1 --json headRefName --jq .headRefName | xargs -I{} sh -c 'forge ls --all --json | jq -r ".tasks[] | select(.branch==\"{}\") | .id"' | head -1 | xargs -I{} forge spec show {} --raw`
+1. Apply the rubric (severity bands, scoring) from the embedded skill.
+2. Output a single ` ```forge-review ` fenced block per the skill's output spec.
+3. End with a clear **approve / request-changes / block** recommendation.
 
-Apply the reviewer skill's rubric (severity bands, scoring) and produce a structured verdict block. End with a clear approve / request-changes / block recommendation.
+If `forge review` printed an error envelope (gh auth, unknown PR, not in a forge-managed repo), surface that to the user and stop.
