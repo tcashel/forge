@@ -11,7 +11,15 @@ import * as path from "node:path";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.js";
 import { withFileLock } from "./file-lock.js";
 
-export type TaskStatus = "draft" | "running" | "quality_check" | "creating_pr" | "done" | "failed" | "quality_failed";
+export type TaskStatus =
+  | "draft"
+  | "running"
+  | "quality_check"
+  | "creating_pr"
+  | "done"
+  | "failed"
+  | "quality_failed"
+  | "fixing";
 
 export type LaunchTarget = "claude" | "codex";
 
@@ -89,6 +97,11 @@ export interface RepoConfig {
   reviewerAgent?: LaunchTarget;
   reviewerModel?: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  fixerAgent?: LaunchTarget;
+  fixerModel?: string;
+  fixerReasoningEffort?: ReasoningEffort;
+  autoFix?: boolean;
+  autoFixRounds?: number;
   // ── GitHub CLI overrides ────────────────────────────────────────────────
   /** gh account to use for this repo (e.g. "tcashelmgni"). Falls back to gh's active account. */
   ghUser?: string;
@@ -208,7 +221,10 @@ export class ForgeStore {
   getRunningTasks(excludeRepo?: string): TaskRecord[] {
     return Object.values(this.readIndex().tasks).filter(
       (t) =>
-        (t.status === "running" || t.status === "quality_check" || t.status === "creating_pr") &&
+        (t.status === "running" ||
+          t.status === "quality_check" ||
+          t.status === "creating_pr" ||
+          t.status === "fixing") &&
         (!excludeRepo || t.repoRoot !== excludeRepo),
     );
   }

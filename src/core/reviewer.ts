@@ -51,6 +51,22 @@ export function buildReviewerPromptPrefix(args: { repoName: string; skillsDir: s
 }
 
 /**
+ * Build the static prefix for the fixer agent prompt: header + forge-fixer skill body.
+ * Dynamic sections (spec, review findings) are appended at runtime by the runner script.
+ */
+export function buildFixerPromptPrefix(args: { skillsDir: string }): string {
+  const skillBody = loadSkillBody(args.skillsDir);
+  return [
+    "You are auto-fixing a PR based on reviewer findings.",
+    "",
+    "## forge-fixer skill",
+    "",
+    skillBody.trim(),
+    "",
+  ].join("\n");
+}
+
+/**
  * Build the full one-shot reviewer prompt — identical to what the
  * `/forge-review` chat command produces. Implemented in terms of
  * `buildReviewerPromptPrefix` plus the dynamic sections.

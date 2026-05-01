@@ -31,9 +31,7 @@ export interface TuiHandle {
   stop(): void;
 }
 
-export interface ComponentFactory {
-  (handle: TuiHandle): TuiComponent;
-}
+export type ComponentFactory = (handle: TuiHandle) => TuiComponent;
 
 export async function runTui(factory: ComponentFactory): Promise<void> {
   if (!process.stdout.isTTY) {
