@@ -1,15 +1,16 @@
 /**
  * Forge PR Body — assembles a structured PR body from spec + git data.
  *
- * Shared helper used by both the pi supervisor and the bash runner.
+ * Shared helper used by the bash runner.
  * The spec file on disk is never modified.
  *
- * Runner: `node --experimental-strip-types` (Node 22), same as supervisor.ts.
+ * Runner: `node --experimental-strip-types` (Node 22).
  */
 
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import type { LaunchTarget } from "./store.js";
 
 // ─── Public types ─────────────────────────────────────────────────────────────
 
@@ -23,7 +24,7 @@ export interface PrBodyInput {
   deletions: number | null;
   filesChanged: number | null;
   qualityResults: Array<{ command: string; ok: boolean; durationMs: number }>;
-  agent: "pi" | "claude" | "codex";
+  agent: LaunchTarget;
   model: string;
   jiraTicket: string | null;
   jiraUrl: string | null;

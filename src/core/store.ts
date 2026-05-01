@@ -21,7 +21,7 @@ export type TaskStatus =
   | "quality_failed"
   | "fixing";
 
-export type LaunchTarget = "claude" | "codex";
+export type LaunchTarget = "claude" | "codex" | "opencode" | "gemini";
 
 export interface TaskRecord {
   id: string;

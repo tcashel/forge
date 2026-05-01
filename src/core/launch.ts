@@ -96,15 +96,20 @@ export function agentCommand(
   opts?: { reasoningEffort?: "low" | "medium" | "high" | "xhigh" },
 ): string {
   switch (target) {
-    case "pi":
-      // pi --print reads the trailing message args; for long prompts pipe via stdin
-      return `pi --print --model "${model}" --no-session < "${promptFile}"`;
     case "claude":
-      return `claude --print --model "${model}" < "${promptFile}"`;
+      return `claude --print --dangerously-skip-permissions --model "${model}" < "${promptFile}"`;
     case "codex": {
       const reasoningFlag = opts?.reasoningEffort ? ` --config reasoning_effort=${opts.reasoningEffort}` : "";
       return `codex exec --model "${model}"${reasoningFlag} -a never --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')"`;
     }
+    case "opencode":
+      // opencode `run` takes the message as a positional. Headless mode auto-approves
+      // tool calls (verified via smoke test).
+      return `opencode run --model "${model}" "$(cat '${promptFile}')"`;
+    case "gemini":
+      // -y is gemini's "yolo" mode — auto-approve all tool calls. Equivalent of
+      // claude's --dangerously-skip-permissions and codex's -a never.
+      return `gemini -y -m "${model}" -p "$(cat '${promptFile}')"`;
   }
 }
 

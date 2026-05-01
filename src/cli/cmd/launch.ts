@@ -2,10 +2,10 @@
  * forge launch <task-id> — kick off a background agent run.
  *
  * Required flags (or RepoConfig defaults):
- *   --agent <claude|codex>           or repoConfig.defaultAgent (or task.agent)
- *   --model <model-id>               or repoConfig.defaultModel  (or task.model)
- *   --reviewer-agent <claude|codex>  or repoConfig.reviewerAgent
- *   --reviewer-model <model-id>      or repoConfig.reviewerModel
+ *   --agent <claude|codex|opencode|gemini>  or repoConfig.defaultAgent (or task.agent)
+ *   --model <model-id>                      or repoConfig.defaultModel  (or task.model)
+ *   --reviewer-agent <claude|codex|opencode|gemini>  or repoConfig.reviewerAgent
+ *   --reviewer-model <model-id>                      or repoConfig.reviewerModel
  *
  * Implementer precedence (highest first): --agent flag → task.agent → repoConfig.defaultAgent.
  * Same for --model → task.model → repoConfig.defaultModel.
@@ -38,16 +38,16 @@ export const HELP = `forge launch <task-id> [...flags]
 Kick off a background agent run for a saved spec.
 
 Implementer (precedence: flag → task → repoConfig):
-  --agent <claude|codex>      defaultAgent
-  --model <model-id>          defaultModel
+  --agent <claude|codex|opencode|gemini>     defaultAgent
+  --model <model-id>                         defaultModel
 
 Reviewer (precedence: flag → repoConfig):
-  --reviewer-agent <claude|codex>     reviewerAgent
-  --reviewer-model <model-id>         reviewerModel
+  --reviewer-agent <claude|codex|opencode|gemini>    reviewerAgent
+  --reviewer-model <model-id>                        reviewerModel
   --reviewer-reasoning <low|medium|high|xhigh>   (codex reviewer only)
 
 Fixer (defaults to reviewer values):
-  --fixer-agent <claude|codex>
+  --fixer-agent <claude|codex|opencode|gemini>
   --fixer-model <model-id>
   --fixer-reasoning <low|medium|high|xhigh>
   --no-auto-fix                Disable the auto-fix loop after request-changes
@@ -67,7 +67,7 @@ Output:
 Set defaults with: forge config set <key> <value>
 `;
 
-const VALID_AGENTS: LaunchTarget[] = ["claude", "codex"];
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 /** Stable JSON shape for `MISSING_FLAGS` errors — cc-plugin parses this. */
