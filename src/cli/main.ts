@@ -22,6 +22,20 @@ import { CliError, emitError } from "./output.ts";
 
 const VERSION = "0.4.0-dev";
 
+const HELP_BY_CMD: Record<string, string> = {
+  attach: attach.HELP,
+  config: config.HELP,
+  critique: critique.HELP,
+  dash: dash.HELP,
+  launch: launch.HELP,
+  logs: logs.HELP,
+  ls: ls.HELP,
+  review: review.HELP,
+  spec: spec.HELP,
+  status: status.HELP,
+  wait: wait.HELP,
+};
+
 function printUsage(): void {
   process.stderr.write(`forge ${VERSION} — agentic coding workflow control plane
 
@@ -52,7 +66,11 @@ Global flags:
   --help, -h               Show this help
   --version, -V            Show version
 
-Run 'forge <command> --help' for command-specific flags (TODO).
+Common per-repo defaults (set with \`forge config set <key> <value>\`):
+  defaultAgent / defaultModel        Zero-flag \`forge launch\` after these are set
+  reviewerAgent / reviewerModel      Reviewer pair (must differ from implementer)
+
+Run 'forge <command> --help' for command-specific flags.
 `);
 }
 
@@ -72,6 +90,17 @@ export async function run(argv: string[]): Promise<void> {
 
   const cmd = argv[0];
   const rest = argv.slice(1);
+
+  // Per-command --help: print the cmd's HELP const and exit 0 before any
+  // store/dispatch work. First-position only; e.g. `forge launch --help`.
+  if (rest[0] === "--help" || rest[0] === "-h") {
+    const helpText = HELP_BY_CMD[cmd];
+    if (helpText) {
+      process.stdout.write(helpText);
+      process.exit(0);
+    }
+  }
+
   const store = new ForgeStore();
   const json = isJsonRequested(rest);
 

@@ -20,6 +20,16 @@ import { buildReviewerPrompt } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
+export const HELP = `forge review <pr-number> [...flags]
+
+Compose a reviewer prompt for a PR (gh + spec lookup baked in). Pipe the
+output to claude/codex.
+
+Flags:
+  --out <path>     Write composed prompt to disk
+  --json           Wrap prompt in the standard envelope
+`;
+
 const PR_VIEW_FIELDS = "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url";
 
 function reviewerSkillsDir(): string {

@@ -11,6 +11,15 @@ import { parseArgs } from "node:util";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 
+export const HELP = `forge logs <task-id> [...flags]
+
+Print the agent run log.
+
+Flags:
+  --tail N        Lines from end (default: 200; 0 = full file)
+  --follow, -f    Stream new lines as they're appended
+`;
+
 export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,

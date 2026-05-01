@@ -11,6 +11,13 @@ import { isTmuxAvailable, isTmuxSessionAlive } from "../../core/launch.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 
+export const HELP = `forge attach <task-id>
+
+Exec into the task's tmux session. Replaces the current process with
+\`tmux attach -t <session>\`. Exits 2 if tmux is missing, 1 if the session
+isn't alive.
+`;
+
 export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const id = argv[0];
   if (!id) {
