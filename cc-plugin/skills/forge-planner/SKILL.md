@@ -75,6 +75,7 @@ These live alongside this `SKILL.md` in the plugin's `skills/forge-planner/` dir
 - **Drafting on turn 1 without research** unless plan mode already did the research for you. Even then, glance at the named files to confirm they exist and the diff target is what the plan assumed.
 - **Adding YAML frontmatter to your draft.** Forge's `spec save` adds it. Start at `# Title`.
 - **Saving silently.** Surface the `taskId` and ask before launching. The user might want to critique the spec first (`forge critique <id>`) before committing tokens to a launch.
+- **Pre-critiquing your draft.** `forge spec save` runs the auto-improve loop (two-critic + synthesizer + improver) by default and rewrites the spec body in place. Don't try to anticipate or replicate that work in your draft — write the cleanest spec you can and let the auto-improve pass refine it.
 - **Citing a file you didn't open.** If the spec mentions `src/foo.ts:42`, `read` it first.
 - **Asking the agent to decide.** "Decide on retention strategy" is a bug, not an acceptance criterion. Make the call in the spec — the launched agent has less context than you do.
 - **Marking a spec as ready when criteria are vague.** "Tests pass" and "code is clean" are not acceptance criteria. The reviewer skill will reject them.

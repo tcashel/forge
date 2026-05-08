@@ -33,6 +33,12 @@ export interface CritiqueConfig {
   criticA: CritiqueAgent;
   criticB: CritiqueAgent;
   synthesizer: CritiqueAgent;
+  /**
+   * Informational only. `runCritiqueSync` always runs sync regardless;
+   * `launchCritique` always runs background regardless. Tracked here so
+   * callers can pass through their intent without splitting config types.
+   */
+  mode?: "sync" | "background";
 }
 
 export interface CritiqueResult {
@@ -288,21 +294,18 @@ echo "Recommendations: ${outputRec}"
 `;
 }
 
-// ─── Public API ───────────────────────────────────────────────────────────────
-
-export async function launchCritique(config: CritiqueConfig, store: ForgeStore): Promise<CritiqueResult> {
-  const tmuxSession = `forge-crit-${config.critiqueId.slice(-14)}`;
+/**
+ * Set up the critique directory: write critic prompts, seed
+ * critique-meta.json, generate the runner script. Shared by both
+ * `launchCritique` (tmux/background) and `runCritiqueSync` (synchronous).
+ */
+function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession: string): { runnerPath: string } {
   const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
   fs.mkdirSync(critiqueDir, { recursive: true });
 
-  const logFile = path.join(critiqueDir, "agent-a.log");
-
-  // Write critic prompt files
   fs.writeFileSync(path.join(critiqueDir, "critic-a.txt"), buildCriticPrompt(config, "A"), "utf-8");
   fs.writeFileSync(path.join(critiqueDir, "critic-b.txt"), buildCriticPrompt(config, "B"), "utf-8");
-  // synth.txt is built by the runner script after critics finish
 
-  // Seed critique-meta.json
   const meta: CritiqueMeta = {
     schemaVersion: 1,
     taskId: config.taskId,
@@ -339,10 +342,21 @@ export async function launchCritique(config: CritiqueConfig, store: ForgeStore):
   };
   store.writeCritiqueMeta(config.taskId, config.critiqueId, meta);
 
-  // Generate and write runner script
   const script = generateRunnerScript(config, store);
   const runnerPath = path.join(critiqueDir, "run.sh");
   fs.writeFileSync(runnerPath, script, { mode: 0o755 });
+
+  return { runnerPath };
+}
+
+// ─── Public API ───────────────────────────────────────────────────────────────
+
+export async function launchCritique(config: CritiqueConfig, store: ForgeStore): Promise<CritiqueResult> {
+  const tmuxSession = `forge-crit-${config.critiqueId.slice(-14)}`;
+  const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const logFile = path.join(critiqueDir, "agent-a.log");
+
+  const { runnerPath } = prepareCritique(config, store, tmuxSession);
 
   // Kill stale session
   killTmuxSession(tmuxSession);
@@ -361,4 +375,57 @@ export async function launchCritique(config: CritiqueConfig, store: ForgeStore):
     const msg = e instanceof Error ? e.message : String(e);
     return { tmuxSession, logFile, error: `Failed to start tmux: ${msg}` };
   }
+}
+
+export interface CritiqueSyncResult {
+  recommendationsPath: string;
+  critiqueId: string;
+  error: string | null;
+}
+
+/**
+ * Run the critique pipeline synchronously, blocking until the runner exits.
+ * Used by the auto-improve loop where the caller needs the recommendations
+ * file in the same process. No tmux session, no polling.
+ */
+export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore): Promise<CritiqueSyncResult> {
+  const tmuxSession = `forge-crit-${config.critiqueId.slice(-14)}`;
+  const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const recommendationsPath = path.join(critiqueDir, "recommendations.md");
+  const runnerLog = path.join(critiqueDir, "runner.log");
+
+  const { runnerPath } = prepareCritique(config, store, tmuxSession);
+
+  try {
+    const out = fs.openSync(runnerLog, "w");
+    try {
+      execSync(`bash '${runnerPath.replace(/'/g, "'\\''")}'`, {
+        stdio: ["ignore", out, out],
+      });
+    } finally {
+      fs.closeSync(out);
+    }
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    const finalMeta = store.readCritiqueMeta(config.taskId, config.critiqueId);
+    const detail = finalMeta?.status === "failed" ? "critics or synthesizer failed" : msg;
+    return { recommendationsPath, critiqueId: config.critiqueId, error: `critique runner failed: ${detail}` };
+  }
+
+  const finalMeta = store.readCritiqueMeta(config.taskId, config.critiqueId);
+  if (!finalMeta || finalMeta.status !== "done") {
+    return {
+      recommendationsPath,
+      critiqueId: config.critiqueId,
+      error: `critique did not complete (status=${finalMeta?.status ?? "unknown"})`,
+    };
+  }
+  if (!fs.existsSync(recommendationsPath)) {
+    return {
+      recommendationsPath,
+      critiqueId: config.critiqueId,
+      error: "recommendations file missing after critique",
+    };
+  }
+  return { recommendationsPath, critiqueId: config.critiqueId, error: null };
 }
