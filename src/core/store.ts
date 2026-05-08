@@ -42,6 +42,7 @@ export interface TaskRecord {
   logFile: string | null;
   jiraTicket: string | null;
   specFile: string;
+  specVersion: number;
 }
 
 export interface ForgeIndex {
@@ -106,6 +107,12 @@ export interface RepoConfig {
   fixerReasoningEffort?: ReasoningEffort;
   autoFix?: boolean;
   autoFixRounds?: number;
+  // ── Auto-improve (forge spec save) ──────────────────────────────────────
+  /** Run the auto-improve loop after `forge spec save`. Treated as `true` when undefined. */
+  autoImprove?: boolean;
+  improverAgent?: LaunchTarget;
+  improverModel?: string;
+  improverReasoning?: ReasoningEffort;
   // ── GitHub CLI overrides ────────────────────────────────────────────────
   /** gh account to use for this repo (e.g. "tcashelmgni"). Falls back to gh's active account. */
   ghUser?: string;
@@ -194,7 +201,13 @@ export class ForgeStore {
   readIndex(): ForgeIndex {
     if (!fs.existsSync(this.indexFile)) return { version: 1, tasks: {} };
     try {
-      return JSON.parse(fs.readFileSync(this.indexFile, "utf-8")) as ForgeIndex;
+      const index = JSON.parse(fs.readFileSync(this.indexFile, "utf-8")) as ForgeIndex;
+      for (const t of Object.values(index.tasks)) {
+        if (typeof (t as Partial<TaskRecord>).specVersion !== "number") {
+          (t as TaskRecord).specVersion = 1;
+        }
+      }
+      return index;
     } catch {
       return { version: 1, tasks: {} };
     }

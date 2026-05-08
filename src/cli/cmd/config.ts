@@ -34,6 +34,9 @@ Common keys:
   ghUser, ghHost                         gh-cli account / host overrides
   jiraProject, jiraType
   critiqueAgentA / critiqueModelA / critiqueReasoningA  (and B / Synth)
+  autoImprove (true|false)               Run auto-improve after forge spec save (default true)
+  improverAgent, improverModel           Spec improver agent/model
+  improverReasoning                      low|medium|high|xhigh (codex only)
 
 Examples:
   forge config set defaultAgent codex
@@ -53,6 +56,7 @@ const STRING_KEYS = [
   "critiqueModelA",
   "critiqueModelB",
   "critiqueModelSynth",
+  "improverModel",
 ] as const;
 
 const AGENT_KEYS = [
@@ -62,6 +66,7 @@ const AGENT_KEYS = [
   "critiqueAgentA",
   "critiqueAgentB",
   "critiqueAgentSynth",
+  "improverAgent",
 ] as const;
 const EFFORT_KEYS = [
   "reviewerReasoningEffort",
@@ -69,8 +74,9 @@ const EFFORT_KEYS = [
   "critiqueReasoningA",
   "critiqueReasoningB",
   "critiqueReasoningSynth",
+  "improverReasoning",
 ] as const;
-const BOOLEAN_KEYS = ["autoFix"] as const;
+const BOOLEAN_KEYS = ["autoFix", "autoImprove"] as const;
 const NUMBER_KEYS = ["autoFixRounds"] as const;
 
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
