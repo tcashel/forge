@@ -11,7 +11,15 @@ Steps:
 
 1. **Compose the spec body.** Reshape the plan content into the Forge schema (Title / Goal / Context / Tasks / Acceptance Criteria / Quality Gates). No YAML frontmatter — `forge spec save` adds it. Title argument: $1 (use this if non-empty).
 
-2. **Save via the CLI.** Pipe the body to `forge spec save - --json` via the Bash tool. If you already know the implementer agent/model the user wants, pass `--agent <claude|codex>` and `--model <model-id>` to pin them on the task. Capture `taskId`, `specPath`, `branch` from the JSON response.
+2. **Save via the CLI.** Pipe the body to `forge spec save - --json` via the Bash tool. If you already know the implementer agent/model the user wants, pass `--agent <claude|codex>` and `--model <model-id>` to pin them on the task. Capture `taskId`, `specPath`, `branch`, and the new `improve` field from the JSON response.
+
+   The `improve` field describes what the auto-improve loop did, with these branches (matched in this order):
+   - `improve === null` — auto-improve was disabled or skipped (user-supplied frontmatter / `--no-improve` / `RepoConfig.autoImprove === false`). Print nothing extra.
+   - `improve.mode === "applied"` — print `auto-improved — {improve.changeCount} changes applied. Run \`forge spec diff <id>\` to see what changed.`
+   - `improve.mode === "no-op"` — print `no actionable findings — original spec saved.`
+   - `improve.mode === "skipped"` — print `auto-improve skipped: {improve.error}` (the error string already starts with `IMPROVE_FAILED:` or similar).
+
+   Print the matching message before the launch confirmation in step 5 — not in place of it.
 
 3. **Pre-flight the launch config.** Before asking the user whether to launch, run `forge config list --json` and parse the `config` object. Check whether these are set:
    - `defaultAgent` (or the task already has `--agent` pinned in step 2)
