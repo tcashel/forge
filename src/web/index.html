@@ -864,6 +864,7 @@ const state = {
   repos: [],
   tasks: [],
   selectedRepo: "",      // "" = all repos
+  searchQuery: "",
   currentTaskId: null,
   currentTab: "log",
   prs: [],
@@ -1110,7 +1111,15 @@ function renderPickup() {
 
 /* ─── task list ────────────────────────────────────────────────────── */
 function visibleTasks() {
-  return state.selectedRepo ? state.tasks.filter((t) => t.repo === state.selectedRepo) : state.tasks.slice();
+  let list = state.selectedRepo ? state.tasks.filter((t) => t.repo === state.selectedRepo) : state.tasks.slice();
+  const q = (state.searchQuery || "").toLowerCase().trim();
+  if (q) {
+    list = list.filter((t) => {
+      const hay = [t.id, t.title, t.branch, t.repo, t.agentLabel || "", t.blurb || ""].join(" ").toLowerCase();
+      return hay.includes(q);
+    });
+  }
+  return list;
 }
 
 function renderTaskRow(t) {
@@ -1750,17 +1759,47 @@ $("#nav-settings").addEventListener("click", () => {
   showToast("Settings UI is on the roadmap. For now: forge config list / set <key> <value>.", "info");
 });
 
-$$("#nav .nav-item").forEach((item) => {
+/* Sidebar nav: scroll-to-section. data-target maps to the relevant
+   section in #list-pane (running / attention / ready / drafting / done).
+   "all" and unmapped targets just clear focus and scroll to top. */
+const NAV_SECTIONS = { running: "running", backlog: "ready", done: "done", all: null, prs: null };
+$$("#nav .nav-item[data-target]").forEach((item) => {
   item.addEventListener("click", () => {
     $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
     item.classList.add("active");
+    const target = item.dataset.target;
+    const section = NAV_SECTIONS[target];
+    const pane = $("#list-pane");
+    if (section) {
+      const header = pane.querySelector(`.section-h[data-section="${section}"]`);
+      if (header) header.scrollIntoView({ behavior: "smooth", block: "start" });
+    } else {
+      pane.scrollTo({ top: 0, behavior: "smooth" });
+    }
   });
+});
+
+/* Search input: debounce-free substring filter on title/branch/repo/agent/blurb. */
+$("#search-input").addEventListener("input", (e) => {
+  state.searchQuery = e.target.value;
+  applyFilter();
 });
 
 window.addEventListener("keydown", (e) => {
   // Modal-open: only Escape (close modal) is honored — let everything else fall through to the form.
   if (!$("#new-spec-modal").hidden) {
     if (e.key === "Escape") { e.preventDefault(); closeNewSpecModal(); }
+    return;
+  }
+  // Search input: Escape clears and blurs.
+  if (e.target === $("#search-input")) {
+    if (e.key === "Escape") {
+      e.preventDefault();
+      e.target.value = "";
+      state.searchQuery = "";
+      applyFilter();
+      e.target.blur();
+    }
     return;
   }
   if (e.target.matches("input,textarea,select")) return;
