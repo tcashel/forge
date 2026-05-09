@@ -5,10 +5,11 @@
  * and open PRs from gh. Keyboard-driven for all common actions.
  */
 
-import { execSync, spawn } from "node:child_process";
+import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { type GhTarget, resolveGhEnv } from "../core/gh.js";
+import type { GhTarget } from "../core/gh.js";
+import { fetchPrs, type GhPr } from "../core/gh-pr.js";
 import { isTmuxSessionAlive, killTmuxSession } from "../core/launch.js";
 import type { RepoProfile } from "../core/repo.js";
 import type { ForgeStore, TaskRecord, TaskStatus } from "../core/store.js";
@@ -16,25 +17,6 @@ import { Key, matchesKey } from "./keys.js";
 import { truncateToWidth, visibleWidth } from "./width.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
-
-interface GhPr {
-  number: number;
-  title: string;
-  headRefName: string;
-  baseRefName: string;
-  url: string;
-  isDraft: boolean;
-  statusCheckRollup: string | null;
-  reviewDecision: string | null;
-  author: string;
-  updatedAt: string;
-  additions: number;
-  deletions: number;
-  changedFiles: number;
-  commentsCount: number;
-  reviewsCount: number;
-  isMine: boolean;
-}
 
 interface Theme {
   fg: (color: string, text: string) => string;
@@ -45,72 +27,6 @@ interface Tui {
 }
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
-
-/**
- * Spawn `gh` with optional per-repo account/host overrides.
- *
- * Bare `gh` always uses gh's globally-active account regardless of the
- * per-repo `ghUser`/`ghHost` configured in repo-config.json — that made
- * forge show an empty PR list (or the wrong @me) for any repo whose
- * configured account differs from gh's active one. We mirror what the
- * runner scripts do: resolve a token via `gh auth token --user …` and
- * inject GH_HOST + GH_TOKEN/GH_ENTERPRISE_TOKEN into the child env.
- */
-function runGh(
-  args: string[],
-  opts?: { timeoutMs?: number; cwd?: string; ghTarget?: GhTarget },
-): Promise<{ stdout: string; ok: boolean }> {
-  const timeout = opts?.timeoutMs ?? 20000;
-  return new Promise((resolve) => {
-    const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeout);
-    let stdout = "";
-    let stderr = "";
-    let settled = false;
-    const settle = (result: { stdout: string; ok: boolean }) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(result);
-    };
-
-    // resolveGhEnv returns {} when no override is configured, so the
-    // child inherits gh's default behaviour in that case.
-    const resolved = resolveGhEnv(opts?.ghTarget);
-    if (resolved.error) {
-      // Configured account isn't logged in — fail fast rather than
-      // silently falling back to the wrong account.
-      settle({ stdout: "", ok: false });
-      return;
-    }
-    const env = { ...process.env, ...resolved.env };
-
-    let child: ReturnType<typeof spawn>;
-    try {
-      child = spawn("gh", args, {
-        stdio: ["ignore", "pipe", "pipe"],
-        signal: ac.signal,
-        cwd: opts?.cwd,
-        env,
-      });
-    } catch {
-      settle({ stdout: "", ok: false });
-      return;
-    }
-
-    child.stdout.on("data", (chunk: Buffer) => {
-      stdout += chunk.toString();
-    });
-    child.stderr.on("data", (chunk: Buffer) => {
-      stderr += chunk.toString();
-    });
-    child.on("error", () => settle({ stdout: "", ok: false }));
-    child.on("close", (code) => {
-      void stderr; // captured for diagnostics, discarded on success
-      settle({ stdout: stdout.trim(), ok: code === 0 });
-    });
-  });
-}
 
 function timeAgo(iso: string | null | undefined): string {
   if (!iso) return "never";
@@ -191,107 +107,6 @@ function reviewCell(theme: Theme, decision: string | null | undefined): string {
       return theme.fg("warning", "·");
     default:
       return theme.fg("dim", "·");
-  }
-}
-
-// Login is recomputed per refresh on the dashboard instance — see
-// ForgeDashboard.myLogin. A module-level cache would leak the login from
-// one repo into another when the user switches repos with different
-// ghUser overrides.
-async function currentLogin(opts: { cwd: string; ghTarget?: GhTarget }): Promise<string> {
-  const { stdout, ok } = await runGh(["api", "user", "--jq", ".login"], opts);
-  return ok ? stdout : "";
-}
-
-async function fetchMinePrNumbers(opts: { cwd: string; ghTarget?: GhTarget }): Promise<Set<number>> {
-  // Use gh's own "@me" resolution so this works even when the local gh login
-  // (e.g. an org-aliased account like "foo-org") differs from the PR author
-  // login on the host (e.g. "foo"). Strict string equality on logins is
-  // unreliable across SAML/enterprise account mappings.
-  const { stdout, ok } = await runGh(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"], opts);
-  if (!ok || !stdout) return new Set();
-  try {
-    const arr = JSON.parse(stdout) as Array<{ number: number }>;
-    return new Set(arr.map((p) => p.number));
-  } catch {
-    return new Set();
-  }
-}
-
-async function fetchPrs(opts: { cwd: string; ghTarget?: GhTarget }): Promise<{ prs: GhPr[]; me: string }> {
-  const [me, mineNumbers] = await Promise.all([currentLogin(opts), fetchMinePrNumbers(opts)]);
-  // Use gh's built-in `--jq` to project the (potentially huge) `comments`
-  // and `reviews` arrays down to scalar counts on gh's side. Without this,
-  // the full review/comment bodies blow past execSync's default maxBuffer
-  // and the call silently returns nothing.
-  const jq =
-    "[.[] | {" +
-    "number,title,headRefName,baseRefName,url,isDraft," +
-    "statusCheckRollup,reviewDecision,author,updatedAt," +
-    "additions,deletions,changedFiles," +
-    "commentsCount:(.comments|length),reviewsCount:(.reviews|length)" +
-    "}]";
-  const { stdout, ok } = await runGh(
-    [
-      "pr",
-      "list",
-      "--json",
-      "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
-      "--jq",
-      jq,
-      "--limit",
-      "30",
-    ],
-    opts,
-  );
-  if (!ok || !stdout) return { prs: [], me };
-  try {
-    const prs = JSON.parse(stdout) as Array<{
-      number: number;
-      title: string;
-      headRefName: string;
-      baseRefName: string;
-      url: string;
-      isDraft: boolean;
-      statusCheckRollup: Array<{ state?: string; conclusion?: string }>;
-      reviewDecision: string | null;
-      author: { login?: string } | null;
-      updatedAt: string;
-      additions: number;
-      deletions: number;
-      changedFiles: number;
-      commentsCount: number;
-      reviewsCount: number;
-    }>;
-    const mapped = prs.map((pr) => {
-      const checks = pr.statusCheckRollup ?? [];
-      const hasFailure = checks.some((c) => c.state === "FAILURE" || c.conclusion === "FAILURE");
-      const allSuccess = checks.length > 0 && checks.every((c) => c.state === "SUCCESS" || c.conclusion === "SUCCESS");
-      const hasPending = checks.some((c) => c.state === "PENDING" || c.conclusion === null);
-      const ciStatus = hasFailure ? "FAILURE" : allSuccess ? "SUCCESS" : hasPending ? "PENDING" : null;
-      const author = pr.author?.login ?? "";
-      return {
-        number: pr.number,
-        title: pr.title,
-        headRefName: pr.headRefName,
-        baseRefName: pr.baseRefName,
-        url: pr.url,
-        isDraft: pr.isDraft,
-        statusCheckRollup: ciStatus,
-        reviewDecision: pr.reviewDecision,
-        author,
-        updatedAt: pr.updatedAt,
-        additions: pr.additions,
-        deletions: pr.deletions,
-        changedFiles: pr.changedFiles,
-        commentsCount: pr.commentsCount ?? 0,
-        reviewsCount: pr.reviewsCount ?? 0,
-        isMine: mineNumbers.has(pr.number) || (me !== "" && author === me),
-      };
-    });
-    return { prs: mapped, me };
-  } catch {
-    return { prs: [], me };
   }
 }
 
