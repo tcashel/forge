@@ -270,6 +270,58 @@ body{
 .btn-attention:hover{ background: rgba(224,140,204,0.18); }
 .btn.sm{ padding: 5px 10px; font-size: 11.5px; }
 
+/* ─── modal ─────────────────────────────────────────────────────────── */
+.modal-overlay{
+  position: fixed; inset: 0; z-index: 200;
+  background: rgba(7,11,17,0.72); backdrop-filter: blur(6px);
+  display: flex; align-items: flex-start; justify-content: center;
+  padding: 60px 20px;
+  overflow-y: auto;
+}
+.modal-overlay[hidden]{ display: none; }
+.modal-card{
+  background: var(--panel); border: 1px solid var(--rule-2); border-radius: 10px;
+  width: 100%; max-width: 720px;
+  box-shadow: var(--shadow-lg, 0 30px 60px -15px rgba(0,0,0,0.6));
+  display: flex; flex-direction: column;
+}
+.modal-head{
+  display: flex; align-items: center; gap: 10px;
+  padding: 18px 22px; border-bottom: 1px solid var(--rule);
+}
+.modal-head h2{ font-size: 15px; font-weight: 700; color: var(--text); }
+.modal-head .close{
+  margin-left: auto; background: transparent; border: 0; color: var(--dim);
+  font-size: 18px; line-height: 1; cursor: pointer; padding: 4px 8px; border-radius: 4px;
+}
+.modal-head .close:hover{ color: var(--text); background: var(--panel-2); }
+.modal-body{ padding: 18px 22px; display: flex; flex-direction: column; gap: 14px; }
+.modal-foot{
+  display: flex; gap: 10px; justify-content: flex-end;
+  padding: 14px 22px 18px; border-top: 1px solid var(--rule);
+}
+.field{ display: flex; flex-direction: column; gap: 6px; }
+.field label{ font-size: 11.5px; font-weight: 600; color: var(--text-2); letter-spacing: 0.02em; text-transform: uppercase; }
+.field .hint{ font-size: 11.5px; color: var(--dim); font-weight: 400; text-transform: none; letter-spacing: 0; margin-top: 2px; }
+.field input, .field select, .field textarea{
+  background: var(--panel-2); color: var(--text);
+  border: 1px solid var(--rule); border-radius: 6px;
+  padding: 8px 10px; font-size: 13px;
+  font-family: inherit;
+}
+.field textarea{
+  font-family: 'JetBrains Mono', ui-monospace, monospace;
+  font-size: 12.5px; line-height: 1.5;
+  min-height: 240px; resize: vertical;
+}
+.field input:focus, .field select:focus, .field textarea:focus{
+  outline: none; border-color: var(--primary); box-shadow: 0 0 0 2px rgba(125,207,232,0.18);
+}
+.field-row{ display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+.field-checkbox{ display: flex; align-items: center; gap: 8px; }
+.field-checkbox input{ accent-color: var(--primary); width: 14px; height: 14px; }
+.field-checkbox label{ font-size: 12.5px; font-weight: 500; color: var(--text-2); text-transform: none; letter-spacing: 0; }
+
 .list-pane{
   grid-area: list;
   border-right: 1px solid var(--rule);
@@ -602,8 +654,8 @@ body.filtered-single .repo-chip{ display: none; }
       <span>FORGE</span>
       <span class="v">workbench</span>
     </div>
-    <button class="new-plan" id="new-plan-btn" title="Planner integration ships in a future release">
-      <span class="plus">+</span> Start a new plan
+    <button class="new-plan" id="new-plan-btn" title="Create a new spec from the Workbench">
+      <span class="plus">+</span> New spec
     </button>
     <nav class="nav" id="nav">
       <div class="nav-section">Workspace</div>
@@ -743,6 +795,64 @@ body.filtered-single .repo-chip{ display: none; }
       <nav class="tabs" id="detail-tabs" hidden></nav>
       <div class="detail-body" id="detail-body" hidden></div>
     </main>
+  </div>
+</div>
+
+<div class="modal-overlay" id="new-spec-modal" hidden>
+  <div class="modal-card" role="dialog" aria-labelledby="new-spec-title-h">
+    <div class="modal-head">
+      <h2 id="new-spec-title-h">New spec</h2>
+      <button type="button" class="close" id="new-spec-close" aria-label="Close">×</button>
+    </div>
+    <form id="new-spec-form">
+      <div class="modal-body">
+        <div class="field">
+          <label for="new-spec-repo">Repo</label>
+          <select id="new-spec-repo" required></select>
+          <div class="hint">Pick from repos that already have Forge tasks. To work in a brand-new repo, run <code>forge spec save</code> from a shell once first.</div>
+        </div>
+        <div class="field">
+          <label for="new-spec-title">Title <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
+          <input id="new-spec-title" type="text" placeholder="feat(scope): short imperative summary, ≤70 chars" maxlength="120">
+          <div class="hint">Defaults to the first H1 in the markdown body. Should match conventional-commit format — Forge uses it verbatim as the PR title.</div>
+        </div>
+        <div class="field">
+          <label for="new-spec-body">Markdown body</label>
+          <textarea id="new-spec-body" required placeholder="# feat(scope): short imperative
+
+A paragraph describing the work, why it's needed, and the intended outcome.
+
+## Acceptance criteria
+
+- it does the thing
+- existing tests still pass"></textarea>
+        </div>
+        <div class="field-row">
+          <div class="field">
+            <label for="new-spec-agent">Agent <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
+            <select id="new-spec-agent">
+              <option value="">Use repo default</option>
+              <option value="claude">claude</option>
+              <option value="codex">codex</option>
+              <option value="opencode">opencode</option>
+              <option value="gemini">gemini</option>
+            </select>
+          </div>
+          <div class="field">
+            <label for="new-spec-model">Model <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
+            <input id="new-spec-model" type="text" placeholder="e.g. claude-opus-4-7">
+          </div>
+        </div>
+        <div class="field field-checkbox">
+          <input id="new-spec-improve" type="checkbox" checked>
+          <label for="new-spec-improve">Run auto-improve after save (two critics + synthesizer; can take 1–2 minutes)</label>
+        </div>
+      </div>
+      <div class="modal-foot">
+        <button type="button" class="btn btn-ghost" id="new-spec-cancel">Cancel</button>
+        <button type="submit" class="btn btn-primary" id="new-spec-submit">Save spec</button>
+      </div>
+    </form>
   </div>
 </div>
 
@@ -1519,10 +1629,83 @@ async function boot() {
   if (candidates[0]) selectTask(candidates[0].id);
 }
 
-/* ─── new-plan + nav stubs ─────────────────────────────────────────── */
-$("#new-plan-btn").addEventListener("click", () => {
-  showToast("New-plan flow ships in PR 3 — for now run /forge-ship-plan in Claude Code.", "info");
+/* ─── new spec modal ──────────────────────────────────────────────── */
+function openNewSpecModal() {
+  const modal = $("#new-spec-modal");
+  const repoSel = $("#new-spec-repo");
+  // Populate repo dropdown from known repos.
+  repoSel.innerHTML = state.repos.map((r) =>
+    `<option value="${escapeHTML(r.root)}" data-name="${escapeHTML(r.name)}">${escapeHTML(r.name)} <span>(${escapeHTML(r.root)})</span></option>`
+  ).join("");
+  if (state.repos.length === 0) {
+    repoSel.innerHTML = `<option value="">No repos yet — register one with \`forge spec save\` first.</option>`;
+    repoSel.disabled = true;
+    $("#new-spec-submit").disabled = true;
+  } else {
+    repoSel.disabled = false;
+    $("#new-spec-submit").disabled = false;
+    // Default to currently-selected repo if any.
+    const selected = state.repos.find((r) => r.name === state.selectedRepo);
+    if (selected) repoSel.value = selected.root;
+  }
+  modal.hidden = false;
+  setTimeout(() => $("#new-spec-body").focus(), 0);
+}
+
+function closeNewSpecModal() {
+  const modal = $("#new-spec-modal");
+  modal.hidden = true;
+  $("#new-spec-form").reset();
+  $("#new-spec-submit").disabled = false;
+  $("#new-spec-submit").textContent = "Save spec";
+}
+
+$("#new-plan-btn").addEventListener("click", openNewSpecModal);
+$("#new-spec-close").addEventListener("click", closeNewSpecModal);
+$("#new-spec-cancel").addEventListener("click", closeNewSpecModal);
+$("#new-spec-modal").addEventListener("click", (e) => {
+  if (e.target.id === "new-spec-modal") closeNewSpecModal();
 });
+
+$("#new-spec-form").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const repoRoot = $("#new-spec-repo").value.trim();
+  const markdown = $("#new-spec-body").value;
+  const title = $("#new-spec-title").value.trim();
+  const agent = $("#new-spec-agent").value;
+  const model = $("#new-spec-model").value.trim();
+  const autoImprove = $("#new-spec-improve").checked;
+
+  if (!repoRoot) { showToast("Pick a repo.", "error"); return; }
+  if (!markdown.trim()) { showToast("Markdown body is required.", "error"); return; }
+
+  const submit = $("#new-spec-submit");
+  submit.disabled = true;
+  submit.textContent = autoImprove ? "Saving (auto-improve, ~1–2 min)…" : "Saving…";
+
+  const body = {
+    markdown,
+    repoRoot,
+    autoImprove,
+    ...(title ? { title } : {}),
+    ...(agent ? { agent } : {}),
+    ...(model ? { model } : {}),
+  };
+
+  try {
+    const data = await apiPost("/api/specs", body);
+    showToast(`Saved spec ${data.taskId}`, "info");
+    closeNewSpecModal();
+    await refreshTasks();
+    if (data.taskId) selectTask(data.taskId);
+  } catch (err) {
+    showToast(err.message || "Save failed", "error");
+    submit.disabled = false;
+    submit.textContent = "Save spec";
+  }
+});
+
+/* ─── nav stubs ───────────────────────────────────────────────────── */
 $("#nav-help").addEventListener("click", () => {
   showToast("Help: navigate with j/k or click. ⌘K focuses search.", "info");
 });
@@ -1538,8 +1721,14 @@ $$("#nav .nav-item").forEach((item) => {
 });
 
 window.addEventListener("keydown", (e) => {
+  // Modal-open: only Escape (close modal) is honored — let everything else fall through to the form.
+  if (!$("#new-spec-modal").hidden) {
+    if (e.key === "Escape") { e.preventDefault(); closeNewSpecModal(); }
+    return;
+  }
   if (e.target.matches("input,textarea,select")) return;
   if (e.key === "/" || (e.metaKey && e.key === "k")) { e.preventDefault(); $("#search-input").focus(); }
+  if (e.key === "n" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openNewSpecModal(); }
   if (e.key === "r" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openRepoPopover(); }
   if (e.key === "Escape" && !$("#repo-popover").hidden) closeRepoPopover();
 });
