@@ -17,6 +17,18 @@ import { parseArgs } from "node:util";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
+import {
+  abortInFlight,
+  createDraft as createPlanDraft,
+  deleteDraft as deletePlanDraft,
+  loadHistory as loadPlanHistory,
+  loadSkillPrompt,
+  promoteDraft as promotePlanDraft,
+  reapStalePlanChats,
+  runChatTurn,
+  type ScopeRef,
+  wipeHistory as wipePlanHistory,
+} from "../../core/plan-chat.ts";
 import { detectRepo } from "../../core/repo.ts";
 import type {
   CritiqueMeta,
@@ -707,6 +719,25 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
   }
 
+  // ── Planner chat — GETs ──────────────────────────────────────────────
+  // GET /api/specs/:id/plan-history → { messages: [...] }
+  const specPlanHistoryMatch = pathname.match(/^\/api\/specs\/([^/]+)\/plan-history$/);
+  if (specPlanHistoryMatch) {
+    const taskId = decodeURIComponent(specPlanHistoryMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const history = loadPlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    return jsonOk({ messages: history.messages });
+  }
+
+  // GET /api/plan-chat/draft/:draftId/history → { messages: [...] }
+  const draftHistoryMatch = pathname.match(/^\/api\/plan-chat\/draft\/([^/]+)\/history$/);
+  if (draftHistoryMatch) {
+    const draftId = decodeURIComponent(draftHistoryMatch[1]);
+    const history = loadPlanHistory(store.forgeDir, { kind: "draft", id: draftId });
+    return jsonOk({ messages: history.messages });
+  }
+
   // GET /api/prs?repo=<name>
   if (pathname === "/api/prs") {
     const repoName = url.searchParams.get("repo") || undefined;
@@ -736,12 +767,34 @@ function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoVie
 // ─── POST routes ─────────────────────────────────────────────────────────────
 
 const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
+const SPEC_PLAN_CHAT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat$/;
+const SPEC_PLAN_CHAT_ABORT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat\/abort$/;
+const SPEC_PLAN_HISTORY_PATH = /^\/api\/specs\/([^/]+)\/plan-history$/;
+const DRAFT_MSG_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/message$/;
+const DRAFT_ABORT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/abort$/;
+const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
+const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
   if (pathname === "/api/repos") return true;
   if (pathname === "/api/config") return true;
+  if (pathname === "/api/plan-chat/draft") return true;
+  if (
+    SPEC_PLAN_CHAT_PATH.test(pathname) ||
+    SPEC_PLAN_CHAT_ABORT_PATH.test(pathname) ||
+    DRAFT_MSG_PATH.test(pathname) ||
+    DRAFT_ABORT_PATH.test(pathname) ||
+    DRAFT_PROMOTE_PATH.test(pathname)
+  )
+    return true;
   return ACTION_TASK_PATH.test(pathname);
+}
+
+function allowsDelete(pathname: string): boolean {
+  if (SPEC_PLAN_HISTORY_PATH.test(pathname)) return true;
+  if (DRAFT_ROOT_PATH.test(pathname)) return true;
+  return false;
 }
 
 /** Map a CliError to an HTTP status. exitCode 1 = user error → 400 by default. */
@@ -831,9 +884,168 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
   }
 }
 
+function getSpecBodyStripped(store: ForgeStore, taskId: string): string | null {
+  const raw = store.getSpec(taskId);
+  if (raw === null) return null;
+  return stripFrontmatter(raw);
+}
+
+function planChatSseResponse(opts: {
+  store: ForgeStore;
+  scope: ScopeRef;
+  message: string;
+  model?: string;
+  specBody: string | null;
+}): Response {
+  const turn = runChatTurn({
+    forgeDir: opts.store.forgeDir,
+    scope: opts.scope,
+    message: opts.message,
+    model: opts.model,
+    specBody: opts.specBody,
+  });
+  // Wrap so cancel() (client disconnect) tears down the spawned child.
+  // ReadableStream from runChatTurn already wires cancel → child.kill,
+  // but the SSE convention here adds the `x-accel-buffering: no` header.
+  return new Response(turn.stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+      connection: "keep-alive",
+    },
+  });
+}
+
+function resolveSpecModel(store: ForgeStore, taskId: string, override: string | undefined): string | undefined {
+  if (override) return override;
+  const task = store.getTask(taskId);
+  if (!task) return undefined;
+  const cfg = store.getRepoConfig(task.repoRoot);
+  return cfg.defaultModel ?? task.model ?? undefined;
+}
+
+async function handleApiDelete(url: URL, ctx: RouteCtx): Promise<Response> {
+  const { pathname } = url;
+  const { store } = ctx;
+
+  const specHistoryMatch = pathname.match(SPEC_PLAN_HISTORY_PATH);
+  if (specHistoryMatch) {
+    const taskId = decodeURIComponent(specHistoryMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    wipePlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    return jsonOk({ ok: true });
+  }
+
+  const draftRootMatch = pathname.match(DRAFT_ROOT_PATH);
+  if (draftRootMatch) {
+    const draftId = decodeURIComponent(draftRootMatch[1]);
+    abortInFlight({ kind: "draft", id: draftId });
+    deletePlanDraft(store.forgeDir, draftId);
+    return jsonOk({ ok: true });
+  }
+
+  return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
+}
+
 async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
   const { pathname } = url;
   const { store } = ctx;
+
+  // ── Plan-chat dispatch (some routes are SSE, not JSON-bodied) ──────────
+  // POST /api/specs/:id/plan-chat/abort
+  const specAbortMatch = pathname.match(SPEC_PLAN_CHAT_ABORT_PATH);
+  if (specAbortMatch) {
+    const taskId = decodeURIComponent(specAbortMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const killed = abortInFlight({ kind: "spec", id: taskId });
+    return jsonOk({ aborted: killed, taskId });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/abort
+  const draftAbortMatch = pathname.match(DRAFT_ABORT_PATH);
+  if (draftAbortMatch) {
+    const draftId = decodeURIComponent(draftAbortMatch[1]);
+    const killed = abortInFlight({ kind: "draft", id: draftId });
+    return jsonOk({ aborted: killed, draftId });
+  }
+
+  // POST /api/plan-chat/draft (mint a new draftId)
+  if (pathname === "/api/plan-chat/draft") {
+    const result = createPlanDraft(store.forgeDir);
+    return jsonOk(result);
+  }
+
+  // POST /api/specs/:id/plan-chat → SSE
+  const specChatMatch = pathname.match(SPEC_PLAN_CHAT_PATH);
+  if (specChatMatch) {
+    const taskId = decodeURIComponent(specChatMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const message = reqString(body, "message");
+    if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
+    const model = resolveSpecModel(store, taskId, optString(body, "model"));
+    const specBody = getSpecBodyStripped(store, taskId);
+    return planChatSseResponse({
+      store,
+      scope: { kind: "spec", id: taskId },
+      message,
+      model,
+      specBody,
+    });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/message → SSE
+  const draftMsgMatch = pathname.match(DRAFT_MSG_PATH);
+  if (draftMsgMatch) {
+    const draftId = decodeURIComponent(draftMsgMatch[1]);
+    // Drafts are filesystem-backed only; no DB row to validate against.
+    // We still verify the draft folder exists so abort/promote stay sane.
+    const draftRoot = path.join(store.forgeDir, "plan-drafts", draftId);
+    if (!fs.existsSync(draftRoot)) {
+      return jsonErr(404, "UNKNOWN_DRAFT", `No plan-chat draft "${draftId}".`);
+    }
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const message = reqString(body, "message");
+    if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
+    const model = optString(body, "model");
+    return planChatSseResponse({
+      store,
+      scope: { kind: "draft", id: draftId },
+      message,
+      model,
+      specBody: null,
+    });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/promote
+  const draftPromoteMatch = pathname.match(DRAFT_PROMOTE_PATH);
+  if (draftPromoteMatch) {
+    const draftId = decodeURIComponent(draftPromoteMatch[1]);
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const taskId = reqString(body, "taskId");
+    if (!taskId) return jsonErr(400, "BAD_REQUEST", "`taskId` is required.");
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    try {
+      promotePlanDraft(store.forgeDir, draftId, taskId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonErr(409, "PROMOTE_CONFLICT", msg);
+    }
+    return jsonOk({ ok: true, taskId, draftId });
+  }
+
+  // ── JSON-bodied POSTs ──────────────────────────────────────────────
   const parsed = await readJsonBody(req);
   if ("error" in parsed) return parsed.error;
   const body = parsed.body;
@@ -1048,6 +1260,34 @@ export async function startServer(
     process.stderr.write(`forge serve: reaped ${swept} stale critique-meta record(s).\n`);
   }
 
+  // Boot reaper for plan-chat subprocesses + stale prompt files.
+  const sweptPlanChats = reapStalePlanChats(store.forgeDir);
+  if (sweptPlanChats > 0) {
+    process.stderr.write(`forge serve: reaped ${sweptPlanChats} stale plan-chat artifact(s).\n`);
+  }
+
+  // Warm the SKILL prompt cache so the first /plan-chat doesn't pay a
+  // disk read on the SSE-spawn path. Best-effort; failure is logged but
+  // non-fatal (the chat endpoint will still try at request time).
+  try {
+    loadSkillPrompt();
+  } catch (e) {
+    process.stderr.write(`forge serve: failed to preload planner SKILL.md: ${e instanceof Error ? e.message : e}\n`);
+  }
+
+  // Periodic plan-chat reaper — every 60s. Cheap (in-memory map walk +
+  // shallow filesystem scan); guarantees stuck subprocesses are killed
+  // within ~6 minutes of becoming stale.
+  const planChatReaper = setInterval(() => {
+    try {
+      reapStalePlanChats(store.forgeDir);
+    } catch (e) {
+      process.stderr.write(`forge serve: plan-chat reaper error: ${e instanceof Error ? e.message : e}\n`);
+    }
+  }, 60_000);
+  // Don't keep the event loop alive just for the reaper.
+  if (typeof planChatReaper.unref === "function") planChatReaper.unref();
+
   const webDistDir = path.join(webDir, "dist");
   try {
     fs.rmSync(webDistDir, { recursive: true, force: true });
@@ -1099,7 +1339,7 @@ export async function startServer(
           status: 204,
           headers: {
             "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, POST, OPTIONS",
+            "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
             "access-control-allow-headers": "content-type",
           },
         });
@@ -1108,6 +1348,9 @@ export async function startServer(
       if (pathname.startsWith("/api/")) {
         if (req.method === "POST" && allowsPost(pathname)) {
           return handleApiPost(req, url, ctx);
+        }
+        if (req.method === "DELETE" && allowsDelete(pathname)) {
+          return handleApiDelete(url, ctx);
         }
         if (req.method !== "GET") {
           return jsonErr(405, "METHOD_NOT_ALLOWED", `${req.method} not allowed for ${pathname}.`);
