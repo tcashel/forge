@@ -19,7 +19,7 @@ function tabsFor(t: TaskView): TabDef[] {
       badgeKind: isRun ? "live" : undefined,
     },
     { id: "spec", label: "Spec", enabled: t.hasSpec },
-    { id: "plan", label: "Plan chat", enabled: true, badgeKind: "pill", badgeText: "soon" },
+    { id: "plan", label: "Plan chat", enabled: true },
     {
       id: "critique",
       label: "Critique",
