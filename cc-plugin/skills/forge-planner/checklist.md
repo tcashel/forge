@@ -13,9 +13,11 @@ Loaded by `forge-planner` and run mentally before each `edit` or `write` call ag
 
 ### Is the title good?
 
-- [ ] Imperative verb, 5–12 words.
-- [ ] Reads as a description of what the merged PR did.
-- [ ] Not "Add caching" or "Fix bug" — specific enough to be searchable later.
+- [ ] Matches `<type>(<scope>): <imperative>` format, all lowercase, ≤ 70 chars.
+- [ ] `<type>` is one of feat, fix, chore, docs, refactor, test, ci, style, perf, build.
+- [ ] `<scope>` names the area touched (package, dir, subsystem) — not generic.
+- [ ] Imperative reads as a description of what the merged PR did.
+- [ ] Not `feat: caching` or `fix: bug` — specific enough to be searchable later.
 
 ### Is `Context` doing its job?
 

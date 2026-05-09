@@ -285,6 +285,7 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const specFile = path.join(store.specsDir, `${config.taskId}.md`);
   const extDir = path.dirname(fileURLToPath(import.meta.url));
   const prBodyTsPath = path.join(extDir, "pr-body.ts");
+  const prBodyArgsTsPath = path.join(extDir, "pr-body-args.ts");
 
   // ── claude / codex bash runner ──────────────────────────────
   const agentCmd = agentCommand(config.target, config.model, promptFile, {
@@ -483,102 +484,46 @@ log "═══ BUILD PR BODY ═══"
 PR_BODY_FILE="${runDir}/pr-body.md"
 PR_BODY_BUILT=0
 
-# Use python3 to safely build pr-body-args.json with proper escaping
-python3 -c "
-import json, subprocess, os, sys
+# Build pr-body-args.json via the typed TS CLI (replaces a fragile Python heredoc).
+ARGS_FILE="${runDir}/pr-body-args.json"
+ARGS_BUILT=0
+if node --experimental-strip-types '${prBodyArgsTsPath}' \\
+    --task-id "$TASK_ID" \\
+    --branch "$BRANCH" \\
+    --base-ref "$BASE_REF" \\
+    --run-dir "$RUN_DIR" \\
+    --spec-path "$SPEC_FILE" \\
+    --agent '${config.target}' \\
+    --model '${config.model}' \\
+    > "$ARGS_FILE" 2>> "$LOG_FILE"; then
+  ARGS_BUILT=1
+else
+  log "⚠  pr-body-args builder failed — see log"
+fi
 
-base_ref = '$BASE_REF'
-branch = '$BRANCH'
-spec_file = '$SPEC_FILE'
-run_dir = '${runDir}'
-task_id = '${config.taskId}'
-agent = '${config.target}'
-model = '${config.model}'
-
-# Gather commits
-commits = []
-try:
-    log = subprocess.check_output(
-        ['git', 'log', '--no-merges', '--format=%h %s', base_ref + '..HEAD'],
-        text=True, stderr=subprocess.DEVNULL
-    ).strip()
-    for line in log.split('\n'):
-        if line.strip():
-            sha, _, subj = line.partition(' ')
-            commits.append({'sha': sha, 'subject': subj})
-except Exception:
-    pass
-
-# Gather shortstat
-additions = None
-deletions = None
-files_changed = None
-try:
-    stat = subprocess.check_output(
-        ['git', 'diff', '--shortstat', base_ref + '..HEAD'],
-        text=True, stderr=subprocess.DEVNULL
-    ).strip()
-    import re
-    m = re.search(r'(\\d+) files? changed', stat)
-    if m:
-        files_changed = int(m.group(1))
-    m = re.search(r'(\\d+) insertions?', stat)
-    if m:
-        additions = int(m.group(1))
-    m = re.search(r'(\\d+) deletions?', stat)
-    if m:
-        deletions = int(m.group(1))
-except Exception:
-    pass
-
-# Read quality results
-quality = []
-qpath = os.path.join(run_dir, 'quality.jsonl')
-if os.path.exists(qpath):
-    with open(qpath) as f:
-        for line in f:
-            line = line.strip()
-            if line:
-                try:
-                    quality.append(json.loads(line))
-                except Exception:
-                    pass
-
-args = {
-    'specPath': spec_file,
-    'agentSummaryPath': os.path.join(run_dir, 'agent-summary.md'),
-    'outputPath': os.path.join(run_dir, 'pr-body.md'),
-    'input': {
-        'taskId': task_id,
-        'specBody': '',
-        'branch': branch,
-        'baseRef': base_ref,
-        'commits': commits,
-        'additions': additions,
-        'deletions': deletions,
-        'filesChanged': files_changed,
-        'qualityResults': quality,
-        'agent': agent,
-        'model': model,
-        'jiraTicket': None,
-        'jiraUrl': None,
-        'agentSummary': None,
-    }
-}
-with open(os.path.join(run_dir, 'pr-body-args.json'), 'w') as f:
-    json.dump(args, f, indent=2)
-" 2>&1 | tee -a "$LOG_FILE"
-
-if node --experimental-strip-types '${prBodyTsPath}' "${runDir}/pr-body-args.json" 2>&1 | tee -a "$LOG_FILE"; then
-  if [ -f "$PR_BODY_FILE" ]; then
-    PR_BODY_BUILT=1
-    log "✓ PR body built"
+if [ "$ARGS_BUILT" -eq 1 ]; then
+  if node --experimental-strip-types '${prBodyTsPath}' "$ARGS_FILE" 2>&1 | tee -a "$LOG_FILE"; then
+    if [ -f "$PR_BODY_FILE" ]; then
+      PR_BODY_BUILT=1
+      log "✓ PR body built"
+    fi
   fi
 fi
 
 if [ "$PR_BODY_BUILT" -eq 0 ]; then
-  log "⚠  PR body build failed — falling back to spec file"
-  PR_BODY_FILE="$SPEC_FILE"
+  log "⚠  PR body build failed — writing minimal Claude Code-format body"
+  cat > "$PR_BODY_FILE" <<'FORGE_FALLBACK_EOF'
+## Summary
+
+- PR body builder failed during this Forge run. The agent committed the work; please review the diff directly.
+- Run logs: see \`~/.forge/runs/${config.taskId}/agent.log\`.
+
+## Test plan
+
+- [ ] Manual review of the diff (the structured body could not be auto-generated).
+
+🤖 Generated with [Claude Code](https://claude.com/claude-code)
+FORGE_FALLBACK_EOF
 fi
 
 # ── Create draft PR ───────────────────────────────────────────────────────────
@@ -739,13 +684,32 @@ ${config.specContent}
    (or contains only files you intentionally chose not to commit, e.g. local
    experiments). Anything left uncommitted will be surfaced as a warning
    and will NOT make it into the PR.
-6. Before exiting (after committing), write a short PR summary to
-   \`${path.join(store.runsDir, config.taskId, "agent-summary.md")}\` — 3–6 sentences in plain prose,
-   describing what you actually did and any noteworthy decisions or
-   follow-ups. Skip implementation details that are obvious from
-   the diff. If the change is trivial (one-line fix, typo, etc.),
-   a single sentence is fine. Do NOT write the file if you didn't
-   complete the task.
+6. Before exiting (after committing), write a structured PR summary to
+   \`${path.join(store.runsDir, config.taskId, "agent-summary.md")}\`.
+   The file MUST contain EXACTLY these two top-level sections (no others,
+   no YAML frontmatter):
+
+       ## Summary
+
+       3–6 markdown bullets. Each starts with a bold label and a colon
+       describing the kind of change, then a single sentence. Examples:
+         - **Bug fix:** unbreak unattended claude runs by passing
+           \`--dangerously-skip-permissions\`.
+         - **Feature:** add \`forge spec diff\` to show pre/post improvement
+           diff for any auto-improved spec.
+
+       ## Test plan
+
+       A markdown checkbox list. Use \`- [x]\` for items you actually ran
+       and verified during this run, \`- [ ]\` for items left for the human
+       reviewer (e.g. an end-to-end smoke that needs a live agent harness).
+       Examples:
+         - [x] \`bun test\` — all suites pass
+         - [x] Smoke: \`forge launch ... --dry-run\` resolves config
+         - [ ] End-to-end: real forge launch in a fresh worktree (deferred)
+
+   If the change is trivial, a single bullet per section is fine. If you
+   didn't complete the task, do NOT write the file.
 7. Exit successfully (exit code 0) when the task is complete and committed.
 8. Do NOT push or create a PR — the forge system handles that automatically.
 `;
