@@ -799,7 +799,7 @@ body.filtered-single .repo-chip{ display: none; }
 </div>
 
 <div class="modal-overlay" id="new-spec-modal" hidden>
-  <div class="modal-card" role="dialog" aria-labelledby="new-spec-title-h">
+  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="new-spec-title-h">
     <div class="modal-head">
       <h2 id="new-spec-title-h">New spec</h2>
       <button type="button" class="close" id="new-spec-close" aria-label="Close">×</button>
@@ -808,8 +808,12 @@ body.filtered-single .repo-chip{ display: none; }
       <div class="modal-body">
         <div class="field">
           <label for="new-spec-repo">Repo</label>
-          <select id="new-spec-repo" required></select>
-          <div class="hint">Pick from repos that already have Forge tasks. To work in a brand-new repo, run <code>forge spec save</code> from a shell once first.</div>
+          <select id="new-spec-repo"></select>
+          <div class="hint">Pick a known repo, or choose <em>Custom path…</em> to register a brand-new one (the server validates it's a git repo before saving).</div>
+        </div>
+        <div class="field" id="new-spec-repo-custom-wrap" hidden>
+          <label for="new-spec-repo-custom">Custom repo path</label>
+          <input id="new-spec-repo-custom" type="text" placeholder="/absolute/path/to/your/git/repo">
         </div>
         <div class="field">
           <label for="new-spec-title">Title <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
@@ -867,6 +871,7 @@ const state = {
   searchQuery: "",
   currentTaskId: null,
   currentTab: "log",
+  lastDetailFp: "",      // see detailFingerprint() — gates detail-head re-renders
   prs: [],
   prsRepo: null,
   logSource: null,       // EventSource for current task
@@ -915,10 +920,12 @@ async function apiPost(path, body) {
   let envelope = null;
   try { envelope = await res.json(); } catch { /* non-JSON */ }
   if (!res.ok || !envelope || envelope.ok !== true) {
-    const code = envelope && envelope.error && envelope.error.code ? envelope.error.code : `HTTP_${res.status}`;
-    const message = envelope && envelope.error && envelope.error.message ? envelope.error.message : `Request failed: ${path}`;
+    const errInfo = envelope && envelope.error ? envelope.error : {};
+    const code = errInfo.code || `HTTP_${res.status}`;
+    const message = errInfo.message || `Request failed: ${path}`;
     const err = new Error(message);
     err.code = code;
+    err.hint = errInfo.hint || null;
     throw err;
   }
   return envelope.data;
@@ -933,7 +940,11 @@ async function runAction(path, opts) {
     showToast(o.successMsg || "Done", "info");
     await refreshTasks();
   } catch (e) {
-    showToast(e.message || "Action failed", "error");
+    // Surface the hint when present — e.g. MISSING_FLAGS includes the
+    // exact `forge config set` invocation. Without this the user sees
+    // a generic 6s toast and has no way to recover.
+    const msg = e.hint ? `${e.message} — ${e.hint}` : (e.message || "Action failed");
+    showToast(msg, "error");
   }
 }
 
@@ -1173,9 +1184,20 @@ function renderLists() {
       empty.style.cssText = "padding:32px 12px;color:var(--dim);font-size:13px;text-align:center";
       pane.appendChild(empty);
     }
-    empty.innerHTML = state.selectedRepo
-      ? `No tasks in <b style="color:var(--text-2)">${escapeHTML(state.selectedRepo)}</b>. Save a spec from a shell:<br><code style="display:inline-block;margin-top:8px;color:var(--text-2);background:var(--panel-2);padding:4px 8px;border-radius:4px">cat plan.md | forge spec save -</code>`
-      : `No tasks yet. Save your first spec:<br><code style="display:inline-block;margin-top:8px;color:var(--text-2);background:var(--panel-2);padding:4px 8px;border-radius:4px">cat plan.md | forge spec save -</code>`;
+    if (state.searchQuery) {
+      empty.innerHTML = `No tasks match <b style="color:var(--text-2)">"${escapeHTML(state.searchQuery)}"</b>. <button id="empty-clear-search" style="margin-left:6px;color:var(--primary);background:transparent;border:0;cursor:pointer;font:inherit">Clear search</button>`;
+      // Wire after innerHTML — runs once per empty render.
+      const clearBtn = empty.querySelector("#empty-clear-search");
+      if (clearBtn) clearBtn.addEventListener("click", () => {
+        $("#search-input").value = "";
+        state.searchQuery = "";
+        applyFilter();
+      });
+    } else {
+      empty.innerHTML = state.selectedRepo
+        ? `No tasks in <b style="color:var(--text-2)">${escapeHTML(state.selectedRepo)}</b>. Save a spec from a shell:<br><code style="display:inline-block;margin-top:8px;color:var(--text-2);background:var(--panel-2);padding:4px 8px;border-radius:4px">cat plan.md | forge spec save -</code>`
+        : `No tasks yet. Click <b style="color:var(--text-2)">+ New spec</b> in the sidebar (or <code style="background:var(--panel-2);padding:2px 6px;border-radius:4px">cat plan.md | forge spec save -</code> from a shell).`;
+    }
   } else if (empty) {
     empty.remove();
   }
@@ -1211,6 +1233,7 @@ function selectTask(id, tab) {
 
   $$(".task-row").forEach((r) => r.classList.toggle("selected", r.dataset.id === id));
 
+  state.lastDetailFp = detailFingerprint(t);
   renderDetailHead(t);
   renderTabs(t);
   renderTabPane(t);
@@ -1239,66 +1262,57 @@ function renderDetailHead(t) {
   `;
 }
 
-function actionsForHTML(t) {
-  const launchAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/launch`, {
-    successMsg: `Launching ${t.id}…`,
-  });
-  const critiqueAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, {
-    successMsg: `Critique queued for ${t.id}`,
-  });
-  const killAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/kill`, {
+/* Action HTML uses data-action="..." instead of binding a closure per
+   button. A single delegated click handler on #detail-head dispatches
+   to ACTION_DISPATCH, looking up the *current* task by state.currentTaskId
+   on each click. This eliminates the previous setTimeout-vs-poll race
+   where button handlers could attach to nodes that were about to be
+   replaced by the next render. */
+const ACTION_DISPATCH = {
+  "tail-log": () => switchTab("log"),
+  "open-log": () => switchTab("log"),
+  "view-spec": () => switchTab("spec"),
+  "review-critique": () => switchTab("critique"),
+  "copy-attach": (t) => copyCmd(`forge attach ${t.id}`),
+  "open-pr": (t) => { if (t.prUrl) window.open(t.prUrl, "_blank"); },
+  "launch": (t) => runAction(`/api/tasks/${encodeURIComponent(t.id)}/launch`, { successMsg: `Launching ${t.id}…` }),
+  "critique": (t) => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, { successMsg: `Critique queued for ${t.id}` }),
+  "kill": (t) => runAction(`/api/tasks/${encodeURIComponent(t.id)}/kill`, {
     successMsg: `Killed ${t.id}`,
     confirm: `Kill this run?\n\nThe tmux session will be terminated and the task marked failed.`,
-  });
+  }),
+};
 
+function actionsForHTML(t) {
   const items = [];
   if (t.section === "running") {
-    items.push({ label: "Tail log", cls: "btn-primary", action: () => switchTab("log") });
+    items.push({ label: "Tail log", cls: "btn-primary", action: "tail-log" });
     // Attach has to stay copy-only — terminal control can't transfer from the browser.
-    if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: () => copyCmd(`forge attach ${t.id}`) });
-    if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: () => window.open(t.prUrl, "_blank") });
-    items.push({ label: "Kill", cls: "btn-ghost", action: killAction });
+    if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: "copy-attach" });
+    if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: "open-pr" });
+    items.push({ label: "Kill", cls: "btn-ghost", action: "kill" });
   } else if (t.kind === "critique-ready") {
-    items.push({ label: "Review critique", cls: "btn-attention", action: () => switchTab("critique") });
-    items.push({ label: "Launch anyway", cls: "btn-secondary", action: launchAction });
+    items.push({ label: "Review critique", cls: "btn-attention", action: "review-critique" });
+    items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
   } else if (t.kind === "failed") {
-    items.push({ label: "Open log", cls: "btn-primary", action: () => switchTab("log") });
-    items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
-    items.push({ label: "Re-launch", cls: "btn-ghost", action: launchAction });
+    items.push({ label: "Open log", cls: "btn-primary", action: "open-log" });
+    items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
+    items.push({ label: "Re-launch", cls: "btn-ghost", action: "launch" });
   } else if (t.section === "ready") {
-    items.push({ label: "Launch", cls: "btn-primary", action: launchAction });
-    items.push({ label: "Critique", cls: "btn-secondary", action: critiqueAction });
-    items.push({ label: "View spec", cls: "btn-ghost", action: () => switchTab("spec") });
+    items.push({ label: "Launch", cls: "btn-primary", action: "launch" });
+    items.push({ label: "Critique", cls: "btn-secondary", action: "critique" });
+    items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
   } else if (t.section === "drafting") {
-    items.push({ label: "View spec", cls: "btn-primary", action: () => switchTab("spec") });
-    items.push({ label: "Run critique", cls: "btn-secondary", action: critiqueAction });
-    items.push({ label: "Launch", cls: "btn-ghost", action: launchAction });
+    items.push({ label: "View spec", cls: "btn-primary", action: "view-spec" });
+    items.push({ label: "Run critique", cls: "btn-secondary", action: "critique" });
+    items.push({ label: "Launch", cls: "btn-ghost", action: "launch" });
   } else if (t.section === "done") {
-    if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: () => window.open(t.prUrl, "_blank") });
-    items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
+    if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: "open-pr" });
+    items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
   }
-  setTimeout(() => {
-    $$("#detail-head .detail-actions .btn").forEach((b, i) => {
-      b.addEventListener("click", async () => {
-        if (b.disabled) return;
-        // Run the action; if it returns a Promise (async — POST endpoint),
-        // disable the button until it settles so double-clicks can't double-fire.
-        const result = items[i].action();
-        if (result && typeof result.then === "function") {
-          const original = b.textContent;
-          b.disabled = true;
-          b.textContent = "Working…";
-          try {
-            await result;
-          } finally {
-            b.disabled = false;
-            b.textContent = original;
-          }
-        }
-      });
-    });
-  }, 0);
-  return items.map((a) => `<button class="btn ${a.cls}">${escapeHTML(a.label)}</button>`).join("");
+  return items.map((a) =>
+    `<button class="btn ${a.cls}" data-action="${a.action}">${escapeHTML(a.label)}</button>`
+  ).join("");
 }
 
 async function copyCmd(cmd) {
@@ -1404,8 +1418,20 @@ function renderLogTab(t, body) {
   src.addEventListener("snapshot", (e) => appendLogLines(box, e.data));
   src.addEventListener("append", (e) => appendLogLines(box, e.data));
   src.addEventListener("error", () => {
-    appendLogLines(box, "(log stream disconnected — refresh tab to reconnect)");
+    appendLogLines(box, "(log stream disconnected)");
     teardownLog();
+    // Inject a Reconnect button next to the toolbar so the user can
+    // recover without switching tabs and back.
+    const tb = body.querySelector(".log-toolbar");
+    if (tb && !tb.querySelector("#log-reconnect")) {
+      const btn = document.createElement("button");
+      btn.id = "log-reconnect";
+      btn.className = "btn sm btn-secondary";
+      btn.textContent = "Reconnect";
+      btn.style.marginLeft = "8px";
+      btn.addEventListener("click", () => renderLogTab(t, body));
+      tb.insertBefore(btn, tb.querySelector("[style*='margin-left:auto']") || null);
+    }
   });
 }
 
@@ -1579,22 +1605,42 @@ function applyFilter() {
   renderRepoOptions();
   renderPickup();
   renderLists();
-  // If the currently selected task is hidden by the filter, clear selection.
+  // If the currently selected task vanished entirely (was deleted from the
+  // index by some other process), clear. Otherwise: when the repo filter
+  // hides it, switch to the first visible task. When SEARCH hides it,
+  // leave the detail visible — yanking it mid-typing is disorienting.
   if (state.currentTaskId) {
     const t = state.tasks.find((x) => x.id === state.currentTaskId);
-    if (!t || (state.selectedRepo && t.repo !== state.selectedRepo)) {
+    const hiddenByRepo = t && state.selectedRepo && t.repo !== state.selectedRepo;
+    if (!t) {
+      clearDetail();
+    } else if (hiddenByRepo) {
       const first = visibleTasks()[0];
       if (first) selectTask(first.id);
       else clearDetail();
     } else {
-      // Re-render head + tabs with the latest task data (status may have changed)
-      const fresh = state.tasks.find((x) => x.id === state.currentTaskId);
-      if (fresh) {
-        renderDetailHead(fresh);
-        renderTabs(fresh);
+      // Skip the re-render when nothing observable changed. Without this
+      // the 3s poll repaints the entire detail head every tick — flicker
+      // + lost focus + lost button state.
+      const fp = detailFingerprint(t);
+      if (fp !== state.lastDetailFp) {
+        state.lastDetailFp = fp;
+        renderDetailHead(t);
+        renderTabs(t);
       }
     }
   }
+}
+
+/* Fingerprint of every detail-head/tabs-relevant field. If unchanged we skip the re-render. */
+function detailFingerprint(t) {
+  return [
+    t.id, t.status, t.statLabel, t.statClass, t.kind || "",
+    t.branch || "", t.agentLabel || "", t.prUrl || "", t.prNumber || "",
+    t.tmuxAlive ? "1" : "0", t.age || "", t.error || "",
+    t.hasLog ? "1" : "0", t.hasSpec ? "1" : "0",
+    t.critique ? `${t.critique.id}:${t.critique.status}:${t.critique.viewedAt || ""}` : "",
+  ].join("|");
 }
 
 function clearDetail() {
@@ -1647,9 +1693,13 @@ async function boot() {
   state.refreshTimer = setInterval(refreshTasks, 3000);
   setInterval(refreshRepos, 30_000);
   setInterval(refreshPrCount, 30_000);
-  // Default selection: pick the first task with attention, then running, then any.
+  // Default selection: pick the first task that needs attention (a critique-
+  // ready or failed kind), then any running task, then anything else. The
+  // section field is "running" | "ready" | "drafting" | "done" | "attention",
+  // but only critique-ready/failed *kinds* roll up into the attention section,
+  // so use kind for those and section for the rest.
   const candidates = [
-    state.tasks.find((t) => t.section === "attention"),
+    state.tasks.find((t) => t.kind === "critique-ready" || t.kind === "failed"),
     state.tasks.find((t) => t.section === "running"),
     state.tasks[0],
   ].filter(Boolean);
@@ -1657,26 +1707,36 @@ async function boot() {
 }
 
 /* ─── new spec modal ──────────────────────────────────────────────── */
+const CUSTOM_REPO_VALUE = "__custom__";
+
 function openNewSpecModal() {
   const modal = $("#new-spec-modal");
   const repoSel = $("#new-spec-repo");
-  // Populate repo dropdown from known repos.
-  repoSel.innerHTML = state.repos.map((r) =>
-    `<option value="${escapeHTML(r.root)}" data-name="${escapeHTML(r.name)}">${escapeHTML(r.name)} <span>(${escapeHTML(r.root)})</span></option>`
+  const known = state.repos.map((r) =>
+    `<option value="${escapeHTML(r.root)}">${escapeHTML(r.name)} (${escapeHTML(r.root)})</option>`
   ).join("");
-  if (state.repos.length === 0) {
-    repoSel.innerHTML = `<option value="">No repos yet — register one with \`forge spec save\` first.</option>`;
-    repoSel.disabled = true;
-    $("#new-spec-submit").disabled = true;
-  } else {
-    repoSel.disabled = false;
-    $("#new-spec-submit").disabled = false;
-    // Default to currently-selected repo if any.
-    const selected = state.repos.find((r) => r.name === state.selectedRepo);
-    if (selected) repoSel.value = selected.root;
-  }
+  // Always include a Custom path option so first-time users (no known
+  // repos) and users who want a brand-new repo aren't blocked.
+  repoSel.innerHTML = `${known}<option value="${CUSTOM_REPO_VALUE}">Custom path…</option>`;
+  $("#new-spec-submit").disabled = false;
+  // Default selection: currently-selected repo, else first known, else custom.
+  const selected = state.repos.find((r) => r.name === state.selectedRepo);
+  if (selected) repoSel.value = selected.root;
+  else if (state.repos[0]) repoSel.value = state.repos[0].root;
+  else repoSel.value = CUSTOM_REPO_VALUE;
+  toggleRepoCustomField();
   modal.hidden = false;
-  setTimeout(() => $("#new-spec-body").focus(), 0);
+  // Focus the body unless they're starting from custom-path (then focus that).
+  setTimeout(() => {
+    if (repoSel.value === CUSTOM_REPO_VALUE) $("#new-spec-repo-custom").focus();
+    else $("#new-spec-body").focus();
+  }, 0);
+}
+
+function toggleRepoCustomField() {
+  const isCustom = $("#new-spec-repo").value === CUSTOM_REPO_VALUE;
+  $("#new-spec-repo-custom-wrap").hidden = !isCustom;
+  if (isCustom) $("#new-spec-repo-custom").focus();
 }
 
 function closeNewSpecModal() {
@@ -1693,17 +1753,37 @@ $("#new-spec-cancel").addEventListener("click", closeNewSpecModal);
 $("#new-spec-modal").addEventListener("click", (e) => {
   if (e.target.id === "new-spec-modal") closeNewSpecModal();
 });
+$("#new-spec-repo").addEventListener("change", toggleRepoCustomField);
+
+/* Modal focus trap: Tab inside the modal cycles between its focusables. */
+$("#new-spec-modal").addEventListener("keydown", (e) => {
+  if (e.key !== "Tab") return;
+  const card = $("#new-spec-modal .modal-card");
+  const focusable = card.querySelectorAll(
+    'button, [href], input:not([type="hidden"]), select, textarea, [tabindex]:not([tabindex="-1"])'
+  );
+  if (focusable.length === 0) return;
+  const visible = Array.from(focusable).filter((el) => !el.disabled && el.offsetParent !== null);
+  if (visible.length === 0) return;
+  const first = visible[0];
+  const last = visible[visible.length - 1];
+  if (e.shiftKey && document.activeElement === first) { e.preventDefault(); last.focus(); }
+  else if (!e.shiftKey && document.activeElement === last) { e.preventDefault(); first.focus(); }
+});
 
 $("#new-spec-form").addEventListener("submit", async (e) => {
   e.preventDefault();
-  const repoRoot = $("#new-spec-repo").value.trim();
+  let repoRoot = $("#new-spec-repo").value.trim();
+  if (repoRoot === CUSTOM_REPO_VALUE) {
+    repoRoot = $("#new-spec-repo-custom").value.trim();
+  }
   const markdown = $("#new-spec-body").value;
   const title = $("#new-spec-title").value.trim();
   const agent = $("#new-spec-agent").value;
   const model = $("#new-spec-model").value.trim();
   const autoImprove = $("#new-spec-improve").checked;
 
-  if (!repoRoot) { showToast("Pick a repo.", "error"); return; }
+  if (!repoRoot) { showToast("Pick a repo or enter a custom path.", "error"); return; }
   if (!markdown.trim()) { showToast("Markdown body is required.", "error"); return; }
 
   const submit = $("#new-spec-submit");
@@ -1711,9 +1791,9 @@ $("#new-spec-form").addEventListener("submit", async (e) => {
   submit.textContent = "Saving…";
 
   // Always do a *fast* save (autoImprove=false). If the user wants
-  // auto-improve, fire it as a separate background request — that way
-  // the modal closes within a second and the new task shows up in the
-  // list with an "Improving" pulse pill while the critics run.
+  // auto-improve, fire it as a separate background request — the server
+  // detaches it to a subprocess and returns immediately, so the new task
+  // shows up in the list right away with an "Improving" pulse pill.
   const body = {
     markdown,
     repoRoot,
@@ -1731,21 +1811,17 @@ $("#new-spec-form").addEventListener("submit", async (e) => {
 
     if (autoImprove && data.taskId) {
       showToast(`Saved ${data.taskId} — auto-improve running in background…`, "info");
-      // Fire-and-forget. Toast on completion / error.
-      apiPost(`/api/tasks/${encodeURIComponent(data.taskId)}/improve`, {})
-        .then((r) => {
-          const im = (r && r.improve) || {};
-          if (im.mode === "applied") showToast(`Auto-improve applied ${im.changeCount} change(s) for ${data.taskId}`, "info");
-          else if (im.mode === "no-op") showToast(`Auto-improve: no actionable findings for ${data.taskId}`, "info");
-          else showToast(`Auto-improve skipped for ${data.taskId}: ${im.error || "unknown"}`, "error");
-          refreshTasks();
-        })
-        .catch((err) => showToast(`Auto-improve failed: ${err.message}`, "error"));
+      // Fire-and-forget. The server returns { queued: true } immediately;
+      // the next 3s task poll surfaces the "Improving" pill, then "Ready".
+      apiPost(`/api/tasks/${encodeURIComponent(data.taskId)}/improve`, {}).catch((err) => {
+        showToast(err.hint ? `Auto-improve failed: ${err.message} — ${err.hint}` : `Auto-improve failed: ${err.message}`, "error");
+      });
     } else {
       showToast(`Saved spec ${data.taskId}`, "info");
     }
   } catch (err) {
-    showToast(err.message || "Save failed", "error");
+    const msg = err.hint ? `${err.message} — ${err.hint}` : (err.message || "Save failed");
+    showToast(msg, "error");
     submit.disabled = false;
     submit.textContent = "Save spec";
   }
@@ -1783,6 +1859,27 @@ $$("#nav .nav-item[data-target]").forEach((item) => {
 $("#search-input").addEventListener("input", (e) => {
   state.searchQuery = e.target.value;
   applyFilter();
+});
+
+/* Delegated handler for detail-head action buttons (see actionsForHTML). */
+$("#detail-head").addEventListener("click", async (e) => {
+  const btn = e.target.closest("button.btn[data-action]");
+  if (!btn || btn.disabled) return;
+  const action = btn.dataset.action;
+  const handler = ACTION_DISPATCH[action];
+  if (!handler) return;
+  const t = state.tasks.find((x) => x.id === state.currentTaskId);
+  if (!t) return;
+  const result = handler(t);
+  if (result && typeof result.then === "function") {
+    btn.disabled = true;
+    const original = btn.textContent;
+    btn.textContent = "Working…";
+    try { await result; } finally {
+      btn.disabled = false;
+      btn.textContent = original;
+    }
+  }
 });
 
 window.addEventListener("keydown", (e) => {
