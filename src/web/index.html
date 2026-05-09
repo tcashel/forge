@@ -845,7 +845,7 @@ A paragraph describing the work, why it's needed, and the intended outcome.
         </div>
         <div class="field field-checkbox">
           <input id="new-spec-improve" type="checkbox" checked>
-          <label for="new-spec-improve">Run auto-improve after save (two critics + synthesizer; can take 1–2 minutes)</label>
+          <label for="new-spec-improve">Run auto-improve in the background after save (two critics + synthesizer; ~1–2 min)</label>
         </div>
       </div>
       <div class="modal-foot">
@@ -1269,7 +1269,25 @@ function actionsForHTML(t) {
     items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
   }
   setTimeout(() => {
-    $$("#detail-head .detail-actions .btn").forEach((b, i) => b.addEventListener("click", items[i].action));
+    $$("#detail-head .detail-actions .btn").forEach((b, i) => {
+      b.addEventListener("click", async () => {
+        if (b.disabled) return;
+        // Run the action; if it returns a Promise (async — POST endpoint),
+        // disable the button until it settles so double-clicks can't double-fire.
+        const result = items[i].action();
+        if (result && typeof result.then === "function") {
+          const original = b.textContent;
+          b.disabled = true;
+          b.textContent = "Working…";
+          try {
+            await result;
+          } finally {
+            b.disabled = false;
+            b.textContent = original;
+          }
+        }
+      });
+    });
   }, 0);
   return items.map((a) => `<button class="btn ${a.cls}">${escapeHTML(a.label)}</button>`).join("");
 }
@@ -1681,12 +1699,16 @@ $("#new-spec-form").addEventListener("submit", async (e) => {
 
   const submit = $("#new-spec-submit");
   submit.disabled = true;
-  submit.textContent = autoImprove ? "Saving (auto-improve, ~1–2 min)…" : "Saving…";
+  submit.textContent = "Saving…";
 
+  // Always do a *fast* save (autoImprove=false). If the user wants
+  // auto-improve, fire it as a separate background request — that way
+  // the modal closes within a second and the new task shows up in the
+  // list with an "Improving" pulse pill while the critics run.
   const body = {
     markdown,
     repoRoot,
-    autoImprove,
+    autoImprove: false,
     ...(title ? { title } : {}),
     ...(agent ? { agent } : {}),
     ...(model ? { model } : {}),
@@ -1694,10 +1716,25 @@ $("#new-spec-form").addEventListener("submit", async (e) => {
 
   try {
     const data = await apiPost("/api/specs", body);
-    showToast(`Saved spec ${data.taskId}`, "info");
     closeNewSpecModal();
     await refreshTasks();
     if (data.taskId) selectTask(data.taskId);
+
+    if (autoImprove && data.taskId) {
+      showToast(`Saved ${data.taskId} — auto-improve running in background…`, "info");
+      // Fire-and-forget. Toast on completion / error.
+      apiPost(`/api/tasks/${encodeURIComponent(data.taskId)}/improve`, {})
+        .then((r) => {
+          const im = (r && r.improve) || {};
+          if (im.mode === "applied") showToast(`Auto-improve applied ${im.changeCount} change(s) for ${data.taskId}`, "info");
+          else if (im.mode === "no-op") showToast(`Auto-improve: no actionable findings for ${data.taskId}`, "info");
+          else showToast(`Auto-improve skipped for ${data.taskId}: ${im.error || "unknown"}`, "error");
+          refreshTasks();
+        })
+        .catch((err) => showToast(`Auto-improve failed: ${err.message}`, "error"));
+    } else {
+      showToast(`Saved spec ${data.taskId}`, "info");
+    }
   } catch (err) {
     showToast(err.message || "Save failed", "error");
     submit.disabled = false;
