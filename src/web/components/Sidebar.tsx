@@ -1,7 +1,7 @@
 import { useComputed } from "@preact/signals";
 import "../lib/forge-bridge";
 import { repos } from "../signals/repos";
-import { selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
+import { modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
 import type { RepoView, SidebarFilter } from "../types";
 
 interface NavTarget {
@@ -68,7 +68,7 @@ export function Sidebar() {
   };
 
   const onNewSpec = () => {
-    window.__forge?.legacy?.openNewSpecModal?.();
+    modalOpen.value = true;
   };
 
   const onHelp = () => {

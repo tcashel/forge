@@ -4,6 +4,7 @@ import { App } from "./components/App";
 import { derivePickups } from "./components/pickup/PickupRow";
 import type { ForgeBridge, ForgeLegacyBridge } from "./lib/forge-bridge";
 import { repos } from "./signals/repos";
+import { refreshSettings, settingsConfig, startSettingsPolling } from "./signals/settings";
 import {
   currentTab,
   currentTaskId,
@@ -16,7 +17,7 @@ import {
   visibleTasks,
 } from "./signals/tasks";
 import { theme } from "./signals/theme";
-import { searchQuery, selectedRepo, viewMode } from "./signals/ui";
+import { modalOpen, searchQuery, selectedRepo, viewMode } from "./signals/ui";
 
 // Expose signals + effect to legacy `src/web/*.js` so they can read/write
 // the same state Preact owns. main.tsx runs before app.js (script tag
@@ -24,7 +25,7 @@ import { searchQuery, selectedRepo, viewMode } from "./signals/ui";
 
 const legacy: ForgeLegacyBridge = {};
 const bridge: ForgeBridge = {
-  signals: { searchQuery, selectedRepo, viewMode, theme, repos, tasks, currentTaskId, currentTab },
+  signals: { searchQuery, selectedRepo, viewMode, theme, repos, tasks, currentTaskId, currentTab, modalOpen },
   effect,
   legacy,
   api: { refreshTasks, selectTask },
@@ -37,6 +38,26 @@ if (root) render(<App />, root);
 // Phase 3 owns the 3s task poll. Legacy app.js still kicks off the
 // initial repo / context fetches and starts repo + PR pollers.
 startTaskPolling();
+// Phase 4: 30s settings poll. The poll only runs while viewMode ===
+// "settings"; SettingsForm reads settingsConfig once on mount, so a
+// poll mid-edit won't recreate the inputs and lose focus.
+startSettingsPolling();
+
+// When the user enters settings mode (or switches repos while in
+// settings mode), kick off a fresh fetch so the form has data to seed
+// from. Mounting `<SettingsForm/>` also triggers a fetch if the signal
+// is null — this effect just keeps things in sync after re-entry.
+effect(() => {
+  if (viewMode.value !== "settings") return;
+  void refreshSettings(selectedRepo.value || null);
+});
+
+// Drop cached settingsConfig when leaving settings mode so a re-entry
+// re-seeds the form from a fresh fetch (matches legacy behavior where
+// the form was rebuilt from scratch on every enterSettingsMode call).
+effect(() => {
+  if (viewMode.value !== "settings") settingsConfig.value = null;
+});
 
 // Sidebar nav counts and the topbar refresh dot/clock are still rendered
 // by Preact components, but the count <span>s themselves are intentionally

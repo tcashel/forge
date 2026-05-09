@@ -1,26 +1,28 @@
 import { viewMode } from "../signals/ui";
+import { NewSpecModal } from "./modal/NewSpecModal";
 import { PickupSection } from "./pickup/PickupSection";
 import { Sidebar } from "./Sidebar";
+import { SettingsForm } from "./settings/SettingsForm";
+import { SettingsRepoList } from "./settings/SettingsRepoList";
 import { Topbar } from "./Topbar";
 import { TaskDetail } from "./tasks/TaskDetail";
 import { TaskList } from "./tasks/TaskList";
 
-// Phase 3: Preact owns the pickup/list/detail panes when in tasks mode.
-// In PRs and Settings modes the Preact subtrees collapse to `null` and
-// legacy prs.js / settings.js paint into the now-empty panes via
-// `pane.innerHTML = ...`. Because Preact unmounts synchronously during a
-// signal-driven re-render, by the time legacy code calls `innerHTML =`
-// the panes are guaranteed to be empty Preact-managed nodes — the
-// legacy write replaces their content cleanly. When tasks mode is
-// re-entered, viewMode flips back to "tasks" and Preact re-mounts.
+// Phase 4: Preact owns the pickup/list/detail panes when in tasks OR
+// settings mode. PRs mode still falls back to the legacy renderer
+// (Phase 5 will port it). The new-spec modal is always rendered by
+// Preact and toggles via the `modalOpen` signal — no more inline
+// markup in index.html.
 //
 // The outer <section> / <aside> / <main> nodes keep their `id`s so
 // existing legacy selectors (#pickup-section, #list-pane, #detail-pane)
 // keep resolving — just their *children* swap between Preact-rendered
-// task content and legacy-rendered prs/settings markup.
+// content (tasks/settings) and the legacy-rendered prs/* markup.
 
 export function App() {
-  const inTasks = viewMode.value === "tasks";
+  const mode = viewMode.value;
+  const inTasks = mode === "tasks";
+  const inSettings = mode === "settings";
   return (
     <div class="app">
       <Sidebar />
@@ -31,11 +33,14 @@ export function App() {
         </section>
         <aside class="list-pane" id="list-pane">
           {inTasks ? <TaskList /> : null}
+          {inSettings ? <SettingsRepoList /> : null}
         </aside>
         <main class="detail-pane" id="detail-pane">
           {inTasks ? <TaskDetail /> : null}
+          {inSettings ? <SettingsForm /> : null}
         </main>
       </div>
+      <NewSpecModal />
     </div>
   );
 }
