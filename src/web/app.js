@@ -13,140 +13,71 @@ import { clearSettingsModeShell, refreshSettings, renderSettingsMode } from "./s
 import { state } from "./state.js";
 
 const runAction = (path, opts) => runTaskAction(path, opts, refreshTasks);
-const TASK_LIST_SHELL = $("#list-pane").innerHTML;
-const TASK_DETAIL_SHELL = $("#detail-pane").innerHTML;
 
-/* ─── clock ────────────────────────────────────────────────────────── */
-function tickClock() {
-  const d = new Date();
-  const hh = String(d.getHours()).padStart(2, "0");
-  const mm = String(d.getMinutes()).padStart(2, "0");
-  const ss = String(d.getSeconds()).padStart(2, "0");
-  $("#clock").textContent = `${hh}:${mm}:${ss}`;
-}
-setInterval(tickClock, 1000); tickClock();
+/* The Preact shell (src/web/components/App.tsx) renders the topbar,
+   sidebar, repo picker, search, theme toggle, and clock. Phase 2 trimmed
+   the corresponding wiring out of this file. The task list/detail
+   panes are rendered into id-named slots that the Preact App seeds with
+   the original markup once and then leaves alone. */
+
+/* Snapshots of the inner markup of #list-pane / #detail-pane. PRs and
+   Settings modes overwrite those panes wholesale; enterTaskMode restores
+   them. The Preact <App /> component seeds the panes with the same
+   markup on first render. */
+const TASK_LIST_SHELL = `
+  <header class="section-h" data-section="running">
+    <span class="ic running"></span>
+    <span class="name">Running now</span>
+    <span class="count">0</span>
+    <span class="help">Live — auto-refreshes every 3s</span>
+  </header>
+  <div id="list-running"></div>
+
+  <header class="section-h" data-section="attention">
+    <span class="ic attention"></span>
+    <span class="name">Needs your attention</span>
+    <span class="count">0</span>
+    <span class="help">Failures + critique-ready</span>
+  </header>
+  <div id="list-attention"></div>
+
+  <header class="section-h" data-section="ready">
+    <span class="ic ready"></span>
+    <span class="name">Ready to launch</span>
+    <span class="count">0</span>
+    <span class="help">Auto-improver has revised these</span>
+  </header>
+  <div id="list-ready"></div>
+
+  <header class="section-h" data-section="drafting">
+    <span class="ic drafting"></span>
+    <span class="name">Drafting</span>
+    <span class="count">0</span>
+    <span class="help">First-pass specs — could use shape</span>
+  </header>
+  <div id="list-drafting"></div>
+
+  <details class="done-section">
+    <summary>
+      <span class="chev">›</span>
+      <span class="ic done" style="width:8px;height:8px;border-radius:50%;background:var(--done)"></span>
+      <span>Recently done</span>
+      <span class="count" style="margin-left:8px">0</span>
+    </summary>
+    <div id="list-done"></div>
+  </details>
+`;
+
+const TASK_DETAIL_SHELL = `
+  <div class="detail-empty" id="detail-empty">Select a task to see details.</div>
+  <div class="detail-head" id="detail-head" hidden></div>
+  <nav class="tabs" id="detail-tabs" hidden></nav>
+  <div class="detail-body" id="detail-body" hidden></div>
+`;
 
 function selectedRepoLabel() {
   return selectedRepoName(state);
 }
-
-/* ─── repo selector ────────────────────────────────────────────────── */
-function renderRepoOptions() {
-  const list = $("#repo-list");
-  $("#repo-count-all").textContent = state.tasks.length;
-  if (state.repos.length === 0) {
-    list.innerHTML = `<div style="padding:10px 12px;color:var(--dim);font-size:12px">No repos yet — add one below or save a spec with <code>forge spec save</code>.</div>`;
-    return;
-  }
-  const active = state.repos.filter((r) => !r.stale);
-  const stale = state.repos.filter((r) => r.stale && r.registered);
-  const renderGroup = (repos) => repos.map((r) => `
-    <button class="repo-option ${repoKey(r) === state.selectedRepo ? "active" : ""} ${r.stale ? "stale" : ""}" data-repo="${escapeHTML(repoKey(r))}" data-search="${escapeHTML(`${r.name} ${r.root}`)}">
-      <span class="repo-dot"></span>
-      <span class="repo-name">${escapeHTML(r.name)}${r.current ? " · current" : ""}</span>
-      <span class="branch-mini">${escapeHTML(r.branch || "")}</span>
-      ${r.stale ? '<span class="repo-state">stale</span>' : ""}
-      <span class="repo-count">${r.taskCount}</span>
-      <span class="check">✓</span>
-    </button>
-  `).join("");
-  list.innerHTML = `${renderGroup(active)}${stale.length ? `<div class="repo-section">Stale or missing</div>${renderGroup(stale)}` : ""}`;
-  $$("#repo-list .repo-option").forEach((opt) => {
-    opt.addEventListener("click", (e) => {
-      e.stopPropagation();
-      state.selectedRepo = opt.dataset.repo || "";
-      closeRepoPopover();
-      applyFilter();
-      if (state.viewMode === "prs") refreshPrs(state, { render: () => renderPrMode(state) });
-      if (state.viewMode === "settings") refreshSettings(state, { render: () => renderSettingsMode(state) });
-    });
-  });
-  $("#repo-popover .repo-option[data-repo='']").addEventListener("click", (e) => {
-    e.stopPropagation();
-    state.selectedRepo = "";
-    closeRepoPopover();
-    applyFilter();
-    if (state.viewMode === "prs") refreshPrs(state, { render: () => renderPrMode(state) });
-    if (state.viewMode === "settings") refreshSettings(state, { render: () => renderSettingsMode(state) });
-  });
-}
-
-function updateRepoButton() {
-  const dot = $("#repo-btn-dot");
-  const name = $("#repo-btn-name");
-  const slash = $("#repo-btn-slash");
-  const branch = $("#repo-btn-branch");
-  if (state.selectedRepo) {
-    dot.classList.remove("multi");
-    const r = state.repos.find((x) => repoKey(x) === state.selectedRepo);
-    name.textContent = r ? r.name : state.selectedRepo;
-    branch.textContent = (r && r.branch) || "";
-    slash.hidden = !branch.textContent;
-    branch.hidden = !branch.textContent;
-    $("#foot-repo").textContent = r ? r.name : state.selectedRepo;
-    $("#foot-branch").textContent = r?.stale ? "stale" : (r && r.branch) || "—";
-  } else {
-    dot.classList.add("multi");
-    name.textContent = "All repos";
-    slash.hidden = true; branch.hidden = true;
-    $("#foot-repo").textContent = `${state.repos.length} repo${state.repos.length === 1 ? "" : "s"}`;
-    $("#foot-branch").textContent = "—";
-  }
-  $$(".repo-popover .repo-option").forEach((opt) => {
-    opt.classList.toggle("active", (opt.dataset.repo || "") === state.selectedRepo);
-  });
-}
-
-function openRepoPopover() {
-  $("#repo-popover").hidden = false;
-  $("#repo-btn").classList.add("open");
-  $("#repo-btn").setAttribute("aria-expanded", "true");
-  setTimeout(() => $("#repo-search").focus(), 0);
-}
-function closeRepoPopover() {
-  $("#repo-popover").hidden = true;
-  $("#repo-btn").classList.remove("open");
-  $("#repo-btn").setAttribute("aria-expanded", "false");
-  $("#repo-search").value = "";
-  $$("#repo-popover .repo-option").forEach((o) => o.style.display = "");
-}
-
-$("#repo-btn").addEventListener("click", (e) => {
-  e.stopPropagation();
-  if ($("#repo-popover").hidden) openRepoPopover(); else closeRepoPopover();
-});
-$("#repo-search").addEventListener("input", () => {
-  const q = $("#repo-search").value.toLowerCase().trim();
-  $$("#repo-popover .repo-option").forEach((opt) => {
-    if (!opt.dataset.repo) { opt.style.display = q ? "none" : ""; return; }
-    const hay = (opt.dataset.search || opt.dataset.repo).toLowerCase();
-    opt.style.display = hay.includes(q) ? "" : "none";
-  });
-});
-document.addEventListener("click", (e) => {
-  if ($("#repo-popover").hidden) return;
-  if (!$("#repo-popover").contains(e.target) && !$("#repo-btn").contains(e.target)) closeRepoPopover();
-});
-
-$("#repo-add-form").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const input = $("#repo-add-path");
-  const repoRoot = input.value.trim();
-  if (!repoRoot) return;
-  try {
-    const data = await apiPost("/api/repos", { repoRoot });
-    await refreshRepos();
-    state.selectedRepo = data.repo?.root || repoRoot;
-    input.value = "";
-    closeRepoPopover();
-    applyFilter();
-    if (state.viewMode === "prs") refreshPrs(state, { render: () => renderPrMode(state) });
-    if (state.viewMode === "settings") refreshSettings(state, { render: () => renderSettingsMode(state) });
-    showToast(`Added repo ${selectedRepoLabel() || repoRoot}`, "info");
-  } catch (err) {
-    showToast(err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not add repo", "error");
-  }
-});
 
 /* ─── pickup cards (derived from tasks) ────────────────────────────── */
 function derivePickups(tasks) {
@@ -640,8 +571,6 @@ function formatDur(ms) {
 /* ─── filtering ────────────────────────────────────────────────────── */
 function applyFilter() {
   document.body.classList.toggle("filtered-single", !!state.selectedRepo);
-  updateRepoButton();
-  renderRepoOptions();
   if (state.viewMode === "prs" || state.viewMode === "settings") {
     renderLists();
     return;
@@ -854,7 +783,6 @@ function closeNewSpecModal() {
   $("#new-spec-submit").textContent = "Save spec";
 }
 
-$("#new-plan-btn").addEventListener("click", openNewSpecModal);
 $("#new-spec-close").addEventListener("click", closeNewSpecModal);
 $("#new-spec-cancel").addEventListener("click", closeNewSpecModal);
 $("#new-spec-modal").addEventListener("click", (e) => {
@@ -940,51 +868,6 @@ $("#new-spec-form").addEventListener("submit", async (e) => {
   }
 });
 
-/* ─── nav stubs ───────────────────────────────────────────────────── */
-$("#nav-help").addEventListener("click", () => {
-  showToast("Help: navigate with j/k or click. ⌘K focuses search.", "info");
-});
-$("#nav-settings").addEventListener("click", () => {
-  $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
-  $("#nav-settings").classList.add("active");
-  enterSettingsMode();
-});
-
-/* Sidebar nav: scroll-to-section. data-target maps to the relevant
-   section in #list-pane (running / attention / ready / drafting / done).
-   "all" and unmapped targets just clear focus and scroll to top. */
-const NAV_SECTIONS = { running: "running", backlog: "ready", done: "done", all: "all" };
-$$("#nav .nav-item[data-target]").forEach((item) => {
-  item.addEventListener("click", () => {
-    $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
-    item.classList.add("active");
-    const target = item.dataset.target;
-    if (target === "prs") {
-      enterPrMode();
-      return;
-    }
-    const section = NAV_SECTIONS[target];
-    enterTaskMode(section || "all");
-  });
-});
-
-$("#mobile-work-btn")?.addEventListener("click", () => {
-  $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
-  $("#nav .nav-item[data-target='all']")?.classList.add("active");
-  enterTaskMode("all");
-});
-$("#mobile-prs-btn")?.addEventListener("click", () => {
-  $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
-  $("#nav .nav-item[data-target='prs']")?.classList.add("active");
-  enterPrMode();
-});
-
-/* Search input: debounce-free substring filter on title/branch/repo/agent/blurb. */
-$("#search-input").addEventListener("input", (e) => {
-  state.searchQuery = e.target.value;
-  applyFilter();
-});
-
 /* Delegated handler for detail-head action buttons (see actionsForHTML). */
 $("#detail-pane").addEventListener("click", async (e) => {
   const btn = e.target.closest("button.btn[data-action]");
@@ -1006,33 +889,61 @@ $("#detail-pane").addEventListener("click", async (e) => {
   }
 });
 
+/* Modal-only keyboard handler. Search-bar focus, '/' / ⌘K, 'r' (repo
+   popover), and Escape-clears-search are owned by Preact components in
+   <Search /> and <RepoPicker />. We only need: Escape closes the
+   currently-open new-spec modal, and 'n' opens it. */
 window.addEventListener("keydown", (e) => {
-  // Modal-open: only Escape (close modal) is honored — let everything else fall through to the form.
   if (!$("#new-spec-modal").hidden) {
     if (e.key === "Escape") { e.preventDefault(); closeNewSpecModal(); }
     return;
   }
-  // Search input: Escape clears and blurs.
-  if (e.target === $("#search-input")) {
-    if (e.key === "Escape") {
-      e.preventDefault();
-      e.target.value = "";
-      state.searchQuery = "";
-      applyFilter();
-      e.target.blur();
-    }
-    return;
-  }
   if (e.target.matches("input,textarea,select")) return;
-  if (e.key === "/" || (e.metaKey && e.key === "k")) { e.preventDefault(); $("#search-input").focus(); }
   if (e.key === "n" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openNewSpecModal(); }
-  if (e.key === "r" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openRepoPopover(); }
-  if (e.key === "Escape" && !$("#repo-popover").hidden) closeRepoPopover();
 });
 
 window.addEventListener("beforeunload", () => {
   teardownLog();
   if (state.refreshTimer) clearInterval(state.refreshTimer);
 });
+
+/* ─── Preact ↔ legacy bridge ──────────────────────────────────────── */
+
+/* Register legacy callbacks that the Preact shell (sidebar, repo picker,
+   topbar, search) dispatches into. main.tsx publishes the signal bag
+   first, so window.__forge is already populated by the time this script
+   runs. */
+function setSelectedRepoFromBridge(key) {
+  state.selectedRepo = key || "";
+  applyFilter();
+  if (state.viewMode === "prs") refreshPrs(state, { render: () => renderPrMode(state) });
+  if (state.viewMode === "settings") refreshSettings(state, { render: () => renderSettingsMode(state) });
+}
+
+if (window.__forge) {
+  Object.assign(window.__forge.legacy, {
+    setSelectedRepo: setSelectedRepoFromBridge,
+    applyFilter,
+    refreshRepos,
+    showToast,
+    enterTaskMode,
+    enterPrMode,
+    enterSettingsMode,
+    openNewSpecModal,
+  });
+
+  /* When Preact-owned signals (search, selectedRepo) change, re-run the
+     legacy filter pipeline. The signals fire synchronously on .value =
+     ... so this glues Preact-side input edits to the legacy task list
+     re-render without coupling app.js to Preact. */
+  let firstRun = true;
+  window.__forge.effect(() => {
+    // Read every signal we want to subscribe to.
+    void window.__forge.signals.searchQuery.value;
+    void window.__forge.signals.selectedRepo.value;
+    if (firstRun) { firstRun = false; return; }
+    applyFilter();
+  });
+}
 
 boot();
