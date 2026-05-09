@@ -6,18 +6,13 @@
 // unchanged. The legacy `state.x` reads/writes always go through the
 // signal layer — no duplicated storage.
 
+// PR state (prs / prMe / prsRepo / prsRepoRoot / prFilterMine /
+// selectedPrNumber / prsLoading / prsError) lives in
+// `src/web/signals/prs.ts` after Phase 5 — Preact components read it
+// directly and no legacy code touches `state.pr*` anymore.
 const _local = {
   context: null,
   lastDetailFp: "",
-  prs: [],
-  prMe: "",
-  prsRepo: null,
-  prsRepoRoot: null,
-  prFilterMine: false,
-  prDetailsOpen: true,
-  selectedPrNumber: null,
-  prsLoading: false,
-  prsError: null,
   logSource: null,
   refreshTimer: null,
 };
