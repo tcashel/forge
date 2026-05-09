@@ -8,6 +8,7 @@
   "files": {
     "includes": [
       "**/*.ts",
+      "**/*.tsx",
       "**/*.json",
       "!**/node_modules",
       "!**/dist",
