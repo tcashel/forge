@@ -113,3 +113,22 @@ export interface PrsResponse {
   repo: string | null;
   repoRoot: string | null;
 }
+
+// ─── Plan chat ──────────────────────────────────────────────────────────────
+// Mirror of `ChatMessage` from src/core/plan-chat.ts. The web layer only
+// needs the structural shape; the role union is intentionally narrowed
+// to "user" | "assistant" since that's what the backend persists.
+export interface ChatMessage {
+  id: string;
+  role: "user" | "assistant";
+  text: string;
+  ts: string;
+}
+
+export interface PlanHistoryResponse {
+  messages: ChatMessage[];
+}
+
+export interface PlanDraftResponse {
+  draftId: string;
+}

@@ -6,6 +6,13 @@
 // only update their data signals; this component re-renders for the
 // repo dropdown when repos change, but the textarea and inputs are
 // keyed off local signals, so typing-in-progress is preserved.
+//
+// Phase 8: a left rail hosts <PlannerChat scope="draft" id={draftId}/>.
+// The draft is minted lazily on first open via POST /api/plan-chat/draft,
+// reused for the lifetime of the modal session, and either promoted onto
+// the new spec (on save) or deleted (on close-without-save). The chat's
+// "Apply to spec" button lifts the latest assistant fenced markdown into
+// the body textarea.
 import { useSignal } from "@preact/signals";
 import { useEffect, useRef } from "preact/hooks";
 import { type ApiError, apiPost } from "../../lib/api";
@@ -14,7 +21,8 @@ import { showToast } from "../../lib/toast";
 import { repos } from "../../signals/repos";
 import { refreshTasks } from "../../signals/tasks";
 import { modalOpen, selectedRepo } from "../../signals/ui";
-import type { RepoView } from "../../types";
+import type { PlanDraftResponse, RepoView } from "../../types";
+import { PlannerChat } from "../chat/PlannerChat";
 
 function repoKey(r: RepoView): string {
   return r.root || r.name || "";
@@ -40,6 +48,14 @@ export function NewSpecModal() {
   const model = useSignal<string>("");
   const autoImprove = useSignal<boolean>(true);
   const submitting = useSignal<boolean>(false);
+  // Plan-chat draft lifecycle. Minted on first open, promoted on save,
+  // deleted on close-without-save. Stored in a signal so the chat rail
+  // re-mounts cleanly when the id flips from null → "d_…".
+  const draftId = useSignal<string | null>(null);
+  // Tracks whether the most recent close path is a "save" vs "cancel" —
+  // the success path of onSubmit sets `promoted=true` so the unmount
+  // effect knows not to delete the draft we just promoted.
+  const promoted = useRef<boolean>(false);
 
   const cardRef = useRef<HTMLDivElement | null>(null);
   const titleRef = useRef<HTMLInputElement | null>(null);
@@ -82,6 +98,42 @@ export function NewSpecModal() {
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
+  }, [open]);
+
+  // Plan-chat draft lifecycle. On first open with no draftId, mint one
+  // via POST /api/plan-chat/draft. On close (open flips false), delete
+  // any unpromoted draft so we don't litter ~/.forge/plan-drafts.
+  useEffect(() => {
+    if (!open) {
+      // Modal just closed. If a draft was minted but not promoted, ask
+      // the server to delete it (and its on-disk transcript).
+      const id = draftId.value;
+      if (id && !promoted.current) {
+        // Fire-and-forget — DELETE failures don't block UX, the boot
+        // reaper sweeps stale drafts.
+        fetch(`/api/plan-chat/draft/${encodeURIComponent(id)}`, { method: "DELETE" }).catch(() => {
+          /* noop */
+        });
+      }
+      draftId.value = null;
+      promoted.current = false;
+      return;
+    }
+    // Modal opened and we don't yet have a draft — mint one.
+    if (draftId.value) return;
+    let cancelled = false;
+    apiPost<PlanDraftResponse>("/api/plan-chat/draft", {})
+      .then((data) => {
+        if (cancelled) return;
+        draftId.value = data.draftId;
+      })
+      .catch((e: ApiError) => {
+        if (cancelled) return;
+        toast(`Could not start plan-chat: ${e.message || "unknown error"}`, "error");
+      });
+    return () => {
+      cancelled = true;
+    };
   }, [open]);
 
   // Tab-focus trap inside the modal card. Mirrors legacy keydown
@@ -149,6 +201,19 @@ export function NewSpecModal() {
 
     try {
       const data = await apiPost<NewSpecResponse>("/api/specs", reqBody);
+      // Promote the plan-chat draft onto the new spec, if any was
+      // minted. Best-effort: if promotion fails (the spec already has a
+      // history.json, etc), surface a toast but still close the modal.
+      const dId = draftId.value;
+      if (dId && data.taskId) {
+        try {
+          await apiPost(`/api/plan-chat/draft/${encodeURIComponent(dId)}/promote`, { taskId: data.taskId });
+          promoted.current = true;
+        } catch (err) {
+          const e3 = err as ApiError;
+          toast(`Plan-chat history not attached: ${e3.message || "promote failed"}`, "error");
+        }
+      }
       // Reset form so the next open starts blank.
       title.value = "";
       body.value = "";
@@ -200,159 +265,184 @@ export function NewSpecModal() {
     // biome-ignore lint/a11y/useKeyWithClickEvents: Escape key handled at window level
     <div class="modal-overlay" id="new-spec-modal" hidden={!open} onClick={onBackdropClick}>
       <div
-        class="modal-card"
+        class="modal-card with-chat"
         role="dialog"
         aria-modal="true"
         aria-labelledby="new-spec-title-h"
         ref={cardRef}
         onKeyDown={onCardKeyDown}
       >
-        <div class="modal-head">
-          <h2 id="new-spec-title-h">New spec</h2>
-          <button
-            type="button"
-            class="close"
-            id="new-spec-close"
-            aria-label="Close"
-            onClick={() => {
-              modalOpen.value = false;
-            }}
-          >
-            ×
-          </button>
-        </div>
-        <form id="new-spec-form" onSubmit={onSubmit}>
-          <div class="modal-body">
-            <div class="field">
-              <label for="new-spec-repo">Repo</label>
-              <select id="new-spec-repo" ref={repoSelRef} value={repoSel.value} onChange={onRepoChange}>
-                {known.map((r) => (
-                  <option key={r.root} value={r.root}>
-                    {r.name} ({r.root})
-                  </option>
-                ))}
-                <option value={CUSTOM_REPO_VALUE}>Custom path…</option>
-              </select>
-              <div class="hint">
-                Pick a known repo, or choose <em>Custom path…</em> to register a brand-new one (the server validates
-                it&apos;s a git repo before saving).
-              </div>
+        <aside class="modal-chat-rail">
+          {draftId.value ? (
+            <PlannerChat
+              scope="draft"
+              id={draftId.value}
+              onApply={(markdown) => {
+                body.value = markdown;
+                toast("Applied to spec body", "info");
+                // Nudge focus into the body textarea so the user can
+                // immediately edit the inserted markdown.
+                setTimeout(() => bodyRef.current?.focus(), 0);
+              }}
+            />
+          ) : (
+            <div class="chat-panel">
+              <div class="chat-empty">Starting plan-chat draft…</div>
             </div>
-            <div class="field" id="new-spec-repo-custom-wrap" hidden={!isCustom}>
-              <label for="new-spec-repo-custom">Custom repo path</label>
-              <input
-                id="new-spec-repo-custom"
-                type="text"
-                placeholder="/absolute/path/to/your/git/repo"
-                ref={customRef}
-                value={repoCustom.value}
-                onInput={(e) => {
-                  repoCustom.value = (e.currentTarget as HTMLInputElement).value;
-                }}
-              />
-            </div>
-            <div class="field">
-              <label for="new-spec-title">
-                Title{" "}
-                <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span>
-              </label>
-              <input
-                id="new-spec-title"
-                type="text"
-                placeholder="feat(scope): short imperative summary, ≤70 chars"
-                maxLength={120}
-                ref={titleRef}
-                value={title.value}
-                onInput={(e) => {
-                  title.value = (e.currentTarget as HTMLInputElement).value;
-                }}
-              />
-              <div class="hint">
-                Defaults to the first H1 in the markdown body. Should match conventional-commit format — Forge uses it
-                verbatim as the PR title.
-              </div>
-            </div>
-            <div class="field">
-              <label for="new-spec-body">Markdown body</label>
-              <textarea
-                id="new-spec-body"
-                required
-                ref={bodyRef}
-                placeholder={
-                  "# feat(scope): short imperative\n\nA paragraph describing the work, why it's needed, and the intended outcome.\n\n## Acceptance criteria\n\n- it does the thing\n- existing tests still pass"
-                }
-                value={body.value}
-                onInput={(e) => {
-                  body.value = (e.currentTarget as HTMLTextAreaElement).value;
-                }}
-              />
-            </div>
-            <div class="field-row">
-              <div class="field">
-                <label for="new-spec-agent">
-                  Agent{" "}
-                  <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span>
-                </label>
-                <select
-                  id="new-spec-agent"
-                  value={agent.value}
-                  onChange={(e) => {
-                    agent.value = (e.currentTarget as HTMLSelectElement).value;
-                  }}
-                >
-                  <option value="">Use repo default</option>
-                  <option value="claude">claude</option>
-                  <option value="codex">codex</option>
-                  <option value="opencode">opencode</option>
-                  <option value="gemini">gemini</option>
-                </select>
-              </div>
-              <div class="field">
-                <label for="new-spec-model">
-                  Model{" "}
-                  <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span>
-                </label>
-                <input
-                  id="new-spec-model"
-                  type="text"
-                  placeholder="e.g. claude-opus-4-7"
-                  value={model.value}
-                  onInput={(e) => {
-                    model.value = (e.currentTarget as HTMLInputElement).value;
-                  }}
-                />
-              </div>
-            </div>
-            <div class="field field-checkbox">
-              <input
-                id="new-spec-improve"
-                type="checkbox"
-                checked={autoImprove.value}
-                onChange={(e) => {
-                  autoImprove.value = (e.currentTarget as HTMLInputElement).checked;
-                }}
-              />
-              <label for="new-spec-improve">
-                Run auto-improve in the background after save (two critics + synthesizer; ~1–2 min)
-              </label>
-            </div>
-          </div>
-          <div class="modal-foot">
+          )}
+        </aside>
+        <div class="modal-form-col">
+          <div class="modal-head">
+            <h2 id="new-spec-title-h">New spec</h2>
             <button
               type="button"
-              class="btn btn-ghost"
-              id="new-spec-cancel"
+              class="close"
+              id="new-spec-close"
+              aria-label="Close"
               onClick={() => {
                 modalOpen.value = false;
               }}
             >
-              Cancel
-            </button>
-            <button type="submit" class="btn btn-primary" id="new-spec-submit" disabled={submitting.value}>
-              {submitting.value ? "Saving…" : "Save spec"}
+              ×
             </button>
           </div>
-        </form>
+          <form id="new-spec-form" onSubmit={onSubmit}>
+            <div class="modal-body">
+              <div class="field">
+                <label for="new-spec-repo">Repo</label>
+                <select id="new-spec-repo" ref={repoSelRef} value={repoSel.value} onChange={onRepoChange}>
+                  {known.map((r) => (
+                    <option key={r.root} value={r.root}>
+                      {r.name} ({r.root})
+                    </option>
+                  ))}
+                  <option value={CUSTOM_REPO_VALUE}>Custom path…</option>
+                </select>
+                <div class="hint">
+                  Pick a known repo, or choose <em>Custom path…</em> to register a brand-new one (the server validates
+                  it&apos;s a git repo before saving).
+                </div>
+              </div>
+              <div class="field" id="new-spec-repo-custom-wrap" hidden={!isCustom}>
+                <label for="new-spec-repo-custom">Custom repo path</label>
+                <input
+                  id="new-spec-repo-custom"
+                  type="text"
+                  placeholder="/absolute/path/to/your/git/repo"
+                  ref={customRef}
+                  value={repoCustom.value}
+                  onInput={(e) => {
+                    repoCustom.value = (e.currentTarget as HTMLInputElement).value;
+                  }}
+                />
+              </div>
+              <div class="field">
+                <label for="new-spec-title">
+                  Title{" "}
+                  <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span>
+                </label>
+                <input
+                  id="new-spec-title"
+                  type="text"
+                  placeholder="feat(scope): short imperative summary, ≤70 chars"
+                  maxLength={120}
+                  ref={titleRef}
+                  value={title.value}
+                  onInput={(e) => {
+                    title.value = (e.currentTarget as HTMLInputElement).value;
+                  }}
+                />
+                <div class="hint">
+                  Defaults to the first H1 in the markdown body. Should match conventional-commit format — Forge uses it
+                  verbatim as the PR title.
+                </div>
+              </div>
+              <div class="field">
+                <label for="new-spec-body">Markdown body</label>
+                <textarea
+                  id="new-spec-body"
+                  required
+                  ref={bodyRef}
+                  placeholder={
+                    "# feat(scope): short imperative\n\nA paragraph describing the work, why it's needed, and the intended outcome.\n\n## Acceptance criteria\n\n- it does the thing\n- existing tests still pass"
+                  }
+                  value={body.value}
+                  onInput={(e) => {
+                    body.value = (e.currentTarget as HTMLTextAreaElement).value;
+                  }}
+                />
+              </div>
+              <div class="field-row">
+                <div class="field">
+                  <label for="new-spec-agent">
+                    Agent{" "}
+                    <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">
+                      (optional)
+                    </span>
+                  </label>
+                  <select
+                    id="new-spec-agent"
+                    value={agent.value}
+                    onChange={(e) => {
+                      agent.value = (e.currentTarget as HTMLSelectElement).value;
+                    }}
+                  >
+                    <option value="">Use repo default</option>
+                    <option value="claude">claude</option>
+                    <option value="codex">codex</option>
+                    <option value="opencode">opencode</option>
+                    <option value="gemini">gemini</option>
+                  </select>
+                </div>
+                <div class="field">
+                  <label for="new-spec-model">
+                    Model{" "}
+                    <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">
+                      (optional)
+                    </span>
+                  </label>
+                  <input
+                    id="new-spec-model"
+                    type="text"
+                    placeholder="e.g. claude-opus-4-7"
+                    value={model.value}
+                    onInput={(e) => {
+                      model.value = (e.currentTarget as HTMLInputElement).value;
+                    }}
+                  />
+                </div>
+              </div>
+              <div class="field field-checkbox">
+                <input
+                  id="new-spec-improve"
+                  type="checkbox"
+                  checked={autoImprove.value}
+                  onChange={(e) => {
+                    autoImprove.value = (e.currentTarget as HTMLInputElement).checked;
+                  }}
+                />
+                <label for="new-spec-improve">
+                  Run auto-improve in the background after save (two critics + synthesizer; ~1–2 min)
+                </label>
+              </div>
+            </div>
+            <div class="modal-foot">
+              <button
+                type="button"
+                class="btn btn-ghost"
+                id="new-spec-cancel"
+                onClick={() => {
+                  modalOpen.value = false;
+                }}
+              >
+                Cancel
+              </button>
+              <button type="submit" class="btn btn-primary" id="new-spec-submit" disabled={submitting.value}>
+                {submitting.value ? "Saving…" : "Save spec"}
+              </button>
+            </div>
+          </form>
+        </div>
       </div>
     </div>
   );
