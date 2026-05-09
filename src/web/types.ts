@@ -85,3 +85,31 @@ export interface QualityResult {
   ok: boolean;
   durationMs: number;
 }
+
+// Mirror of GhPr from src/core/gh-pr.ts. Returned by GET /api/prs as
+// `{ prs: PrView[]; me: string; repo: string|null; repoRoot: string|null }`.
+export interface PrView {
+  number: number;
+  title: string;
+  headRefName: string;
+  baseRefName: string;
+  url: string;
+  isDraft: boolean;
+  statusCheckRollup: string | null;
+  reviewDecision: string | null;
+  author: string;
+  updatedAt: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+  commentsCount: number;
+  reviewsCount: number;
+  isMine: boolean;
+}
+
+export interface PrsResponse {
+  prs: PrView[];
+  me: string;
+  repo: string | null;
+  repoRoot: string | null;
+}

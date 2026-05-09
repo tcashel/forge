@@ -3,6 +3,7 @@ import { render } from "preact";
 import { App } from "./components/App";
 import { derivePickups } from "./components/pickup/PickupRow";
 import type { ForgeBridge, ForgeLegacyBridge } from "./lib/forge-bridge";
+import { prs, refreshPrs, startPrPolling } from "./signals/prs";
 import { repos } from "./signals/repos";
 import { refreshSettings, settingsConfig, startSettingsPolling } from "./signals/settings";
 import {
@@ -42,6 +43,19 @@ startTaskPolling();
 // "settings"; SettingsForm reads settingsConfig once on mount, so a
 // poll mid-edit won't recreate the inputs and lose focus.
 startSettingsPolling();
+// Phase 5: 30s PR poll. Always runs (so the sidebar count stays fresh
+// even when the user is on tasks/settings views). The poll writes only
+// to `prs` / `prMe` / `prsRepoName` / `prsRepoRoot` — no DOM nodes are
+// recreated, so any input or scroll position survives.
+startPrPolling();
+
+// Re-fetch PRs whenever the repo filter changes (PRs view honours the
+// global repo filter — switching repos must update the list).
+effect(() => {
+  // Subscribe to the repo signal; ignore the value otherwise.
+  void selectedRepo.value;
+  void refreshPrs();
+});
 
 // When the user enters settings mode (or switches repos while in
 // settings mode), kick off a fresh fetch so the form has data to seed
@@ -79,6 +93,15 @@ effect(() => {
   setText("count-running", map.running);
   setText("count-backlog", map.ready + map.drafting);
   setText("count-done", map.done);
+});
+
+// PR count writes follow the same pattern: write text into the opaque
+// sidebar <span> rather than re-rendering Sidebar (keeps focus / nav
+// behaviour stable when the poll tick lands).
+effect(() => {
+  const el = document.getElementById("count-prs");
+  if (!el) return;
+  el.textContent = String(prs.value.length);
 });
 
 // The topbar refresh dot + footer "last refresh" timestamp are also DOM
