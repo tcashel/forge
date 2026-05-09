@@ -27,6 +27,7 @@
  * NOTE: keep this docblock in sync with the HELP const below.
  */
 
+import { execSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { launchAgent } from "../../core/launch.ts";
 import { createWorktree, detectRepo } from "../../core/repo.ts";
@@ -379,6 +380,7 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
 
   let worktreePath: string;
   let branch = opts.branch ?? task.branch;
+  let createdNewWorktree = false;
 
   if (opts.inPlace) {
     branch = repo.currentBranch;
@@ -395,63 +397,83 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
     const wt = await createWorktree(repo.root, branch, repo.worktreeScript, repo.stack);
     if (wt.error) throw new CliError("WORKTREE_FAIL", `Worktree creation failed: ${wt.error}`, { exitCode: 3 });
     worktreePath = wt.worktreePath;
+    createdNewWorktree = true;
   }
 
-  const fullSpec = store.getSpec(task.id);
-  if (!fullSpec) throw new CliError("NO_SPEC", `Spec file missing for ${task.id}.`, { exitCode: 2 });
-  const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
+  try {
+    const fullSpec = store.getSpec(task.id);
+    if (!fullSpec) throw new CliError("NO_SPEC", `Spec file missing for ${task.id}.`, { exitCode: 2 });
+    const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
 
-  const result = await launchAgent(
-    {
-      taskId: task.id,
-      specContent: specBody,
-      specTitle: task.title,
-      target: resolved.agent,
+    const result = await launchAgent(
+      {
+        taskId: task.id,
+        specContent: specBody,
+        specTitle: task.title,
+        target: resolved.agent,
+        model: resolved.model,
+        reasoningEffort: resolved.reasoning,
+        worktreePath,
+        qualityCommands: repo.qualityCommands,
+        defaultBranch: repo.defaultBranch,
+        branch,
+        repoRoot: repo.root,
+        repoName: repo.name,
+        contextContent: repo.contextContent,
+        reviewerTarget: resolved.reviewerAgent,
+        reviewerModel: resolved.reviewerModel,
+        reviewerReasoningEffort: resolved.reviewerReasoning,
+        autoFix: resolved.autoFix,
+        autoFixRounds: resolved.autoFixRounds,
+        fixerTarget: resolved.fixerAgent,
+        fixerModel: resolved.fixerModel,
+        fixerReasoningEffort: resolved.fixerReasoning,
+        ghUser: repoConfig.ghUser,
+        ghHost: repoConfig.ghHost,
+      },
+      store,
+    );
+
+    if (result.error) throw new CliError("LAUNCH_FAIL", `Launch failed: ${result.error}`, { exitCode: 3 });
+
+    store.upsertTask({
+      ...task,
+      status: "running",
+      agent: resolved.agent,
       model: resolved.model,
-      reasoningEffort: resolved.reasoning,
-      worktreePath,
-      qualityCommands: repo.qualityCommands,
-      defaultBranch: repo.defaultBranch,
       branch,
-      repoRoot: repo.root,
-      repoName: repo.name,
-      contextContent: repo.contextContent,
-      reviewerTarget: resolved.reviewerAgent,
-      reviewerModel: resolved.reviewerModel,
-      reviewerReasoningEffort: resolved.reviewerReasoning,
-      autoFix: resolved.autoFix,
-      autoFixRounds: resolved.autoFixRounds,
-      fixerTarget: resolved.fixerAgent,
-      fixerModel: resolved.fixerModel,
-      fixerReasoningEffort: resolved.fixerReasoning,
-      ghUser: repoConfig.ghUser,
-      ghHost: repoConfig.ghHost,
-    },
-    store,
-  );
+      worktree: worktreePath,
+      tmuxSession: result.tmuxSession,
+      logFile: result.logFile,
+      launchedAt: new Date().toISOString(),
+    });
 
-  if (result.error) throw new CliError("LAUNCH_FAIL", `Launch failed: ${result.error}`, { exitCode: 3 });
-
-  store.upsertTask({
-    ...task,
-    status: "running",
-    agent: resolved.agent,
-    model: resolved.model,
-    branch,
-    worktree: worktreePath,
-    tmuxSession: result.tmuxSession,
-    logFile: result.logFile,
-    launchedAt: new Date().toISOString(),
-  });
-
-  return {
-    taskId: task.id,
-    tmuxSession: result.tmuxSession,
-    worktreePath,
-    branch,
-    runDir: store.ensureRunDir(task.id),
-    logFile: result.logFile,
-  };
+    return {
+      taskId: task.id,
+      tmuxSession: result.tmuxSession,
+      worktreePath,
+      branch,
+      runDir: store.ensureRunDir(task.id),
+      logFile: result.logFile,
+    };
+  } catch (e) {
+    // If we created a fresh worktree just for this launch and the launch
+    // failed, best-effort tear it down so a retry doesn't trip over
+    // "branch already checked out". Swallow secondary errors so the user
+    // sees the original failure, not the cleanup error.
+    if (createdNewWorktree) {
+      try {
+        execSync(`git worktree remove --force ${JSON.stringify(worktreePath)}`, {
+          cwd: repo.root,
+          stdio: "pipe",
+          timeout: 10_000,
+        });
+      } catch {
+        /* leave it; the user can `git worktree remove` manually */
+      }
+    }
+    throw e;
+  }
 }
 
 function dryRunHumanFormat(c: ResolvedLaunchConfig, taskId: string): string {

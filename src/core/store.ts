@@ -303,6 +303,23 @@ export class ForgeStore {
     atomicWriteJSON(p, meta);
   }
 
+  /**
+   * Merge a partial RunMeta patch into the existing file under a per-task
+   * lock so concurrent writers (the bash runner script's set_status, plus
+   * HTTP handlers like /api/tasks/:id/kill) can't lose updates. Returns
+   * the merged meta, or null if no meta exists yet.
+   */
+  mergeRunMeta(taskId: string, patch: Partial<RunMeta>): RunMeta | null {
+    const p = path.join(this.runsDir, taskId, "meta.json");
+    return withFileLock(`${p}.lock`, () => {
+      if (!fs.existsSync(p)) return null;
+      const current = JSON.parse(fs.readFileSync(p, "utf-8")) as RunMeta;
+      const merged: RunMeta = { ...current, ...patch };
+      atomicWriteJSON(p, merged);
+      return merged;
+    });
+  }
+
   /** Read meta.json status and sync back to index if changed. Returns updated task or null. */
   syncTaskStatus(task: TaskRecord): TaskRecord | null {
     if (task.status === "done" || task.status === "failed" || task.status === "draft") return null;

@@ -439,15 +439,123 @@ test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta",
   const task = h.store.getTask(id);
   assert.equal(task!.status, "failed");
   const meta = h.store.readRunMeta(id);
-  assert.equal(meta!.errorMessage, "killed from Workbench");
+  assert.equal(meta!.errorMessage, "Killed by user");
   assert.deepEqual(meta!.qualityResults, [{ command: "lint", ok: true, durationMs: 10 }]);
 });
 
-test("POST /api/tasks/:id/kill rejects when task has no tmux session", async (t) => {
+test("POST /api/tasks/:id/kill rejects draft (non-running) tasks with 409", async (t) => {
   const h = bootServer();
   t.after(() => h.stop());
-  makeDraftTask(h.store, "nokill", h.tmpHome, "demo", "feat(demo): no session");
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill/kill`);
+  makeDraftTask(h.store, "nokill-draft", h.tmpHome, "demo", "feat(demo): draft");
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill-draft/kill`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+});
+
+test("POST /api/tasks/:id/kill rejects already-done tasks (no state corruption)", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const id = "done-task";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): merged",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/done-task",
+    worktree: null,
+    status: "done", // already completed; tmuxSession is set but stale
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: now,
+    prUrl: "https://github.com/x/y/pull/1",
+    prNumber: 1,
+    tmuxSession: "forge-stale-99999", // never cleared on completion
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# done\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+  // Status must still be "done" — kill should not have touched it.
+  assert.equal(h.store.getTask(id)!.status, "done");
+});
+
+test("POST /api/specs rejects invalid agent value", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
+    markdown: "# feat(x): y\n\nbody",
+    repoRoot: "/tmp/foo",
+    agent: "rm -rf /",
+  });
   assert.equal(status, 400);
-  assert.equal(body.error!.code, "NO_TMUX_SESSION");
+  assert.equal(body.error!.code, "BAD_REQUEST");
+  assert.match(body.error!.message, /agent/);
+});
+
+test("POST /api/tasks/:id/improve rejects non-draft tasks with 409", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const id = "improve-running";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): improving running",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/improve-running",
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: "forge-x",
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# x\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/improve`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+});
+
+test("POST /api/tasks/:id/critique rejects non-draft tasks with 409", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const id = "critique-done";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): critique on done",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/critique-done",
+    worktree: null,
+    status: "done",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: now,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# x\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/critique`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
 });
