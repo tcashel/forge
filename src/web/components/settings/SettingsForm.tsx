@@ -8,6 +8,7 @@
 import { type Signal, useSignal } from "@preact/signals";
 import { useEffect, useRef } from "preact/hooks";
 import { type ApiError, apiPost } from "../../lib/api";
+import { showToast } from "../../lib/toast";
 import {
   type RepoConfig,
   refreshSettings,
@@ -129,7 +130,7 @@ function buildPatch(form: FormSignals): Record<string, string | number | boolean
 }
 
 function toast(msg: string, kind: "info" | "error" = "info") {
-  window.__forge?.legacy?.showToast?.(msg, kind);
+  showToast(msg, kind);
 }
 
 interface TextFieldProps {

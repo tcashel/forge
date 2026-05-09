@@ -1,28 +1,13 @@
-// Shim that lets pre-existing legacy `src/web/*.js` files talk to the
-// new Preact signal modules. main.tsx populates `window.__forge.signals`
-// at startup, and legacy code can register callbacks under
-// `window.__forge.legacy.*` so the Preact shell can dispatch nav clicks
-// and repo selections back into the legacy state machine.
+// Debug surface that exposes the central Preact signal bag plus the
+// signals `effect()` helper on `window.__forge`. After Phase 6 the
+// workbench has no legacy `.js` consumers — every component imports
+// signals directly. This bridge stays only because external tooling
+// (Claude-in-Chrome scripts, browser-console debugging) reads
+// `window.__forge.signals.modalOpen.value` and friends to drive the
+// UI. Don't widen the surface beyond that purpose.
 
 import type { effect as effectFn, Signal } from "@preact/signals";
 import type { RepoView, TabId, TaskView, Theme, ViewMode } from "../types";
-
-export interface ForgeLegacyBridge {
-  /** Set selectedRepo and run the legacy applyFilter() pipeline. */
-  setSelectedRepo?: (key: string) => void;
-  /** Re-run legacy filter pipeline (refresh views after a signal write). */
-  applyFilter?: () => void;
-  /** Async refresh of repos signal via /api/repos. */
-  refreshRepos?: () => Promise<void>;
-  /** Show a legacy toast — kept on legacy side for Phase 2. */
-  showToast?: (msg: string, kind?: "info" | "error") => void;
-  /** Enter the tasks / pickup mode and scroll to a section. */
-  enterTaskMode?: (target?: string) => void | Promise<void>;
-  /** Enter PRs mode. */
-  enterPrMode?: () => void | Promise<void>;
-  /** Enter Settings mode. */
-  enterSettingsMode?: () => void | Promise<void>;
-}
 
 export interface ForgeSignalBag {
   searchQuery: Signal<string>;
@@ -44,7 +29,6 @@ export interface ForgeApi {
 export interface ForgeBridge {
   signals: ForgeSignalBag;
   effect: typeof effectFn;
-  legacy: ForgeLegacyBridge;
   api: ForgeApi;
 }
 

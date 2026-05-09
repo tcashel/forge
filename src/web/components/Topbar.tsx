@@ -1,4 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
+import { enterPrMode, enterTaskMode } from "../lib/modes";
 import { viewMode } from "../signals/ui";
 import { RepoPicker } from "./RepoPicker";
 import { Search } from "./Search";
@@ -21,10 +22,10 @@ export function Topbar() {
 
   const mode = viewMode.value;
   const onMobileWork = () => {
-    window.__forge?.legacy?.enterTaskMode?.("all");
+    enterTaskMode("all");
   };
   const onMobilePrs = () => {
-    window.__forge?.legacy?.enterPrMode?.();
+    enterPrMode();
   };
 
   return (
