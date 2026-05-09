@@ -63,6 +63,16 @@ Open the standalone TUI dashboard:
 forge dash
 ```
 
+Or boot the **Workbench** — a localhost web UI over the same state — with:
+
+```bash
+forge serve --open      # default: http://127.0.0.1:7456
+```
+
+`forge serve` is read-only in this revision (mutations still go through
+the CLI subcommands so agents and humans share one contract). Localhost
+binding only; no auth.
+
 ## Subcommand reference
 
 | Command | Purpose |
@@ -79,6 +89,7 @@ forge dash
 | `forge critique <id>` | Two-critic + synth adversarial spec critique. |
 | `forge config get/set/list <key> [<value>]` | Per-repo settings (reviewer/critique pairs, gh user/host, JIRA project). |
 | `forge dash` | Mission-control TUI. |
+| `forge serve [--port N] [--open]` | Boot the Workbench (web UI) on localhost. |
 
 Every command supports `--json` and a stable error envelope:
 
@@ -111,7 +122,8 @@ forge/
 ├── src/
 │   ├── cli/                  # subcommand dispatch + per-command files
 │   ├── core/                 # store, launch, critique, gh, jira, repo, reviewer, pr-body
-│   └── tui/                  # theme, keys, width, render-loop, dashboard
+│   ├── tui/                  # theme, keys, width, render-loop, dashboard
+│   └── web/                  # Workbench HTML served by `forge serve`
 ├── skills/                   # 4 skills used by the CLI and the cc-plugin
 │   ├── forge-planner/
 │   ├── forge-reviewer/

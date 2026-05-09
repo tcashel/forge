@@ -150,6 +150,16 @@ export interface CritiqueMeta {
   synthesizer: CritiqueAgentMeta;
 }
 
+export interface ForgeStoreOptions {
+  /**
+   * Override the forge state directory. Defaults to `~/.forge/`. Tests
+   * pass an explicit path because `os.homedir()` is captured at process
+   * startup — mutating `process.env.HOME` mid-run does not redirect it,
+   * so HOME-tweaks aren't a viable isolation strategy.
+   */
+  forgeDir?: string;
+}
+
 export class ForgeStore {
   readonly forgeDir: string;
   readonly specsDir: string;
@@ -159,8 +169,8 @@ export class ForgeStore {
 
   readonly repoConfigFile: string;
 
-  constructor() {
-    this.forgeDir = path.join(os.homedir(), ".forge");
+  constructor(opts: ForgeStoreOptions = {}) {
+    this.forgeDir = opts.forgeDir ?? path.join(os.homedir(), ".forge");
     this.specsDir = path.join(this.forgeDir, "specs");
     this.runsDir = path.join(this.forgeDir, "runs");
     this.critiquesDir = path.join(this.forgeDir, "critiques");

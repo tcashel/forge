@@ -15,6 +15,7 @@ import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
 import * as review from "./cmd/review.ts";
+import * as serve from "./cmd/serve.ts";
 import * as spec from "./cmd/spec.ts";
 import * as status from "./cmd/status.ts";
 import * as wait from "./cmd/wait.ts";
@@ -31,6 +32,7 @@ const HELP_BY_CMD: Record<string, string> = {
   logs: logs.HELP,
   ls: ls.HELP,
   review: review.HELP,
+  serve: serve.HELP,
   spec: spec.HELP,
   status: status.HELP,
   wait: wait.HELP,
@@ -60,6 +62,7 @@ Commands:
   config list              List per-repo settings
 
   dash                     Open the mission-control TUI dashboard
+  serve                    Serve the Workbench (web UI) on localhost
 
 Global flags:
   --json                   Machine-readable output
@@ -138,6 +141,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "dash":
         await dash.run(rest, store);
+        return;
+      case "serve":
+        await serve.run(rest, store);
         return;
       default: {
         const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, { exitCode: 1 });
