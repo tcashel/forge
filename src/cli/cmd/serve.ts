@@ -22,7 +22,7 @@ import type { CritiqueMeta, ForgeStore, TaskRecord, TaskStatus } from "../../cor
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
-import { improveSpec, saveSpec } from "./spec.ts";
+import { saveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
 
@@ -741,13 +741,29 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   }
 
   if (action === "improve") {
-    try {
-      const result = await improveSpec(taskId, store);
-      return jsonOk(result);
-    } catch (e) {
-      if (e instanceof CliError) return fromCliError(e);
-      throw e;
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    if (task.status !== "draft") {
+      return jsonErr(
+        409,
+        "BAD_STATE",
+        `Task ${taskId} is in state "${task.status}" — improve only runs on draft specs.`,
+      );
     }
+    // runImprover uses synchronous execSync to drive critic + synth + improver
+    // agents, which would block the entire Bun event loop for 1–2 minutes
+    // (every other request — health, polls, log SSE pumps — would queue
+    // behind it). Spawn a detached child running the equivalent CLI so the
+    // request returns immediately. The next 3s task poll picks up the
+    // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
+    const child = spawn(process.execPath, [process.argv[1], "spec", "improve", taskId, "--json"], {
+      cwd: task.repoRoot,
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    return jsonOk({ taskId, queued: true, pid: child.pid });
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
@@ -770,6 +786,36 @@ export interface ServeOptions {
  * spin up a server, hit it, and call `stop()` instead of fork-spawning
  * a subprocess.
  */
+/**
+ * Boot-time sweep: any critique-meta in `running_critics`/`running_synth`
+ * older than the threshold is almost certainly orphaned (the worker
+ * process died — server crashed mid-improve, terminal closed during a
+ * `forge spec save`, etc.). Mark it failed so the Workbench's
+ * "Improving" pulse pill doesn't stick forever.
+ *
+ * We can't use isTmuxSessionAlive as a liveness check because the sync
+ * improve path writes a tmuxSession in the meta but never actually
+ * creates that tmux session — only the async path does.
+ */
+const STALE_IMPROVE_MS = 10 * 60_000;
+function reapStaleCritiques(store: ForgeStore): number {
+  const now = Date.now();
+  let swept = 0;
+  for (const { taskId, critiqueId, meta } of store.getPendingCritiques()) {
+    if (meta.status !== "running_critics" && meta.status !== "running_synth") continue;
+    const startedMs = new Date(meta.startedAt).getTime();
+    if (Number.isNaN(startedMs)) continue;
+    if (now - startedMs < STALE_IMPROVE_MS) continue;
+    store.writeCritiqueMeta(taskId, critiqueId, {
+      ...meta,
+      status: "failed",
+      completedAt: new Date().toISOString(),
+    });
+    swept++;
+  }
+  return swept;
+}
+
 export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port: number; stop: () => void } {
   const port = opts.port ?? DEFAULT_PORT;
   const host = opts.host ?? DEFAULT_HOST;
@@ -781,6 +827,11 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
       hint: "Re-install forge or check that src/web/index.html exists in your checkout.",
       exitCode: 2,
     });
+  }
+
+  const swept = reapStaleCritiques(store);
+  if (swept > 0) {
+    process.stderr.write(`forge serve: reaped ${swept} stale critique-meta record(s).\n`);
   }
 
   const ctx: RouteCtx = { store, webDir };

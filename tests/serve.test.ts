@@ -378,6 +378,124 @@ test("POST /api/tasks/:id/improve returns 404 for unknown task", async (t) => {
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
+test("POST /api/tasks/:id/improve queues a draft task (returns immediately, no event-loop block)", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "improve-queue", h.tmpHome, "demo", "feat(demo): improvable");
+  const start = Date.now();
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/improve-queue/improve`);
+  const elapsed = Date.now() - start;
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.queued, true);
+  assert.equal(typeof body.data!.pid, "number");
+  // The whole point is to NOT block on the improve work — must return fast
+  // even though the spawned child is doing real work in another process.
+  assert.ok(elapsed < 2000, `expected fast response, got ${elapsed}ms`);
+});
+
+test("startServer reaps stale critique-meta on boot", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-reap-"));
+  const forgeDir = path.join(tmpHome, ".forge");
+  const store = new ForgeStore({ forgeDir });
+  // Seed a critique-meta in `running_critics` with a startedAt 30 minutes ago.
+  // We expect the reaper at startServer to mark it failed.
+  const taskId = "reap-target";
+  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): reap me");
+  const critiqueId = "crit-stale-001";
+  const dir = store.getCritiqueDir(taskId, critiqueId);
+  fs.mkdirSync(dir, { recursive: true });
+  const oldStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  store.writeCritiqueMeta(taskId, critiqueId, {
+    schemaVersion: 1,
+    taskId,
+    critiqueId,
+    specTitle: "feat(demo): reap me",
+    repoRoot: tmpHome,
+    repoName: "demo",
+    status: "running_critics",
+    startedAt: oldStartedAt,
+    completedAt: null,
+    viewedAt: null,
+    tmuxSession: "forge-crit-fake-stale",
+    criticA: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    synthesizer: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+  });
+
+  const { stop } = startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  assert.equal(meta!.status, "failed");
+  assert.ok(meta!.completedAt, "reaped record should have a completedAt");
+});
+
+test("startServer leaves recent critique-meta alone (under stale threshold)", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-reap-recent-"));
+  const forgeDir = path.join(tmpHome, ".forge");
+  const store = new ForgeStore({ forgeDir });
+  const taskId = "recent-improving";
+  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): recent");
+  const critiqueId = "crit-recent-001";
+  const dir = store.getCritiqueDir(taskId, critiqueId);
+  fs.mkdirSync(dir, { recursive: true });
+  // 30 seconds ago — well under the 10-minute stale threshold.
+  const recentStartedAt = new Date(Date.now() - 30_000).toISOString();
+  store.writeCritiqueMeta(taskId, critiqueId, {
+    schemaVersion: 1,
+    taskId,
+    critiqueId,
+    specTitle: "feat(demo): recent",
+    repoRoot: tmpHome,
+    repoName: "demo",
+    status: "running_critics",
+    startedAt: recentStartedAt,
+    completedAt: null,
+    viewedAt: null,
+    tmuxSession: "forge-crit-fake-recent",
+    criticA: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    synthesizer: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+  });
+
+  const { stop } = startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  assert.equal(meta!.status, "running_critics", "recent record must not be reaped");
+});
+
 test("POST /api/tasks/:id/resume returns 501", async (t) => {
   const h = bootServer();
   t.after(() => h.stop());
