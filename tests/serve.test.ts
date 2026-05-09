@@ -179,7 +179,10 @@ test("GET / returns the workbench HTML", async (t) => {
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /Forge — Workbench/);
-  assert.match(html, /id="repo-popover"/);
+  // Phase 2: Preact owns the shell; index.html ships a bare <div id="app"/>
+  // and loads the bundled module + the legacy app.js script.
+  assert.match(html, /<div id="app">/);
+  assert.match(html, /src="\/dist\/main\.js"/);
 });
 
 test("empty index → /api/tasks returns []", async (t) => {

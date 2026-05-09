@@ -12,166 +12,9 @@
 </head>
 <body>
 
-<div class="app">
-  <aside class="side">
-    <div class="brand">
-      <span class="glyph"></span>
-      <span>FORGE</span>
-      <span class="v">workbench</span>
-    </div>
-    <button class="new-plan" id="new-plan-btn" title="Create a new spec from the Workbench">
-      <span class="plus">+</span> New spec
-    </button>
-    <nav class="nav" id="nav">
-      <div class="nav-section">Workspace</div>
-      <button class="nav-item alert active" data-target="all">
-        <span class="ic" style="color:var(--attention)">●</span>
-        <span class="lbl">Pick up here</span>
-        <span class="count" id="count-pickup">0</span>
-      </button>
-      <button class="nav-item" data-target="running">
-        <span class="ic" style="color:var(--running)">⟳</span>
-        <span class="lbl">Running now</span>
-        <span class="count" id="count-running">0</span>
-      </button>
-      <button class="nav-item" data-target="backlog">
-        <span class="ic" style="color:var(--ready)">★</span>
-        <span class="lbl">Backlog</span>
-        <span class="count" id="count-backlog">0</span>
-      </button>
-      <button class="nav-item" data-target="prs">
-        <span class="ic" style="color:var(--primary)">⇪</span>
-        <span class="lbl">Open PRs</span>
-        <span class="count" id="count-prs">—</span>
-      </button>
-      <button class="nav-item" data-target="done">
-        <span class="ic" style="color:var(--done)">✓</span>
-        <span class="lbl">Recently done</span>
-        <span class="count" id="count-done">0</span>
-      </button>
-      <div class="nav-section">Reference</div>
-      <button class="nav-item" id="nav-settings"><span class="ic">⚙</span><span class="lbl">Settings</span></button>
-      <button class="nav-item" id="nav-help"><span class="ic">?</span><span class="lbl">Help &amp; shortcuts</span></button>
-    </nav>
-    <div class="side-foot">
-      <div class="row"><span class="lbl">Repo</span><span class="v" id="foot-repo">—</span></div>
-      <div class="row"><span class="lbl">Branch</span><span class="v" id="foot-branch">—</span></div>
-      <div class="row"><span class="lbl">Last refresh</span><span class="v" id="foot-refreshed">—</span></div>
-      <div class="help">
-        <span>Search</span>
-        <kbd>⌘ K</kbd>
-      </div>
-    </div>
-  </aside>
+<div id="app"></div>
 
-  <header class="topbar">
-    <div class="repo-selector">
-      <button class="repo-btn" id="repo-btn" aria-expanded="false">
-        <span class="repo-dot multi" id="repo-btn-dot"></span>
-        <span class="repo-name" id="repo-btn-name">All repos</span>
-        <span class="slash" id="repo-btn-slash" hidden>/</span>
-        <span class="branch" id="repo-btn-branch" hidden></span>
-        <span class="slash">·</span>
-        <span class="scope">workbench</span>
-        <span class="caret">▾</span>
-      </button>
-      <div class="repo-popover" id="repo-popover" hidden>
-        <input type="text" class="repo-search" id="repo-search" placeholder="Filter repos…">
-        <div class="repo-section">Scope</div>
-        <button class="repo-option active" data-repo="">
-          <span class="repo-dot multi"></span>
-          <span class="repo-name">All repos</span>
-          <span class="repo-count" id="repo-count-all">—</span>
-          <span class="check">✓</span>
-        </button>
-        <div class="repo-divider"></div>
-        <div class="repo-section" id="repo-list-section">Repos with active work</div>
-        <div id="repo-list"></div>
-        <div class="repo-divider"></div>
-        <form class="repo-add" id="repo-add-form">
-          <input type="text" id="repo-add-path" placeholder="/absolute/path/to/git/repo" aria-label="Repo path">
-          <button type="submit" class="btn btn-secondary sm">Add repo</button>
-        </form>
-      </div>
-    </div>
-    <div class="search">
-      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3"/></svg>
-      <input id="search-input" placeholder="Search specs, branches…">
-      <kbd>⌘ K</kbd>
-    </div>
-    <div class="mobile-switch" id="mobile-switch">
-      <button type="button" class="active" id="mobile-work-btn">Work</button>
-      <button type="button" id="mobile-prs-btn">PRs</button>
-    </div>
-    <div class="right">
-      <span class="refresh-dot live" id="refresh-dot" title="Auto-refreshing"></span>
-      <span class="clock" id="clock">—</span>
-      <div class="avatar" id="avatar">··</div>
-    </div>
-  </header>
-
-  <div class="workspace-body">
-    <section class="pickup" id="pickup-section">
-      <div class="pickup-head">
-        <h2>Pick up here</h2>
-        <span class="sub" id="pickup-sub">—</span>
-      </div>
-      <div class="pickup-cards" id="pickup-cards"></div>
-    </section>
-
-    <aside class="list-pane" id="list-pane">
-      <header class="section-h" data-section="running">
-        <span class="ic running"></span>
-        <span class="name">Running now</span>
-        <span class="count">0</span>
-        <span class="help">Live — auto-refreshes every 3s</span>
-      </header>
-      <div id="list-running"></div>
-
-      <header class="section-h" data-section="attention">
-        <span class="ic attention"></span>
-        <span class="name">Needs your attention</span>
-        <span class="count">0</span>
-        <span class="help">Failures + critique-ready</span>
-      </header>
-      <div id="list-attention"></div>
-
-      <header class="section-h" data-section="ready">
-        <span class="ic ready"></span>
-        <span class="name">Ready to launch</span>
-        <span class="count">0</span>
-        <span class="help">Auto-improver has revised these</span>
-      </header>
-      <div id="list-ready"></div>
-
-      <header class="section-h" data-section="drafting">
-        <span class="ic drafting"></span>
-        <span class="name">Drafting</span>
-        <span class="count">0</span>
-        <span class="help">First-pass specs — could use shape</span>
-      </header>
-      <div id="list-drafting"></div>
-
-      <details class="done-section">
-        <summary>
-          <span class="chev">›</span>
-          <span class="ic done" style="width:8px;height:8px;border-radius:50%;background:var(--done)"></span>
-          <span>Recently done</span>
-          <span class="count" style="margin-left:8px">0</span>
-        </summary>
-        <div id="list-done"></div>
-      </details>
-    </aside>
-
-    <main class="detail-pane" id="detail-pane">
-      <div class="detail-empty" id="detail-empty">Select a task to see details.</div>
-      <div class="detail-head" id="detail-head" hidden></div>
-      <nav class="tabs" id="detail-tabs" hidden></nav>
-      <div class="detail-body" id="detail-body" hidden></div>
-    </main>
-  </div>
-</div>
-
+<!-- Legacy modal stays here for now; Phase 4 ports it to <NewSpecModal /> -->
 <div class="modal-overlay" id="new-spec-modal" hidden>
   <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="new-spec-title-h">
     <div class="modal-head">
@@ -234,10 +77,8 @@ A paragraph describing the work, why it's needed, and the intended outcome.
   </div>
 </div>
 
-<div id="preact-root"></div>
-
-<script type="module" src="/app.js"></script>
 <script type="module" src="/dist/main.js"></script>
+<script type="module" src="/app.js"></script>
 
 </body>
 </html>
