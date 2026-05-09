@@ -10,6 +10,7 @@ import { useSignal } from "@preact/signals";
 import { useEffect, useRef } from "preact/hooks";
 import { type ApiError, apiPost } from "../../lib/api";
 import { CUSTOM_REPO_VALUE } from "../../lib/modal-constants";
+import { showToast } from "../../lib/toast";
 import { repos } from "../../signals/repos";
 import { refreshTasks } from "../../signals/tasks";
 import { modalOpen, selectedRepo } from "../../signals/ui";
@@ -20,7 +21,7 @@ function repoKey(r: RepoView): string {
 }
 
 function toast(msg: string, kind: "info" | "error" = "info") {
-  window.__forge?.legacy?.showToast?.(msg, kind);
+  showToast(msg, kind);
 }
 
 interface NewSpecResponse {

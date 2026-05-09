@@ -1,5 +1,6 @@
 import { useComputed } from "@preact/signals";
-import "../lib/forge-bridge";
+import { enterPrMode, enterSettingsMode, enterTaskMode } from "../lib/modes";
+import { showToast } from "../lib/toast";
 import { repos } from "../signals/repos";
 import { modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
 import type { RepoView, SidebarFilter } from "../types";
@@ -47,9 +48,8 @@ export function Sidebar() {
 
   const onNav = (target: SidebarFilter) => {
     sidebarFilter.value = target;
-    const bridge = window.__forge?.legacy;
     if (target === "prs") {
-      bridge?.enterPrMode?.();
+      enterPrMode();
       return;
     }
     const SECTIONS: Record<string, string> = {
@@ -59,12 +59,12 @@ export function Sidebar() {
       all: "all",
     };
     const section = SECTIONS[target] || "all";
-    bridge?.enterTaskMode?.(section);
+    enterTaskMode(section);
   };
 
   const onSettings = () => {
     sidebarFilter.value = "all";
-    window.__forge?.legacy?.enterSettingsMode?.();
+    enterSettingsMode();
   };
 
   const onNewSpec = () => {
@@ -72,7 +72,7 @@ export function Sidebar() {
   };
 
   const onHelp = () => {
-    window.__forge?.legacy?.showToast?.("Help: navigate with j/k or click. ⌘K focuses search.", "info");
+    showToast("Help: navigate with j/k or click. ⌘K focuses search.", "info");
   };
 
   const filter = sidebarFilter.value;

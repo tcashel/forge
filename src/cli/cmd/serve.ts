@@ -1066,7 +1066,9 @@ export async function startServer(
     }
   } catch (e) {
     console.error("[forge serve] web bundle threw:", e);
-    // Phase 1 fallback: continue serving — the legacy app.js still works.
+    // Phase 6: bundle failure leaves /dist/main.js missing; the page
+    // will load with no JS and show a blank shell. Operator must fix
+    // the build error and re-run.
   }
 
   const detectedCurrentRepo = detectRepo(process.cwd());

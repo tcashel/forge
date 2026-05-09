@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { apiPost } from "../lib/api";
-import "../lib/forge-bridge";
-import { repos } from "../signals/repos";
+import { showToast } from "../lib/toast";
+import { refreshRepos, repos } from "../signals/repos";
 import { selectedRepo } from "../signals/ui";
 import type { RepoView } from "../types";
 
@@ -64,34 +64,27 @@ export function RepoPicker() {
   const onSelect = (key: string) => {
     setOpen(false);
     setFilter("");
-    const bridge = window.__forge?.legacy;
-    if (bridge?.setSelectedRepo) {
-      bridge.setSelectedRepo(key);
-    } else {
-      selectedRepo.value = key;
-    }
+    selectedRepo.value = key;
   };
 
   const onAddSubmit = async (e: Event) => {
     e.preventDefault();
     const repoRoot = addPath.trim();
     if (!repoRoot) return;
-    const bridge = window.__forge?.legacy;
     setAdding(true);
     try {
       const data = (await apiPost<{ repo?: { root?: string } }>("/api/repos", { repoRoot })) || {};
-      if (bridge?.refreshRepos) await bridge.refreshRepos();
+      await refreshRepos();
       const newKey = data.repo?.root || repoRoot;
       setAddPath("");
       setOpen(false);
       setFilter("");
-      if (bridge?.setSelectedRepo) bridge.setSelectedRepo(newKey);
-      else selectedRepo.value = newKey;
-      bridge?.showToast?.(`Added repo ${newKey}`, "info");
+      selectedRepo.value = newKey;
+      showToast(`Added repo ${newKey}`, "info");
     } catch (err) {
       const e2 = err as { message?: string; hint?: string };
       const msg = e2.hint ? `${e2.message ?? ""} — ${e2.hint}` : (e2.message ?? "Could not add repo");
-      bridge?.showToast?.(msg, "error");
+      showToast(msg, "error");
     } finally {
       setAdding(false);
     }
