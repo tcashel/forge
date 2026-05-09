@@ -309,6 +309,151 @@ function parseEffort(v: unknown, flag: string, problems: Problem[]): ReasoningEf
   return undefined;
 }
 
+export interface DoLaunchOpts {
+  taskId: string;
+  agent?: LaunchTarget;
+  model?: string;
+  reasoning?: ReasoningEffort;
+  reviewerAgent?: LaunchTarget;
+  reviewerModel?: string;
+  reviewerReasoning?: ReasoningEffort;
+  fixerAgent?: LaunchTarget;
+  fixerModel?: string;
+  fixerReasoning?: ReasoningEffort;
+  /** Pass false to disable auto-fix; undefined uses repo-config default. */
+  autoFix?: boolean;
+  inPlace?: boolean;
+  worktree?: string;
+  branch?: string;
+}
+
+export interface DoLaunchResult {
+  taskId: string;
+  tmuxSession: string;
+  worktreePath: string;
+  branch: string;
+  runDir: string;
+  logFile: string;
+}
+
+/**
+ * Launch a saved spec. Pure programmatic core for `forge launch`; called by
+ * both the CLI shell and the HTTP server. Throws CliError on failure.
+ */
+export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<DoLaunchResult> {
+  const task = store.getTask(opts.taskId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.taskId}".`, { exitCode: 1 });
+  if (task.status !== "draft" && task.status !== "failed" && task.status !== "quality_failed") {
+    throw new CliError("BAD_STATE", `Task ${opts.taskId} is in state "${task.status}" — cannot launch.`, {
+      hint: "Use `forge resume` for partial-failure recovery.",
+      exitCode: 1,
+    });
+  }
+
+  const repoConfig = store.getRepoConfig(task.repoRoot);
+  const repo = detectRepo(task.repoRoot);
+  if (!repo) {
+    throw new CliError("NOT_A_REPO", `Task's repo root is not a git repo: ${task.repoRoot}`, { exitCode: 2 });
+  }
+
+  // resolveLaunchConfig accepts the parseArgs-shaped record (kebab-case
+  // keys). Map our structured opts onto that shape so the resolver stays
+  // single-sourced.
+  const values: Record<string, unknown> = {
+    agent: opts.agent,
+    model: opts.model,
+    reasoning: opts.reasoning,
+    "reviewer-agent": opts.reviewerAgent,
+    "reviewer-model": opts.reviewerModel,
+    "reviewer-reasoning": opts.reviewerReasoning,
+    "fixer-agent": opts.fixerAgent,
+    "fixer-model": opts.fixerModel,
+    "fixer-reasoning": opts.fixerReasoning,
+    "no-auto-fix": opts.autoFix === false,
+  };
+  const { config: resolved, problems } = resolveLaunchConfig(values, task, repoConfig);
+  if (!resolved) {
+    const { message, hint } = fmtProblems(problems);
+    throw new CliError("MISSING_FLAGS", message, { hint: hint || undefined, detail: problems, exitCode: 1 });
+  }
+
+  let worktreePath: string;
+  let branch = opts.branch ?? task.branch;
+
+  if (opts.inPlace) {
+    branch = repo.currentBranch;
+    if (branch === repo.defaultBranch) {
+      throw new CliError("DEFAULT_BRANCH", `Refusing to run in place on default branch "${branch}".`, {
+        hint: "Switch to a feature branch first, or omit --in-place to create a worktree.",
+        exitCode: 1,
+      });
+    }
+    worktreePath = repo.root;
+  } else if (opts.worktree) {
+    worktreePath = opts.worktree;
+  } else {
+    const wt = await createWorktree(repo.root, branch, repo.worktreeScript, repo.stack);
+    if (wt.error) throw new CliError("WORKTREE_FAIL", `Worktree creation failed: ${wt.error}`, { exitCode: 3 });
+    worktreePath = wt.worktreePath;
+  }
+
+  const fullSpec = store.getSpec(task.id);
+  if (!fullSpec) throw new CliError("NO_SPEC", `Spec file missing for ${task.id}.`, { exitCode: 2 });
+  const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
+
+  const result = await launchAgent(
+    {
+      taskId: task.id,
+      specContent: specBody,
+      specTitle: task.title,
+      target: resolved.agent,
+      model: resolved.model,
+      reasoningEffort: resolved.reasoning,
+      worktreePath,
+      qualityCommands: repo.qualityCommands,
+      defaultBranch: repo.defaultBranch,
+      branch,
+      repoRoot: repo.root,
+      repoName: repo.name,
+      contextContent: repo.contextContent,
+      reviewerTarget: resolved.reviewerAgent,
+      reviewerModel: resolved.reviewerModel,
+      reviewerReasoningEffort: resolved.reviewerReasoning,
+      autoFix: resolved.autoFix,
+      autoFixRounds: resolved.autoFixRounds,
+      fixerTarget: resolved.fixerAgent,
+      fixerModel: resolved.fixerModel,
+      fixerReasoningEffort: resolved.fixerReasoning,
+      ghUser: repoConfig.ghUser,
+      ghHost: repoConfig.ghHost,
+    },
+    store,
+  );
+
+  if (result.error) throw new CliError("LAUNCH_FAIL", `Launch failed: ${result.error}`, { exitCode: 3 });
+
+  store.upsertTask({
+    ...task,
+    status: "running",
+    agent: resolved.agent,
+    model: resolved.model,
+    branch,
+    worktree: worktreePath,
+    tmuxSession: result.tmuxSession,
+    logFile: result.logFile,
+    launchedAt: new Date().toISOString(),
+  });
+
+  return {
+    taskId: task.id,
+    tmuxSession: result.tmuxSession,
+    worktreePath,
+    branch,
+    runDir: store.ensureRunDir(task.id),
+    logFile: result.logFile,
+  };
+}
+
 function dryRunHumanFormat(c: ResolvedLaunchConfig, taskId: string): string {
   const lines: string[] = [
     `dry-run resolved config for ${taskId}`,
@@ -353,121 +498,45 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const id = positionals[0];
   if (!id) throw new CliError("MISSING_ARG", "Usage: forge launch <task-id> [...flags]", { exitCode: 1 });
 
-  const task = store.getTask(id);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
-  if (task.status !== "draft" && task.status !== "failed" && task.status !== "quality_failed") {
-    throw new CliError("BAD_STATE", `Task ${id} is in state "${task.status}" — cannot launch.`, {
-      hint: "Use `forge resume` for partial-failure recovery.",
-      exitCode: 1,
-    });
-  }
-
-  const repoConfig = store.getRepoConfig(task.repoRoot);
-  const repo = detectRepo(task.repoRoot);
-  if (!repo) {
-    throw new CliError("NOT_A_REPO", `Task's repo root is not a git repo: ${task.repoRoot}`, { exitCode: 2 });
-  }
-
-  const { config: resolved, problems } = resolveLaunchConfig(values, task, repoConfig);
-  if (!resolved) {
-    const { message, hint } = fmtProblems(problems);
-    throw new CliError("MISSING_FLAGS", message, {
-      hint: hint || undefined,
-      detail: problems,
-      exitCode: 1,
-    });
-  }
-
-  // ── --dry-run: print resolved config and exit ───────────────────────────
+  // ── --dry-run: resolve config + print without launching. CLI-only path. ─
   if (values["dry-run"] as boolean) {
+    const task = store.getTask(id);
+    if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
+    const repoConfig = store.getRepoConfig(task.repoRoot);
+    const { config: resolved, problems } = resolveLaunchConfig(values, task, repoConfig);
+    if (!resolved) {
+      const { message, hint } = fmtProblems(problems);
+      throw new CliError("MISSING_FLAGS", message, { hint: hint || undefined, detail: problems, exitCode: 1 });
+    }
     emitOk({ taskId: task.id, repoRoot: task.repoRoot, ...resolved }, values.json === true, () =>
       dryRunHumanFormat(resolved, task.id),
     );
     return;
   }
 
-  // ── Resolve workspace ────────────────────────────────────────────────────
-  let worktreePath: string;
-  let branch = (values.branch as string | undefined) ?? task.branch;
-
-  if (values["in-place"]) {
-    branch = repo.currentBranch;
-    if (branch === repo.defaultBranch) {
-      throw new CliError("DEFAULT_BRANCH", `Refusing to run in place on default branch "${branch}".`, {
-        hint: "Switch to a feature branch first, or omit --in-place to create a worktree.",
-        exitCode: 1,
-      });
-    }
-    worktreePath = repo.root;
-  } else if (typeof values.worktree === "string") {
-    worktreePath = values.worktree;
-  } else {
-    const result = await createWorktree(repo.root, branch, repo.worktreeScript, repo.stack);
-    if (result.error) {
-      throw new CliError("WORKTREE_FAIL", `Worktree creation failed: ${result.error}`, { exitCode: 3 });
-    }
-    worktreePath = result.worktreePath;
-  }
-
-  const fullSpec = store.getSpec(task.id);
-  if (!fullSpec) throw new CliError("NO_SPEC", `Spec file missing for ${task.id}.`, { exitCode: 2 });
-  const specBody = fullSpec.replace(/^---[\s\S]*?---\n*/m, "").trim();
-
-  const result = await launchAgent(
+  const result = await doLaunch(
     {
-      taskId: task.id,
-      specContent: specBody,
-      specTitle: task.title,
-      target: resolved.agent,
-      model: resolved.model,
-      reasoningEffort: resolved.reasoning,
-      worktreePath,
-      qualityCommands: repo.qualityCommands,
-      defaultBranch: repo.defaultBranch,
-      branch,
-      repoRoot: repo.root,
-      repoName: repo.name,
-      contextContent: repo.contextContent,
-      reviewerTarget: resolved.reviewerAgent,
-      reviewerModel: resolved.reviewerModel,
-      reviewerReasoningEffort: resolved.reviewerReasoning,
-      autoFix: resolved.autoFix,
-      autoFixRounds: resolved.autoFixRounds,
-      fixerTarget: resolved.fixerAgent,
-      fixerModel: resolved.fixerModel,
-      fixerReasoningEffort: resolved.fixerReasoning,
-      ghUser: repoConfig.ghUser,
-      ghHost: repoConfig.ghHost,
+      taskId: id,
+      agent: values.agent as LaunchTarget | undefined,
+      model: values.model as string | undefined,
+      reasoning: values.reasoning as ReasoningEffort | undefined,
+      reviewerAgent: values["reviewer-agent"] as LaunchTarget | undefined,
+      reviewerModel: values["reviewer-model"] as string | undefined,
+      reviewerReasoning: values["reviewer-reasoning"] as ReasoningEffort | undefined,
+      fixerAgent: values["fixer-agent"] as LaunchTarget | undefined,
+      fixerModel: values["fixer-model"] as string | undefined,
+      fixerReasoning: values["fixer-reasoning"] as ReasoningEffort | undefined,
+      autoFix: values["no-auto-fix"] === true ? false : undefined,
+      inPlace: values["in-place"] === true,
+      worktree: values.worktree as string | undefined,
+      branch: values.branch as string | undefined,
     },
     store,
   );
 
-  if (result.error) {
-    throw new CliError("LAUNCH_FAIL", `Launch failed: ${result.error}`, { exitCode: 3 });
-  }
-
-  store.upsertTask({
-    ...task,
-    status: "running",
-    agent: resolved.agent,
-    model: resolved.model,
-    branch,
-    worktree: worktreePath,
-    tmuxSession: result.tmuxSession,
-    logFile: result.logFile,
-    launchedAt: new Date().toISOString(),
-  });
-
   emitOk(
-    {
-      taskId: task.id,
-      tmuxSession: result.tmuxSession,
-      worktreePath,
-      branch,
-      runDir: store.ensureRunDir(task.id),
-      logFile: result.logFile,
-    },
+    result,
     values.json === true,
-    () => `✓ launched ${task.id}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
+    () => `✓ launched ${result.taskId}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
   );
 }

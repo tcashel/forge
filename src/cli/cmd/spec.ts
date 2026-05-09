@@ -81,8 +81,7 @@ function deriveTitle(body: string, override?: string): string {
   return "untitled-spec";
 }
 
-const CONVENTIONAL_COMMIT_RE =
-  /^(feat|fix|chore|docs|refactor|test|ci|style|perf|build)\([a-z0-9_-]+\): .+$/;
+const CONVENTIONAL_COMMIT_RE = /^(feat|fix|chore|docs|refactor|test|ci|style|perf|build)\([a-z0-9_-]+\): .+$/;
 
 /**
  * Forge uses the spec H1 verbatim as the PR title. A non-conformant title
@@ -211,6 +210,99 @@ async function runAutoImprove(task: TaskRecord, store: ForgeStore): Promise<Impr
 
 // ─── save ───────────────────────────────────────────────────────────────────
 
+export interface SaveSpecOpts {
+  body: string;
+  repoRoot: string;
+  repoName: string;
+  title?: string;
+  branch?: string;
+  agent?: LaunchTarget;
+  model?: string;
+  jiraTicket?: string;
+  /** When false, skip the auto-improve loop. Default true (subject to repoConfig.autoImprove). */
+  autoImprove?: boolean;
+}
+
+export interface SaveSpecResult {
+  taskId: string;
+  specPath: string;
+  branch: string;
+  status: "draft";
+  improve: ImproveResult | null;
+}
+
+/**
+ * Save a spec and (by default) run auto-improve. Pure programmatic core for
+ * `forge spec save`; called by both the CLI shell and the HTTP server.
+ *
+ * Throws CliError on failure.
+ */
+export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<SaveSpecResult> {
+  if (!opts.body.trim()) {
+    throw new CliError("EMPTY_INPUT", "spec body is empty.", {
+      hint: "Provide content via stdin or --from-file <path>.",
+      exitCode: 1,
+    });
+  }
+
+  // If body already has frontmatter, leave it alone — caller knows what
+  // they're doing. Otherwise generate one.
+  const hasFrontmatter = /^---\s*\n[\s\S]*?\n---\s*\n/.test(opts.body);
+
+  const title = deriveTitle(opts.body, opts.title);
+  warnIfTitleNotConventional(title);
+  const id = store.generateId(title);
+  const branch = deriveBranch(title, opts.branch);
+
+  const task: TaskRecord = {
+    id,
+    title,
+    repoRoot: opts.repoRoot,
+    repoName: opts.repoName,
+    branch,
+    worktree: null,
+    status: "draft",
+    agent: opts.agent ?? null,
+    model: opts.model ?? null,
+    createdAt: new Date().toISOString(),
+    launchedAt: null,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: opts.jiraTicket ?? null,
+    specFile: "", // filled below
+    specVersion: 1,
+  };
+
+  const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
+  const specPath = store.writeSpec(id, frontmatter + opts.body);
+  task.specFile = specPath;
+  store.upsertTask(task);
+
+  const repoConfig = store.getRepoConfig(opts.repoRoot);
+  const skip = opts.autoImprove === false || repoConfig.autoImprove === false || hasFrontmatter;
+
+  let improve: ImproveResult | null = null;
+  if (!skip) {
+    try {
+      improve = await runAutoImprove(task, store);
+    } catch (e: unknown) {
+      const msg = e instanceof Error ? e.message : String(e);
+      improve = {
+        critiqueId: "",
+        applied: false,
+        changeCount: 0,
+        mode: "skipped",
+        error: `IMPROVE_FAILED: ${msg}`,
+      };
+    }
+  }
+
+  return { taskId: id, specPath, branch, status: "draft", improve };
+}
+
 async function runSave(argv: string[], store: ForgeStore): Promise<void> {
   const { values } = parseArgs({
     args: argv,
@@ -244,16 +336,6 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
     }
     body = await readStdin();
   }
-  if (!body.trim()) {
-    throw new CliError("EMPTY_INPUT", "spec body is empty.", {
-      hint: "Provide content via stdin or --from-file <path>.",
-      exitCode: 1,
-    });
-  }
-
-  // If body already has frontmatter, leave it alone — caller knows what
-  // they're doing. Otherwise generate one.
-  const hasFrontmatter = /^---\s*\n[\s\S]*?\n---\s*\n/.test(body);
 
   const repo = detectRepo(process.cwd());
   if (!repo) {
@@ -263,79 +345,44 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
     });
   }
 
-  const title = deriveTitle(body, values.title as string | undefined);
-  warnIfTitleNotConventional(title);
-  const id = store.generateId(title);
-  const branch = deriveBranch(title, values.branch as string | undefined);
-
-  const task: TaskRecord = {
-    id,
-    title,
-    repoRoot: repo.root,
-    repoName: repo.name,
-    branch,
-    worktree: null,
-    status: "draft",
-    agent: (values.agent as LaunchTarget | undefined) ?? null,
-    model: (values.model as string | undefined) ?? null,
-    createdAt: new Date().toISOString(),
-    launchedAt: null,
-    completedAt: null,
-    prUrl: null,
-    prNumber: null,
-    tmuxSession: null,
-    logFile: null,
-    jiraTicket: (values.jira as string | undefined) ?? null,
-    specFile: "", // filled by store
-    specVersion: 1,
-  };
-
-  const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
-  const specPath = store.writeSpec(id, frontmatter + body);
-  task.specFile = specPath;
-  store.upsertTask(task);
-
-  // ── Decide whether to auto-improve ────────────────────────────────────────
-  const repoConfig = store.getRepoConfig(repo.root);
   const improveMode = (values["improve-mode"] as string | undefined)?.toLowerCase();
   if (improveMode === "background") {
     process.stderr.write("(improve-mode=background not yet supported in Phase 1, falling back to sync)\n");
   }
   const explicitOff = values["no-improve"] === true || improveMode === "off";
-  const repoOff = repoConfig.autoImprove === false;
-  const userFm = hasFrontmatter;
-  const skip = explicitOff || repoOff || userFm;
 
-  let improve: ImproveResult | null = null;
-  if (!skip) {
-    try {
-      improve = await runAutoImprove(task, store);
-    } catch (e: unknown) {
-      const msg = e instanceof Error ? e.message : String(e);
-      improve = {
-        critiqueId: "",
-        applied: false,
-        changeCount: 0,
-        mode: "skipped",
-        error: `IMPROVE_FAILED: ${msg}`,
-      };
-    }
-    if (improve.error) {
-      process.stderr.write(
-        `${improve.error.startsWith("IMPROVE_") ? improve.error : `IMPROVE_FAILED: ${improve.error}`}\n`,
-      );
-    }
+  const result = await saveSpec(
+    {
+      body,
+      repoRoot: repo.root,
+      repoName: repo.name,
+      title: values.title as string | undefined,
+      branch: values.branch as string | undefined,
+      agent: values.agent as LaunchTarget | undefined,
+      model: values.model as string | undefined,
+      jiraTicket: values.jira as string | undefined,
+      autoImprove: explicitOff ? false : undefined,
+    },
+    store,
+  );
+
+  if (result.improve?.error) {
+    process.stderr.write(
+      `${result.improve.error.startsWith("IMPROVE_") ? result.improve.error : `IMPROVE_FAILED: ${result.improve.error}`}\n`,
+    );
   }
 
-  emitOk({ taskId: id, specPath, branch, status: "draft", improve }, values.json === true, () => {
-    const lines = [`saved spec ${id}`, `  path: ${specPath}`, `  branch: ${branch}`];
-    if (improve) {
-      if (improve.mode === "applied") {
-        lines.push(`  improve: applied ${improve.changeCount} change(s) (critique ${improve.critiqueId})`);
-      } else if (improve.mode === "no-op") {
+  emitOk(result, values.json === true, () => {
+    const lines = [`saved spec ${result.taskId}`, `  path: ${result.specPath}`, `  branch: ${result.branch}`];
+    if (result.improve) {
+      if (result.improve.mode === "applied") {
+        lines.push(
+          `  improve: applied ${result.improve.changeCount} change(s) (critique ${result.improve.critiqueId})`,
+        );
+      } else if (result.improve.mode === "no-op") {
         lines.push("  improve: no actionable findings");
       } else {
-        lines.push(`  improve: skipped (${improve.error ?? "unknown"})`);
+        lines.push(`  improve: skipped (${result.improve.error ?? "unknown"})`);
       }
     }
     return lines.join("\n");
