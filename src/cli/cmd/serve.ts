@@ -22,7 +22,7 @@ import type { CritiqueMeta, ForgeStore, RunMeta, TaskRecord, TaskStatus } from "
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
-import { saveSpec } from "./spec.ts";
+import { improveSpec, saveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
 
@@ -182,6 +182,12 @@ function statusInfo(
           error: null,
           critique,
         };
+      }
+      // Critics or synthesizer in flight — auto-improve / critique is
+      // actively running. Stay in drafting (the task isn't launched), but
+      // give the pill the running pulse so the user sees activity.
+      if (critiqueMeta?.status === "running_critics" || critiqueMeta?.status === "running_synth") {
+        return { section: "drafting", statLabel: "Improving", statClass: "running", error: null, critique };
       }
       // "Ready" today = the auto-improver has already revised this spec
       // (specVersion > 1). It's a coarse signal but matches the prototype's
@@ -542,7 +548,7 @@ function uniqueRepos(store: ForgeStore): Array<{ name: string; root: string }> {
 
 // ─── POST routes ─────────────────────────────────────────────────────────────
 
-const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|kill|resume)$/;
+const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
@@ -691,6 +697,16 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
   if (action === "critique") {
     try {
       const result = await doCritique({ taskId }, store);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  if (action === "improve") {
+    try {
+      const result = await improveSpec(taskId, store);
       return jsonOk(result);
     } catch (e) {
       if (e instanceof CliError) return fromCliError(e);

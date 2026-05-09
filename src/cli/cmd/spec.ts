@@ -391,6 +391,23 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
 
 // ─── improve ────────────────────────────────────────────────────────────────
 
+export interface ImproveSpecResult {
+  taskId: string;
+  improve: ImproveResult;
+}
+
+/**
+ * Run the auto-improve loop on a saved spec. Pure programmatic core for
+ * `forge spec improve`; called by both the CLI shell and the HTTP server.
+ * Throws CliError on failure.
+ */
+export async function improveSpec(taskId: string, store: ForgeStore): Promise<ImproveSpecResult> {
+  const task = store.getTask(taskId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${taskId}".`, { exitCode: 1 });
+  const improve = await runAutoImprove(task, store);
+  return { taskId: task.id, improve };
+}
+
 async function runImproveCmd(argv: string[], store: ForgeStore): Promise<void> {
   const { values, positionals } = parseArgs({
     args: argv,
@@ -411,21 +428,19 @@ async function runImproveCmd(argv: string[], store: ForgeStore): Promise<void> {
   const id = positionals[0];
   if (!id) throw new CliError("MISSING_ARG", "Usage: forge spec improve <task-id> [--json]", { exitCode: 1 });
 
-  const task = store.getTask(id);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
-
-  const improve = await runAutoImprove(task, store);
-  if (improve.error) {
+  const result = await improveSpec(id, store);
+  if (result.improve.error) {
     process.stderr.write(
-      `${improve.error.startsWith("IMPROVE_") ? improve.error : `IMPROVE_FAILED: ${improve.error}`}\n`,
+      `${result.improve.error.startsWith("IMPROVE_") ? result.improve.error : `IMPROVE_FAILED: ${result.improve.error}`}\n`,
     );
   }
 
-  emitOk({ taskId: task.id, improve }, values.json === true, () => {
-    if (improve.mode === "applied")
-      return `improved ${task.id}: ${improve.changeCount} change(s) (critique ${improve.critiqueId})`;
-    if (improve.mode === "no-op") return `no actionable findings for ${task.id}`;
-    return `improve skipped for ${task.id}: ${improve.error ?? "unknown"}`;
+  emitOk(result, values.json === true, () => {
+    const im = result.improve;
+    if (im.mode === "applied")
+      return `improved ${result.taskId}: ${im.changeCount} change(s) (critique ${im.critiqueId})`;
+    if (im.mode === "no-op") return `no actionable findings for ${result.taskId}`;
+    return `improve skipped for ${result.taskId}: ${im.error ?? "unknown"}`;
   });
 }
 

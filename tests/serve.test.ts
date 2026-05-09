@@ -370,6 +370,14 @@ test("POST /api/tasks/:id/critique returns 404 for unknown task", async (t) => {
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
+test("POST /api/tasks/:id/improve returns 404 for unknown task", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/improve`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
 test("POST /api/tasks/:id/resume returns 501", async (t) => {
   const h = bootServer();
   t.after(() => h.stop());
