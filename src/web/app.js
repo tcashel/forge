@@ -618,10 +618,17 @@ function detailFingerprint(t) {
 function clearDetail() {
   state.currentTaskId = null;
   teardownLog();
-  $("#detail-empty").hidden = false;
-  $("#detail-head").hidden = true;
-  $("#detail-tabs").hidden = true;
-  $("#detail-body").hidden = true;
+  // PR / Settings modes overwrite #detail-pane wholesale, so the shell ids
+  // may be absent here. Skip the hidden flips if so — the pending mode
+  // render will fully replace the pane on the next tick.
+  const empty = $("#detail-empty");
+  if (empty) empty.hidden = false;
+  const head = $("#detail-head");
+  if (head) head.hidden = true;
+  const tabs = $("#detail-tabs");
+  if (tabs) tabs.hidden = true;
+  const body = $("#detail-body");
+  if (body) body.hidden = true;
 }
 
 function enterTaskMode(target = "all") {
