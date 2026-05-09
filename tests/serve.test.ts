@@ -283,11 +283,163 @@ test("path traversal under / is blocked", async (t) => {
   await res.text();
 });
 
-test("POST is rejected on read endpoints (PR 1 is read-only)", async (t) => {
+test("POST is rejected on read endpoints", async (t) => {
   const h = bootServer();
   t.after(() => h.stop());
   const res = await fetch(`${h.baseUrl}/api/tasks`, { method: "POST" });
   assert.equal(res.status, 405);
   const body = (await res.json()) as Envelope;
   assert.equal(body.error!.code, "METHOD_NOT_ALLOWED");
+});
+
+// ─── action endpoints ────────────────────────────────────────────────────────
+
+async function postJson(url: string, body?: unknown): Promise<{ status: number; body: Envelope }> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: body !== undefined ? { "content-type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  let parsed: Envelope | null = null;
+  try {
+    parsed = (await res.json()) as Envelope;
+  } catch {
+    /* non-JSON */
+  }
+  if (!parsed) throw new Error(`No JSON body from POST ${url}`);
+  return { status: res.status, body: parsed };
+}
+
+test("POST /api/specs rejects non-JSON content-type", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const res = await fetch(`${h.baseUrl}/api/specs`, {
+    method: "POST",
+    headers: { "content-type": "text/plain" },
+    body: "not json",
+  });
+  assert.equal(res.status, 415);
+  const body = (await res.json()) as Envelope;
+  assert.equal(body.error!.code, "UNSUPPORTED_MEDIA_TYPE");
+});
+
+test("POST /api/specs rejects body missing markdown", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs`, { repoRoot: "/tmp/foo" });
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "BAD_REQUEST");
+  assert.match(body.error!.message, /markdown/);
+});
+
+test("POST /api/specs rejects relative repoRoot", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
+    markdown: "# feat(x): y\n\nbody",
+    repoRoot: "relative/path",
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "BAD_REQUEST");
+});
+
+test("POST /api/specs rejects non-git repoRoot", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
+    markdown: "# feat(x): y\n\nbody",
+    repoRoot: h.tmpHome, // exists but not a git repo
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "NOT_A_REPO");
+});
+
+test("POST /api/tasks/:id/launch returns 404 for unknown task", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/launch`, {});
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("POST /api/tasks/:id/critique returns 404 for unknown task", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/critique`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("POST /api/tasks/:id/resume returns 501", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/anything/resume`);
+  assert.equal(status, 501);
+  assert.equal(body.error!.code, "NOT_IMPLEMENTED");
+});
+
+test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+
+  const id = "kill-target";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): killable",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/kill-target",
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    // Use a name that almost certainly doesn't exist on the test runner.
+    // killTmuxSession swallows the "no such session" error, so this is fine.
+    tmuxSession: "forge-noop-12345",
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# kill\n"),
+    specVersion: 1,
+  });
+
+  // Seed run-meta with an unrelated key so we can assert merge (not overwrite).
+  fs.mkdirSync(path.join(h.store.runsDir, id), { recursive: true });
+  h.store.writeRunMeta(id, {
+    taskId: id,
+    tmuxSession: "forge-noop-12345",
+    logFile: "/tmp/x.log",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    worktree: "/tmp/wt",
+    status: "running",
+    startedAt: now,
+    prUrl: null,
+    qualityResults: [{ command: "lint", ok: true, durationMs: 10 }],
+  });
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.killed, true);
+
+  const task = h.store.getTask(id);
+  assert.equal(task!.status, "failed");
+  const meta = h.store.readRunMeta(id);
+  assert.equal(meta!.errorMessage, "killed from Workbench");
+  assert.deepEqual(meta!.qualityResults, [{ command: "lint", ok: true, durationMs: 10 }]);
+});
+
+test("POST /api/tasks/:id/kill rejects when task has no tmux session", async (t) => {
+  const h = bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "nokill", h.tmpHome, "demo", "feat(demo): no session");
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill/kill`);
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "NO_TMUX_SESSION");
 });

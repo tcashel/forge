@@ -795,6 +795,37 @@ async function apiGet(path) {
   return body.data;
 }
 
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let envelope = null;
+  try { envelope = await res.json(); } catch { /* non-JSON */ }
+  if (!res.ok || !envelope || envelope.ok !== true) {
+    const code = envelope && envelope.error && envelope.error.code ? envelope.error.code : `HTTP_${res.status}`;
+    const message = envelope && envelope.error && envelope.error.message ? envelope.error.message : `Request failed: ${path}`;
+    const err = new Error(message);
+    err.code = code;
+    throw err;
+  }
+  return envelope.data;
+}
+
+/** POST + toast + refresh. Pass `confirm` to prompt before sending. */
+async function runAction(path, opts) {
+  const o = opts || {};
+  if (o.confirm && !window.confirm(o.confirm)) return;
+  try {
+    await apiPost(path, o.body);
+    showToast(o.successMsg || "Done", "info");
+    await refreshTasks();
+  } catch (e) {
+    showToast(e.message || "Action failed", "error");
+  }
+}
+
 /* ─── clock ────────────────────────────────────────────────────────── */
 function tickClock() {
   const d = new Date();
@@ -1090,27 +1121,39 @@ function renderDetailHead(t) {
 }
 
 function actionsForHTML(t) {
+  const launchAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/launch`, {
+    successMsg: `Launching ${t.id}…`,
+  });
+  const critiqueAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, {
+    successMsg: `Critique queued for ${t.id}`,
+  });
+  const killAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/kill`, {
+    successMsg: `Killed ${t.id}`,
+    confirm: `Kill this run?\n\nThe tmux session will be terminated and the task marked failed.`,
+  });
+
   const items = [];
-  // PR 2 will wire these — for PR 1 we surface the equivalent CLI invocation
-  // on click so the user can copy & paste.
   if (t.section === "running") {
     items.push({ label: "Tail log", cls: "btn-primary", action: () => switchTab("log") });
+    // Attach has to stay copy-only — terminal control can't transfer from the browser.
     if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: () => copyCmd(`forge attach ${t.id}`) });
     if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: () => window.open(t.prUrl, "_blank") });
+    items.push({ label: "Kill", cls: "btn-ghost", action: killAction });
   } else if (t.kind === "critique-ready") {
     items.push({ label: "Review critique", cls: "btn-attention", action: () => switchTab("critique") });
-    items.push({ label: "Launch anyway", cls: "btn-secondary", action: () => copyCmd(`forge launch ${t.id}`) });
+    items.push({ label: "Launch anyway", cls: "btn-secondary", action: launchAction });
   } else if (t.kind === "failed") {
     items.push({ label: "Open log", cls: "btn-primary", action: () => switchTab("log") });
     items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
+    items.push({ label: "Re-launch", cls: "btn-ghost", action: launchAction });
   } else if (t.section === "ready") {
-    items.push({ label: "Launch", cls: "btn-primary", action: () => copyCmd(`forge launch ${t.id}`) });
-    items.push({ label: "Critique", cls: "btn-secondary", action: () => copyCmd(`forge critique ${t.id}`) });
+    items.push({ label: "Launch", cls: "btn-primary", action: launchAction });
+    items.push({ label: "Critique", cls: "btn-secondary", action: critiqueAction });
     items.push({ label: "View spec", cls: "btn-ghost", action: () => switchTab("spec") });
   } else if (t.section === "drafting") {
     items.push({ label: "View spec", cls: "btn-primary", action: () => switchTab("spec") });
-    items.push({ label: "Run critique", cls: "btn-secondary", action: () => copyCmd(`forge critique ${t.id}`) });
-    items.push({ label: "Launch", cls: "btn-ghost", action: () => copyCmd(`forge launch ${t.id}`) });
+    items.push({ label: "Run critique", cls: "btn-secondary", action: critiqueAction });
+    items.push({ label: "Launch", cls: "btn-ghost", action: launchAction });
   } else if (t.section === "done") {
     if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: () => window.open(t.prUrl, "_blank") });
     items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
@@ -1312,10 +1355,12 @@ async function renderCritiqueTab(t, body) {
         <div class="empty-pane">
           <div class="big">No critique on file</div>
           <p>Run a two-critic + synthesizer pass before launching:</p>
-          <button class="btn btn-secondary" id="crit-copy">Copy <code>forge critique ${escapeHTML(t.id)}</code></button>
+          <button class="btn btn-primary" id="crit-run">Run critique</button>
         </div>
       `;
-      $("#crit-copy").addEventListener("click", () => copyCmd(`forge critique ${t.id}`));
+      $("#crit-run").addEventListener("click", () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, {
+        successMsg: `Critique queued for ${t.id}`,
+      }));
       return;
     }
     const c = data.critique;

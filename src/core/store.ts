@@ -81,6 +81,8 @@ export interface RunMeta {
   reviewerReasoningEffort?: ReasoningEffort;
   reviewVerdict?: ReviewVerdict | null;
   reviewError?: string | null;
+  /** Human-readable failure reason. Surfaced on the Workbench failure card. */
+  errorMessage?: string;
 }
 
 export interface RepoConfig {

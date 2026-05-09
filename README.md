@@ -69,9 +69,11 @@ Or boot the **Workbench** — a localhost web UI over the same state — with:
 forge serve --open      # default: http://127.0.0.1:7456
 ```
 
-`forge serve` is read-only in this revision (mutations still go through
-the CLI subcommands so agents and humans share one contract). Localhost
-binding only; no auth.
+The Workbench can launch, critique, and kill tasks directly from the UI.
+Buttons call into the same programmatic cores the CLI uses, so agents
+and humans share one contract. Localhost binding only; no auth. Spec
+creation is exposed as `POST /api/specs` for external tooling — there is
+no in-UI form yet.
 
 ## Subcommand reference
 

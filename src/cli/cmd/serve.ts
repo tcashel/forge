@@ -1,9 +1,10 @@
 /**
  * forge serve — localhost HTTP + SSE for the Workbench UI.
  *
- * Boots a Bun.serve on 127.0.0.1:<port>, ports static UI bytes from
- * src/web/index.html, and exposes read endpoints over `~/.forge/`. The
- * UI is a viewer in PR 1 — mutations land in PR 2.
+ * Boots a Bun.serve on 127.0.0.1:<port>, serves static UI bytes from
+ * src/web/index.html, and exposes read endpoints + four POST action
+ * endpoints (specs / launch / critique / kill) backed by the same
+ * programmatic cores the CLI uses (saveSpec, doLaunch, doCritique).
  *
  * Localhost-only by design. There is no auth in this revision.
  */
@@ -15,9 +16,13 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs } from "../../core/gh-pr.ts";
-import { isTmuxSessionAlive } from "../../core/launch.ts";
-import type { CritiqueMeta, ForgeStore, TaskRecord, TaskStatus } from "../../core/store.ts";
+import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
+import { detectRepo } from "../../core/repo.ts";
+import type { CritiqueMeta, ForgeStore, RunMeta, TaskRecord, TaskStatus } from "../../core/store.ts";
 import { CliError } from "../output.ts";
+import { doCritique } from "./critique.ts";
+import { doLaunch } from "./launch.ts";
+import { saveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
 
@@ -535,6 +540,166 @@ function uniqueRepos(store: ForgeStore): Array<{ name: string; root: string }> {
   return Array.from(seen.values());
 }
 
+// ─── POST routes ─────────────────────────────────────────────────────────────
+
+const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|kill|resume)$/;
+
+function allowsPost(pathname: string): boolean {
+  if (pathname === "/api/specs") return true;
+  return ACTION_TASK_PATH.test(pathname);
+}
+
+/** Map a CliError to an HTTP status. exitCode 1 = user error → 400 by default. */
+function httpStatusFor(err: CliError): number {
+  switch (err.code) {
+    case "UNKNOWN_TASK":
+      return 404;
+    case "BAD_STATE":
+      return 409;
+    case "EMPTY_INPUT":
+    case "NOT_A_REPO":
+    case "MISSING_FLAGS":
+    case "DEFAULT_BRANCH":
+    case "BAD_REQUEST":
+      return 400;
+    default:
+      return err.exitCode === 1 ? 400 : 500;
+  }
+}
+
+function fromCliError(err: CliError): Response {
+  return jsonErr(httpStatusFor(err), err.code, err.message, err.hint);
+}
+
+async function readJsonBody(req: Request): Promise<{ body: Record<string, unknown> } | { error: Response }> {
+  const ct = req.headers.get("content-type") ?? "";
+  // Allow an empty body for endpoints that don't take one (e.g. /critique, /kill).
+  // Browsers may set content-length: 0 with no content-type.
+  if (req.headers.get("content-length") === "0") return { body: {} };
+  if (!ct.toLowerCase().includes("application/json")) {
+    return { error: jsonErr(415, "UNSUPPORTED_MEDIA_TYPE", "Expected Content-Type: application/json.") };
+  }
+  let parsed: unknown;
+  try {
+    parsed = await req.json();
+  } catch {
+    return { error: jsonErr(400, "BAD_JSON", "Request body is not valid JSON.") };
+  }
+  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
+    return { error: jsonErr(400, "BAD_JSON", "Request body must be a JSON object.") };
+  }
+  return { body: parsed as Record<string, unknown> };
+}
+
+function reqString(body: Record<string, unknown>, key: string): string | null {
+  const v = body[key];
+  return typeof v === "string" && v.length > 0 ? v : null;
+}
+
+function optString(body: Record<string, unknown>, key: string): string | undefined {
+  const v = body[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
+  const { pathname } = url;
+  const { store } = ctx;
+  const parsed = await readJsonBody(req);
+  if ("error" in parsed) return parsed.error;
+  const body = parsed.body;
+
+  // POST /api/specs
+  if (pathname === "/api/specs") {
+    const markdown = reqString(body, "markdown");
+    const repoRoot = reqString(body, "repoRoot");
+    if (!markdown) return jsonErr(400, "BAD_REQUEST", "`markdown` is required.");
+    if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
+    if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const repo = detectRepo(repoRoot);
+    if (!repo) {
+      return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
+    }
+    try {
+      const result = await saveSpec(
+        {
+          body: markdown,
+          repoRoot: repo.root,
+          repoName: repo.name,
+          title: optString(body, "title"),
+          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
+          model: optString(body, "model"),
+        },
+        store,
+      );
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  const m = pathname.match(ACTION_TASK_PATH);
+  if (!m) return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
+  const taskId = decodeURIComponent(m[1]);
+  const action = m[2];
+
+  if (action === "resume") {
+    return jsonErr(
+      501,
+      "NOT_IMPLEMENTED",
+      "forge resume is not wired in this version.",
+      "Re-launch from scratch with POST /api/tasks/:id/launch.",
+    );
+  }
+
+  if (action === "kill") {
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    if (!task.tmuxSession) {
+      return jsonErr(400, "NO_TMUX_SESSION", `Task ${taskId} has no tmux session — it hasn't been launched.`);
+    }
+    killTmuxSession(task.tmuxSession);
+    // Merge errorMessage into existing meta so the failure card surfaces a
+    // clean reason. writeRunMeta is a full overwrite, so we read-then-write.
+    const existing = store.readRunMeta(taskId);
+    if (existing) {
+      const merged: RunMeta = { ...(existing as unknown as RunMeta), errorMessage: "killed from Workbench" };
+      store.writeRunMeta(taskId, merged);
+    }
+    store.upsertTask({ ...task, status: "failed", completedAt: new Date().toISOString() });
+    return jsonOk({ killed: true, taskId });
+  }
+
+  if (action === "launch") {
+    try {
+      const result = await doLaunch(
+        {
+          taskId,
+          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
+          model: optString(body, "model"),
+        },
+        store,
+      );
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  if (action === "critique") {
+    try {
+      const result = await doCritique({ taskId }, store);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
+}
+
 // ─── server boot ─────────────────────────────────────────────────────────────
 
 declare const Bun: {
@@ -594,8 +759,11 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
       }
 
       if (pathname.startsWith("/api/")) {
+        if (req.method === "POST" && allowsPost(pathname)) {
+          return handleApiPost(req, url, ctx);
+        }
         if (req.method !== "GET") {
-          return jsonErr(405, "METHOD_NOT_ALLOWED", `${req.method} not allowed (PR 1 is read-only).`);
+          return jsonErr(405, "METHOD_NOT_ALLOWED", `${req.method} not allowed for ${pathname}.`);
         }
         return handleApi(url, ctx);
       }
