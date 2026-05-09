@@ -56,3 +56,32 @@ export interface WorkbenchContext {
 export type ViewMode = "tasks" | "prs" | "settings";
 export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done";
 export type Theme = "light" | "dark";
+export type TabId = "log" | "spec" | "plan" | "critique" | "gates";
+
+export interface CritiqueAgentMeta {
+  agent: string;
+  model: string;
+  status: string;
+}
+
+export interface CritiqueMeta {
+  status: string;
+  startedAt?: string;
+  criticA?: CritiqueAgentMeta | null;
+  criticB?: CritiqueAgentMeta | null;
+  synthesizer?: CritiqueAgentMeta | null;
+}
+
+export interface CritiquePayload {
+  meta: CritiqueMeta;
+  recommendations: string | null;
+  criticA: string | null;
+  criticB: string | null;
+  synth: string | null;
+}
+
+export interface QualityResult {
+  command: string;
+  ok: boolean;
+  durationMs: number;
+}

@@ -5,7 +5,7 @@
 // and repo selections back into the legacy state machine.
 
 import type { effect as effectFn, Signal } from "@preact/signals";
-import type { RepoView, Theme, ViewMode } from "../types";
+import type { RepoView, TabId, TaskView, Theme, ViewMode } from "../types";
 
 export interface ForgeLegacyBridge {
   /** Set selectedRepo and run the legacy applyFilter() pipeline. */
@@ -32,12 +32,21 @@ export interface ForgeSignalBag {
   viewMode: Signal<ViewMode>;
   theme: Signal<Theme>;
   repos: Signal<RepoView[]>;
+  tasks: Signal<TaskView[]>;
+  currentTaskId: Signal<string | null>;
+  currentTab: Signal<TabId>;
+}
+
+export interface ForgeApi {
+  refreshTasks: () => Promise<void>;
+  selectTask: (id: string, tab?: TabId) => void;
 }
 
 export interface ForgeBridge {
   signals: ForgeSignalBag;
   effect: typeof effectFn;
   legacy: ForgeLegacyBridge;
+  api: ForgeApi;
 }
 
 declare global {
