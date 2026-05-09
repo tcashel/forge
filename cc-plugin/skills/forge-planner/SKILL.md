@@ -38,7 +38,9 @@ If the user already produced a plan-mode plan that names files and is concrete e
 
 ### Phase 2 — Draft
 
-Read `schema.md`. It defines the section structure (Goal, Context, Tasks, Acceptance Criteria, Quality Gates, etc.) and what good vs. bad content looks like in each. Compose the spec body in your reply (no frontmatter — Forge adds that). Aim for under 200 lines unless the change is genuinely large.
+Read `schema.md`. It defines the section structure (Title, Context, What We're Building, Acceptance Criteria, Implementation Notes, Quality Gates, For the Executing Agent) and what good vs. bad content looks like in each. Compose the spec body in your reply (no frontmatter — Forge adds that). Aim for under 200 lines unless the change is genuinely large.
+
+**Title format matters.** The H1 title is used verbatim as the PR title, so it must follow conventional-commit format: `<type>(<scope>): <imperative>`, all lowercase, ≤ 70 chars. See the Title section in `schema.md` for the full rule and examples.
 
 ### Phase 3 — Save (and optionally launch)
 

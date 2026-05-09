@@ -28,12 +28,24 @@ That's seven sections plus the title. Some are mandatory, some optional — call
 
 ### Title (mandatory)
 
-Imperative, present tense, 5–12 words. Describes the change as the agent would describe it after doing it.
+Conventional-commit format, all lowercase, total length ≤ 70 chars:
 
-- ✅ `# Make rate-limit bucket size configurable via env var`
-- ✅ `# Add Redis caching to user session lookup`
-- ❌ `# Caching` (too short, too vague)
-- ❌ `# I'd like to add some caching to user sessions because they're slow` (sentence, not title)
+```
+<type>(<scope>): <imperative>
+```
+
+- `<type>` is one of `feat | fix | chore | docs | refactor | test | ci | style | perf | build`.
+- `<scope>` is the area touched — a package name, top-level dir, or subsystem (`auth`, `launch`, `cc-plugin`).
+- `<imperative>` is the change as the agent would describe it after doing it. Present tense, no trailing period.
+
+Forge uses the H1 verbatim as the PR title, so it must already be in this format.
+
+- ✅ `# feat(auth): add redis caching to user session lookup`
+- ✅ `# fix(launch): unbreak unattended claude runs`
+- ✅ `# chore(cc-plugin): rename forge-critic severity labels`
+- ❌ `# Add Redis caching to user session lookup` (no prefix, capitalized)
+- ❌ `# feat: caching` (no scope, too vague)
+- ❌ `# I'd like to add some caching to user sessions` (sentence, not title)
 
 The title is what shows up in the Forge dashboard and (Flow A) becomes the JIRA ticket summary. Make it scannable.
 

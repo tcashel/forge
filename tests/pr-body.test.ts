@@ -1,8 +1,20 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { buildPrBody, type PrBodyInput, stripFrontmatter } from "../src/core/pr-body.ts";
+import { buildPrBody, parseAgentSummary, type PrBodyInput, stripFrontmatter } from "../src/core/pr-body.ts";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
+
+const STRUCTURED_AGENT_SUMMARY = `## Summary
+
+- **Bug fix:** unbreak Safari logins by setting cookie SameSite=None.
+- **Refactor:** extract \`buildSetCookie\` helper for reuse.
+
+## Test plan
+
+- [x] \`bun test\` — 12 pass
+- [x] Manual: tested login on Safari 17 + Chrome 120
+- [ ] End-to-end: real production smoke (deferred)
+`;
 
 function baseInput(overrides?: Partial<PrBodyInput>): PrBodyInput {
   return {
@@ -14,310 +26,277 @@ repoName: my-repo
 createdAt: 2025-01-01T00:00:00Z
 status: draft
 suggestedAgent: claude
-suggestedModel: claude-opus-4-6
-suggestedBranch: feat/test
+suggestedModel: claude-opus-4-7
+suggestedBranch: feat/auth-login-cookie
 jiraTicket: PROJ-123
 ---
 
-# Add caching layer
+# feat(auth): set samesite=none on login cookie
 
 ## Context
 
-The app is slow because every request hits the database. We need a caching
-layer to reduce latency by 80%. This is a critical performance issue.
+Login is broken on Safari due to a cookie SameSite issue.
 
 ## What We're Building
 
-A Redis-based caching middleware that sits between the API handler and the
-database layer. Cache invalidation uses TTL with tag-based purging.
+The login cookie now sets \`SameSite=None\` and \`Secure\`. Existing token validation is untouched.
 
 ## Acceptance Criteria
 
-- Cache hit returns in <5ms
-- Cache miss falls through to DB transparently
+- Login works on Safari 17+
+- Login still works on Chrome 120+ and Firefox 121+
+- Existing JWT validation behavior is unchanged
 `,
-    branch: "feat/test",
+    branch: "feat/auth-login-cookie",
     baseRef: "origin/main",
     commits: [
-      { sha: "abc1234", subject: "feat(cache): add Redis middleware" },
-      { sha: "def5678", subject: "test(cache): add integration tests" },
+      { sha: "abc1234", subject: "feat(auth): set SameSite=None on login cookie" },
+      { sha: "def5678", subject: "test(auth): cover Safari and Chrome cases" },
     ],
-    additions: 245,
-    deletions: 12,
-    filesChanged: 8,
+    additions: 24,
+    deletions: 3,
+    filesChanged: 2,
     qualityResults: [
-      { command: "npm run lint", ok: true, durationMs: 1200 },
-      { command: "npm run test", ok: true, durationMs: 8400 },
+      { command: "bun test", ok: true, durationMs: 1200 },
+      { command: "biome check .", ok: true, durationMs: 800 },
     ],
     agent: "claude",
-    model: "claude-opus-4-6",
+    model: "claude-opus-4-7",
     jiraTicket: "PROJ-123",
     jiraUrl: "https://jira.example.com/browse/PROJ-123",
-    agentSummary:
-      "Added a Redis caching middleware between the API handlers and the database layer. Cache entries use a 5-minute TTL with tag-based invalidation. Integration tests cover hit, miss, and invalidation paths.",
+    agentSummary: STRUCTURED_AGENT_SUMMARY,
     ...overrides,
   };
 }
 
+// ─── parseAgentSummary ────────────────────────────────────────────────────────
+
+test("parseAgentSummary extracts both sections from structured markdown", () => {
+  const parsed = parseAgentSummary(STRUCTURED_AGENT_SUMMARY);
+  assert.ok(parsed.summary);
+  assert.ok(parsed.summary?.includes("**Bug fix:**"));
+  assert.ok(parsed.testPlan);
+  assert.ok(parsed.testPlan?.includes("- [x] `bun test`"));
+});
+
+test("parseAgentSummary returns null for missing sections", () => {
+  const onlySummary = "## Summary\n\n- only summary, no test plan\n";
+  const parsed = parseAgentSummary(onlySummary);
+  assert.equal(parsed.testPlan, null);
+  assert.ok(parsed.summary);
+});
+
+test("parseAgentSummary returns nulls for completely unstructured input", () => {
+  const parsed = parseAgentSummary("just some prose with no sections");
+  assert.equal(parsed.summary, null);
+  assert.equal(parsed.testPlan, null);
+});
+
 // ─── Happy path ───────────────────────────────────────────────────────────────
 
-test("happy path: all sections present with agent summary, commits, quality, JIRA link", () => {
+test("happy path: agent-authored Summary + Test plan + collapsed details + Claude Code footer", () => {
   const body = buildPrBody(baseInput());
 
-  // Summary uses agentSummary
-  assert.ok(body.includes("## Summary"), "missing Summary header");
-  assert.ok(body.includes("Redis caching middleware"), "summary content missing");
+  // Summary uses agent bullets
+  assert.ok(body.startsWith("## Summary\n\n- **Bug fix:**"), "starts with Summary section");
 
-  // Changes section
-  assert.ok(body.includes("## Changes"), "missing Changes header");
-  assert.ok(body.includes("2 commits on `feat/test` ahead of `origin/main`"), "commit count line");
-  assert.ok(body.includes("+245 / −12 across 8 files"), "diff stats");
-  assert.ok(body.includes("`abc1234` feat(cache): add Redis middleware"), "commit bullet");
-  assert.ok(body.includes("`def5678` test(cache): add integration tests"), "commit bullet 2");
+  // Test plan from agent
+  assert.ok(body.includes("## Test plan\n\n- [x] `bun test`"), "Test plan section with checkbox");
+  assert.ok(body.includes("- [ ] End-to-end:"), "Test plan unchecked item");
 
-  // Quality Gates
-  assert.ok(body.includes("## Quality Gates"), "missing Quality Gates header");
-  assert.ok(body.includes("✅ npm run lint (1.2s)"), "lint result");
-  assert.ok(body.includes("✅ npm run test (8.4s)"), "test result");
+  // Collapsed forge run details
+  assert.ok(body.includes("<details>\n<summary>🤖 forge run details</summary>"), "collapsed details block");
+  assert.ok(body.includes("### Changes"), "Changes header inside details");
+  assert.ok(body.includes("2 commits on `feat/auth-login-cookie` ahead of `origin/main`"), "commit count line");
+  assert.ok(body.includes("+24 / −3 across 2 files"), "diff stats");
+  assert.ok(body.includes("`abc1234` feat(auth): set SameSite=None"), "commit bullet");
+  assert.ok(body.includes("### Quality Gates"), "Quality Gates header inside details");
+  assert.ok(body.includes("✅ bun test (1.2s)"), "quality result");
+  assert.ok(body.includes("### Forge spec"), "Forge spec header inside details");
+  assert.ok(body.includes("# feat(auth): set samesite=none on login cookie"), "spec H1 in details");
+  assert.ok(body.includes("forge: `task-abc123` · `claude` / `claude-opus-4-7`"), "forge meta line");
 
-  // Forge Spec details
-  assert.ok(body.includes("<summary>📋 Forge spec</summary>"), "spec details summary");
-  assert.ok(body.includes("# Add caching layer"), "spec title in details");
-  assert.ok(!body.includes("suggestedAgent"), "frontmatter should be stripped from details");
+  // Footer
+  assert.ok(body.includes("🔗 [PROJ-123](https://jira.example.com/browse/PROJ-123)"), "JIRA link");
+  assert.ok(body.includes("🤖 Generated with [Claude Code](https://claude.com/claude-code)"), "Claude Code footer");
+});
 
-  // Footer with JIRA link
-  assert.ok(body.includes("🔗 [PROJ-123](https://jira.example.com/browse/PROJ-123)"), "JIRA markdown link in footer");
-  assert.ok(body.includes("🤖 forge `task-abc123`"), "forge task id in footer");
-  assert.ok(body.includes("`claude` / `claude-opus-4-6`"), "agent/model in footer");
+test("body never contains a top-level frontmatter delimiter line", () => {
+  const body = buildPrBody(baseInput());
+  // No standalone `---` line that would be parsed as frontmatter by markdown viewers.
+  for (const line of body.split("\n")) {
+    assert.notEqual(line.trim(), "---", "no bare --- line allowed");
+  }
+});
+
+test("frontmatter inside specBody is stripped before rendering", () => {
+  const body = buildPrBody(baseInput());
+  assert.ok(!body.includes("suggestedAgent"), "no leaked frontmatter keys");
+  assert.ok(!body.includes("createdAt:"), "no leaked frontmatter keys");
 });
 
 // ─── Summary fallback: Context ────────────────────────────────────────────────
 
-test("no agent summary, with Context section → Summary uses Context", () => {
+test("no agentSummary → Summary falls back to Context bullets", () => {
   const body = buildPrBody(baseInput({ agentSummary: null }));
-  assert.ok(body.includes("## Summary"), "missing Summary header");
-  assert.ok(body.includes("app is slow"), "should use Context section content");
+  assert.ok(body.includes("## Summary"));
+  // Context: "Login is broken on Safari due to a cookie SameSite issue."
+  assert.ok(body.includes("- Login is broken on Safari"), "Context split into bullet(s)");
+  // Test plan should fall back too
+  assert.ok(body.includes("## Test plan"));
+  assert.ok(body.includes("- [ ] Login works on Safari 17+"), "AC turned into unchecked checkbox");
 });
 
 // ─── Summary fallback: What We're Building ────────────────────────────────────
 
-test("no agent summary, no Context, with What We're Building → uses What We're Building", () => {
+test("no agentSummary, no Context → Summary falls back to What We're Building", () => {
   const input = baseInput({
     agentSummary: null,
     specBody: `---
-id: task-abc123
+id: task-x
 ---
 
-# Title
+# feat(auth): set samesite=none on login cookie
 
 ## What We're Building
 
-A Redis-based caching middleware that sits between the API handler and the
-database layer. Cache invalidation uses TTL with tag-based purging.
+The login cookie now sets \`SameSite=None\` and \`Secure\`.
+
+## Acceptance Criteria
+
+- Login works on Safari 17+
 `,
   });
   const body = buildPrBody(input);
-  assert.ok(body.includes("Redis-based caching middleware"), "should use What We're Building");
+  assert.ok(body.includes("- The login cookie now sets"), "What We're Building used as bullets");
 });
 
-// ─── Empty spec body ──────────────────────────────────────────────────────────
+// ─── Both fallbacks: empty spec ──────────────────────────────────────────────
 
-test("empty spec body and no agent summary → _No spec body available._", () => {
+test("no agentSummary, no Context, no What We're Building, no Acceptance Criteria → safe placeholders", () => {
   const input = baseInput({
     agentSummary: null,
     specBody: `---
-id: task-abc123
+id: task-x
 ---
+
+# feat(misc): some change
 `,
   });
   const body = buildPrBody(input);
-  assert.ok(body.includes("_No spec body available._"), "should show fallback");
+  assert.ok(body.includes("Spec body did not contain"), "Summary placeholder");
+  assert.ok(body.includes("- [ ] Manual review of the diff"), "Test plan placeholder");
+  // Should still not throw and should include the footer
+  assert.ok(body.includes("🤖 Generated with [Claude Code]"), "footer present");
 });
 
-// ─── Long summary truncation ─────────────────────────────────────────────────
+// ─── Agent Test plan only (no Summary) → mixed ───────────────────────────────
 
-test("long summary source is truncated to ≤6 sentences with trailing …", () => {
-  const longSummary = Array(10).fill("This is a moderately long sentence about the feature.").join(" ");
-  const body = buildPrBody(baseInput({ agentSummary: longSummary }));
+test("agent provides Test plan but not Summary → Summary falls back, Test plan from agent", () => {
+  const input = baseInput({
+    agentSummary: `## Test plan
 
-  // Extract Summary section content
-  const summaryMatch = body.match(/## Summary\n\n([\s\S]*?)(?:\n\n---\n\n)/);
-  assert.ok(summaryMatch, "summary section should be extractable");
-  const summaryText = summaryMatch?.[1] ?? "";
-
-  // Count sentences (ending with .)
-  const sentenceCount = (summaryText.match(/\./g) || []).length;
-  assert.ok(sentenceCount <= 6, `should have ≤6 sentences, got ${sentenceCount}`);
-  assert.ok(summaryText.endsWith("…"), "should end with … when truncated");
-});
-
-test("long summary truncated by char limit (≤600 chars)", () => {
-  // 10 sentences, each ~100 chars — total ~1000, should be truncated by char limit
-  const longSummary = Array(10)
-    .fill(
-      "This is a very long sentence that goes on and on about implementation details and other things that are quite verbose indeed.",
-    )
-    .join(" ");
-  const body = buildPrBody(baseInput({ agentSummary: longSummary }));
-
-  const summaryMatch = body.match(/## Summary\n\n([\s\S]*?)(?:\n\n---\n\n)/);
-  assert.ok(summaryMatch, "summary section should be extractable");
-  const summaryText = summaryMatch?.[1] ?? "";
-  // The text itself (minus the …) should be ≤600
-  assert.ok(summaryText.length <= 610, `should be ≤610 chars (with …), got ${summaryText.length}`);
-  assert.ok(summaryText.endsWith("…"), "should end with …");
-});
-
-// ─── 12 commits: 10 visible, 2 in details ────────────────────────────────────
-
-test("12 commits → first 10 inline, remaining 2 inside <details>", () => {
-  const commits = Array.from({ length: 12 }, (_, i) => ({
-    sha: `sha${String(i).padStart(4, "0")}`,
-    subject: `commit message ${i}`,
-  }));
-  const body = buildPrBody(baseInput({ commits }));
-
-  assert.ok(body.includes("`sha0000` commit message 0"), "first commit visible");
-  assert.ok(body.includes("`sha0009` commit message 9"), "10th commit visible");
-  assert.ok(body.includes("<summary>2 more commits</summary>"), "details summary for overflow");
-  assert.ok(body.includes("`sha0010` commit message 10"), "11th commit in details");
-  assert.ok(body.includes("`sha0011` commit message 11"), "12th commit in details");
-});
-
-// ─── Empty quality results ────────────────────────────────────────────────────
-
-test("qualityResults empty → Quality Gates section is omitted", () => {
-  const body = buildPrBody(baseInput({ qualityResults: [] }));
-  assert.ok(!body.includes("## Quality Gates"), "Quality Gates should be omitted");
-});
-
-// ─── JIRA ticket without URL ──────────────────────────────────────────────────
-
-test("jiraTicket set, jiraUrl null → footer renders bare key with no link", () => {
-  const body = buildPrBody(baseInput({ jiraUrl: null }));
-  assert.ok(body.includes("🔗 PROJ-123 ·"), "bare JIRA key in footer");
-  assert.ok(!body.includes("[PROJ-123]"), "no markdown link");
-});
-
-// ─── No JIRA at all ──────────────────────────────────────────────────────────
-
-test("jiraTicket null → JIRA segment omitted from footer entirely", () => {
-  const body = buildPrBody(baseInput({ jiraTicket: null, jiraUrl: null }));
-  assert.ok(!body.includes("🔗"), "no JIRA segment");
-  assert.ok(body.includes("🤖 forge `task-abc123`"), "forge id still present");
-});
-
-// ─── Frontmatter idempotently stripped ────────────────────────────────────────
-
-test("frontmatter in specBody is idempotently stripped", () => {
-  const input = baseInput();
-  const body1 = buildPrBody(input);
-  // Run strip twice on the specBody — should yield the same PR body
-  const body2 = buildPrBody({ ...input, specBody: stripFrontmatter(input.specBody) });
-  assert.equal(body1, body2, "stripping frontmatter twice should be idempotent");
-});
-
-// ─── Snapshot test ────────────────────────────────────────────────────────────
-
-test("deterministic snapshot: fixed input produces exact expected output", () => {
-  const input: PrBodyInput = {
-    taskId: "task-snap1",
-    specBody: `---
-id: task-snap1
-repo: /tmp/r
----
-
-# Fix login
-
-## Context
-
-Login is broken on Safari due to a cookie SameSite issue.
-
-## Acceptance Criteria
-
-- Login works on Safari 17+
+- [x] manually tested
 `,
-    branch: "fix/login",
-    baseRef: "origin/main",
-    commits: [{ sha: "aaa1111", subject: "fix(auth): set SameSite=None for login cookie" }],
-    additions: 3,
-    deletions: 1,
-    filesChanged: 1,
-    qualityResults: [{ command: "npm run test", ok: true, durationMs: 2300 }],
-    agent: "claude",
-    model: "claude-sonnet-4-6",
-    jiraTicket: "AUTH-42",
-    jiraUrl: "https://jira.example.com/browse/AUTH-42",
+  });
+  const body = buildPrBody(input);
+  // Summary from Context fallback
+  assert.ok(body.includes("- Login is broken on Safari"));
+  // Test plan from agent
+  assert.ok(body.includes("- [x] manually tested"));
+});
+
+// ─── Acceptance criteria checkbox cap ────────────────────────────────────────
+
+test("more than 8 acceptance criteria are capped at 8 in fallback Test plan", () => {
+  const acs = Array.from({ length: 12 }, (_, i) => `- AC item ${i + 1}`).join("\n");
+  const input = baseInput({
     agentSummary: null,
-  };
-
-  const expected = `## Summary
-
-Login is broken on Safari due to a cookie SameSite issue.
-
+    specBody: `---
+id: task-x
 ---
 
-## Changes
-
-- 1 commit on \`fix/login\` ahead of \`origin/main\`
-- +3 / −1 across 1 file
-
-- \`aaa1111\` fix(auth): set SameSite=None for login cookie
-
----
-
-## Quality Gates
-
-- ✅ npm run test (2.3s)
-
----
-
-<details>
-<summary>📋 Forge spec</summary>
-
-# Fix login
-
-## Context
-
-Login is broken on Safari due to a cookie SameSite issue.
+# feat(misc): change
 
 ## Acceptance Criteria
 
-- Login works on Safari 17+
-
-</details>
-
----
-
-🔗 [AUTH-42](https://jira.example.com/browse/AUTH-42) · 🤖 forge \`task-snap1\` · \`claude\` / \`claude-sonnet-4-6\``;
-
-  const actual = buildPrBody(input);
-  assert.equal(actual, expected);
+${acs}
+`,
+  });
+  const body = buildPrBody(input);
+  assert.ok(body.includes("- [ ] AC item 1"));
+  assert.ok(body.includes("- [ ] AC item 8"));
+  assert.ok(!body.includes("- [ ] AC item 9"), "9th AC should be dropped");
 });
 
-// ─── Single commit wording ────────────────────────────────────────────────────
+// ─── Quality gates section ────────────────────────────────────────────────────
 
-test("single commit uses singular 'commit' not 'commits'", () => {
-  const body = buildPrBody(
-    baseInput({
-      commits: [{ sha: "abc1234", subject: "feat: single change" }],
-    }),
-  );
-  assert.ok(body.includes("1 commit on"), "singular commit");
-  assert.ok(!body.includes("1 commits"), "no plural for 1");
+test("empty qualityResults → Quality Gates section omitted from details", () => {
+  const body = buildPrBody(baseInput({ qualityResults: [] }));
+  assert.ok(!body.includes("### Quality Gates"));
 });
-
-// ─── Failed quality result ────────────────────────────────────────────────────
 
 test("failed quality result shows ❌", () => {
   const body = buildPrBody(
     baseInput({
       qualityResults: [
-        { command: "npm run lint", ok: false, durationMs: 800 },
-        { command: "npm run test", ok: true, durationMs: 5000 },
+        { command: "biome check .", ok: false, durationMs: 800 },
+        { command: "bun test", ok: true, durationMs: 5000 },
       ],
     }),
   );
-  assert.ok(body.includes("❌ npm run lint (0.8s)"), "failed lint");
-  assert.ok(body.includes("✅ npm run test (5.0s)"), "passed test");
+  assert.ok(body.includes("❌ biome check . (0.8s)"));
+  assert.ok(body.includes("✅ bun test (5.0s)"));
+});
+
+// ─── Commits ─────────────────────────────────────────────────────────────────
+
+test("single commit uses singular wording", () => {
+  const body = buildPrBody(
+    baseInput({
+      commits: [{ sha: "aaa1111", subject: "fix(x): single change" }],
+      filesChanged: 1,
+    }),
+  );
+  assert.ok(body.includes("1 commit on"));
+  assert.ok(body.includes("across 1 file"));
+  assert.ok(!body.includes("1 commits"));
+  assert.ok(!body.includes("1 files"));
+});
+
+test("12 commits → first 10 inline, remaining 2 in nested <details>", () => {
+  const commits = Array.from({ length: 12 }, (_, i) => ({
+    sha: `sha${String(i).padStart(4, "0")}`,
+    subject: `commit message ${i}`,
+  }));
+  const body = buildPrBody(baseInput({ commits }));
+  assert.ok(body.includes("`sha0000` commit message 0"));
+  assert.ok(body.includes("`sha0009` commit message 9"));
+  assert.ok(body.includes("<summary>2 more commits</summary>"));
+  assert.ok(body.includes("`sha0010` commit message 10"));
+  assert.ok(body.includes("`sha0011` commit message 11"));
+});
+
+// ─── JIRA / footer ───────────────────────────────────────────────────────────
+
+test("jiraTicket without url → bare key in footer", () => {
+  const body = buildPrBody(baseInput({ jiraUrl: null }));
+  assert.ok(body.includes("🔗 PROJ-123"), "bare JIRA key");
+  assert.ok(!body.includes("[PROJ-123]"), "no markdown link");
+});
+
+test("no jira → only Claude Code line in footer", () => {
+  const body = buildPrBody(baseInput({ jiraTicket: null, jiraUrl: null }));
+  assert.ok(!body.includes("🔗"));
+  // Should still have Claude Code line
+  assert.ok(body.endsWith("🤖 Generated with [Claude Code](https://claude.com/claude-code)"));
+});
+
+// ─── Idempotency ─────────────────────────────────────────────────────────────
+
+test("frontmatter stripping is idempotent", () => {
+  const input = baseInput();
+  const body1 = buildPrBody(input);
+  const body2 = buildPrBody({ ...input, specBody: stripFrontmatter(input.specBody) });
+  assert.equal(body1, body2);
 });

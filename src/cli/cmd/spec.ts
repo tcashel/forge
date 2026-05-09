@@ -81,6 +81,24 @@ function deriveTitle(body: string, override?: string): string {
   return "untitled-spec";
 }
 
+const CONVENTIONAL_COMMIT_RE =
+  /^(feat|fix|chore|docs|refactor|test|ci|style|perf|build)\([a-z0-9_-]+\): .+$/;
+
+/**
+ * Forge uses the spec H1 verbatim as the PR title. A non-conformant title
+ * becomes a non-conformant PR title — surface it now, but don't fail the
+ * save (older specs and one-off uses should keep working).
+ */
+function warnIfTitleNotConventional(title: string): void {
+  if (title === "untitled-spec") return;
+  if (CONVENTIONAL_COMMIT_RE.test(title) && title.length <= 70) return;
+  process.stderr.write(
+    "WARNING: spec title doesn't match conventional-commit format " +
+      "`<type>(<scope>): <imperative>` (lowercase, ≤70 chars).\n" +
+      "         Forge will use the title verbatim as the PR title.\n",
+  );
+}
+
 function deriveBranch(title: string, override?: string): string {
   if (override) return override.trim();
   const slug = title
@@ -246,6 +264,7 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
   }
 
   const title = deriveTitle(body, values.title as string | undefined);
+  warnIfTitleNotConventional(title);
   const id = store.generateId(title);
   const branch = deriveBranch(title, values.branch as string | undefined);
 
