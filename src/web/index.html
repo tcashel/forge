@@ -14,69 +14,6 @@
 
 <div id="app"></div>
 
-<!-- Legacy modal stays here for now; Phase 4 ports it to <NewSpecModal /> -->
-<div class="modal-overlay" id="new-spec-modal" hidden>
-  <div class="modal-card" role="dialog" aria-modal="true" aria-labelledby="new-spec-title-h">
-    <div class="modal-head">
-      <h2 id="new-spec-title-h">New spec</h2>
-      <button type="button" class="close" id="new-spec-close" aria-label="Close">×</button>
-    </div>
-    <form id="new-spec-form">
-      <div class="modal-body">
-        <div class="field">
-          <label for="new-spec-repo">Repo</label>
-          <select id="new-spec-repo"></select>
-          <div class="hint">Pick a known repo, or choose <em>Custom path…</em> to register a brand-new one (the server validates it's a git repo before saving).</div>
-        </div>
-        <div class="field" id="new-spec-repo-custom-wrap" hidden>
-          <label for="new-spec-repo-custom">Custom repo path</label>
-          <input id="new-spec-repo-custom" type="text" placeholder="/absolute/path/to/your/git/repo">
-        </div>
-        <div class="field">
-          <label for="new-spec-title">Title <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
-          <input id="new-spec-title" type="text" placeholder="feat(scope): short imperative summary, ≤70 chars" maxlength="120">
-          <div class="hint">Defaults to the first H1 in the markdown body. Should match conventional-commit format — Forge uses it verbatim as the PR title.</div>
-        </div>
-        <div class="field">
-          <label for="new-spec-body">Markdown body</label>
-          <textarea id="new-spec-body" required placeholder="# feat(scope): short imperative
-
-A paragraph describing the work, why it's needed, and the intended outcome.
-
-## Acceptance criteria
-
-- it does the thing
-- existing tests still pass"></textarea>
-        </div>
-        <div class="field-row">
-          <div class="field">
-            <label for="new-spec-agent">Agent <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
-            <select id="new-spec-agent">
-              <option value="">Use repo default</option>
-              <option value="claude">claude</option>
-              <option value="codex">codex</option>
-              <option value="opencode">opencode</option>
-              <option value="gemini">gemini</option>
-            </select>
-          </div>
-          <div class="field">
-            <label for="new-spec-model">Model <span style="color:var(--dim);font-weight:400;text-transform:none;letter-spacing:0">(optional)</span></label>
-            <input id="new-spec-model" type="text" placeholder="e.g. claude-opus-4-7">
-          </div>
-        </div>
-        <div class="field field-checkbox">
-          <input id="new-spec-improve" type="checkbox" checked>
-          <label for="new-spec-improve">Run auto-improve in the background after save (two critics + synthesizer; ~1–2 min)</label>
-        </div>
-      </div>
-      <div class="modal-foot">
-        <button type="button" class="btn btn-ghost" id="new-spec-cancel">Cancel</button>
-        <button type="submit" class="btn btn-primary" id="new-spec-submit">Save spec</button>
-      </div>
-    </form>
-  </div>
-</div>
-
 <script type="module" src="/dist/main.js"></script>
 <script type="module" src="/app.js"></script>
 

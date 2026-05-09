@@ -22,8 +22,6 @@ export interface ForgeLegacyBridge {
   enterPrMode?: () => void | Promise<void>;
   /** Enter Settings mode. */
   enterSettingsMode?: () => void | Promise<void>;
-  /** Open the new-spec modal (legacy still owns it). */
-  openNewSpecModal?: () => void;
 }
 
 export interface ForgeSignalBag {
@@ -35,6 +33,7 @@ export interface ForgeSignalBag {
   tasks: Signal<TaskView[]>;
   currentTaskId: Signal<string | null>;
   currentTab: Signal<TabId>;
+  modalOpen: Signal<boolean>;
 }
 
 export interface ForgeApi {

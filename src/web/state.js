@@ -18,10 +18,6 @@ const _local = {
   selectedPrNumber: null,
   prsLoading: false,
   prsError: null,
-  settingsRepo: null,
-  settingsConfig: {},
-  settingsLoading: false,
-  settingsError: null,
   logSource: null,
   refreshTimer: null,
 };
