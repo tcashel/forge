@@ -1,0 +1,2285 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forge — dashboard prototypes</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Newsreader:ital,opsz,wght@0,6..72,300;0,6..72,400;0,6..72,500;0,6..72,600;1,6..72,400&family=Geist:wght@300;400;500;600;700&family=Geist+Mono:wght@400;500;700&family=JetBrains+Mono:wght@400;500;700&family=IBM+Plex+Mono:wght@300;400;500;600&family=Fraunces:opsz,wght@9..144,400;9..144,500;9..144,700;9..144,900&family=Manrope:wght@300;400;500;600;700;800&display=swap" rel="stylesheet">
+
+<style>
+/* ─────────────────────────────────────────────────────────────────────────
+   reset + globals
+   ────────────────────────────────────────────────────────────────────── */
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+body{background:#000;color:#fff;overflow:hidden}
+button,input,select,textarea{font:inherit;color:inherit;background:transparent;border:0;outline:0}
+button{cursor:pointer}
+a{color:inherit;text-decoration:none}
+ul{margin:0;padding:0;list-style:none}
+
+:root{
+  --switcher-h: 48px;
+}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   switcher (neutral, sits above all variants)
+   ────────────────────────────────────────────────────────────────────── */
+#switcher{
+  position:fixed; top:0; left:0; right:0; z-index:50;
+  height:var(--switcher-h);
+  display:grid; grid-template-columns:1fr auto 1fr; align-items:center;
+  padding:0 16px;
+  background:rgba(10,10,12,0.86);
+  backdrop-filter:saturate(120%) blur(14px);
+  -webkit-backdrop-filter:saturate(120%) blur(14px);
+  border-bottom:1px solid rgba(255,255,255,0.06);
+  color:#cfd2d6;
+  font-family:'Geist Mono', ui-monospace, monospace;
+  font-size:12px; letter-spacing:0.04em;
+}
+#switcher .brand{display:flex;align-items:center;gap:10px}
+#switcher .brand .glyph{
+  width:18px;height:18px;border-radius:3px;
+  background:conic-gradient(from 215deg,#ff8a3d,#ffd24a,#7bdfff,#a78bfa,#ff8a3d);
+  box-shadow:0 0 0 1px rgba(255,255,255,0.15) inset, 0 1px 0 rgba(255,255,255,0.06);
+}
+#switcher .brand .name{color:#fff;font-weight:600;letter-spacing:0.16em;font-size:11px}
+#switcher .brand .sub{color:#7d828a}
+#switcher .tabs{display:flex;gap:4px;padding:4px;border:1px solid rgba(255,255,255,0.08);border-radius:8px;background:rgba(255,255,255,0.02)}
+#switcher .tab{
+  padding:6px 14px; border-radius:5px; color:#9aa0a8; font-weight:500;
+  display:inline-flex; align-items:center; gap:8px; transition:all .18s ease;
+}
+#switcher .tab:hover{color:#fff;background:rgba(255,255,255,0.04)}
+#switcher .tab.active{background:linear-gradient(180deg,#fff,#e7e8ea);color:#0b0b0c}
+#switcher .tab .num{opacity:0.5;font-size:10px}
+#switcher .right{display:flex;justify-content:flex-end;gap:10px;align-items:center}
+#switcher .knob-btn{
+  padding:6px 12px;border-radius:6px;border:1px solid rgba(255,255,255,0.12);
+  color:#cfd2d6; transition:all .15s ease;
+  display:inline-flex;align-items:center;gap:6px;
+}
+#switcher .knob-btn:hover{background:rgba(255,255,255,0.05);border-color:rgba(255,255,255,0.22)}
+#switcher .knob-btn .dot{width:6px;height:6px;border-radius:50%;background:#7bdfff;box-shadow:0 0 8px #7bdfff}
+#switcher .clock{color:#7d828a;font-variant-numeric:tabular-nums}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   stage / variants
+   ────────────────────────────────────────────────────────────────────── */
+main#stage{position:fixed;inset:var(--switcher-h) 0 0 0;overflow:hidden}
+.variant{position:absolute;inset:0;overflow:auto;opacity:0;pointer-events:none;transition:opacity .35s ease}
+.variant.active{opacity:1;pointer-events:auto}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   VARIANT 1 — ATELIER  (editorial / warm / spec-as-document)
+   ═════════════════════════════════════════════════════════════════════ */
+#atelier{
+  --bg:#F4EFE3;
+  --paper:#FBF7EC;
+  --ink:#1A1814;
+  --ink-2:#3A352D;
+  --dim:#7A6F60;
+  --rule:#C9C0AC;
+  --accent:#B5391C;     /* terracotta */
+  --accent-soft:#D9745B;
+  --olive:#5C6B3A;
+  --gold:#A77B2B;
+  background:var(--bg);
+  color:var(--ink);
+  font-family:'Geist', ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings:"ss01","cv11";
+}
+/* very subtle paper texture (procedural) */
+#atelier::before{
+  content:""; position:absolute; inset:0; pointer-events:none; opacity:.5;
+  background:
+    radial-gradient(1200px 600px at 20% 0%, rgba(181,57,28,0.05), transparent 60%),
+    radial-gradient(900px 500px at 90% 100%, rgba(92,107,58,0.05), transparent 60%);
+}
+#atelier::after{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='220' height='220'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.92' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 0.10  0 0 0 0 0.09  0 0 0 0 0.07  0 0 0 0.06 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode:multiply; opacity:0.55;
+}
+
+#atelier .layout{
+  position:relative; z-index:1;
+  display:grid;
+  grid-template-columns: 360px 1fr 320px;
+  gap:0; height:100%;
+}
+
+/* sidebar */
+#atelier .side{
+  border-right:1px solid var(--rule);
+  background:linear-gradient(180deg, rgba(251,247,236,0.6), rgba(244,239,227,0));
+  padding:28px 24px 24px 28px;
+  overflow:auto;
+  display:flex; flex-direction:column;
+}
+#atelier .crest{
+  display:flex; align-items:baseline; gap:10px; margin-bottom:18px;
+  font-family:'Newsreader', ui-serif, serif;
+}
+#atelier .crest .mark{
+  font-size:30px; font-weight:600; letter-spacing:-0.02em; color:var(--ink);
+  font-style:italic;
+}
+#atelier .crest .ampersand{font-size:30px;color:var(--accent);font-style:italic;font-weight:500}
+#atelier .crest .dot{width:5px;height:5px;border-radius:50%;background:var(--olive)}
+#atelier .crest .repo{margin-left:auto;color:var(--dim);font-family:'Geist Mono',monospace;font-size:11px;letter-spacing:0.06em}
+
+#atelier .search{
+  display:flex; align-items:center; gap:8px; padding:10px 12px;
+  background:var(--paper); border:1px solid var(--rule); border-radius:6px;
+  margin-bottom:14px;
+}
+#atelier .search svg{flex:none;color:var(--dim)}
+#atelier .search input{flex:1;font-size:13px}
+#atelier .search input::placeholder{color:var(--dim)}
+#atelier .search .kbd{
+  font-family:'Geist Mono',monospace; font-size:10px; color:var(--dim);
+  border:1px solid var(--rule); padding:2px 6px; border-radius:3px; background:#fff;
+}
+
+#atelier .new-btn{
+  display:flex; align-items:center; justify-content:center; gap:8px;
+  padding:11px 14px; border-radius:6px;
+  background:var(--ink); color:var(--paper);
+  font-weight:500; letter-spacing:0.02em; font-size:13px;
+  margin-bottom:22px;
+  box-shadow:0 1px 0 rgba(0,0,0,0.08), inset 0 1px 0 rgba(255,255,255,0.06);
+  transition:all .15s ease;
+}
+#atelier .new-btn:hover{background:#000}
+#atelier .new-btn .plus{font-family:'Newsreader',serif;font-size:18px;line-height:0;font-style:italic}
+
+#atelier .filter-group{margin-bottom:18px}
+#atelier .filter-label{
+  font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:0.18em;
+  color:var(--dim); text-transform:uppercase; margin-bottom:8px;
+}
+#atelier .chips{display:flex;flex-wrap:wrap;gap:6px}
+#atelier .chip{
+  padding:5px 10px; border-radius:999px; border:1px solid var(--rule);
+  font-size:12px; color:var(--ink-2); background:rgba(255,255,255,0.4);
+  display:inline-flex; align-items:center; gap:6px;
+  transition:all .15s ease;
+}
+#atelier .chip:hover{border-color:var(--ink)}
+#atelier .chip .count{color:var(--dim);font-size:10px;font-family:'Geist Mono',monospace}
+#atelier .chip.active{background:var(--ink);color:var(--paper);border-color:var(--ink)}
+#atelier .chip.active .count{color:rgba(255,255,255,0.5)}
+
+#atelier .legend{
+  margin-top:auto; padding-top:18px; border-top:1px dashed var(--rule);
+  font-size:11px; color:var(--dim); line-height:1.7;
+  font-family:'Geist Mono',monospace;
+}
+#atelier .legend strong{color:var(--ink);font-weight:500}
+
+/* spec list (middle column header + list) */
+#atelier .center{display:grid;grid-template-rows:auto 1fr;overflow:hidden}
+#atelier .center-head{
+  padding:20px 28px 14px;
+  border-bottom:1px solid var(--rule);
+  display:flex; align-items:flex-end; justify-content:space-between; gap:20px;
+}
+#atelier .ttl{
+  font-family:'Newsreader',serif; font-size:38px; line-height:1; letter-spacing:-0.02em;
+  font-weight:500; font-style:italic; color:var(--ink);
+}
+#atelier .ttl em{color:var(--accent);font-style:italic}
+#atelier .ttl .count{
+  font-family:'Geist Mono',monospace; font-size:12px; font-style:normal;
+  color:var(--dim); margin-left:10px; vertical-align:middle; letter-spacing:0.04em;
+}
+#atelier .sort{
+  font-family:'Geist Mono',monospace; font-size:11px; color:var(--dim);
+  letter-spacing:0.1em; text-transform:uppercase;
+  display:flex; align-items:center; gap:14px;
+}
+#atelier .sort a{color:var(--ink)}
+#atelier .sort a.active{color:var(--accent);text-decoration:underline;text-decoration-thickness:1px;text-underline-offset:4px}
+
+#atelier .list{overflow:auto;padding:6px 0 60px}
+#atelier .item{
+  display:grid; grid-template-columns: 56px 1fr auto; gap:14px;
+  padding:18px 28px; border-bottom:1px solid var(--rule);
+  cursor:pointer; transition:background .15s ease;
+  position:relative;
+}
+#atelier .item:hover{background:rgba(255,255,255,0.4)}
+#atelier .item.selected{background:rgba(181,57,28,0.06)}
+#atelier .item.selected::before{
+  content:""; position:absolute; left:0; top:0; bottom:0; width:3px; background:var(--accent);
+}
+#atelier .item .num{
+  font-family:'Newsreader',serif; font-style:italic; color:var(--dim);
+  font-size:18px; line-height:1; padding-top:2px;
+}
+#atelier .item .heading{display:flex;flex-direction:column;gap:6px;min-width:0}
+#atelier .item .meta{
+  display:flex; align-items:center; gap:10px; font-family:'Geist Mono',monospace;
+  font-size:10px; color:var(--dim); letter-spacing:0.06em; text-transform:uppercase;
+}
+#atelier .item .meta .badge{
+  padding:2px 8px; border-radius:3px; border:1px solid var(--rule); color:var(--ink-2);
+}
+#atelier .item .meta .badge.draft{color:var(--dim)}
+#atelier .item .meta .badge.running{color:var(--accent);border-color:var(--accent-soft);background:rgba(181,57,28,0.06)}
+#atelier .item .meta .badge.done{color:var(--olive);border-color:var(--olive)}
+#atelier .item .meta .badge.failed{color:#9b2a16;border-color:#9b2a16;background:rgba(155,42,22,0.06)}
+#atelier .item .title{
+  font-family:'Geist',sans-serif; font-size:17px; font-weight:500; line-height:1.35;
+  color:var(--ink); letter-spacing:-0.005em;
+  overflow:hidden; text-overflow:ellipsis; white-space:nowrap;
+}
+#atelier .item .blurb{font-size:13px;color:var(--ink-2);line-height:1.5;
+  overflow:hidden;display:-webkit-box;-webkit-line-clamp:1;-webkit-box-orient:vertical}
+#atelier .item .quality{
+  text-align:right; min-width:120px;
+  font-family:'Geist Mono',monospace; font-size:10px; letter-spacing:0.08em;
+  color:var(--dim); display:flex; flex-direction:column; gap:6px; align-items:flex-end;
+}
+#atelier .stars{color:var(--gold);letter-spacing:0.04em;font-family:'Newsreader',serif;font-size:13px}
+#atelier .stars .off{color:var(--rule)}
+#atelier .crit-tag{font-family:'Geist Mono',monospace;font-size:10px;color:var(--accent);
+  display:inline-flex;align-items:center;gap:4px;letter-spacing:0.06em;text-transform:uppercase}
+#atelier .crit-tag .o{width:5px;height:5px;border-radius:50%;background:currentColor;display:inline-block}
+#atelier .crit-tag.muted{color:var(--dim)}
+
+/* preview rail */
+#atelier .preview{
+  border-left:1px solid var(--rule);
+  padding:24px 24px 28px;
+  overflow:auto;
+  background:linear-gradient(180deg,#fff 0%, var(--paper) 100%);
+  display:flex; flex-direction:column;
+}
+#atelier .preview-head{
+  font-family:'Geist Mono',monospace; font-size:10px; color:var(--dim);
+  letter-spacing:0.18em; text-transform:uppercase; margin-bottom:14px;
+  display:flex; align-items:center; justify-content:space-between;
+}
+#atelier .preview-head .branch{color:var(--ink-2)}
+#atelier .preview-doc{
+  font-family:'Newsreader',serif; color:var(--ink);
+  font-size:15.5px; line-height:1.6;
+}
+#atelier .preview-doc h1{
+  font-family:'Newsreader',serif; font-style:italic; font-weight:500;
+  font-size:28px; line-height:1.15; letter-spacing:-0.01em;
+  margin:0 0 6px; color:var(--ink);
+}
+#atelier .preview-doc .commit{
+  font-family:'Geist Mono',monospace; font-size:11px; color:var(--accent);
+  letter-spacing:0.04em; margin-bottom:18px;
+}
+#atelier .preview-doc h2{
+  font-family:'Geist',sans-serif; font-size:11px; font-weight:600;
+  color:var(--olive); letter-spacing:0.16em; text-transform:uppercase;
+  margin:20px 0 8px; padding-bottom:6px; border-bottom:1px solid var(--rule);
+}
+#atelier .preview-doc p{margin:0 0 12px}
+#atelier .preview-doc ul{margin:8px 0;padding:0 0 0 8px}
+#atelier .preview-doc li{
+  position:relative; padding-left:18px; margin:4px 0; font-size:14.5px;
+  list-style:none; color:var(--ink-2); line-height:1.5;
+}
+#atelier .preview-doc li::before{
+  content:"•"; position:absolute; left:4px; color:var(--accent);
+  font-family:'Newsreader',serif; font-size:18px; line-height:1;
+}
+#atelier .preview-doc code{
+  font-family:'Geist Mono',monospace; font-size:13px;
+  background:rgba(181,57,28,0.06); padding:1px 5px; border-radius:3px; color:var(--accent);
+}
+
+#atelier .preview-stats{
+  margin:18px 0; padding:14px 16px;
+  border:1px solid var(--rule); border-radius:6px; background:rgba(255,255,255,0.5);
+  font-family:'Geist Mono',monospace; font-size:11px; color:var(--ink-2);
+  display:grid; grid-template-columns:1fr 1fr; gap:10px 18px;
+}
+#atelier .preview-stats .k{color:var(--dim);letter-spacing:0.08em;text-transform:uppercase;font-size:10px}
+#atelier .preview-stats .v{color:var(--ink);font-weight:500}
+#atelier .preview-stats .v.bad{color:#9b2a16}
+#atelier .preview-stats .v.good{color:var(--olive)}
+
+#atelier .actions{
+  margin-top:auto; display:flex; gap:8px; padding-top:18px;
+  border-top:1px dashed var(--rule);
+}
+#atelier .btn{
+  padding:10px 14px; border-radius:6px; font-size:13px; font-weight:500;
+  border:1px solid var(--rule); background:#fff; color:var(--ink);
+  display:inline-flex; align-items:center; gap:8px; transition:all .15s ease;
+}
+#atelier .btn:hover{border-color:var(--ink)}
+#atelier .btn.primary{background:var(--accent);color:#fff;border-color:var(--accent)}
+#atelier .btn.primary:hover{background:#9b2a16;border-color:#9b2a16}
+#atelier .btn.ghost{background:transparent}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   VARIANT 2 — CONSOLE  (terminal / dense / phosphor)
+   ═════════════════════════════════════════════════════════════════════ */
+#console{
+  --bg:#070A0E;
+  --panel:#0C1218;
+  --panel-2:#10171F;
+  --rule:rgba(125,249,255,0.10);
+  --rule-strong:rgba(125,249,255,0.20);
+  --text:#C9D6E2;
+  --dim:#5C6B7A;
+  --accent:#7DF9FF;
+  --green:#7CFFB2;
+  --amber:#FFB86B;
+  --magenta:#FF79C6;
+  --red:#FF6B6B;
+  background:var(--bg);
+  color:var(--text);
+  font-family:'JetBrains Mono', 'Geist Mono', ui-monospace, monospace;
+  font-size:13px; line-height:1.45;
+}
+/* CRT scanline + vignette */
+#console::before{
+  content:""; position:absolute; inset:0; pointer-events:none; z-index:2;
+  background:
+    repeating-linear-gradient(180deg, rgba(255,255,255,0.018) 0 1px, transparent 1px 3px),
+    radial-gradient(120% 100% at 50% 50%, transparent 60%, rgba(0,0,0,0.45) 100%);
+}
+#console::after{
+  content:""; position:absolute; inset:0; pointer-events:none; z-index:1;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='180' height='180'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.9' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 0.5  0 0 0 0 0.95  0 0 0 0 1  0 0 0 0.018 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode:screen; opacity:0.6;
+}
+
+#console .grid{
+  position:relative; z-index:3; height:100%;
+  display:grid;
+  grid-template-columns: 1.05fr 1.4fr 0.9fr;
+  grid-template-rows: 38px 1fr 38px 1fr 110px;
+  grid-template-areas:
+    "head  head  head"
+    "tasks log   prs"
+    "tasks log   prs"
+    "tasks log   prs"
+    "cmd   cmd   cmd";
+  gap:0;
+}
+#console .head{
+  grid-area:head;
+  display:flex; align-items:center; gap:18px;
+  padding:0 14px;
+  border-bottom:1px solid var(--rule-strong);
+  background:linear-gradient(180deg, rgba(125,249,255,0.04), transparent);
+  font-size:11px; letter-spacing:0.1em; text-transform:uppercase;
+  color:var(--dim);
+}
+#console .head .h-brand{color:var(--accent);font-weight:700;letter-spacing:0.22em}
+#console .head .h-path{color:var(--text)}
+#console .head .h-sep{color:var(--rule-strong);font-weight:300}
+#console .head .h-status{margin-left:auto;display:flex;gap:14px;align-items:center}
+#console .head .h-status .ok{color:var(--green)}
+#console .head .h-status .warn{color:var(--amber)}
+#console .head .pulse{
+  width:8px;height:8px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 8px var(--green);
+  animation:pulse 1.4s ease-in-out infinite;
+}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:0.35}}
+
+#console .panel{
+  border-right:1px solid var(--rule);
+  display:grid; grid-template-rows:auto 1fr; min-height:0;
+}
+#console .panel-head{
+  padding:8px 12px; border-bottom:1px solid var(--rule);
+  background:rgba(125,249,255,0.025);
+  font-size:10px; letter-spacing:0.18em; text-transform:uppercase; color:var(--accent);
+  display:flex; align-items:center; gap:10px;
+}
+#console .panel-head .count{color:var(--dim);font-weight:300}
+#console .panel-head .sp{margin-left:auto;color:var(--dim)}
+#console .panel-body{overflow:auto;padding:6px 0}
+
+#console #c-tasks{grid-area:tasks}
+#console #c-log{grid-area:log;border-right:1px solid var(--rule)}
+#console #c-prs{grid-area:prs;border-right:0}
+
+/* tasks list */
+#console .task{
+  display:grid; grid-template-columns:14px 14px 1fr auto; gap:8px;
+  padding:5px 12px; align-items:center; cursor:pointer;
+  border-left:2px solid transparent;
+  transition:background .1s ease;
+}
+#console .task:hover{background:rgba(125,249,255,0.04)}
+#console .task.sel{
+  background:rgba(125,249,255,0.06);
+  border-left-color:var(--accent);
+  box-shadow:inset 0 0 0 1px rgba(125,249,255,0.06);
+}
+#console .task .cur{color:var(--accent);font-weight:700}
+#console .task .ic{font-size:13px;text-align:center}
+#console .task .ic.run{color:var(--amber)}
+#console .task .ic.draft{color:var(--dim)}
+#console .task .ic.ok{color:var(--green)}
+#console .task .ic.bad{color:var(--red)}
+#console .task .name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;color:var(--text)}
+#console .task.sel .name{color:#fff}
+#console .task .age{color:var(--dim);font-size:11px;font-variant-numeric:tabular-nums}
+#console .task .name .scope{color:var(--magenta)}
+
+#console .task-sub{
+  padding:0 12px 6px 38px; color:var(--dim); font-size:11px;
+  display:grid; grid-template-columns:auto 1fr auto; gap:8px; align-items:center;
+}
+#console .task-sub .ag{color:var(--accent)}
+#console .task-sub .ag.codex{color:var(--magenta)}
+#console .task-sub .err{color:var(--red)}
+#console .task-sub .pr{color:var(--green)}
+#console .sep{color:var(--rule-strong);padding:0 6px;text-align:center;font-size:9px;letter-spacing:0.3em;height:18px;display:flex;align-items:center;border-top:1px solid var(--rule);border-bottom:1px solid var(--rule);background:rgba(0,0,0,0.2);margin:6px 0}
+
+/* log tail */
+#console .log{
+  font-family:'JetBrains Mono',monospace; font-size:12px;
+  padding:8px 14px; color:var(--text);
+  height:100%; overflow:hidden; position:relative;
+}
+#console .log .line{padding:1px 0;display:flex;gap:10px;white-space:pre;animation:logfade .25s ease}
+#console .log .ts{color:var(--dim);flex:none}
+#console .log .lvl{flex:none;width:28px}
+#console .log .lvl.info{color:var(--accent)}
+#console .log .lvl.ok{color:var(--green)}
+#console .log .lvl.warn{color:var(--amber)}
+#console .log .lvl.err{color:var(--red)}
+#console .log .msg{flex:1;color:var(--text)}
+#console .log .ind{color:var(--dim)}
+#console .log .v{color:var(--green)}
+#console .log .accent{color:var(--accent)}
+@keyframes logfade{from{opacity:0;transform:translateY(-2px)}to{opacity:1;transform:none}}
+#console .log-cursor{display:inline-block;width:8px;height:14px;background:var(--green);box-shadow:0 0 8px var(--green);animation:blink 1s steps(2,end) infinite;vertical-align:middle;margin-left:2px}
+@keyframes blink{50%{opacity:0}}
+
+/* PRs */
+#console .pr-row{
+  padding:8px 12px; border-bottom:1px dashed var(--rule);
+  cursor:pointer; transition:background .1s ease;
+}
+#console .pr-row:hover{background:rgba(125,249,255,0.04)}
+#console .pr-row .pr-top{display:flex;gap:8px;align-items:center}
+#console .pr-row .num{color:var(--accent);font-weight:700}
+#console .pr-row .pr-title{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;flex:1;color:var(--text)}
+#console .pr-row .pr-bot{display:flex;gap:14px;color:var(--dim);font-size:10px;margin-top:4px;letter-spacing:0.04em}
+#console .pr-row .pr-bot span{display:inline-flex;align-items:center;gap:4px}
+#console .pr-row .pr-bot .ok{color:var(--green)}
+#console .pr-row .pr-bot .bad{color:var(--red)}
+#console .pr-row .pr-bot .pend{color:var(--amber)}
+#console .pr-row .draft-tag{color:var(--magenta);font-size:10px;letter-spacing:0.06em}
+
+/* cmd bar */
+#console .cmdbar{
+  grid-area:cmd; border-top:1px solid var(--rule-strong);
+  background:linear-gradient(0deg, rgba(125,249,255,0.04), transparent);
+  display:grid; grid-template-rows:auto 1fr; padding:6px 14px 8px;
+}
+#console .cmd-input{
+  display:flex; align-items:center; gap:10px;
+  font-family:'JetBrains Mono',monospace; font-size:13px;
+  padding:6px 0; border-bottom:1px solid var(--rule);
+}
+#console .cmd-input .prompt{color:var(--green)}
+#console .cmd-input .typed{color:var(--text)}
+#console .cmd-input .typed em{color:var(--accent);font-style:normal}
+#console .keys{
+  display:flex; flex-wrap:wrap; gap:6px 14px; padding-top:6px;
+  font-size:11px; color:var(--dim);
+}
+#console .keys b{color:var(--accent);font-weight:500}
+#console .keys b.danger{color:var(--red)}
+#console .keys span{display:inline-flex;align-items:center;gap:6px}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   VARIANT 3 — ATRIUM  (calm / status board / instrument cluster)
+   ═════════════════════════════════════════════════════════════════════ */
+#atrium{
+  --bg:#0E1218;
+  --bg-2:#13181F;
+  --panel:#161B23;
+  --panel-2:#1B2129;
+  --line:rgba(255,255,255,0.06);
+  --line-2:rgba(255,255,255,0.10);
+  --text:#E8E2D5;
+  --text-2:#B8B2A6;
+  --dim:#7E848D;
+  --gold:#D4A574;
+  --gold-soft:rgba(212,165,116,0.18);
+  --teal:#7BB69E;
+  --rose:#D88379;
+  --slate:#8FA0B5;
+  background:radial-gradient(1400px 800px at 10% 0%, #1A2030 0%, var(--bg) 50%);
+  color:var(--text);
+  font-family:'Manrope', ui-sans-serif, system-ui, sans-serif;
+  font-feature-settings:"ss01","ss02";
+  letter-spacing:0;
+}
+/* faint architectural grid + vignette */
+#atrium::before{
+  content:""; position:absolute; inset:0; pointer-events:none;
+  background-image:
+    linear-gradient(var(--line) 1px, transparent 1px),
+    linear-gradient(90deg, var(--line) 1px, transparent 1px);
+  background-size: 64px 64px;
+  mask-image: radial-gradient(900px 600px at 30% 20%, black, transparent 80%);
+  -webkit-mask-image: radial-gradient(900px 600px at 30% 20%, black, transparent 80%);
+  opacity:0.5;
+}
+
+#atrium .layout{
+  position:relative; z-index:1;
+  height:100%; overflow:auto;
+  display:grid; grid-template-rows:auto auto 1fr; gap:0;
+  padding:30px 40px 40px;
+  max-width:1400px; margin:0 auto;
+}
+
+#atrium .topline{
+  display:grid; grid-template-columns: 1fr auto; align-items:end;
+  margin-bottom:34px;
+}
+#atrium .topline .crest{
+  font-family:'Fraunces',serif; font-weight:500; font-size:14px;
+  letter-spacing:0.36em; text-transform:uppercase; color:var(--text-2);
+  display:flex; align-items:center; gap:14px;
+}
+#atrium .topline .crest .dot{width:6px;height:6px;border-radius:50%;background:var(--gold);box-shadow:0 0 12px var(--gold)}
+#atrium .topline .crest .repo{font-family:'Manrope',sans-serif;font-weight:300;letter-spacing:0.06em;text-transform:none;font-size:12px;color:var(--dim)}
+#atrium .topline .when{
+  font-family:'Manrope',sans-serif; font-size:11px; color:var(--dim);
+  letter-spacing:0.16em; text-transform:uppercase;
+  display:flex; gap:18px; align-items:center;
+}
+#atrium .topline .when b{color:var(--text-2);font-weight:500}
+
+/* hero tiles */
+#atrium .tiles{
+  display:grid; grid-template-columns: repeat(4, 1fr); gap:18px;
+  margin-bottom:34px;
+}
+#atrium .tile{
+  position:relative;
+  padding:24px 24px 22px;
+  border:1px solid var(--line); border-radius:8px;
+  background:linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
+  overflow:hidden;
+}
+#atrium .tile::after{
+  content:""; position:absolute; left:0; top:0; bottom:0; width:3px;
+  background:linear-gradient(180deg, var(--gold), transparent);
+  opacity:0.6;
+}
+#atrium .tile .label{
+  font-size:10px; letter-spacing:0.22em; text-transform:uppercase;
+  color:var(--dim); font-weight:500; margin-bottom:8px;
+}
+#atrium .tile .v{
+  font-family:'Fraunces',serif; font-size:64px; line-height:0.95;
+  font-weight:500; letter-spacing:-0.03em;
+  color:var(--text);
+  font-feature-settings:"tnum","ss01";
+}
+#atrium .tile .v .unit{font-family:'Manrope',sans-serif;font-size:18px;color:var(--dim);font-weight:300;margin-left:4px;letter-spacing:0}
+#atrium .tile .sub{
+  margin-top:10px; font-size:12px; color:var(--text-2);
+  display:flex; align-items:center; gap:8px;
+}
+#atrium .tile .delta{font-size:11px;color:var(--teal)}
+#atrium .tile .delta.down{color:var(--rose)}
+#atrium .tile .micro{
+  margin-top:6px; display:flex; gap:3px;
+}
+#atrium .tile .micro .b{
+  width:5px; border-radius:1px; background:var(--gold-soft);
+}
+#atrium .tile .micro .b.on{background:var(--gold)}
+#atrium .tile.accent::after{background:linear-gradient(180deg, var(--teal), transparent)}
+#atrium .tile.accent .delta{color:var(--gold)}
+
+/* main grid: activity + agent mix + timeline */
+#atrium .main{
+  display:grid; grid-template-columns: 1.4fr 1fr; gap:18px;
+}
+
+#atrium .card{
+  border:1px solid var(--line); border-radius:8px;
+  background:linear-gradient(180deg, var(--panel) 0%, var(--bg-2) 100%);
+  padding:22px 24px 22px;
+  position:relative;
+}
+#atrium .card-head{
+  display:flex; align-items:baseline; justify-content:space-between;
+  margin-bottom:18px;
+}
+#atrium .card-title{
+  font-family:'Fraunces',serif; font-style:italic; font-weight:400;
+  font-size:22px; letter-spacing:-0.01em; color:var(--text);
+}
+#atrium .card-title .num{
+  font-style:normal; font-family:'Manrope',sans-serif; font-weight:500;
+  font-size:12px; color:var(--dim); margin-left:8px; letter-spacing:0.06em;
+}
+#atrium .card-tools{
+  font-family:'Geist Mono',monospace; font-size:10px;
+  color:var(--dim); letter-spacing:0.16em; text-transform:uppercase;
+  display:flex; gap:14px; align-items:center;
+}
+#atrium .card-tools a{cursor:pointer}
+#atrium .card-tools a:hover{color:var(--gold)}
+#atrium .card-tools a.active{color:var(--gold)}
+
+/* spark / activity hist */
+#atrium .spark{
+  height:84px; display:flex; align-items:flex-end; gap:3px;
+  border-bottom:1px solid var(--line); padding-bottom:6px; margin-bottom:14px;
+}
+#atrium .spark .b{
+  flex:1; background:linear-gradient(180deg, var(--gold), rgba(212,165,116,0.2));
+  border-radius:1px 1px 0 0; min-height:2px;
+  transition:height .4s ease;
+}
+#atrium .spark-axis{
+  display:flex; justify-content:space-between;
+  font-size:10px; color:var(--dim); letter-spacing:0.12em; text-transform:uppercase;
+}
+
+/* timeline */
+#atrium .tl{display:flex;flex-direction:column;gap:1px}
+#atrium .tl-item{
+  display:grid; grid-template-columns: 70px 22px 1fr auto; gap:14px;
+  padding:13px 4px 13px 0; border-top:1px solid var(--line); align-items:center;
+  font-size:14px;
+}
+#atrium .tl-item:first-child{border-top:0}
+#atrium .tl-item:hover{background:rgba(255,255,255,0.018)}
+#atrium .tl-item .at{
+  font-family:'Geist Mono',monospace; font-size:11px;
+  color:var(--dim); letter-spacing:0.04em;
+}
+#atrium .tl-item .ic{
+  width:20px;height:20px;border-radius:50%;
+  display:flex;align-items:center;justify-content:center;font-size:11px;
+  background:var(--bg-2); border:1px solid var(--line-2);
+}
+#atrium .tl-item .ic.launch{color:var(--gold);border-color:rgba(212,165,116,0.35)}
+#atrium .tl-item .ic.merge{color:var(--teal);border-color:rgba(123,182,158,0.35)}
+#atrium .tl-item .ic.crit{color:#C9A6E0;border-color:rgba(201,166,224,0.35)}
+#atrium .tl-item .ic.fail{color:var(--rose);border-color:rgba(216,131,121,0.35)}
+#atrium .tl-item .ic.save{color:var(--slate);border-color:rgba(143,160,181,0.35)}
+#atrium .tl-item .ic.review{color:var(--gold);border-color:rgba(212,165,116,0.35)}
+#atrium .tl-item .text{color:var(--text-2);font-weight:300;font-size:14px;line-height:1.4}
+#atrium .tl-item .text b{color:var(--text);font-weight:500}
+#atrium .tl-item .meta{
+  font-family:'Geist Mono',monospace; font-size:10px; color:var(--dim);
+  letter-spacing:0.06em;
+}
+#atrium .tl-item .meta .arr{color:var(--gold);margin-left:6px;opacity:0;transition:opacity .15s}
+#atrium .tl-item:hover .meta .arr{opacity:1}
+
+/* agent mix card content */
+#atrium .mix{display:flex;flex-direction:column;gap:14px;margin-top:6px}
+#atrium .mix-row{display:grid;grid-template-columns:120px 1fr 50px;gap:12px;align-items:center;font-size:13px}
+#atrium .mix-row .name{color:var(--text);font-weight:500}
+#atrium .mix-row .name .m{color:var(--dim);font-weight:300;font-size:11px;margin-left:4px}
+#atrium .mix-row .bar{height:6px;background:var(--line);border-radius:99px;overflow:hidden}
+#atrium .mix-row .bar .fill{height:100%;background:linear-gradient(90deg, var(--gold), var(--gold-soft));border-radius:99px;transition:width .8s ease}
+#atrium .mix-row .pct{text-align:right;color:var(--text-2);font-family:'Geist Mono',monospace;font-size:11px;font-variant-numeric:tabular-nums}
+
+#atrium .quality{margin-top:24px;padding-top:18px;border-top:1px solid var(--line)}
+#atrium .quality .qrow{display:grid;grid-template-columns:120px 1fr 30px;gap:12px;align-items:center;margin-bottom:10px;font-size:13px}
+#atrium .quality .qrow .name{color:var(--text-2);font-family:'Geist Mono',monospace;font-size:11px}
+#atrium .quality .qrow .bar{height:4px;background:var(--line);border-radius:99px}
+#atrium .quality .qrow .bar .fill{height:100%;background:var(--rose);border-radius:99px}
+#atrium .quality .qrow .ct{text-align:right;font-family:'Geist Mono',monospace;color:var(--rose);font-size:11px}
+
+/* ─────────────────────────────────────────────────────────────────────────
+   knobs drawer (workflow + theme controls)
+   ────────────────────────────────────────────────────────────────────── */
+#knobs{
+  position:fixed; top:var(--switcher-h); right:0; bottom:0; width:340px;
+  z-index:40; background:#0E1117; color:#D8DCE4;
+  font-family:'Geist Mono', ui-monospace, monospace; font-size:12px;
+  border-left:1px solid rgba(255,255,255,0.08);
+  transform:translateX(100%); transition:transform .25s ease;
+  display:flex; flex-direction:column;
+  box-shadow:-12px 0 24px rgba(0,0,0,0.4);
+}
+#knobs.open{transform:none}
+#knobs .kh{
+  padding:18px 18px 14px; border-bottom:1px solid rgba(255,255,255,0.06);
+  display:flex; align-items:center; justify-content:space-between;
+}
+#knobs .kh .t{font-size:11px;letter-spacing:0.22em;text-transform:uppercase;color:#a4abb6}
+#knobs .kh .x{color:#7d828a;cursor:pointer;font-size:18px;line-height:1}
+#knobs .kh .x:hover{color:#fff}
+#knobs .kbody{padding:14px 18px 24px;overflow:auto}
+#knobs h4{
+  font-size:10px;letter-spacing:0.22em;text-transform:uppercase;
+  color:#7d828a;margin:18px 0 8px;font-weight:500;
+}
+#knobs h4:first-child{margin-top:6px}
+#knobs .row{display:flex;align-items:center;justify-content:space-between;padding:8px 0;border-top:1px solid rgba(255,255,255,0.05)}
+#knobs .row:first-of-type{border-top:0}
+#knobs .row .lbl{color:#cfd2d6;font-size:12px}
+#knobs .row .lbl .h{color:#7d828a;font-size:10px;display:block;margin-top:2px;letter-spacing:0.06em;font-weight:300}
+#knobs .seg{display:inline-flex;border:1px solid rgba(255,255,255,0.1);border-radius:5px;overflow:hidden}
+#knobs .seg button{padding:5px 10px;font-size:11px;color:#7d828a;background:transparent;letter-spacing:0.04em}
+#knobs .seg button.on{background:#7bdfff;color:#000;font-weight:600}
+#knobs .seg button:not(.on):hover{color:#fff}
+#knobs .toggle{
+  position:relative;width:34px;height:18px;border-radius:99px;
+  background:rgba(255,255,255,0.08);border:1px solid rgba(255,255,255,0.12);
+  cursor:pointer; transition:all .15s ease;
+}
+#knobs .toggle::after{
+  content:"";position:absolute;top:1px;left:1px;width:14px;height:14px;border-radius:50%;
+  background:#a4abb6; transition:all .15s ease;
+}
+#knobs .toggle.on{background:rgba(123,223,255,0.25);border-color:#7bdfff}
+#knobs .toggle.on::after{left:17px;background:#7bdfff;box-shadow:0 0 8px #7bdfff}
+#knobs select{
+  background:rgba(255,255,255,0.04); border:1px solid rgba(255,255,255,0.1);
+  border-radius:5px; padding:5px 8px; color:#cfd2d6; font-size:11px;
+  font-family:'Geist Mono',monospace;
+}
+#knobs .note{
+  margin-top:18px; padding:12px 14px; border:1px dashed rgba(255,255,255,0.1);
+  border-radius:6px; color:#7d828a; line-height:1.6; font-size:11px;
+}
+#knobs .note b{color:#cfd2d6;font-weight:500}
+
+/* ═════════════════════════════════════════════════════════════════════════
+   VARIANT 4 — TERMINAL  (Bloomberg-inspired / amber-on-black / dense)
+   ═════════════════════════════════════════════════════════════════════ */
+#terminal{
+  --bg:#000;
+  --amber:#FFB347;
+  --amber-2:#FFA424;
+  --amber-3:#FFC97A;
+  --amber-dim:#4A3818;
+  --amber-fade:#241A0C;
+  --cyan:#4DC8FF;
+  --cyan-2:#7AD7FF;
+  --white:#F0EDE5;
+  --dim:#7E6B4A;
+  --green:#4DEB7E;
+  --red:#FF6B6B;
+  --magenta:#FF5BC8;
+  background:#000;
+  color:var(--white);
+  font-family:'IBM Plex Mono','JetBrains Mono',ui-monospace,monospace;
+  font-size:12px; line-height:1.35;
+  letter-spacing:0.02em;
+  font-feature-settings:"ss01","zero";
+}
+/* very faint horizontal scanlines + amber vignette */
+#terminal::before{
+  content:""; position:absolute; inset:0; pointer-events:none; z-index:1;
+  background:
+    repeating-linear-gradient(180deg, rgba(255,179,71,0.014) 0 1px, transparent 1px 3px),
+    radial-gradient(140% 100% at 50% 0%, rgba(255,179,71,0.05), transparent 50%),
+    radial-gradient(120% 100% at 50% 100%, rgba(0,0,0,0.5), transparent 60%);
+}
+#terminal::after{
+  content:""; position:absolute; inset:0; pointer-events:none; z-index:0;
+  background-image:url("data:image/svg+xml;utf8,<svg xmlns='http://www.w3.org/2000/svg' width='200' height='200'><filter id='n'><feTurbulence type='fractalNoise' baseFrequency='0.85' numOctaves='2' stitchTiles='stitch'/><feColorMatrix type='matrix' values='0 0 0 0 1  0 0 0 0 0.7  0 0 0 0 0.3  0 0 0 0.012 0'/></filter><rect width='100%' height='100%' filter='url(%23n)'/></svg>");
+  mix-blend-mode:screen;
+}
+
+#terminal .t-grid{
+  position:relative; z-index:2;
+  height:100%; min-width:0;
+  display:grid;
+  grid-template-columns: 1.05fr 1.4fr;
+  grid-template-rows: 36px 32px 28px minmax(0,1.05fr) minmax(0,0.95fr) 24px;
+  grid-template-areas:
+    "cmd    cmd"
+    "fkey   fkey"
+    "tick   tick"
+    "tasks  detail"
+    "prs    market"
+    "status status";
+}
+
+/* command line */
+#terminal .t-cmd{
+  grid-area:cmd;
+  display:flex; align-items:center; gap:14px; padding:0 14px;
+  border-bottom:1px solid var(--amber-dim);
+  background:linear-gradient(180deg, rgba(255,179,71,0.06), transparent);
+  font-size:13px; font-weight:500;
+}
+#terminal .t-prompt{ color:var(--amber-2); font-weight:700; letter-spacing:0.14em }
+#terminal .t-input{ color:var(--white); letter-spacing:0.06em }
+#terminal .t-input em{ color:var(--cyan); font-style:normal; font-weight:600 }
+#terminal .t-go{ color:var(--green); font-weight:700; letter-spacing:0.06em; padding:1px 6px; border:1px solid var(--green); border-radius:2px; background:rgba(77,235,126,0.08); font-size:11px }
+#terminal .t-cursor{
+  display:inline-block; width:9px; height:16px; background:var(--amber-2);
+  margin-left:-4px; box-shadow:0 0 6px var(--amber-2);
+  animation:tblink 1s steps(2,end) infinite;
+}
+@keyframes tblink{ 50%{ opacity:0 } }
+#terminal .t-clock{
+  margin-left:auto; display:flex; gap:18px; align-items:center;
+  color:var(--amber); font-size:11px; letter-spacing:0.14em; text-transform:uppercase;
+}
+#terminal .t-clock .live{
+  display:inline-flex; align-items:center; gap:6px; color:var(--green);
+}
+#terminal .t-clock .live .d{
+  width:7px;height:7px;border-radius:50%;background:var(--green);
+  box-shadow:0 0 6px var(--green);
+  animation:tblink 1.4s steps(2,end) infinite;
+}
+#terminal .t-clock b{ color:var(--white); font-weight:500; font-variant-numeric:tabular-nums }
+
+/* function key strip */
+#terminal .t-fkeys{
+  grid-area:fkey;
+  display:grid; grid-template-columns:repeat(12,1fr);
+  border-bottom:1px solid var(--amber-dim);
+  background:rgba(255,179,71,0.025);
+}
+#terminal .t-fkeys button{
+  border-right:1px solid var(--amber-dim);
+  display:flex; align-items:center; justify-content:center; gap:7px;
+  font-size:10.5px; font-weight:500; letter-spacing:0.12em;
+  text-transform:uppercase; padding:0 6px; height:32px;
+  color:var(--white);
+}
+#terminal .t-fkeys button:last-child{ border-right:0 }
+#terminal .t-fkeys button:hover{ background:rgba(255,179,71,0.07) }
+#terminal .t-fkeys button b{ color:var(--amber-2); font-weight:700; font-size:10px }
+#terminal .t-fkeys .lbl-amber{color:var(--amber)}
+#terminal .t-fkeys .lbl-cyan{color:var(--cyan)}
+#terminal .t-fkeys .lbl-green{color:var(--green)}
+#terminal .t-fkeys .lbl-red{color:var(--red)}
+#terminal .t-fkeys .lbl-magenta{color:var(--magenta)}
+#terminal .t-fkeys .lbl-white{color:var(--white)}
+
+/* news ticker */
+#terminal .t-ticker{
+  grid-area:tick; position:relative; overflow:hidden;
+  border-bottom:1px solid var(--amber-dim);
+  display:flex; align-items:center;
+  background:rgba(0,0,0,0.55);
+  height:28px;
+}
+#terminal .t-ticker .label{
+  flex:none; padding:0 14px; height:100%;
+  display:flex; align-items:center; gap:8px;
+  color:var(--amber-2); font-size:10px; font-weight:700;
+  letter-spacing:0.22em; border-right:1px solid var(--amber-dim);
+  background:#0a0a0a; z-index:2;
+}
+#terminal .t-ticker .label .dot{
+  width:6px;height:6px;border-radius:50%;background:var(--red);
+  box-shadow:0 0 6px var(--red);
+  animation:tblink 1.2s steps(2,end) infinite;
+}
+#terminal .t-ticker-track{
+  display:flex; gap:0;
+  white-space:nowrap;
+  padding-left:30px;
+  animation:tscroll 80s linear infinite;
+  font-size:11px; letter-spacing:0.04em;
+}
+@keyframes tscroll{
+  from{ transform:translateX(0) }
+  to{ transform:translateX(-50%) }
+}
+#terminal .t-ticker .item{
+  display:inline-flex; align-items:center; gap:10px; padding-right:38px;
+}
+#terminal .t-ticker .item .pill{
+  color:var(--cyan); font-weight:700; letter-spacing:0.08em;
+}
+#terminal .t-ticker .item .v{ color:var(--white) }
+#terminal .t-ticker .item .pos{ color:var(--green) }
+#terminal .t-ticker .item .neg{ color:var(--red) }
+#terminal .t-ticker .item .alert{ color:var(--magenta); font-weight:700 }
+#terminal .t-ticker .item .ts{ color:var(--dim); margin-left:6px; font-size:10px }
+#terminal .t-ticker .sep{ color:var(--amber-dim) }
+
+/* generic pane */
+#terminal .t-pane{
+  display:grid; grid-template-rows:auto 1fr;
+  border-right:1px solid var(--amber-dim);
+  border-bottom:1px solid var(--amber-dim);
+  min-width:0; min-height:0;
+}
+#terminal #t-tasks{ grid-area:tasks }
+#terminal #t-detail{ grid-area:detail; border-right:0 }
+#terminal #t-prs{ grid-area:prs; border-bottom:0 }
+#terminal #t-market{ grid-area:market; border-right:0; border-bottom:0; display:grid; grid-template-rows:auto 1fr auto }
+
+#terminal .t-pane-head{
+  display:flex; align-items:center; gap:10px;
+  padding:5px 10px; min-height:24px;
+  border-bottom:1px solid var(--amber-dim);
+  background:linear-gradient(180deg, rgba(255,179,71,0.06), rgba(255,179,71,0.015));
+  font-size:10px; letter-spacing:0.18em; text-transform:uppercase;
+}
+#terminal .t-pane-head .cyan{ color:var(--cyan); font-weight:700 }
+#terminal .t-pane-head .white{ color:var(--white); font-weight:500 }
+#terminal .t-pane-head .amber{ color:var(--amber) }
+#terminal .t-pane-head .dim{ color:var(--dim) }
+#terminal .t-pane-head .magenta{ color:var(--magenta); font-weight:700 }
+#terminal .t-pane-head .green{ color:var(--green) }
+#terminal .t-pane-head .sep{ color:var(--amber-dim) }
+#terminal .t-pane-head .tag{
+  margin-left:auto; padding:1px 8px; border:1px solid var(--amber-dim);
+  color:var(--amber); font-size:10px; letter-spacing:0.16em;
+}
+#terminal .t-pane-head .tag.alert{
+  border-color:var(--magenta); color:var(--magenta);
+  animation:tblink 1.4s steps(2,end) infinite;
+}
+#terminal .t-pane-body{ overflow:auto }
+
+/* tables */
+#terminal table.t-table{
+  width:100%; border-collapse:collapse;
+  font-variant-numeric:tabular-nums;
+}
+#terminal table.t-table thead th{
+  position:sticky; top:0; z-index:3;
+  background:#080705;
+  color:var(--cyan); font-weight:600;
+  font-size:10px; letter-spacing:0.16em; text-transform:uppercase;
+  text-align:left; padding:6px 10px;
+  border-bottom:1px solid var(--amber-dim);
+  white-space:nowrap;
+}
+#terminal table.t-table thead th.num{ text-align:right }
+#terminal table.t-table tbody td{
+  padding:5px 10px;
+  border-bottom:1px dotted var(--amber-fade);
+  white-space:nowrap;
+  color:var(--white);
+}
+#terminal table.t-table tbody tr:hover{ background:rgba(255,179,71,0.05); cursor:pointer }
+#terminal table.t-table tbody tr.sel{
+  background:rgba(255,179,71,0.10);
+  outline:1px solid var(--amber-2);
+  outline-offset:-1px;
+}
+#terminal table.t-table tbody tr.sel td{ color:var(--amber-3) }
+#terminal table.t-table tbody tr.sel .ticker{ color:var(--amber-2); font-weight:700 }
+#terminal table.t-table .ticker{ color:var(--cyan); font-weight:600 }
+#terminal table.t-table .num{ text-align:right }
+#terminal table.t-table .pos{ color:var(--green) }
+#terminal table.t-table .neg{ color:var(--red) }
+#terminal table.t-table .pend{ color:var(--amber) }
+#terminal table.t-table .dim{ color:var(--dim) }
+#terminal table.t-table .stat-run{ color:var(--amber-2); font-weight:600 }
+#terminal table.t-table .stat-done{ color:var(--green); font-weight:600 }
+#terminal table.t-table .stat-fail{ color:var(--red); font-weight:600 }
+#terminal table.t-table .stat-draft{ color:var(--dim); font-weight:500 }
+#terminal table.t-table .stat-qfail{ color:var(--magenta); font-weight:600 }
+#terminal table.t-table .qlty{ color:var(--amber); letter-spacing:0.06em; font-size:11px }
+#terminal table.t-table .blink{ animation:tblink 1.2s steps(2,end) infinite }
+
+/* tasks-specific column widths */
+#terminal #t-tasks td.ticker, #terminal #t-tasks th{ font-size:11px }
+
+/* detail kv */
+#terminal .t-detail-body{ padding:0; display:flex; flex-direction:column; min-height:0 }
+#terminal .t-kv{
+  display:grid; grid-template-columns:120px 1fr;
+  padding:6px 12px; row-gap:0;
+}
+#terminal .t-kv .k{
+  color:var(--cyan); font-size:10px; letter-spacing:0.18em;
+  text-transform:uppercase; padding:5px 0;
+  border-bottom:1px dotted var(--amber-fade);
+}
+#terminal .t-kv .v{
+  color:var(--white); padding:5px 0;
+  border-bottom:1px dotted var(--amber-fade);
+  font-variant-numeric:tabular-nums;
+}
+#terminal .t-kv .v:last-of-type, #terminal .t-kv .k:last-of-type{ border-bottom:0 }
+#terminal .t-kv .v .cyan{ color:var(--cyan) }
+#terminal .t-kv .v .magenta{ color:var(--magenta); font-weight:600 }
+#terminal .t-kv .v .amber{ color:var(--amber); font-weight:600 }
+#terminal .t-kv .v .green{ color:var(--green); font-weight:600 }
+#terminal .t-kv .v .red{ color:var(--red); font-weight:600 }
+#terminal .t-kv .v .dim{ color:var(--dim); font-size:11px }
+#terminal .t-kv .v .pulse{ animation:tblink 1.2s steps(2,end) infinite }
+
+/* sub-pane head inside detail */
+#terminal .t-sub-head{
+  display:flex; align-items:center; gap:10px;
+  padding:5px 12px; min-height:24px;
+  border-top:1px solid var(--amber-dim);
+  border-bottom:1px solid var(--amber-dim);
+  background:rgba(255,179,71,0.04);
+  font-size:10px; letter-spacing:0.18em; text-transform:uppercase;
+}
+#terminal .t-sub-head .cyan{ color:var(--cyan); font-weight:700 }
+#terminal .t-sub-head .amber{ color:var(--amber) }
+#terminal .t-sub-head .dim{ color:var(--dim) }
+#terminal .t-sub-head .ml-auto{ margin-left:auto }
+
+/* market rows summary */
+#terminal .t-market-foot{
+  border-top:1px solid var(--amber-dim);
+  padding:6px 12px;
+  display:flex; gap:18px; flex-wrap:wrap;
+  font-size:10px; letter-spacing:0.14em; text-transform:uppercase;
+  color:var(--dim);
+}
+#terminal .t-market-foot b{ color:var(--white); font-weight:500 }
+#terminal .t-market-foot .pos{ color:var(--green) }
+
+/* status bar */
+#terminal .t-status{
+  grid-area:status; height:24px;
+  border-top:1px solid var(--amber-dim);
+  background:linear-gradient(0deg, rgba(255,179,71,0.05), transparent);
+  display:flex; align-items:center; gap:18px; padding:0 14px;
+  font-size:10px; letter-spacing:0.14em; text-transform:uppercase;
+  color:var(--dim);
+}
+#terminal .t-status b{ color:var(--white); font-weight:500 }
+#terminal .t-status .green{ color:var(--green); font-weight:600 }
+#terminal .t-status .amber{ color:var(--amber); font-weight:600 }
+#terminal .t-status .ml-auto{ margin-left:auto; color:var(--amber) }
+#terminal .t-status .blink{ animation:tblink 1s steps(2,end) infinite }
+
+/* responsive guard */
+@media (max-width:1100px){
+  #atelier .layout{grid-template-columns:0 1fr 0}
+  #atelier .side, #atelier .preview{display:none}
+}
+</style>
+</head>
+<body>
+
+<!-- ═══ switcher ═══════════════════════════════════════════════════════════ -->
+<header id="switcher">
+  <div class="brand">
+    <span class="glyph"></span>
+    <span class="name">FORGE</span>
+    <span class="sub">/ dashboard prototypes</span>
+  </div>
+  <nav class="tabs" role="tablist">
+    <button class="tab active" data-target="atelier"><span>Atelier</span><span class="num">01</span></button>
+    <button class="tab" data-target="console"><span>Console</span><span class="num">02</span></button>
+    <button class="tab" data-target="atrium"><span>Atrium</span><span class="num">03</span></button>
+    <button class="tab" data-target="terminal"><span>Terminal</span><span class="num">04</span></button>
+  </nav>
+  <div class="right">
+    <span class="clock" id="clock">—</span>
+    <button class="knob-btn" id="knob-btn"><span class="dot"></span> design &amp; workflow</button>
+  </div>
+</header>
+
+<main id="stage">
+
+<!-- ═══ VARIANT 1: ATELIER ════════════════════════════════════════════════ -->
+<section id="atelier" class="variant active">
+  <div class="layout">
+
+    <!-- sidebar -->
+    <aside class="side">
+      <div class="crest">
+        <span class="mark">forge</span><span class="ampersand">&amp;</span>
+        <span class="mark" style="font-style:normal;color:var(--olive);font-size:24px;font-weight:500;letter-spacing:-0.01em">co</span>
+        <span class="repo">forge · main</span>
+      </div>
+
+      <div class="search">
+        <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3"/></svg>
+        <input placeholder="search specs, branches, tickets…">
+        <span class="kbd">/</span>
+      </div>
+
+      <button class="new-btn"><span class="plus">+</span> Compose new spec</button>
+
+      <div class="filter-group">
+        <div class="filter-label">Status</div>
+        <div class="chips">
+          <button class="chip active">all <span class="count">24</span></button>
+          <button class="chip">draft <span class="count">12</span></button>
+          <button class="chip">running <span class="count">3</span></button>
+          <button class="chip">done <span class="count">8</span></button>
+          <button class="chip">failed <span class="count">1</span></button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <div class="filter-label">Agent</div>
+        <div class="chips">
+          <button class="chip">claude</button>
+          <button class="chip">codex</button>
+          <button class="chip">opencode</button>
+          <button class="chip">gemini</button>
+        </div>
+      </div>
+
+      <div class="filter-group">
+        <div class="filter-label">Auto-improve</div>
+        <div class="chips">
+          <button class="chip">★★★★★ ready</button>
+          <button class="chip">improving</button>
+          <button class="chip">needs work</button>
+        </div>
+      </div>
+
+      <div class="legend">
+        <div><strong>l</strong> launch &middot; <strong>e</strong> edit &middot; <strong>c</strong> critique</div>
+        <div><strong>↵</strong> open &middot; <strong>/</strong> search &middot; <strong>?</strong> help</div>
+      </div>
+    </aside>
+
+    <!-- center column -->
+    <section class="center">
+      <header class="center-head">
+        <h1 class="ttl"><em>Backlog</em><span class="count">— 24 specs &middot; sorted by quality</span></h1>
+        <div class="sort">
+          <a class="active">quality</a>
+          <a>recency</a>
+          <a>title</a>
+        </div>
+      </header>
+
+      <ol class="list" id="atelier-list">
+        <!-- items injected by JS -->
+      </ol>
+    </section>
+
+    <!-- preview rail -->
+    <aside class="preview">
+      <div class="preview-head">
+        <span>Spec preview</span>
+        <span class="branch" id="atelier-branch">forge/feat-auth-rotate</span>
+      </div>
+
+      <div class="preview-doc" id="atelier-doc">
+        <h1>Rotate OAuth refresh tokens every 24h</h1>
+        <div class="commit">feat(auth): rotate oauth refresh tokens</div>
+
+        <h2>Context</h2>
+        <p>The current OAuth implementation in <code>src/auth/refresh.ts</code> issues a single long-lived refresh token at login and never rotates it. Compliance flagged this on the Q1 audit because a leaked token is valid for the full 90-day session window.</p>
+
+        <h2>Acceptance criteria</h2>
+        <ul>
+          <li>Refresh tokens rotate every 24h, with grace period of 30 minutes for in-flight requests.</li>
+          <li>Old token is revoked after grace period and a revocation entry is written to <code>auth_revocations</code>.</li>
+          <li>Token rotation is observable via the <code>auth.refresh.rotated</code> metric.</li>
+          <li>No regression in the <code>tests/auth/refresh.test.ts</code> suite.</li>
+        </ul>
+
+        <h2>Quality gates</h2>
+        <ul>
+          <li><code>bun test tests/auth</code></li>
+          <li><code>bun run lint</code></li>
+          <li><code>bunx tsc --noEmit</code></li>
+        </ul>
+      </div>
+
+      <div class="preview-stats">
+        <div><div class="k">Status</div><div class="v" id="ap-status">draft</div></div>
+        <div><div class="k">Quality</div><div class="v good">★★★★ auto-improved</div></div>
+        <div><div class="k">Critique</div><div class="v" id="ap-crit">not run</div></div>
+        <div><div class="k">Reviewer</div><div class="v">codex · o3</div></div>
+        <div><div class="k">Agent</div><div class="v">claude · opus-4.7</div></div>
+        <div><div class="k">Branch</div><div class="v" id="ap-branch">forge/feat-auth-rotate</div></div>
+      </div>
+
+      <div class="actions">
+        <button class="btn ghost">Critique</button>
+        <button class="btn">Edit</button>
+        <button class="btn primary">Launch &nbsp;→</button>
+      </div>
+    </aside>
+
+  </div>
+</section>
+
+<!-- ═══ VARIANT 2: CONSOLE ════════════════════════════════════════════════ -->
+<section id="console" class="variant">
+  <div class="grid">
+
+    <header class="head">
+      <span class="h-brand">⚙ FORGE</span>
+      <span class="h-sep">│</span>
+      <span class="h-path">~/code/forge</span>
+      <span class="h-sep">│</span>
+      <span>main</span>
+      <span class="h-sep">│</span>
+      <span>tcashel@github.com</span>
+      <div class="h-status">
+        <span><span class="pulse"></span> 3 running</span>
+        <span class="warn">1 quality_failed</span>
+        <span class="ok">2 done</span>
+        <span id="console-clock">12:04:33</span>
+      </div>
+    </header>
+
+    <!-- tasks panel -->
+    <div class="panel" id="c-tasks">
+      <div class="panel-head">
+        <span>tasks</span><span class="count" id="c-tasks-count">[12]</span>
+        <span class="sp">[j/k] move &middot; [↵] attach</span>
+      </div>
+      <div class="panel-body" id="c-tasks-body"></div>
+    </div>
+
+    <!-- log tail -->
+    <div class="panel" id="c-log">
+      <div class="panel-head">
+        <span>log tail</span>
+        <span class="count" id="c-log-task">forge/feat-auth-rotate</span>
+        <span class="sp">[f] follow &middot; [w] wrap</span>
+      </div>
+      <div class="panel-body">
+        <div class="log" id="c-log-body"></div>
+      </div>
+    </div>
+
+    <!-- prs -->
+    <div class="panel" id="c-prs">
+      <div class="panel-head">
+        <span>open PRs</span>
+        <span class="count" id="c-prs-count">[6]</span>
+        <span class="sp">[m] mine &middot; [o] open</span>
+      </div>
+      <div class="panel-body" id="c-prs-body"></div>
+    </div>
+
+    <!-- cmd bar -->
+    <div class="cmdbar">
+      <div class="cmd-input">
+        <span class="prompt">forge ›</span>
+        <span class="typed" id="c-typed"></span><span class="log-cursor"></span>
+      </div>
+      <div class="keys">
+        <span><b>n</b> new</span>
+        <span><b>l</b> launch</span>
+        <span><b>e</b> edit</span>
+        <span><b>v</b> view</span>
+        <span><b>c</b> critique</span>
+        <span><b>↵</b> attach</span>
+        <span><b>R</b> resume</span>
+        <span><b class="danger">K</b> kill</span>
+        <span><b>p</b> prs</span>
+        <span><b>s</b> settings</span>
+        <span><b>r</b> refresh</span>
+        <span><b>/</b> search</span>
+        <span><b>q</b> quit</span>
+      </div>
+    </div>
+
+  </div>
+</section>
+
+<!-- ═══ VARIANT 3: ATRIUM ════════════════════════════════════════════════ -->
+<section id="atrium" class="variant">
+  <div class="layout">
+
+    <header class="topline">
+      <div class="crest">
+        <span class="dot"></span> Forge &nbsp;·&nbsp; Mission overview
+        <span class="repo">forge / main · @tcashel</span>
+      </div>
+      <div class="when"><span><b id="a-day">Wed</b> May 6</span><span><b id="a-time">12:04</b></span><span>refreshed 18s ago</span></div>
+    </header>
+
+    <!-- hero tiles -->
+    <section class="tiles">
+      <div class="tile accent">
+        <div class="label">Running now</div>
+        <div class="v" id="a-running">3</div>
+        <div class="sub"><span class="delta">+2 vs. yesterday</span></div>
+        <div class="micro" id="a-running-micro"></div>
+      </div>
+      <div class="tile">
+        <div class="label">Backlog</div>
+        <div class="v">12<span class="unit">drafts</span></div>
+        <div class="sub"><span class="delta">4 ready · 8 improving</span></div>
+      </div>
+      <div class="tile">
+        <div class="label">Success rate · 30d</div>
+        <div class="v">87<span class="unit">%</span></div>
+        <div class="sub"><span class="delta">+4.2 pts</span></div>
+      </div>
+      <div class="tile">
+        <div class="label">Avg run · 30d</div>
+        <div class="v">4.2<span class="unit">min</span></div>
+        <div class="sub"><span class="delta down">+12s</span> &middot; p95 9.4m</div>
+      </div>
+    </section>
+
+    <section class="main">
+      <!-- activity + timeline -->
+      <article class="card">
+        <header class="card-head">
+          <h3 class="card-title">Activity <span class="num">last 24h · 47 events</span></h3>
+          <div class="card-tools">
+            <a class="active">24h</a><a>7d</a><a>30d</a>
+          </div>
+        </header>
+        <div class="spark" id="a-spark"></div>
+        <div class="spark-axis"><span>00:00</span><span>06:00</span><span>12:00</span><span>18:00</span><span>now</span></div>
+
+        <div class="tl" id="a-timeline" style="margin-top:18px"></div>
+      </article>
+
+      <!-- agent mix + quality failures -->
+      <article class="card">
+        <header class="card-head">
+          <h3 class="card-title">Agent mix <span class="num">last 30d · 142 runs</span></h3>
+          <div class="card-tools"><a>by run</a><a class="active">by tokens</a></div>
+        </header>
+        <div class="mix" id="a-mix"></div>
+
+        <div class="quality">
+          <header class="card-head" style="margin-bottom:14px">
+            <h3 class="card-title">Quality gate failures</h3>
+            <div class="card-tools" style="font-size:10px">7 failures / 142 runs</div>
+          </header>
+          <div id="a-qfail"></div>
+        </div>
+      </article>
+    </section>
+
+  </div>
+</section>
+
+<!-- ═══ VARIANT 4: TERMINAL (Bloomberg-inspired) ═══════════════════════════ -->
+<section id="terminal" class="variant">
+  <div class="t-grid">
+
+    <!-- command line -->
+    <header class="t-cmd">
+      <span class="t-prompt">FORGE ›</span>
+      <span class="t-input">TICKER <em id="t-cmd-ticker">AUTH-ROT</em></span>
+      <span class="t-go">&lt;GO&gt;</span>
+      <span class="t-cursor"></span>
+      <div class="t-clock">
+        <span class="live"><span class="d"></span> LIVE</span>
+        <span>SES <b>FORGE-04</b></span>
+        <span>UTC <b id="t-clock">12:04:33</b></span>
+      </div>
+    </header>
+
+    <!-- function key strip -->
+    <div class="t-fkeys">
+      <button><b>F1</b><span class="lbl-amber">HELP</span></button>
+      <button><b>F2</b><span class="lbl-amber">MENU</span></button>
+      <button><b>F3</b><span class="lbl-cyan">TASK</span></button>
+      <button><b>F4</b><span class="lbl-cyan">PRS</span></button>
+      <button><b>F5</b><span class="lbl-magenta">CRIT</span></button>
+      <button><b>F6</b><span class="lbl-white">LOG</span></button>
+      <button><b>F7</b><span class="lbl-amber">SET</span></button>
+      <button><b>F8</b><span class="lbl-amber">DASH</span></button>
+      <button><b>F9</b><span class="lbl-green">LAUNCH</span></button>
+      <button><b>F10</b><span class="lbl-amber">DIFF</span></button>
+      <button><b>F11</b><span class="lbl-white">SHELL</span></button>
+      <button><b>F12</b><span class="lbl-red">EXIT</span></button>
+    </div>
+
+    <!-- news ticker -->
+    <div class="t-ticker">
+      <div class="label"><span class="dot"></span> FORGE-WIRE</div>
+      <div class="t-ticker-track" id="t-ticker-track"></div>
+    </div>
+
+    <!-- tasks pane -->
+    <div class="t-pane" id="t-tasks">
+      <div class="t-pane-head">
+        <span class="cyan">TASKS</span>
+        <span class="sep">│</span>
+        <span class="white" id="t-tasks-n">10 ROWS</span>
+        <span class="sep">│</span>
+        <span class="cyan">SCOPE</span><span class="white">:THIS REPO</span>
+        <span class="sep">│</span>
+        <span class="cyan">SORT</span><span class="white">:STATUS</span>
+        <span class="tag">&lt;ALL&gt;</span>
+      </div>
+      <div class="t-pane-body">
+        <table class="t-table">
+          <thead>
+            <tr>
+              <th style="width:90px">TICKER</th>
+              <th>STATUS</th>
+              <th>AGE</th>
+              <th>AG</th>
+              <th>MD</th>
+              <th>QLTY</th>
+              <th class="num">DELTA</th>
+            </tr>
+          </thead>
+          <tbody id="t-tasks-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- detail pane -->
+    <div class="t-pane" id="t-detail">
+      <div class="t-pane-head">
+        <span class="cyan">TASK DETAIL</span>
+        <span class="sep">│</span>
+        <span class="white" id="t-detail-id">AUTH-ROT</span>
+        <span class="sep">│</span>
+        <span id="t-detail-status" class="amber">RUNNING</span>
+        <span class="tag alert">CRIT READY · CAPS</span>
+      </div>
+      <div class="t-pane-body t-detail-body">
+        <div class="t-kv" id="t-kv"></div>
+
+        <div class="t-sub-head">
+          <span class="cyan">QUALITY GATES</span>
+          <span class="sep">│</span>
+          <span class="amber" id="t-gates-summary">2 PASS · 1 PEND</span>
+          <span class="ml-auto dim">PHASE: QUALITY ⟳</span>
+        </div>
+        <div>
+          <table class="t-table">
+            <thead>
+              <tr><th style="width:30px">#</th><th>COMMAND</th><th>STATUS</th><th class="num">DURATION</th></tr>
+            </thead>
+            <tbody id="t-gates-body"></tbody>
+          </table>
+        </div>
+
+        <div class="t-sub-head">
+          <span class="cyan">CRITIQUE</span>
+          <span class="sep">│</span>
+          <span class="white" id="t-crit-status">NOT RUN</span>
+          <span class="ml-auto dim">F5 TO RUN · TWO-CRITIC + SYNTH</span>
+        </div>
+        <div>
+          <table class="t-table">
+            <thead>
+              <tr><th>ROLE</th><th>AGENT</th><th>VERDICT</th><th class="num">SCORE</th></tr>
+            </thead>
+            <tbody>
+              <tr><td>CRITIC A</td><td class="ticker">CDX/O3</td><td class="dim">— pending</td><td class="num dim">—</td></tr>
+              <tr><td>CRITIC B</td><td class="ticker">GMN/2.5P</td><td class="dim">— pending</td><td class="num dim">—</td></tr>
+              <tr><td>SYNTH</td><td class="ticker">CLD/OPS</td><td class="dim">— pending</td><td class="num dim">—</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </div>
+
+    <!-- prs pane -->
+    <div class="t-pane" id="t-prs">
+      <div class="t-pane-head">
+        <span class="cyan">OPEN PRS</span>
+        <span class="sep">│</span>
+        <span class="white" id="t-prs-n">6 ROWS</span>
+        <span class="sep">│</span>
+        <span class="cyan">FILTER</span><span class="white">:ALL</span>
+        <span class="tag">&lt;F4&gt;</span>
+      </div>
+      <div class="t-pane-body">
+        <table class="t-table">
+          <thead>
+            <tr>
+              <th style="width:48px">#</th>
+              <th>NAME</th>
+              <th>CI</th>
+              <th>RV</th>
+              <th>AGE</th>
+              <th class="num">±LINES</th>
+              <th class="num">F</th>
+              <th class="num">💬</th>
+            </tr>
+          </thead>
+          <tbody id="t-prs-body"></tbody>
+        </table>
+      </div>
+    </div>
+
+    <!-- agent market pane -->
+    <div class="t-pane" id="t-market">
+      <div class="t-pane-head">
+        <span class="cyan">AGENT MARKET</span>
+        <span class="sep">│</span>
+        <span class="white">30D · 142 RUNS</span>
+        <span class="tag">BY WIN%</span>
+      </div>
+      <div class="t-pane-body">
+        <table class="t-table">
+          <thead>
+            <tr>
+              <th>AGENT/MODEL</th>
+              <th class="num">RUNS</th>
+              <th class="num">WIN</th>
+              <th class="num">WIN%</th>
+              <th class="num">Δ7D</th>
+              <th class="num">AVG</th>
+            </tr>
+          </thead>
+          <tbody id="t-market-body"></tbody>
+        </table>
+      </div>
+      <div class="t-market-foot">
+        <span>FAILS · <b>BIOME</b> 4 / <b>TSC</b> 2 / <b>TEST</b> 1</span>
+        <span>SUCCESS RATE · <b class="pos">87.3%</b></span>
+        <span>AVG DURATION · <b>4.2m</b></span>
+        <span>P95 · <b>9.4m</b></span>
+      </div>
+    </div>
+
+    <!-- status bar -->
+    <footer class="t-status">
+      <span>FORGE <b>0.4.0-dev</b></span>
+      <span class="green">● STATUS:OK</span>
+      <span>QUEUE:<b>12</b></span>
+      <span>RUNNING:<b class="amber">3</b></span>
+      <span>GH:<b>tcashel</b></span>
+      <span>TMUX:<b class="green">OK</b></span>
+      <span>WORKTREES:<b>3</b></span>
+      <span class="ml-auto">F1 HELP · TYPE COMMAND · &lt;GO&gt;</span>
+    </footer>
+
+  </div>
+</section>
+
+</main>
+
+<!-- ═══ knobs drawer ══════════════════════════════════════════════════════ -->
+<aside id="knobs">
+  <div class="kh">
+    <span class="t">design &amp; workflow knobs</span>
+    <span class="x" id="knob-close">×</span>
+  </div>
+  <div class="kbody">
+
+    <h4>theme</h4>
+    <div class="row">
+      <span class="lbl">density <span class="h">spacing of lists &amp; cards</span></span>
+      <div class="seg" data-knob="density">
+        <button>compact</button><button class="on">comfortable</button><button>roomy</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="lbl">accent <span class="h">applies to atelier &amp; atrium</span></span>
+      <div class="seg" data-knob="accent">
+        <button class="on">terracotta</button><button>olive</button><button>indigo</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="lbl">grain &amp; scanlines <span class="h">paper / CRT texture</span></span>
+      <div class="toggle on" data-knob="grain"></div>
+    </div>
+
+    <h4>workflow — spec authoring</h4>
+    <div class="row">
+      <span class="lbl">auto-improve on <code>spec save</code> <span class="h">two-critic + synth + improver</span></span>
+      <div class="toggle on" data-knob="autoImprove"></div>
+    </div>
+    <div class="row">
+      <span class="lbl">show critique gate before launch</span>
+      <div class="seg" data-knob="critique">
+        <button>skip</button><button class="on">optional</button><button>required</button>
+      </div>
+    </div>
+
+    <h4>workflow — launch &amp; review</h4>
+    <div class="row">
+      <span class="lbl">default implementer</span>
+      <select data-knob="impl">
+        <option>claude · opus-4.7</option>
+        <option>claude · sonnet-4.6</option>
+        <option>codex · o3</option>
+        <option>codex · gpt-5</option>
+        <option>opencode · haiku-4.5</option>
+        <option>gemini · 2.5-pro</option>
+      </select>
+    </div>
+    <div class="row">
+      <span class="lbl">default reviewer</span>
+      <select data-knob="rev">
+        <option>codex · o3</option>
+        <option>claude · opus-4.7</option>
+        <option>gemini · 2.5-pro</option>
+      </select>
+    </div>
+    <div class="row">
+      <span class="lbl">auto-fix after review <span class="h">if reviewer requests changes</span></span>
+      <div class="seg" data-knob="autofix">
+        <button>off</button><button class="on">1 round</button><button>2 rounds</button>
+      </div>
+    </div>
+    <div class="row">
+      <span class="lbl">quality gates blocking</span>
+      <div class="toggle on" data-knob="gates"></div>
+    </div>
+
+    <h4>workflow — visibility</h4>
+    <div class="row">
+      <span class="lbl">show pending critiques cross-repo</span>
+      <div class="toggle on" data-knob="xcrit"></div>
+    </div>
+    <div class="row">
+      <span class="lbl">surface failure reason on row</span>
+      <div class="toggle on" data-knob="failrow"></div>
+    </div>
+
+    <div class="note">
+      Knobs are <b>illustrative</b> — they riff on what surfaces could look
+      like with each setting on/off. None of them mutate the real
+      <code style="font-family:inherit;color:#cfd2d6">~/.forge/repo-config.json</code>.
+    </div>
+  </div>
+</aside>
+
+<!-- ═══ data + behaviour ═════════════════════════════════════════════════ -->
+<script>
+/* ── shared mock data ──────────────────────────────────────────────── */
+const tasks = [
+  {id:'auth-rotate', title:'feat(auth): rotate oauth refresh tokens',
+   blurb:'Compliance Q1: cap refresh-token TTL to 24h with grace.',
+   status:'running', agent:'claude', model:'opus-4.7',
+   branch:'forge/feat-auth-rotate', age:'2m', repo:'forge', quality:4, critique:'not run', selected:true},
+  {id:'launch-stale', title:'fix(launch): handle stale tmux sessions on resume',
+   blurb:'`forge wait` hangs forever when the tmux session was reaped.',
+   status:'running', agent:'codex', model:'o3',
+   branch:'forge/fix-launch-stale', age:'14s', repo:'forge', quality:5, critique:null},
+  {id:'deps-bump', title:'chore(deps): bump bun to 1.3.4',
+   blurb:'Bun 1.3.4 ships fix for `bun test --watch` flake.',
+   status:'creating_pr', agent:'claude', model:'sonnet-4.6',
+   branch:'forge/chore-bump-bun', age:'1m', repo:'forge', quality:5, critique:null},
+  {id:'caps', title:'feat(caps): emit observability caps for forge launch',
+   blurb:'Wire OTel spans around launch + quality phases. Done.',
+   status:'done', agent:'claude', model:'opus-4.7',
+   branch:'forge/feat-caps', age:'8h', repo:'forge', quality:5, critique:'4/5', prNumber:141},
+  {id:'webhook', title:'feat(webhook): forge webhook signing rotation',
+   blurb:'Failed quality gates: biome.lint flagged unused symbols.',
+   status:'quality_failed', agent:'codex', model:'gpt-5',
+   branch:'forge/feat-webhook', age:'2d', repo:'forge', quality:3, critique:'2/5',
+   error:'biome.lint: 4 unused-import errors in src/webhook/'},
+  {id:'redis', title:'feat(forge): redis caching for spec listing',
+   blurb:'`forge spec ls` should be O(1) for repos with >500 saved specs.',
+   status:'draft', age:'4h', repo:'forge', quality:4, critique:'ready'},
+  {id:'archive', title:'feat(forge): /forge-archive slash command',
+   blurb:'Move done+merged tasks into ~/.forge/archive/ to keep index lean.',
+   status:'draft', age:'1d', repo:'forge', quality:3, critique:null},
+  {id:'index-split', title:'refactor(store): split index.json by repo',
+   blurb:'Per-repo file removes the cross-repo lock contention seen in #128.',
+   status:'draft', age:'2d', repo:'forge', quality:2, critique:'pending'},
+  {id:'pr-tmpl', title:'fix(pr-body): respect repo PULL_REQUEST_TEMPLATE.md',
+   blurb:'Currently we overwrite the repo template with our schema.',
+   status:'draft', age:'5h', repo:'forge', quality:5, critique:null},
+  {id:'docs-troub', title:'docs: troubleshooting guide for tmux/gh failures',
+   blurb:'Common failure modes the user hits before their first run.',
+   status:'draft', age:'3d', repo:'forge', quality:2, critique:null},
+];
+
+const prs = [
+  {n:142, title:'feat(auth): rotate oauth refresh tokens', ci:'pending', review:'pending', author:'me', age:'2m', add:120, del:18, files:6, comments:0, reviews:0, draft:true},
+  {n:141, title:'feat(caps): observability caps for launch', ci:'success', review:'approved', author:'me', age:'8h', add:340, del:42, files:12, comments:2, reviews:1, draft:false},
+  {n:140, title:'feat(webhook): signing rotation', ci:'failure', review:'changes_requested', author:'me', age:'2d', add:78, del:5, files:4, comments:5, reviews:2, draft:false},
+  {n:139, title:'fix(launch): tmux session reuse', ci:'success', review:'pending', author:'colleague', age:'1d', add:45, del:30, files:3, comments:1, reviews:0, draft:false},
+  {n:138, title:'chore(deps): bump bun to 1.3.4', ci:'pending', review:'pending', author:'me', age:'1m', add:8, del:8, files:2, comments:0, reviews:0, draft:true},
+  {n:137, title:'docs: skill authoring guide', ci:'success', review:'approved', author:'me', age:'4d', add:212, del:5, files:5, comments:3, reviews:1, draft:false},
+];
+
+const activity = [
+  {at:'12:04', kind:'launch', text:'<b>feat(auth)</b> launched — claude · opus-4.7', meta:'forge/feat-auth-rotate'},
+  {at:'12:00', kind:'crit',   text:'<b>feat(caps)</b> critique synth ready — 4/5', meta:'press c to review'},
+  {at:'11:58', kind:'merge',  text:'<b>chore(deps)</b> bun 1.3.4 — merged #141', meta:'+340 / −42'},
+  {at:'11:42', kind:'save',   text:'<b>fix(pr-body)</b> spec saved — auto-improve passed', meta:'★★★★★'},
+  {at:'11:30', kind:'fail',   text:'<b>feat(webhook)</b> quality_failed — biome.lint', meta:'4 errors'},
+  {at:'11:05', kind:'review', text:'reviewer (codex · o3) <b>approved #139</b>', meta:'fix(launch)'},
+  {at:'10:55', kind:'save',   text:'<b>docs:</b> troubleshooting guide drafted', meta:'★★ improving'},
+  {at:'10:20', kind:'launch', text:'<b>fix(launch)</b> launched — codex · o3', meta:'forge/fix-launch-stale'},
+];
+
+/* ── switcher behaviour ───────────────────────────────────────────── */
+const tabs = document.querySelectorAll('#switcher .tab');
+const variants = document.querySelectorAll('.variant');
+tabs.forEach(t => t.addEventListener('click', () => {
+  tabs.forEach(x=>x.classList.remove('active'));
+  t.classList.add('active');
+  const target = t.dataset.target;
+  variants.forEach(v=>v.classList.toggle('active', v.id===target));
+  if(target==='atrium') runAtriumIntro();
+  if(target==='console') restartConsoleAnims();
+}));
+
+/* clock */
+function updateClock(){
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2,'0');
+  const mm = String(d.getMinutes()).padStart(2,'0');
+  const ss = String(d.getSeconds()).padStart(2,'0');
+  document.getElementById('clock').textContent = `${hh}:${mm}:${ss}`;
+  const day = ['Sun','Mon','Tue','Wed','Thu','Fri','Sat'][d.getDay()];
+  const aDay = document.getElementById('a-day');
+  if(aDay) aDay.textContent = day;
+  const aTime = document.getElementById('a-time');
+  if(aTime) aTime.textContent = `${hh}:${mm}`;
+  const cClock = document.getElementById('console-clock');
+  if(cClock) cClock.textContent = `${hh}:${mm}:${ss}`;
+  const tClock = document.getElementById('t-clock');
+  if(tClock) tClock.textContent = `${hh}:${mm}:${ss}`;
+}
+setInterval(updateClock, 1000); updateClock();
+
+/* ── ATELIER: render spec list + bind selection ───────────────────── */
+function stars(n){
+  let s=''; for(let i=0;i<5;i++) s += i<n ? '★' : '<span class="off">★</span>';
+  return s;
+}
+function statusBadge(t){
+  const map = {
+    draft:['draft','draft'],
+    running:['agent ⟳','running'],
+    creating_pr:['PR ⟳','running'],
+    quality_check:['quality ⟳','running'],
+    done:['done','done'],
+    failed:['failed','failed'],
+    quality_failed:['quality ✗','failed'],
+  };
+  const [label, cls] = map[t.status] || ['—','draft'];
+  return `<span class="badge ${cls}">${label}</span>`;
+}
+function renderAtelierList(){
+  const list = document.getElementById('atelier-list');
+  list.innerHTML = tasks.map((t,i) => `
+    <li class="item ${t.selected?'selected':''}" data-idx="${i}">
+      <span class="num">${String(i+1).padStart(2,'0')}</span>
+      <div class="heading">
+        <div class="meta">
+          ${statusBadge(t)}
+          ${t.agent ? `<span>${t.agent} · ${t.model}</span>` : `<span>—</span>`}
+          <span>${t.branch || '—'}</span>
+          <span>${t.age} ago</span>
+        </div>
+        <div class="title">${t.title}</div>
+        <div class="blurb">${t.blurb || ''}</div>
+      </div>
+      <div class="quality">
+        <span class="stars">${stars(t.quality)}</span>
+        ${t.critique==='ready' ? '<span class="crit-tag"><span class="o"></span> critique ready</span>'
+          : t.critique==='pending' ? '<span class="crit-tag muted"><span class="o"></span> critique pending</span>'
+          : t.critique ? `<span class="crit-tag muted"><span class="o"></span> critique ${t.critique}</span>`
+          : '<span class="crit-tag muted">no critique</span>'}
+      </div>
+    </li>`).join('');
+  list.querySelectorAll('.item').forEach(el => el.addEventListener('click', () => {
+    list.querySelectorAll('.item').forEach(x=>x.classList.remove('selected'));
+    el.classList.add('selected');
+    const t = tasks[+el.dataset.idx];
+    document.getElementById('atelier-branch').textContent = t.branch || '—';
+  }));
+}
+renderAtelierList();
+
+/* ── CONSOLE: tasks + prs + log animation ─────────────────────────── */
+function consoleStatusIcon(t){
+  if(t.status==='running'||t.status==='quality_check'||t.status==='creating_pr') return '<span class="ic run">⟳</span>';
+  if(t.status==='done') return '<span class="ic ok">✓</span>';
+  if(t.status==='failed'||t.status==='quality_failed') return '<span class="ic bad">✗</span>';
+  return '<span class="ic draft">○</span>';
+}
+function renderConsoleTasks(){
+  const body = document.getElementById('c-tasks-body');
+  document.getElementById('c-tasks-count').textContent = `[${tasks.length}]`;
+  // group: this repo first, then drafts marked separately
+  const repo = tasks.filter(t=>t.status!=='draft');
+  const drafts = tasks.filter(t=>t.status==='draft');
+  let html = '';
+  repo.forEach((t,i) => {
+    const sel = t.selected ? 'sel' : '';
+    const cur = t.selected ? '▶' : '';
+    html += `
+      <div class="task ${sel}" data-idx="${tasks.indexOf(t)}">
+        <span class="cur">${cur}</span>
+        ${consoleStatusIcon(t)}
+        <span class="name">${t.title.replace(/(\w+)\(([^)]+)\)/, '$1<span class="scope">($2)</span>')}</span>
+        <span class="age">${t.age}</span>
+      </div>
+      <div class="task-sub">
+        <span class="ag ${t.agent==='codex'?'codex':''}">${t.agent ? t.agent+'·'+t.model : 'unlaunched'}</span>
+        <span>${t.error ? '<span class="err">✖ '+t.error+'</span>' : (t.prNumber ? '<span class="pr">→ #'+t.prNumber+'</span>' : '')}</span>
+        <span>${t.branch}</span>
+      </div>`;
+  });
+  html += `<div class="sep">drafts · backlog</div>`;
+  drafts.forEach(t => {
+    html += `
+      <div class="task" data-idx="${tasks.indexOf(t)}">
+        <span class="cur"></span>
+        ${consoleStatusIcon(t)}
+        <span class="name">${t.title.replace(/(\w+)\(([^)]+)\)/, '$1<span class="scope">($2)</span>')}</span>
+        <span class="age">${t.age}</span>
+      </div>`;
+  });
+  body.innerHTML = html;
+  body.querySelectorAll('.task').forEach(row => row.addEventListener('click', () => {
+    body.querySelectorAll('.task').forEach(r=>r.classList.remove('sel'));
+    row.classList.add('sel');
+    row.querySelector('.cur').textContent = '▶';
+    body.querySelectorAll('.task:not(.sel) .cur').forEach(c=>c.textContent='');
+  }));
+}
+renderConsoleTasks();
+
+function ciDot(s){
+  if(s==='success') return '<span class="ok">✓</span>';
+  if(s==='failure') return '<span class="bad">✗</span>';
+  return '<span class="pend">⟳</span>';
+}
+function rvDot(s){
+  if(s==='approved') return '<span class="ok">✓</span>';
+  if(s==='changes_requested') return '<span class="bad">✗</span>';
+  return '<span class="pend">·</span>';
+}
+function renderConsolePrs(){
+  const body = document.getElementById('c-prs-body');
+  document.getElementById('c-prs-count').textContent = `[${prs.length}]`;
+  body.innerHTML = prs.map(p => `
+    <div class="pr-row">
+      <div class="pr-top">
+        ${ciDot(p.ci)} ${rvDot(p.review)}
+        <span class="num">#${p.n}</span>
+        <span class="pr-title">${p.title}</span>
+        ${p.draft ? '<span class="draft-tag">◐ draft</span>' : ''}
+      </div>
+      <div class="pr-bot">
+        <span>@${p.author}</span>
+        <span>${p.age}</span>
+        <span class="ok">+${p.add}</span><span class="bad">−${p.del}</span>
+        <span>${p.files}f</span>
+        <span>💬 ${p.comments}</span>
+        <span>📝 ${p.reviews}</span>
+      </div>
+    </div>`).join('');
+}
+renderConsolePrs();
+
+/* console log tail animation */
+const logScript = [
+  {ts:'12:04:33', lvl:'info', html:'spawning runner: <span class="accent">claude --model claude-opus-4-7 --dangerously-skip-permissions</span>'},
+  {ts:'12:04:34', lvl:'info', html:'tmux session attached: <span class="accent">forge:auth-rotate-mok</span>'},
+  {ts:'12:04:35', lvl:'info', html:'agent reading spec @ <span class="accent">~/.forge/specs/auth-rotate-mok.md</span>'},
+  {ts:'12:04:42', lvl:'info', html:'agent edit: <span class="accent">src/auth/refresh.ts</span> <span class="v">+58 −12</span>'},
+  {ts:'12:04:51', lvl:'info', html:'agent edit: <span class="accent">tests/auth/refresh.test.ts</span> <span class="v">+34 −0</span>'},
+  {ts:'12:04:58', lvl:'info', html:'agent edit: <span class="accent">src/auth/revocations.ts</span> (new) <span class="v">+44</span>'},
+  {ts:'12:05:11', lvl:'info', html:'quality phase begin'},
+  {ts:'12:05:11', lvl:'info', html:'$ <span class="accent">bun test tests/auth</span>'},
+  {ts:'12:05:14', lvl:'ok',   html:'PASS  tests/auth/refresh.test.ts (12 tests, 142 ms)'},
+  {ts:'12:05:14', lvl:'ok',   html:'PASS  tests/auth/revocations.test.ts (8 tests, 96 ms)'},
+  {ts:'12:05:14', lvl:'info', html:'$ <span class="accent">bun run lint</span>'},
+  {ts:'12:05:16', lvl:'ok',   html:'biome check . — checked 142 files, no fixes applied'},
+  {ts:'12:05:16', lvl:'info', html:'$ <span class="accent">bunx tsc --noEmit</span>'},
+  {ts:'12:05:21', lvl:'ok',   html:'tsc — 0 errors'},
+  {ts:'12:05:21', lvl:'ok',   html:'all 3 quality gates passed'},
+  {ts:'12:05:22', lvl:'info', html:'creating draft PR via <span class="accent">gh pr create --draft</span>'},
+];
+let logTick;
+function restartConsoleAnims(){
+  clearInterval(logTick);
+  const body = document.getElementById('c-log-body');
+  body.innerHTML = '';
+  let i = 0;
+  function push(){
+    if(i >= logScript.length){
+      // restart after a beat
+      clearInterval(logTick);
+      setTimeout(restartConsoleAnims, 4000);
+      return;
+    }
+    const e = logScript[i++];
+    const line = document.createElement('div');
+    line.className = 'line';
+    const lvlMap = {info:'INFO',ok:'OK  ',warn:'WARN',err:'ERR '};
+    line.innerHTML = `<span class="ts">[${e.ts}]</span><span class="lvl ${e.lvl}">${lvlMap[e.lvl]}</span><span class="msg">${e.html}</span>`;
+    body.appendChild(line);
+    body.scrollTop = body.scrollHeight;
+  }
+  push(); push(); push();
+  logTick = setInterval(push, 700);
+}
+restartConsoleAnims();
+
+/* console typed prompt */
+const typedTarget = 'launch auth-rotate --agent claude --model opus-4.7';
+let typedI = 0;
+function typeStep(){
+  const el = document.getElementById('c-typed');
+  if(!el) return;
+  if(typedI > typedTarget.length){
+    setTimeout(()=>{ typedI=0; el.innerHTML=''; setTimeout(typeStep, 400); }, 2400);
+    return;
+  }
+  const part = typedTarget.slice(0, typedI);
+  el.innerHTML = part.replace(/(--agent|--model)/g, '<em>$1</em>');
+  typedI++;
+  setTimeout(typeStep, 70);
+}
+typeStep();
+
+/* ── ATRIUM: spark, mix, timeline, intro animation ────────────────── */
+const sparkData = [2,1,1,2,3,3,4,5,7,9,12,11,9,7,5,4,3,3,4,5,7,9,11,8,6,4,3,2,2,3,4,6,8,10,12,11,9,7,5,4,3,4,5,7,9,12,14];
+function renderSpark(){
+  const el = document.getElementById('a-spark');
+  if(!el) return;
+  const max = Math.max(...sparkData);
+  el.innerHTML = sparkData.map((v,i) => {
+    const h = (v/max)*100;
+    return `<div class="b" style="height:0%" data-h="${h}"></div>`;
+  }).join('');
+}
+renderSpark();
+
+const mix = [
+  {name:'claude · opus-4.7',  model:'opus', pct:48, color:'#D4A574'},
+  {name:'codex · o3',          model:'o3',  pct:23, color:'#D4A574'},
+  {name:'claude · sonnet-4.6', model:'sonnet', pct:14, color:'#D4A574'},
+  {name:'codex · gpt-5',       model:'gpt-5', pct:9,  color:'#D4A574'},
+  {name:'opencode · haiku-4.5',model:'haiku', pct:4,  color:'#D4A574'},
+  {name:'gemini · 2.5-pro',    model:'2.5pro', pct:2, color:'#D4A574'},
+];
+function renderMix(){
+  const el = document.getElementById('a-mix');
+  el.innerHTML = mix.map(m => `
+    <div class="mix-row">
+      <div class="name">${m.name}</div>
+      <div class="bar"><div class="fill" style="width:0%" data-w="${m.pct}"></div></div>
+      <div class="pct">${m.pct}%</div>
+    </div>`).join('');
+}
+renderMix();
+
+const qfail = [
+  {name:'biome.lint', count:4, w:60},
+  {name:'tsc',        count:2, w:30},
+  {name:'bun test',   count:1, w:14},
+];
+function renderQfail(){
+  const el = document.getElementById('a-qfail');
+  el.innerHTML = qfail.map(q => `
+    <div class="qrow">
+      <div class="name">${q.name}</div>
+      <div class="bar"><div class="fill" style="width:${q.w}%"></div></div>
+      <div class="ct">${q.count}</div>
+    </div>`).join('');
+}
+renderQfail();
+
+const iconForKind = {
+  launch:'↗', merge:'✓', crit:'?', fail:'✗', save:'✎', review:'★'
+};
+function renderTimeline(){
+  const el = document.getElementById('a-timeline');
+  el.innerHTML = activity.map(a => `
+    <div class="tl-item">
+      <span class="at">${a.at}</span>
+      <span class="ic ${a.kind}">${iconForKind[a.kind]}</span>
+      <span class="text">${a.text}</span>
+      <span class="meta">${a.meta}<span class="arr">→</span></span>
+    </div>`).join('');
+}
+renderTimeline();
+
+function renderRunningMicro(){
+  const el = document.getElementById('a-running-micro');
+  if(!el) return;
+  el.innerHTML = Array.from({length:24}).map((_,i) => {
+    const on = [3,8,12,15,17,21,22,23].includes(i);
+    return `<div class="b ${on?'on':''}" style="height:${10+Math.round(Math.random()*8)}px"></div>`;
+  }).join('');
+}
+renderRunningMicro();
+
+function runAtriumIntro(){
+  // animate spark heights
+  document.querySelectorAll('#a-spark .b').forEach((el, i) => {
+    const h = el.dataset.h;
+    setTimeout(() => { el.style.height = h+'%'; }, 30 + i*8);
+  });
+  document.querySelectorAll('#atrium .mix .fill').forEach((el, i) => {
+    setTimeout(() => { el.style.width = el.dataset.w+'%'; }, 250 + i*60);
+  });
+}
+// trigger once on load if atrium happens to be active later
+setTimeout(runAtriumIntro, 200);
+
+/* ── TERMINAL: Bloomberg-inspired ─────────────────────────────────── */
+const T_AGENT = { claude:'CLD', codex:'CDX', opencode:'OPC', gemini:'GMN' };
+const T_MODEL = {
+  'opus-4.7':'OPS', 'sonnet-4.6':'SNT', 'o3':'O3', 'gpt-5':'GP5',
+  'haiku-4.5':'HKU', '2.5-pro':'25P'
+};
+const T_STATUS = {
+  running:['RUN','stat-run'], creating_pr:['PR-CR','stat-run'],
+  quality_check:['Q-CHK','stat-run'], done:['DONE','stat-done'],
+  failed:['FAIL','stat-fail'], quality_failed:['Q-FAIL','stat-qfail'],
+  draft:['DRFT','stat-draft'],
+};
+function tTickerOf(id){ return id.toUpperCase().replace(/-/g,'·').slice(0,9).replace(/·/g,'-'); }
+function tQltyStars(n){ return '★'.repeat(n) + '·'.repeat(5-n); }
+
+/* per-task delta — synthesized "rating" delta to feel market-y */
+const tDeltas = { 'auth-rotate':+0.42, 'launch-stale':+0.18, 'deps-bump':+0.08,
+  'caps':+1.21, 'webhook':-0.84, 'redis':+0.12, 'archive':-0.04,
+  'index-split':-0.31, 'pr-tmpl':+0.55, 'docs-troub':-0.09 };
+
+function renderTerminalTasks(){
+  const body = document.getElementById('t-tasks-body');
+  document.getElementById('t-tasks-n').textContent = `${tasks.length} ROWS`;
+  body.innerHTML = tasks.map((t,i) => {
+    const [s,c] = T_STATUS[t.status];
+    const ag = t.agent ? T_AGENT[t.agent] : '—';
+    const md = t.model ? T_MODEL[t.model] || t.model.slice(0,3).toUpperCase() : '—';
+    const d = tDeltas[t.id] ?? 0;
+    const dCls = d > 0 ? 'pos' : d < 0 ? 'neg' : 'dim';
+    const dStr = d > 0 ? `▲${d.toFixed(2)}` : d < 0 ? `▼${Math.abs(d).toFixed(2)}` : '—';
+    return `<tr class="${t.selected?'sel':''}" data-idx="${i}">
+      <td class="ticker">${tTickerOf(t.id)}</td>
+      <td class="${c}">${s}${t.status==='running'||t.status==='creating_pr'||t.status==='quality_check'?' <span class="blink">⟳</span>':''}</td>
+      <td>${t.age}</td>
+      <td>${ag}</td>
+      <td>${md}</td>
+      <td class="qlty">${tQltyStars(t.quality)}</td>
+      <td class="num ${dCls}">${dStr}</td>
+    </tr>`;
+  }).join('');
+  body.querySelectorAll('tr').forEach(row => row.addEventListener('click', () => {
+    body.querySelectorAll('tr').forEach(r=>r.classList.remove('sel'));
+    row.classList.add('sel');
+    const t = tasks[+row.dataset.idx];
+    renderTerminalDetail(t);
+  }));
+}
+
+function renderTerminalDetail(t){
+  document.getElementById('t-cmd-ticker').textContent = tTickerOf(t.id);
+  document.getElementById('t-detail-id').textContent = tTickerOf(t.id);
+  const [s,c] = T_STATUS[t.status];
+  const sEl = document.getElementById('t-detail-status');
+  sEl.className = c.replace('stat-','').replace('run','amber').replace('done','green').replace('fail','red').replace('qfail','magenta').replace('draft','dim');
+  sEl.textContent = s.toUpperCase() === 'RUN' ? 'RUNNING' : s;
+
+  const ag = t.agent ? T_AGENT[t.agent] : null;
+  const md = t.model ? (T_MODEL[t.model] || t.model.toUpperCase()) : null;
+
+  document.getElementById('t-kv').innerHTML = `
+    <div class="k">TITLE</div>
+    <div class="v">${t.title}</div>
+    <div class="k">STATUS</div>
+    <div class="v"><span class="${t.status==='done'?'green':(t.status==='failed'||t.status==='quality_failed')?'red':'amber'}">${s}</span> ${t.status==='running'?'<span class="pulse amber">⟳ AGENT WORKING</span>':''}</div>
+    <div class="k">REPO</div>
+    <div class="v">${t.repo} <span class="dim">/ main</span></div>
+    <div class="k">BRANCH</div>
+    <div class="v"><span class="cyan">${t.branch || '—'}</span></div>
+    <div class="k">AGENT</div>
+    <div class="v">${ag ? `${ag} / <span class="cyan">${md}</span>` : '<span class="dim">unlaunched</span>'}</div>
+    <div class="k">REVIEWER</div>
+    <div class="v">CDX / <span class="cyan">O3</span></div>
+    <div class="k">STARTED</div>
+    <div class="v">${t.age==='draft'?'<span class="dim">—</span>':`12:04:33 <span class="dim">(${t.age} ago)</span>`}</div>
+    <div class="k">BASE SHA</div>
+    <div class="v">a544979 <span class="dim">main</span></div>
+    <div class="k">PR</div>
+    <div class="v">${t.prNumber ? `<span class="cyan">#${t.prNumber}</span> <span class="magenta">DRAFT</span> <span class="dim">→ gh.com/forge/pr/${t.prNumber}</span>` : '<span class="dim">— not opened</span>'}</div>
+    <div class="k">QUALITY</div>
+    <div class="v"><span class="amber">${tQltyStars(t.quality)}</span> <span class="dim">auto-improve ${t.quality>=4?'passed':'pending'}</span></div>
+    <div class="k">ERROR</div>
+    <div class="v">${t.error ? `<span class="red">${t.error}</span>` : '<span class="dim">—</span>'}</div>
+  `;
+
+  // synthesize quality gates per task
+  let gates;
+  if(t.status === 'running' || t.status === 'creating_pr'){
+    gates = [
+      {cmd:'bun test tests/auth', stat:'PASS', cls:'pos', dur:'142ms'},
+      {cmd:'biome check .',       stat:'PASS', cls:'pos', dur:'840ms'},
+      {cmd:'bunx tsc --noEmit',   stat:'PEND', cls:'pend blink', dur:'⟳'},
+    ];
+  } else if(t.status === 'quality_failed'){
+    gates = [
+      {cmd:'bun test',            stat:'PASS', cls:'pos', dur:'1.2s'},
+      {cmd:'biome check .',       stat:'FAIL', cls:'neg', dur:'820ms'},
+      {cmd:'bunx tsc --noEmit',   stat:'SKIP', cls:'dim',  dur:'—'},
+    ];
+  } else if(t.status === 'done'){
+    gates = [
+      {cmd:'bun test',            stat:'PASS', cls:'pos', dur:'1.4s'},
+      {cmd:'biome check .',       stat:'PASS', cls:'pos', dur:'880ms'},
+      {cmd:'bunx tsc --noEmit',   stat:'PASS', cls:'pos', dur:'5.1s'},
+    ];
+  } else {
+    gates = [{cmd:'(unlaunched)', stat:'—', cls:'dim', dur:'—'}];
+  }
+  const gatesBody = document.getElementById('t-gates-body');
+  gatesBody.innerHTML = gates.map((g,i) => `
+    <tr><td class="dim">${i+1}</td><td>${g.cmd}</td><td class="${g.cls}">${g.stat}</td><td class="num">${g.dur}</td></tr>
+  `).join('');
+  const passed = gates.filter(g=>g.stat==='PASS').length;
+  const pending = gates.filter(g=>g.stat==='PEND').length;
+  const failed = gates.filter(g=>g.stat==='FAIL').length;
+  document.getElementById('t-gates-summary').textContent =
+    `${passed} PASS${failed?` · ${failed} FAIL`:''}${pending?` · ${pending} PEND`:''}`;
+
+  // critique status
+  const crit = t.critique;
+  document.getElementById('t-crit-status').textContent =
+    crit === 'ready' ? 'READY · 4/5'
+    : crit === 'pending' ? 'IN-FLIGHT'
+    : crit ? `LAST: ${crit.toUpperCase()}`
+    : 'NOT RUN';
+}
+
+function renderTerminalPrs(){
+  const body = document.getElementById('t-prs-body');
+  document.getElementById('t-prs-n').textContent = `${prs.length} ROWS`;
+  body.innerHTML = prs.map(p => {
+    const ci = p.ci==='success'?'<span class="pos">✓</span>'
+             : p.ci==='failure'?'<span class="neg">✗</span>'
+             : '<span class="pend">⟳</span>';
+    const rv = p.review==='approved'?'<span class="pos">✓</span>'
+             : p.review==='changes_requested'?'<span class="neg">✗</span>'
+             : '<span class="dim">·</span>';
+    return `<tr>
+      <td class="ticker">#${p.n}</td>
+      <td>${p.title}${p.draft?' <span class="magenta">◐</span>':''}</td>
+      <td>${ci}</td><td>${rv}</td>
+      <td>${p.age}</td>
+      <td class="num"><span class="pos">+${p.add}</span><span class="dim">/</span><span class="neg">-${p.del}</span></td>
+      <td class="num">${p.files}</td>
+      <td class="num ${p.comments>0?'pos':'dim'}">${p.comments}</td>
+    </tr>`;
+  }).join('');
+}
+
+const tMarket = [
+  {ag:'CLD/OPS',   runs:68, win:62, wp:91.2, d:+1.4, avg:'3.8m'},
+  {ag:'CDX/O3',    runs:33, win:27, wp:81.8, d:-0.6, avg:'4.6m'},
+  {ag:'CLD/SNT',   runs:20, win:17, wp:85.0, d:+2.1, avg:'2.9m'},
+  {ag:'CDX/GP5',   runs:13, win: 9, wp:69.2, d:-3.2, avg:'5.2m'},
+  {ag:'OPC/HKU',   runs: 6, win: 5, wp:83.3, d: 0.0, avg:'2.1m'},
+  {ag:'GMN/25P',   runs: 2, win: 2, wp:100.0,d:+4.5, avg:'6.8m'},
+];
+function renderTerminalMarket(){
+  const body = document.getElementById('t-market-body');
+  body.innerHTML = tMarket.map(m => {
+    const dCls = m.d>0?'pos':m.d<0?'neg':'dim';
+    const dStr = m.d>0?`▲${m.d.toFixed(1)}`:m.d<0?`▼${Math.abs(m.d).toFixed(1)}`:'—';
+    return `<tr>
+      <td class="ticker">${m.ag}</td>
+      <td class="num">${m.runs}</td>
+      <td class="num">${m.win}</td>
+      <td class="num">${m.wp.toFixed(1)}</td>
+      <td class="num ${dCls}">${dStr}</td>
+      <td class="num dim">${m.avg}</td>
+    </tr>`;
+  }).join('');
+}
+
+/* news ticker — duplicate items twice for seamless loop */
+function renderTerminalTicker(){
+  const items = [
+    {pill:'AUTH-ROT', kind:'pos', text:'LAUNCHED · CLD/OPS · BRANCH FORGE/FEAT-AUTH-ROTATE', ts:'12:04'},
+    {pill:'CAPS',     kind:'alert', text:'CRIT READY · SYNTH 4/5 · PRESS F5 TO REVIEW', ts:'12:00'},
+    {pill:'DEPS-BUMP',kind:'pos', text:'PR DRAFT OPENED · #142 · +8 -8', ts:'11:58'},
+    {pill:'CAPS',     kind:'pos', text:'MERGED · #141 · +340 -42 · 12 FILES', ts:'11:58'},
+    {pill:'PR-TMPL',  kind:'pos', text:'SPEC SAVED · ★★★★★ · AUTO-IMPROVE PASSED', ts:'11:42'},
+    {pill:'WEBHOOK',  kind:'neg', text:'QUALITY_FAILED · BIOME.LINT · 4 ERRORS', ts:'11:30'},
+    {pill:'#139',     kind:'pos', text:'REVIEWER (CDX/O3) APPROVED · FIX(LAUNCH)', ts:'11:05'},
+    {pill:'AGENTS',   kind:'pos', text:'WIN% 87.3 ▲ +4.2pts vs PRIOR 30D', ts:''},
+    {pill:'INDEX-SPLIT',kind:'alert',text:'CRIT REQUESTED · A=CDX/O3 B=GMN/25P SYNTH=CLD/OPS', ts:'10:55'},
+    {pill:'DOCS-TROUB',kind:'pos', text:'SPEC DRAFTED · ★★ IMPROVING · 3 SUGGESTIONS', ts:'10:55'},
+    {pill:'LAUNCH-STALE',kind:'pos', text:'LAUNCHED · CDX/O3 · TMUX OK · PHASE QUALITY', ts:'10:20'},
+    {pill:'P95',      kind:'neg', text:'9.4M ▼ +12s vs YESTERDAY', ts:''},
+  ];
+  const html = items.map(it => `
+    <span class="item">
+      <span class="pill">${it.pill}</span>
+      <span class="${it.kind==='alert'?'alert':it.kind==='neg'?'neg':'pos'}">●</span>
+      <span class="v">${it.text}</span>
+      ${it.ts?`<span class="ts">${it.ts}</span>`:''}
+    </span>
+    <span class="sep">│</span>
+  `).join('');
+  // duplicate for seamless loop
+  document.getElementById('t-ticker-track').innerHTML = html + html;
+}
+
+renderTerminalTasks();
+renderTerminalPrs();
+renderTerminalMarket();
+renderTerminalTicker();
+renderTerminalDetail(tasks[0]);
+
+/* ── knobs drawer ─────────────────────────────────────────────────── */
+const knobs = document.getElementById('knobs');
+document.getElementById('knob-btn').addEventListener('click', () => knobs.classList.toggle('open'));
+document.getElementById('knob-close').addEventListener('click', () => knobs.classList.remove('open'));
+knobs.querySelectorAll('.toggle').forEach(t => t.addEventListener('click', () => t.classList.toggle('on')));
+knobs.querySelectorAll('.seg').forEach(seg => {
+  seg.querySelectorAll('button').forEach(b => b.addEventListener('click', () => {
+    seg.querySelectorAll('button').forEach(x=>x.classList.remove('on'));
+    b.classList.add('on');
+    applyKnob(seg.dataset.knob, b.textContent.trim());
+  }));
+});
+
+function applyKnob(name, val){
+  if(name==='accent'){
+    const presets = {
+      terracotta:{at:'#B5391C', as:'#D9745B', au:'#D4A574'},
+      olive:     {at:'#5C6B3A', as:'#7D9046', au:'#A6B97A'},
+      indigo:    {at:'#3F4B8C', as:'#5C6BB0', au:'#9CA8E0'},
+    };
+    const c = presets[val];
+    if(!c) return;
+    document.getElementById('atelier').style.setProperty('--accent', c.at);
+    document.getElementById('atelier').style.setProperty('--accent-soft', c.as);
+    document.getElementById('atrium').style.setProperty('--gold', c.au);
+  }
+  if(name==='density'){
+    const map = {compact:'4px 12px', comfortable:'18px 28px', roomy:'26px 32px'};
+    document.querySelectorAll('#atelier .item').forEach(el => el.style.padding = map[val] || '');
+  }
+}
+const grainToggle = knobs.querySelector('[data-knob="grain"]');
+grainToggle.addEventListener('click', () => {
+  document.getElementById('atelier').classList.toggle('no-grain', !grainToggle.classList.contains('on'));
+  document.getElementById('console').classList.toggle('no-grain', !grainToggle.classList.contains('on'));
+});
+
+/* keyboard shortcuts: 1/2/3 for variants, k for knobs, esc to close */
+window.addEventListener('keydown', (e) => {
+  if(e.target.matches('input,textarea,select')) return;
+  if(e.key==='1') tabs[0].click();
+  else if(e.key==='2') tabs[1].click();
+  else if(e.key==='3') tabs[2].click();
+  else if(e.key==='4') tabs[3].click();
+  else if(e.key==='k' || e.key==='K'){ e.preventDefault(); knobs.classList.toggle('open'); }
+  else if(e.key==='Escape') knobs.classList.remove('open');
+});
+
+</script>
+
+<style>
+/* grain/scanline opt-out (knob) */
+#atelier.no-grain::after, #console.no-grain::before, #console.no-grain::after { display:none; }
+</style>
+
+</body>
+</html>

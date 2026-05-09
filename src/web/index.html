@@ -1,0 +1,1556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forge — Workbench</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Manrope:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+
+<style>
+*,*::before,*::after{box-sizing:border-box}
+html,body{margin:0;padding:0;height:100%;-webkit-font-smoothing:antialiased;text-rendering:optimizeLegibility}
+button,input,select,textarea{font:inherit;color:inherit;background:transparent;border:0;outline:0}
+button{cursor:pointer}
+ul,ol{margin:0;padding:0;list-style:none}
+a{color:inherit;text-decoration:none}
+
+:root{
+  --bg: #0F1419;
+  --bg-2: #131820;
+  --panel: #161D26;
+  --panel-2: #1B232E;
+  --panel-3: #222B37;
+  --hover: rgba(255,255,255,0.04);
+  --rule: rgba(255,255,255,0.06);
+  --rule-2: rgba(255,255,255,0.12);
+
+  --text: #E8E2D5;
+  --text-2: #C8C2B5;
+  --dim: #8A8479;
+  --dim-2: #6E695F;
+
+  --running: #F4B860;
+  --running-soft: rgba(244,184,96,0.12);
+  --attention: #E08CCC;
+  --attention-soft: rgba(224,140,204,0.12);
+  --failed: #E07A7A;
+  --failed-soft: rgba(224,122,122,0.12);
+  --ready: #D4A574;
+  --ready-soft: rgba(212,165,116,0.12);
+  --drafting: #8FA0B5;
+  --drafting-soft: rgba(143,160,181,0.10);
+  --done: #88C9A1;
+  --done-soft: rgba(136,201,161,0.12);
+  --primary: #7DCFE8;
+  --primary-soft: rgba(125,207,232,0.14);
+  --primary-strong: #5DBCD9;
+
+  --shadow-sm: 0 1px 2px rgba(0,0,0,0.4);
+  --shadow-md: 0 4px 12px rgba(0,0,0,0.35);
+}
+
+body{
+  background: radial-gradient(1400px 800px at 10% 0%, #1A2230 0%, var(--bg) 55%);
+  color: var(--text);
+  font-family: 'Manrope', ui-sans-serif, system-ui, -apple-system, sans-serif;
+  font-size: 14px;
+  line-height: 1.5;
+  font-feature-settings: "ss01","ss02","cv11";
+  overflow: hidden;
+}
+.mono{ font-family:'JetBrains Mono', ui-monospace, monospace; font-size:0.92em; }
+
+.app{
+  position:fixed; inset:0;
+  display:grid;
+  grid-template-columns: 240px 1fr;
+  grid-template-rows: 56px 1fr;
+  grid-template-areas: "side topbar" "side body";
+}
+
+.side{
+  grid-area:side;
+  background: linear-gradient(180deg, #141A22 0%, #0E141B 100%);
+  border-right: 1px solid var(--rule);
+  display: flex; flex-direction: column;
+  min-height: 0;
+}
+.brand{
+  display:flex; align-items:center; gap:10px;
+  padding: 18px 20px 14px;
+  font-weight: 700; letter-spacing: 0.18em; font-size: 13px;
+  color: var(--text);
+}
+.brand .glyph{
+  width:18px;height:18px;border-radius:4px;
+  background:conic-gradient(from 215deg, var(--running), var(--attention), var(--primary), var(--done), var(--running));
+  box-shadow:0 0 0 1px rgba(255,255,255,0.18) inset;
+}
+.brand .v{ color: var(--dim); font-weight: 400; letter-spacing: 0; font-size: 11px; margin-left: auto; }
+
+.new-plan{
+  margin: 8px 16px 18px;
+  padding: 11px 14px;
+  border-radius: 8px;
+  background: linear-gradient(180deg, var(--primary), var(--primary-strong));
+  color: #0B1117;
+  font-weight: 600; font-size: 13.5px;
+  display: flex; align-items: center; justify-content: center; gap: 8px;
+  box-shadow: var(--shadow-sm), 0 0 0 1px rgba(125,207,232,0.3);
+  transition: transform .12s ease, box-shadow .12s ease;
+}
+.new-plan:hover{ transform: translateY(-1px); box-shadow: var(--shadow-md), 0 0 0 1px rgba(125,207,232,0.5); }
+.new-plan .plus{ font-size: 16px; line-height: 0; font-weight: 800; }
+
+.nav{ flex: 1; padding: 0 12px; overflow: auto; }
+.nav-section{
+  font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--dim-2); padding: 14px 12px 6px; font-weight: 600;
+}
+.nav-item{
+  display: flex; align-items: center; gap: 12px;
+  padding: 9px 12px; border-radius: 7px;
+  color: var(--text-2); font-size: 13.5px; font-weight: 500;
+  margin-bottom: 1px;
+  transition: background .12s ease, color .12s ease;
+  width: 100%; text-align: left;
+}
+.nav-item:hover{ background: var(--hover); color: var(--text); }
+.nav-item.active{
+  background: var(--panel-2);
+  color: var(--text);
+  box-shadow: inset 0 0 0 1px var(--rule-2);
+}
+.nav-item .ic{ width: 20px; height: 20px; flex: none; display: flex; align-items: center; justify-content: center; font-size: 14px; }
+.nav-item .lbl{ flex: 1; }
+.nav-item .count{
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 11px; color: var(--dim);
+  background: var(--panel); padding: 2px 8px; border-radius: 99px;
+  font-weight: 500;
+}
+.nav-item.active .count{ background: var(--panel-3); color: var(--text-2); }
+.nav-item.alert .count{ background: var(--attention-soft); color: var(--attention); }
+
+.side-foot{
+  padding: 14px 16px 16px;
+  border-top: 1px solid var(--rule);
+  font-size: 12px; color: var(--dim);
+  display: flex; flex-direction: column; gap: 8px;
+}
+.side-foot .row{ display: flex; align-items: center; gap: 8px; }
+.side-foot .row .lbl{ flex: 1; }
+.side-foot .row .v{ color: var(--text-2); font-family: 'JetBrains Mono', monospace; font-size: 11px; }
+.side-foot .help{
+  display: flex; align-items: center; justify-content: space-between;
+  padding: 8px 10px; margin-top: 4px;
+  border: 1px dashed var(--rule-2); border-radius: 6px;
+  color: var(--dim);
+}
+.side-foot kbd{
+  font-family: 'JetBrains Mono', monospace; font-size: 10px;
+  padding: 1px 5px; border-radius: 3px;
+  background: var(--panel); color: var(--text-2);
+  border: 1px solid var(--rule-2);
+}
+
+.topbar{
+  grid-area: topbar;
+  border-bottom: 1px solid var(--rule);
+  background: rgba(15, 20, 25, 0.7);
+  backdrop-filter: saturate(120%) blur(14px);
+  -webkit-backdrop-filter: saturate(120%) blur(14px);
+  display: flex; align-items: center; gap: 16px;
+  padding: 0 24px;
+  position: relative; z-index: 5;
+}
+.search{
+  flex: 1; max-width: 480px;
+  display: flex; align-items: center; gap: 10px;
+  margin-left: auto;
+  padding: 7px 12px;
+  border-radius: 8px;
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  color: var(--text-2);
+}
+.search:focus-within{ border-color: var(--rule-2); }
+.search svg{ color: var(--dim); flex: none; }
+.search input{ flex: 1; font-size: 13.5px; }
+.search input::placeholder{ color: var(--dim); }
+.search kbd{
+  font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--dim);
+  background: var(--panel-2); padding: 2px 6px; border-radius: 4px;
+  border: 1px solid var(--rule-2);
+}
+.topbar .right{ display: flex; align-items: center; gap: 12px; }
+.topbar .clock{
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--dim);
+  font-variant-numeric: tabular-nums;
+}
+.avatar{
+  width: 30px; height: 30px; border-radius: 50%;
+  background: linear-gradient(135deg, var(--ready), var(--attention));
+  color: #0B1117; font-weight: 700; font-size: 12px;
+  display: flex; align-items: center; justify-content: center;
+}
+.refresh-dot{
+  width: 8px; height: 8px; border-radius: 50%;
+  background: var(--dim-2);
+}
+.refresh-dot.live{ background: var(--done); box-shadow: 0 0 6px var(--done); animation: pulse 2s ease-in-out infinite; }
+.refresh-dot.stale{ background: var(--failed); }
+
+.body{
+  grid-area: body;
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  grid-template-rows: auto 1fr;
+  grid-template-areas: "pickup pickup" "list detail";
+  min-height: 0; min-width: 0;
+}
+
+.pickup{
+  grid-area: pickup;
+  padding: 18px 24px 16px;
+  border-bottom: 1px solid var(--rule);
+  background: linear-gradient(180deg, rgba(255,255,255,0.012), transparent);
+}
+.pickup-head{ display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; }
+.pickup-head h2{ margin: 0; font-size: 14px; font-weight: 600; color: var(--text); letter-spacing: -0.005em; }
+.pickup-head .sub{ font-size: 12.5px; color: var(--dim); font-weight: 400; }
+.pickup-cards{ display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: 12px; }
+.card{
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-left: 3px solid var(--dim);
+  border-radius: 8px;
+  padding: 14px 16px;
+  display: flex; flex-direction: column; gap: 10px;
+  transition: border-color .12s ease, transform .12s ease;
+  cursor: pointer;
+}
+.card:hover{ transform: translateY(-1px); border-color: var(--rule-2); }
+.card.attention{ border-left-color: var(--attention); }
+.card.failed   { border-left-color: var(--failed); }
+.card.running  { border-left-color: var(--running); }
+.card.review   { border-left-color: var(--ready); }
+.card.merged   { border-left-color: var(--done); }
+.card .top{ display: flex; align-items: center; gap: 10px; font-size: 11.5px; color: var(--dim); letter-spacing: 0.06em; text-transform: uppercase; font-weight: 600; }
+.card .top .kind{ display: flex; align-items: center; gap: 6px; }
+.card.attention .top .kind{ color: var(--attention); }
+.card.failed    .top .kind{ color: var(--failed); }
+.card.running   .top .kind{ color: var(--running); }
+.card .top .when{ margin-left: auto; color: var(--dim); font-weight: 400; text-transform: none; letter-spacing: 0; }
+.card .title{ font-size: 14.5px; color: var(--text); font-weight: 600; line-height: 1.35; }
+.card .blurb{ font-size: 12.5px; color: var(--text-2); line-height: 1.5; }
+.card .actions{ display: flex; gap: 8px; margin-top: 4px; flex-wrap: wrap; }
+
+.btn{
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 7px 12px; border-radius: 6px;
+  font-size: 12.5px; font-weight: 600; line-height: 1;
+  border: 1px solid transparent;
+  transition: background .12s ease, border-color .12s ease, color .12s ease;
+  white-space: nowrap;
+}
+.btn.disabled,.btn:disabled{ opacity: 0.5; cursor: not-allowed; }
+.btn .arr{ font-size: 14px; line-height: 0; }
+.btn-primary{ background: var(--primary); color: #0B1117; box-shadow: var(--shadow-sm); }
+.btn-primary:hover{ background: #9adcef; }
+.btn-secondary{ background: var(--panel-2); color: var(--text); border-color: var(--rule-2); }
+.btn-secondary:hover{ background: var(--panel-3); border-color: rgba(255,255,255,0.18); }
+.btn-ghost{ background: transparent; color: var(--text-2); border-color: var(--rule); }
+.btn-ghost:hover{ color: var(--text); border-color: var(--rule-2); }
+.btn-danger{ background: transparent; color: var(--failed); border-color: rgba(224,122,122,0.4); }
+.btn-danger:hover{ background: var(--failed-soft); }
+.btn-attention{ background: var(--attention-soft); color: var(--attention); border-color: rgba(224,140,204,0.4); }
+.btn-attention:hover{ background: rgba(224,140,204,0.18); }
+.btn.sm{ padding: 5px 10px; font-size: 11.5px; }
+
+.list-pane{
+  grid-area: list;
+  border-right: 1px solid var(--rule);
+  overflow: auto;
+  padding: 18px 8px 60px 18px;
+  min-width: 0;
+}
+.section-h{
+  display: flex; align-items: center; gap: 10px;
+  padding: 14px 8px 8px;
+  margin-top: 6px;
+}
+.section-h:first-child{ margin-top: 0; }
+.section-h .name{ font-size: 13px; font-weight: 700; color: var(--text); letter-spacing: 0.005em; }
+.section-h .ic{ width: 8px; height: 8px; border-radius: 50%; flex: none; }
+.section-h .ic.running   { background: var(--running);   box-shadow: 0 0 8px var(--running); animation: pulse 1.6s ease-in-out infinite; }
+.section-h .ic.attention { background: var(--attention); box-shadow: 0 0 8px var(--attention); animation: pulse 1.6s ease-in-out infinite; }
+.section-h .ic.ready     { background: var(--ready); }
+.section-h .ic.drafting  { background: var(--drafting); }
+.section-h .ic.done      { background: var(--done); }
+.section-h .count{ font-family: 'JetBrains Mono', monospace; font-size: 11px; color: var(--dim); background: var(--panel); padding: 2px 8px; border-radius: 99px; font-weight: 500; }
+.section-h .help{ margin-left: auto; font-size: 11.5px; color: var(--dim); font-weight: 400; }
+@keyframes pulse{ 0%,100%{ opacity:1 } 50%{ opacity: 0.4 } }
+
+.task-row{
+  display: grid;
+  grid-template-columns: auto 1fr auto;
+  gap: 12px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  margin: 2px 0;
+  cursor: pointer;
+  transition: background .12s ease;
+  align-items: center;
+}
+.task-row:hover{ background: var(--hover); }
+.task-row.selected{ background: var(--panel-2); box-shadow: inset 0 0 0 1px var(--rule-2); }
+.task-row .left{ display: flex; align-items: center; gap: 8px; }
+.task-row .stat-pill{
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 3px 7px; border-radius: 4px;
+  text-transform: uppercase;
+  font-family: 'JetBrains Mono', monospace;
+}
+.task-row .stat-pill.running   { background: var(--running-soft);   color: var(--running);   }
+.task-row .stat-pill.attention { background: var(--attention-soft); color: var(--attention); }
+.task-row .stat-pill.failed    { background: var(--failed-soft);    color: var(--failed);    }
+.task-row .stat-pill.ready     { background: var(--ready-soft);     color: var(--ready);     }
+.task-row .stat-pill.drafting  { background: var(--drafting-soft);  color: var(--drafting);  }
+.task-row .stat-pill.done      { background: var(--done-soft);      color: var(--done);      }
+.task-row .body{ display: flex; flex-direction: column; gap: 3px; min-width: 0; }
+.task-row .title{ color: var(--text); font-size: 13.5px; font-weight: 600; line-height: 1.3; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.task-row .meta{ display: flex; align-items: center; gap: 10px; color: var(--dim); font-size: 11.5px; font-family: 'JetBrains Mono', monospace; }
+.task-row .meta .agent{ color: var(--text-2); }
+.task-row .meta .err{ color: var(--failed); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; max-width: 280px; }
+.task-row .meta .crit-ready{ color: var(--attention); }
+.task-row .right-action{ display: flex; gap: 6px; opacity: 0; transition: opacity .12s ease; }
+.task-row:hover .right-action,
+.task-row.selected .right-action{ opacity: 1; }
+
+.done-section{ margin-top: 18px; }
+.done-section summary{
+  list-style: none; cursor: pointer;
+  padding: 10px 12px; border-radius: 8px;
+  display: flex; align-items: center; gap: 10px;
+  color: var(--dim); font-size: 13px; font-weight: 600;
+}
+.done-section summary::-webkit-details-marker{ display: none; }
+.done-section summary:hover{ background: var(--hover); color: var(--text-2); }
+.done-section[open] summary{ color: var(--text-2); }
+.done-section summary .chev{ transition: transform .15s ease; font-size: 11px; }
+.done-section[open] summary .chev{ transform: rotate(90deg); }
+
+.detail-pane{
+  grid-area: detail;
+  display: flex; flex-direction: column;
+  min-height: 0; min-width: 0;
+  background: var(--bg-2);
+}
+.detail-empty{
+  flex: 1; display: flex; align-items: center; justify-content: center;
+  color: var(--dim); font-size: 13px;
+}
+.detail-head{
+  padding: 18px 24px 12px;
+  border-bottom: 1px solid var(--rule);
+  background: linear-gradient(180deg, rgba(255,255,255,0.015), transparent);
+}
+.detail-head .row1{ display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+.detail-head .row1 .stat-pill{
+  font-size: 10.5px; font-weight: 700; letter-spacing: 0.04em;
+  padding: 3px 7px; border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace;
+  text-transform: uppercase;
+}
+.detail-head .row1 .stat-pill.running   { background: var(--running-soft);   color: var(--running);   }
+.detail-head .row1 .stat-pill.attention { background: var(--attention-soft); color: var(--attention); }
+.detail-head .row1 .stat-pill.failed    { background: var(--failed-soft);    color: var(--failed);    }
+.detail-head .row1 .stat-pill.ready     { background: var(--ready-soft);     color: var(--ready);     }
+.detail-head .row1 .stat-pill.drafting  { background: var(--drafting-soft);  color: var(--drafting);  }
+.detail-head .row1 .stat-pill.done      { background: var(--done-soft);      color: var(--done);      }
+.detail-head h1{
+  margin: 0; font-size: 19px; line-height: 1.3; font-weight: 700;
+  color: var(--text); letter-spacing: -0.01em;
+}
+.detail-head .meta{
+  display: flex; align-items: center; gap: 14px; flex-wrap: wrap;
+  margin-top: 8px;
+  color: var(--dim); font-size: 12px;
+}
+.detail-head .meta b{ color: var(--text-2); font-weight: 500; }
+.detail-head .meta .branch{ font-family: 'JetBrains Mono', monospace; color: var(--text-2); }
+.detail-actions{ display: flex; gap: 8px; margin-top: 14px; flex-wrap: wrap; }
+
+.tabs{
+  display: flex; align-items: center; gap: 2px;
+  padding: 0 24px;
+  border-bottom: 1px solid var(--rule);
+  background: var(--bg-2);
+}
+.tab{
+  padding: 12px 16px;
+  font-size: 13px; font-weight: 600; color: var(--dim);
+  border-bottom: 2px solid transparent;
+  margin-bottom: -1px;
+  display: flex; align-items: center; gap: 8px;
+  transition: color .12s ease, border-color .12s ease;
+}
+.tab:hover{ color: var(--text-2); }
+.tab.active{ color: var(--text); border-bottom-color: var(--primary); }
+.tab .pill{ font-size: 10px; font-weight: 700; letter-spacing: 0.04em; padding: 2px 6px; border-radius: 99px; background: var(--panel-2); color: var(--dim); }
+.tab.active .pill{ background: var(--primary-soft); color: var(--primary); }
+.tab .dot{ width: 7px; height: 7px; border-radius: 50%; }
+.tab .dot.live{ background: var(--running); animation: pulse 1.4s ease-in-out infinite; box-shadow: 0 0 6px var(--running); }
+.tab .dot.alert{ background: var(--attention); box-shadow: 0 0 6px var(--attention); }
+
+.detail-body{ flex: 1; overflow: auto; padding: 18px 24px 60px; min-height: 0; }
+.tab-pane{ display: none; }
+.tab-pane.active{ display: block; }
+
+.log-toolbar{ display: flex; align-items: center; gap: 10px; margin-bottom: 12px; font-size: 12px; color: var(--dim); }
+.log-toolbar .toggle{
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 5px 10px; border-radius: 6px;
+  border: 1px solid var(--rule-2); color: var(--text-2);
+  font-size: 12px;
+}
+.log-toolbar .toggle.on{ background: var(--running-soft); color: var(--running); border-color: rgba(244,184,96,0.4); }
+.log-toolbar .toggle .d{ width: 6px; height: 6px; border-radius: 50%; background: var(--dim); }
+.log-toolbar .toggle.on .d{ background: var(--running); animation: pulse 1.2s ease-in-out infinite; }
+.log{
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 12px 16px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px; line-height: 1.55;
+  color: var(--text-2);
+  max-height: 60vh; overflow: auto;
+  white-space: pre-wrap; word-break: break-word;
+}
+.log .line{ display: block; padding: 1px 0; }
+.log .line.ok{ color: var(--done); }
+.log .line.err{ color: var(--failed); }
+.log .line.warn{ color: var(--running); }
+.log .line.info{ color: var(--text-2); }
+.log .line.dim{ color: var(--dim); }
+.log-cursor{ display:inline-block; width:8px; height:14px; background: var(--running); margin-left: 2px; vertical-align: middle; animation: blink 1s steps(2,end) infinite; box-shadow: 0 0 8px var(--running); }
+@keyframes blink{ 50%{ opacity: 0 } }
+
+.spec{
+  background: var(--panel);
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  padding: 22px 28px 26px;
+  max-width: 760px;
+  font-size: 14px;
+}
+.spec pre{
+  background: var(--bg);
+  border: 1px solid var(--rule);
+  border-radius: 6px;
+  padding: 10px 14px;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 12.5px;
+  color: var(--text-2);
+  overflow: auto;
+  white-space: pre-wrap;
+}
+.spec h1{ margin: 0 0 14px; font-size: 22px; line-height: 1.3; font-weight: 700; color: var(--text); letter-spacing: -0.01em; }
+.spec h2{ font-size: 11px; letter-spacing: 0.16em; text-transform: uppercase; color: var(--dim); font-weight: 700; margin: 22px 0 8px; padding-bottom: 6px; border-bottom: 1px solid var(--rule); }
+.spec h3{ font-size: 14px; color: var(--text); font-weight: 600; margin: 18px 0 6px; }
+.spec p{ margin: 0 0 12px; color: var(--text-2); line-height: 1.65; }
+.spec ul, .spec ol{ margin: 4px 0 12px; padding-left: 20px; list-style: disc; }
+.spec li{ margin: 5px 0; color: var(--text-2); line-height: 1.55; }
+.spec code{ font-family:'JetBrains Mono',monospace; font-size: 12.5px; background: var(--panel-3); color: var(--text); padding: 1px 6px; border-radius: 4px; }
+.spec a{ color: var(--primary); text-decoration: underline; }
+.spec hr{ border: 0; border-top: 1px solid var(--rule); margin: 18px 0; }
+
+.empty-pane{
+  background: var(--panel); border: 1px dashed var(--rule-2);
+  border-radius: 10px; padding: 28px 24px;
+  text-align: center; color: var(--text-2);
+}
+.empty-pane .big{ font-size: 16px; font-weight: 600; color: var(--text); margin-bottom: 6px; }
+.empty-pane p{ margin: 0 0 14px; font-size: 13px; color: var(--dim); }
+
+.critique-grid{ display: grid; grid-template-columns: 1fr 1fr 1fr; gap: 10px; margin-bottom: 18px; }
+@media (max-width: 1100px){ .critique-grid{ grid-template-columns: 1fr; } }
+.critique-card{
+  background: var(--panel); border: 1px solid var(--rule);
+  border-radius: 8px; padding: 14px;
+}
+.critique-card .role{ font-size: 11px; color: var(--dim); letter-spacing: 0.16em; text-transform: uppercase; font-weight: 700; margin-bottom: 4px; }
+.critique-card .agent{ font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--primary); margin-bottom: 8px; }
+.critique-card .verdict{ font-size: 13.5px; color: var(--text); font-weight: 600; margin-bottom: 8px; text-transform: capitalize; }
+.critique-card .summary{ font-size: 12.5px; color: var(--text-2); line-height: 1.5; max-height: 220px; overflow: auto; white-space: pre-wrap; }
+
+.gates{ background: var(--panel); border: 1px solid var(--rule); border-radius: 8px; overflow: hidden; margin-bottom: 14px; }
+.gates .gh{
+  display: flex; align-items: center; gap: 10px;
+  padding: 10px 14px; border-bottom: 1px solid var(--rule);
+  font-size: 12px; color: var(--dim); letter-spacing: 0.06em;
+  text-transform: uppercase; font-weight: 700;
+}
+.gates .gh .summary{ margin-left: auto; color: var(--text-2); text-transform: none; letter-spacing: 0; font-size: 12px; font-weight: 500; }
+.gates table{ width: 100%; border-collapse: collapse; }
+.gates td{ padding: 9px 14px; font-size: 13px; color: var(--text-2); border-top: 1px dotted var(--rule); }
+.gates tr:first-child td{ border-top: 0; }
+.gates td.cmd{ font-family: 'JetBrains Mono', monospace; font-size: 12.5px; color: var(--text); }
+.gates td.stat{ width: 80px; }
+.gates td.stat .pill{ font-family: 'JetBrains Mono', monospace; font-size: 10.5px; padding: 2px 7px; border-radius: 4px; font-weight: 700; letter-spacing: 0.04em; }
+.gates td.stat .pill.pass{ background: var(--done-soft); color: var(--done); }
+.gates td.stat .pill.fail{ background: var(--failed-soft); color: var(--failed); }
+.gates td.stat .pill.pend{ background: var(--running-soft); color: var(--running); }
+.gates td.dur{ width: 90px; color: var(--dim); font-family: 'JetBrains Mono', monospace; font-size: 12px; text-align: right; }
+
+.repo-selector{ position: relative; }
+.repo-btn{
+  display: flex; align-items: center; gap: 9px;
+  padding: 6px 10px 6px 8px; border-radius: 7px;
+  border: 1px solid transparent;
+  font-size: 13px; color: var(--text);
+  transition: background .12s ease, border-color .12s ease;
+}
+.repo-btn:hover, .repo-btn.open{ background: var(--panel); border-color: var(--rule-2); }
+.repo-btn .scope{ color: var(--text-2); font-weight: 500; }
+.repo-btn .repo-name{ color: var(--text); font-weight: 600; }
+.repo-btn .branch{ font-family:'JetBrains Mono',monospace; font-size: 12px; color: var(--text-2); }
+.repo-btn .slash{ color: var(--dim-2); }
+.repo-btn .caret{ color: var(--dim); font-size: 10px; }
+.repo-dot{
+  width: 9px; height: 9px; border-radius: 3px; flex: none;
+  background: var(--primary);
+}
+.repo-dot.multi{ background: conic-gradient(from 0deg, var(--primary), var(--ready), var(--attention), var(--done), var(--primary)); }
+
+.repo-popover{
+  position: absolute; top: calc(100% + 6px); left: 0;
+  width: 340px; padding: 8px;
+  background: var(--panel); border: 1px solid var(--rule-2);
+  border-radius: 10px; box-shadow: var(--shadow-md);
+  z-index: 60;
+  max-height: 70vh; overflow: auto;
+}
+.repo-popover[hidden]{ display: none !important; }
+.repo-search{
+  width: 100%; padding: 8px 10px; margin-bottom: 6px;
+  background: var(--bg-2); border: 1px solid var(--rule);
+  border-radius: 6px; color: var(--text); font-size: 13px;
+}
+.repo-search::placeholder{ color: var(--dim); }
+.repo-section{
+  font-size: 10.5px; letter-spacing: 0.18em; text-transform: uppercase;
+  color: var(--dim-2); font-weight: 700;
+  padding: 8px 10px 4px;
+}
+.repo-option{
+  width: 100%; display: flex; align-items: center; gap: 10px;
+  padding: 8px 10px; border-radius: 6px;
+  font-size: 13px; color: var(--text-2);
+  margin-bottom: 1px; text-align: left;
+}
+.repo-option:hover{ background: var(--hover); color: var(--text); }
+.repo-option.active{ background: var(--panel-2); color: var(--text); box-shadow: inset 0 0 0 1px var(--rule-2); }
+.repo-option .repo-name{ flex: 1; font-weight: 500; }
+.repo-option .branch-mini{ font-family:'JetBrains Mono',monospace; font-size: 11px; color: var(--dim); }
+.repo-option .repo-count{ font-family:'JetBrains Mono',monospace; font-size: 11px; color: var(--dim); background: var(--panel); padding: 2px 8px; border-radius: 99px; min-width: 26px; text-align: center; font-weight: 500; }
+.repo-option.active .repo-count{ background: var(--panel-3); color: var(--text-2); }
+.repo-option .check{ color: var(--primary); font-size: 13px; opacity: 0; width: 12px; }
+.repo-option.active .check{ opacity: 1; }
+.repo-divider{ height: 1px; background: var(--rule); margin: 6px 4px; }
+
+.repo-chip{
+  display: inline-flex; align-items: center; gap: 5px;
+  padding: 1px 8px 1px 6px; border-radius: 99px;
+  background: var(--panel-2); border: 1px solid var(--rule-2);
+  font-family:'JetBrains Mono',monospace; font-size: 10.5px;
+  color: var(--text-2); font-weight: 500;
+  white-space: nowrap;
+}
+.repo-chip .repo-dot{ width: 6px; height: 6px; border-radius: 50%; }
+body.filtered-single .repo-chip{ display: none; }
+
+.toast{
+  position: fixed; right: 24px; bottom: 24px; z-index: 100;
+  background: var(--panel); border: 1px solid var(--rule-2);
+  border-radius: 8px; padding: 12px 16px;
+  font-size: 13px; color: var(--text-2);
+  box-shadow: var(--shadow-md);
+  max-width: 380px;
+}
+.toast.error{ border-left: 3px solid var(--failed); }
+.toast.info{ border-left: 3px solid var(--primary); }
+.toast button{ margin-left: 8px; color: var(--dim); font-size: 12px; }
+
+@media (max-width:1100px){
+  .body{ grid-template-columns: 1fr; grid-template-areas: "pickup" "list" "detail"; grid-template-rows: auto 1fr 1fr; }
+  .list-pane{ border-right: 0; border-bottom: 1px solid var(--rule); }
+  .app{ grid-template-columns: 200px 1fr; }
+}
+</style>
+</head>
+<body>
+
+<div class="app">
+  <aside class="side">
+    <div class="brand">
+      <span class="glyph"></span>
+      <span>FORGE</span>
+      <span class="v">workbench</span>
+    </div>
+    <button class="new-plan" id="new-plan-btn" title="Planner integration ships in a future release">
+      <span class="plus">+</span> Start a new plan
+    </button>
+    <nav class="nav" id="nav">
+      <div class="nav-section">Workspace</div>
+      <button class="nav-item alert active" data-target="all">
+        <span class="ic" style="color:var(--attention)">●</span>
+        <span class="lbl">Pick up here</span>
+        <span class="count" id="count-pickup">0</span>
+      </button>
+      <button class="nav-item" data-target="running">
+        <span class="ic" style="color:var(--running)">⟳</span>
+        <span class="lbl">Running now</span>
+        <span class="count" id="count-running">0</span>
+      </button>
+      <button class="nav-item" data-target="backlog">
+        <span class="ic" style="color:var(--ready)">★</span>
+        <span class="lbl">Backlog</span>
+        <span class="count" id="count-backlog">0</span>
+      </button>
+      <button class="nav-item" data-target="prs">
+        <span class="ic" style="color:var(--primary)">⇪</span>
+        <span class="lbl">Open PRs</span>
+        <span class="count" id="count-prs">—</span>
+      </button>
+      <button class="nav-item" data-target="done">
+        <span class="ic" style="color:var(--done)">✓</span>
+        <span class="lbl">Recently done</span>
+        <span class="count" id="count-done">0</span>
+      </button>
+      <div class="nav-section">Reference</div>
+      <button class="nav-item" id="nav-settings"><span class="ic">⚙</span><span class="lbl">Settings</span></button>
+      <button class="nav-item" id="nav-help"><span class="ic">?</span><span class="lbl">Help &amp; shortcuts</span></button>
+    </nav>
+    <div class="side-foot">
+      <div class="row"><span class="lbl">Repo</span><span class="v" id="foot-repo">—</span></div>
+      <div class="row"><span class="lbl">Branch</span><span class="v" id="foot-branch">—</span></div>
+      <div class="row"><span class="lbl">Last refresh</span><span class="v" id="foot-refreshed">—</span></div>
+      <div class="help">
+        <span>Search</span>
+        <kbd>⌘ K</kbd>
+      </div>
+    </div>
+  </aside>
+
+  <header class="topbar">
+    <div class="repo-selector">
+      <button class="repo-btn" id="repo-btn" aria-expanded="false">
+        <span class="repo-dot multi" id="repo-btn-dot"></span>
+        <span class="repo-name" id="repo-btn-name">All repos</span>
+        <span class="slash" id="repo-btn-slash" hidden>/</span>
+        <span class="branch" id="repo-btn-branch" hidden></span>
+        <span class="slash">·</span>
+        <span class="scope">workbench</span>
+        <span class="caret">▾</span>
+      </button>
+      <div class="repo-popover" id="repo-popover" hidden>
+        <input type="text" class="repo-search" id="repo-search" placeholder="Filter repos…">
+        <div class="repo-section">Scope</div>
+        <button class="repo-option active" data-repo="">
+          <span class="repo-dot multi"></span>
+          <span class="repo-name">All repos</span>
+          <span class="repo-count" id="repo-count-all">—</span>
+          <span class="check">✓</span>
+        </button>
+        <div class="repo-divider"></div>
+        <div class="repo-section" id="repo-list-section">Repos with active work</div>
+        <div id="repo-list"></div>
+      </div>
+    </div>
+    <div class="search">
+      <svg width="14" height="14" viewBox="0 0 16 16" fill="none" stroke="currentColor" stroke-width="1.5"><circle cx="7" cy="7" r="5"/><path d="M11 11l3 3"/></svg>
+      <input id="search-input" placeholder="Search specs, branches…">
+      <kbd>⌘ K</kbd>
+    </div>
+    <div class="right">
+      <span class="refresh-dot live" id="refresh-dot" title="Auto-refreshing"></span>
+      <span class="clock" id="clock">—</span>
+      <div class="avatar" id="avatar">··</div>
+    </div>
+  </header>
+
+  <div class="body">
+    <section class="pickup" id="pickup-section">
+      <div class="pickup-head">
+        <h2>Pick up here</h2>
+        <span class="sub" id="pickup-sub">—</span>
+      </div>
+      <div class="pickup-cards" id="pickup-cards"></div>
+    </section>
+
+    <aside class="list-pane" id="list-pane">
+      <header class="section-h" data-section="running">
+        <span class="ic running"></span>
+        <span class="name">Running now</span>
+        <span class="count">0</span>
+        <span class="help">Live — auto-refreshes every 3s</span>
+      </header>
+      <div id="list-running"></div>
+
+      <header class="section-h" data-section="attention">
+        <span class="ic attention"></span>
+        <span class="name">Needs your attention</span>
+        <span class="count">0</span>
+        <span class="help">Failures + critique-ready</span>
+      </header>
+      <div id="list-attention"></div>
+
+      <header class="section-h" data-section="ready">
+        <span class="ic ready"></span>
+        <span class="name">Ready to launch</span>
+        <span class="count">0</span>
+        <span class="help">Auto-improver has revised these</span>
+      </header>
+      <div id="list-ready"></div>
+
+      <header class="section-h" data-section="drafting">
+        <span class="ic drafting"></span>
+        <span class="name">Drafting</span>
+        <span class="count">0</span>
+        <span class="help">First-pass specs — could use shape</span>
+      </header>
+      <div id="list-drafting"></div>
+
+      <details class="done-section">
+        <summary>
+          <span class="chev">›</span>
+          <span class="ic done" style="width:8px;height:8px;border-radius:50%;background:var(--done)"></span>
+          <span>Recently done</span>
+          <span class="count" style="margin-left:8px">0</span>
+        </summary>
+        <div id="list-done"></div>
+      </details>
+    </aside>
+
+    <main class="detail-pane" id="detail-pane">
+      <div class="detail-empty" id="detail-empty">Select a task to see details.</div>
+      <div class="detail-head" id="detail-head" hidden></div>
+      <nav class="tabs" id="detail-tabs" hidden></nav>
+      <div class="detail-body" id="detail-body" hidden></div>
+    </main>
+  </div>
+</div>
+
+<script>
+"use strict";
+
+/* ─── state ────────────────────────────────────────────────────────── */
+const state = {
+  repos: [],
+  tasks: [],
+  selectedRepo: "",      // "" = all repos
+  currentTaskId: null,
+  currentTab: "log",
+  prs: [],
+  prsRepo: null,
+  logSource: null,       // EventSource for current task
+  refreshTimer: null,
+};
+
+/* ─── tiny dom helpers ─────────────────────────────────────────────── */
+const $ = (sel, root) => (root || document).querySelector(sel);
+const $$ = (sel, root) => Array.from((root || document).querySelectorAll(sel));
+const escapeHTML = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({
+  "&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"
+})[c]);
+
+function showToast(msg, kind) {
+  const old = $(".toast");
+  if (old) old.remove();
+  const t = document.createElement("div");
+  t.className = `toast ${kind || "info"}`;
+  t.innerHTML = `${escapeHTML(msg)} <button title="Dismiss">×</button>`;
+  t.querySelector("button").addEventListener("click", () => t.remove());
+  document.body.appendChild(t);
+  setTimeout(() => t.remove(), 6000);
+}
+
+/* ─── api wrappers ─────────────────────────────────────────────────── */
+async function apiGet(path) {
+  const res = await fetch(path, { headers: { "accept": "application/json" } });
+  let body = null;
+  try { body = await res.json(); } catch { /* non-JSON */ }
+  if (!res.ok || !body || body.ok !== true) {
+    const code = body && body.error && body.error.code ? body.error.code : `HTTP_${res.status}`;
+    const message = body && body.error && body.error.message ? body.error.message : `Request failed: ${path}`;
+    const err = new Error(message);
+    err.code = code;
+    throw err;
+  }
+  return body.data;
+}
+
+async function apiPost(path, body) {
+  const res = await fetch(path, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify(body || {}),
+  });
+  let envelope = null;
+  try { envelope = await res.json(); } catch { /* non-JSON */ }
+  if (!res.ok || !envelope || envelope.ok !== true) {
+    const code = envelope && envelope.error && envelope.error.code ? envelope.error.code : `HTTP_${res.status}`;
+    const message = envelope && envelope.error && envelope.error.message ? envelope.error.message : `Request failed: ${path}`;
+    const err = new Error(message);
+    err.code = code;
+    throw err;
+  }
+  return envelope.data;
+}
+
+/** POST + toast + refresh. Pass `confirm` to prompt before sending. */
+async function runAction(path, opts) {
+  const o = opts || {};
+  if (o.confirm && !window.confirm(o.confirm)) return;
+  try {
+    await apiPost(path, o.body);
+    showToast(o.successMsg || "Done", "info");
+    await refreshTasks();
+  } catch (e) {
+    showToast(e.message || "Action failed", "error");
+  }
+}
+
+/* ─── clock ────────────────────────────────────────────────────────── */
+function tickClock() {
+  const d = new Date();
+  const hh = String(d.getHours()).padStart(2, "0");
+  const mm = String(d.getMinutes()).padStart(2, "0");
+  const ss = String(d.getSeconds()).padStart(2, "0");
+  $("#clock").textContent = `${hh}:${mm}:${ss}`;
+}
+setInterval(tickClock, 1000); tickClock();
+
+/* ─── formatting ───────────────────────────────────────────────────── */
+function statClass(t) { return t.statClass || "drafting"; }
+function repoChipHTML(repo) {
+  if (!repo) return "";
+  return `<span class="repo-chip"><span class="repo-dot"></span>${escapeHTML(repo)}</span>`;
+}
+
+/* ─── repo selector ────────────────────────────────────────────────── */
+function renderRepoOptions() {
+  const list = $("#repo-list");
+  $("#repo-count-all").textContent = state.tasks.length;
+  if (state.repos.length === 0) {
+    list.innerHTML = `<div style="padding:10px 12px;color:var(--dim);font-size:12px">No repos yet — save a spec with <code>forge spec save</code> to populate.</div>`;
+    return;
+  }
+  list.innerHTML = state.repos.map((r) => `
+    <button class="repo-option ${state.selectedRepo === r.name ? "active" : ""}" data-repo="${escapeHTML(r.name)}">
+      <span class="repo-dot"></span>
+      <span class="repo-name">${escapeHTML(r.name)}</span>
+      <span class="branch-mini">${escapeHTML(r.branch || "")}</span>
+      <span class="repo-count">${r.taskCount}</span>
+      <span class="check">✓</span>
+    </button>
+  `).join("");
+  $$("#repo-list .repo-option").forEach((opt) => {
+    opt.addEventListener("click", (e) => {
+      e.stopPropagation();
+      state.selectedRepo = opt.dataset.repo || "";
+      closeRepoPopover();
+      applyFilter();
+    });
+  });
+  $("#repo-popover .repo-option[data-repo='']").addEventListener("click", (e) => {
+    e.stopPropagation();
+    state.selectedRepo = "";
+    closeRepoPopover();
+    applyFilter();
+  });
+}
+
+function updateRepoButton() {
+  const dot = $("#repo-btn-dot");
+  const name = $("#repo-btn-name");
+  const slash = $("#repo-btn-slash");
+  const branch = $("#repo-btn-branch");
+  if (state.selectedRepo) {
+    dot.classList.remove("multi");
+    name.textContent = state.selectedRepo;
+    const r = state.repos.find((x) => x.name === state.selectedRepo);
+    branch.textContent = (r && r.branch) || "";
+    slash.hidden = !branch.textContent;
+    branch.hidden = !branch.textContent;
+    $("#foot-repo").textContent = state.selectedRepo;
+    $("#foot-branch").textContent = (r && r.branch) || "—";
+  } else {
+    dot.classList.add("multi");
+    name.textContent = "All repos";
+    slash.hidden = true; branch.hidden = true;
+    $("#foot-repo").textContent = `${state.repos.length} repo${state.repos.length === 1 ? "" : "s"}`;
+    $("#foot-branch").textContent = "—";
+  }
+  $$(".repo-popover .repo-option").forEach((opt) => {
+    opt.classList.toggle("active", (opt.dataset.repo || "") === state.selectedRepo);
+  });
+}
+
+function openRepoPopover() {
+  $("#repo-popover").hidden = false;
+  $("#repo-btn").classList.add("open");
+  $("#repo-btn").setAttribute("aria-expanded", "true");
+  setTimeout(() => $("#repo-search").focus(), 0);
+}
+function closeRepoPopover() {
+  $("#repo-popover").hidden = true;
+  $("#repo-btn").classList.remove("open");
+  $("#repo-btn").setAttribute("aria-expanded", "false");
+  $("#repo-search").value = "";
+  $$("#repo-popover .repo-option").forEach((o) => o.style.display = "");
+}
+
+$("#repo-btn").addEventListener("click", (e) => {
+  e.stopPropagation();
+  if ($("#repo-popover").hidden) openRepoPopover(); else closeRepoPopover();
+});
+$("#repo-search").addEventListener("input", () => {
+  const q = $("#repo-search").value.toLowerCase().trim();
+  $$("#repo-popover .repo-option").forEach((opt) => {
+    if (!opt.dataset.repo) { opt.style.display = q ? "none" : ""; return; }
+    opt.style.display = opt.dataset.repo.toLowerCase().includes(q) ? "" : "none";
+  });
+});
+document.addEventListener("click", (e) => {
+  if ($("#repo-popover").hidden) return;
+  if (!$("#repo-popover").contains(e.target) && !$("#repo-btn").contains(e.target)) closeRepoPopover();
+});
+
+/* ─── pickup cards (derived from tasks) ────────────────────────────── */
+function derivePickups(tasks) {
+  const out = [];
+  for (const t of tasks) {
+    if (t.kind === "critique-ready") {
+      out.push({
+        kind: "attention", kindLabel: "Critique ready", when: `${t.age} ago`, repo: t.repo,
+        title: t.title, blurb: t.blurb || "Critique finished — review before launching.",
+        taskId: t.id, defaultTab: "critique",
+      });
+    }
+  }
+  for (const t of tasks) {
+    if (t.kind === "failed") {
+      out.push({
+        kind: "failed", kindLabel: t.statLabel, when: `${t.age} ago`, repo: t.repo,
+        title: t.title, blurb: t.error || t.blurb || "Run did not finish — open the log to inspect.",
+        taskId: t.id, defaultTab: "log",
+      });
+    }
+  }
+  // Top-most running task (only when nothing higher-priority is waiting)
+  const running = tasks.filter((t) => t.section === "running");
+  if (out.length === 0 && running.length > 0) {
+    const t = running[0];
+    out.push({
+      kind: "running", kindLabel: "Running now", when: `${t.age}`, repo: t.repo,
+      title: t.title, blurb: t.agentLabel ? `${t.agentLabel}. Tail the log to follow.` : "Tail the log to follow.",
+      taskId: t.id, defaultTab: "log",
+    });
+  }
+  return out.slice(0, 4);
+}
+
+function renderPickup() {
+  const visible = visibleTasks();
+  const picks = derivePickups(visible);
+  const wrap = $("#pickup-cards");
+  const sub = $("#pickup-sub");
+  if (picks.length === 0) {
+    $("#pickup-section").style.display = "none";
+    sub.textContent = "Nothing waiting — clean slate.";
+    return;
+  }
+  $("#pickup-section").style.display = "";
+  sub.textContent = picks.length === 1
+    ? `1 thing waiting on you${state.selectedRepo ? ` in ${state.selectedRepo}` : ""}`
+    : `${picks.length} things waiting on you${state.selectedRepo ? ` in ${state.selectedRepo}` : ""}`;
+  wrap.innerHTML = picks.map((p) => `
+    <div class="card ${p.kind}" data-task-id="${escapeHTML(p.taskId)}" data-tab="${escapeHTML(p.defaultTab)}">
+      <div class="top">
+        <span class="kind">● ${escapeHTML(p.kindLabel)}</span>
+        ${repoChipHTML(p.repo)}
+        <span class="when">${escapeHTML(p.when)}</span>
+      </div>
+      <div class="title">${escapeHTML(p.title)}</div>
+      <div class="blurb">${escapeHTML(p.blurb)}</div>
+    </div>
+  `).join("");
+  $$("#pickup-cards .card").forEach((card) => {
+    card.addEventListener("click", () => {
+      selectTask(card.dataset.taskId, card.dataset.tab);
+    });
+  });
+}
+
+/* ─── task list ────────────────────────────────────────────────────── */
+function visibleTasks() {
+  return state.selectedRepo ? state.tasks.filter((t) => t.repo === state.selectedRepo) : state.tasks.slice();
+}
+
+function renderTaskRow(t) {
+  const cls = statClass(t);
+  const meta = [];
+  if (!state.selectedRepo) meta.push(repoChipHTML(t.repo));
+  if (t.agentLabel) meta.push(`<span class="agent">${escapeHTML(t.agentLabel)}</span>`);
+  if (t.branch) meta.push(`<span>${escapeHTML(t.branch)}</span>`);
+  if (t.age && t.age !== "—") meta.push(`<span>${escapeHTML(t.age)}${t.section === "running" ? " running" : " ago"}</span>`);
+  if (t.kind === "critique-ready") meta.push(`<span class="crit-ready">● critique ready</span>`);
+  if (t.error) meta.push(`<span class="err" title="${escapeHTML(t.error)}">${escapeHTML(t.error)}</span>`);
+
+  return `<div class="task-row ${state.currentTaskId === t.id ? "selected" : ""}" data-id="${escapeHTML(t.id)}">
+    <div class="left"><span class="stat-pill ${cls}">${escapeHTML(t.statLabel)}</span></div>
+    <div class="body">
+      <div class="title">${escapeHTML(t.title)}</div>
+      <div class="meta">${meta.join('<span style="color:var(--rule-2)">·</span>')}</div>
+    </div>
+    <div class="right-action"></div>
+  </div>`;
+}
+
+function renderLists() {
+  const visible = visibleTasks();
+  const map = { running: [], attention: [], ready: [], drafting: [], done: [] };
+  for (const t of visible) { if (map[t.section]) map[t.section].push(t); }
+  $("#list-running").innerHTML = map.running.map(renderTaskRow).join("");
+  $("#list-attention").innerHTML = map.attention.map(renderTaskRow).join("");
+  $("#list-ready").innerHTML = map.ready.map(renderTaskRow).join("");
+  $("#list-drafting").innerHTML = map.drafting.map(renderTaskRow).join("");
+  $("#list-done").innerHTML = map.done.map(renderTaskRow).join("");
+
+  $$(".list-pane > .section-h").forEach((h) => {
+    const k = h.dataset.section;
+    const c = (map[k] || []).length;
+    h.style.display = c === 0 ? "none" : "";
+    const cnt = h.querySelector(".count");
+    if (cnt) cnt.textContent = c;
+  });
+  const doneCount = $(".done-section summary .count");
+  if (doneCount) doneCount.textContent = map.done.length;
+  $(".done-section").style.display = map.done.length === 0 ? "none" : "";
+
+  // empty state
+  const pane = $("#list-pane");
+  let empty = pane.querySelector(".empty-state");
+  if (visible.length === 0) {
+    if (!empty) {
+      empty = document.createElement("div");
+      empty.className = "empty-state";
+      empty.style.cssText = "padding:32px 12px;color:var(--dim);font-size:13px;text-align:center";
+      pane.appendChild(empty);
+    }
+    empty.innerHTML = state.selectedRepo
+      ? `No tasks in <b style="color:var(--text-2)">${escapeHTML(state.selectedRepo)}</b>. Save a spec from a shell:<br><code style="display:inline-block;margin-top:8px;color:var(--text-2);background:var(--panel-2);padding:4px 8px;border-radius:4px">cat plan.md | forge spec save -</code>`
+      : `No tasks yet. Save your first spec:<br><code style="display:inline-block;margin-top:8px;color:var(--text-2);background:var(--panel-2);padding:4px 8px;border-radius:4px">cat plan.md | forge spec save -</code>`;
+  } else if (empty) {
+    empty.remove();
+  }
+
+  $$(".task-row").forEach((row) => {
+    row.addEventListener("click", () => selectTask(row.dataset.id));
+  });
+
+  // sidebar nav counts
+  $("#count-pickup").textContent = derivePickups(visible).length;
+  $("#count-running").textContent = map.running.length;
+  $("#count-backlog").textContent = map.ready.length + map.drafting.length;
+  $("#count-done").textContent = map.done.length;
+}
+
+/* ─── detail pane ──────────────────────────────────────────────────── */
+function selectTask(id, tab) {
+  const t = state.tasks.find((x) => x.id === id);
+  if (!t) return;
+  state.currentTaskId = id;
+
+  if (!tab) {
+    if (t.section === "running") tab = "log";
+    else if (t.kind === "critique-ready") tab = "critique";
+    else tab = "spec";
+  }
+  state.currentTab = tab;
+
+  $("#detail-empty").hidden = true;
+  $("#detail-head").hidden = false;
+  $("#detail-tabs").hidden = false;
+  $("#detail-body").hidden = false;
+
+  $$(".task-row").forEach((r) => r.classList.toggle("selected", r.dataset.id === id));
+
+  renderDetailHead(t);
+  renderTabs(t);
+  renderTabPane(t);
+}
+
+function renderDetailHead(t) {
+  const head = $("#detail-head");
+  const meta = [];
+  if (t.agentLabel) meta.push(`<span><b>Agent</b> ${escapeHTML(t.agentLabel)}</span>`);
+  if (t.branch) meta.push(`<span><b>Branch</b> <span class="branch">${escapeHTML(t.branch)}</span></span>`);
+  if (t.age && t.age !== "—") meta.push(`<span><b>Age</b> ${escapeHTML(t.age)}</span>`);
+  if (t.prNumber) meta.push(`<span><b>PR</b> ${t.prUrl ? `<a href="${escapeHTML(t.prUrl)}" target="_blank" style="color:var(--primary)">#${t.prNumber}</a>` : `#${t.prNumber}`}</span>`);
+  if (!state.selectedRepo) meta.push(`<span><b>Repo</b> ${escapeHTML(t.repo)}</span>`);
+
+  head.innerHTML = `
+    <div class="row1">
+      <span class="stat-pill ${statClass(t)}">${escapeHTML(t.statLabel)}</span>
+      ${t.kind === "critique-ready" ? '<span style="color:var(--attention);font-size:11.5px;font-weight:600">● critique waiting</span>' : ""}
+      ${t.tmuxAlive ? '<span style="color:var(--running);font-size:11.5px;font-weight:600">● tmux alive</span>' : ""}
+    </div>
+    <h1>${escapeHTML(t.title)}</h1>
+    <div class="meta">${meta.join("")}</div>
+    <div class="detail-actions">
+      ${actionsForHTML(t)}
+    </div>
+  `;
+}
+
+function actionsForHTML(t) {
+  const launchAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/launch`, {
+    successMsg: `Launching ${t.id}…`,
+  });
+  const critiqueAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, {
+    successMsg: `Critique queued for ${t.id}`,
+  });
+  const killAction = () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/kill`, {
+    successMsg: `Killed ${t.id}`,
+    confirm: `Kill this run?\n\nThe tmux session will be terminated and the task marked failed.`,
+  });
+
+  const items = [];
+  if (t.section === "running") {
+    items.push({ label: "Tail log", cls: "btn-primary", action: () => switchTab("log") });
+    // Attach has to stay copy-only — terminal control can't transfer from the browser.
+    if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: () => copyCmd(`forge attach ${t.id}`) });
+    if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: () => window.open(t.prUrl, "_blank") });
+    items.push({ label: "Kill", cls: "btn-ghost", action: killAction });
+  } else if (t.kind === "critique-ready") {
+    items.push({ label: "Review critique", cls: "btn-attention", action: () => switchTab("critique") });
+    items.push({ label: "Launch anyway", cls: "btn-secondary", action: launchAction });
+  } else if (t.kind === "failed") {
+    items.push({ label: "Open log", cls: "btn-primary", action: () => switchTab("log") });
+    items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
+    items.push({ label: "Re-launch", cls: "btn-ghost", action: launchAction });
+  } else if (t.section === "ready") {
+    items.push({ label: "Launch", cls: "btn-primary", action: launchAction });
+    items.push({ label: "Critique", cls: "btn-secondary", action: critiqueAction });
+    items.push({ label: "View spec", cls: "btn-ghost", action: () => switchTab("spec") });
+  } else if (t.section === "drafting") {
+    items.push({ label: "View spec", cls: "btn-primary", action: () => switchTab("spec") });
+    items.push({ label: "Run critique", cls: "btn-secondary", action: critiqueAction });
+    items.push({ label: "Launch", cls: "btn-ghost", action: launchAction });
+  } else if (t.section === "done") {
+    if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: () => window.open(t.prUrl, "_blank") });
+    items.push({ label: "View spec", cls: "btn-secondary", action: () => switchTab("spec") });
+  }
+  setTimeout(() => {
+    $$("#detail-head .detail-actions .btn").forEach((b, i) => b.addEventListener("click", items[i].action));
+  }, 0);
+  return items.map((a) => `<button class="btn ${a.cls}">${escapeHTML(a.label)}</button>`).join("");
+}
+
+async function copyCmd(cmd) {
+  try {
+    await navigator.clipboard.writeText(cmd);
+    showToast(`Copied: ${cmd}`, "info");
+  } catch {
+    showToast(`Copy failed — run manually: ${cmd}`, "error");
+  }
+}
+
+function switchTab(id) {
+  state.currentTab = id;
+  const t = state.tasks.find((x) => x.id === state.currentTaskId);
+  if (!t) return;
+  renderTabs(t);
+  renderTabPane(t);
+}
+
+function renderTabs(t) {
+  const isRun = t.section === "running";
+  const tabs = [
+    { id: "log", label: "Live log", enabled: isRun || t.kind === "failed" || t.section === "done", badge: isRun ? '<span class="dot live"></span>' : "" },
+    { id: "spec", label: "Spec", enabled: t.hasSpec },
+    { id: "plan", label: "Plan chat", enabled: true, badge: '<span class="pill">soon</span>' },
+    { id: "critique", label: "Critique", enabled: !!t.critique, badge: t.kind === "critique-ready" ? '<span class="dot alert"></span>' : "" },
+    { id: "gates", label: "Quality gates", enabled: isRun || t.kind === "failed" || t.section === "done" },
+  ];
+  $("#detail-tabs").innerHTML = tabs.map((tb) => `
+    <button class="tab ${state.currentTab === tb.id ? "active" : ""}" data-tab="${tb.id}" ${tb.enabled ? "" : `disabled style="opacity:0.4;cursor:not-allowed"`}>
+      ${tb.badge || ""} ${escapeHTML(tb.label)}
+    </button>
+  `).join("");
+  $$("#detail-tabs .tab").forEach((b) => b.addEventListener("click", () => {
+    if (b.disabled) return;
+    switchTab(b.dataset.tab);
+  }));
+}
+
+function teardownLog() {
+  if (state.logSource) {
+    try { state.logSource.close(); } catch { /* noop */ }
+    state.logSource = null;
+  }
+}
+
+function renderTabPane(t) {
+  teardownLog();
+  const body = $("#detail-body");
+  if (state.currentTab === "log") return renderLogTab(t, body);
+  if (state.currentTab === "spec") return renderSpecTab(t, body);
+  if (state.currentTab === "plan") return renderPlanTab(t, body);
+  if (state.currentTab === "critique") return renderCritiqueTab(t, body);
+  if (state.currentTab === "gates") return renderGatesTab(t, body);
+}
+
+/* ─── log tab (SSE) ────────────────────────────────────────────────── */
+function classifyLogLine(line) {
+  if (/✗|✘|FAIL|error|fatal|exit 1|\bERR\b/i.test(line)) return "err";
+  if (/✓|✔|PASS|✅|\bOK\b|done\./i.test(line)) return "ok";
+  if (/⚠|warn(ing)?\b/i.test(line)) return "warn";
+  if (/^\$\s/.test(line) || /^>>>/.test(line) || /^═/.test(line)) return "info";
+  return "dim";
+}
+
+function appendLogLines(box, text) {
+  if (!text) return;
+  const wasAtBottom = box.scrollHeight - box.scrollTop - box.clientHeight < 60;
+  const lines = text.split(/\r?\n/);
+  for (const line of lines) {
+    if (line === "" && box.lastElementChild && box.lastElementChild.textContent === "") continue;
+    const div = document.createElement("div");
+    div.className = `line ${classifyLogLine(line)}`;
+    div.textContent = line;
+    box.appendChild(div);
+  }
+  // cap at 5000 lines so very long runs don't OOM the tab
+  while (box.children.length > 5000) box.removeChild(box.firstChild);
+  if (wasAtBottom) box.scrollTop = box.scrollHeight;
+}
+
+function renderLogTab(t, body) {
+  const isLive = t.section === "running";
+  body.innerHTML = `
+    <div class="log-toolbar">
+      <span class="toggle ${isLive ? "on" : ""}"><span class="d"></span> ${isLive ? "Following live" : "Static (run finished)"}</span>
+      <button class="btn sm btn-ghost" id="log-copy-path">Copy log path</button>
+      <span style="margin-left:auto" class="mono">~/.forge/runs/${escapeHTML(t.id)}/agent.log</span>
+    </div>
+    <div class="log" id="logbox"></div>
+  `;
+  $("#log-copy-path").addEventListener("click", () => copyCmd(`~/.forge/runs/${t.id}/agent.log`));
+  const box = $("#logbox");
+
+  if (!t.hasLog) {
+    box.innerHTML = `<div class="line dim">No log file yet — run hasn't started, or it was deleted.</div>`;
+    return;
+  }
+
+  const url = `/api/tasks/${encodeURIComponent(t.id)}/log?lines=400`;
+  const src = new EventSource(url);
+  state.logSource = src;
+  src.addEventListener("snapshot", (e) => appendLogLines(box, e.data));
+  src.addEventListener("append", (e) => appendLogLines(box, e.data));
+  src.addEventListener("error", () => {
+    appendLogLines(box, "(log stream disconnected — refresh tab to reconnect)");
+    teardownLog();
+  });
+}
+
+/* ─── spec tab ─────────────────────────────────────────────────────── */
+function escapeMarkdown(s) { return escapeHTML(s); }
+function renderMarkdown(md) {
+  // Tiny markdown renderer: enough for forge specs (h1/h2/h3, lists, code,
+  // bold, links, paragraphs). Anything exotic falls through as a paragraph
+  // — the user can always click "Copy spec path" to read the raw file.
+  const lines = md.split(/\r?\n/);
+  const out = [];
+  let inUL = false, inOL = false, inCode = false, codeLang = "", codeBuf = [];
+  const flush = () => {
+    if (inUL) { out.push("</ul>"); inUL = false; }
+    if (inOL) { out.push("</ol>"); inOL = false; }
+  };
+  for (let i = 0; i < lines.length; i++) {
+    const ln = lines[i];
+    if (inCode) {
+      if (/^```/.test(ln)) {
+        out.push(`<pre><code>${escapeMarkdown(codeBuf.join("\n"))}</code></pre>`);
+        inCode = false; codeBuf = []; codeLang = "";
+      } else codeBuf.push(ln);
+      continue;
+    }
+    const fence = ln.match(/^```\s*(\w+)?/);
+    if (fence) { flush(); inCode = true; codeLang = fence[1] || ""; continue; }
+    if (/^#\s+/.test(ln)) { flush(); out.push(`<h1>${inline(ln.replace(/^#\s+/, ""))}</h1>`); continue; }
+    if (/^##\s+/.test(ln)) { flush(); out.push(`<h2>${inline(ln.replace(/^##\s+/, ""))}</h2>`); continue; }
+    if (/^###\s+/.test(ln)) { flush(); out.push(`<h3>${inline(ln.replace(/^###\s+/, ""))}</h3>`); continue; }
+    const ulm = ln.match(/^\s*[-*]\s+(.+)/);
+    if (ulm) { if (!inUL) { flush(); out.push("<ul>"); inUL = true; } out.push(`<li>${inline(ulm[1])}</li>`); continue; }
+    const olm = ln.match(/^\s*\d+\.\s+(.+)/);
+    if (olm) { if (!inOL) { flush(); out.push("<ol>"); inOL = true; } out.push(`<li>${inline(olm[1])}</li>`); continue; }
+    if (/^---+$/.test(ln)) { flush(); out.push("<hr>"); continue; }
+    if (ln.trim() === "") { flush(); continue; }
+    flush();
+    out.push(`<p>${inline(ln)}</p>`);
+  }
+  if (inCode) out.push(`<pre><code>${escapeMarkdown(codeBuf.join("\n"))}</code></pre>`);
+  flush();
+  return out.join("\n");
+
+  function inline(s) {
+    // backtick code → <code>; **bold** → <b>; [text](url) → <a>
+    let out = escapeHTML(s);
+    out = out.replace(/`([^`]+)`/g, "<code>$1</code>");
+    out = out.replace(/\*\*([^*]+)\*\*/g, "<b>$1</b>");
+    out = out.replace(/\[([^\]]+)\]\(([^)]+)\)/g, '<a href="$2" target="_blank" rel="noopener">$1</a>');
+    return out;
+  }
+}
+
+async function renderSpecTab(t, body) {
+  body.innerHTML = `<div class="spec" id="spec-out"><p style="color:var(--dim)">Loading spec…</p></div>`;
+  try {
+    const data = await apiGet(`/api/tasks/${encodeURIComponent(t.id)}/spec?raw=1`);
+    $("#spec-out").innerHTML = renderMarkdown(data.body || "");
+  } catch (e) {
+    $("#spec-out").innerHTML = `<p style="color:var(--failed)">Could not load spec: ${escapeHTML(e.message)}</p>`;
+  }
+}
+
+/* ─── plan chat tab (placeholder for PR 3) ─────────────────────────── */
+function renderPlanTab(t, body) {
+  body.innerHTML = `
+    <div class="empty-pane">
+      <div class="big">Planner chat lives in Claude Code today</div>
+      <p>Open Claude Code, run plan-mode for "${escapeHTML(t.title)}", then <code>/forge-ship-plan</code> to save.</p>
+      <p style="margin-bottom:8px">Browser-native planner is on the roadmap (see PR&nbsp;3 of the workbench rollout).</p>
+      <button class="btn btn-secondary" id="plan-copy-id">Copy task id</button>
+    </div>
+  `;
+  $("#plan-copy-id").addEventListener("click", () => copyCmd(t.id));
+}
+
+/* ─── critique tab ─────────────────────────────────────────────────── */
+async function renderCritiqueTab(t, body) {
+  body.innerHTML = `<p style="color:var(--dim)">Loading critique…</p>`;
+  try {
+    const data = await apiGet(`/api/tasks/${encodeURIComponent(t.id)}/critique`);
+    if (!data.critique) {
+      body.innerHTML = `
+        <div class="empty-pane">
+          <div class="big">No critique on file</div>
+          <p>Run a two-critic + synthesizer pass before launching:</p>
+          <button class="btn btn-primary" id="crit-run">Run critique</button>
+        </div>
+      `;
+      $("#crit-run").addEventListener("click", () => runAction(`/api/tasks/${encodeURIComponent(t.id)}/critique`, {
+        successMsg: `Critique queued for ${t.id}`,
+      }));
+      return;
+    }
+    const c = data.critique;
+    const m = c.meta;
+    body.innerHTML = `
+      <div style="display:flex; gap:10px; align-items:center; margin-bottom:14px; flex-wrap:wrap">
+        <span style="font-size:13px;color:var(--text)"><b>Critique status:</b></span>
+        <span style="color:var(--ready);font-size:13px">${escapeHTML(m.status)}</span>
+        <span style="margin-left:auto;font-size:11px;color:var(--dim)">${escapeHTML(m.startedAt || "")}</span>
+      </div>
+      <div class="critique-grid">
+        ${critiqueCardHTML("Critic A", m.criticA, c.criticA)}
+        ${critiqueCardHTML("Critic B", m.criticB, c.criticB)}
+        ${critiqueCardHTML("Synthesizer", m.synthesizer, c.synth || c.recommendations)}
+      </div>
+      ${c.recommendations ? `
+        <h3 style="font-size:13px;color:var(--text);margin:18px 0 6px">Recommendations</h3>
+        <div class="spec" style="max-width:none">${renderMarkdown(c.recommendations)}</div>
+      ` : ""}
+    `;
+  } catch (e) {
+    body.innerHTML = `<p style="color:var(--failed)">Could not load critique: ${escapeHTML(e.message)}</p>`;
+  }
+}
+
+function critiqueCardHTML(role, agentMeta, content) {
+  const agentLabel = agentMeta ? `${agentMeta.agent} · ${agentMeta.model}` : "—";
+  const status = agentMeta ? agentMeta.status : "—";
+  return `<div class="critique-card">
+    <div class="role">${escapeHTML(role)}</div>
+    <div class="agent">${escapeHTML(agentLabel)}</div>
+    <div class="verdict">${escapeHTML(status)}</div>
+    <div class="summary">${content ? escapeHTML(content).slice(0, 1200) : '<span style="color:var(--dim)">No output yet</span>'}</div>
+  </div>`;
+}
+
+/* ─── gates tab ────────────────────────────────────────────────────── */
+async function renderGatesTab(t, body) {
+  try {
+    const data = await apiGet(`/api/tasks/${encodeURIComponent(t.id)}`);
+    const meta = data.meta || {};
+    const results = meta.qualityResults || [];
+    if (results.length === 0) {
+      body.innerHTML = `<div class="empty-pane"><div class="big">No quality run yet</div><p>Quality gates run automatically after the agent commits its work.</p></div>`;
+      return;
+    }
+    const passCount = results.filter((r) => r.ok).length;
+    const summary = passCount === results.length
+      ? "All passed"
+      : `${passCount} of ${results.length} passed`;
+    body.innerHTML = `
+      <div class="gates">
+        <div class="gh">
+          Quality gates
+          <span class="summary">${escapeHTML(summary)}</span>
+        </div>
+        <table>${results.map((r) => `<tr>
+          <td class="cmd">${escapeHTML(r.command)}</td>
+          <td class="stat"><span class="pill ${r.ok ? "pass" : "fail"}">${r.ok ? "PASS" : "FAIL"}</span></td>
+          <td class="dur">${escapeHTML(formatDur(r.durationMs))}</td>
+        </tr>`).join("")}</table>
+      </div>
+    `;
+  } catch (e) {
+    body.innerHTML = `<p style="color:var(--failed)">Could not load gates: ${escapeHTML(e.message)}</p>`;
+  }
+}
+
+function formatDur(ms) {
+  if (typeof ms !== "number") return "—";
+  if (ms < 1000) return `${ms}ms`;
+  return `${(ms / 1000).toFixed(1)}s`;
+}
+
+/* ─── filtering ────────────────────────────────────────────────────── */
+function applyFilter() {
+  document.body.classList.toggle("filtered-single", !!state.selectedRepo);
+  updateRepoButton();
+  renderRepoOptions();
+  renderPickup();
+  renderLists();
+  // If the currently selected task is hidden by the filter, clear selection.
+  if (state.currentTaskId) {
+    const t = state.tasks.find((x) => x.id === state.currentTaskId);
+    if (!t || (state.selectedRepo && t.repo !== state.selectedRepo)) {
+      const first = visibleTasks()[0];
+      if (first) selectTask(first.id);
+      else clearDetail();
+    } else {
+      // Re-render head + tabs with the latest task data (status may have changed)
+      const fresh = state.tasks.find((x) => x.id === state.currentTaskId);
+      if (fresh) {
+        renderDetailHead(fresh);
+        renderTabs(fresh);
+      }
+    }
+  }
+}
+
+function clearDetail() {
+  state.currentTaskId = null;
+  teardownLog();
+  $("#detail-empty").hidden = false;
+  $("#detail-head").hidden = true;
+  $("#detail-tabs").hidden = true;
+  $("#detail-body").hidden = true;
+}
+
+/* ─── data fetch ───────────────────────────────────────────────────── */
+async function refreshTasks() {
+  try {
+    const data = await apiGet("/api/tasks");
+    state.tasks = data.tasks || [];
+    $("#refresh-dot").classList.remove("stale");
+    $("#foot-refreshed").textContent = new Date().toLocaleTimeString();
+    applyFilter();
+  } catch (e) {
+    $("#refresh-dot").classList.add("stale");
+    showToast(`Refresh failed: ${e.message}`, "error");
+  }
+}
+
+async function refreshRepos() {
+  try {
+    const data = await apiGet("/api/repos");
+    state.repos = data.repos || [];
+  } catch {
+    state.repos = [];
+  }
+}
+
+async function refreshPrCount() {
+  try {
+    const data = await apiGet("/api/prs" + (state.selectedRepo ? `?repo=${encodeURIComponent(state.selectedRepo)}` : ""));
+    $("#count-prs").textContent = (data.prs || []).length;
+  } catch {
+    $("#count-prs").textContent = "—";
+  }
+}
+
+/* ─── boot ─────────────────────────────────────────────────────────── */
+async function boot() {
+  await refreshRepos();
+  await refreshTasks();
+  refreshPrCount();
+  // 3s polling for tasks, slower for repos and PRs
+  state.refreshTimer = setInterval(refreshTasks, 3000);
+  setInterval(refreshRepos, 30_000);
+  setInterval(refreshPrCount, 30_000);
+  // Default selection: pick the first task with attention, then running, then any.
+  const candidates = [
+    state.tasks.find((t) => t.section === "attention"),
+    state.tasks.find((t) => t.section === "running"),
+    state.tasks[0],
+  ].filter(Boolean);
+  if (candidates[0]) selectTask(candidates[0].id);
+}
+
+/* ─── new-plan + nav stubs ─────────────────────────────────────────── */
+$("#new-plan-btn").addEventListener("click", () => {
+  showToast("New-plan flow ships in PR 3 — for now run /forge-ship-plan in Claude Code.", "info");
+});
+$("#nav-help").addEventListener("click", () => {
+  showToast("Help: navigate with j/k or click. ⌘K focuses search.", "info");
+});
+$("#nav-settings").addEventListener("click", () => {
+  showToast("Settings UI is on the roadmap. For now: forge config list / set <key> <value>.", "info");
+});
+
+$$("#nav .nav-item").forEach((item) => {
+  item.addEventListener("click", () => {
+    $$("#nav .nav-item").forEach((x) => x.classList.remove("active"));
+    item.classList.add("active");
+  });
+});
+
+window.addEventListener("keydown", (e) => {
+  if (e.target.matches("input,textarea,select")) return;
+  if (e.key === "/" || (e.metaKey && e.key === "k")) { e.preventDefault(); $("#search-input").focus(); }
+  if (e.key === "r" && !e.metaKey && !e.ctrlKey) { e.preventDefault(); openRepoPopover(); }
+  if (e.key === "Escape" && !$("#repo-popover").hidden) closeRepoPopover();
+});
+
+window.addEventListener("beforeunload", () => {
+  teardownLog();
+  if (state.refreshTimer) clearInterval(state.refreshTimer);
+});
+
+boot();
+</script>
+
+</body>
+</html>

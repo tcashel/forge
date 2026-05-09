@@ -79,30 +79,34 @@ function resolveCritiqueAgent(
   return { agent, model, reasoningEffort };
 }
 
-export async function run(argv: string[], store: ForgeStore): Promise<void> {
-  const { values, positionals } = parseArgs({
-    args: argv,
-    options: {
-      "critic-a-agent": { type: "string" },
-      "critic-a-model": { type: "string" },
-      "critic-a-reasoning": { type: "string" },
-      "critic-b-agent": { type: "string" },
-      "critic-b-model": { type: "string" },
-      "critic-b-reasoning": { type: "string" },
-      "synth-agent": { type: "string" },
-      "synth-model": { type: "string" },
-      "synth-reasoning": { type: "string" },
-      json: { type: "boolean", default: false },
-    },
-    strict: false,
-    allowPositionals: true,
-  });
+export interface CritiqueAgentOverride {
+  agent?: LaunchTarget;
+  model?: string;
+  reasoning?: ReasoningEffort;
+}
 
-  const id = positionals[0];
-  if (!id) throw new CliError("MISSING_ARG", "Usage: forge critique <task-id> [...flags]", { exitCode: 1 });
+export interface DoCritiqueOpts {
+  taskId: string;
+  criticA?: CritiqueAgentOverride;
+  criticB?: CritiqueAgentOverride;
+  synth?: CritiqueAgentOverride;
+}
 
-  const task = store.getTask(id);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
+export interface DoCritiqueResult {
+  taskId: string;
+  critiqueId: string;
+  tmuxSession: string;
+  critiqueDir: string;
+  logFile: string;
+}
+
+/**
+ * Launch a critique. Pure programmatic core for `forge critique`; called by
+ * both the CLI shell and the HTTP server. Throws CliError on failure.
+ */
+export async function doCritique(opts: DoCritiqueOpts, store: ForgeStore): Promise<DoCritiqueResult> {
+  const task = store.getTask(opts.taskId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.taskId}".`, { exitCode: 1 });
 
   const repoConfig = store.getRepoConfig(task.repoRoot);
   const repo = detectRepo(task.repoRoot);
@@ -112,27 +116,27 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
   const criticA = resolveCritiqueAgent(
     "critic-a",
-    values["critic-a-agent"],
-    values["critic-a-model"],
-    values["critic-a-reasoning"],
+    opts.criticA?.agent,
+    opts.criticA?.model,
+    opts.criticA?.reasoning,
     repoConfig.critiqueAgentA,
     repoConfig.critiqueModelA,
     repoConfig.critiqueReasoningA,
   );
   const criticB = resolveCritiqueAgent(
     "critic-b",
-    values["critic-b-agent"],
-    values["critic-b-model"],
-    values["critic-b-reasoning"],
+    opts.criticB?.agent,
+    opts.criticB?.model,
+    opts.criticB?.reasoning,
     repoConfig.critiqueAgentB,
     repoConfig.critiqueModelB,
     repoConfig.critiqueReasoningB,
   );
   const synthesizer = resolveCritiqueAgent(
     "synth",
-    values["synth-agent"],
-    values["synth-model"],
-    values["synth-reasoning"],
+    opts.synth?.agent,
+    opts.synth?.model,
+    opts.synth?.reasoning,
     repoConfig.critiqueAgentSynth,
     repoConfig.critiqueModelSynth,
     repoConfig.critiqueReasoningSynth,
@@ -160,20 +164,65 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     store,
   );
 
-  if (result.error) {
-    throw new CliError("CRITIQUE_FAIL", `Critique launch failed: ${result.error}`, { exitCode: 3 });
-  }
+  if (result.error) throw new CliError("CRITIQUE_FAIL", `Critique launch failed: ${result.error}`, { exitCode: 3 });
+
+  return {
+    taskId: task.id,
+    critiqueId,
+    tmuxSession: result.tmuxSession,
+    critiqueDir: store.getCritiqueDir(task.id, critiqueId),
+    logFile: result.logFile,
+  };
+}
+
+export async function run(argv: string[], store: ForgeStore): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: {
+      "critic-a-agent": { type: "string" },
+      "critic-a-model": { type: "string" },
+      "critic-a-reasoning": { type: "string" },
+      "critic-b-agent": { type: "string" },
+      "critic-b-model": { type: "string" },
+      "critic-b-reasoning": { type: "string" },
+      "synth-agent": { type: "string" },
+      "synth-model": { type: "string" },
+      "synth-reasoning": { type: "string" },
+      json: { type: "boolean", default: false },
+    },
+    strict: false,
+    allowPositionals: true,
+  });
+
+  const id = positionals[0];
+  if (!id) throw new CliError("MISSING_ARG", "Usage: forge critique <task-id> [...flags]", { exitCode: 1 });
+
+  const result = await doCritique(
+    {
+      taskId: id,
+      criticA: {
+        agent: values["critic-a-agent"] as LaunchTarget | undefined,
+        model: values["critic-a-model"] as string | undefined,
+        reasoning: values["critic-a-reasoning"] as ReasoningEffort | undefined,
+      },
+      criticB: {
+        agent: values["critic-b-agent"] as LaunchTarget | undefined,
+        model: values["critic-b-model"] as string | undefined,
+        reasoning: values["critic-b-reasoning"] as ReasoningEffort | undefined,
+      },
+      synth: {
+        agent: values["synth-agent"] as LaunchTarget | undefined,
+        model: values["synth-model"] as string | undefined,
+        reasoning: values["synth-reasoning"] as ReasoningEffort | undefined,
+      },
+    },
+    store,
+  );
 
   emitOk(
-    {
-      taskId: task.id,
-      critiqueId,
-      tmuxSession: result.tmuxSession,
-      critiqueDir: store.getCritiqueDir(task.id, critiqueId),
-      logFile: result.logFile,
-    },
+    result,
     values.json === true,
     () =>
-      `✓ critique launched ${critiqueId}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
+      `✓ critique launched ${result.critiqueId}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
   );
 }
