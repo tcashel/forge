@@ -2,19 +2,17 @@
 
 import { apiGet } from "./api.js";
 import { $, showToast } from "./dom.js";
-import { clearPrModeShell, refreshPrs, renderPrMode, updatePrCount } from "./prs.js";
 import { repoKey } from "./repo-picker.js";
 import { state } from "./state.js";
 
 /* The Preact shell (src/web/components/App.tsx) renders the topbar,
    sidebar, repo picker, search, theme toggle, clock, the pickup
    section, the task list, the task detail (head + tabs + read-only
-   tab bodies), the settings view, and the new-spec modal. Legacy
-   code in this file is now responsible only for:
+   tab bodies), the PRs list/detail, the settings view, and the
+   new-spec modal. Legacy code in this file is now responsible only for:
 
    - Initial /api/workbench/context + /api/repos hydration
-   - PRs mode legacy renderer (Phase 5 will move it)
-   - The 30s repos poll + 30s PR-count poll
+   - The 30s repos poll
    - Mode transitions (enterTaskMode / enterPrMode / enterSettingsMode)
 */
 
@@ -27,42 +25,21 @@ function refreshTasksBridge() {
 }
 
 /* ─── filtering ────────────────────────────────────────────────────── */
-/* Legacy callers (sidebar nav, repo picker) call applyFilter() to nudge
-   the legacy mode renderers (PR list) when a repo filter changes. The
-   Preact task and settings views read directly from signals and don't
-   need it. */
-function applyFilter() {
-  if (state.viewMode === "prs") {
-    renderPrMode(state);
-  }
-}
+/* Preact components read directly from signals; mode renderers no
+   longer need a manual nudge when the repo filter changes. Kept as a
+   no-op for the bridge so legacy callers don't break. */
+function applyFilter() {}
 
 function clearDetail() {
   state.currentTaskId = null;
 }
 
-function clearLegacyPaneContent() {
-  // PRs legacy code wrote into #list-pane and #detail-pane via
-  // innerHTML, bypassing Preact. When tasks/settings mode re-mounts,
-  // Preact's diff has no record of those legacy children and would
-  // just append its new children alongside the leftover markup. Reset
-  // the panes here so the upcoming Preact re-mount paints into clean
-  // DOM.
-  const list = $("#list-pane");
-  if (list) list.innerHTML = "";
-  const detail = $("#detail-pane");
-  if (detail) detail.innerHTML = "";
-}
-
 function enterTaskMode(target = "all") {
-  const wasOtherMode = state.viewMode !== "tasks";
-  if (wasOtherMode) clearLegacyPaneContent();
   state.viewMode = "tasks";
   $("#mobile-work-btn")?.classList.add("active");
   $("#mobile-prs-btn")?.classList.remove("active");
-  clearPrModeShell();
   // Preact re-mounts the pickup / list / detail panes via the viewMode
-  // signal flip above. No legacy markup injection needed.
+  // signal flip above.
   if (target === "all") {
     $("#list-pane")?.scrollTo({ top: 0, behavior: "smooth" });
   } else {
@@ -74,40 +51,21 @@ function enterTaskMode(target = "all") {
   }
 }
 
-/* Wait for Preact's signal-driven re-render to flush. @preact/signals
-   batches component updates on the microtask after a signal write, so
-   we yield once before letting legacy code paint into the now-vacated
-   pane DOM. Without this, renderPrMode would run while Preact's task
-   subtrees are still mounted, and Preact would unmount over the legacy
-   markup on its scheduled flush. */
-function afterPreactFlush() {
-  return new Promise((resolve) => queueMicrotask(resolve));
-}
-
-async function enterPrMode() {
-  const wasOtherMode = state.viewMode !== "prs";
+function enterPrMode() {
   state.viewMode = "prs";
   $("#mobile-prs-btn")?.classList.add("active");
   $("#mobile-work-btn")?.classList.remove("active");
   clearDetail();
-  if (wasOtherMode) {
-    // Preact-rendered children (settings/tasks) will unmount on the
-    // viewMode flip; clear the panes once the flush lands so the
-    // legacy renderer paints into empty DOM.
-    await afterPreactFlush();
-    clearLegacyPaneContent();
-  }
-  renderPrMode(state);
-  await refreshPrs(state, { render: () => renderPrMode(state) });
+  // PrList / PrDetail mount via the viewMode signal flip above and the
+  // 30s poll started in main.tsx keeps the data fresh; no manual
+  // refresh needed here (the poll's data is already current and the
+  // component renders from signals immediately).
 }
 
 function enterSettingsMode() {
-  const wasOtherMode = state.viewMode !== "settings";
-  if (wasOtherMode) clearLegacyPaneContent();
   state.viewMode = "settings";
   $("#mobile-work-btn")?.classList.remove("active");
   $("#mobile-prs-btn")?.classList.remove("active");
-  clearPrModeShell();
   clearDetail();
   // SettingsForm and SettingsRepoList mount via the viewMode signal
   // flip above; main.tsx kicks off the /api/config fetch in an effect.
@@ -134,23 +92,6 @@ async function refreshRepos() {
   }
 }
 
-async function refreshPrCount() {
-  try {
-    const data = await apiGet("/api/prs" + (state.selectedRepo ? `?repo=${encodeURIComponent(state.selectedRepo)}` : ""));
-    state.prs = data.prs || [];
-    state.prMe = data.me || "";
-    state.prsRepo = data.repo || null;
-    state.prsRepoRoot = data.repoRoot || null;
-    state.prsError = null;
-    updatePrCount(state);
-    if (state.viewMode === "prs") renderPrMode(state);
-  } catch {
-    state.prsError = "Could not refresh PR count.";
-    const cnt = $("#count-prs");
-    if (cnt) cnt.textContent = "—";
-  }
-}
-
 /* ─── boot ─────────────────────────────────────────────────────────── */
 async function boot() {
   await refreshContext();
@@ -159,12 +100,11 @@ async function boot() {
     const currentRoot = state.context.currentRepo.root;
     if (state.repos.some((r) => repoKey(r) === currentRoot)) state.selectedRepo = currentRoot;
   }
-  // The 3s task poll is started by main.tsx via startTaskPolling(). The
-  // initial fetch below seeds the signal so the UI doesn't flash empty.
+  // The 3s task poll is started by main.tsx via startTaskPolling(); the
+  // 30s PR poll is started by main.tsx via startPrPolling(). The initial
+  // task fetch below seeds the signal so the UI doesn't flash empty.
   await refreshTasksBridge();
-  refreshPrCount();
   setInterval(refreshRepos, 30_000);
-  setInterval(refreshPrCount, 30_000);
   // Default selection: first attention candidate, then any running, then anything.
   const list = state.tasks;
   const candidate =
@@ -196,9 +136,9 @@ window.addEventListener("keydown", (e) => {
    runs. */
 function setSelectedRepoFromBridge(key) {
   state.selectedRepo = key || "";
-  if (state.viewMode === "prs") refreshPrs(state, { render: () => renderPrMode(state) });
-  // Settings mode reacts via the effect in main.tsx (re-fetches on
-  // selectedRepo change). No manual nudge needed here.
+  // PRs mode reacts via the `effect()` in main.tsx (refreshPrs runs on
+  // selectedRepo change). Settings mode reacts via its own effect there.
+  // No manual nudge needed here.
 }
 
 if (window.__forge) {
