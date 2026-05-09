@@ -8,6 +8,7 @@
 import { computed, signal } from "@preact/signals";
 import { type ApiError, getTasks } from "../lib/api";
 import { taskRepoKey } from "../lib/format";
+import { showToast } from "../lib/toast";
 import type { TabId, TaskView } from "../types";
 import { searchQuery, selectedRepo } from "./ui";
 
@@ -49,7 +50,7 @@ export async function refreshTasks(): Promise<void> {
   } catch (e) {
     lastRefreshOk.value = false;
     const err = e as ApiError;
-    window.__forge?.legacy?.showToast?.(`Refresh failed: ${err.message}`, "error");
+    showToast(`Refresh failed: ${err.message}`, "error");
   }
 }
 

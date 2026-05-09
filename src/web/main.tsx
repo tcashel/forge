@@ -2,9 +2,11 @@ import { effect } from "@preact/signals";
 import { render } from "preact";
 import { App } from "./components/App";
 import { derivePickups } from "./components/pickup/PickupRow";
-import type { ForgeBridge, ForgeLegacyBridge } from "./lib/forge-bridge";
+import { boot } from "./lib/boot";
+import type { ForgeBridge } from "./lib/forge-bridge";
+import { startGlobalShortcuts } from "./lib/shortcuts";
 import { prs, refreshPrs, startPrPolling } from "./signals/prs";
-import { repos } from "./signals/repos";
+import { repos, startReposPolling } from "./signals/repos";
 import { refreshSettings, settingsConfig, startSettingsPolling } from "./signals/settings";
 import {
   currentTab,
@@ -20,15 +22,13 @@ import {
 import { theme } from "./signals/theme";
 import { modalOpen, searchQuery, selectedRepo, viewMode } from "./signals/ui";
 
-// Expose signals + effect to legacy `src/web/*.js` so they can read/write
-// the same state Preact owns. main.tsx runs before app.js (script tag
-// order in index.html), so by the time app.js executes the bridge is ready.
-
-const legacy: ForgeLegacyBridge = {};
+// Debug surface: expose the central signal bag + the signals `effect()`
+// helper on `window.__forge` so external tooling (Claude-in-Chrome
+// scripts, browser-console debugging) can drive the UI without poking
+// at internals. Don't widen the surface beyond what's already here.
 const bridge: ForgeBridge = {
   signals: { searchQuery, selectedRepo, viewMode, theme, repos, tasks, currentTaskId, currentTab, modalOpen },
   effect,
-  legacy,
   api: { refreshTasks, selectTask },
 };
 window.__forge = bridge;
@@ -36,8 +36,11 @@ window.__forge = bridge;
 const root = document.getElementById("app");
 if (root) render(<App />, root);
 
-// Phase 3 owns the 3s task poll. Legacy app.js still kicks off the
-// initial repo / context fetches and starts repo + PR pollers.
+// Initial hydration (workbench context, repos, tasks) + default repo +
+// task selection. Kicks off async on first tick.
+void boot();
+
+// Phase 3: 3s task poll.
 startTaskPolling();
 // Phase 4: 30s settings poll. The poll only runs while viewMode ===
 // "settings"; SettingsForm reads settingsConfig once on mount, so a
@@ -48,6 +51,11 @@ startSettingsPolling();
 // to `prs` / `prMe` / `prsRepoName` / `prsRepoRoot` — no DOM nodes are
 // recreated, so any input or scroll position survives.
 startPrPolling();
+// Phase 6: 30s repos poll. The poll only writes to the repos signal.
+startReposPolling();
+
+// Phase 6: global `n` keyboard shortcut to open the new-spec modal.
+startGlobalShortcuts();
 
 // Re-fetch PRs whenever the repo filter changes (PRs view honours the
 // global repo filter — switching repos must update the list).
