@@ -125,6 +125,15 @@ export interface RepoConfig {
 export interface RepoConfigFile {
   version: 1;
   repos: Record<string, RepoConfig>;
+  workbench?: {
+    registeredRepos?: Record<string, RegisteredWorkbenchRepo>;
+  };
+}
+
+export interface RegisteredWorkbenchRepo {
+  root: string;
+  name: string;
+  addedAt: string;
 }
 
 export interface CritiqueAgentMeta {
@@ -208,6 +217,30 @@ export class ForgeStore {
       file.repos[repoRoot] = { ...(file.repos[repoRoot] ?? {}), ...patch };
       this.writeRepoConfigFile(file);
     });
+  }
+
+  getWorkbenchRepos(): RegisteredWorkbenchRepo[] {
+    const repos = this.readRepoConfigFile().workbench?.registeredRepos ?? {};
+    return Object.values(repos).sort((a, b) => a.name.localeCompare(b.name) || a.root.localeCompare(b.root));
+  }
+
+  registerWorkbenchRepo(repo: { root: string; name: string }): RegisteredWorkbenchRepo {
+    const record: RegisteredWorkbenchRepo = {
+      root: repo.root,
+      name: repo.name,
+      addedAt: new Date().toISOString(),
+    };
+    withFileLock(`${this.repoConfigFile}.lock`, () => {
+      const file = this.readRepoConfigFile();
+      file.workbench ??= {};
+      file.workbench.registeredRepos ??= {};
+      file.workbench.registeredRepos[repo.root] = {
+        ...(file.workbench.registeredRepos[repo.root] ?? {}),
+        ...record,
+      };
+      this.writeRepoConfigFile(file);
+    });
+    return record;
   }
 
   readIndex(): ForgeIndex {

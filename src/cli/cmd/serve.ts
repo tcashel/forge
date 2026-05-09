@@ -15,10 +15,18 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { GhTarget } from "../../core/gh.ts";
-import { fetchPrs } from "../../core/gh-pr.ts";
+import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import { detectRepo } from "../../core/repo.ts";
-import type { CritiqueMeta, ForgeStore, TaskRecord, TaskStatus } from "../../core/store.ts";
+import type {
+  CritiqueMeta,
+  ForgeStore,
+  LaunchTarget,
+  ReasoningEffort,
+  RepoConfig,
+  TaskRecord,
+  TaskStatus,
+} from "../../core/store.ts";
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
@@ -58,6 +66,9 @@ interface TaskView {
   agentLabel: string | null;
   repo: string;
   repoRoot: string;
+  repoReachable: boolean;
+  repoHasGit: boolean;
+  repoStale: boolean;
   blurb: string | null;
   age: string;
   ageMs: number;
@@ -69,6 +80,55 @@ interface TaskView {
   hasLog: boolean;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
 }
+
+interface RepoView {
+  name: string;
+  root: string;
+  branch: string | null;
+  taskCount: number;
+  registered: boolean;
+  current: boolean;
+  reachable: boolean;
+  hasGit: boolean;
+  stale: boolean;
+}
+
+type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+
+const CONFIG_STRING_KEYS = new Set([
+  "ghUser",
+  "ghHost",
+  "jiraProject",
+  "jiraType",
+  "defaultModel",
+  "critiqueModelA",
+  "critiqueModelB",
+  "critiqueModelSynth",
+  "reviewerModel",
+  "fixerModel",
+  "improverModel",
+]);
+const CONFIG_AGENT_KEYS = new Set([
+  "defaultAgent",
+  "critiqueAgentA",
+  "critiqueAgentB",
+  "critiqueAgentSynth",
+  "reviewerAgent",
+  "fixerAgent",
+  "improverAgent",
+]);
+const CONFIG_EFFORT_KEYS = new Set([
+  "critiqueReasoningA",
+  "critiqueReasoningB",
+  "critiqueReasoningSynth",
+  "reviewerReasoningEffort",
+  "fixerReasoningEffort",
+  "improverReasoning",
+]);
+const CONFIG_BOOLEAN_KEYS = new Set(["autoFix", "autoImprove"]);
+const CONFIG_NUMBER_KEYS = new Set(["autoFixRounds"]);
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
+const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -228,10 +288,74 @@ function specBranchInDisk(repoRoot: string): string | null {
   }
 }
 
+function repoDiskInfo(repoRoot: string): { reachable: boolean; hasGit: boolean; branch: string | null } {
+  if (!repoRoot || !path.isAbsolute(repoRoot) || !fs.existsSync(repoRoot)) {
+    return { reachable: false, hasGit: false, branch: null };
+  }
+  const detected = detectRepo(repoRoot);
+  return { reachable: true, hasGit: !!detected, branch: detected ? specBranchInDisk(detected.root) : null };
+}
+
 function ghTargetForRepo(store: ForgeStore, repoRoot: string): GhTarget | undefined {
   const cfg = store.getRepoConfig(repoRoot);
   if (!cfg.ghUser && !cfg.ghHost) return undefined;
   return { user: cfg.ghUser, host: cfg.ghHost };
+}
+
+function resolveConfigRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
+  if (repoName) {
+    const byRoot = repos.find((r) => r.root === repoName);
+    if (byRoot) return byRoot;
+    return repos.find((r) => r.name === repoName && !r.stale) ?? repos.find((r) => r.name === repoName) ?? null;
+  }
+  return repos.find((r) => r.current) ?? repos.find((r) => !r.stale) ?? repos[0] ?? null;
+}
+
+function validateConfigPatch(
+  input: unknown,
+): { ok: true; patch: Partial<RepoConfig> } | { ok: false; error: Response } {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: jsonErr(400, "BAD_REQUEST", "`config` must be an object.") };
+  }
+  const patch: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (
+      !CONFIG_STRING_KEYS.has(key) &&
+      !CONFIG_AGENT_KEYS.has(key) &&
+      !CONFIG_EFFORT_KEYS.has(key) &&
+      !CONFIG_BOOLEAN_KEYS.has(key) &&
+      !CONFIG_NUMBER_KEYS.has(key)
+    ) {
+      return { ok: false, error: jsonErr(400, "BAD_CONFIG_KEY", `Unsupported config key: ${key}`) };
+    }
+    if (raw === null || raw === "") {
+      patch[key] = undefined;
+      continue;
+    }
+    if (CONFIG_STRING_KEYS.has(key)) {
+      if (typeof raw !== "string") return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be a string.`) };
+      patch[key] = raw;
+    } else if (CONFIG_AGENT_KEYS.has(key)) {
+      if (typeof raw !== "string" || !VALID_AGENTS.includes(raw as LaunchTarget)) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be one of: ${VALID_AGENTS.join(", ")}.`) };
+      }
+      patch[key] = raw;
+    } else if (CONFIG_EFFORT_KEYS.has(key)) {
+      if (typeof raw !== "string" || !VALID_EFFORTS.includes(raw as ReasoningEffort)) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be one of: ${VALID_EFFORTS.join(", ")}.`) };
+      }
+      patch[key] = raw;
+    } else if (CONFIG_BOOLEAN_KEYS.has(key)) {
+      if (typeof raw !== "boolean") return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be boolean.`) };
+      patch[key] = raw;
+    } else if (CONFIG_NUMBER_KEYS.has(key)) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be a positive integer.`) };
+      }
+      patch[key] = raw;
+    }
+  }
+  return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
 function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
@@ -240,6 +364,7 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
   const age = timeAgo(ageRef);
   const spec = store.getSpec(task.id);
   const blurb = spec ? blurbFromSpec(spec) : null;
+  const repoInfo = repoDiskInfo(task.repoRoot);
   return {
     id: task.id,
     title: task.title,
@@ -253,6 +378,9 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     agentLabel: agentLabel(task.agent, task.model),
     repo: task.repoName,
     repoRoot: task.repoRoot,
+    repoReachable: repoInfo.reachable,
+    repoHasGit: repoInfo.hasGit,
+    repoStale: !repoInfo.reachable || !repoInfo.hasGit,
     blurb,
     age: age.label,
     ageMs: age.ms,
@@ -264,6 +392,51 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     critique: info.critique,
   };
+}
+
+function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: string } | null): RepoView[] {
+  const byRoot = new Map<string, RepoView>();
+
+  const ensure = (input: {
+    name: string;
+    root: string;
+    taskCount?: number;
+    registered?: boolean;
+    current?: boolean;
+  }) => {
+    const info = repoDiskInfo(input.root);
+    const existing = byRoot.get(input.root);
+    const next: RepoView = {
+      name: input.name,
+      root: input.root,
+      branch: info.branch,
+      taskCount: (existing?.taskCount ?? 0) + (input.taskCount ?? 0),
+      registered: (existing?.registered ?? false) || input.registered === true,
+      current: (existing?.current ?? false) || input.current === true,
+      reachable: info.reachable,
+      hasGit: info.hasGit,
+      stale: !info.reachable || !info.hasGit,
+    };
+    if (existing && (existing.current || existing.registered) && !input.current) next.name = existing.name;
+    byRoot.set(input.root, next);
+  };
+
+  if (currentRepo) ensure({ ...currentRepo, registered: true, current: true });
+  for (const repo of store.getWorkbenchRepos()) ensure({ name: repo.name, root: repo.root, registered: true });
+
+  const counts = new Map<string, { name: string; root: string; count: number }>();
+  for (const t of store.getTasks()) {
+    const entry = counts.get(t.repoRoot) ?? { name: t.repoName, root: t.repoRoot, count: 0 };
+    entry.count += 1;
+    counts.set(t.repoRoot, entry);
+  }
+  for (const repo of counts.values()) ensure({ name: repo.name, root: repo.root, taskCount: repo.count });
+
+  return Array.from(byRoot.values()).sort((a, b) => {
+    if (a.current !== b.current) return a.current ? -1 : 1;
+    if (a.stale !== b.stale) return a.stale ? 1 : -1;
+    return b.taskCount - a.taskCount || a.name.localeCompare(b.name) || a.root.localeCompare(b.root);
+  });
 }
 
 // ─── response helpers ────────────────────────────────────────────────────────
@@ -413,6 +586,8 @@ function logSseResponse(logFile: string, initialLines: number): Response {
 interface RouteCtx {
   store: ForgeStore;
   webDir: string;
+  currentRepo: { name: string; root: string } | null;
+  prFetcher: PrFetcher;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -430,19 +605,26 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ ok: true, version: "0.4.0-dev" });
   }
 
+  // GET /api/workbench/context
+  if (pathname === "/api/workbench/context") {
+    return jsonOk({
+      currentRepo: ctx.currentRepo,
+      registeredRepos: store.getWorkbenchRepos(),
+      forgeDir: store.forgeDir,
+    });
+  }
+
   // GET /api/repos
   if (pathname === "/api/repos") {
-    const tasks = store.getTasks();
-    const counts = new Map<string, { name: string; root: string; count: number }>();
-    for (const t of tasks) {
-      const entry = counts.get(t.repoRoot) ?? { name: t.repoName, root: t.repoRoot, count: 0 };
-      entry.count += 1;
-      counts.set(t.repoRoot, entry);
-    }
-    const repos = Array.from(counts.values())
-      .map((r) => ({ name: r.name, root: r.root, branch: specBranchInDisk(r.root), taskCount: r.count }))
-      .sort((a, b) => b.taskCount - a.taskCount || a.name.localeCompare(b.name));
-    return jsonOk({ repos });
+    return jsonOk({ repos: buildRepoViews(store, ctx.currentRepo) });
+  }
+
+  // GET /api/config?repo=<name-or-root>
+  if (pathname === "/api/config") {
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolveConfigRepo(repos, url.searchParams.get("repo") || undefined);
+    if (!target) return jsonErr(404, "NO_REPO", "No repo is available for settings.");
+    return jsonOk({ repo: target, config: store.getRepoConfig(target.root) });
   }
 
   // GET /api/tasks?repo=<name>&section=<...>
@@ -528,22 +710,27 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // GET /api/prs?repo=<name>
   if (pathname === "/api/prs") {
     const repoName = url.searchParams.get("repo") || undefined;
-    const repos = uniqueRepos(store);
-    const target = repoName ? repos.find((r) => r.name === repoName || r.root === repoName) : repos[0];
-    if (!target) return jsonOk({ prs: [], me: "" });
-    const result = await fetchPrs({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
-    return jsonOk({ prs: result.prs, me: result.me, repo: target.name });
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoName);
+    if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
+    const result = await ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    return jsonOk({ prs: result.prs, me: result.me, repo: target.name, repoRoot: target.root });
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
 }
 
-function uniqueRepos(store: ForgeStore): Array<{ name: string; root: string }> {
-  const seen = new Map<string, { name: string; root: string }>();
-  for (const t of store.getTasks()) {
-    if (!seen.has(t.repoRoot)) seen.set(t.repoRoot, { name: t.repoName, root: t.repoRoot });
-  }
-  return Array.from(seen.values());
+function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
+  const reachable = repos.filter((r) => !r.stale);
+  if (!repoName) return reachable[0] ?? repos[0] ?? null;
+
+  const exactRoot = repos.find((r) => r.root === repoName);
+  if (exactRoot) return exactRoot.stale ? null : exactRoot;
+
+  const byName = repos.filter((r) => r.name === repoName);
+  const reachableByName = byName.find((r) => !r.stale);
+  if (reachableByName) return reachableByName;
+  return null;
 }
 
 // ─── POST routes ─────────────────────────────────────────────────────────────
@@ -552,6 +739,8 @@ const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|improve|kill|
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
+  if (pathname === "/api/repos") return true;
+  if (pathname === "/api/config") return true;
   return ACTION_TASK_PATH.test(pathname);
 }
 
@@ -607,7 +796,7 @@ function optString(body: Record<string, unknown>, key: string): string | undefin
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
-const VALID_AGENTS = new Set(["claude", "codex", "opencode", "gemini"]);
+const VALID_ACTION_AGENTS = new Set(["claude", "codex", "opencode", "gemini"]);
 
 /** Returns: { ok: true, value } | { ok: false, error: Response } | { ok: true, value: undefined } when absent. */
 function optAgent(
@@ -616,10 +805,10 @@ function optAgent(
 ): { ok: true; value: TaskRecord["agent"] } | { ok: false; error: Response } {
   const v = body[key];
   if (v === undefined || v === null || v === "") return { ok: true, value: null };
-  if (typeof v !== "string" || !VALID_AGENTS.has(v)) {
+  if (typeof v !== "string" || !VALID_ACTION_AGENTS.has(v)) {
     return {
       ok: false,
-      error: jsonErr(400, "BAD_REQUEST", `\`${key}\` must be one of: ${Array.from(VALID_AGENTS).join(", ")}.`),
+      error: jsonErr(400, "BAD_REQUEST", `\`${key}\` must be one of: ${Array.from(VALID_ACTION_AGENTS).join(", ")}.`),
     };
   }
   return { ok: true, value: v as TaskRecord["agent"] };
@@ -648,6 +837,27 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const parsed = await readJsonBody(req);
   if ("error" in parsed) return parsed.error;
   const body = parsed.body;
+
+  // POST /api/specs
+  if (pathname === "/api/repos") {
+    const repoRoot = reqString(body, "repoRoot");
+    if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
+    if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const repo = detectRepo(repoRoot);
+    if (!repo) return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
+    const record = store.registerWorkbenchRepo({ root: repo.root, name: repo.name });
+    return jsonOk({ repo: record });
+  }
+
+  if (pathname === "/api/config") {
+    const repoRoot = reqString(body, "repoRoot");
+    if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
+    if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const parsedPatch = validateConfigPatch(body.config);
+    if (!parsedPatch.ok) return parsedPatch.error;
+    store.setRepoConfig(repoRoot, parsedPatch.patch);
+    return jsonOk({ repoRoot, config: store.getRepoConfig(repoRoot) });
+  }
 
   // POST /api/specs
   if (pathname === "/api/specs") {
@@ -779,6 +989,7 @@ export interface ServeOptions {
   port?: number;
   host?: string;
   open?: boolean;
+  prFetcher?: PrFetcher;
 }
 
 /**
@@ -816,7 +1027,10 @@ function reapStaleCritiques(store: ForgeStore): number {
   return swept;
 }
 
-export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port: number; stop: () => void } {
+export async function startServer(
+  store: ForgeStore,
+  opts: ServeOptions = {},
+): Promise<{ port: number; stop: () => void }> {
   const port = opts.port ?? DEFAULT_PORT;
   const host = opts.host ?? DEFAULT_HOST;
 
@@ -834,7 +1048,34 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
     process.stderr.write(`forge serve: reaped ${swept} stale critique-meta record(s).\n`);
   }
 
-  const ctx: RouteCtx = { store, webDir };
+  const webDistDir = path.join(webDir, "dist");
+  try {
+    fs.rmSync(webDistDir, { recursive: true, force: true });
+    fs.mkdirSync(webDistDir, { recursive: true });
+    const result = await Bun.build({
+      entrypoints: [path.join(webDir, "main.tsx")],
+      outdir: webDistDir,
+      target: "browser",
+      format: "esm",
+      minify: false,
+      sourcemap: "inline",
+      naming: "[name].js",
+    });
+    if (!result.success) {
+      console.error("[forge serve] web bundle failed:", result.logs);
+    }
+  } catch (e) {
+    console.error("[forge serve] web bundle threw:", e);
+    // Phase 1 fallback: continue serving — the legacy app.js still works.
+  }
+
+  const detectedCurrentRepo = detectRepo(process.cwd());
+  const ctx: RouteCtx = {
+    store,
+    webDir,
+    currentRepo: detectedCurrentRepo ? { name: detectedCurrentRepo.name, root: detectedCurrentRepo.root } : null,
+    prFetcher: opts.prFetcher ?? fetchPrs,
+  };
 
   const server = Bun.serve({
     port,
@@ -933,7 +1174,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const open = values.open === true;
   const json = values.json === true;
 
-  const { port, stop } = startServer(store, { port: portRaw, host });
+  const { port, stop } = await startServer(store, { port: portRaw, host });
   const url = `http://${host}:${port}`;
 
   if (json) {
