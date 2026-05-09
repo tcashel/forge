@@ -628,6 +628,7 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
           title: optString(body, "title"),
           agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
           model: optString(body, "model"),
+          autoImprove: body.autoImprove === false ? false : undefined,
         },
         store,
       );
