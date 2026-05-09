@@ -18,7 +18,7 @@ import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import { detectRepo } from "../../core/repo.ts";
-import type { CritiqueMeta, ForgeStore, RunMeta, TaskRecord, TaskStatus } from "../../core/store.ts";
+import type { CritiqueMeta, ForgeStore, TaskRecord, TaskStatus } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
@@ -607,7 +607,42 @@ function optString(body: Record<string, unknown>, key: string): string | undefin
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+const VALID_AGENTS = new Set(["claude", "codex", "opencode", "gemini"]);
+
+/** Returns: { ok: true, value } | { ok: false, error: Response } | { ok: true, value: undefined } when absent. */
+function optAgent(
+  body: Record<string, unknown>,
+  key: string,
+): { ok: true; value: TaskRecord["agent"] } | { ok: false; error: Response } {
+  const v = body[key];
+  if (v === undefined || v === null || v === "") return { ok: true, value: null };
+  if (typeof v !== "string" || !VALID_AGENTS.has(v)) {
+    return {
+      ok: false,
+      error: jsonErr(400, "BAD_REQUEST", `\`${key}\` must be one of: ${Array.from(VALID_AGENTS).join(", ")}.`),
+    };
+  }
+  return { ok: true, value: v as TaskRecord["agent"] };
+}
+
+// Statuses where a `kill` is meaningful — only running-family tasks. Killing
+// a `done`/`failed`/`draft` task would silently rewrite the completion record.
+const KILLABLE_STATUSES: Set<TaskStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
+
 async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
+  try {
+    return await dispatchApiPost(req, url, ctx);
+  } catch (e) {
+    // Last-resort net so bugs don't return Bun's default 500 page. CliErrors
+    // are caught at the per-action sites for accurate status mapping; this
+    // is for unexpected runtime errors (I/O, type errors, etc.).
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`forge serve: unhandled POST error: ${msg}\n`);
+    return jsonErr(500, "INTERNAL", `Unhandled server error: ${msg}`);
+  }
+}
+
+async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
   const { pathname } = url;
   const { store } = ctx;
   const parsed = await readJsonBody(req);
@@ -621,10 +656,10 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
     if (!markdown) return jsonErr(400, "BAD_REQUEST", "`markdown` is required.");
     if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
     if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const agentResult = optAgent(body, "agent");
+    if (!agentResult.ok) return agentResult.error;
     const repo = detectRepo(repoRoot);
-    if (!repo) {
-      return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
-    }
+    if (!repo) return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
     try {
       const result = await saveSpec(
         {
@@ -632,7 +667,7 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
           repoRoot: repo.root,
           repoName: repo.name,
           title: optString(body, "title"),
-          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
+          agent: agentResult.value ?? undefined,
           model: optString(body, "model"),
           autoImprove: body.autoImprove === false ? false : undefined,
         },
@@ -662,29 +697,30 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
   if (action === "kill") {
     const task = store.getTask(taskId);
     if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    if (!KILLABLE_STATUSES.has(task.status)) {
+      return jsonErr(
+        409,
+        "BAD_STATE",
+        `Task ${taskId} is in state "${task.status}" — only running tasks can be killed.`,
+      );
+    }
     if (!task.tmuxSession) {
       return jsonErr(400, "NO_TMUX_SESSION", `Task ${taskId} has no tmux session — it hasn't been launched.`);
     }
     killTmuxSession(task.tmuxSession);
-    // Merge errorMessage into existing meta so the failure card surfaces a
-    // clean reason. writeRunMeta is a full overwrite, so we read-then-write.
-    const existing = store.readRunMeta(taskId);
-    if (existing) {
-      const merged: RunMeta = { ...(existing as unknown as RunMeta), errorMessage: "killed from Workbench" };
-      store.writeRunMeta(taskId, merged);
-    }
+    // Locked merge: the runner's bash set_status writes meta concurrently,
+    // so a naive read-spread-write would lose either field.
+    store.mergeRunMeta(taskId, { errorMessage: "Killed by user", status: "failed" });
     store.upsertTask({ ...task, status: "failed", completedAt: new Date().toISOString() });
     return jsonOk({ killed: true, taskId });
   }
 
   if (action === "launch") {
+    const agentResult = optAgent(body, "agent");
+    if (!agentResult.ok) return agentResult.error;
     try {
       const result = await doLaunch(
-        {
-          taskId,
-          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
-          model: optString(body, "model"),
-        },
+        { taskId, agent: agentResult.value ?? undefined, model: optString(body, "model") },
         store,
       );
       return jsonOk(result);

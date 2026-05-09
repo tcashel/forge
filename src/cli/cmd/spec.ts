@@ -404,6 +404,13 @@ export interface ImproveSpecResult {
 export async function improveSpec(taskId: string, store: ForgeStore): Promise<ImproveSpecResult> {
   const task = store.getTask(taskId);
   if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${taskId}".`, { exitCode: 1 });
+  if (task.status !== "draft") {
+    throw new CliError(
+      "BAD_STATE",
+      `Task ${taskId} is in state "${task.status}" — improve only runs on draft specs (rewriting a launched spec corrupts the snapshot the agent is implementing against).`,
+      { exitCode: 1 },
+    );
+  }
   const improve = await runAutoImprove(task, store);
   return { taskId: task.id, improve };
 }
