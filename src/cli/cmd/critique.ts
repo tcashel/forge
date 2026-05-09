@@ -107,6 +107,13 @@ export interface DoCritiqueResult {
 export async function doCritique(opts: DoCritiqueOpts, store: ForgeStore): Promise<DoCritiqueResult> {
   const task = store.getTask(opts.taskId);
   if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.taskId}".`, { exitCode: 1 });
+  if (task.status !== "draft") {
+    throw new CliError(
+      "BAD_STATE",
+      `Task ${opts.taskId} is in state "${task.status}" — critique only runs on draft specs.`,
+      { exitCode: 1 },
+    );
+  }
 
   const repoConfig = store.getRepoConfig(task.repoRoot);
   const repo = detectRepo(task.repoRoot);
