@@ -143,9 +143,7 @@ function renderChangesSection(input: PrBodyInput): string | null {
   lines.push(overviewLine);
 
   if (statParts.length > 0 && input.filesChanged != null) {
-    lines.push(
-      `- ${statParts.join(" / ")} across ${input.filesChanged} file${input.filesChanged === 1 ? "" : "s"}`,
-    );
+    lines.push(`- ${statParts.join(" / ")} across ${input.filesChanged} file${input.filesChanged === 1 ? "" : "s"}`);
   }
 
   if (commitCount > 0) {
