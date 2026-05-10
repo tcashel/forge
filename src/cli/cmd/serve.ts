@@ -22,6 +22,7 @@ import {
   BadCwdError,
   createDraft as createPlanDraft,
   deleteDraft as deletePlanDraft,
+  isValidDraftId,
   loadHistory as loadPlanHistory,
   loadSkillPrompt,
   promoteDraft as promotePlanDraft,
@@ -735,6 +736,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   const draftHistoryMatch = pathname.match(/^\/api\/plan-chat\/draft\/([^/]+)\/history$/);
   if (draftHistoryMatch) {
     const draftId = decodeURIComponent(draftHistoryMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
     const history = loadPlanHistory(store.forgeDir, { kind: "draft", id: draftId });
     return jsonOk({ messages: history.messages });
   }
@@ -970,6 +972,7 @@ async function handleApiDelete(url: URL, ctx: RouteCtx): Promise<Response> {
   const draftRootMatch = pathname.match(DRAFT_ROOT_PATH);
   if (draftRootMatch) {
     const draftId = decodeURIComponent(draftRootMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
     abortInFlight({ kind: "draft", id: draftId });
     deletePlanDraft(store.forgeDir, draftId);
     return jsonOk({ ok: true });
@@ -997,6 +1000,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const draftAbortMatch = pathname.match(DRAFT_ABORT_PATH);
   if (draftAbortMatch) {
     const draftId = decodeURIComponent(draftAbortMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
     const killed = abortInFlight({ kind: "draft", id: draftId });
     return jsonOk({ aborted: killed, draftId });
   }
@@ -1038,6 +1042,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const draftMsgMatch = pathname.match(DRAFT_MSG_PATH);
   if (draftMsgMatch) {
     const draftId = decodeURIComponent(draftMsgMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
     // Drafts are filesystem-backed only; no DB row to validate against.
     // We still verify the draft folder exists so abort/promote stay sane.
     const draftRoot = path.join(store.forgeDir, "plan-drafts", draftId);
@@ -1069,6 +1074,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const draftPromoteMatch = pathname.match(DRAFT_PROMOTE_PATH);
   if (draftPromoteMatch) {
     const draftId = decodeURIComponent(draftPromoteMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
     const parsed = await readJsonBody(req);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;

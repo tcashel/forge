@@ -85,6 +85,20 @@ export function newDraftId(): string {
   return `d_${randomHex(8)}`;
 }
 
+const DRAFT_ID_RE = /^d_[0-9a-f]{8}$/;
+
+/**
+ * Strict format check matching `newDraftId()`'s output. Used by route
+ * handlers to reject malformed/path-traversal `draftId` values before
+ * any filesystem operation. `path.join(forgeDir, "plan-drafts", id)`
+ * normalizes `..` segments, so without this check a request like
+ * `DELETE /api/plan-chat/draft/%2e%2e%2f...` could escape the
+ * `plan-drafts` directory.
+ */
+export function isValidDraftId(s: string): boolean {
+  return DRAFT_ID_RE.test(s);
+}
+
 // ─── Path helpers ───────────────────────────────────────────────────────────
 
 function specChatDir(forgeDir: string, taskId: string): string {
@@ -320,12 +334,12 @@ export interface RunChatTurnOptions {
    */
   cwd?: string;
   /**
-   * Spawner override for tests — defaults to the real `claude` binary
-   * via `bash -lc`. Tests can swap in a stub that emits canned bytes.
-   * Receives the resolved `cwd` so tests can assert it was plumbed
-   * correctly.
+   * Spawner override for tests — defaults to spawning `claude` directly
+   * with argv (no shell). Tests can swap in a stub that emits canned
+   * bytes. Receives `(binary, args, cwd)` so tests can assert all three
+   * were plumbed correctly.
    */
-  spawnImpl?: (cmd: string, cwd?: string) => ChildProcess;
+  spawnImpl?: (binary: string, args: string[], cwd?: string) => ChildProcess;
 }
 
 /**
@@ -349,8 +363,12 @@ export interface RunChatTurnResult {
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
-function defaultSpawn(cmd: string, cwd?: string): ChildProcess {
-  return spawn("bash", ["-lc", cmd], { stdio: ["ignore", "pipe", "pipe"], env: process.env, cwd });
+function defaultSpawn(binary: string, args: string[], cwd?: string): ChildProcess {
+  // argv-style spawn (no shell). The prompt file is piped to stdin from
+  // Node in `runChatTurn` rather than via `< file` shell redirection so
+  // the entire command is structurally injection-free — `model` and any
+  // other field land as discrete argv entries that bash never sees.
+  return spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd });
 }
 
 function nextTurnNumber(chatDir: string): number {
@@ -463,14 +481,32 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
 
   // 3. Spawn claude in stream-json mode so we can surface tool-use
   //    activity in the UI. `--verbose` is required when output-format is
-  //    stream-json (claude rejects it otherwise). The prompt is fed via
-  //    stdin (default `--input-format text`) using shell redirection.
-  const escapedModel = model.replace(/"/g, '\\"');
-  const escapedPath = promptFile.replace(/"/g, '\\"');
-  const cmd =
-    `claude --print --output-format stream-json --verbose --include-partial-messages ` +
-    `--dangerously-skip-permissions --model "${escapedModel}" < "${escapedPath}"`;
-  const child = spawnFn(cmd, opts.cwd);
+  //    stream-json (claude rejects it otherwise). The prompt is piped to
+  //    stdin from Node — argv-only, no shell, so `model` cannot inject.
+  const args = [
+    "--print",
+    "--output-format",
+    "stream-json",
+    "--verbose",
+    "--include-partial-messages",
+    "--dangerously-skip-permissions",
+    "--model",
+    model,
+  ];
+  const child = spawnFn("claude", args, opts.cwd);
+
+  // Pipe the prompt file into claude's stdin. Defensive error handlers:
+  // claude may exit before consuming stdin (bad model, missing binary)
+  // and the resulting EPIPE / ENOENT must not crash the server — let
+  // the child's `error`/`close` handler surface the failure as an SSE
+  // `error` frame instead.
+  const childStdin = child.stdin;
+  if (childStdin) {
+    const promptStream = fs.createReadStream(promptFile);
+    promptStream.on("error", () => {});
+    childStdin.on("error", () => {});
+    promptStream.pipe(childStdin);
+  }
 
   const key = inFlightKey(scope);
   // If someone left a stale entry around (the abort handler ran but the
