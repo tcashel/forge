@@ -22,9 +22,7 @@ test("happy path: all gatherers return data → args JSON has expected shape", (
       { sha: "def5678", subject: "test(x): cover edge case" },
     ],
     gatherShortstat: () => ({ additions: 12, deletions: 3, filesChanged: 2 }),
-    gatherQualityResults: () => [
-      { command: "bun test", ok: true, durationMs: 1234 },
-    ],
+    gatherQualityResults: () => [{ command: "bun test", ok: true, durationMs: 1234 }],
   });
 
   assert.equal(args.specPath, "/tmp/forge-specs/task-abc.md");
@@ -101,9 +99,7 @@ test("jira fields propagate when set", () => {
 test("subjects with tabs or special chars round-trip via the injected gatherer", () => {
   const args = buildArgs({
     ...baseInput,
-    gatherCommits: () => [
-      { sha: "aaa", subject: "feat(x): subject with: colon and (parens)" },
-    ],
+    gatherCommits: () => [{ sha: "aaa", subject: "feat(x): subject with: colon and (parens)" }],
     gatherShortstat: () => ({ additions: null, deletions: null, filesChanged: null }),
     gatherQualityResults: () => [],
   });

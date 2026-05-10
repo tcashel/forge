@@ -178,6 +178,11 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
     // Mutable working copy — we replace `streamingBlocks.value` with a
     // shallow clone on every change so signal subscribers re-render.
     let workingBlocks: ChatBlock[] = [];
+    // Tracks each text block's slot in `workingBlocks` by SSE `blockId`,
+    // so back-to-back text blocks in the same turn don't overwrite each
+    // other (server emits one blockId per content block — see
+    // src/core/plan-chat.ts:610).
+    const textBlockIndexById = new Map<string, number>();
     const flush = () => {
       streamingBlocks.value = workingBlocks.slice();
     };
@@ -192,13 +197,16 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
             streamingMeta.value = meta;
           },
           onTextDelta: (e) => {
-            // Stream-json emits a fresh full snapshot per text block.
-            // If the current open block is text, replace it; otherwise
-            // open a new text block at the end.
-            const last = workingBlocks[workingBlocks.length - 1];
-            if (last && last.type === "text") {
-              workingBlocks = workingBlocks.slice(0, -1).concat({ type: "text", text: e.text });
+            // Stream-json emits a fresh full snapshot per text block, keyed
+            // by `blockId`. Replace the slot for that blockId if we've seen
+            // it before; otherwise append a new text block and remember
+            // its index. This preserves earlier text blocks when the
+            // assistant emits multiple text blocks back-to-back.
+            const existingIdx = textBlockIndexById.get(e.blockId);
+            if (existingIdx !== undefined) {
+              workingBlocks = workingBlocks.map((b, i) => (i === existingIdx ? { type: "text", text: e.text } : b));
             } else {
+              textBlockIndexById.set(e.blockId, workingBlocks.length);
               workingBlocks = workingBlocks.concat({ type: "text", text: e.text });
             }
             flush();
