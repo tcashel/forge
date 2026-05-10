@@ -31,20 +31,66 @@ export function openLogStream(taskId: string, lines: number, handlers: LogStream
 // ─── Chat SSE (POST + streamed response) ────────────────────────────────────
 // EventSource is GET-only, so the planner-chat endpoints (which POST a
 // JSON body) need a manual fetch + ReadableStream parser. We implement a
-// minimal SSE event splitter on top of `Response.body`. The stream emits
-// three event types per turn:
-//   - `event: delta`  data: {"text": "..."}        — incremental output
-//   - `event: done`   data: {"messageId","fullText"} — final ack
-//   - `event: error`  data: {"message": "..."}     — fatal failure
+// minimal SSE event splitter on top of `Response.body`. The server emits
+// the following event vocabulary per turn:
+//   - `event: meta`        data: {sessionId, model, cwd, tools}
+//   - `event: text`        data: {blockId, text, append}
+//   - `event: tool_use`    data: {toolUseId, name, input}
+//   - `event: tool_result` data: {toolUseId, output, isError, truncated}
+//   - `event: rate_limit`  data: {status, resetsAt}
+//   - `event: done`        data: {messageId, fullText, durationMs?, totalCostUsd?, numTurns?}
+//   - `event: error`       data: {message}
 //
 // Listeners get fine-grained callbacks; the returned promise resolves
 // after the stream closes (regardless of done/error). Callers pass an
 // `AbortSignal` to cancel — it triggers the underlying `fetch` abort,
 // which the server interprets as "kill the spawned claude".
 
+export interface ChatMeta {
+  sessionId: string | null;
+  model: string | null;
+  cwd: string | null;
+  tools: string[];
+}
+export interface ChatTextEvent {
+  blockId: string;
+  text: string;
+  append: boolean;
+}
+export interface ChatToolUseEvent {
+  toolUseId: string;
+  name: string;
+  input: unknown;
+}
+export interface ChatToolResultEvent {
+  toolUseId: string;
+  output: string;
+  isError: boolean;
+  truncated: boolean;
+}
+export interface ChatRateLimit {
+  status: string | null;
+  resetsAt: number | null;
+}
+export interface ChatDoneEvent {
+  messageId: string;
+  fullText: string;
+  durationMs: number | null;
+  totalCostUsd: number | null;
+  numTurns: number | null;
+}
+
 export interface ChatStreamListeners {
-  onDelta: (text: string) => void;
-  onDone: (final: { messageId: string; fullText: string }) => void;
+  /** Back-compat alias receiving the latest text snapshot for callers that
+   *  don't care about block boundaries. Invoked alongside `onTextDelta`
+   *  with the full current text of the active block. */
+  onDelta?: (text: string) => void;
+  onMeta?: (meta: ChatMeta) => void;
+  onTextDelta?: (e: ChatTextEvent) => void;
+  onToolUse?: (e: ChatToolUseEvent) => void;
+  onToolResult?: (e: ChatToolResultEvent) => void;
+  onRateLimit?: (e: ChatRateLimit) => void;
+  onDone: (final: ChatDoneEvent) => void;
   onError: (message: string) => void;
 }
 
@@ -147,32 +193,85 @@ export async function startChatStream(opts: StartChatStreamOptions): Promise<voi
   }
   try {
     for await (const evt of parseSseStream(res.body)) {
-      if (evt.event === "delta") {
-        try {
-          const parsed = JSON.parse(evt.data) as { text?: string };
-          if (typeof parsed.text === "string") listeners.onDelta(parsed.text);
-        } catch {
-          /* skip malformed frame */
-        }
-      } else if (evt.event === "done") {
-        try {
-          const parsed = JSON.parse(evt.data) as { messageId?: string; fullText?: string };
-          listeners.onDone({ messageId: parsed.messageId ?? "", fullText: parsed.fullText ?? "" });
-        } catch {
-          /* still treat as done with empty payload */
-          listeners.onDone({ messageId: "", fullText: "" });
-        }
-      } else if (evt.event === "error") {
-        try {
-          const parsed = JSON.parse(evt.data) as { message?: string };
-          listeners.onError(parsed.message || "stream error");
-        } catch {
-          listeners.onError("stream error");
-        }
-      }
+      dispatchChatEvent(evt, listeners);
     }
   } catch (e) {
     if (signal?.aborted) return;
     listeners.onError(e instanceof Error ? e.message : String(e));
   }
 }
+
+function safeParse<T>(data: string): T | null {
+  try {
+    return JSON.parse(data) as T;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Map a single SSE frame onto the typed listener vocabulary. Exported so
+ * unit tests can drive it directly with a captured fixture without
+ * spinning up a fetch / ReadableStream.
+ */
+export function dispatchChatEvent(evt: SseEvent, listeners: ChatStreamListeners): void {
+  if (evt.event === "meta") {
+    const parsed = safeParse<Partial<ChatMeta>>(evt.data);
+    if (!parsed) return;
+    listeners.onMeta?.({
+      sessionId: typeof parsed.sessionId === "string" ? parsed.sessionId : null,
+      model: typeof parsed.model === "string" ? parsed.model : null,
+      cwd: typeof parsed.cwd === "string" ? parsed.cwd : null,
+      tools: Array.isArray(parsed.tools) ? parsed.tools.filter((t): t is string => typeof t === "string") : [],
+    });
+  } else if (evt.event === "text") {
+    const parsed = safeParse<Partial<ChatTextEvent>>(evt.data);
+    if (!parsed || typeof parsed.text !== "string") return;
+    const ev: ChatTextEvent = {
+      blockId: typeof parsed.blockId === "string" ? parsed.blockId : "",
+      text: parsed.text,
+      append: parsed.append === true,
+    };
+    listeners.onTextDelta?.(ev);
+    listeners.onDelta?.(ev.text);
+  } else if (evt.event === "tool_use") {
+    const parsed = safeParse<Partial<ChatToolUseEvent>>(evt.data);
+    if (!parsed || typeof parsed.toolUseId !== "string" || typeof parsed.name !== "string") return;
+    listeners.onToolUse?.({ toolUseId: parsed.toolUseId, name: parsed.name, input: parsed.input });
+  } else if (evt.event === "tool_result") {
+    const parsed = safeParse<Partial<ChatToolResultEvent>>(evt.data);
+    if (!parsed || typeof parsed.toolUseId !== "string") return;
+    listeners.onToolResult?.({
+      toolUseId: parsed.toolUseId,
+      output: typeof parsed.output === "string" ? parsed.output : "",
+      isError: parsed.isError === true,
+      truncated: parsed.truncated === true,
+    });
+  } else if (evt.event === "rate_limit") {
+    const parsed = safeParse<Partial<ChatRateLimit>>(evt.data);
+    if (!parsed) return;
+    listeners.onRateLimit?.({
+      status: typeof parsed.status === "string" ? parsed.status : null,
+      resetsAt: typeof parsed.resetsAt === "number" ? parsed.resetsAt : null,
+    });
+  } else if (evt.event === "done") {
+    const parsed = safeParse<Partial<ChatDoneEvent>>(evt.data);
+    listeners.onDone({
+      messageId: typeof parsed?.messageId === "string" ? parsed.messageId : "",
+      fullText: typeof parsed?.fullText === "string" ? parsed.fullText : "",
+      durationMs: typeof parsed?.durationMs === "number" ? parsed.durationMs : null,
+      totalCostUsd: typeof parsed?.totalCostUsd === "number" ? parsed.totalCostUsd : null,
+      numTurns: typeof parsed?.numTurns === "number" ? parsed.numTurns : null,
+    });
+  } else if (evt.event === "error") {
+    const parsed = safeParse<{ message?: string }>(evt.data);
+    listeners.onError(parsed?.message || "stream error");
+  } else if (evt.event === "delta") {
+    // Legacy event name (pre-stream-json). Forward to onDelta for any
+    // caller still reading from older servers.
+    const parsed = safeParse<{ text?: string }>(evt.data);
+    if (parsed && typeof parsed.text === "string") listeners.onDelta?.(parsed.text);
+  }
+}
+
+export type { SseEvent };

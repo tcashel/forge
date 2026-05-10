@@ -1,0 +1,6 @@
+{"type":"system","subtype":"init","cwd":"/tmp/fake-repo","session_id":"sess_abc","tools":["Read","Grep","Bash"],"model":"claude-opus-4-7","permissionMode":"bypassPermissions","uuid":"u_init"}
+{"type":"assistant","message":{"id":"msg_1","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Let me check the file."}],"stop_reason":null},"session_id":"sess_abc","uuid":"u_a1"}
+{"type":"assistant","message":{"id":"msg_2","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"tool_use","id":"tu_read1","name":"Read","input":{"file_path":"/tmp/fake-repo/README.md"}}],"stop_reason":null},"session_id":"sess_abc","uuid":"u_a2"}
+{"type":"user","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"tu_read1","content":[{"type":"text","text":"# Demo\n\nFake readme contents."}],"is_error":false}]},"session_id":"sess_abc","uuid":"u_u1"}
+{"type":"assistant","message":{"id":"msg_3","type":"message","role":"assistant","model":"claude-opus-4-7","content":[{"type":"text","text":"Found it. The README is short."}],"stop_reason":null},"session_id":"sess_abc","uuid":"u_a3"}
+{"type":"result","subtype":"success","is_error":false,"duration_ms":4200,"num_turns":2,"result":"Found it. The README is short.","total_cost_usd":0.0123,"session_id":"sess_abc","uuid":"u_done"}
