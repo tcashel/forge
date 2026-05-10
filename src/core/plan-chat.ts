@@ -29,6 +29,16 @@ import { withFileLock } from "./file-lock.ts";
 
 export type ChatRole = "user" | "assistant";
 
+/**
+ * Structured block of an assistant turn. The plain `text` field on
+ * `ChatMessage` is kept (concatenation of all text blocks) for backward
+ * compatibility with histories persisted before stream-json mode.
+ */
+export type ChatBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | { type: "tool_result"; toolUseId: string; output: string; isError: boolean; truncated?: boolean };
+
 export interface ChatMessage {
   /** "m_" + 8 hex chars */
   id: string;
@@ -36,6 +46,11 @@ export interface ChatMessage {
   text: string;
   /** ISO timestamp */
   ts: string;
+  /**
+   * Optional ordered sequence of blocks for assistant turns. When absent
+   * (legacy histories), renderers fall back to plain `text`.
+   */
+  blocks?: ChatBlock[];
 }
 
 export interface PlanHistory {
@@ -358,16 +373,57 @@ function turnPromptFile(chatDir: string, scope: ScopeRef, turn: number): string 
   return path.join(chatDir, name);
 }
 
+// ─── stream-json parsing ────────────────────────────────────────────────────
+
+/** Cap on a single tool_result `output` string before we mark it truncated. */
+const TOOL_RESULT_MAX_BYTES = 4 * 1024;
+
 /**
- * Spawn `claude` with the per-turn prompt, return an SSE-formatted
- * ReadableStream. The stream emits:
- *   - `event: delta data: {"text": "..."}` for each stdout chunk
- *   - `event: done  data: {"messageId": "...", "fullText": "..."}` on success
- *   - `event: error data: {"message": "..."}` on failure
+ * Stringify and truncate a tool_result `content` payload. Claude returns
+ * either a plain string or an array of `{type:"text",text:string}` blocks
+ * (occasionally with `image` blocks we don't care about here).
+ */
+export function summarizeToolResultContent(content: unknown): { output: string; truncated: boolean } {
+  let raw: string;
+  if (typeof content === "string") {
+    raw = content;
+  } else if (Array.isArray(content)) {
+    const parts: string[] = [];
+    for (const block of content) {
+      if (block && typeof block === "object" && (block as { type?: string }).type === "text") {
+        const t = (block as { text?: unknown }).text;
+        if (typeof t === "string") parts.push(t);
+      }
+    }
+    raw = parts.join("\n");
+  } else {
+    try {
+      raw = JSON.stringify(content);
+    } catch {
+      raw = String(content);
+    }
+  }
+  if (raw.length > TOOL_RESULT_MAX_BYTES) {
+    return { output: raw.slice(0, TOOL_RESULT_MAX_BYTES), truncated: true };
+  }
+  return { output: raw, truncated: false };
+}
+
+/**
+ * Spawn `claude` in stream-json mode and return an SSE-formatted
+ * ReadableStream. The stream emits a small typed vocabulary:
+ *   - `event: meta`        data: {sessionId, model, cwd, tools}
+ *   - `event: text`        data: {blockId, text, append}
+ *   - `event: tool_use`    data: {toolUseId, name, input}
+ *   - `event: tool_result` data: {toolUseId, output, isError, truncated}
+ *   - `event: rate_limit`  data: {status, resetsAt}
+ *   - `event: done`        data: {messageId, fullText, durationMs, totalCostUsd, numTurns}
+ *   - `event: error`       data: {message}
  *
  * Side effects: writes the user message to history before spawn, and the
- * assistant message after a clean `done`. Removes the per-turn prompt
- * file on success; keeps it on failure for debugging.
+ * assistant message (with both `text` and `blocks`) after a clean `done`.
+ * Removes the per-turn prompt file on success; keeps it on failure for
+ * debugging.
  */
 export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const { forgeDir, scope, message } = opts;
@@ -405,11 +461,15 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const promptFile = turnPromptFile(chatDir, scope, turnNum);
   atomicWriteText(promptFile, promptText);
 
-  // 3. Spawn claude. Mirrors agentCommand("claude", model, file) from
-  //    src/core/launch.ts:92.
+  // 3. Spawn claude in stream-json mode so we can surface tool-use
+  //    activity in the UI. `--verbose` is required when output-format is
+  //    stream-json (claude rejects it otherwise). The prompt is fed via
+  //    stdin (default `--input-format text`) using shell redirection.
   const escapedModel = model.replace(/"/g, '\\"');
   const escapedPath = promptFile.replace(/"/g, '\\"');
-  const cmd = `claude --print --dangerously-skip-permissions --model "${escapedModel}" < "${escapedPath}"`;
+  const cmd =
+    `claude --print --output-format stream-json --verbose --include-partial-messages ` +
+    `--dangerously-skip-permissions --model "${escapedModel}" < "${escapedPath}"`;
   const child = spawnFn(cmd, opts.cwd);
 
   const key = inFlightKey(scope);
@@ -432,9 +492,17 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
 
   const stream = new ReadableStream<Uint8Array>({
     start(controller) {
-      let stdoutBuf = "";
+      let lineBuf = "";
       let stderrBuf = "";
       let closed = false;
+      // Accumulator for the assistant turn we'll persist on `done`. Text
+      // blocks come as standalone content chunks (usually one per
+      // assistant message in non-partial mode); tool_use / tool_result
+      // pairs come from separate frames and we interleave them here.
+      const turnBlocks: ChatBlock[] = [];
+      // Track the index of the last open text block so partial text
+      // chunks can append rather than fragment into many tiny blocks.
+      let openTextIdx: number | null = null;
 
       const send = (event: string, data: unknown) => {
         if (closed) return;
@@ -458,10 +526,114 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       };
       cleanup = close;
 
+      const handleEvent = (evt: Record<string, unknown>) => {
+        const t = typeof evt.type === "string" ? evt.type : "";
+        if (t === "system" && evt.subtype === "init") {
+          const tools = Array.isArray(evt.tools) ? (evt.tools as unknown[]).filter((x) => typeof x === "string") : [];
+          send("meta", {
+            sessionId: typeof evt.session_id === "string" ? evt.session_id : null,
+            model: typeof evt.model === "string" ? evt.model : null,
+            cwd: typeof evt.cwd === "string" ? evt.cwd : null,
+            tools,
+          });
+          return;
+        }
+        if (t === "rate_limit_event") {
+          const info = (evt.rate_limit_info ?? {}) as Record<string, unknown>;
+          send("rate_limit", {
+            status: typeof info.status === "string" ? info.status : null,
+            resetsAt: typeof info.resetsAt === "number" ? info.resetsAt : null,
+          });
+          return;
+        }
+        if (t === "assistant") {
+          const msg = evt.message as { content?: unknown[]; id?: string } | undefined;
+          if (!msg || !Array.isArray(msg.content)) return;
+          for (const block of msg.content) {
+            if (!block || typeof block !== "object") continue;
+            const b = block as Record<string, unknown>;
+            if (b.type === "text" && typeof b.text === "string") {
+              const text = b.text;
+              // Treat each fresh text block as a standalone segment.
+              // Partial-message frames re-emit the same block id with
+              // accumulated text — we collapse them by replacing the
+              // current open block's content.
+              if (openTextIdx === null) {
+                turnBlocks.push({ type: "text", text });
+                openTextIdx = turnBlocks.length - 1;
+              } else {
+                const cur = turnBlocks[openTextIdx];
+                if (cur.type === "text") cur.text = text;
+              }
+              const blockId = `${msg.id ?? "msg"}_${openTextIdx}`;
+              send("text", { blockId, text, append: false });
+            } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
+              turnBlocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
+              // A tool_use ends any open text block — subsequent text
+              // chunks should start fresh below it.
+              openTextIdx = null;
+              send("tool_use", { toolUseId: b.id, name: b.name, input: b.input });
+            }
+          }
+          return;
+        }
+        if (t === "user") {
+          const msg = evt.message as { content?: unknown[] } | undefined;
+          if (!msg || !Array.isArray(msg.content)) return;
+          for (const block of msg.content) {
+            if (!block || typeof block !== "object") continue;
+            const b = block as Record<string, unknown>;
+            if (b.type === "tool_result" && typeof b.tool_use_id === "string") {
+              const { output, truncated } = summarizeToolResultContent(b.content);
+              const isError = b.is_error === true;
+              turnBlocks.push({
+                type: "tool_result",
+                toolUseId: b.tool_use_id,
+                output,
+                isError,
+                truncated: truncated || undefined,
+              });
+              send("tool_result", { toolUseId: b.tool_use_id, output, isError, truncated });
+            }
+          }
+          return;
+        }
+        if (t === "result") {
+          // Handled at child-close — we have the assistant message
+          // ready to persist regardless of whether `result` arrived
+          // first or got cut off.
+          return;
+        }
+        // Anything else (e.g. future event types) — ignore.
+      };
+
+      const flushLine = (line: string) => {
+        const trimmed = line.trim();
+        if (!trimmed) return;
+        let parsed: unknown;
+        try {
+          parsed = JSON.parse(trimmed);
+        } catch (e) {
+          // Skip malformed line — log to server stderr but don't kill the
+          // stream (forward-compatible with future event shapes).
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(`plan-chat: skipping malformed stream-json line: ${msg}\n`);
+          return;
+        }
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed)) {
+          handleEvent(parsed as Record<string, unknown>);
+        }
+      };
+
       child.stdout?.on("data", (chunk: Buffer) => {
-        const text = chunk.toString("utf-8");
-        stdoutBuf += text;
-        send("delta", { text });
+        lineBuf += chunk.toString("utf-8");
+        let nl = lineBuf.indexOf("\n");
+        while (nl !== -1) {
+          const line = lineBuf.slice(0, nl);
+          lineBuf = lineBuf.slice(nl + 1);
+          flushLine(line);
+          nl = lineBuf.indexOf("\n");
+        }
       });
 
       child.stderr?.on("data", (chunk: Buffer) => {
@@ -474,17 +646,29 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       });
 
       child.on("close", (code, signal) => {
+        // Drain any trailing partial line — some claude versions don't
+        // newline-terminate their final event.
+        if (lineBuf.length > 0) {
+          flushLine(lineBuf);
+          lineBuf = "";
+        }
         if (cancelled) {
           // Client disconnected; emit nothing, just tear down.
           close();
           return;
         }
-        if (code === 0 && stdoutBuf.length > 0) {
+        const fullText = turnBlocks
+          .filter((b): b is { type: "text"; text: string } => b.type === "text")
+          .map((b) => b.text)
+          .join("\n")
+          .trim();
+        if (code === 0 && (turnBlocks.length > 0 || fullText.length > 0)) {
           const assistantMsg: ChatMessage = {
             id: newMessageId(),
             role: "assistant",
-            text: stdoutBuf,
+            text: fullText,
             ts: new Date().toISOString(),
+            blocks: turnBlocks,
           };
           try {
             appendMessage(forgeDir, scope, assistantMsg);
@@ -494,13 +678,19 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
             } catch {
               /* noop */
             }
-            send("done", { messageId: assistantMsg.id, fullText: stdoutBuf });
+            send("done", {
+              messageId: assistantMsg.id,
+              fullText,
+              durationMs: null,
+              totalCostUsd: null,
+              numTurns: null,
+            });
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             send("error", { message: `failed to persist assistant message: ${msg}` });
           }
         } else {
-          // Non-zero exit OR no stdout — keep the prompt file for debug.
+          // Non-zero exit OR no content — keep the prompt file for debug.
           const why = signal
             ? `claude exited via signal ${signal}`
             : code !== 0

@@ -118,11 +118,22 @@ export interface PrsResponse {
 // Mirror of `ChatMessage` from src/core/plan-chat.ts. The web layer only
 // needs the structural shape; the role union is intentionally narrowed
 // to "user" | "assistant" since that's what the backend persists.
+//
+// `blocks` is the ordered sequence of text + tool_use + tool_result
+// segments emitted by claude in stream-json mode. Older histories
+// (persisted before stream-json was wired up) won't have it — renderers
+// fall back to plain `text` in that case.
+export type ChatBlock =
+  | { type: "text"; text: string }
+  | { type: "tool_use"; id: string; name: string; input: unknown }
+  | { type: "tool_result"; toolUseId: string; output: string; isError: boolean; truncated?: boolean };
+
 export interface ChatMessage {
   id: string;
   role: "user" | "assistant";
   text: string;
   ts: string;
+  blocks?: ChatBlock[];
 }
 
 export interface PlanHistoryResponse {

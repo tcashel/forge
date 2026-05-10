@@ -17,7 +17,7 @@ import * as path from "node:path";
 import { Readable } from "node:stream";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
-import { BadCwdError, runChatTurn } from "../src/core/plan-chat.ts";
+import { BadCwdError, type ChatMessage as ChatMsgType, loadHistory, runChatTurn } from "../src/core/plan-chat.ts";
 import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -483,4 +483,197 @@ test("POST /api/specs/:id/plan-chat surfaces BAD_CWD when the task's repoRoot is
   const text = await res.text();
   assert.match(text, /event: error/);
   assert.match(text, /repo not found at/);
+});
+
+// ─── stream-json parsing → SSE event vocabulary ─────────────────────────────
+//
+// Drives runChatTurn with a captured `claude --output-format stream-json`
+// fixture to verify the event taxonomy: meta, text, tool_use,
+// tool_result, done. The fixture lives in tests/fixtures/.
+
+interface ParsedFrame {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+function parseSseFrames(text: string): ParsedFrame[] {
+  const frames: ParsedFrame[] = [];
+  for (const raw of text.split("\n\n")) {
+    if (!raw.trim()) continue;
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const ln of raw.split("\n")) {
+      if (!ln || ln.startsWith(":")) continue;
+      const colon = ln.indexOf(":");
+      const field = colon === -1 ? ln : ln.slice(0, colon);
+      let value = colon === -1 ? "" : ln.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value;
+      else if (field === "data") dataLines.push(value);
+    }
+    if (dataLines.length === 0) continue;
+    try {
+      frames.push({ event, data: JSON.parse(dataLines.join("\n")) });
+    } catch {
+      /* skip */
+    }
+  }
+  return frames;
+}
+
+async function drainSse(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    out += dec.decode(value, { stream: true });
+  }
+  out += dec.decode();
+  return out;
+}
+
+function fixtureChild(jsonl: string, exitCode = 0): ReturnType<typeof makeStubChild> {
+  return makeStubChild({ stdout: jsonl, exitCode });
+}
+
+test("runChatTurn emits meta + text + done from a basic stream-json fixture", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-basic-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const fixture = fs.readFileSync(path.join(import.meta.dirname, "fixtures", "plan-chat-stream.jsonl"), "utf-8");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_basicfix" },
+      message: "say PING",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(fixture) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+
+    const eventNames = frames.map((f) => f.event);
+    assert.deepEqual(
+      eventNames,
+      ["meta", "rate_limit", "text", "done"],
+      `unexpected event sequence: ${eventNames.join(",")}`,
+    );
+
+    const meta = frames[0].data as { sessionId: string; cwd: string };
+    assert.equal(meta.cwd, "/Users/tcashel/repositories/forge");
+    assert.match(meta.sessionId, /^d9cd675e/);
+
+    const textEv = frames[2].data as { text: string; append: boolean };
+    assert.equal(textEv.text, "PING");
+    assert.equal(textEv.append, false);
+
+    const done = frames[3].data as { messageId: string; fullText: string };
+    assert.match(done.messageId, /^m_[0-9a-f]{8}$/);
+    assert.equal(done.fullText, "PING");
+
+    // Persisted assistant message has both text + blocks.
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_basicfix" });
+    const assistant = history.messages.find((m: ChatMsgType) => m.role === "assistant");
+    assert.ok(assistant, "assistant message must be persisted");
+    assert.equal(assistant!.text, "PING");
+    assert.ok(Array.isArray(assistant!.blocks) && assistant!.blocks!.length === 1);
+    assert.equal(assistant!.blocks![0].type, "text");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn surfaces tool_use + tool_result and persists block sequence", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-tools-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const fixture = fs.readFileSync(
+      path.join(import.meta.dirname, "fixtures", "plan-chat-stream-tools.jsonl"),
+      "utf-8",
+    );
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_toolfix0" },
+      message: "summarize the readme",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(fixture) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+    const eventNames = frames.map((f) => f.event);
+
+    // Order: meta, text, tool_use, tool_result, text, done
+    assert.deepEqual(
+      eventNames,
+      ["meta", "text", "tool_use", "tool_result", "text", "done"],
+      `unexpected event sequence: ${eventNames.join(",")}`,
+    );
+
+    const toolUse = frames[2].data as { toolUseId: string; name: string; input: { file_path: string } };
+    assert.equal(toolUse.toolUseId, "tu_read1");
+    assert.equal(toolUse.name, "Read");
+    assert.equal(toolUse.input.file_path, "/tmp/fake-repo/README.md");
+
+    const toolResult = frames[3].data as { toolUseId: string; output: string; isError: boolean };
+    assert.equal(toolResult.toolUseId, "tu_read1");
+    assert.equal(toolResult.isError, false);
+    assert.match(toolResult.output, /Demo/);
+
+    // Persisted blocks reflect text → tool_use → tool_result → text order.
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_toolfix0" });
+    const assistant = history.messages.find((m: ChatMsgType) => m.role === "assistant");
+    assert.ok(assistant && Array.isArray(assistant.blocks));
+    const kinds = assistant!.blocks!.map((b) => b.type);
+    assert.deepEqual(kinds, ["text", "tool_use", "tool_result", "text"]);
+    // Concatenated text fallback joins both text segments.
+    assert.match(assistant!.text, /Let me check the file\./);
+    assert.match(assistant!.text, /Found it/);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn skips malformed stream-json lines without aborting the stream", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-malformed-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    // Mix one bogus line in with valid frames so parsing must skip and
+    // continue. Without that resilience, a single torn frame would kill
+    // the SSE stream mid-flight.
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `not-json garbage`,
+      `{"type":"assistant","message":{"id":"msg_a","content":[{"type":"text","text":"hello"}]},"session_id":"sX"}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"hello","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_malform0" },
+      message: "hi",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(stdout) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const eventNames = parseSseFrames(sse).map((f) => f.event);
+    assert.deepEqual(eventNames, ["meta", "text", "done"]);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
 });
