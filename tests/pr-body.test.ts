@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { buildPrBody, parseAgentSummary, type PrBodyInput, stripFrontmatter } from "../src/core/pr-body.ts";
+import { buildPrBody, type PrBodyInput, parseAgentSummary, stripFrontmatter } from "../src/core/pr-body.ts";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
