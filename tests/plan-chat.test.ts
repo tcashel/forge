@@ -10,11 +10,14 @@
  */
 
 import { strict as assert } from "node:assert";
+import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { Readable } from "node:stream";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
+import { BadCwdError, runChatTurn } from "../src/core/plan-chat.ts";
 import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -321,4 +324,163 @@ test("POST /api/specs/:id/plan-chat/abort returns aborted: false when nothing in
   const { status, body } = await postJson(`${h.baseUrl}/api/specs/abort-noop/plan-chat/abort`);
   assert.equal(status, 200);
   assert.equal(body.data!.aborted, false);
+});
+
+// ─── runChatTurn cwd plumbing ───────────────────────────────────────────────
+//
+// These tests exercise the cwd validation + spawnImpl receiver directly,
+// without booting a full HTTP server. They use a stub child that ends
+// immediately with code 0 so the SSE stream completes on its own.
+
+interface StubChildOptions {
+  stdout?: string;
+  exitCode?: number;
+}
+
+function makeStubChild(opts: StubChildOptions = {}): EventEmitter & {
+  stdout: Readable;
+  stderr: Readable;
+  kill: (sig?: string) => boolean;
+} {
+  const emitter = new EventEmitter() as EventEmitter & {
+    stdout: Readable;
+    stderr: Readable;
+    kill: (sig?: string) => boolean;
+  };
+  emitter.stdout = Readable.from(Buffer.from(opts.stdout ?? "ok\n"));
+  emitter.stderr = Readable.from(Buffer.from(""));
+  emitter.kill = () => true;
+  // Defer the close event to the next tick so the consumer has time to
+  // wire up its `data` / `close` handlers in the ReadableStream start().
+  setImmediate(() => {
+    emitter.emit("close", opts.exitCode ?? 0, null);
+  });
+  return emitter;
+}
+
+test("runChatTurn rejects a missing cwd with BadCwdError before spawning", () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    let spawnCalls = 0;
+    assert.throws(
+      () =>
+        runChatTurn({
+          forgeDir,
+          scope: { kind: "draft", id: "d_doesntmatter" },
+          message: "hello",
+          cwd: path.join(tmpHome, "definitely-not-here"),
+          spawnImpl: () => {
+            spawnCalls++;
+            // Should never be reached.
+            return makeStubChild() as never;
+          },
+        }),
+      (err: unknown) => err instanceof BadCwdError && /repo not found at /.test((err as Error).message),
+    );
+    assert.equal(spawnCalls, 0, "spawnImpl must not run when cwd is invalid");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn rejects a relative cwd with BadCwdError", () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-rel-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    assert.throws(
+      () =>
+        runChatTurn({
+          forgeDir,
+          scope: { kind: "draft", id: "d_rel" },
+          message: "hi",
+          cwd: "relative/path",
+          spawnImpl: () => makeStubChild() as never,
+        }),
+      (err: unknown) => err instanceof BadCwdError,
+    );
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn forwards a valid cwd to spawnImpl", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-ok-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    let observedCwd: string | undefined;
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_okcwd001" },
+      message: "ping",
+      cwd: repoRoot,
+      spawnImpl: (_cmd, cwd) => {
+        observedCwd = cwd;
+        return makeStubChild({ stdout: "pong\n" }) as never;
+      },
+    });
+
+    // Drain the stream so the assistant message is persisted and the
+    // child's close handler fires (which is where in-flight cleanup
+    // happens). We don't assert on the SSE shape here — the existing
+    // tests cover that path.
+    const reader = result.stream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    assert.equal(observedCwd, repoRoot, "spawnImpl received the resolved cwd");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/plan-chat/draft/:id/message with bogus repoRoot returns SSE error event", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+
+  const bogus = path.join(h.tmpHome, "no-such-repo");
+  const res = await fetch(`${h.baseUrl}/api/plan-chat/draft/${draftId}/message`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ message: "hi", repoRoot: bogus }),
+  });
+  // The error is reported via the SSE stream, not as a 4xx status — the
+  // fetch itself succeeds with a single `event: error` frame.
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const text = await res.text();
+  assert.match(text, /event: error/);
+  assert.match(text, /repo not found at/);
+  assert.match(text, new RegExp(bogus.replace(/[/\\.+*?()[\]{}|^$]/g, "\\$&")));
+});
+
+test("POST /api/specs/:id/plan-chat surfaces BAD_CWD when the task's repoRoot is gone", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Point the task at a directory that doesn't exist on disk so the
+  // server-side cwd resolution falls into BAD_CWD without us having to
+  // mock the dropdown.
+  const ghostRoot = path.join(h.tmpHome, "ghost-repo");
+  makeDraftTask(h.store, "ghost-cwd", ghostRoot, "feat(demo): ghost");
+
+  const res = await fetch(`${h.baseUrl}/api/specs/ghost-cwd/plan-chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ message: "hi" }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const text = await res.text();
+  assert.match(text, /event: error/);
+  assert.match(text, /repo not found at/);
 });

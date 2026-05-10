@@ -48,9 +48,20 @@ interface PlannerChatProps {
   /** Optional callback for the "Apply to spec" affordance — only the
    *  draft-scope mount in NewSpecModal wires this up. */
   onApply?: (markdown: string) => void;
+  /**
+   * Absolute path of the repo the planner subprocess should run in.
+   *
+   * - **Draft scope**: required for the spawned `claude` to explore the
+   *   right tree. Without it the server falls back to `process.cwd()`,
+   *   which is almost always wrong (= the directory `forge serve` was
+   *   launched from).
+   * - **Spec scope**: optional. The server resolves `repoRoot` from
+   *   the task record, so passing it is a no-op symmetry with draft.
+   */
+  repoRoot?: string;
 }
 
-export function PlannerChat({ scope, id, onApply }: PlannerChatProps) {
+export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) {
   // Server-side history (hydrated on mount + after each turn). Local
   // signals only — no global signal, since two modals could coexist
   // (Plan tab open + new-spec modal in the future).
@@ -157,7 +168,7 @@ export function PlannerChat({ scope, id, onApply }: PlannerChatProps) {
     try {
       await startChatStream({
         url: messageUrl(scope, id),
-        body: { message: text },
+        body: repoRoot ? { message: text, repoRoot } : { message: text },
         signal: controller.signal,
         listeners: {
           onDelta: (chunk) => {

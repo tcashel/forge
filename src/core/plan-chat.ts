@@ -296,10 +296,35 @@ export interface RunChatTurnOptions {
   /** Optional spec body to seed the planner with task context. */
   specBody?: string | null;
   /**
+   * Working directory for the spawned `claude` subprocess. Should be the
+   * selected repo's root so the planner explores the right tree. If
+   * omitted the child inherits the server's `process.cwd()` — preserved
+   * for backward-compat but almost certainly the wrong directory in
+   * production (forge serve is launched from forge's own checkout).
+   * Validated by `runChatTurn`: must be an absolute path that exists.
+   */
+  cwd?: string;
+  /**
    * Spawner override for tests — defaults to the real `claude` binary
    * via `bash -lc`. Tests can swap in a stub that emits canned bytes.
+   * Receives the resolved `cwd` so tests can assert it was plumbed
+   * correctly.
    */
-  spawnImpl?: (cmd: string) => ChildProcess;
+  spawnImpl?: (cmd: string, cwd?: string) => ChildProcess;
+}
+
+/**
+ * Tagged error thrown by `runChatTurn` when an explicit `cwd` is invalid
+ * (relative path or missing on disk). Route handlers convert this to a
+ * clean SSE `error` event so the user gets "repo not found at <path>"
+ * instead of an opaque spawn failure.
+ */
+export class BadCwdError extends Error {
+  readonly code = "BAD_CWD" as const;
+  constructor(message: string) {
+    super(message);
+    this.name = "BadCwdError";
+  }
 }
 
 export interface RunChatTurnResult {
@@ -309,8 +334,8 @@ export interface RunChatTurnResult {
 
 const DEFAULT_MODEL = "claude-opus-4-7";
 
-function defaultSpawn(cmd: string): ChildProcess {
-  return spawn("bash", ["-lc", cmd], { stdio: ["ignore", "pipe", "pipe"], env: process.env });
+function defaultSpawn(cmd: string, cwd?: string): ChildProcess {
+  return spawn("bash", ["-lc", cmd], { stdio: ["ignore", "pipe", "pipe"], env: process.env, cwd });
 }
 
 function nextTurnNumber(chatDir: string): number {
@@ -349,6 +374,17 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const model = opts.model ?? DEFAULT_MODEL;
   const spawnFn = opts.spawnImpl ?? defaultSpawn;
 
+  // 0. Validate cwd up front so the caller can convert the failure into
+  //    a clean SSE error frame before any history side-effects land.
+  if (opts.cwd !== undefined) {
+    if (!path.isAbsolute(opts.cwd)) {
+      throw new BadCwdError(`repo not found at ${opts.cwd} (not an absolute path)`);
+    }
+    if (!fs.existsSync(opts.cwd)) {
+      throw new BadCwdError(`repo not found at ${opts.cwd}`);
+    }
+  }
+
   // 1. Append the user message to history immediately so a refresh
   //    mid-stream still sees it.
   const userMsg: ChatMessage = {
@@ -374,7 +410,7 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const escapedModel = model.replace(/"/g, '\\"');
   const escapedPath = promptFile.replace(/"/g, '\\"');
   const cmd = `claude --print --dangerously-skip-permissions --model "${escapedModel}" < "${escapedPath}"`;
-  const child = spawnFn(cmd);
+  const child = spawnFn(cmd, opts.cwd);
 
   const key = inFlightKey(scope);
   // If someone left a stale entry around (the abort handler ran but the
