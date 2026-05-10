@@ -10,10 +10,11 @@
 import { type Signal, useSignal } from "@preact/signals";
 import { useEffect, useRef } from "preact/hooks";
 import { type ApiError, apiGet, apiPost } from "../../lib/api";
-import { startChatStream } from "../../lib/sse";
+import { type ChatMeta, type ChatRateLimit, startChatStream } from "../../lib/sse";
 import { showToast } from "../../lib/toast";
-import type { ChatMessage as ChatMessageType, PlanHistoryResponse } from "../../types";
+import type { ChatBlock, ChatMessage as ChatMessageType, PlanHistoryResponse } from "../../types";
 import { ChatMessage } from "./ChatMessage";
+import { ChatToolCard } from "./ChatToolCard";
 
 type Scope = "spec" | "draft";
 
@@ -67,7 +68,14 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
   // (Plan tab open + new-spec modal in the future).
   const messages = useSignal<ChatMessageType[]>([]);
   const draft = useSignal<string>("");
-  const streamingText = useSignal<string>("");
+  // Live blocks for the in-flight assistant turn. We mutate a single
+  // signal array so partial-text frames can update the open text block
+  // and tool_use / tool_result frames can land in order. Cleared on
+  // turn close — finalized blocks are appended via `messages` after
+  // history refresh.
+  const streamingBlocks = useSignal<ChatBlock[]>([]);
+  const streamingMeta = useSignal<ChatMeta | null>(null);
+  const streamingRate = useSignal<ChatRateLimit | null>(null);
   const isStreaming = useSignal<boolean>(false);
   const loading = useSignal<boolean>(true);
   const error = useSignal<string | null>(null);
@@ -114,7 +122,7 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
   // user is already near the bottom — preserves intentional scroll-up
   // for re-reading earlier replies.
   useEffect(() => {
-    void streamingText.value;
+    void streamingBlocks.value;
     void messages.value;
     const el = scrollRef.current;
     if (!el) return;
@@ -157,7 +165,9 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
     };
     messages.value = [...messages.value, userMsg];
 
-    streamingText.value = "";
+    streamingBlocks.value = [];
+    streamingMeta.value = null;
+    streamingRate.value = null;
     isStreaming.value = true;
     const controller = new AbortController();
     abortRef.current = controller;
@@ -165,18 +175,59 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
     let receivedDone = false;
     let receivedFullText = "";
 
+    // Mutable working copy — we replace `streamingBlocks.value` with a
+    // shallow clone on every change so signal subscribers re-render.
+    let workingBlocks: ChatBlock[] = [];
+    const flush = () => {
+      streamingBlocks.value = workingBlocks.slice();
+    };
+
     try {
       await startChatStream({
         url: messageUrl(scope, id),
         body: repoRoot ? { message: text, repoRoot } : { message: text },
         signal: controller.signal,
         listeners: {
-          onDelta: (chunk) => {
-            streamingText.value = streamingText.value + chunk;
+          onMeta: (meta) => {
+            streamingMeta.value = meta;
+          },
+          onTextDelta: (e) => {
+            // Stream-json emits a fresh full snapshot per text block.
+            // If the current open block is text, replace it; otherwise
+            // open a new text block at the end.
+            const last = workingBlocks[workingBlocks.length - 1];
+            if (last && last.type === "text") {
+              workingBlocks = workingBlocks.slice(0, -1).concat({ type: "text", text: e.text });
+            } else {
+              workingBlocks = workingBlocks.concat({ type: "text", text: e.text });
+            }
+            flush();
+          },
+          onToolUse: (e) => {
+            workingBlocks = workingBlocks.concat({ type: "tool_use", id: e.toolUseId, name: e.name, input: e.input });
+            flush();
+          },
+          onToolResult: (e) => {
+            workingBlocks = workingBlocks.concat({
+              type: "tool_result",
+              toolUseId: e.toolUseId,
+              output: e.output,
+              isError: e.isError,
+              truncated: e.truncated || undefined,
+            });
+            flush();
+          },
+          onRateLimit: (e) => {
+            streamingRate.value = e;
           },
           onDone: (final) => {
             receivedDone = true;
-            receivedFullText = final.fullText || streamingText.value;
+            const fallback = workingBlocks
+              .filter((b): b is { type: "text"; text: string } => b.type === "text")
+              .map((b) => b.text)
+              .join("\n")
+              .trim();
+            receivedFullText = final.fullText || fallback;
           },
           onError: (msg) => {
             error.value = msg;
@@ -186,7 +237,9 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
     } finally {
       isStreaming.value = false;
       abortRef.current = null;
-      streamingText.value = "";
+      streamingBlocks.value = [];
+      streamingMeta.value = null;
+      streamingRate.value = null;
       if (receivedDone) {
         // Refresh from disk so we get the server-assigned id + ts. If
         // the network round-trip fails (rare), fall back to splicing
@@ -241,7 +294,7 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
       const res = await fetch(url, { method: "DELETE" });
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       messages.value = [];
-      streamingText.value = "";
+      streamingBlocks.value = [];
       showToast("Plan-chat history wiped.", "info");
     } catch (e) {
       showToast(`Wipe failed: ${e instanceof Error ? e.message : String(e)}`, "error");
@@ -292,12 +345,7 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
           <ChatMessage key={m.id} m={m} />
         ))}
         {isStreaming.value ? (
-          <div class="chat-message assistant streaming">
-            <div class="chat-bubble">
-              {streamingText.value || <span class="chat-pending">thinking…</span>}
-              <span class="chat-cursor" />
-            </div>
-          </div>
+          <StreamingBubble blocks={streamingBlocks.value} meta={streamingMeta.value} rate={streamingRate.value} />
         ) : null}
         {error.value ? <div class="chat-error">{error.value}</div> : null}
       </div>
@@ -372,6 +420,65 @@ function ChatComposer(props: ChatComposerProps) {
             Send
           </button>
         )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Streaming bubble ──────────────────────────────────────────────────────
+// Renders the in-flight assistant turn: meta header (cwd · model), then
+// each block in order — text as markdown, tool_use as a collapsible card
+// pre-paired with its tool_result if one has arrived. A blinking cursor
+// trails the active text block; "thinking…" placeholder when nothing has
+// streamed yet.
+
+interface StreamingBubbleProps {
+  blocks: ChatBlock[];
+  meta: ChatMeta | null;
+  rate: ChatRateLimit | null;
+}
+
+function StreamingBubble({ blocks, meta, rate }: StreamingBubbleProps) {
+  // Pair tool_use → tool_result by id so the card opens with its output.
+  const resultsById = new Map<string, Extract<ChatBlock, { type: "tool_result" }>>();
+  for (const b of blocks) if (b.type === "tool_result") resultsById.set(b.toolUseId, b);
+
+  const segments = blocks.filter((b) => b.type !== "tool_result");
+  const hasContent = segments.length > 0;
+
+  return (
+    <div class="chat-message assistant streaming">
+      <div class="chat-bubble">
+        {meta ? (
+          <div class="chat-stream-meta">
+            <span class="chat-stream-meta-label">Working in</span>
+            <span class="chat-stream-meta-val">{meta.cwd ?? "(unknown cwd)"}</span>
+            {meta.model ? (
+              <>
+                <span class="chat-stream-meta-sep">·</span>
+                <span class="chat-stream-meta-val">{meta.model}</span>
+              </>
+            ) : null}
+          </div>
+        ) : null}
+        {!hasContent ? <span class="chat-pending">thinking…</span> : null}
+        {segments.map((b, i) => {
+          if (b.type === "text") {
+            return (
+              <p key={`t-${i}`} class="chat-stream-text">
+                {b.text}
+                {i === segments.length - 1 ? <span class="chat-cursor" /> : null}
+              </p>
+            );
+          }
+          if (b.type === "tool_use") {
+            return <ChatToolCard key={`tu-${b.id}`} use={b} result={resultsById.get(b.id) ?? null} />;
+          }
+          return null;
+        })}
+        {rate?.status && rate.status !== "allowed" ? (
+          <div class="chat-stream-rate">rate-limit: {rate.status}</div>
+        ) : null}
       </div>
     </div>
   );
