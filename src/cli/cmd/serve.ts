@@ -15,10 +15,32 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import type { GhTarget } from "../../core/gh.ts";
-import { fetchPrs } from "../../core/gh-pr.ts";
+import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
+import {
+  abortInFlight,
+  BadCwdError,
+  createDraft as createPlanDraft,
+  deleteDraft as deletePlanDraft,
+  isValidDraftId,
+  loadHistory as loadPlanHistory,
+  loadSkillPrompt,
+  promoteDraft as promotePlanDraft,
+  reapStalePlanChats,
+  runChatTurn,
+  type ScopeRef,
+  wipeHistory as wipePlanHistory,
+} from "../../core/plan-chat.ts";
 import { detectRepo } from "../../core/repo.ts";
-import type { CritiqueMeta, ForgeStore, RunMeta, TaskRecord, TaskStatus } from "../../core/store.ts";
+import type {
+  CritiqueMeta,
+  ForgeStore,
+  LaunchTarget,
+  ReasoningEffort,
+  RepoConfig,
+  TaskRecord,
+  TaskStatus,
+} from "../../core/store.ts";
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
@@ -58,6 +80,9 @@ interface TaskView {
   agentLabel: string | null;
   repo: string;
   repoRoot: string;
+  repoReachable: boolean;
+  repoHasGit: boolean;
+  repoStale: boolean;
   blurb: string | null;
   age: string;
   ageMs: number;
@@ -69,6 +94,55 @@ interface TaskView {
   hasLog: boolean;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
 }
+
+interface RepoView {
+  name: string;
+  root: string;
+  branch: string | null;
+  taskCount: number;
+  registered: boolean;
+  current: boolean;
+  reachable: boolean;
+  hasGit: boolean;
+  stale: boolean;
+}
+
+type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+
+const CONFIG_STRING_KEYS = new Set([
+  "ghUser",
+  "ghHost",
+  "jiraProject",
+  "jiraType",
+  "defaultModel",
+  "critiqueModelA",
+  "critiqueModelB",
+  "critiqueModelSynth",
+  "reviewerModel",
+  "fixerModel",
+  "improverModel",
+]);
+const CONFIG_AGENT_KEYS = new Set([
+  "defaultAgent",
+  "critiqueAgentA",
+  "critiqueAgentB",
+  "critiqueAgentSynth",
+  "reviewerAgent",
+  "fixerAgent",
+  "improverAgent",
+]);
+const CONFIG_EFFORT_KEYS = new Set([
+  "critiqueReasoningA",
+  "critiqueReasoningB",
+  "critiqueReasoningSynth",
+  "reviewerReasoningEffort",
+  "fixerReasoningEffort",
+  "improverReasoning",
+]);
+const CONFIG_BOOLEAN_KEYS = new Set(["autoFix", "autoImprove"]);
+const CONFIG_NUMBER_KEYS = new Set(["autoFixRounds"]);
+const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
+const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -183,6 +257,12 @@ function statusInfo(
           critique,
         };
       }
+      // Critics or synthesizer in flight — auto-improve / critique is
+      // actively running. Stay in drafting (the task isn't launched), but
+      // give the pill the running pulse so the user sees activity.
+      if (critiqueMeta?.status === "running_critics" || critiqueMeta?.status === "running_synth") {
+        return { section: "drafting", statLabel: "Improving", statClass: "running", error: null, critique };
+      }
       // "Ready" today = the auto-improver has already revised this spec
       // (specVersion > 1). It's a coarse signal but matches the prototype's
       // "auto-improve passed" framing without requiring a new field.
@@ -222,10 +302,74 @@ function specBranchInDisk(repoRoot: string): string | null {
   }
 }
 
+function repoDiskInfo(repoRoot: string): { reachable: boolean; hasGit: boolean; branch: string | null } {
+  if (!repoRoot || !path.isAbsolute(repoRoot) || !fs.existsSync(repoRoot)) {
+    return { reachable: false, hasGit: false, branch: null };
+  }
+  const detected = detectRepo(repoRoot);
+  return { reachable: true, hasGit: !!detected, branch: detected ? specBranchInDisk(detected.root) : null };
+}
+
 function ghTargetForRepo(store: ForgeStore, repoRoot: string): GhTarget | undefined {
   const cfg = store.getRepoConfig(repoRoot);
   if (!cfg.ghUser && !cfg.ghHost) return undefined;
   return { user: cfg.ghUser, host: cfg.ghHost };
+}
+
+function resolveConfigRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
+  if (repoName) {
+    const byRoot = repos.find((r) => r.root === repoName);
+    if (byRoot) return byRoot;
+    return repos.find((r) => r.name === repoName && !r.stale) ?? repos.find((r) => r.name === repoName) ?? null;
+  }
+  return repos.find((r) => r.current) ?? repos.find((r) => !r.stale) ?? repos[0] ?? null;
+}
+
+function validateConfigPatch(
+  input: unknown,
+): { ok: true; patch: Partial<RepoConfig> } | { ok: false; error: Response } {
+  if (input === null || typeof input !== "object" || Array.isArray(input)) {
+    return { ok: false, error: jsonErr(400, "BAD_REQUEST", "`config` must be an object.") };
+  }
+  const patch: Record<string, unknown> = {};
+  for (const [key, raw] of Object.entries(input)) {
+    if (
+      !CONFIG_STRING_KEYS.has(key) &&
+      !CONFIG_AGENT_KEYS.has(key) &&
+      !CONFIG_EFFORT_KEYS.has(key) &&
+      !CONFIG_BOOLEAN_KEYS.has(key) &&
+      !CONFIG_NUMBER_KEYS.has(key)
+    ) {
+      return { ok: false, error: jsonErr(400, "BAD_CONFIG_KEY", `Unsupported config key: ${key}`) };
+    }
+    if (raw === null || raw === "") {
+      patch[key] = undefined;
+      continue;
+    }
+    if (CONFIG_STRING_KEYS.has(key)) {
+      if (typeof raw !== "string") return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be a string.`) };
+      patch[key] = raw;
+    } else if (CONFIG_AGENT_KEYS.has(key)) {
+      if (typeof raw !== "string" || !VALID_AGENTS.includes(raw as LaunchTarget)) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be one of: ${VALID_AGENTS.join(", ")}.`) };
+      }
+      patch[key] = raw;
+    } else if (CONFIG_EFFORT_KEYS.has(key)) {
+      if (typeof raw !== "string" || !VALID_EFFORTS.includes(raw as ReasoningEffort)) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be one of: ${VALID_EFFORTS.join(", ")}.`) };
+      }
+      patch[key] = raw;
+    } else if (CONFIG_BOOLEAN_KEYS.has(key)) {
+      if (typeof raw !== "boolean") return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be boolean.`) };
+      patch[key] = raw;
+    } else if (CONFIG_NUMBER_KEYS.has(key)) {
+      if (typeof raw !== "number" || !Number.isInteger(raw) || raw < 1) {
+        return { ok: false, error: jsonErr(400, "BAD_VALUE", `${key} must be a positive integer.`) };
+      }
+      patch[key] = raw;
+    }
+  }
+  return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
 function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
@@ -234,6 +378,7 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
   const age = timeAgo(ageRef);
   const spec = store.getSpec(task.id);
   const blurb = spec ? blurbFromSpec(spec) : null;
+  const repoInfo = repoDiskInfo(task.repoRoot);
   return {
     id: task.id,
     title: task.title,
@@ -247,6 +392,9 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     agentLabel: agentLabel(task.agent, task.model),
     repo: task.repoName,
     repoRoot: task.repoRoot,
+    repoReachable: repoInfo.reachable,
+    repoHasGit: repoInfo.hasGit,
+    repoStale: !repoInfo.reachable || !repoInfo.hasGit,
     blurb,
     age: age.label,
     ageMs: age.ms,
@@ -258,6 +406,51 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     critique: info.critique,
   };
+}
+
+function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: string } | null): RepoView[] {
+  const byRoot = new Map<string, RepoView>();
+
+  const ensure = (input: {
+    name: string;
+    root: string;
+    taskCount?: number;
+    registered?: boolean;
+    current?: boolean;
+  }) => {
+    const info = repoDiskInfo(input.root);
+    const existing = byRoot.get(input.root);
+    const next: RepoView = {
+      name: input.name,
+      root: input.root,
+      branch: info.branch,
+      taskCount: (existing?.taskCount ?? 0) + (input.taskCount ?? 0),
+      registered: (existing?.registered ?? false) || input.registered === true,
+      current: (existing?.current ?? false) || input.current === true,
+      reachable: info.reachable,
+      hasGit: info.hasGit,
+      stale: !info.reachable || !info.hasGit,
+    };
+    if (existing && (existing.current || existing.registered) && !input.current) next.name = existing.name;
+    byRoot.set(input.root, next);
+  };
+
+  if (currentRepo) ensure({ ...currentRepo, registered: true, current: true });
+  for (const repo of store.getWorkbenchRepos()) ensure({ name: repo.name, root: repo.root, registered: true });
+
+  const counts = new Map<string, { name: string; root: string; count: number }>();
+  for (const t of store.getTasks()) {
+    const entry = counts.get(t.repoRoot) ?? { name: t.repoName, root: t.repoRoot, count: 0 };
+    entry.count += 1;
+    counts.set(t.repoRoot, entry);
+  }
+  for (const repo of counts.values()) ensure({ name: repo.name, root: repo.root, taskCount: repo.count });
+
+  return Array.from(byRoot.values()).sort((a, b) => {
+    if (a.current !== b.current) return a.current ? -1 : 1;
+    if (a.stale !== b.stale) return a.stale ? 1 : -1;
+    return b.taskCount - a.taskCount || a.name.localeCompare(b.name) || a.root.localeCompare(b.root);
+  });
 }
 
 // ─── response helpers ────────────────────────────────────────────────────────
@@ -407,6 +600,8 @@ function logSseResponse(logFile: string, initialLines: number): Response {
 interface RouteCtx {
   store: ForgeStore;
   webDir: string;
+  currentRepo: { name: string; root: string } | null;
+  prFetcher: PrFetcher;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -424,19 +619,26 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ ok: true, version: "0.4.0-dev" });
   }
 
+  // GET /api/workbench/context
+  if (pathname === "/api/workbench/context") {
+    return jsonOk({
+      currentRepo: ctx.currentRepo,
+      registeredRepos: store.getWorkbenchRepos(),
+      forgeDir: store.forgeDir,
+    });
+  }
+
   // GET /api/repos
   if (pathname === "/api/repos") {
-    const tasks = store.getTasks();
-    const counts = new Map<string, { name: string; root: string; count: number }>();
-    for (const t of tasks) {
-      const entry = counts.get(t.repoRoot) ?? { name: t.repoName, root: t.repoRoot, count: 0 };
-      entry.count += 1;
-      counts.set(t.repoRoot, entry);
-    }
-    const repos = Array.from(counts.values())
-      .map((r) => ({ name: r.name, root: r.root, branch: specBranchInDisk(r.root), taskCount: r.count }))
-      .sort((a, b) => b.taskCount - a.taskCount || a.name.localeCompare(b.name));
-    return jsonOk({ repos });
+    return jsonOk({ repos: buildRepoViews(store, ctx.currentRepo) });
+  }
+
+  // GET /api/config?repo=<name-or-root>
+  if (pathname === "/api/config") {
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolveConfigRepo(repos, url.searchParams.get("repo") || undefined);
+    if (!target) return jsonErr(404, "NO_REPO", "No repo is available for settings.");
+    return jsonOk({ repo: target, config: store.getRepoConfig(target.root) });
   }
 
   // GET /api/tasks?repo=<name>&section=<...>
@@ -519,34 +721,83 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
   }
 
+  // ── Planner chat — GETs ──────────────────────────────────────────────
+  // GET /api/specs/:id/plan-history → { messages: [...] }
+  const specPlanHistoryMatch = pathname.match(/^\/api\/specs\/([^/]+)\/plan-history$/);
+  if (specPlanHistoryMatch) {
+    const taskId = decodeURIComponent(specPlanHistoryMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const history = loadPlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    return jsonOk({ messages: history.messages });
+  }
+
+  // GET /api/plan-chat/draft/:draftId/history → { messages: [...] }
+  const draftHistoryMatch = pathname.match(/^\/api\/plan-chat\/draft\/([^/]+)\/history$/);
+  if (draftHistoryMatch) {
+    const draftId = decodeURIComponent(draftHistoryMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
+    const history = loadPlanHistory(store.forgeDir, { kind: "draft", id: draftId });
+    return jsonOk({ messages: history.messages });
+  }
+
   // GET /api/prs?repo=<name>
   if (pathname === "/api/prs") {
     const repoName = url.searchParams.get("repo") || undefined;
-    const repos = uniqueRepos(store);
-    const target = repoName ? repos.find((r) => r.name === repoName || r.root === repoName) : repos[0];
-    if (!target) return jsonOk({ prs: [], me: "" });
-    const result = await fetchPrs({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
-    return jsonOk({ prs: result.prs, me: result.me, repo: target.name });
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoName);
+    if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
+    const result = await ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    return jsonOk({ prs: result.prs, me: result.me, repo: target.name, repoRoot: target.root });
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
 }
 
-function uniqueRepos(store: ForgeStore): Array<{ name: string; root: string }> {
-  const seen = new Map<string, { name: string; root: string }>();
-  for (const t of store.getTasks()) {
-    if (!seen.has(t.repoRoot)) seen.set(t.repoRoot, { name: t.repoName, root: t.repoRoot });
-  }
-  return Array.from(seen.values());
+function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
+  const reachable = repos.filter((r) => !r.stale);
+  if (!repoName) return reachable[0] ?? repos[0] ?? null;
+
+  const exactRoot = repos.find((r) => r.root === repoName);
+  if (exactRoot) return exactRoot.stale ? null : exactRoot;
+
+  const byName = repos.filter((r) => r.name === repoName);
+  const reachableByName = byName.find((r) => !r.stale);
+  if (reachableByName) return reachableByName;
+  return null;
 }
 
 // ─── POST routes ─────────────────────────────────────────────────────────────
 
-const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|kill|resume)$/;
+const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
+const SPEC_PLAN_CHAT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat$/;
+const SPEC_PLAN_CHAT_ABORT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat\/abort$/;
+const SPEC_PLAN_HISTORY_PATH = /^\/api\/specs\/([^/]+)\/plan-history$/;
+const DRAFT_MSG_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/message$/;
+const DRAFT_ABORT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/abort$/;
+const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
+const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
+  if (pathname === "/api/repos") return true;
+  if (pathname === "/api/config") return true;
+  if (pathname === "/api/plan-chat/draft") return true;
+  if (
+    SPEC_PLAN_CHAT_PATH.test(pathname) ||
+    SPEC_PLAN_CHAT_ABORT_PATH.test(pathname) ||
+    DRAFT_MSG_PATH.test(pathname) ||
+    DRAFT_ABORT_PATH.test(pathname) ||
+    DRAFT_PROMOTE_PATH.test(pathname)
+  )
+    return true;
   return ACTION_TASK_PATH.test(pathname);
+}
+
+function allowsDelete(pathname: string): boolean {
+  if (SPEC_PLAN_HISTORY_PATH.test(pathname)) return true;
+  if (DRAFT_ROOT_PATH.test(pathname)) return true;
+  return false;
 }
 
 /** Map a CliError to an HTTP status. exitCode 1 = user error → 400 by default. */
@@ -601,12 +852,271 @@ function optString(body: Record<string, unknown>, key: string): string | undefin
   return typeof v === "string" && v.length > 0 ? v : undefined;
 }
 
+const VALID_ACTION_AGENTS = new Set(["claude", "codex", "opencode", "gemini"]);
+
+/** Returns: { ok: true, value } | { ok: false, error: Response } | { ok: true, value: undefined } when absent. */
+function optAgent(
+  body: Record<string, unknown>,
+  key: string,
+): { ok: true; value: TaskRecord["agent"] } | { ok: false; error: Response } {
+  const v = body[key];
+  if (v === undefined || v === null || v === "") return { ok: true, value: null };
+  if (typeof v !== "string" || !VALID_ACTION_AGENTS.has(v)) {
+    return {
+      ok: false,
+      error: jsonErr(400, "BAD_REQUEST", `\`${key}\` must be one of: ${Array.from(VALID_ACTION_AGENTS).join(", ")}.`),
+    };
+  }
+  return { ok: true, value: v as TaskRecord["agent"] };
+}
+
+// Statuses where a `kill` is meaningful — only running-family tasks. Killing
+// a `done`/`failed`/`draft` task would silently rewrite the completion record.
+const KILLABLE_STATUSES: Set<TaskStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
+
 async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
+  try {
+    return await dispatchApiPost(req, url, ctx);
+  } catch (e) {
+    // Last-resort net so bugs don't return Bun's default 500 page. CliErrors
+    // are caught at the per-action sites for accurate status mapping; this
+    // is for unexpected runtime errors (I/O, type errors, etc.).
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`forge serve: unhandled POST error: ${msg}\n`);
+    return jsonErr(500, "INTERNAL", `Unhandled server error: ${msg}`);
+  }
+}
+
+function getSpecBodyStripped(store: ForgeStore, taskId: string): string | null {
+  const raw = store.getSpec(taskId);
+  if (raw === null) return null;
+  return stripFrontmatter(raw);
+}
+
+function planChatSseResponse(opts: {
+  store: ForgeStore;
+  scope: ScopeRef;
+  message: string;
+  model?: string;
+  specBody: string | null;
+  cwd?: string;
+}): Response {
+  let turn: { stream: ReadableStream<Uint8Array>; abort: () => void };
+  try {
+    turn = runChatTurn({
+      forgeDir: opts.store.forgeDir,
+      scope: opts.scope,
+      message: opts.message,
+      model: opts.model,
+      specBody: opts.specBody,
+      cwd: opts.cwd,
+    });
+  } catch (e) {
+    // BAD_CWD is the only typed failure runChatTurn throws synchronously.
+    // Convert it to a clean single-frame SSE `error` stream so the
+    // browser sees the same shape as a runtime stream failure rather
+    // than a JSON 400 mid-`fetch`.
+    if (e instanceof BadCwdError) {
+      const payload = `event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(payload));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+          connection: "keep-alive",
+        },
+      });
+    }
+    throw e;
+  }
+  // Wrap so cancel() (client disconnect) tears down the spawned child.
+  // ReadableStream from runChatTurn already wires cancel → child.kill,
+  // but the SSE convention here adds the `x-accel-buffering: no` header.
+  return new Response(turn.stream, {
+    headers: {
+      "content-type": "text/event-stream",
+      "cache-control": "no-cache, no-transform",
+      "x-accel-buffering": "no",
+      connection: "keep-alive",
+    },
+  });
+}
+
+function resolveSpecModel(store: ForgeStore, taskId: string, override: string | undefined): string | undefined {
+  if (override) return override;
+  const task = store.getTask(taskId);
+  if (!task) return undefined;
+  const cfg = store.getRepoConfig(task.repoRoot);
+  return cfg.defaultModel ?? task.model ?? undefined;
+}
+
+async function handleApiDelete(url: URL, ctx: RouteCtx): Promise<Response> {
   const { pathname } = url;
   const { store } = ctx;
+
+  const specHistoryMatch = pathname.match(SPEC_PLAN_HISTORY_PATH);
+  if (specHistoryMatch) {
+    const taskId = decodeURIComponent(specHistoryMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    wipePlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    return jsonOk({ ok: true });
+  }
+
+  const draftRootMatch = pathname.match(DRAFT_ROOT_PATH);
+  if (draftRootMatch) {
+    const draftId = decodeURIComponent(draftRootMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
+    abortInFlight({ kind: "draft", id: draftId });
+    deletePlanDraft(store.forgeDir, draftId);
+    return jsonOk({ ok: true });
+  }
+
+  return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
+}
+
+async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
+  const { pathname } = url;
+  const { store } = ctx;
+
+  // ── Plan-chat dispatch (some routes are SSE, not JSON-bodied) ──────────
+  // POST /api/specs/:id/plan-chat/abort
+  const specAbortMatch = pathname.match(SPEC_PLAN_CHAT_ABORT_PATH);
+  if (specAbortMatch) {
+    const taskId = decodeURIComponent(specAbortMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const killed = abortInFlight({ kind: "spec", id: taskId });
+    return jsonOk({ aborted: killed, taskId });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/abort
+  const draftAbortMatch = pathname.match(DRAFT_ABORT_PATH);
+  if (draftAbortMatch) {
+    const draftId = decodeURIComponent(draftAbortMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
+    const killed = abortInFlight({ kind: "draft", id: draftId });
+    return jsonOk({ aborted: killed, draftId });
+  }
+
+  // POST /api/plan-chat/draft (mint a new draftId)
+  if (pathname === "/api/plan-chat/draft") {
+    const result = createPlanDraft(store.forgeDir);
+    return jsonOk(result);
+  }
+
+  // POST /api/specs/:id/plan-chat → SSE
+  const specChatMatch = pathname.match(SPEC_PLAN_CHAT_PATH);
+  if (specChatMatch) {
+    const taskId = decodeURIComponent(specChatMatch[1]);
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const message = reqString(body, "message");
+    if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
+    const model = resolveSpecModel(store, taskId, optString(body, "model"));
+    const specBody = getSpecBodyStripped(store, taskId);
+    // Spec scope: server resolves the working directory from the task
+    // record so the planner runs against the right repo regardless of
+    // where `forge serve` was launched. Falls through to runChatTurn's
+    // BAD_CWD validation if the task's repoRoot has been deleted.
+    return planChatSseResponse({
+      store,
+      scope: { kind: "spec", id: taskId },
+      message,
+      model,
+      specBody,
+      cwd: task.repoRoot,
+    });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/message → SSE
+  const draftMsgMatch = pathname.match(DRAFT_MSG_PATH);
+  if (draftMsgMatch) {
+    const draftId = decodeURIComponent(draftMsgMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
+    // Drafts are filesystem-backed only; no DB row to validate against.
+    // We still verify the draft folder exists so abort/promote stay sane.
+    const draftRoot = path.join(store.forgeDir, "plan-drafts", draftId);
+    if (!fs.existsSync(draftRoot)) {
+      return jsonErr(404, "UNKNOWN_DRAFT", `No plan-chat draft "${draftId}".`);
+    }
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const message = reqString(body, "message");
+    if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
+    const model = optString(body, "model");
+    // Draft scope has no task record yet, so the frontend must tell us
+    // which repo the planner should explore. When absent, we fall
+    // through to process.cwd() (legacy behavior) — runChatTurn will
+    // reject an explicit but invalid path with BAD_CWD.
+    const cwd = optString(body, "repoRoot");
+    return planChatSseResponse({
+      store,
+      scope: { kind: "draft", id: draftId },
+      message,
+      model,
+      specBody: null,
+      cwd,
+    });
+  }
+
+  // POST /api/plan-chat/draft/:draftId/promote
+  const draftPromoteMatch = pathname.match(DRAFT_PROMOTE_PATH);
+  if (draftPromoteMatch) {
+    const draftId = decodeURIComponent(draftPromoteMatch[1]);
+    if (!isValidDraftId(draftId)) return jsonErr(400, "BAD_DRAFT_ID", `Invalid draft id "${draftId}".`);
+    const parsed = await readJsonBody(req);
+    if ("error" in parsed) return parsed.error;
+    const body = parsed.body;
+    const taskId = reqString(body, "taskId");
+    if (!taskId) return jsonErr(400, "BAD_REQUEST", "`taskId` is required.");
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    try {
+      abortInFlight({ kind: "draft", id: draftId });
+      promotePlanDraft(store.forgeDir, draftId, taskId);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonErr(409, "PROMOTE_CONFLICT", msg);
+    }
+    return jsonOk({ ok: true, taskId, draftId });
+  }
+
+  // ── JSON-bodied POSTs ──────────────────────────────────────────────
   const parsed = await readJsonBody(req);
   if ("error" in parsed) return parsed.error;
   const body = parsed.body;
+
+  // POST /api/specs
+  if (pathname === "/api/repos") {
+    const repoRoot = reqString(body, "repoRoot");
+    if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
+    if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const repo = detectRepo(repoRoot);
+    if (!repo) return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
+    const record = store.registerWorkbenchRepo({ root: repo.root, name: repo.name });
+    return jsonOk({ repo: record });
+  }
+
+  if (pathname === "/api/config") {
+    const repoRoot = reqString(body, "repoRoot");
+    if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
+    if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const parsedPatch = validateConfigPatch(body.config);
+    if (!parsedPatch.ok) return parsedPatch.error;
+    store.setRepoConfig(repoRoot, parsedPatch.patch);
+    return jsonOk({ repoRoot, config: store.getRepoConfig(repoRoot) });
+  }
 
   // POST /api/specs
   if (pathname === "/api/specs") {
@@ -615,10 +1125,10 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
     if (!markdown) return jsonErr(400, "BAD_REQUEST", "`markdown` is required.");
     if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
     if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
+    const agentResult = optAgent(body, "agent");
+    if (!agentResult.ok) return agentResult.error;
     const repo = detectRepo(repoRoot);
-    if (!repo) {
-      return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
-    }
+    if (!repo) return jsonErr(400, "NOT_A_REPO", `Not a git repository: ${repoRoot}`);
     try {
       const result = await saveSpec(
         {
@@ -626,8 +1136,9 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
           repoRoot: repo.root,
           repoName: repo.name,
           title: optString(body, "title"),
-          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
+          agent: agentResult.value ?? undefined,
           model: optString(body, "model"),
+          autoImprove: body.autoImprove === false ? false : undefined,
         },
         store,
       );
@@ -655,29 +1166,30 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
   if (action === "kill") {
     const task = store.getTask(taskId);
     if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    if (!KILLABLE_STATUSES.has(task.status)) {
+      return jsonErr(
+        409,
+        "BAD_STATE",
+        `Task ${taskId} is in state "${task.status}" — only running tasks can be killed.`,
+      );
+    }
     if (!task.tmuxSession) {
       return jsonErr(400, "NO_TMUX_SESSION", `Task ${taskId} has no tmux session — it hasn't been launched.`);
     }
     killTmuxSession(task.tmuxSession);
-    // Merge errorMessage into existing meta so the failure card surfaces a
-    // clean reason. writeRunMeta is a full overwrite, so we read-then-write.
-    const existing = store.readRunMeta(taskId);
-    if (existing) {
-      const merged: RunMeta = { ...(existing as unknown as RunMeta), errorMessage: "killed from Workbench" };
-      store.writeRunMeta(taskId, merged);
-    }
+    // Locked merge: the runner's bash set_status writes meta concurrently,
+    // so a naive read-spread-write would lose either field.
+    store.mergeRunMeta(taskId, { errorMessage: "Killed by user", status: "failed" });
     store.upsertTask({ ...task, status: "failed", completedAt: new Date().toISOString() });
     return jsonOk({ killed: true, taskId });
   }
 
   if (action === "launch") {
+    const agentResult = optAgent(body, "agent");
+    if (!agentResult.ok) return agentResult.error;
     try {
       const result = await doLaunch(
-        {
-          taskId,
-          agent: (optString(body, "agent") as TaskRecord["agent"]) ?? undefined,
-          model: optString(body, "model"),
-        },
+        { taskId, agent: agentResult.value ?? undefined, model: optString(body, "model") },
         store,
       );
       return jsonOk(result);
@@ -697,6 +1209,32 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
     }
   }
 
+  if (action === "improve") {
+    const task = store.getTask(taskId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    if (task.status !== "draft") {
+      return jsonErr(
+        409,
+        "BAD_STATE",
+        `Task ${taskId} is in state "${task.status}" — improve only runs on draft specs.`,
+      );
+    }
+    // runImprover uses synchronous execSync to drive critic + synth + improver
+    // agents, which would block the entire Bun event loop for 1–2 minutes
+    // (every other request — health, polls, log SSE pumps — would queue
+    // behind it). Spawn a detached child running the equivalent CLI so the
+    // request returns immediately. The next 3s task poll picks up the
+    // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
+    const child = spawn(process.execPath, [process.argv[1], "spec", "improve", taskId, "--json"], {
+      cwd: task.repoRoot,
+      detached: true,
+      stdio: "ignore",
+      env: process.env,
+    });
+    child.unref();
+    return jsonOk({ taskId, queued: true, pid: child.pid });
+  }
+
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
 }
 
@@ -710,6 +1248,7 @@ export interface ServeOptions {
   port?: number;
   host?: string;
   open?: boolean;
+  prFetcher?: PrFetcher;
 }
 
 /**
@@ -717,7 +1256,40 @@ export interface ServeOptions {
  * spin up a server, hit it, and call `stop()` instead of fork-spawning
  * a subprocess.
  */
-export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port: number; stop: () => void } {
+/**
+ * Boot-time sweep: any critique-meta in `running_critics`/`running_synth`
+ * older than the threshold is almost certainly orphaned (the worker
+ * process died — server crashed mid-improve, terminal closed during a
+ * `forge spec save`, etc.). Mark it failed so the Workbench's
+ * "Improving" pulse pill doesn't stick forever.
+ *
+ * We can't use isTmuxSessionAlive as a liveness check because the sync
+ * improve path writes a tmuxSession in the meta but never actually
+ * creates that tmux session — only the async path does.
+ */
+const STALE_IMPROVE_MS = 10 * 60_000;
+function reapStaleCritiques(store: ForgeStore): number {
+  const now = Date.now();
+  let swept = 0;
+  for (const { taskId, critiqueId, meta } of store.getPendingCritiques()) {
+    if (meta.status !== "running_critics" && meta.status !== "running_synth") continue;
+    const startedMs = new Date(meta.startedAt).getTime();
+    if (Number.isNaN(startedMs)) continue;
+    if (now - startedMs < STALE_IMPROVE_MS) continue;
+    store.writeCritiqueMeta(taskId, critiqueId, {
+      ...meta,
+      status: "failed",
+      completedAt: new Date().toISOString(),
+    });
+    swept++;
+  }
+  return swept;
+}
+
+export async function startServer(
+  store: ForgeStore,
+  opts: ServeOptions = {},
+): Promise<{ port: number; stop: () => void }> {
   const port = opts.port ?? DEFAULT_PORT;
   const host = opts.host ?? DEFAULT_HOST;
 
@@ -730,7 +1302,69 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
     });
   }
 
-  const ctx: RouteCtx = { store, webDir };
+  const swept = reapStaleCritiques(store);
+  if (swept > 0) {
+    process.stderr.write(`forge serve: reaped ${swept} stale critique-meta record(s).\n`);
+  }
+
+  // Boot reaper for plan-chat subprocesses + stale prompt files.
+  const sweptPlanChats = reapStalePlanChats(store.forgeDir);
+  if (sweptPlanChats > 0) {
+    process.stderr.write(`forge serve: reaped ${sweptPlanChats} stale plan-chat artifact(s).\n`);
+  }
+
+  // Warm the SKILL prompt cache so the first /plan-chat doesn't pay a
+  // disk read on the SSE-spawn path. Best-effort; failure is logged but
+  // non-fatal (the chat endpoint will still try at request time).
+  try {
+    loadSkillPrompt();
+  } catch (e) {
+    process.stderr.write(`forge serve: failed to preload planner SKILL.md: ${e instanceof Error ? e.message : e}\n`);
+  }
+
+  // Periodic plan-chat reaper — every 60s. Cheap (in-memory map walk +
+  // shallow filesystem scan); guarantees stuck subprocesses are killed
+  // within ~6 minutes of becoming stale.
+  const planChatReaper = setInterval(() => {
+    try {
+      reapStalePlanChats(store.forgeDir);
+    } catch (e) {
+      process.stderr.write(`forge serve: plan-chat reaper error: ${e instanceof Error ? e.message : e}\n`);
+    }
+  }, 60_000);
+  // Don't keep the event loop alive just for the reaper.
+  if (typeof planChatReaper.unref === "function") planChatReaper.unref();
+
+  const webDistDir = path.join(webDir, "dist");
+  try {
+    fs.rmSync(webDistDir, { recursive: true, force: true });
+    fs.mkdirSync(webDistDir, { recursive: true });
+    const result = await Bun.build({
+      entrypoints: [path.join(webDir, "main.tsx")],
+      outdir: webDistDir,
+      target: "browser",
+      format: "esm",
+      minify: false,
+      sourcemap: "inline",
+      naming: "[name].js",
+    });
+    if (!result.success) {
+      console.error("[forge serve] web bundle failed:", result.logs);
+    }
+  } catch (e) {
+    console.error("[forge serve] web bundle threw:", e);
+    // Phase 6: bundle failure leaves /dist/main.js missing; the page
+    // will load with no JS and show a blank shell. Operator must fix
+    // the build error and re-run.
+  }
+
+  const detectedCurrentRepo = detectRepo(process.cwd());
+  const ctx: RouteCtx = {
+    store,
+    webDir,
+    currentRepo: detectedCurrentRepo ? { name: detectedCurrentRepo.name, root: detectedCurrentRepo.root } : null,
+    prFetcher: opts.prFetcher ?? fetchPrs,
+  };
 
   const server = Bun.serve({
     port,
@@ -752,7 +1386,7 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
           status: 204,
           headers: {
             "access-control-allow-origin": "*",
-            "access-control-allow-methods": "GET, POST, OPTIONS",
+            "access-control-allow-methods": "GET, POST, DELETE, OPTIONS",
             "access-control-allow-headers": "content-type",
           },
         });
@@ -761,6 +1395,9 @@ export function startServer(store: ForgeStore, opts: ServeOptions = {}): { port:
       if (pathname.startsWith("/api/")) {
         if (req.method === "POST" && allowsPost(pathname)) {
           return handleApiPost(req, url, ctx);
+        }
+        if (req.method === "DELETE" && allowsDelete(pathname)) {
+          return handleApiDelete(url, ctx);
         }
         if (req.method !== "GET") {
           return jsonErr(405, "METHOD_NOT_ALLOWED", `${req.method} not allowed for ${pathname}.`);
@@ -829,7 +1466,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const open = values.open === true;
   const json = values.json === true;
 
-  const { port, stop } = startServer(store, { port: portRaw, host });
+  const { port, stop } = await startServer(store, { port: portRaw, host });
   const url = `http://${host}:${port}`;
 
   if (json) {

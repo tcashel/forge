@@ -125,6 +125,15 @@ export interface RepoConfig {
 export interface RepoConfigFile {
   version: 1;
   repos: Record<string, RepoConfig>;
+  workbench?: {
+    registeredRepos?: Record<string, RegisteredWorkbenchRepo>;
+  };
+}
+
+export interface RegisteredWorkbenchRepo {
+  root: string;
+  name: string;
+  addedAt: string;
 }
 
 export interface CritiqueAgentMeta {
@@ -208,6 +217,30 @@ export class ForgeStore {
       file.repos[repoRoot] = { ...(file.repos[repoRoot] ?? {}), ...patch };
       this.writeRepoConfigFile(file);
     });
+  }
+
+  getWorkbenchRepos(): RegisteredWorkbenchRepo[] {
+    const repos = this.readRepoConfigFile().workbench?.registeredRepos ?? {};
+    return Object.values(repos).sort((a, b) => a.name.localeCompare(b.name) || a.root.localeCompare(b.root));
+  }
+
+  registerWorkbenchRepo(repo: { root: string; name: string }): RegisteredWorkbenchRepo {
+    const record: RegisteredWorkbenchRepo = {
+      root: repo.root,
+      name: repo.name,
+      addedAt: new Date().toISOString(),
+    };
+    withFileLock(`${this.repoConfigFile}.lock`, () => {
+      const file = this.readRepoConfigFile();
+      file.workbench ??= {};
+      file.workbench.registeredRepos ??= {};
+      file.workbench.registeredRepos[repo.root] = {
+        ...(file.workbench.registeredRepos[repo.root] ?? {}),
+        ...record,
+      };
+      this.writeRepoConfigFile(file);
+    });
+    return record;
   }
 
   readIndex(): ForgeIndex {
@@ -301,6 +334,23 @@ export class ForgeStore {
   writeRunMeta(taskId: string, meta: RunMeta): void {
     const p = path.join(this.runsDir, taskId, "meta.json");
     atomicWriteJSON(p, meta);
+  }
+
+  /**
+   * Merge a partial RunMeta patch into the existing file under a per-task
+   * lock so concurrent writers (the bash runner script's set_status, plus
+   * HTTP handlers like /api/tasks/:id/kill) can't lose updates. Returns
+   * the merged meta, or null if no meta exists yet.
+   */
+  mergeRunMeta(taskId: string, patch: Partial<RunMeta>): RunMeta | null {
+    const p = path.join(this.runsDir, taskId, "meta.json");
+    return withFileLock(`${p}.lock`, () => {
+      if (!fs.existsSync(p)) return null;
+      const current = JSON.parse(fs.readFileSync(p, "utf-8")) as RunMeta;
+      const merged: RunMeta = { ...current, ...patch };
+      atomicWriteJSON(p, merged);
+      return merged;
+    });
   }
 
   /** Read meta.json status and sync back to index if changed. Returns updated task or null. */

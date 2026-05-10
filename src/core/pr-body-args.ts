@@ -92,9 +92,7 @@ function gatherShortstat(baseRef: string): {
   }
 }
 
-function gatherQualityResults(
-  runDir: string,
-): Array<{ command: string; ok: boolean; durationMs: number }> {
+function gatherQualityResults(runDir: string): Array<{ command: string; ok: boolean; durationMs: number }> {
   const file = path.join(runDir, "quality.jsonl");
   try {
     if (!fs.existsSync(file)) return [];
@@ -146,9 +144,7 @@ export interface BuildArgsInput {
     deletions: number | null;
     filesChanged: number | null;
   };
-  gatherQualityResults?: (
-    runDir: string,
-  ) => Array<{ command: string; ok: boolean; durationMs: number }>;
+  gatherQualityResults?: (runDir: string) => Array<{ command: string; ok: boolean; durationMs: number }>;
 }
 
 export function buildArgs(opts: BuildArgsInput): BuiltArgs {

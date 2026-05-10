@@ -1,0 +1,55 @@
+import { viewMode } from "../signals/ui";
+import { NewSpecModal } from "./modal/NewSpecModal";
+import { PickupSection } from "./pickup/PickupSection";
+import { PrDetail } from "./prs/PrDetail";
+import { PrList } from "./prs/PrList";
+import { Sidebar } from "./Sidebar";
+import { SettingsForm } from "./settings/SettingsForm";
+import { SettingsRepoList } from "./settings/SettingsRepoList";
+import { Topbar } from "./Topbar";
+import { TaskDetail } from "./tasks/TaskDetail";
+import { TaskList } from "./tasks/TaskList";
+
+// Phase 5: Preact now owns the pickup/list/detail panes for all three
+// view modes (tasks / prs / settings). The new-spec modal is always
+// rendered by Preact and toggles via the `modalOpen` signal.
+//
+// The outer <section> / <aside> / <main> nodes keep their `id`s so
+// existing selectors (#pickup-section, #list-pane, #detail-pane) keep
+// resolving — just their *children* swap based on viewMode.
+//
+// Pickup section is hidden in PRs and Settings modes (legacy behaviour
+// hid pickup whenever the user navigated away from the tasks view).
+// The PR list pane gets the `pr-list-pane` class (and detail the
+// `pr-detail-pane` class) so the existing styles continue to apply.
+
+export function App() {
+  const mode = viewMode.value;
+  const inTasks = mode === "tasks";
+  const inPrs = mode === "prs";
+  const inSettings = mode === "settings";
+  const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}`;
+  const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}`;
+  return (
+    <div class="app">
+      <Sidebar />
+      <Topbar />
+      <div class="workspace-body">
+        <section class="pickup" id="pickup-section">
+          {inTasks ? <PickupSection /> : null}
+        </section>
+        <aside class={listPaneClass} id="list-pane">
+          {inTasks ? <TaskList /> : null}
+          {inPrs ? <PrList /> : null}
+          {inSettings ? <SettingsRepoList /> : null}
+        </aside>
+        <main class={detailPaneClass} id="detail-pane">
+          {inTasks ? <TaskDetail /> : null}
+          {inPrs ? <PrDetail /> : null}
+          {inSettings ? <SettingsForm /> : null}
+        </main>
+      </div>
+      <NewSpecModal />
+    </div>
+  );
+}

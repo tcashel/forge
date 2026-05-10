@@ -7,11 +7,13 @@
  */
 
 import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
+import type { GhFetchOpts, GhPr } from "../src/core/gh-pr.ts";
 import { ForgeStore } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -21,14 +23,16 @@ interface ServerHandle {
   tmpHome: string;
 }
 
-function bootServer(): ServerHandle {
+async function bootServer(
+  opts: { prFetcher?: (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }> } = {},
+): Promise<ServerHandle> {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-serve-"));
   const forgeDir = path.join(tmpHome, ".forge");
   try {
     // Pass forgeDir explicitly: os.homedir() is captured at process start
     // and won't pick up mid-run HOME tweaks, so we can't isolate via env.
     const store = new ForgeStore({ forgeDir });
-    const { port, stop } = startServer(store, { port: 0, host: "127.0.0.1" });
+    const { port, stop } = await startServer(store, { port: 0, host: "127.0.0.1", prFetcher: opts.prFetcher });
     return {
       baseUrl: `http://127.0.0.1:${port}`,
       store,
@@ -54,6 +58,12 @@ interface Envelope {
   data?: {
     tasks?: TaskView[];
     repos?: RepoView[];
+    repo?: RepoView;
+    registeredRepos?: RepoView[];
+    currentRepo?: { name: string; root: string };
+    prs?: GhPr[];
+    me?: string;
+    repoRoot?: string | null;
     task?: TaskView;
     body?: string;
     ok?: boolean;
@@ -77,7 +87,13 @@ interface TaskView {
 
 interface RepoView {
   name: string;
+  root: string;
   taskCount: number;
+  current?: boolean;
+  registered?: boolean;
+  reachable?: boolean;
+  hasGit?: boolean;
+  stale?: boolean;
   [k: string]: unknown;
 }
 
@@ -120,8 +136,35 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, repoName
   });
 }
 
+function fakePr(number: number): GhPr {
+  return {
+    number,
+    title: `PR ${number}`,
+    headRefName: `forge/pr-${number}`,
+    baseRefName: "main",
+    url: `https://github.com/acme/repo/pull/${number}`,
+    isDraft: true,
+    statusCheckRollup: "PENDING",
+    reviewDecision: "REVIEW_REQUIRED",
+    author: "alice",
+    updatedAt: new Date().toISOString(),
+    additions: 10,
+    deletions: 2,
+    changedFiles: 3,
+    commentsCount: 1,
+    reviewsCount: 0,
+    isMine: true,
+  };
+}
+
+function makeGitRepo(prefix: string): string {
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
+  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  return repo;
+}
+
 test("GET /api/health returns ok", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await getJson(`${h.baseUrl}/api/health`);
   assert.equal(status, 200);
@@ -130,17 +173,21 @@ test("GET /api/health returns ok", async (t) => {
 });
 
 test("GET / returns the workbench HTML", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const res = await fetch(`${h.baseUrl}/`);
   assert.equal(res.status, 200);
   const html = await res.text();
   assert.match(html, /Forge — Workbench/);
-  assert.match(html, /id="repo-popover"/);
+  // Phase 6: Preact owns the shell; index.html ships a bare <div id="app"/>
+  // and loads only the bundled module — no legacy /app.js any more.
+  assert.match(html, /<div id="app">/);
+  assert.match(html, /src="\/dist\/main\.js"/);
+  assert.doesNotMatch(html, /\/app\.js/);
 });
 
 test("empty index → /api/tasks returns []", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await getJson(`${h.baseUrl}/api/tasks`);
   assert.equal(status, 200);
@@ -148,16 +195,70 @@ test("empty index → /api/tasks returns []", async (t) => {
   assert.deepEqual(body.data!.tasks, []);
 });
 
-test("empty index → /api/repos returns []", async (t) => {
-  const h = bootServer();
+test("empty index → /api/repos still exposes the current repo context", async (t) => {
+  const h = await bootServer();
   t.after(() => h.stop());
   const { body } = await getJson(`${h.baseUrl}/api/repos`);
   assert.equal(body.ok, true);
-  assert.deepEqual(body.data!.repos, []);
+  assert.equal(body.data!.repos!.length >= 1, true);
+  const current = body.data!.repos!.find((r) => r.current);
+  assert.ok(current, "current repo should be present");
+  assert.equal(current.reachable, true);
+  assert.equal(current.hasGit, true);
+});
+
+test("GET /api/workbench/context returns current repo and registered repos", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/workbench/context`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.ok(body.data!.currentRepo);
+  assert.deepEqual(body.data!.registeredRepos, []);
+});
+
+test("GET /api/config returns current repo config", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  h.store.setRepoConfig(process.cwd(), { defaultAgent: "codex", defaultModel: "gpt-5-codex" });
+
+  const { status, body } = await getJson(`${h.baseUrl}/api/config`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.repo.root, process.cwd());
+  assert.deepEqual(body.data!.config, { defaultAgent: "codex", defaultModel: "gpt-5-codex" });
+});
+
+test("POST /api/config saves validated repo settings", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/config`, {
+    repoRoot: process.cwd(),
+    config: { defaultAgent: "claude", autoImprove: false, autoFixRounds: 2, ghHost: "github.com" },
+  });
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.config.defaultAgent, "claude");
+  assert.equal(body.data!.config.autoImprove, false);
+  assert.equal(body.data!.config.autoFixRounds, 2);
+  assert.equal(h.store.getRepoConfig(process.cwd()).ghHost, "github.com");
+});
+
+test("POST /api/config rejects invalid values", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/config`, {
+    repoRoot: process.cwd(),
+    config: { defaultAgent: "bad-agent" },
+  });
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "BAD_VALUE");
 });
 
 test("single draft → /api/tasks enriches with section + statLabel + blurb", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-foo", h.tmpHome, "demo", "feat(demo): add the thing");
   const { body } = await getJson(`${h.baseUrl}/api/tasks`);
@@ -173,7 +274,7 @@ test("single draft → /api/tasks enriches with section + statLabel + blurb", as
 });
 
 test("single draft → /api/tasks/:id returns full record", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-bar", h.tmpHome, "demo", "feat(demo): bar");
   const { body } = await getJson(`${h.baseUrl}/api/tasks/draft-bar`);
@@ -183,7 +284,7 @@ test("single draft → /api/tasks/:id returns full record", async (t) => {
 });
 
 test("/api/tasks/:id/spec returns markdown body", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-spec", h.tmpHome, "demo", "feat(demo): spec");
   const { body } = await getJson(`${h.baseUrl}/api/tasks/draft-spec/spec`);
@@ -192,7 +293,7 @@ test("/api/tasks/:id/spec returns markdown body", async (t) => {
 });
 
 test("unknown task id → 404 envelope", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await getJson(`${h.baseUrl}/api/tasks/nope`);
   assert.equal(status, 404);
@@ -201,7 +302,7 @@ test("unknown task id → 404 envelope", async (t) => {
 });
 
 test("repo filter returns only the requested repo's tasks", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-a", "/repo-a", "alpha", "feat(alpha): a");
   makeDraftTask(h.store, "draft-b", "/repo-b", "beta", "feat(beta): b");
@@ -212,7 +313,7 @@ test("repo filter returns only the requested repo's tasks", async (t) => {
 });
 
 test("/api/repos groups by repoRoot with a task count", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-a1", "/repo-a", "alpha", "feat(alpha): one");
   makeDraftTask(h.store, "draft-a2", "/repo-a", "alpha", "feat(alpha): two");
@@ -224,8 +325,140 @@ test("/api/repos groups by repoRoot with a task count", async (t) => {
   assert.equal(byName.get("beta")!.taskCount, 1);
 });
 
+test("POST /api/repos registers a git repo with no tasks", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), "forge-registered-repo-")));
+  execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
+  const { status, body } = await postJson(`${h.baseUrl}/api/repos`, { repoRoot: repo });
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.repo.root, repo);
+
+  const after = await getJson(`${h.baseUrl}/api/repos`);
+  const registered = after.body.data!.repos!.find((r) => r.root === repo);
+  assert.ok(registered, "registered repo should be listed");
+  assert.equal(registered.taskCount, 0);
+  assert.equal(registered.registered, true);
+  assert.equal(registered.stale, false);
+});
+
+test("POST /api/repos rejects non-git repoRoot", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), "forge-not-git-"));
+  const { status, body } = await postJson(`${h.baseUrl}/api/repos`, { repoRoot: repo });
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "NOT_A_REPO");
+});
+
+test("GET /api/prs uses current repo when there are no tasks", async (t) => {
+  let seenCwd = "";
+  const h = await bootServer({
+    prFetcher: async (opts) => {
+      seenCwd = opts.cwd ?? "";
+      return { prs: [fakePr(101)], me: "alice" };
+    },
+  });
+  t.after(() => h.stop());
+
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.prs!.length, 1);
+  assert.equal(body.data!.repoRoot, process.cwd());
+  assert.equal(seenCwd, process.cwd());
+});
+
+test("GET /api/prs resolves registered repo by absolute root", async (t) => {
+  const repo = makeGitRepo("forge-pr-registered-root-");
+  let seenCwd = "";
+  const h = await bootServer({
+    prFetcher: async (opts) => {
+      seenCwd = opts.cwd ?? "";
+      return { prs: [fakePr(202)], me: "alice" };
+    },
+  });
+  t.after(() => {
+    h.stop();
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+  h.store.registerWorkbenchRepo({ root: repo, name: path.basename(repo) });
+
+  const { body } = await getJson(`${h.baseUrl}/api/prs?repo=${encodeURIComponent(repo)}`);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.prs![0].number, 202);
+  assert.equal(body.data!.repoRoot, repo);
+  assert.equal(seenCwd, repo);
+});
+
+test("GET /api/prs resolves registered repo by name", async (t) => {
+  const repo = makeGitRepo("forge-pr-registered-name-");
+  let seenCwd = "";
+  const h = await bootServer({
+    prFetcher: async (opts) => {
+      seenCwd = opts.cwd ?? "";
+      return { prs: [fakePr(303)], me: "alice" };
+    },
+  });
+  t.after(() => {
+    h.stop();
+    fs.rmSync(repo, { recursive: true, force: true });
+  });
+  const name = path.basename(repo);
+  h.store.registerWorkbenchRepo({ root: repo, name });
+
+  const { body } = await getJson(`${h.baseUrl}/api/prs?repo=${encodeURIComponent(name)}`);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.prs![0].number, 303);
+  assert.equal(body.data!.repoRoot, repo);
+  assert.equal(seenCwd, repo);
+});
+
+test("GET /api/prs prefers reachable current repo over stale same-name task repo", async (t) => {
+  let seenCwd = "";
+  const h = await bootServer({
+    prFetcher: async (opts) => {
+      seenCwd = opts.cwd ?? "";
+      return { prs: [fakePr(404)], me: "alice" };
+    },
+  });
+  t.after(() => h.stop());
+  makeDraftTask(
+    h.store,
+    "stale-pr-repo",
+    path.join(h.tmpHome, "missing"),
+    path.basename(process.cwd()),
+    "feat(stale): old",
+  );
+
+  const { body } = await getJson(`${h.baseUrl}/api/prs?repo=${encodeURIComponent(path.basename(process.cwd()))}`);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.prs![0].number, 404);
+  assert.equal(body.data!.repoRoot, process.cwd());
+  assert.equal(seenCwd, process.cwd());
+});
+
+test("missing task repoRoot is marked stale in /api/repos and /api/tasks", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const missing = path.join(h.tmpHome, "missing-repo");
+  makeDraftTask(h.store, "stale-repo-task", missing, "missing", "feat(missing): stale");
+
+  const repos = await getJson(`${h.baseUrl}/api/repos`);
+  const staleRepo = repos.body.data!.repos!.find((r) => r.root === missing);
+  assert.ok(staleRepo, "stale repo should still be visible");
+  assert.equal(staleRepo!.reachable, false);
+  assert.equal(staleRepo!.hasGit, false);
+  assert.equal(staleRepo!.stale, true);
+
+  const tasks = await getJson(`${h.baseUrl}/api/tasks`);
+  const task = tasks.body.data!.tasks!.find((x) => x.id === "stale-repo-task");
+  assert.equal(task!.repoStale, true);
+});
+
 test("running task surfaces section=running + log file path", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   // Seed a running task by hand.
   const id = "run-baz";
@@ -264,7 +497,7 @@ test("running task surfaces section=running + log file path", async (t) => {
 });
 
 test("path traversal under / is blocked", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const res = await fetch(`${h.baseUrl}/../package.json`);
   // The browser/fetch will normalize the URL before sending; the ".." gets
@@ -284,7 +517,7 @@ test("path traversal under / is blocked", async (t) => {
 });
 
 test("POST is rejected on read endpoints", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const res = await fetch(`${h.baseUrl}/api/tasks`, { method: "POST" });
   assert.equal(res.status, 405);
@@ -311,7 +544,7 @@ async function postJson(url: string, body?: unknown): Promise<{ status: number; 
 }
 
 test("POST /api/specs rejects non-JSON content-type", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const res = await fetch(`${h.baseUrl}/api/specs`, {
     method: "POST",
@@ -324,7 +557,7 @@ test("POST /api/specs rejects non-JSON content-type", async (t) => {
 });
 
 test("POST /api/specs rejects body missing markdown", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/specs`, { repoRoot: "/tmp/foo" });
   assert.equal(status, 400);
@@ -333,7 +566,7 @@ test("POST /api/specs rejects body missing markdown", async (t) => {
 });
 
 test("POST /api/specs rejects relative repoRoot", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
     markdown: "# feat(x): y\n\nbody",
@@ -344,7 +577,7 @@ test("POST /api/specs rejects relative repoRoot", async (t) => {
 });
 
 test("POST /api/specs rejects non-git repoRoot", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
     markdown: "# feat(x): y\n\nbody",
@@ -355,7 +588,7 @@ test("POST /api/specs rejects non-git repoRoot", async (t) => {
 });
 
 test("POST /api/tasks/:id/launch returns 404 for unknown task", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/launch`, {});
   assert.equal(status, 404);
@@ -363,15 +596,141 @@ test("POST /api/tasks/:id/launch returns 404 for unknown task", async (t) => {
 });
 
 test("POST /api/tasks/:id/critique returns 404 for unknown task", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/critique`);
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
+test("POST /api/tasks/:id/improve returns 404 for unknown task", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/improve`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("POST /api/tasks/:id/improve queues a draft task (returns immediately, no event-loop block)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "improve-queue", h.tmpHome, "demo", "feat(demo): improvable");
+  const start = Date.now();
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/improve-queue/improve`);
+  const elapsed = Date.now() - start;
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.queued, true);
+  assert.equal(typeof body.data!.pid, "number");
+  // The whole point is to NOT block on the improve work — must return fast
+  // even though the spawned child is doing real work in another process.
+  assert.ok(elapsed < 2000, `expected fast response, got ${elapsed}ms`);
+});
+
+test("startServer reaps stale critique-meta on boot", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-reap-"));
+  const forgeDir = path.join(tmpHome, ".forge");
+  const store = new ForgeStore({ forgeDir });
+  // Seed a critique-meta in `running_critics` with a startedAt 30 minutes ago.
+  // We expect the reaper at startServer to mark it failed.
+  const taskId = "reap-target";
+  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): reap me");
+  const critiqueId = "crit-stale-001";
+  const dir = store.getCritiqueDir(taskId, critiqueId);
+  fs.mkdirSync(dir, { recursive: true });
+  const oldStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
+  store.writeCritiqueMeta(taskId, critiqueId, {
+    schemaVersion: 1,
+    taskId,
+    critiqueId,
+    specTitle: "feat(demo): reap me",
+    repoRoot: tmpHome,
+    repoName: "demo",
+    status: "running_critics",
+    startedAt: oldStartedAt,
+    completedAt: null,
+    viewedAt: null,
+    tmuxSession: "forge-crit-fake-stale",
+    criticA: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    synthesizer: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+  });
+
+  const { stop } = await startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  assert.equal(meta!.status, "failed");
+  assert.ok(meta!.completedAt, "reaped record should have a completedAt");
+});
+
+test("startServer leaves recent critique-meta alone (under stale threshold)", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-reap-recent-"));
+  const forgeDir = path.join(tmpHome, ".forge");
+  const store = new ForgeStore({ forgeDir });
+  const taskId = "recent-improving";
+  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): recent");
+  const critiqueId = "crit-recent-001";
+  const dir = store.getCritiqueDir(taskId, critiqueId);
+  fs.mkdirSync(dir, { recursive: true });
+  // 30 seconds ago — well under the 10-minute stale threshold.
+  const recentStartedAt = new Date(Date.now() - 30_000).toISOString();
+  store.writeCritiqueMeta(taskId, critiqueId, {
+    schemaVersion: 1,
+    taskId,
+    critiqueId,
+    specTitle: "feat(demo): recent",
+    repoRoot: tmpHome,
+    repoName: "demo",
+    status: "running_critics",
+    startedAt: recentStartedAt,
+    completedAt: null,
+    viewedAt: null,
+    tmuxSession: "forge-crit-fake-recent",
+    criticA: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    synthesizer: {
+      agent: "claude",
+      model: "claude-opus-4-7",
+      reasoningEffort: undefined,
+      status: "pending",
+      durationMs: null,
+    },
+  });
+
+  const { stop } = await startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  assert.equal(meta!.status, "running_critics", "recent record must not be reaped");
+});
+
 test("POST /api/tasks/:id/resume returns 501", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/anything/resume`);
   assert.equal(status, 501);
@@ -379,7 +738,7 @@ test("POST /api/tasks/:id/resume returns 501", async (t) => {
 });
 
 test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta", async (t) => {
-  const h = bootServer();
+  const h = await bootServer();
   t.after(() => h.stop());
 
   const id = "kill-target";
@@ -431,15 +790,123 @@ test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta",
   const task = h.store.getTask(id);
   assert.equal(task!.status, "failed");
   const meta = h.store.readRunMeta(id);
-  assert.equal(meta!.errorMessage, "killed from Workbench");
+  assert.equal(meta!.errorMessage, "Killed by user");
   assert.deepEqual(meta!.qualityResults, [{ command: "lint", ok: true, durationMs: 10 }]);
 });
 
-test("POST /api/tasks/:id/kill rejects when task has no tmux session", async (t) => {
-  const h = bootServer();
+test("POST /api/tasks/:id/kill rejects draft (non-running) tasks with 409", async (t) => {
+  const h = await bootServer();
   t.after(() => h.stop());
-  makeDraftTask(h.store, "nokill", h.tmpHome, "demo", "feat(demo): no session");
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill/kill`);
+  makeDraftTask(h.store, "nokill-draft", h.tmpHome, "demo", "feat(demo): draft");
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill-draft/kill`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+});
+
+test("POST /api/tasks/:id/kill rejects already-done tasks (no state corruption)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const id = "done-task";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): merged",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/done-task",
+    worktree: null,
+    status: "done", // already completed; tmuxSession is set but stale
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: now,
+    prUrl: "https://github.com/x/y/pull/1",
+    prNumber: 1,
+    tmuxSession: "forge-stale-99999", // never cleared on completion
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# done\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+  // Status must still be "done" — kill should not have touched it.
+  assert.equal(h.store.getTask(id)!.status, "done");
+});
+
+test("POST /api/specs rejects invalid agent value", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs`, {
+    markdown: "# feat(x): y\n\nbody",
+    repoRoot: "/tmp/foo",
+    agent: "rm -rf /",
+  });
   assert.equal(status, 400);
-  assert.equal(body.error!.code, "NO_TMUX_SESSION");
+  assert.equal(body.error!.code, "BAD_REQUEST");
+  assert.match(body.error!.message, /agent/);
+});
+
+test("POST /api/tasks/:id/improve rejects non-draft tasks with 409", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const id = "improve-running";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): improving running",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/improve-running",
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: "forge-x",
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# x\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/improve`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+});
+
+test("POST /api/tasks/:id/critique rejects non-draft tasks with 409", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const id = "critique-done";
+  const now = new Date().toISOString();
+  h.store.upsertTask({
+    id,
+    title: "feat(demo): critique on done",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/critique-done",
+    worktree: null,
+    status: "done",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: now,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# x\n"),
+    specVersion: 1,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/critique`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
 });

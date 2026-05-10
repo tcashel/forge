@@ -1,0 +1,804 @@
+/**
+ * forge serve — planner chat (Phase 7) endpoint smoke tests.
+ *
+ * Covers the JSON-bodied / non-SSE plan-chat routes: draft mint, history
+ * read, history wipe, draft promote. The actual SSE chat-turn path is
+ * NOT covered here because it spawns the real `claude` binary; those
+ * paths are exercised at the unit level in plan-chat.spawn.test.ts (TBD)
+ * with a stub spawn implementation, and end-to-end via the manual
+ * verification recipe in the Phase 7 plan.
+ */
+
+import { strict as assert } from "node:assert";
+import { EventEmitter } from "node:events";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
+import { Readable } from "node:stream";
+import { test } from "node:test";
+import { startServer } from "../src/cli/cmd/serve.ts";
+import { BadCwdError, type ChatMessage as ChatMsgType, loadHistory, runChatTurn } from "../src/core/plan-chat.ts";
+import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
+
+interface ServerHandle {
+  baseUrl: string;
+  stop: () => void;
+  store: ForgeStore;
+  tmpHome: string;
+  forgeDir: string;
+}
+
+async function bootServer(): Promise<ServerHandle> {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-plan-chat-"));
+  const forgeDir = path.join(tmpHome, ".forge");
+  try {
+    const store = new ForgeStore({ forgeDir });
+    const { port, stop } = await startServer(store, { port: 0, host: "127.0.0.1" });
+    return {
+      baseUrl: `http://127.0.0.1:${port}`,
+      store,
+      tmpHome,
+      forgeDir,
+      stop: () => {
+        stop();
+        fs.rmSync(tmpHome, { recursive: true, force: true });
+      },
+    };
+  } catch (e) {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+    throw e;
+  }
+}
+
+interface Envelope {
+  ok: boolean;
+  data?: Record<string, unknown> & { messages?: unknown[]; draftId?: string; taskId?: string };
+  error?: { code: string; message: string };
+}
+
+async function getJson(url: string): Promise<{ status: number; body: Envelope }> {
+  const res = await fetch(url);
+  const body = (await res.json()) as Envelope;
+  return { status: res.status, body };
+}
+
+async function postJson(url: string, body?: unknown): Promise<{ status: number; body: Envelope }> {
+  const res = await fetch(url, {
+    method: "POST",
+    headers: body !== undefined ? { "content-type": "application/json" } : {},
+    body: body !== undefined ? JSON.stringify(body) : undefined,
+  });
+  const parsed = (await res.json()) as Envelope;
+  return { status: res.status, body: parsed };
+}
+
+async function delJson(url: string): Promise<{ status: number; body: Envelope }> {
+  const res = await fetch(url, { method: "DELETE" });
+  const parsed = (await res.json()) as Envelope;
+  return { status: res.status, body: parsed };
+}
+
+function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, title: string): TaskRecord {
+  const now = new Date().toISOString();
+  const specBody = `# ${title}\n\nA stub spec body for chat tests.\n`;
+  const specPath = store.writeSpec(id, specBody);
+  const task: TaskRecord = {
+    id,
+    title,
+    repoRoot,
+    repoName: "demo",
+    branch: `forge/${id}`,
+    worktree: null,
+    status: "draft",
+    agent: null,
+    model: null,
+    createdAt: now,
+    launchedAt: null,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: specPath,
+    specVersion: 1,
+  };
+  store.upsertTask(task);
+  return task;
+}
+
+test("POST /api/plan-chat/draft mints a draftId and creates the history file", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const draftId = body.data!.draftId as string;
+  assert.match(draftId, /^d_[0-9a-f]{8}$/);
+  // Folder + history.json should exist on disk.
+  const historyFile = path.join(h.forgeDir, "plan-drafts", draftId, "history.json");
+  assert.equal(fs.existsSync(historyFile), true);
+  const parsed = JSON.parse(fs.readFileSync(historyFile, "utf-8"));
+  assert.equal(parsed.version, 1);
+  assert.deepEqual(parsed.messages, []);
+});
+
+test("GET /api/plan-chat/draft/:id/history returns empty messages for fresh draft", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+
+  const { status, body } = await getJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/history`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.deepEqual(body.data!.messages, []);
+});
+
+test("GET /api/plan-chat/draft/:id/history returns [] for unknown draft (treated as empty)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // We don't 404 missing history files — empty is a valid empty state.
+  const { status, body } = await getJson(`${h.baseUrl}/api/plan-chat/draft/d_deadbeef/history`);
+  assert.equal(status, 200);
+  assert.deepEqual(body.data!.messages, []);
+});
+
+test("DELETE /api/plan-chat/draft/:id wipes the draft folder", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+  const draftDir = path.join(h.forgeDir, "plan-drafts", draftId);
+  assert.equal(fs.existsSync(draftDir), true);
+
+  const { status, body } = await delJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(fs.existsSync(draftDir), false);
+
+  // History endpoint should still return [] even though the folder is gone.
+  const after = await getJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/history`);
+  assert.deepEqual(after.body.data!.messages, []);
+});
+
+test("POST /api/plan-chat/draft/:id/abort succeeds even with no in-flight subprocess", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/abort`);
+  assert.equal(status, 200);
+  assert.equal(body.data!.aborted, false); // nothing to kill
+});
+
+// Defense against path traversal: every draft route must reject `draftId`
+// values that don't match `^d_[0-9a-f]{8}$`. Without this gate, an encoded
+// `..` payload could escape the `plan-drafts` directory and hit
+// `fs.rmSync(recursive: true)` on arbitrary paths under `forgeDir`.
+test("draft routes reject malformed draftId with 400 BAD_DRAFT_ID", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Encoded `../../evil` — path.join would normalize this to escape
+  // the plan-drafts directory if validation were missing.
+  const evil = encodeURIComponent("../../evil");
+  const cases: Array<{ method: string; url: string }> = [
+    { method: "GET", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/history` },
+    { method: "DELETE", url: `${h.baseUrl}/api/plan-chat/draft/${evil}` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/abort` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/message` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/promote` },
+  ];
+  for (const c of cases) {
+    const res = await fetch(c.url, {
+      method: c.method,
+      headers: { "content-type": "application/json" },
+      body: c.method === "GET" || c.method === "DELETE" ? undefined : JSON.stringify({ message: "x" }),
+    });
+    const body = (await res.json()) as Envelope;
+    assert.equal(res.status, 400, `${c.method} ${c.url} should 400`);
+    assert.equal(body.error?.code, "BAD_DRAFT_ID", `${c.method} ${c.url} should error BAD_DRAFT_ID`);
+  }
+});
+
+test("GET /api/specs/:id/plan-history is empty for a fresh draft task", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "draft-fresh", h.tmpHome, "feat(demo): fresh");
+  const { status, body } = await getJson(`${h.baseUrl}/api/specs/draft-fresh/plan-history`);
+  assert.equal(status, 200);
+  assert.deepEqual(body.data!.messages, []);
+});
+
+test("GET /api/specs/:id/plan-history returns 404 for unknown task", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/specs/nope/plan-history`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const taskId = "wipe-target";
+  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): wipe");
+  // Hand-write some history.
+  const dir = path.join(h.forgeDir, "specs", taskId);
+  fs.mkdirSync(dir, { recursive: true });
+  const histFile = path.join(dir, "plan-history.json");
+  fs.writeFileSync(
+    histFile,
+    JSON.stringify({
+      version: 1,
+      messages: [
+        { id: "m_1234abcd", role: "user", text: "hi", ts: new Date().toISOString() },
+        { id: "m_5678efgh", role: "assistant", text: "hello", ts: new Date().toISOString() },
+      ],
+    }),
+  );
+  // Sanity: GET sees both messages.
+  const before = await getJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  assert.equal((before.body.data!.messages as unknown[]).length, 2);
+
+  const { status, body } = await delJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  assert.equal(status, 200);
+  assert.equal(body.data!.ok, true);
+  assert.equal(fs.existsSync(histFile), false);
+
+  const after = await getJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  assert.deepEqual(after.body.data!.messages, []);
+});
+
+test("POST /api/plan-chat/draft/:id/promote moves draft history into the spec dir", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const taskId = "promote-target";
+  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): promote");
+
+  // Mint a draft and hand-write some history into it.
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+  const draftFile = path.join(h.forgeDir, "plan-drafts", draftId, "history.json");
+  const sample = {
+    version: 1,
+    messages: [
+      { id: "m_aabbccdd", role: "user", text: "draft msg", ts: new Date().toISOString() },
+      { id: "m_eeff0011", role: "assistant", text: "draft reply", ts: new Date().toISOString() },
+    ],
+  };
+  fs.writeFileSync(draftFile, JSON.stringify(sample));
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { taskId });
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.taskId, taskId);
+
+  // Draft folder gone, spec history file present with the original payload.
+  const draftDir = path.join(h.forgeDir, "plan-drafts", draftId);
+  assert.equal(fs.existsSync(draftDir), false);
+  const targetFile = path.join(h.forgeDir, "specs", taskId, "plan-history.json");
+  assert.equal(fs.existsSync(targetFile), true);
+  const moved = JSON.parse(fs.readFileSync(targetFile, "utf-8"));
+  assert.deepEqual(moved.messages, sample.messages);
+});
+
+test("POST /api/plan-chat/draft/:id/promote 404s for an unknown taskId", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, {
+    taskId: "does-not-exist",
+  });
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("POST /api/plan-chat/draft/:id/promote rejects when spec already has plan history", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const taskId = "promote-conflict";
+  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): conflict");
+  // Pre-seed an existing plan-history.json on the spec.
+  const dir = path.join(h.forgeDir, "specs", taskId);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(
+    path.join(dir, "plan-history.json"),
+    JSON.stringify({ version: 1, messages: [{ id: "m_existing0", role: "user", text: "x", ts: "now" }] }),
+  );
+
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+  fs.writeFileSync(
+    path.join(h.forgeDir, "plan-drafts", draftId, "history.json"),
+    JSON.stringify({ version: 1, messages: [] }),
+  );
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { taskId });
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "PROMOTE_CONFLICT");
+});
+
+test("POST /api/specs/:id/plan-chat returns 404 for unknown taskId", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs/nope/plan-chat`, { message: "hi" });
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("POST /api/specs/:id/plan-chat rejects empty message", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "msg-validation", h.tmpHome, "feat(demo): validation");
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs/msg-validation/plan-chat`, {});
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "BAD_REQUEST");
+});
+
+test("POST /api/plan-chat/draft/:id/message rejects unknown draftId", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Format-valid id (matches `^d_[0-9a-f]{8}$`) that simply has no
+  // folder on disk — exercises the existence check, not the format gate.
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/d_deadbeef/message`, { message: "hi" });
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_DRAFT");
+});
+
+test("POST /api/specs/:id/plan-chat/abort returns aborted: false when nothing in flight", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "abort-noop", h.tmpHome, "feat(demo): abort");
+  const { status, body } = await postJson(`${h.baseUrl}/api/specs/abort-noop/plan-chat/abort`);
+  assert.equal(status, 200);
+  assert.equal(body.data!.aborted, false);
+});
+
+// ─── runChatTurn cwd plumbing ───────────────────────────────────────────────
+//
+// These tests exercise the cwd validation + spawnImpl receiver directly,
+// without booting a full HTTP server. They use a stub child that ends
+// immediately with code 0 so the SSE stream completes on its own.
+
+interface StubChildOptions {
+  stdout?: string;
+  exitCode?: number;
+}
+
+function makeStubChild(opts: StubChildOptions = {}): EventEmitter & {
+  stdout: Readable;
+  stderr: Readable;
+  kill: (sig?: string) => boolean;
+} {
+  const emitter = new EventEmitter() as EventEmitter & {
+    stdout: Readable;
+    stderr: Readable;
+    kill: (sig?: string) => boolean;
+  };
+  emitter.stdout = Readable.from(Buffer.from(opts.stdout ?? "ok\n"));
+  emitter.stderr = Readable.from(Buffer.from(""));
+  emitter.kill = () => true;
+  // Defer the close event to the next tick so the consumer has time to
+  // wire up its `data` / `close` handlers in the ReadableStream start().
+  setImmediate(() => {
+    emitter.emit("close", opts.exitCode ?? 0, null);
+  });
+  return emitter;
+}
+
+test("runChatTurn rejects a missing cwd with BadCwdError before spawning", () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    let spawnCalls = 0;
+    assert.throws(
+      () =>
+        runChatTurn({
+          forgeDir,
+          scope: { kind: "draft", id: "d_doesntmatter" },
+          message: "hello",
+          cwd: path.join(tmpHome, "definitely-not-here"),
+          spawnImpl: () => {
+            spawnCalls++;
+            // Should never be reached.
+            return makeStubChild() as never;
+          },
+        }),
+      (err: unknown) => err instanceof BadCwdError && /repo not found at /.test((err as Error).message),
+    );
+    assert.equal(spawnCalls, 0, "spawnImpl must not run when cwd is invalid");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn rejects a relative cwd with BadCwdError", () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-rel-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    assert.throws(
+      () =>
+        runChatTurn({
+          forgeDir,
+          scope: { kind: "draft", id: "d_rel" },
+          message: "hi",
+          cwd: "relative/path",
+          spawnImpl: () => makeStubChild() as never,
+        }),
+      (err: unknown) => err instanceof BadCwdError,
+    );
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn forwards a valid cwd to spawnImpl", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-cwd-ok-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    let observedCwd: string | undefined;
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_okcwd001" },
+      message: "ping",
+      cwd: repoRoot,
+      spawnImpl: (_bin, _args, cwd) => {
+        observedCwd = cwd;
+        return makeStubChild({ stdout: "pong\n" }) as never;
+      },
+    });
+
+    // Drain the stream so the assistant message is persisted and the
+    // child's close handler fires (which is where in-flight cleanup
+    // happens). We don't assert on the SSE shape here — the existing
+    // tests cover that path.
+    const reader = result.stream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    assert.equal(observedCwd, repoRoot, "spawnImpl received the resolved cwd");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+// Regression: model strings must be forwarded as a single argv element.
+// Earlier versions built a `bash -lc` command and only escaped `"`, which
+// left `$()` and backticks live — a planner request with
+// `model: "x$(touch /tmp/pwn)"` would execute the substitution at chat
+// turn startup. The argv-only spawn closes that hole structurally.
+test("runChatTurn passes model as a single argv arg, not shell-interpolated", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-argv-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const evilModel = "claude-opus-4-7$(touch /tmp/forge-pwn-test)";
+    let observedBin = "";
+    let observedArgs: string[] = [];
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_argvtst" },
+      message: "ping",
+      cwd: repoRoot,
+      model: evilModel,
+      spawnImpl: (bin, args, _cwd) => {
+        observedBin = bin;
+        observedArgs = args;
+        return makeStubChild({ stdout: "ok\n" }) as never;
+      },
+    });
+
+    // Drain so the stream's start callback runs.
+    const reader = result.stream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    assert.equal(observedBin, "claude", "binary should be `claude`, not bash");
+    const i = observedArgs.indexOf("--model");
+    assert.ok(i >= 0, "argv should contain --model");
+    assert.equal(observedArgs[i + 1], evilModel, "model must land verbatim, no shell expansion");
+    // Sanity: argv must not contain bash-like wrapping.
+    assert.ok(!observedArgs.includes("-lc"), "spawn must not invoke a shell wrapper");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("POST /api/plan-chat/draft/:id/message with bogus repoRoot returns SSE error event", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
+  const draftId = created.body.data!.draftId as string;
+
+  const bogus = path.join(h.tmpHome, "no-such-repo");
+  const res = await fetch(`${h.baseUrl}/api/plan-chat/draft/${draftId}/message`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ message: "hi", repoRoot: bogus }),
+  });
+  // The error is reported via the SSE stream, not as a 4xx status — the
+  // fetch itself succeeds with a single `event: error` frame.
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const text = await res.text();
+  assert.match(text, /event: error/);
+  assert.match(text, /repo not found at/);
+  assert.match(text, new RegExp(bogus.replace(/[/\\.+*?()[\]{}|^$]/g, "\\$&")));
+});
+
+test("POST /api/specs/:id/plan-chat surfaces BAD_CWD when the task's repoRoot is gone", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Point the task at a directory that doesn't exist on disk so the
+  // server-side cwd resolution falls into BAD_CWD without us having to
+  // mock the dropdown.
+  const ghostRoot = path.join(h.tmpHome, "ghost-repo");
+  makeDraftTask(h.store, "ghost-cwd", ghostRoot, "feat(demo): ghost");
+
+  const res = await fetch(`${h.baseUrl}/api/specs/ghost-cwd/plan-chat`, {
+    method: "POST",
+    headers: { "content-type": "application/json", accept: "text/event-stream" },
+    body: JSON.stringify({ message: "hi" }),
+  });
+  assert.equal(res.status, 200);
+  assert.equal(res.headers.get("content-type"), "text/event-stream");
+  const text = await res.text();
+  assert.match(text, /event: error/);
+  assert.match(text, /repo not found at/);
+});
+
+// ─── stream-json parsing → SSE event vocabulary ─────────────────────────────
+//
+// Drives runChatTurn with a captured `claude --output-format stream-json`
+// fixture to verify the event taxonomy: meta, text, tool_use,
+// tool_result, done. The fixture lives in tests/fixtures/.
+
+interface ParsedFrame {
+  event: string;
+  data: Record<string, unknown>;
+}
+
+function parseSseFrames(text: string): ParsedFrame[] {
+  const frames: ParsedFrame[] = [];
+  for (const raw of text.split("\n\n")) {
+    if (!raw.trim()) continue;
+    let event = "message";
+    const dataLines: string[] = [];
+    for (const ln of raw.split("\n")) {
+      if (!ln || ln.startsWith(":")) continue;
+      const colon = ln.indexOf(":");
+      const field = colon === -1 ? ln : ln.slice(0, colon);
+      let value = colon === -1 ? "" : ln.slice(colon + 1);
+      if (value.startsWith(" ")) value = value.slice(1);
+      if (field === "event") event = value;
+      else if (field === "data") dataLines.push(value);
+    }
+    if (dataLines.length === 0) continue;
+    try {
+      frames.push({ event, data: JSON.parse(dataLines.join("\n")) });
+    } catch {
+      /* skip */
+    }
+  }
+  return frames;
+}
+
+async function drainSse(stream: ReadableStream<Uint8Array>): Promise<string> {
+  const reader = stream.getReader();
+  const dec = new TextDecoder();
+  let out = "";
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    out += dec.decode(value, { stream: true });
+  }
+  out += dec.decode();
+  return out;
+}
+
+function fixtureChild(jsonl: string, exitCode = 0): ReturnType<typeof makeStubChild> {
+  return makeStubChild({ stdout: jsonl, exitCode });
+}
+
+test("runChatTurn emits meta + text + done from a basic stream-json fixture", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-basic-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const fixture = fs.readFileSync(path.join(import.meta.dirname, "fixtures", "plan-chat-stream.jsonl"), "utf-8");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_basicfix" },
+      message: "say PING",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(fixture) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+
+    const eventNames = frames.map((f) => f.event);
+    assert.deepEqual(
+      eventNames,
+      ["meta", "rate_limit", "text", "done"],
+      `unexpected event sequence: ${eventNames.join(",")}`,
+    );
+
+    const meta = frames[0].data as { sessionId: string; cwd: string };
+    assert.equal(meta.cwd, "/Users/tcashel/repositories/forge");
+    assert.match(meta.sessionId, /^d9cd675e/);
+
+    const textEv = frames[2].data as { text: string; append: boolean };
+    assert.equal(textEv.text, "PING");
+    assert.equal(textEv.append, false);
+
+    const done = frames[3].data as { messageId: string; fullText: string };
+    assert.match(done.messageId, /^m_[0-9a-f]{8}$/);
+    assert.equal(done.fullText, "PING");
+
+    // Persisted assistant message has both text + blocks.
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_basicfix" });
+    const assistant = history.messages.find((m: ChatMsgType) => m.role === "assistant");
+    assert.ok(assistant, "assistant message must be persisted");
+    assert.equal(assistant!.text, "PING");
+    assert.ok(Array.isArray(assistant!.blocks) && assistant!.blocks!.length === 1);
+    assert.equal(assistant!.blocks![0].type, "text");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn surfaces tool_use + tool_result and persists block sequence", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-tools-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const fixture = fs.readFileSync(
+      path.join(import.meta.dirname, "fixtures", "plan-chat-stream-tools.jsonl"),
+      "utf-8",
+    );
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_toolfix0" },
+      message: "summarize the readme",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(fixture) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+    const eventNames = frames.map((f) => f.event);
+
+    // Order: meta, text, tool_use, tool_result, text, done
+    assert.deepEqual(
+      eventNames,
+      ["meta", "text", "tool_use", "tool_result", "text", "done"],
+      `unexpected event sequence: ${eventNames.join(",")}`,
+    );
+
+    const toolUse = frames[2].data as { toolUseId: string; name: string; input: { file_path: string } };
+    assert.equal(toolUse.toolUseId, "tu_read1");
+    assert.equal(toolUse.name, "Read");
+    assert.equal(toolUse.input.file_path, "/tmp/fake-repo/README.md");
+
+    const toolResult = frames[3].data as { toolUseId: string; output: string; isError: boolean };
+    assert.equal(toolResult.toolUseId, "tu_read1");
+    assert.equal(toolResult.isError, false);
+    assert.match(toolResult.output, /Demo/);
+
+    // Persisted blocks reflect text → tool_use → tool_result → text order.
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_toolfix0" });
+    const assistant = history.messages.find((m: ChatMsgType) => m.role === "assistant");
+    assert.ok(assistant && Array.isArray(assistant.blocks));
+    const kinds = assistant!.blocks!.map((b) => b.type);
+    assert.deepEqual(kinds, ["text", "tool_use", "tool_result", "text"]);
+    // Concatenated text fallback joins both text segments.
+    assert.match(assistant!.text, /Let me check the file\./);
+    assert.match(assistant!.text, /Found it/);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn skips malformed stream-json lines without aborting the stream", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-streamjson-malformed-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    // Mix one bogus line in with valid frames so parsing must skip and
+    // continue. Without that resilience, a single torn frame would kill
+    // the SSE stream mid-flight.
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `not-json garbage`,
+      `{"type":"assistant","message":{"id":"msg_a","content":[{"type":"text","text":"hello"}]},"session_id":"sX"}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"hello","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_malform0" },
+      message: "hi",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(stdout) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const eventNames = parseSseFrames(sse).map((f) => f.event);
+    assert.deepEqual(eventNames, ["meta", "text", "done"]);
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+// Regression: an assistant frame whose `content` contains two distinct
+// text blocks before any tool_use must persist BOTH blocks. Earlier code
+// used a single `openTextIdx`, so the second text block clobbered the
+// first in `turnBlocks`, silently dropping content from history and the
+// SSE stream.
+test("runChatTurn keeps multiple text blocks in a single assistant frame", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-multi-text-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `{"type":"assistant","message":{"id":"msg_multi","content":[{"type":"text","text":"first part"},{"type":"text","text":"second part"}]},"session_id":"sX"}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"first part\\nsecond part","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_multitxt" },
+      message: "hi",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(stdout) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+    const textFrames = frames.filter((f) => f.event === "text");
+    assert.equal(textFrames.length, 2, "both text blocks must emit `text` SSE events");
+    assert.equal((textFrames[0].data as { text: string }).text, "first part");
+    assert.equal((textFrames[1].data as { text: string }).text, "second part");
+
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_multitxt" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.ok(assistant, "assistant message must persist");
+    const textBlocks = (assistant!.blocks ?? []).filter((b): b is { type: "text"; text: string } => b.type === "text");
+    assert.equal(textBlocks.length, 2, "both text blocks must persist in history");
+    assert.equal(textBlocks[0].text, "first part");
+    assert.equal(textBlocks[1].text, "second part");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
