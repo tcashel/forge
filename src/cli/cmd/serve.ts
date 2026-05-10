@@ -1083,6 +1083,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const task = store.getTask(taskId);
     if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
     try {
+      abortInFlight({ kind: "draft", id: draftId });
       promotePlanDraft(store.forgeDir, draftId, taskId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);

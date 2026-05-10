@@ -27,7 +27,7 @@
  * NOTE: keep this docblock in sync with the HELP const below.
  */
 
-import { execSync } from "node:child_process";
+import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { launchAgent } from "../../core/launch.ts";
 import { createWorktree, detectRepo } from "../../core/repo.ts";
@@ -463,7 +463,7 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
     // sees the original failure, not the cleanup error.
     if (createdNewWorktree) {
       try {
-        execSync(`git worktree remove --force ${JSON.stringify(worktreePath)}`, {
+        spawnSync("git", ["worktree", "remove", "--force", worktreePath], {
           cwd: repo.root,
           stdio: "pipe",
           timeout: 10_000,
