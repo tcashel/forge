@@ -6,5 +6,8 @@ import type { TaskView } from "../../../types";
 import { PlannerChat } from "../../chat/PlannerChat";
 
 export function PlanTab({ t }: { t: TaskView }) {
-  return <PlannerChat scope="spec" id={t.id} />;
+  // Pass repoRoot explicitly even though the spec-scope server resolves
+  // it from the task record — keeps the prop contract symmetrical with
+  // the draft-scope mount in NewSpecModal.
+  return <PlannerChat scope="spec" id={t.id} repoRoot={t.repoRoot} />;
 }

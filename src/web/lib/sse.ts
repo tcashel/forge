@@ -50,7 +50,13 @@ export interface ChatStreamListeners {
 
 export interface StartChatStreamOptions {
   url: string;
-  body: { message: string; model?: string };
+  /**
+   * Body forwarded to the planner-chat endpoint. `repoRoot` is the
+   * absolute path of the selected repo — required for the draft scope
+   * (no task record exists yet); for the spec scope the server already
+   * resolves it from the task and the field is optional.
+   */
+  body: { message: string; model?: string; repoRoot?: string };
   signal?: AbortSignal;
   listeners: ChatStreamListeners;
 }

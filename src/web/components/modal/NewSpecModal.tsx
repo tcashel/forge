@@ -257,6 +257,19 @@ export function NewSpecModal() {
   const known = repoList.filter((r) => !r.stale);
   const isCustom = repoSel.value === CUSTOM_REPO_VALUE;
 
+  // Resolve the absolute repo root the planner subprocess should run
+  // in. For known repos the dropdown value IS the absolute root; for
+  // the "Custom path…" option, fall back to whatever the user typed
+  // (must be absolute — server will reject relative paths with
+  // BAD_CWD). When unset, we omit the field entirely so the server
+  // keeps its `process.cwd()` fallback.
+  const customTrimmed = repoCustom.value.trim();
+  const selectedRepoForChat = isCustom
+    ? customTrimmed.startsWith("/")
+      ? customTrimmed
+      : undefined
+    : repoSel.value || undefined;
+
   return (
     // The overlay is a click-only backdrop dismiss target — Escape and
     // the explicit Cancel/Close buttons cover keyboard navigation, so
@@ -275,8 +288,14 @@ export function NewSpecModal() {
         <aside class="modal-chat-rail">
           {draftId.value ? (
             <PlannerChat
+              // Re-key on the selected repo so flipping the Repo
+              // dropdown mid-modal-session remounts the chat panel —
+              // without this an in-flight stream would still be
+              // running against the previous repo's filesystem.
+              key={`${draftId.value}|${selectedRepoForChat ?? ""}`}
               scope="draft"
               id={draftId.value}
+              repoRoot={selectedRepoForChat}
               onApply={(markdown) => {
                 body.value = markdown;
                 toast("Applied to spec body", "info");

@@ -19,6 +19,7 @@ import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import {
   abortInFlight,
+  BadCwdError,
   createDraft as createPlanDraft,
   deleteDraft as deletePlanDraft,
   loadHistory as loadPlanHistory,
@@ -896,14 +897,42 @@ function planChatSseResponse(opts: {
   message: string;
   model?: string;
   specBody: string | null;
+  cwd?: string;
 }): Response {
-  const turn = runChatTurn({
-    forgeDir: opts.store.forgeDir,
-    scope: opts.scope,
-    message: opts.message,
-    model: opts.model,
-    specBody: opts.specBody,
-  });
+  let turn: { stream: ReadableStream<Uint8Array>; abort: () => void };
+  try {
+    turn = runChatTurn({
+      forgeDir: opts.store.forgeDir,
+      scope: opts.scope,
+      message: opts.message,
+      model: opts.model,
+      specBody: opts.specBody,
+      cwd: opts.cwd,
+    });
+  } catch (e) {
+    // BAD_CWD is the only typed failure runChatTurn throws synchronously.
+    // Convert it to a clean single-frame SSE `error` stream so the
+    // browser sees the same shape as a runtime stream failure rather
+    // than a JSON 400 mid-`fetch`.
+    if (e instanceof BadCwdError) {
+      const payload = `event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`;
+      const stream = new ReadableStream<Uint8Array>({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode(payload));
+          controller.close();
+        },
+      });
+      return new Response(stream, {
+        headers: {
+          "content-type": "text/event-stream",
+          "cache-control": "no-cache, no-transform",
+          "x-accel-buffering": "no",
+          connection: "keep-alive",
+        },
+      });
+    }
+    throw e;
+  }
   // Wrap so cancel() (client disconnect) tears down the spawned child.
   // ReadableStream from runChatTurn already wires cancel → child.kill,
   // but the SSE convention here adds the `x-accel-buffering: no` header.
@@ -991,12 +1020,17 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
     const model = resolveSpecModel(store, taskId, optString(body, "model"));
     const specBody = getSpecBodyStripped(store, taskId);
+    // Spec scope: server resolves the working directory from the task
+    // record so the planner runs against the right repo regardless of
+    // where `forge serve` was launched. Falls through to runChatTurn's
+    // BAD_CWD validation if the task's repoRoot has been deleted.
     return planChatSseResponse({
       store,
       scope: { kind: "spec", id: taskId },
       message,
       model,
       specBody,
+      cwd: task.repoRoot,
     });
   }
 
@@ -1016,12 +1050,18 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const message = reqString(body, "message");
     if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
     const model = optString(body, "model");
+    // Draft scope has no task record yet, so the frontend must tell us
+    // which repo the planner should explore. When absent, we fall
+    // through to process.cwd() (legacy behavior) — runChatTurn will
+    // reject an explicit but invalid path with BAD_CWD.
+    const cwd = optString(body, "repoRoot");
     return planChatSseResponse({
       store,
       scope: { kind: "draft", id: draftId },
       message,
       model,
       specBody: null,
+      cwd,
     });
   }
 
