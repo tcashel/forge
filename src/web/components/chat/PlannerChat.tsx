@@ -137,13 +137,13 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
   }
 
   async function refreshHistory(): Promise<void> {
-    try {
-      const data = await apiGet<PlanHistoryResponse>(historyUrl(scope, id));
-      messages.value = data.messages ?? [];
-    } catch (e) {
-      const apiErr = e as ApiError;
-      error.value = apiErr.message || "Failed to refresh history.";
-    }
+    // Throw on failure — `send()` relies on the rejection to route to its
+    // local-fallback path (splice receivedFullText into the optimistic
+    // user message) when a refresh after `done` fails. Swallowing here
+    // would leave the user with only the optimistic user turn and no
+    // assistant reply.
+    const data = await apiGet<PlanHistoryResponse>(historyUrl(scope, id));
+    messages.value = data.messages ?? [];
   }
 
   async function send(): Promise<void> {
@@ -260,8 +260,14 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
       } else {
         // Stream ended without `done` (error or abort). Re-sync from
         // server so the optimistic user message reflects whatever
-        // actually persisted.
-        await refreshHistory();
+        // actually persisted. Best-effort — surface failures via the
+        // banner but don't blow up the finally block.
+        try {
+          await refreshHistory();
+        } catch (e) {
+          const apiErr = e as ApiError;
+          error.value = apiErr.message || "Failed to refresh history.";
+        }
       }
       requestAnimationFrame(scrollToBottom);
     }

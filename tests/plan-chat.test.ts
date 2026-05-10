@@ -756,3 +756,49 @@ test("runChatTurn skips malformed stream-json lines without aborting the stream"
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
 });
+
+// Regression: an assistant frame whose `content` contains two distinct
+// text blocks before any tool_use must persist BOTH blocks. Earlier code
+// used a single `openTextIdx`, so the second text block clobbered the
+// first in `turnBlocks`, silently dropping content from history and the
+// SSE stream.
+test("runChatTurn keeps multiple text blocks in a single assistant frame", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-multi-text-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `{"type":"assistant","message":{"id":"msg_multi","content":[{"type":"text","text":"first part"},{"type":"text","text":"second part"}]},"session_id":"sX"}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"first part\\nsecond part","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_multitxt" },
+      message: "hi",
+      cwd: repoRoot,
+      spawnImpl: () => fixtureChild(stdout) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+    const textFrames = frames.filter((f) => f.event === "text");
+    assert.equal(textFrames.length, 2, "both text blocks must emit `text` SSE events");
+    assert.equal((textFrames[0].data as { text: string }).text, "first part");
+    assert.equal((textFrames[1].data as { text: string }).text, "second part");
+
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_multitxt" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.ok(assistant, "assistant message must persist");
+    const textBlocks = (assistant!.blocks ?? []).filter((b): b is { type: "text"; text: string } => b.type === "text");
+    assert.equal(textBlocks.length, 2, "both text blocks must persist in history");
+    assert.equal(textBlocks[0].text, "first part");
+    assert.equal(textBlocks[1].text, "second part");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});

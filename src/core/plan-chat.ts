@@ -536,9 +536,14 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       // assistant message in non-partial mode); tool_use / tool_result
       // pairs come from separate frames and we interleave them here.
       const turnBlocks: ChatBlock[] = [];
-      // Track the index of the last open text block so partial text
-      // chunks can append rather than fragment into many tiny blocks.
-      let openTextIdx: number | null = null;
+      // Map (msgId, contentIdx) → turnBlocks index. With
+      // `--include-partial-messages`, claude re-emits the same content
+      // block at the same index across frames with growing text; we
+      // collapse those into the existing turnBlocks entry. Distinct
+      // blocks (different content positions, possibly within the same
+      // assistant message) get their own entries — without this keying,
+      // a content array like `[{text:A},{text:B}]` would clobber A.
+      const blockIndexByKey = new Map<string, number>();
 
       const send = (event: string, data: unknown) => {
         if (closed) return;
@@ -585,30 +590,34 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
         if (t === "assistant") {
           const msg = evt.message as { content?: unknown[]; id?: string } | undefined;
           if (!msg || !Array.isArray(msg.content)) return;
-          for (const block of msg.content) {
+          const msgId = msg.id ?? "msg";
+          for (let i = 0; i < msg.content.length; i++) {
+            const block = msg.content[i];
             if (!block || typeof block !== "object") continue;
             const b = block as Record<string, unknown>;
+            const key = `${msgId}:${i}`;
             if (b.type === "text" && typeof b.text === "string") {
               const text = b.text;
-              // Treat each fresh text block as a standalone segment.
-              // Partial-message frames re-emit the same block id with
-              // accumulated text — we collapse them by replacing the
-              // current open block's content.
-              if (openTextIdx === null) {
+              let blockIdx = blockIndexByKey.get(key);
+              if (blockIdx === undefined) {
                 turnBlocks.push({ type: "text", text });
-                openTextIdx = turnBlocks.length - 1;
+                blockIdx = turnBlocks.length - 1;
+                blockIndexByKey.set(key, blockIdx);
               } else {
-                const cur = turnBlocks[openTextIdx];
+                const cur = turnBlocks[blockIdx];
                 if (cur.type === "text") cur.text = text;
               }
-              const blockId = `${msg.id ?? "msg"}_${openTextIdx}`;
-              send("text", { blockId, text, append: false });
+              send("text", { blockId: `${msgId}_${blockIdx}`, text, append: false });
             } else if (b.type === "tool_use" && typeof b.id === "string" && typeof b.name === "string") {
-              turnBlocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
-              // A tool_use ends any open text block — subsequent text
-              // chunks should start fresh below it.
-              openTextIdx = null;
-              send("tool_use", { toolUseId: b.id, name: b.name, input: b.input });
+              // First sighting of this tool_use position: push + emit.
+              // Partial frames re-emit the same content position; ignore
+              // those (tool_use isn't streamed in deltas, the input is
+              // complete on first appearance).
+              if (!blockIndexByKey.has(key)) {
+                turnBlocks.push({ type: "tool_use", id: b.id, name: b.name, input: b.input });
+                blockIndexByKey.set(key, turnBlocks.length - 1);
+                send("tool_use", { toolUseId: b.id, name: b.name, input: b.input });
+              }
             }
           }
           return;
