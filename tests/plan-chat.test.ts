@@ -173,6 +173,35 @@ test("POST /api/plan-chat/draft/:id/abort succeeds even with no in-flight subpro
   assert.equal(body.data!.aborted, false); // nothing to kill
 });
 
+// Defense against path traversal: every draft route must reject `draftId`
+// values that don't match `^d_[0-9a-f]{8}$`. Without this gate, an encoded
+// `..` payload could escape the `plan-drafts` directory and hit
+// `fs.rmSync(recursive: true)` on arbitrary paths under `forgeDir`.
+test("draft routes reject malformed draftId with 400 BAD_DRAFT_ID", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Encoded `../../evil` — path.join would normalize this to escape
+  // the plan-drafts directory if validation were missing.
+  const evil = encodeURIComponent("../../evil");
+  const cases: Array<{ method: string; url: string }> = [
+    { method: "GET", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/history` },
+    { method: "DELETE", url: `${h.baseUrl}/api/plan-chat/draft/${evil}` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/abort` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/message` },
+    { method: "POST", url: `${h.baseUrl}/api/plan-chat/draft/${evil}/promote` },
+  ];
+  for (const c of cases) {
+    const res = await fetch(c.url, {
+      method: c.method,
+      headers: { "content-type": "application/json" },
+      body: c.method === "GET" || c.method === "DELETE" ? undefined : JSON.stringify({ message: "x" }),
+    });
+    const body = (await res.json()) as Envelope;
+    assert.equal(res.status, 400, `${c.method} ${c.url} should 400`);
+    assert.equal(body.error?.code, "BAD_DRAFT_ID", `${c.method} ${c.url} should error BAD_DRAFT_ID`);
+  }
+});
+
 test("GET /api/specs/:id/plan-history is empty for a fresh draft task", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
@@ -312,7 +341,9 @@ test("POST /api/specs/:id/plan-chat rejects empty message", async (t) => {
 test("POST /api/plan-chat/draft/:id/message rejects unknown draftId", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/d_nonexist/message`, { message: "hi" });
+  // Format-valid id (matches `^d_[0-9a-f]{8}$`) that simply has no
+  // folder on disk — exercises the existence check, not the format gate.
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/d_deadbeef/message`, { message: "hi" });
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_DRAFT");
 });
@@ -420,7 +451,7 @@ test("runChatTurn forwards a valid cwd to spawnImpl", async () => {
       scope: { kind: "draft", id: "d_okcwd001" },
       message: "ping",
       cwd: repoRoot,
-      spawnImpl: (_cmd, cwd) => {
+      spawnImpl: (_bin, _args, cwd) => {
         observedCwd = cwd;
         return makeStubChild({ stdout: "pong\n" }) as never;
       },
@@ -437,6 +468,54 @@ test("runChatTurn forwards a valid cwd to spawnImpl", async () => {
     }
 
     assert.equal(observedCwd, repoRoot, "spawnImpl received the resolved cwd");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+// Regression: model strings must be forwarded as a single argv element.
+// Earlier versions built a `bash -lc` command and only escaped `"`, which
+// left `$()` and backticks live — a planner request with
+// `model: "x$(touch /tmp/pwn)"` would execute the substitution at chat
+// turn startup. The argv-only spawn closes that hole structurally.
+test("runChatTurn passes model as a single argv arg, not shell-interpolated", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-argv-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const evilModel = "claude-opus-4-7$(touch /tmp/forge-pwn-test)";
+    let observedBin = "";
+    let observedArgs: string[] = [];
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_argvtst" },
+      message: "ping",
+      cwd: repoRoot,
+      model: evilModel,
+      spawnImpl: (bin, args, _cwd) => {
+        observedBin = bin;
+        observedArgs = args;
+        return makeStubChild({ stdout: "ok\n" }) as never;
+      },
+    });
+
+    // Drain so the stream's start callback runs.
+    const reader = result.stream.getReader();
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+
+    assert.equal(observedBin, "claude", "binary should be `claude`, not bash");
+    const i = observedArgs.indexOf("--model");
+    assert.ok(i >= 0, "argv should contain --model");
+    assert.equal(observedArgs[i + 1], evilModel, "model must land verbatim, no shell expansion");
+    // Sanity: argv must not contain bash-like wrapping.
+    assert.ok(!observedArgs.includes("-lc"), "spawn must not invoke a shell wrapper");
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
