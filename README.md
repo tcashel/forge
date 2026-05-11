@@ -153,6 +153,10 @@ bun run check         # biome check --write .
 - Pi (the previous host) is removed entirely. The pre-rip snapshot is tagged `pre-rip-v0.3.0`.
 - `forge resume` is not yet wired — the supervisor that backed it was pi-specific. Re-launching a failed spec from scratch is the current path.
 
+## Vision & roadmap
+
+This repo is the Track A prototype for **Juicer** — the operator's cockpit for staff engineers running agent fleets. See [`docs/`](docs/) for the full vision, roadmap, architecture, schema, and decision log (ADRs). Start at [`docs/README.md`](docs/README.md).
+
 ## License
 
 TBD.
