@@ -266,15 +266,22 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
           ];
         }
       } else {
-        // Stream ended without `done` (error or abort). Re-sync from
-        // server so the optimistic user message reflects whatever
-        // actually persisted. Best-effort — surface failures via the
-        // banner but don't blow up the finally block.
+        // Stream ended without `done` (error or abort). The browser's
+        // fetch may have died mid-stream while the spawned claude was
+        // still running — in which case the server persists the reply
+        // anyway (see plan-chat.ts close handler). Re-sync from disk
+        // and, if the latest message is now an assistant turn, treat it
+        // as success and drop the error banner. (The server appends the
+        // user turn before spawning, so a trailing assistant message
+        // necessarily belongs to the turn we just attempted.)
         try {
           await refreshHistory();
+          const latest = messages.value[messages.value.length - 1];
+          if (latest && latest.role === "assistant") error.value = null;
         } catch (e) {
           const apiErr = e as ApiError;
-          error.value = apiErr.message || "Failed to refresh history.";
+          // Don't clobber a more specific stream error if one's already set.
+          if (!error.value) error.value = apiErr.message || "Failed to refresh history.";
         }
       }
       requestAnimationFrame(scrollToBottom);

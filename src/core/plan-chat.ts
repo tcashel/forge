@@ -340,6 +340,15 @@ export interface RunChatTurnOptions {
    * were plumbed correctly.
    */
   spawnImpl?: (binary: string, args: string[], cwd?: string) => ChildProcess;
+  /**
+   * Idle keepalive interval (ms). The SSE response writes a `: hb\n\n`
+   * comment line whenever there's been no outbound traffic for this
+   * long, so WebKit `fetch` and intermediate proxies don't time out the
+   * read during long quiet stretches (tool calls, model thinking).
+   * Defaults to 15s. Tests can pass a small value to exercise the path;
+   * pass 0 to disable.
+   */
+  heartbeatIntervalMs?: number;
 }
 
 /**
@@ -435,11 +444,20 @@ export function summarizeToolResultContent(content: unknown): { output: string; 
  *   - `event: tool_use`    data: {toolUseId, name, input}
  *   - `event: tool_result` data: {toolUseId, output, isError, truncated}
  *   - `event: rate_limit`  data: {status, resetsAt}
- *   - `event: done`        data: {messageId, fullText, durationMs, totalCostUsd, numTurns}
+ *   - `event: done`        data: {messageId, fullText, durationMs, totalCostUsd, numTurns, stopReason}
  *   - `event: error`       data: {message}
  *
+ * Also writes periodic SSE comment lines (`: hb\n\n`) to keep WebKit
+ * fetch and intermediate proxies from timing out the read during long
+ * quiet stretches (e.g. multi-minute tool calls). CLI `ping` events and
+ * `system/api_retry` notices are forwarded as SSE comments for the same
+ * reason. Comments are ignored by SSE consumers.
+ *
  * Side effects: writes the user message to history before spawn, and the
- * assistant message (with both `text` and `blocks`) after a clean `done`.
+ * assistant message (with both `text` and `blocks`) after the child
+ * exits *as long as we accumulated any blocks* — including when the
+ * client already disconnected. That way a transient SSE break (the
+ * browser fetch dropping mid-stream) doesn't lose the agent's reply.
  * Removes the per-turn prompt file on success; keeps it on failure for
  * debugging.
  */
@@ -447,6 +465,7 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const { forgeDir, scope, message } = opts;
   const model = opts.model ?? DEFAULT_MODEL;
   const spawnFn = opts.spawnImpl ?? defaultSpawn;
+  const heartbeatIntervalMs = opts.heartbeatIntervalMs ?? 15_000;
 
   // 0. Validate cwd up front so the caller can convert the failure into
   //    a clean SSE error frame before any history side-effects land.
@@ -545,19 +564,50 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       // a content array like `[{text:A},{text:B}]` would clobber A.
       const blockIndexByKey = new Map<string, number>();
 
-      const send = (event: string, data: unknown) => {
+      // Captured from the CLI's `result` event so we can forward
+      // duration / cost / turn count to the client `done` frame.
+      // `result` is emitted once per turn just before exit; if we never
+      // see it (non-zero exit, SIGTERM), these stay null.
+      let resultDurationMs: number | null = null;
+      let resultTotalCostUsd: number | null = null;
+      let resultNumTurns: number | null = null;
+      let resultStopReason: string | null = null;
+
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
+      let lastWriteAt = Date.now();
+
+      const writeRaw = (payload: string): void => {
         if (closed) return;
-        const payload = `event: ${event}\ndata: ${JSON.stringify(data)}\n\n`;
         try {
           controller.enqueue(enc.encode(payload));
+          lastWriteAt = Date.now();
         } catch {
           /* controller already closed */
         }
       };
 
+      const send = (event: string, data: unknown) => {
+        writeRaw(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
+      };
+
+      // SSE comments (lines starting with `:`) are dropped by the EventSource
+      // / fetch SSE parser but still travel the wire — perfect for keeping
+      // a long-running connection from being idle-timed-out by WebKit or a
+      // reverse proxy. Used both for the periodic heartbeat and to surface
+      // CLI keepalives (`ping`, `api_retry`).
+      const sendComment = (text: string): void => {
+        // Strip CR/LF so callers can't accidentally inject a frame.
+        const safe = text.replace(/[\r\n]+/g, " ");
+        writeRaw(`: ${safe}\n\n`);
+      };
+
       const close = () => {
         if (closed) return;
         closed = true;
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+          heartbeatTimer = null;
+        }
         try {
           controller.close();
         } catch {
@@ -566,6 +616,19 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
         if (inFlight.get(key)?.child === child) inFlight.delete(key);
       };
       cleanup = close;
+
+      if (heartbeatIntervalMs > 0) {
+        heartbeatTimer = setInterval(() => {
+          // Only emit if we've been quiet for ~the full interval. Bursty
+          // streams (token-level deltas) don't need extra padding.
+          if (Date.now() - lastWriteAt >= heartbeatIntervalMs - 100) {
+            sendComment("hb");
+          }
+        }, heartbeatIntervalMs);
+        // Don't pin the event loop on the heartbeat — if everything else
+        // has shut down, the process should exit.
+        if (typeof heartbeatTimer.unref === "function") heartbeatTimer.unref();
+      }
 
       const handleEvent = (evt: Record<string, unknown>) => {
         const t = typeof evt.type === "string" ? evt.type : "";
@@ -577,6 +640,27 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
             cwd: typeof evt.cwd === "string" ? evt.cwd : null,
             tools,
           });
+          return;
+        }
+        if (t === "system" && evt.subtype === "api_retry") {
+          // CLI is retrying the API call (rate_limit, overloaded, etc.).
+          // We don't have a UI for it yet, but forwarding as a comment
+          // resets the client's idle timer and tells operators tailing
+          // the network log that the agent is alive.
+          const attempt = typeof evt.attempt === "number" ? evt.attempt : "?";
+          const reason = typeof evt.error === "string" ? evt.error : "unknown";
+          sendComment(`api_retry attempt=${attempt} reason=${reason}`);
+          return;
+        }
+        if (t === "stream_event") {
+          // Wrapper for raw API events when `--include-partial-messages`
+          // is set. `assistant` snapshots already deliver the content we
+          // care about; here we only sniff for `ping` keepalives so an
+          // idle proxy doesn't time out the SSE response.
+          const inner = (evt.event ?? {}) as Record<string, unknown>;
+          if (typeof inner.type === "string" && inner.type === "ping") {
+            sendComment("cli_ping");
+          }
           return;
         }
         if (t === "rate_limit_event") {
@@ -644,9 +728,14 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           return;
         }
         if (t === "result") {
-          // Handled at child-close — we have the assistant message
-          // ready to persist regardless of whether `result` arrived
-          // first or got cut off.
+          // Persist is deferred to child-close (so we have the assistant
+          // message ready regardless of whether `result` arrived first
+          // or got cut off). Capture the metadata here so we can forward
+          // it into the `done` frame.
+          if (typeof evt.duration_ms === "number") resultDurationMs = evt.duration_ms;
+          if (typeof evt.total_cost_usd === "number") resultTotalCostUsd = evt.total_cost_usd;
+          if (typeof evt.num_turns === "number") resultNumTurns = evt.num_turns;
+          if (typeof evt.stop_reason === "string") resultStopReason = evt.stop_reason;
           return;
         }
         // Anything else (e.g. future event types) — ignore.
@@ -697,17 +786,27 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           flushLine(lineBuf);
           lineBuf = "";
         }
-        if (cancelled) {
-          // Client disconnected; emit nothing, just tear down.
-          close();
-          return;
-        }
         const fullText = turnBlocks
           .filter((b): b is { type: "text"; text: string } => b.type === "text")
           .map((b) => b.text)
           .join("\n")
           .trim();
-        if (code === 0 && (turnBlocks.length > 0 || fullText.length > 0)) {
+        // We persist whenever we have accumulated content, even if the
+        // client already disconnected (`cancelled === true`). This is the
+        // recovery path for a transient SSE break: the browser's fetch
+        // can die mid-stream (WebKit "Load failed"), but the spawned
+        // claude often keeps running for a few hundred ms before our
+        // SIGTERM lands — and any complete blocks it emitted are valuable
+        // to save. Without this, the user re-opens the modal to find
+        // only their question with no reply, even though the agent
+        // finished.
+        //
+        // The `done` and `error` SSE frames are still gated on the
+        // controller being live (`!cancelled`) because nothing's
+        // listening on the other side when it's not.
+        const haveContent = turnBlocks.length > 0 || fullText.length > 0;
+        const cleanExit = (code === 0 || cancelled) && haveContent;
+        if (cleanExit) {
           const assistantMsg: ChatMessage = {
             id: newMessageId(),
             role: "assistant",
@@ -723,19 +822,24 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
             } catch {
               /* noop */
             }
-            send("done", {
-              messageId: assistantMsg.id,
-              fullText,
-              durationMs: null,
-              totalCostUsd: null,
-              numTurns: null,
-            });
+            if (!cancelled) {
+              send("done", {
+                messageId: assistantMsg.id,
+                fullText,
+                durationMs: resultDurationMs,
+                totalCostUsd: resultTotalCostUsd,
+                numTurns: resultNumTurns,
+                stopReason: resultStopReason,
+              });
+            }
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
-            send("error", { message: `failed to persist assistant message: ${msg}` });
+            // Best effort: only the live-stream path gets the error frame.
+            if (!cancelled) send("error", { message: `failed to persist assistant message: ${msg}` });
           }
-        } else {
-          // Non-zero exit OR no content — keep the prompt file for debug.
+        } else if (!cancelled) {
+          // Non-zero exit OR no content, and the client is still
+          // listening — keep the prompt file for debug, surface why.
           const why = signal
             ? `claude exited via signal ${signal}`
             : code !== 0

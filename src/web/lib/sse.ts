@@ -78,6 +78,10 @@ export interface ChatDoneEvent {
   durationMs: number | null;
   totalCostUsd: number | null;
   numTurns: number | null;
+  /** End-of-turn reason from the CLI's `result` event ("end_turn",
+   *  "tool_use", "max_tokens", "stop_sequence"). Null if the CLI exited
+   *  without emitting `result`. */
+  stopReason: string | null;
 }
 
 export interface ChatStreamListeners {
@@ -262,6 +266,7 @@ export function dispatchChatEvent(evt: SseEvent, listeners: ChatStreamListeners)
       durationMs: typeof parsed?.durationMs === "number" ? parsed.durationMs : null,
       totalCostUsd: typeof parsed?.totalCostUsd === "number" ? parsed.totalCostUsd : null,
       numTurns: typeof parsed?.numTurns === "number" ? parsed.numTurns : null,
+      stopReason: typeof parsed?.stopReason === "string" ? parsed.stopReason : null,
     });
   } else if (evt.event === "error") {
     const parsed = safeParse<{ message?: string }>(evt.data);
