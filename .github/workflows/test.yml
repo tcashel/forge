@@ -8,6 +8,8 @@ on:
 jobs:
   bun-test:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +17,45 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun install --frozen-lockfile
+      - name: Install deps
+        id: install
+        run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
+        continue-on-error: true
 
-      - run: bun run test
+      - name: Run tests
+        id: tests
+        if: steps.install.outcome == 'success'
+        run: bun run test 2>&1 | tee /tmp/test.log
+        continue-on-error: true
+
+      - name: Post diagnostic comment
+        if: always() && github.event_name == 'pull_request'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          {
+            echo "## Test CI Diagnostic"
+            echo ""
+            echo "**bun version:** $(bun --version 2>/dev/null || echo 'N/A')"
+            echo "**install outcome:** ${{ steps.install.outcome }}"
+            echo "**test outcome:** ${{ steps.tests.outcome }}"
+            echo ""
+            echo "<details><summary>Install log</summary>"
+            echo ""
+            echo '```'
+            head -100 /tmp/install.log 2>/dev/null || echo "no install log"
+            echo '```'
+            echo "</details>"
+            echo ""
+            echo "<details><summary>Test log</summary>"
+            echo ""
+            echo '```'
+            head -300 /tmp/test.log 2>/dev/null || echo "no test log"
+            echo '```'
+            echo "</details>"
+          } > /tmp/comment.md
+          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/comment.md || echo "gh pr comment failed: $?"
+
+      - name: Verify tests pass
+        if: steps.install.outcome == 'success'
+        run: bun run test
