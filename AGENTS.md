@@ -75,3 +75,4 @@ The SSE stream should show `event: meta` → `event: text` → `event: done` whe
 
 This means `tmux` must be available (it is in this env) and the agent binary must be on PATH.
 
+# CI diagnostic marker: 20260522180624
