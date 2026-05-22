@@ -17,4 +17,30 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - run: bun run lint
+      - name: Run biome check
+        id: biome
+        run: |
+          bun run lint 2>&1 | tee /tmp/biome-output.txt
+          exit ${PIPESTATUS[0]}
+        continue-on-error: true
+
+      - name: Post biome output as comment
+        if: failure() || steps.biome.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const output = fs.readFileSync('/tmp/biome-output.txt', 'utf8');
+            const body = `### Biome Check Output\n\`\`\`\n${output.slice(-3000)}\n\`\`\``;
+            if (context.payload.pull_request) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.payload.pull_request.number,
+                body: body,
+              });
+            }
+
+      - name: Fail if biome failed
+        if: steps.biome.outcome == 'failure'
+        run: exit 1
