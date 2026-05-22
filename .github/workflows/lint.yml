@@ -25,6 +25,7 @@ jobs:
 
       - name: Auto-fix with biome
         run: bun run check
+        continue-on-error: true
 
       - name: Check for changes
         id: diff
@@ -56,4 +57,18 @@ jobs:
           git push
 
       - name: Verify biome passes
-        run: bun run lint
+        id: verify
+        run: bun run lint 2>&1 | tee /tmp/biome-verify.txt
+        continue-on-error: true
+
+      - name: Post remaining errors
+        if: steps.verify.outcome == 'failure'
+        run: |
+          echo "### Remaining biome errors after auto-fix:" >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+          cat /tmp/biome-verify.txt >> $GITHUB_STEP_SUMMARY
+          echo '```' >> $GITHUB_STEP_SUMMARY
+
+      - name: Fail if biome still has errors
+        if: steps.verify.outcome == 'failure'
+        run: exit 1
