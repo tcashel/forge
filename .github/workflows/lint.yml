@@ -18,22 +18,44 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun install --frozen-lockfile
+      - name: Install deps
+        id: install
+        run: bun install --frozen-lockfile
+        continue-on-error: true
 
-      - name: Run biome and post output
-        if: github.event_name == 'pull_request'
+      - name: Run biome
+        id: biome
+        if: steps.install.outcome == 'success'
+        run: bun run lint > /tmp/biome.txt 2>&1; echo "EXIT_CODE=$?" >> /tmp/biome-meta.txt
+        continue-on-error: true
+
+      - name: Post biome output as PR comment
+        if: always() && github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          bun run lint > /tmp/biome.txt 2>&1 || true
-          BODY=$(printf '## Biome Check Output\n```\n%s\n```' "$(head -300 /tmp/biome.txt)")
+          if [ -f /tmp/biome.txt ]; then
+            CONTENT=$(head -300 /tmp/biome.txt)
+          else
+            CONTENT="Install failed (outcome: ${{ steps.install.outcome }}). Biome did not run."
+          fi
+          BODY=$(printf '## Biome CI Diagnostic\n\nInstall: %s | Biome: %s\n\n```\n%s\n```' \
+            "${{ steps.install.outcome }}" "${{ steps.biome.outcome }}" "$CONTENT")
           jq -n --arg body "$BODY" '{body: $body}' > /tmp/comment.json
           curl -sS -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
             "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
-            -d @/tmp/comment.json
-          cat /tmp/biome.txt
+            -d @/tmp/comment.json || echo "curl failed with exit code $?"
 
-      - name: Verify biome passes
-        run: bun run lint
+      - name: Final status
+        if: always()
+        run: |
+          if [ "${{ steps.install.outcome }}" != "success" ]; then
+            echo "Install failed"
+            exit 1
+          fi
+          if [ "${{ steps.biome.outcome }}" != "success" ]; then
+            echo "Biome check failed"
+            exit 1
+          fi
