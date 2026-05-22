@@ -8,53 +8,13 @@ on:
 jobs:
   biome:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - name: Capture all diagnostic output
-        run: |
-          set +e
-          echo "=== bun version ===" > biome-diagnostic.txt
-          bun --version >> biome-diagnostic.txt 2>&1
-          echo "" >> biome-diagnostic.txt
+      - run: bun install --frozen-lockfile
 
-          echo "=== bun install ===" >> biome-diagnostic.txt
-          bun install --frozen-lockfile >> biome-diagnostic.txt 2>&1
-          INSTALL_EXIT=$?
-          echo "install exit code: $INSTALL_EXIT" >> biome-diagnostic.txt
-          echo "" >> biome-diagnostic.txt
-
-          echo "=== biome check ===" >> biome-diagnostic.txt
-          if [ $INSTALL_EXIT -eq 0 ]; then
-            bun run lint >> biome-diagnostic.txt 2>&1
-            echo "biome exit code: $?" >> biome-diagnostic.txt
-          else
-            echo "SKIPPED: install failed" >> biome-diagnostic.txt
-          fi
-
-          echo "" >> biome-diagnostic.txt
-          echo "=== node_modules/@biomejs ===" >> biome-diagnostic.txt
-          ls -la node_modules/@biomejs/ >> biome-diagnostic.txt 2>&1 || echo "no @biomejs dir" >> biome-diagnostic.txt
-
-          cat biome-diagnostic.txt
-
-      - name: Commit diagnostic
-        if: always()
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -f biome-diagnostic.txt
-          git diff --cached --quiet && echo "nothing to commit" || git commit -m "ci: biome diagnostic [skip ci]"
-          git push || echo "push failed with exit $?"
-
-      - name: Verify biome passes
-        run: bun run lint
+      - run: bun run lint

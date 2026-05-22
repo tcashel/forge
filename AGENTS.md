@@ -74,5 +74,3 @@ The SSE stream should show `event: meta` → `event: text` → `event: done` whe
 3. Runner invokes the agent CLI with the prompt file via stdin/cat
 
 This means `tmux` must be available (it is in this env) and the agent binary must be on PATH.
-
-# CI diagnostic marker: 20260522180624
