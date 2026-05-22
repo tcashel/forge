@@ -20,41 +20,20 @@ jobs:
 
       - run: bun install --frozen-lockfile
 
-      - name: Run biome check
-        id: biome
-        run: bun run lint 2>&1 | tee /tmp/biome-output.txt || true
-
-      - name: Post biome output as PR comment
+      - name: Run biome and post output
         if: github.event_name == 'pull_request'
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-          REPO: ${{ github.repository }}
         run: |
-          BIOME_OUTPUT=$(cat /tmp/biome-output.txt | head -200)
-          BODY=$(cat <<'ENDOFBODY'
-          ## Biome Check Output
-          ```
-          ENDOFBODY
-          )
-          BODY="${BODY}
-          ${BIOME_OUTPUT}
-          \`\`\`"
-          # Use GitHub API to post comment
-          curl -s -X POST \
+          bun run lint > /tmp/biome.txt 2>&1 || true
+          BODY=$(printf '## Biome Check Output\n```\n%s\n```' "$(head -300 /tmp/biome.txt)")
+          jq -n --arg body "$BODY" '{body: $body}' > /tmp/comment.json
+          curl -sS -X POST \
             -H "Authorization: token ${GH_TOKEN}" \
             -H "Accept: application/vnd.github.v3+json" \
-            "https://api.github.com/repos/${REPO}/issues/${PR_NUMBER}/comments" \
-            -d "$(jq -n --arg body "$BODY" '{body: $body}')"
+            "https://api.github.com/repos/${{ github.repository }}/issues/${{ github.event.pull_request.number }}/comments" \
+            -d @/tmp/comment.json
+          cat /tmp/biome.txt
 
-      - name: Fail if biome had errors
-        run: |
-          if grep -q "Found [0-9]* error" /tmp/biome-output.txt; then
-            exit 1
-          fi
-          # Also fail if biome itself exited non-zero (captured by checking content)
-          if grep -qE "^(ci:|error)" /tmp/biome-output.txt; then
-            exit 1
-          fi
-          # Re-run to get the actual exit code
-          bun run lint
+      - name: Verify biome passes
+        run: bun run lint
