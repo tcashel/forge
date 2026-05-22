@@ -9,78 +9,51 @@ jobs:
   biome:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
-      checks: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - name: Install dependencies
-        id: install
-        run: |
-          set -o pipefail
-          bun install --frozen-lockfile 2>&1 | tee /tmp/install-output.txt
-        continue-on-error: true
+      - run: bun install --frozen-lockfile
 
-      - name: Run biome check
-        id: biome
-        if: steps.install.outcome == 'success'
-        run: |
-          set -o pipefail
-          bun run lint 2>&1 | tee /tmp/biome-output.txt
-        continue-on-error: true
+      - name: Auto-fix with biome
+        run: bun run check
 
-      - name: Write job summary
-        if: always()
+      - name: Check for changes
+        id: diff
         run: |
-          echo "## CI Diagnostic Output" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          echo "### Install step outcome: ${{ steps.install.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "### Biome step outcome: ${{ steps.biome.outcome }}" >> $GITHUB_STEP_SUMMARY
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f /tmp/install-output.txt ]; then
-            echo "### Install Output" >> $GITHUB_STEP_SUMMARY
+          git diff --name-only > /tmp/changed-files.txt
+          if [ -s /tmp/changed-files.txt ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "### Biome auto-fixed these files:" >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -50 /tmp/install-output.txt >> $GITHUB_STEP_SUMMARY
+            cat /tmp/changed-files.txt >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-          fi
-          echo "" >> $GITHUB_STEP_SUMMARY
-          if [ -f /tmp/biome-output.txt ]; then
-            echo "### Biome Output" >> $GITHUB_STEP_SUMMARY
+            echo "" >> $GITHUB_STEP_SUMMARY
+            echo "### Diff:" >> $GITHUB_STEP_SUMMARY
+            echo '```diff' >> $GITHUB_STEP_SUMMARY
+            git diff >> $GITHUB_STEP_SUMMARY
             echo '```' >> $GITHUB_STEP_SUMMARY
-            tail -80 /tmp/biome-output.txt >> $GITHUB_STEP_SUMMARY
-            echo '```' >> $GITHUB_STEP_SUMMARY
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "No formatting changes needed." >> $GITHUB_STEP_SUMMARY
           fi
 
-      - name: Post diagnostic comment
-        if: always() && (steps.install.outcome == 'failure' || steps.biome.outcome == 'failure')
-        uses: actions/github-script@v7
-        with:
-          github-token: ${{ secrets.GITHUB_TOKEN }}
-          script: |
-            const fs = require('fs');
-            let body = `## CI Diagnostic\n\n**Install**: ${`${{ steps.install.outcome }}`}\n**Biome**: ${`${{ steps.biome.outcome }}`}\n\n`;
-            if (fs.existsSync('/tmp/install-output.txt')) {
-              const install = fs.readFileSync('/tmp/install-output.txt', 'utf8');
-              body += `### Install Output (last 2000 chars)\n\`\`\`\n${install.slice(-2000)}\n\`\`\`\n\n`;
-            }
-            if (fs.existsSync('/tmp/biome-output.txt')) {
-              const biome = fs.readFileSync('/tmp/biome-output.txt', 'utf8');
-              body += `### Biome Check Output (last 3000 chars)\n\`\`\`\n${biome.slice(-3000)}\n\`\`\``;
-            }
-            if (context.payload.pull_request) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number: context.payload.pull_request.number,
-                body: body,
-              });
-            }
+      - name: Commit and push fixes
+        if: steps.diff.outputs.has_changes == 'true'
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git commit -m "style: auto-fix biome lint/format issues"
+          git push
 
-      - name: Fail if install or biome failed
-        if: always() && (steps.install.outcome == 'failure' || steps.biome.outcome == 'failure')
-        run: exit 1
+      - name: Verify biome passes
+        run: bun run lint
