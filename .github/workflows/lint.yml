@@ -9,54 +9,35 @@ jobs:
   biome:
     runs-on: ubuntu-latest
     permissions:
-      contents: read
+      contents: write
       pull-requests: write
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
 
       - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
 
-      - name: Install deps
-        id: install
-        run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
-        continue-on-error: true
+      - run: bun install --frozen-lockfile
 
-      - name: Run biome
-        id: biome
-        if: steps.install.outcome == 'success'
-        run: bun run lint 2>&1 | tee /tmp/biome.log
-        continue-on-error: true
+      - name: Auto-fix biome issues
+        run: bun run check || true
 
-      - name: Post diagnostic comment
-        if: always() && github.event_name == 'pull_request'
-        env:
-          GH_TOKEN: ${{ github.token }}
+      - name: Commit fixes if any
+        if: github.event_name == 'pull_request'
         run: |
-          {
-            echo "## Biome CI Diagnostic"
-            echo ""
-            echo "**bun version:** $(bun --version 2>/dev/null || echo 'N/A')"
-            echo "**install outcome:** ${{ steps.install.outcome }}"
-            echo "**biome outcome:** ${{ steps.biome.outcome }}"
-            echo ""
-            echo "<details><summary>Install log</summary>"
-            echo ""
-            echo '```'
-            head -100 /tmp/install.log 2>/dev/null || echo "no install log"
-            echo '```'
-            echo "</details>"
-            echo ""
-            echo "<details><summary>Biome log</summary>"
-            echo ""
-            echo '```'
-            head -200 /tmp/biome.log 2>/dev/null || echo "no biome log"
-            echo '```'
-            echo "</details>"
-          } > /tmp/comment.md
-          gh pr comment ${{ github.event.pull_request.number }} --body-file /tmp/comment.md || echo "gh pr comment failed: $?"
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          if git diff --cached --quiet; then
+            echo "No auto-fixable changes"
+          else
+            git commit -m "style: auto-fix biome formatting and lint issues"
+            git push
+          fi
 
       - name: Verify biome passes
-        if: steps.install.outcome == 'success'
         run: bun run lint
