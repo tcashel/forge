@@ -14,7 +14,7 @@ import { EventEmitter } from "node:events";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { Readable } from "node:stream";
+import { PassThrough, Readable } from "node:stream";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
 import { BadCwdError, type ChatMessage as ChatMsgType, loadHistory, runChatTurn } from "../src/core/plan-chat.ts";
@@ -798,6 +798,286 @@ test("runChatTurn keeps multiple text blocks in a single assistant frame", async
     assert.equal(textBlocks.length, 2, "both text blocks must persist in history");
     assert.equal(textBlocks[0].text, "first part");
     assert.equal(textBlocks[1].text, "second part");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+// ─── Resilience: heartbeat, result metadata, persist-on-cancel ──────────────
+//
+// These exercise the workbench resilience patch: the SSE response must keep
+// the connection alive across long quiet stretches, forward result-event
+// metadata into the `done` frame, surface CLI keepalives, and rescue the
+// assistant turn when the browser fetch dies mid-stream.
+
+/** Stub child whose stdout is a PassThrough — callers push frames over time
+ *  via `pushLine` / `closeStdout` and control the exit code via `exit`. */
+function makeControllableChild(): {
+  child: EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    stdin: PassThrough;
+    kill: (sig?: string) => boolean;
+  };
+  pushLine: (json: string) => void;
+  closeStdout: () => void;
+  exit: (code: number, signal?: NodeJS.Signals | null) => void;
+  killed: { value: boolean };
+} {
+  const stdout = new PassThrough();
+  const stderr = new PassThrough();
+  const stdin = new PassThrough();
+  const killed = { value: false };
+  const child = new EventEmitter() as EventEmitter & {
+    stdout: PassThrough;
+    stderr: PassThrough;
+    stdin: PassThrough;
+    kill: (sig?: string) => boolean;
+  };
+  child.stdout = stdout;
+  child.stderr = stderr;
+  child.stdin = stdin;
+  child.kill = (_sig?: string): boolean => {
+    killed.value = true;
+    return true;
+  };
+  return {
+    child,
+    pushLine: (json: string) => stdout.write(`${json}\n`),
+    closeStdout: () => stdout.end(),
+    exit: (code: number, signal?: NodeJS.Signals | null) => {
+      stdout.end();
+      child.emit("close", code, signal ?? null);
+    },
+    killed,
+  };
+}
+
+test("runChatTurn forwards result-event metadata into the `done` frame", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-result-meta-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `{"type":"assistant","message":{"id":"msg_meta","content":[{"type":"text","text":"hi"}]},"session_id":"sX"}`,
+      // Realistic `result` envelope from a captured fixture — duration,
+      // num_turns, total_cost_usd, stop_reason should all bubble through.
+      `{"type":"result","subtype":"success","is_error":false,"duration_ms":2345,"num_turns":1,"result":"hi","stop_reason":"end_turn","session_id":"sX","total_cost_usd":0.0123}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_meta0001" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => makeStubChild({ stdout }) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+    const done = frames.find((f) => f.event === "done");
+    assert.ok(done, "stream must emit a `done` event");
+    const data = done!.data as {
+      durationMs: number | null;
+      totalCostUsd: number | null;
+      numTurns: number | null;
+      stopReason: string | null;
+    };
+    assert.equal(data.durationMs, 2345);
+    assert.equal(data.totalCostUsd, 0.0123);
+    assert.equal(data.numTurns, 1);
+    assert.equal(data.stopReason, "end_turn");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn emits SSE heartbeat comments while stdout is idle", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-hb-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const ctl = makeControllableChild();
+    // Aggressive heartbeat so the test runs fast.
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_hbtest01" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 25,
+      spawnImpl: () => ctl.child as never,
+    });
+
+    // Read incrementally — drain a few chunks while the child is silent
+    // so the heartbeat has room to fire, then close it out.
+    const reader = result.stream.getReader();
+    const dec = new TextDecoder();
+    let buf = "";
+    // First push a real init frame so the parser is engaged.
+    ctl.pushLine(
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+    );
+    // Read until we observe at least one heartbeat comment. We bound the
+    // attempt count so a regression doesn't hang the suite.
+    let sawHeartbeat = false;
+    for (let i = 0; i < 50 && !sawHeartbeat; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) buf += dec.decode(value, { stream: true });
+      if (/(^|\n): hb\n\n/.test(buf)) sawHeartbeat = true;
+    }
+    assert.ok(sawHeartbeat, `expected to see a ': hb' comment, got: ${buf.slice(0, 400)}`);
+
+    // Wrap up so the stream terminates cleanly.
+    ctl.pushLine(
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"ok"}]},"session_id":"sX"}`,
+    );
+    ctl.pushLine(
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"ok","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+    );
+    ctl.exit(0);
+    while (true) {
+      const { done } = await reader.read();
+      if (done) break;
+    }
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn forwards CLI ping and api_retry as SSE comments (keepalive)", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-cli-keepalive-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      // Raw API ping wrapped in stream_event — must surface as a comment,
+      // not a typed SSE event (no consumer wants it semantically).
+      `{"type":"stream_event","event":{"type":"ping"},"session_id":"sX"}`,
+      // CLI-emitted retry notice — also a keepalive-grade signal.
+      `{"type":"system","subtype":"api_retry","attempt":1,"max_retries":3,"retry_delay_ms":1000,"error":"rate_limit","error_status":429,"session_id":"sX"}`,
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"hi"}]},"session_id":"sX"}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"hi","total_cost_usd":0,"is_error":false,"session_id":"sX"}`,
+      "",
+    ].join("\n");
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_cliping0" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => makeStubChild({ stdout }) as never,
+    });
+    const sse = await drainSse(result.stream);
+    assert.match(sse, /: cli_ping\n\n/, "ping must emit a `: cli_ping` SSE comment");
+    assert.match(sse, /: api_retry attempt=1 reason=rate_limit\n\n/, "api_retry must emit a labelled SSE comment");
+
+    // Comments must not appear as typed events to the SSE consumer.
+    const eventNames = parseSseFrames(sse).map((f) => f.event);
+    assert.ok(!eventNames.includes("ping"));
+    assert.ok(!eventNames.includes("api_retry"));
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn persists the assistant turn even when the client disconnected mid-stream", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-persist-cancel-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const ctl = makeControllableChild();
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_cancel01" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => ctl.child as never,
+    });
+
+    // Read just enough to engage the parser, then cancel as if the
+    // browser fetch died.
+    const reader = result.stream.getReader();
+    ctl.pushLine(
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+    );
+    ctl.pushLine(
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"the reply that must survive"}]},"session_id":"sX"}`,
+    );
+    // Drain pending bytes so the runtime delivers the writes.
+    await reader.read();
+    await reader.read();
+
+    // Client disconnect: cancel the consumer side. The stream's `cancel`
+    // hook fires SIGTERM at the child and flips the `cancelled` flag.
+    await reader.cancel();
+    assert.equal(ctl.killed.value, true, "child must be SIGTERM-ed on cancel");
+
+    // Now simulate the child actually exiting (post-SIGTERM). The close
+    // handler should still persist the assistant turn even though the
+    // SSE stream is already torn down.
+    ctl.exit(0, "SIGTERM");
+
+    // Give the persist path one tick to land — `appendMessage` is sync,
+    // but the close handler runs after our `cancel()` await resolves.
+    await new Promise((r) => setImmediate(r));
+
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_cancel01" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.ok(assistant, "assistant message must be persisted even after client disconnect");
+    assert.equal(assistant!.text, "the reply that must survive");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn does NOT persist an empty turn when the client disconnects before content arrives", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-cancel-empty-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const ctl = makeControllableChild();
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_cancmt00" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => ctl.child as never,
+    });
+    const reader = result.stream.getReader();
+    // Only emit the init frame — no assistant content.
+    ctl.pushLine(
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+    );
+    await reader.read();
+    await reader.cancel();
+    ctl.exit(0, "SIGTERM");
+    await new Promise((r) => setImmediate(r));
+
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_cancmt00" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.equal(assistant, undefined, "no assistant turn should be persisted when there was no content");
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
