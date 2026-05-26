@@ -10,7 +10,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { RunMeta, TaskRecord } from "../store.ts";
+import type { CritiqueMeta, RunMeta, TaskRecord } from "../store.ts";
 
 export function livePlanVersionId(taskId: string, version: number): string {
   return `pv-${taskId}-v${version}`;
@@ -208,6 +208,246 @@ export function recordJobStarted(db: Database, task: TaskRecord, meta: RunMeta):
   })();
 
   return runNumber;
+}
+
+function safe(s: string): string {
+  return s.replace(/[^a-z0-9_-]/gi, "_");
+}
+
+function liveCriticConfigId(agent: string, model: string): string {
+  return `cc-${safe(agent)}-${safe(model)}`;
+}
+
+function liveCritiqueSessionId(critiqueId: string, slot: "critic-a" | "critic-b" | "synth"): string {
+  return `s-${critiqueId}-${slot}`;
+}
+
+function liveCriticRunId(critiqueId: string, slot: "a" | "b"): string {
+  return `cr-${critiqueId}-${slot}`;
+}
+
+function liveCritiqueSynthesisId(critiqueId: string): string {
+  return `cs-${critiqueId}`;
+}
+
+function mapCritiqueAgentState(s: CritiqueMeta["criticA"]["status"]): string {
+  switch (s) {
+    case "done":
+      return "completed";
+    case "failed":
+      return "failed";
+    default:
+      return "running";
+  }
+}
+
+/**
+ * Called when a critique is launched (after writeCritiqueMeta). Inserts
+ * critic_configs (for the 3 agent/model pairs encountered), 3 sessions
+ * (critic-a, critic-b, synth), and 2 critic_runs (a, b) pointing at the
+ * plan's current_version_id.
+ *
+ * The critique's bash runner updates critique-meta.json directly as
+ * critics complete; those state transitions get reflected in the DB via
+ * `syncCritiqueState` (read-path) rather than runner-script writes.
+ *
+ * Idempotent — re-running on the same critiqueId is a no-op.
+ */
+export function recordCritiqueStarted(db: Database, task: TaskRecord, meta: CritiqueMeta): void {
+  db.transaction(() => {
+    ensurePlanAndSyntheticTask(db, task);
+
+    const planRow = db.prepare("SELECT current_version_id FROM plans WHERE id = ?").get(task.id) as {
+      current_version_id: string | null;
+    };
+    const targetVersionId = planRow.current_version_id;
+    if (!targetVersionId) return; // no version → nothing to critique against
+
+    insertCriticConfigIfMissing(db, meta.criticA.agent, meta.criticA.model, meta.startedAt);
+    insertCriticConfigIfMissing(db, meta.criticB.agent, meta.criticB.model, meta.startedAt);
+    insertCriticConfigIfMissing(db, meta.synthesizer.agent, meta.synthesizer.model, meta.startedAt);
+
+    insertCritiqueSession(db, meta, "critic-a", "critique", meta.criticA);
+    insertCritiqueSession(db, meta, "critic-b", "critique", meta.criticB);
+    insertCritiqueSession(db, meta, "synth", "synthesis", meta.synthesizer);
+
+    insertLiveCriticRun(db, meta, "a", targetVersionId, meta.criticA);
+    insertLiveCriticRun(db, meta, "b", targetVersionId, meta.criticB);
+  })();
+}
+
+/**
+ * Read-path sync — reconciles DB state with the bash runner's
+ * critique-meta.json. Called by API/CLI readers before returning data
+ * so finished critiques land their 'completed'/'failed' state and the
+ * synthesis row appears. Idempotent.
+ */
+export function syncCritiqueState(db: Database, meta: CritiqueMeta): void {
+  db.transaction(() => {
+    const finishedAt = meta.completedAt ?? null;
+
+    // Sync the three sessions
+    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "critic-a"), meta.criticA, finishedAt);
+    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "critic-b"), meta.criticB, finishedAt);
+    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "synth"), meta.synthesizer, finishedAt);
+
+    // Sync the two critic_runs
+    db.prepare("UPDATE critic_runs SET state = ?, finished_at = ? WHERE id = ?").run(
+      mapCritiqueAgentState(meta.criticA.status),
+      meta.criticA.status === "done" || meta.criticA.status === "failed" ? finishedAt : null,
+      liveCriticRunId(meta.critiqueId, "a"),
+    );
+    db.prepare("UPDATE critic_runs SET state = ?, finished_at = ? WHERE id = ?").run(
+      mapCritiqueAgentState(meta.criticB.status),
+      meta.criticB.status === "done" || meta.criticB.status === "failed" ? finishedAt : null,
+      liveCriticRunId(meta.critiqueId, "b"),
+    );
+
+    // Synthesis row appears when the critique reaches a terminal state.
+    if (meta.status === "done" || meta.status === "failed") {
+      const targetRow = db
+        .prepare("SELECT target_id FROM critic_runs WHERE id = ? LIMIT 1")
+        .get(liveCriticRunId(meta.critiqueId, "a")) as { target_id: string } | undefined;
+      const targetVersionId = targetRow?.target_id ?? null;
+      if (targetVersionId) {
+        db.prepare(
+          `INSERT OR IGNORE INTO critic_syntheses
+           (id, target_kind, target_id, critic_run_ids, agreements, disagreements, recommendation, created_at)
+           VALUES (?, 'plan_version', ?, ?, NULL, NULL, NULL, ?)`,
+        ).run(
+          liveCritiqueSynthesisId(meta.critiqueId),
+          targetVersionId,
+          JSON.stringify([liveCriticRunId(meta.critiqueId, "a"), liveCriticRunId(meta.critiqueId, "b")]),
+          finishedAt ?? meta.startedAt,
+        );
+      }
+    }
+  })();
+}
+
+function insertCriticConfigIfMissing(db: Database, agent: string, model: string, createdAt: string): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO critic_configs
+     (id, name, description, prompt_template, agent_adapter, model, role, enabled, created_at, updated_at)
+     VALUES (?, ?, NULL, '(live — prompt loaded from skills at runtime)', ?, ?, 'plan', 1, ?, ?)`,
+  ).run(liveCriticConfigId(agent, model), `${agent}:${model}`, agent, model, createdAt, createdAt);
+}
+
+function insertCritiqueSession(
+  db: Database,
+  meta: CritiqueMeta,
+  slot: "critic-a" | "critic-b" | "synth",
+  purpose: "critique" | "synthesis",
+  agent: CritiqueMeta["criticA"],
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO sessions
+     (id, purpose, related_id, agent_adapter, model, started_at, finished_at, state,
+      pid, cwd, command_line, exit_code, error, metrics)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, 'running', NULL, NULL, ?, NULL, NULL, ?)`,
+  ).run(
+    liveCritiqueSessionId(meta.critiqueId, slot),
+    purpose,
+    meta.critiqueId,
+    agent.agent,
+    agent.model,
+    meta.startedAt,
+    meta.tmuxSession,
+    JSON.stringify({ reasoningEffort: agent.reasoningEffort }),
+  );
+}
+
+function updateCritiqueSession(
+  db: Database,
+  sessionId: string,
+  agent: CritiqueMeta["criticA"],
+  finishedAt: string | null,
+): void {
+  const state = mapCritiqueAgentState(agent.status);
+  const done = agent.status === "done" || agent.status === "failed";
+  db.prepare("UPDATE sessions SET state = ?, finished_at = ?, metrics = ? WHERE id = ?").run(
+    state,
+    done ? finishedAt : null,
+    JSON.stringify({ durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort }),
+    sessionId,
+  );
+}
+
+function insertLiveCriticRun(
+  db: Database,
+  meta: CritiqueMeta,
+  slot: "a" | "b",
+  targetVersionId: string,
+  agent: CritiqueMeta["criticA"],
+): void {
+  db.prepare(
+    `INSERT OR IGNORE INTO critic_runs
+     (id, critic_config_id, target_kind, target_id, session_id, findings, severity_summary,
+      started_at, finished_at, state)
+     VALUES (?, ?, 'plan_version', ?, ?, NULL, NULL, ?, NULL, 'running')`,
+  ).run(
+    liveCriticRunId(meta.critiqueId, slot),
+    liveCriticConfigId(agent.agent, agent.model),
+    targetVersionId,
+    liveCritiqueSessionId(meta.critiqueId, slot === "a" ? "critic-a" : "critic-b"),
+    meta.startedAt,
+  );
+}
+
+/**
+ * Mark the most recent jobs row for a plan as finished, with the
+ * RunMeta's status mapped to a jobs.state. Called by serve.ts when it
+ * reads RunMeta and notices a status transition that the bash runner
+ * wrote to meta.json but the DB hasn't seen yet.
+ */
+export function syncJobState(db: Database, task: TaskRecord, meta: Partial<RunMeta>): void {
+  const taskRow = db.prepare("SELECT id FROM tasks WHERE plan_id = ? AND sequence = 1").get(task.id) as
+    | { id: string }
+    | undefined;
+  if (!taskRow) return;
+
+  const latest = db
+    .prepare("SELECT id, run_number, state FROM jobs WHERE task_id = ? ORDER BY run_number DESC LIMIT 1")
+    .get(taskRow.id) as { id: string; run_number: number; state: string } | undefined;
+  if (!latest) return;
+
+  const newState = mapMetaStatusToJobState(meta.status);
+  const finishedAt =
+    newState === "succeeded" || newState === "failed" ? (meta.endedAt ?? new Date().toISOString()) : null;
+  if (newState === latest.state && !finishedAt) return;
+
+  db.prepare(
+    "UPDATE jobs SET state = ?, finished_at = COALESCE(?, finished_at), summary = COALESCE(?, summary) WHERE id = ?",
+  ).run(newState, finishedAt, meta.errorMessage ?? null, latest.id);
+
+  if (newState === "succeeded" || newState === "failed") {
+    const planStage = newState === "succeeded" ? "completed" : "completed";
+    db.prepare("UPDATE plans SET stage = ?, updated_at = ? WHERE id = ?").run(planStage, finishedAt, task.id);
+    db.prepare("UPDATE tasks SET state = ?, completed_at = ?, updated_at = ? WHERE id = ?").run(
+      newState === "succeeded" ? "completed" : "failed",
+      finishedAt,
+      finishedAt,
+      taskRow.id,
+    );
+  }
+}
+
+function mapMetaStatusToJobState(status: string | undefined): string {
+  switch (status) {
+    case "done":
+      return "succeeded";
+    case "failed":
+    case "quality_failed":
+      return "failed";
+    case "running":
+    case "quality_check":
+    case "creating_pr":
+    case "fixing":
+    case "reviewing":
+      return "running";
+    default:
+      return "running";
+  }
 }
 
 function ensurePlanAndSyntheticTask(db: Database, task: TaskRecord): void {

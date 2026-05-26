@@ -11,6 +11,7 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { recordCritiqueStarted } from "./db/writes.ts";
 import { agentCommand, isTmuxSessionAlive, killTmuxSession } from "./launch.js";
 import type { CritiqueMeta, ForgeStore, LaunchTarget, ReasoningEffort } from "./store.js";
 
@@ -341,6 +342,17 @@ function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession:
     },
   };
   store.writeCritiqueMeta(config.taskId, config.critiqueId, meta);
+
+  // Phase 3 dual-write: record critique start in SQLite. DB failure is
+  // warned, not fatal — the critique-meta.json above is the live source
+  // of truth during the dual-write window.
+  try {
+    const task = store.getTask(config.taskId);
+    if (task) recordCritiqueStarted(store.db.db, task, meta);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record critique_runs for ${config.critiqueId}: ${msg}\n`);
+  }
 
   const script = generateRunnerScript(config, store);
   const runnerPath = path.join(critiqueDir, "run.sh");

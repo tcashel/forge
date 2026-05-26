@@ -10,6 +10,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.js";
 import { ForgeDb } from "./db/connection.ts";
+import { syncJobState } from "./db/writes.ts";
 import { withFileLock } from "./file-lock.js";
 
 export type TaskStatus =
@@ -397,6 +398,15 @@ export class ForgeStore {
           : task.completedAt,
     };
     this.upsertTask(updated);
+
+    // Phase 3 dual-write: keep the DB job row coherent with the bash
+    // runner's meta.json transitions. Doesn't fail the sync if DB hiccups.
+    try {
+      syncJobState(this.db.db, updated, meta as Partial<RunMeta>);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: syncJobState failed for ${task.id}: ${msg}\n`);
+    }
     return updated;
   }
 
