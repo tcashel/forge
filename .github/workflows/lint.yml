@@ -8,65 +8,13 @@ on:
 jobs:
   biome:
     runs-on: ubuntu-latest
-    permissions:
-      contents: read
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
-      - name: Setup Bun
-        id: setup-bun
-        uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2
         with:
-          bun-version: "1"
-        continue-on-error: true
+          bun-version: latest
 
-      - name: Install deps
-        id: install
-        if: steps.setup-bun.outcome == 'success'
-        run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
-        continue-on-error: true
+      - run: bun install --frozen-lockfile
 
-      - name: Biome check
-        id: lint
-        if: steps.install.outcome == 'success'
-        run: bun run lint 2>&1 | tee /tmp/lint.log
-        continue-on-error: true
-
-      - name: Post diagnostics
-        if: always()
-        env:
-          GH_TOKEN: ${{ github.token }}
-          PR_NUMBER: ${{ github.event.pull_request.number }}
-        run: |
-          echo "### CI Lint Diagnostics" > /tmp/comment.md
-          echo "" >> /tmp/comment.md
-          echo "**setup-bun:** ${{ steps.setup-bun.outcome }}" >> /tmp/comment.md
-          echo "**install:** ${{ steps.install.outcome }}" >> /tmp/comment.md
-          echo "**lint:** ${{ steps.lint.outcome }}" >> /tmp/comment.md
-          echo "" >> /tmp/comment.md
-          bun --version >> /tmp/comment.md 2>&1 || echo "bun not available" >> /tmp/comment.md
-          echo "" >> /tmp/comment.md
-          if [ -f /tmp/install.log ]; then
-            echo '<details><summary>Install output</summary>' >> /tmp/comment.md
-            echo '' >> /tmp/comment.md
-            echo '```' >> /tmp/comment.md
-            tail -100 /tmp/install.log >> /tmp/comment.md
-            echo '```' >> /tmp/comment.md
-            echo '</details>' >> /tmp/comment.md
-          fi
-          if [ -f /tmp/lint.log ]; then
-            echo '<details><summary>Lint output</summary>' >> /tmp/comment.md
-            echo '' >> /tmp/comment.md
-            echo '```' >> /tmp/comment.md
-            tail -100 /tmp/lint.log >> /tmp/comment.md
-            echo '```' >> /tmp/comment.md
-            echo '</details>' >> /tmp/comment.md
-          fi
-          if [ -n "$PR_NUMBER" ]; then
-            gh pr comment "$PR_NUMBER" --body-file /tmp/comment.md || echo "Failed to post comment"
-          fi
-
-      - name: Fail if any step failed
-        if: always() && (steps.setup-bun.outcome == 'failure' || steps.install.outcome == 'failure' || steps.lint.outcome == 'failure')
-        run: exit 1
+      - run: bun run lint
