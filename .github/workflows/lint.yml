@@ -15,6 +15,12 @@ jobs:
         with:
           bun-version: "1"
 
-      - run: bun install --frozen-lockfile
+      - name: Install deps
+        run: |
+          echo "::group::bun version"
+          bun --version
+          echo "::endgroup::"
+          bun install --frozen-lockfile
 
-      - run: bun run lint
+      - name: Biome check
+        run: bun run lint
