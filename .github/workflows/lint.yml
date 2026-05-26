@@ -15,6 +15,16 @@ jobs:
       - uses: actions/checkout@v4
         with:
           ref: ${{ github.head_ref || github.ref_name }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Diagnostic - before bun setup
+        run: |
+          echo "=== Runner info ===" > /tmp/ci-diag.txt
+          uname -a >> /tmp/ci-diag.txt
+          echo "Date: $(date -u)" >> /tmp/ci-diag.txt
+          echo "PWD: $(pwd)" >> /tmp/ci-diag.txt
+          echo "Node: $(node --version 2>&1)" >> /tmp/ci-diag.txt
+          echo "" >> /tmp/ci-diag.txt
 
       - name: Install Bun
         id: bun-setup
@@ -23,31 +33,51 @@ jobs:
           bun-version: latest
         continue-on-error: true
 
+      - name: Diagnostic - after bun setup
+        if: always()
+        run: |
+          echo "=== setup-bun outcome: ${{ steps.bun-setup.outcome }} ===" >> /tmp/ci-diag.txt
+          echo "Bun path: $(which bun 2>&1)" >> /tmp/ci-diag.txt
+          echo "Bun version: $(bun --version 2>&1)" >> /tmp/ci-diag.txt
+          echo "" >> /tmp/ci-diag.txt
+
       - name: Fallback Bun install
         if: steps.bun-setup.outcome == 'failure'
         run: |
           curl -fsSL https://bun.sh/install | bash
           echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
+          echo "=== Fallback bun: $(~/.bun/bin/bun --version 2>&1) ===" >> /tmp/ci-diag.txt
 
       - name: Install deps
-        run: bun install --frozen-lockfile
+        id: install
+        run: bun install --frozen-lockfile >> /tmp/ci-diag.txt 2>&1
+        continue-on-error: true
 
-      - name: Lint
-        run: bun run lint
+      - name: Run biome
+        id: lint
+        if: steps.install.outcome == 'success'
+        run: bun run lint >> /tmp/ci-diag.txt 2>&1
+        continue-on-error: true
 
-      - name: Post failure diagnostic
-        if: failure() && github.event_name == 'pull_request'
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const { execSync } = require('child_process');
-            let diag = '';
-            try { diag += '## Bun version\n```\n' + execSync('bun --version 2>&1 || echo "bun not found"').toString() + '```\n'; } catch(e) { diag += 'bun --version failed\n'; }
-            try { diag += '## Install output\n```\n' + execSync('bun install --frozen-lockfile 2>&1 || true').toString().slice(0, 3000) + '```\n'; } catch(e) {}
-            try { diag += '## Lint output\n```\n' + execSync('bun run lint 2>&1 || true').toString().slice(0, 3000) + '```\n'; } catch(e) {}
-            await github.rest.issues.createComment({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              issue_number: context.issue.number,
-              body: `### CI Diagnostic\nsetup-bun outcome: ${{ steps.bun-setup.outcome }}\n\n${diag}`
-            });
+      - name: Commit diagnostic
+        if: always()
+        run: |
+          echo "" >> /tmp/ci-diag.txt
+          echo "=== install outcome: ${{ steps.install.outcome }} ===" >> /tmp/ci-diag.txt
+          echo "=== lint outcome: ${{ steps.lint.outcome }} ===" >> /tmp/ci-diag.txt
+          cp /tmp/ci-diag.txt ci-diagnostic.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ci-diagnostic.txt
+          git diff --cached --quiet || git commit -m "ci: diagnostic output [skip ci]"
+          git push || echo "Push failed"
+
+      - name: Final check
+        if: always()
+        run: |
+          if [ "${{ steps.install.outcome }}" != "success" ]; then
+            echo "Install failed"; exit 1
+          fi
+          if [ "${{ steps.lint.outcome }}" != "success" ]; then
+            echo "Lint failed"; exit 1
+          fi
