@@ -6,6 +6,7 @@
  * as CliError are caught here and rendered into the standard envelope.
  */
 
+import { ForgeDb } from "../core/db/connection.ts";
 import { ForgeStore } from "../core/store.ts";
 import * as attach from "./cmd/attach.ts";
 import * as config from "./cmd/config.ts";
@@ -105,6 +106,9 @@ export async function run(argv: string[]): Promise<void> {
   }
 
   const store = new ForgeStore();
+  // Open + migrate the SQLite store. Phase 1 only opens it; per-subsystem
+  // writes still go through ForgeStore's JSON files until Phase 3.
+  new ForgeDb({ forgeDir: store.forgeDir });
   const json = isJsonRequested(rest);
 
   try {
