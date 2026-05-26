@@ -8,76 +8,13 @@ on:
 jobs:
   biome:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
-      pull-requests: write
     steps:
       - uses: actions/checkout@v4
-        with:
-          ref: ${{ github.head_ref || github.ref_name }}
-          token: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Diagnostic - before bun setup
-        run: |
-          echo "=== Runner info ===" > /tmp/ci-diag.txt
-          uname -a >> /tmp/ci-diag.txt
-          echo "Date: $(date -u)" >> /tmp/ci-diag.txt
-          echo "PWD: $(pwd)" >> /tmp/ci-diag.txt
-          echo "Node: $(node --version 2>&1)" >> /tmp/ci-diag.txt
-          echo "" >> /tmp/ci-diag.txt
-
-      - name: Install Bun
-        id: bun-setup
-        uses: oven-sh/setup-bun@v2
+      - uses: oven-sh/setup-bun@v2
         with:
           bun-version: latest
-        continue-on-error: true
 
-      - name: Diagnostic - after bun setup
-        if: always()
-        run: |
-          echo "=== setup-bun outcome: ${{ steps.bun-setup.outcome }} ===" >> /tmp/ci-diag.txt
-          echo "Bun path: $(which bun 2>&1)" >> /tmp/ci-diag.txt
-          echo "Bun version: $(bun --version 2>&1)" >> /tmp/ci-diag.txt
-          echo "" >> /tmp/ci-diag.txt
+      - run: bun install --frozen-lockfile
 
-      - name: Fallback Bun install
-        if: steps.bun-setup.outcome == 'failure'
-        run: |
-          curl -fsSL https://bun.sh/install | bash
-          echo "$HOME/.bun/bin" >> "$GITHUB_PATH"
-          echo "=== Fallback bun: $(~/.bun/bin/bun --version 2>&1) ===" >> /tmp/ci-diag.txt
-
-      - name: Install deps
-        id: install
-        run: bun install --frozen-lockfile >> /tmp/ci-diag.txt 2>&1
-        continue-on-error: true
-
-      - name: Run biome
-        id: lint
-        if: steps.install.outcome == 'success'
-        run: bun run lint >> /tmp/ci-diag.txt 2>&1
-        continue-on-error: true
-
-      - name: Commit diagnostic
-        if: always()
-        run: |
-          echo "" >> /tmp/ci-diag.txt
-          echo "=== install outcome: ${{ steps.install.outcome }} ===" >> /tmp/ci-diag.txt
-          echo "=== lint outcome: ${{ steps.lint.outcome }} ===" >> /tmp/ci-diag.txt
-          cp /tmp/ci-diag.txt ci-diagnostic.txt
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add ci-diagnostic.txt
-          git diff --cached --quiet || git commit -m "ci: diagnostic output [skip ci]"
-          git push || echo "Push failed"
-
-      - name: Final check
-        if: always()
-        run: |
-          if [ "${{ steps.install.outcome }}" != "success" ]; then
-            echo "Install failed"; exit 1
-          fi
-          if [ "${{ steps.lint.outcome }}" != "success" ]; then
-            echo "Lint failed"; exit 1
-          fi
+      - run: bun run lint

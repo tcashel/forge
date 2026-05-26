@@ -1,0 +1,25 @@
+name: Diagnostic
+
+on: pull_request
+
+jobs:
+  diag:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.head_ref }}
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - run: |
+          echo "CI runner is working" > ci-diagnostic.txt
+          echo "Date: $(date -u)" >> ci-diagnostic.txt
+          echo "uname: $(uname -a)" >> ci-diagnostic.txt
+          echo "bun: $(which bun 2>&1 || echo 'not found')" >> ci-diagnostic.txt
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add ci-diagnostic.txt
+          git commit -m "ci: diagnostic output [skip ci]" || true
+          git push || true
