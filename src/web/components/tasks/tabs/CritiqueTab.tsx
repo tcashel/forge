@@ -227,20 +227,38 @@ export function CritiqueTab({ t }: { t: TaskView }) {
           <div style="font-size:12.5px;color:var(--text)">
             <b>{s.attempts.length}</b> attempt{s.attempts.length === 1 ? "" : "s"}
           </div>
-          <button
-            type="button"
-            class="btn btn-ghost"
-            style="font-size:11.5px;padding:4px 10px"
-            onClick={() =>
-              runAction(
-                `/api/tasks/${encodeURIComponent(t.id)}/critique`,
-                { successMsg: `Critique queued for ${t.id}` },
-                refreshTasks,
-              )
-            }
-          >
-            New critique
-          </button>
+          <div style="display:flex;gap:6px">
+            <button
+              type="button"
+              class="btn btn-secondary"
+              style="font-size:11.5px;padding:4px 10px"
+              onClick={() =>
+                runAction(
+                  `/api/tasks/${encodeURIComponent(t.id)}/improve`,
+                  { successMsg: `Improve queued for ${t.id}` },
+                  refreshTasks,
+                )
+              }
+              title="Run the critique + improver pipeline; applies findings to the spec"
+            >
+              Run improver
+            </button>
+            <button
+              type="button"
+              class="btn btn-ghost"
+              style="font-size:11.5px;padding:4px 10px"
+              onClick={() =>
+                runAction(
+                  `/api/tasks/${encodeURIComponent(t.id)}/critique`,
+                  { successMsg: `Critique queued for ${t.id}` },
+                  refreshTasks,
+                )
+              }
+              title="Run critique only (no auto-improve)"
+            >
+              New critique
+            </button>
+          </div>
         </div>
         <div style="border:1px solid var(--rule);border-radius:8px;overflow:hidden">
           {s.attempts.map((a) => {

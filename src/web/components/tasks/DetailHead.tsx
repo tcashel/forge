@@ -22,10 +22,6 @@ type ActionId =
   | "improve"
   | "kill";
 
-function needsRecovery(t: TaskView): boolean {
-  return t.section === "drafting" && (!!t.lastImproveError || t.critique?.status === "failed");
-}
-
 function actionsFor(t: TaskView): ActionDef[] {
   const items: ActionDef[] = [];
   if (t.section === "running") {
@@ -33,16 +29,10 @@ function actionsFor(t: TaskView): ActionDef[] {
     if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: "copy-attach" });
     if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: "open-pr" });
     items.push({ label: "Kill", cls: "btn-ghost", action: "kill" });
-  } else if (needsRecovery(t)) {
-    // Auto-improve or critique failed — surface recovery affordances so the
-    // user can retry, push past the failure, or read the spec to decide.
-    items.push({ label: "Retry improve", cls: "btn-primary", action: "improve" });
-    items.push({ label: "Retry critique", cls: "btn-secondary", action: "critique" });
-    items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
-    items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
   } else if (t.kind === "critique-ready") {
     items.push({ label: "Review critique", cls: "btn-attention", action: "review-critique" });
     items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
+    items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
   } else if (t.kind === "failed") {
     items.push({ label: "Open log", cls: "btn-primary", action: "open-log" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
@@ -58,6 +48,19 @@ function actionsFor(t: TaskView): ActionDef[] {
   } else if (t.section === "done") {
     if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: "open-pr" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
+  }
+  // Recovery affordances are additive — surface them on top of whatever
+  // base state the task is in, since improve/critique can fail
+  // independently of "critique-ready", "drafting", etc. Dedupe against
+  // buttons already present.
+  const present = new Set(items.map((i) => i.action));
+  if (t.lastImproveError && !present.has("improve")) {
+    items.push({ label: "Retry improve", cls: "btn-secondary", action: "improve" });
+    present.add("improve");
+  }
+  if (t.critique?.status === "failed" && !present.has("critique")) {
+    items.push({ label: "Retry critique", cls: "btn-secondary", action: "critique" });
+    present.add("critique");
   }
   return items;
 }
