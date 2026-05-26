@@ -1,9 +1,26 @@
 import { useComputed } from "@preact/signals";
 import { repos } from "../../signals/repos";
 import { visibleTasks } from "../../signals/tasks";
-import { searchQuery, selectedRepo } from "../../signals/ui";
-import type { TaskView, WorkbenchSection } from "../../types";
+import { searchQuery, selectedRepo, sidebarFilter } from "../../signals/ui";
+import type { SidebarFilter, TaskView, WorkbenchSection } from "../../types";
 import { DoneSection, TaskSection } from "./TaskSection";
+
+// Which task sections each sidebar filter surfaces. "all" (Pick up here)
+// keeps the original always-show-everything behaviour. The others narrow
+// the list so the sidebar nav actually feels like a filter, not just a
+// scroll-to-header anchor (which is what it used to be).
+const FILTER_SECTIONS: Record<SidebarFilter, Set<WorkbenchSection> | "all"> = {
+  all: "all",
+  running: new Set<WorkbenchSection>(["running"]),
+  backlog: new Set<WorkbenchSection>(["ready", "drafting", "attention"]),
+  done: new Set<WorkbenchSection>(["done"]),
+  prs: "all", // unreachable here — prs flips viewMode, not just the filter
+};
+
+function shouldRender(section: WorkbenchSection, filter: SidebarFilter): boolean {
+  const set = FILTER_SECTIONS[filter];
+  return set === "all" || set.has(section);
+}
 
 interface SectionMap {
   running: TaskView[];
@@ -72,39 +89,53 @@ function EmptyState() {
 export function TaskList() {
   const buckets = useComputed(() => bucketize(visibleTasks.value));
   const map = buckets.value;
-  const total = map.running.length + map.attention.length + map.ready.length + map.drafting.length + map.done.length;
+  const filter = sidebarFilter.value;
+  const visibleCount =
+    (shouldRender("running", filter) ? map.running.length : 0) +
+    (shouldRender("attention", filter) ? map.attention.length : 0) +
+    (shouldRender("ready", filter) ? map.ready.length : 0) +
+    (shouldRender("drafting", filter) ? map.drafting.length : 0) +
+    (shouldRender("done", filter) ? map.done.length : 0);
   return (
     <>
-      <TaskSection
-        section="running"
-        ic="running"
-        name="Running now"
-        help="Live — auto-refreshes every 3s"
-        rows={map.running}
-      />
-      <TaskSection
-        section="attention"
-        ic="attention"
-        name="Needs your attention"
-        help="Failures + critique-ready"
-        rows={map.attention}
-      />
-      <TaskSection
-        section="ready"
-        ic="ready"
-        name="Ready to launch"
-        help="Auto-improver has revised these"
-        rows={map.ready}
-      />
-      <TaskSection
-        section="drafting"
-        ic="drafting"
-        name="Drafting"
-        help="First-pass specs — could use shape"
-        rows={map.drafting}
-      />
-      <DoneSection rows={map.done} />
-      {total === 0 ? <EmptyState /> : null}
+      {shouldRender("running", filter) ? (
+        <TaskSection
+          section="running"
+          ic="running"
+          name="Running now"
+          help="Live — auto-refreshes every 3s"
+          rows={map.running}
+        />
+      ) : null}
+      {shouldRender("attention", filter) ? (
+        <TaskSection
+          section="attention"
+          ic="attention"
+          name="Needs your attention"
+          help="Failures + critique-ready"
+          rows={map.attention}
+        />
+      ) : null}
+      {shouldRender("ready", filter) ? (
+        <TaskSection
+          section="ready"
+          ic="ready"
+          name="Ready to launch"
+          help="Auto-improver has revised these"
+          rows={map.ready}
+        />
+      ) : null}
+      {shouldRender("drafting", filter) ? (
+        <TaskSection
+          section="drafting"
+          ic="drafting"
+          name="Drafting"
+          help="First-pass specs — could use shape"
+          rows={map.drafting}
+        />
+      ) : null}
+      {shouldRender("done", filter) ? <DoneSection rows={map.done} /> : null}
+      {visibleCount === 0 ? <EmptyState /> : null}
     </>
   );
 }

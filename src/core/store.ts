@@ -43,6 +43,12 @@ export interface TaskRecord {
   jiraTicket: string | null;
   specFile: string;
   specVersion: number;
+  /**
+   * Outcome of the most recent auto-improve attempt (forge spec save / spec improve).
+   * Non-null only when the attempt errored or was skipped — successful applies clear it.
+   * Surfaced in the Workbench so the user can retry or launch anyway.
+   */
+  lastImproveError: { mode: string; error: string; at: string } | null;
 }
 
 export interface ForgeIndex {
@@ -250,6 +256,9 @@ export class ForgeStore {
       for (const t of Object.values(index.tasks)) {
         if (typeof (t as Partial<TaskRecord>).specVersion !== "number") {
           (t as TaskRecord).specVersion = 1;
+        }
+        if (!("lastImproveError" in t)) {
+          (t as TaskRecord).lastImproveError = null;
         }
       }
       return index;

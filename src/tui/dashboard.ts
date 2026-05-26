@@ -10,7 +10,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import type { GhTarget } from "../core/gh.js";
 import { fetchPrs, type GhPr } from "../core/gh-pr.js";
-import { isTmuxSessionAlive, killTmuxSession } from "../core/launch.js";
+import { isTmuxSessionAlive } from "../core/launch.js";
 import type { RepoProfile } from "../core/repo.js";
 import type { ForgeStore, TaskRecord, TaskStatus } from "../core/store.js";
 import { Key, matchesKey } from "./keys.js";
@@ -153,7 +153,7 @@ export class ForgeDashboard {
   onClose: () => void = () => {};
 
   constructor(
-    private readonly theme: Theme,
+    readonly _theme: Theme,
     private readonly tui: Tui,
     private readonly store: ForgeStore,
     private readonly repo: RepoProfile,
@@ -405,7 +405,7 @@ export class ForgeDashboard {
   private drawHeader(lines: string[], width: number): void {
     const { theme } = this;
     const spin = this.loading
-      ? " " + theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length])
+      ? ` ${theme.fg("accent", SPINNER_FRAMES[this.spinnerFrame % SPINNER_FRAMES.length])}`
       : "";
     const left = `  ${theme.bold("⚙ FORGE")}${spin}   ${theme.fg("accent", this.repo.name)}  ${theme.fg("dim", this.repo.currentBranch)}`;
     const runningCount = this.tasks.filter(
@@ -488,7 +488,7 @@ export class ForgeDashboard {
     this.drawActionBar(lines, width, allTasks[this.selectedIdx]);
   }
 
-  private drawTask(lines: string[], width: number, task: TaskRecord, idx: number, selected: boolean): void {
+  private drawTask(lines: string[], width: number, task: TaskRecord, _idx: number, selected: boolean): void {
     const { theme } = this;
     const cursor = selected ? theme.fg("accent", "▶") : " ";
     const icon = statusIcon(theme, task.status, task.tmuxSession);
@@ -502,7 +502,7 @@ export class ForgeDashboard {
 
     // Row 1: cursor icon status branch agent when
     const row1Parts = [cursor, " ", icon, "  ", statusLbl, "  ", theme.bold(branch), agentLbl, "  ", when, repoLbl];
-    lines.push(truncateToWidth("  " + row1Parts.join(""), width));
+    lines.push(truncateToWidth(`  ${row1Parts.join("")}`, width));
 
     // Row 2: indented title
     const titleColor = selected ? "text" : "dim";
@@ -686,7 +686,7 @@ export class ForgeDashboard {
       hdrParts.push(theme.fg("dim", padEnd("AGE", ageW)));
       hdrParts.push("  ");
       hdrParts.push(theme.fg("dim", padEnd("±LINES", diffW)));
-      lines.push(truncateToWidth("  " + hdrParts.join(""), width));
+      lines.push(truncateToWidth(`  ${hdrParts.join("")}`, width));
       lines.push("");
 
       for (let i = 0; i < visible.length; i++) {

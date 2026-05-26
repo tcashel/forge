@@ -47,7 +47,30 @@ export interface TaskView {
   hasSpec: boolean;
   hasLog: boolean;
   critique: CritiqueRef | null;
+  lastImproveError: LastImproveError | null;
 }
+
+export interface LastImproveError {
+  mode: string;
+  error: string;
+  at: string;
+}
+
+// Mirror of the per-attempt projection returned by GET /api/tasks/:id/critiques.
+export interface CritiqueAttemptSummary {
+  id: string;
+  status: string;
+  startedAt: string;
+  completedAt: string | null;
+  viewedAt: string | null;
+  criticA: CritiqueAgentMeta | null;
+  criticB: CritiqueAgentMeta | null;
+  synthesizer: CritiqueAgentMeta | null;
+}
+
+// Mirror of GET /api/agents/models — { claude: [...], codex: [...], ... }
+export type AgentName = "claude" | "codex" | "opencode" | "gemini";
+export type AgentModelRegistry = Record<AgentName, readonly string[]>;
 
 export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;

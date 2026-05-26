@@ -100,7 +100,7 @@ export function agentCommand(
       return `claude --print --dangerously-skip-permissions --model "${model}" < "${promptFile}"`;
     case "codex": {
       const reasoningFlag = opts?.reasoningEffort ? ` --config reasoning_effort=${opts.reasoningEffort}` : "";
-      return `codex exec --model "${model}"${reasoningFlag} -a never --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')"`;
+      return `codex exec --model "${model}"${reasoningFlag} --dangerously-bypass-approvals-and-sandbox --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')"`;
     }
     case "opencode":
       // opencode `run` takes the message as a positional. Headless mode auto-approves
@@ -108,7 +108,7 @@ export function agentCommand(
       return `opencode run --model "${model}" "$(cat '${promptFile}')"`;
     case "gemini":
       // -y is gemini's "yolo" mode — auto-approve all tool calls. Equivalent of
-      // claude's --dangerously-skip-permissions and codex's -a never.
+      // claude's --dangerously-skip-permissions and codex's --dangerously-bypass-approvals-and-sandbox.
       return `gemini -y -m "${model}" -p "$(cat '${promptFile}')"`;
   }
 }

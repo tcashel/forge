@@ -34,6 +34,7 @@ const task: TaskRecord = {
   jiraTicket: null,
   specFile: `/tmp/specs/${id}.md`,
   specVersion: 1,
+  lastImproveError: null,
 };
 
 store.upsertTask(task);

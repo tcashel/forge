@@ -133,6 +133,7 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, repoName
     jiraTicket: null,
     specFile: specPath,
     specVersion: 1,
+    lastImproveError: null,
   });
 }
 
@@ -483,6 +484,7 @@ test("running task surfaces section=running + log file path", async (t) => {
     jiraTicket: null,
     specFile: h.store.writeSpec(id, "# running task\n"),
     specVersion: 1,
+    lastImproveError: null,
   });
   // Drop a log file so hasLog flips true.
   fs.mkdirSync(path.join(h.store.runsDir, id), { recursive: true });
@@ -765,6 +767,7 @@ test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta",
     jiraTicket: null,
     specFile: h.store.writeSpec(id, "# kill\n"),
     specVersion: 1,
+    lastImproveError: null,
   });
 
   // Seed run-meta with an unrelated key so we can assert merge (not overwrite).
@@ -828,6 +831,7 @@ test("POST /api/tasks/:id/kill rejects already-done tasks (no state corruption)"
     jiraTicket: null,
     specFile: h.store.writeSpec(id, "# done\n"),
     specVersion: 1,
+    lastImproveError: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
   assert.equal(status, 409);
@@ -874,6 +878,7 @@ test("POST /api/tasks/:id/improve rejects non-draft tasks with 409", async (t) =
     jiraTicket: null,
     specFile: h.store.writeSpec(id, "# x\n"),
     specVersion: 1,
+    lastImproveError: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/improve`);
   assert.equal(status, 409);
@@ -905,6 +910,7 @@ test("POST /api/tasks/:id/critique rejects non-draft tasks with 409", async (t) 
     jiraTicket: null,
     specFile: h.store.writeSpec(id, "# x\n"),
     specVersion: 1,
+    lastImproveError: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/critique`);
   assert.equal(status, 409);

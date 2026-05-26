@@ -183,7 +183,11 @@ Produce a single \`\`\`forge-spec-improved fenced block per the skill instructio
 
 // ─── Improver output parsing ──────────────────────────────────────────────────
 
-const IMPROVED_BLOCK_RE = /```forge-spec-improved\s*\n([\s\S]*?)\n```/;
+// Greedy match so inner ``` fences inside the spec body (bash/yaml/etc.
+// code blocks the improved spec itself contains) don't prematurely
+// terminate the outer block. The real closing fence is always the LAST
+// ``` in the agent's output.
+const IMPROVED_BLOCK_RE = /```forge-spec-improved\s*\n([\s\S]*)\n```/;
 
 export interface ImprovedOutput {
   mode: "applied" | "no-op";

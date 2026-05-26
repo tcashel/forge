@@ -14,6 +14,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
+import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
@@ -93,6 +94,7 @@ interface TaskView {
   hasSpec: boolean;
   hasLog: boolean;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
+  lastImproveError: { mode: string; error: string; at: string } | null;
 }
 
 interface RepoView {
@@ -327,6 +329,7 @@ function resolveConfigRepo(repos: RepoView[], repoName: string | undefined): Rep
 
 function validateConfigPatch(
   input: unknown,
+  current: Partial<RepoConfig> = {},
 ): { ok: true; patch: Partial<RepoConfig> } | { ok: false; error: Response } {
   if (input === null || typeof input !== "object" || Array.isArray(input)) {
     return { ok: false, error: jsonErr(400, "BAD_REQUEST", "`config` must be an object.") };
@@ -369,6 +372,22 @@ function validateConfigPatch(
       patch[key] = raw;
     }
   }
+  // Validate agent/model pairs — reject orphans like {improverModel: "gpt-5.5"}
+  // when the matching agent is claude. Falls back to DEFAULT_FALLBACK_AGENT
+  // when no agent is pinned.
+  const pairErrors = validateAgentModelPairs(patch, current as Record<string, unknown>);
+  if (pairErrors.length > 0) {
+    const e = pairErrors[0];
+    return {
+      ok: false,
+      error: jsonErr(
+        400,
+        "MODEL_NOT_IN_AGENT",
+        `${e.modelKey} "${e.model}" is not a known model for agent "${e.agent}" (resolved via ${e.agentKey}). Allowed: ${e.allowed.join(", ")}. Use the Custom… escape hatch or set ${e.agentKey} to match.`,
+      ),
+    };
+  }
+
   return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
@@ -405,6 +424,7 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     hasSpec: !!spec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     critique: info.critique,
+    lastImproveError: task.lastImproveError,
   };
 }
 
@@ -633,6 +653,13 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ repos: buildRepoViews(store, ctx.currentRepo) });
   }
 
+  // GET /api/agents/models
+  // Returns the registry the settings UI uses to populate per-agent
+  // model dropdowns and that validation uses to reject orphan pairs.
+  if (pathname === "/api/agents/models") {
+    return jsonOk({ models: AGENT_MODELS });
+  }
+
   // GET /api/config?repo=<name-or-root>
   if (pathname === "/api/config") {
     const repos = buildRepoViews(store, ctx.currentRepo);
@@ -670,7 +697,8 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // GET /api/tasks/:id/spec
   // GET /api/tasks/:id/log    (SSE)
   // GET /api/tasks/:id/critique
-  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(spec|log|critique))?$/);
+  // GET /api/tasks/:id/critiques  (list of all attempts for visibility)
+  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(spec|log|critique|critiques))?$/);
   if (taskMatch) {
     const id = decodeURIComponent(taskMatch[1]);
     const sub = taskMatch[2];
@@ -688,6 +716,29 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       if (spec === null) return jsonErr(404, "NO_SPEC", `No spec on disk for task "${id}".`);
       const stripped = url.searchParams.get("raw") === "1" ? stripFrontmatter(spec) : spec;
       return jsonOk({ taskId: id, body: stripped });
+    }
+
+    if (sub === "critiques") {
+      // Surface every attempt for this task so the operator can see
+      // history and what's currently in flight, not just the latest.
+      const ids = store.listCritiques(id);
+      const attempts = ids
+        .map((critiqueId) => {
+          const meta = store.readCritiqueMeta(id, critiqueId);
+          if (!meta) return null;
+          return {
+            id: critiqueId,
+            status: meta.status,
+            startedAt: meta.startedAt,
+            completedAt: meta.completedAt,
+            viewedAt: meta.viewedAt,
+            criticA: meta.criticA,
+            criticB: meta.criticB,
+            synthesizer: meta.synthesizer,
+          };
+        })
+        .filter((a): a is NonNullable<typeof a> => a !== null);
+      return jsonOk({ taskId: id, attempts });
     }
 
     if (sub === "critique") {
@@ -1112,7 +1163,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const repoRoot = reqString(body, "repoRoot");
     if (!repoRoot) return jsonErr(400, "BAD_REQUEST", "`repoRoot` is required.");
     if (!path.isAbsolute(repoRoot)) return jsonErr(400, "BAD_REQUEST", "`repoRoot` must be an absolute path.");
-    const parsedPatch = validateConfigPatch(body.config);
+    const parsedPatch = validateConfigPatch(body.config, store.getRepoConfig(repoRoot));
     if (!parsedPatch.ok) return parsedPatch.error;
     store.setRepoConfig(repoRoot, parsedPatch.patch);
     return jsonOk({ repoRoot, config: store.getRepoConfig(repoRoot) });

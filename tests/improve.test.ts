@@ -50,6 +50,7 @@ function seedTask(store: ForgeStore, id: string, body: string): TaskRecord {
     jiraTicket: null,
     specFile: "",
     specVersion: 1,
+    lastImproveError: null,
   };
   const fm = [
     "---",
@@ -212,6 +213,45 @@ test("parseImprovedOutput reads mode + body + summary", () => {
   assert.equal(out.mode, "applied");
   assert.match(out.improvedSpec, /^# Title/);
   assert.match(out.changeSummary, /Recommendation #1/);
+});
+
+test("parseImprovedOutput handles inner ``` fences inside the improved spec body", () => {
+  // Regression: real improver outputs contain code blocks (bash, yaml, etc.)
+  // inside the spec body. A non-greedy outer match prematurely terminates
+  // at the first inner ``` and the parser returns null.
+  const raw = [
+    "```forge-spec-improved",
+    "## Mode",
+    "applied",
+    "## Improved Spec",
+    "# Title",
+    "",
+    "Some prose.",
+    "",
+    "```bash",
+    "bun test",
+    "```",
+    "",
+    "More prose.",
+    "",
+    "```yaml",
+    "ticketSource:",
+    "  provider: linear",
+    "```",
+    "",
+    "## Change Summary",
+    "- Recommendation #1: did X",
+    "- Recommendation #2: did Y",
+    "```",
+  ].join("\n");
+  const out = parseImprovedOutput(raw);
+  assert.ok(out, "parser must handle nested fences");
+  assert.equal(out.mode, "applied");
+  assert.match(out.improvedSpec, /^# Title/);
+  assert.match(out.improvedSpec, /bun test/);
+  assert.match(out.improvedSpec, /ticketSource:/);
+  assert.match(out.changeSummary, /Recommendation #1/);
+  assert.match(out.changeSummary, /Recommendation #2/);
 });
 
 test("rewriteSpec preserves existing frontmatter keys and adds the three new ones", () => {

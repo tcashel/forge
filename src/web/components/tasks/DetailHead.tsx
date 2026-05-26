@@ -19,6 +19,7 @@ type ActionId =
   | "open-pr"
   | "launch"
   | "critique"
+  | "improve"
   | "kill";
 
 function actionsFor(t: TaskView): ActionDef[] {
@@ -31,6 +32,7 @@ function actionsFor(t: TaskView): ActionDef[] {
   } else if (t.kind === "critique-ready") {
     items.push({ label: "Review critique", cls: "btn-attention", action: "review-critique" });
     items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
+    items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
   } else if (t.kind === "failed") {
     items.push({ label: "Open log", cls: "btn-primary", action: "open-log" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
@@ -46,6 +48,19 @@ function actionsFor(t: TaskView): ActionDef[] {
   } else if (t.section === "done") {
     if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: "open-pr" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
+  }
+  // Recovery affordances are additive — surface them on top of whatever
+  // base state the task is in, since improve/critique can fail
+  // independently of "critique-ready", "drafting", etc. Dedupe against
+  // buttons already present.
+  const present = new Set(items.map((i) => i.action));
+  if (t.lastImproveError && !present.has("improve")) {
+    items.push({ label: "Retry improve", cls: "btn-secondary", action: "improve" });
+    present.add("improve");
+  }
+  if (t.critique?.status === "failed" && !present.has("critique")) {
+    items.push({ label: "Retry critique", cls: "btn-secondary", action: "critique" });
+    present.add("critique");
   }
   return items;
 }
@@ -77,6 +92,12 @@ function dispatch(t: TaskView, action: ActionId): void | Promise<void> {
       return runAction(
         `/api/tasks/${encodeURIComponent(t.id)}/critique`,
         { successMsg: `Critique queued for ${t.id}` },
+        refreshTasks,
+      );
+    case "improve":
+      return runAction(
+        `/api/tasks/${encodeURIComponent(t.id)}/improve`,
+        { successMsg: `Improve queued for ${t.id}` },
         refreshTasks,
       );
     case "kill":
@@ -123,6 +144,17 @@ export function DetailHead({ t }: { t: TaskView }) {
         <span class={`stat-pill ${statClass(t)}`}>{t.statLabel}</span>
         {t.kind === "critique-ready" ? (
           <span style="color:var(--attention);font-size:11.5px;font-weight:600">● critique waiting</span>
+        ) : null}
+        {t.lastImproveError ? (
+          <span
+            style="color:var(--failed,#c0392b);font-size:11.5px;font-weight:600;cursor:help"
+            title={t.lastImproveError.error}
+          >
+            ● improve failed
+          </span>
+        ) : null}
+        {t.critique?.status === "failed" && !t.lastImproveError ? (
+          <span style="color:var(--failed,#c0392b);font-size:11.5px;font-weight:600">● critique failed</span>
         ) : null}
         {t.tmuxAlive ? <span style="color:var(--running);font-size:11.5px;font-weight:600">● tmux alive</span> : null}
       </div>

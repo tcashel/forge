@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 
 const major = parseInt(process.versions.node.split(".")[0], 10);
 if (major < 22) {
-  console.error("forge smoke test requires Node 22+; got " + process.versions.node + ". Run `nvm use 22` and retry.");
+  console.error(`forge smoke test requires Node 22+; got ${process.versions.node}. Run \`nvm use 22\` and retry.`);
   process.exit(2);
 }
 
@@ -32,7 +32,7 @@ if (major < 22) {
 
 const MODEL = "claude-haiku-4-5";
 const TIMEOUT_MS = 90_000;
-const POLL_MS = 500;
+const _POLL_MS = 500;
 const FORGE_ROOT = path.dirname(path.dirname(fileURLToPath(import.meta.url)));
 
 // ─── Main ─────────────────────────────────────────────────────────────────────
@@ -77,10 +77,10 @@ async function main() {
     env: { ...process.env },
   });
 
-  let stdout = "";
+  let _stdout = "";
   let stderr = "";
   child.stdout.on("data", (d) => {
-    stdout += d.toString();
+    _stdout += d.toString();
     process.stdout.write(d);
   });
   child.stderr.on("data", (d) => {
