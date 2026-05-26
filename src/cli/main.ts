@@ -15,6 +15,7 @@ import * as dash from "./cmd/dash.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
+import * as migrate from "./cmd/migrate.ts";
 import * as review from "./cmd/review.ts";
 import * as serve from "./cmd/serve.ts";
 import * as spec from "./cmd/spec.ts";
@@ -32,6 +33,7 @@ const HELP_BY_CMD: Record<string, string> = {
   launch: launch.HELP,
   logs: logs.HELP,
   ls: ls.HELP,
+  migrate: migrate.HELP,
   review: review.HELP,
   serve: serve.HELP,
   spec: spec.HELP,
@@ -57,6 +59,7 @@ Commands:
   status <id>      Show task and run state
   logs <id>        Print or tail (-f) the run log
   wait <id>        Block until the task reaches a terminal state
+  migrate          One-time backfill of ~/.forge/ JSON into forge.db
 
   config get <k>           Read a per-repo setting
   config set <k> <v>       Write a per-repo setting
@@ -136,6 +139,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "logs":
         await logs.run(rest, store);
+        return;
+      case "migrate":
+        await migrate.run(rest, store);
         return;
       case "wait":
         await wait.run(rest, store);
