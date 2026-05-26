@@ -8,6 +8,9 @@ on:
 jobs:
   bun-test:
     runs-on: ubuntu-latest
+    permissions:
+      contents: read
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +18,43 @@ jobs:
         with:
           bun-version: "1"
 
-      - run: bun install --frozen-lockfile
+      - name: Install deps
+        id: install
+        run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
+        continue-on-error: true
 
-      - run: bun run test
+      - name: Run tests
+        id: test
+        if: steps.install.outcome == 'success'
+        run: bun run test 2>&1 | tee /tmp/test.log
+        continue-on-error: true
+
+      - name: Post diagnostics on failure
+        if: failure() || steps.install.outcome == 'failure' || steps.test.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            let body = '### CI Test Diagnostics\n\n';
+            body += '**bun version:** ' + require('child_process').execSync('bun --version').toString().trim() + '\n\n';
+            if (fs.existsSync('/tmp/install.log')) {
+              const log = fs.readFileSync('/tmp/install.log', 'utf8').slice(-3000);
+              body += '<details><summary>Install output</summary>\n\n```\n' + log + '\n```\n</details>\n\n';
+            }
+            if (fs.existsSync('/tmp/test.log')) {
+              const log = fs.readFileSync('/tmp/test.log', 'utf8').slice(-3000);
+              body += '<details><summary>Test output</summary>\n\n```\n' + log + '\n```\n</details>\n\n';
+            }
+            const issue_number = context.payload.pull_request?.number;
+            if (issue_number) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number,
+                body
+              });
+            }
+
+      - name: Fail if any step failed
+        if: steps.install.outcome == 'failure' || steps.test.outcome == 'failure'
+        run: exit 1
