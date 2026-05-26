@@ -8,6 +8,8 @@ on:
 jobs:
   biome:
     runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
     steps:
       - uses: actions/checkout@v4
 
@@ -15,6 +17,45 @@ jobs:
         with:
           bun-version: latest
 
-      - run: bun install --frozen-lockfile
+      - name: Install deps
+        id: install
+        run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
+        continue-on-error: true
 
-      - run: bun run lint
+      - name: Run lint
+        id: lint
+        if: steps.install.outcome == 'success'
+        run: bun run lint 2>&1 | tee /tmp/lint.log
+        continue-on-error: true
+
+      - name: Post diagnostic comment
+        if: failure() || steps.install.outcome == 'failure' || steps.lint.outcome == 'failure'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const { execSync } = require('child_process');
+            const fs = require('fs');
+            let body = '### Lint CI Diagnostic\n\n';
+            try { body += `**Bun version:** ${execSync('bun --version').toString().trim()}\n\n`; } catch { body += '**Bun:** not found\n\n'; }
+            body += `**Install outcome:** ${{ steps.install.outcome }}\n`;
+            body += `**Lint outcome:** ${{ steps.lint.outcome }}\n\n`;
+            try {
+              const installLog = fs.readFileSync('/tmp/install.log', 'utf8').slice(-2000);
+              body += `<details><summary>Install log</summary>\n\n\`\`\`\n${installLog}\n\`\`\`\n</details>\n\n`;
+            } catch {}
+            try {
+              const lintLog = fs.readFileSync('/tmp/lint.log', 'utf8').slice(-2000);
+              body += `<details><summary>Lint log</summary>\n\n\`\`\`\n${lintLog}\n\`\`\`\n</details>\n`;
+            } catch {}
+            if (context.issue?.number) {
+              await github.rest.issues.createComment({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                issue_number: context.issue.number,
+                body
+              });
+            }
+
+      - name: Fail if needed
+        if: steps.install.outcome == 'failure' || steps.lint.outcome == 'failure'
+        run: exit 1
