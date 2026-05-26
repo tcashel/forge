@@ -33,35 +33,39 @@ jobs:
         run: bun run test 2>&1 | tee /tmp/test.log
         continue-on-error: true
 
-      - name: Post diagnostics on failure
-        if: always() && (steps.setup-bun.outcome == 'failure' || steps.install.outcome == 'failure' || steps.test.outcome == 'failure')
-        uses: actions/github-script@v7
-        with:
-          script: |
-            const fs = require('fs');
-            const { execSync } = require('child_process');
-            let body = '### CI Test Diagnostics\n\n';
-            body += '**setup-bun outcome:** ' + '${{ steps.setup-bun.outcome }}' + '\n';
-            body += '**install outcome:** ' + '${{ steps.install.outcome }}' + '\n';
-            body += '**test outcome:** ' + '${{ steps.test.outcome }}' + '\n\n';
-            try { body += '**bun version:** ' + execSync('bun --version 2>&1').toString().trim() + '\n\n'; } catch(e) { body += '**bun:** not available\n\n'; }
-            if (fs.existsSync('/tmp/install.log')) {
-              const log = fs.readFileSync('/tmp/install.log', 'utf8').slice(-3000);
-              body += '<details><summary>Install output</summary>\n\n```\n' + log + '\n```\n</details>\n\n';
-            }
-            if (fs.existsSync('/tmp/test.log')) {
-              const log = fs.readFileSync('/tmp/test.log', 'utf8').slice(-3000);
-              body += '<details><summary>Test output</summary>\n\n```\n' + log + '\n```\n</details>\n\n';
-            }
-            const issue_number = context.payload.pull_request?.number;
-            if (issue_number) {
-              await github.rest.issues.createComment({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                issue_number,
-                body
-              });
-            }
+      - name: Post diagnostics
+        if: always()
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PR_NUMBER: ${{ github.event.pull_request.number }}
+        run: |
+          echo "### CI Test Diagnostics" > /tmp/comment.md
+          echo "" >> /tmp/comment.md
+          echo "**setup-bun:** ${{ steps.setup-bun.outcome }}" >> /tmp/comment.md
+          echo "**install:** ${{ steps.install.outcome }}" >> /tmp/comment.md
+          echo "**test:** ${{ steps.test.outcome }}" >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+          bun --version >> /tmp/comment.md 2>&1 || echo "bun not available" >> /tmp/comment.md
+          echo "" >> /tmp/comment.md
+          if [ -f /tmp/install.log ]; then
+            echo '<details><summary>Install output</summary>' >> /tmp/comment.md
+            echo '' >> /tmp/comment.md
+            echo '```' >> /tmp/comment.md
+            tail -100 /tmp/install.log >> /tmp/comment.md
+            echo '```' >> /tmp/comment.md
+            echo '</details>' >> /tmp/comment.md
+          fi
+          if [ -f /tmp/test.log ]; then
+            echo '<details><summary>Test output</summary>' >> /tmp/comment.md
+            echo '' >> /tmp/comment.md
+            echo '```' >> /tmp/comment.md
+            tail -100 /tmp/test.log >> /tmp/comment.md
+            echo '```' >> /tmp/comment.md
+            echo '</details>' >> /tmp/comment.md
+          fi
+          if [ -n "$PR_NUMBER" ]; then
+            gh pr comment "$PR_NUMBER" --body-file /tmp/comment.md || echo "Failed to post comment"
+          fi
 
       - name: Fail if any step failed
         if: always() && (steps.setup-bun.outcome == 'failure' || steps.install.outcome == 'failure' || steps.test.outcome == 'failure')
