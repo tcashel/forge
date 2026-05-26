@@ -10,6 +10,7 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { recordJobStarted } from "./db/writes.ts";
 import { bashGhEnvExport } from "./gh.js";
 import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
@@ -776,6 +777,18 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     reviewerReasoningEffort: config.reviewerReasoningEffort,
   };
   store.writeRunMeta(config.taskId, meta);
+
+  // Phase 3 dual-write: also record this launch as a versioned jobs row.
+  // Failure here doesn't break the launch — the JSON meta.json above is
+  // still the live source of truth during the cutover. Dropped to a
+  // warning so the launch path stays robust to DB hiccups.
+  try {
+    const task = store.getTask(config.taskId);
+    if (task) recordJobStarted(store.db.db, task, meta);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record jobs row for ${config.taskId}: ${msg}\n`);
+  }
 
   // Kill any stale session with the same name
   killTmuxSession(tmuxSession);

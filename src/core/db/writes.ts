@@ -10,7 +10,7 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { TaskRecord } from "../store.ts";
+import type { RunMeta, TaskRecord } from "../store.ts";
 
 export function livePlanVersionId(taskId: string, version: number): string {
   return `pv-${taskId}-v${version}`;
@@ -163,6 +163,51 @@ export function recordPlanVersionAdded(db: Database, task: TaskRecord, version: 
       task.id,
     );
   })();
+}
+
+/**
+ * Insert a new `jobs` row for a launch attempt. Computes
+ * `run_number = max(existing for this plan) + 1` so a second `forge
+ * launch` against the same plan gets run_number=2 instead of
+ * overwriting the prior run. Returns the new run_number.
+ *
+ * Self-heals plan + synthetic task if either is missing. Re-runs on the
+ * same task always produce a fresh row (no INSERT OR IGNORE) — that's
+ * the whole point of versioned jobs.
+ */
+export function recordJobStarted(db: Database, task: TaskRecord, meta: RunMeta): number {
+  let runNumber = 0;
+
+  db.transaction(() => {
+    ensurePlanAndSyntheticTask(db, task);
+
+    const synthetic = db.prepare("SELECT id FROM tasks WHERE plan_id = ? AND sequence = 1").get(task.id) as {
+      id: string;
+    };
+    const taskRowId = synthetic.id;
+
+    const maxRow = db
+      .prepare("SELECT COALESCE(MAX(run_number), 0) AS n FROM jobs WHERE task_id = ?")
+      .get(taskRowId) as { n: number };
+    runNumber = maxRow.n + 1;
+
+    db.prepare(
+      `INSERT INTO jobs
+       (id, task_id, run_number, run_kind, session_id, worktree_path, branch_name, state,
+        blocker_summary, eta_seconds, started_at, finished_at, exit_code, summary)
+       VALUES (?, ?, ?, 'initial', NULL, ?, ?, 'running', NULL, NULL, ?, NULL, NULL, NULL)`,
+    ).run(liveJobId(task.id, runNumber), taskRowId, runNumber, meta.worktree, task.branch, meta.startedAt);
+
+    db.prepare("UPDATE plans SET stage = 'running', updated_at = ? WHERE id = ?").run(meta.startedAt, task.id);
+
+    db.prepare("UPDATE tasks SET state = 'running', started_at = ?, updated_at = ? WHERE id = ?").run(
+      meta.startedAt,
+      meta.startedAt,
+      taskRowId,
+    );
+  })();
+
+  return runNumber;
 }
 
 function ensurePlanAndSyntheticTask(db: Database, task: TaskRecord): void {
