@@ -35,6 +35,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0019 | [Sessions are jobs, not shows](./0019-sessions-are-jobs.md)                                 | Accepted                        |
 | 0020 | [Hook-policy enforcement at agent level](./0020-hook-policy-at-agent-level.md)              | Accepted                        |
 | 0021 | [Two-track build path: TS prototype → Rust product](./0021-two-track-build-path.md)         | Accepted                        |
+| 0022 | [Skill + CLI as the agent↔orchestrator contract (no MCP)](./0022-skill-cli-as-agent-contract.md) | Accepted                        |
 
 ## Foundational ADRs
 
@@ -54,7 +55,7 @@ Forward-looking decisions to capture as ADRs when they're made. Pulled from the 
 - GPUI version pinning strategy (after Phase B0)
 - Plan document representation: markdown vs. AST (early Phase A1)
 - Worktree root location (Phase A2)
-- Agent stdio protocol: per-adapter vs. unified JSON-lines (Phase A2)
+- ~~Agent stdio protocol: per-adapter vs. unified JSON-lines (Phase A2)~~ — resolved by [`0022`](./0022-skill-cli-as-agent-contract.md) (skill + CLI; no stdio protocol)
 - Synthesis approach: agent-based vs. rule-based (Phase A1)
 - Disagreement adjudication UX: inline vs. modal vs. separate workspace (Phase A1)
 - Phase detection heuristics (Phase A2)

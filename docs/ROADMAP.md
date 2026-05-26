@@ -61,6 +61,10 @@ You can articulate, in one sentence, why a Conductor or Superset user would swit
   - Copy locked plan to clipboard as briefing for external tools
 - **Minimum agent integration**
   - One agent adapter (Claude Code) for drafting and critique
+- **External ticket source (added 2026-05-26)**
+  - Provider abstraction over the existing Jira surface plus a Linear provider
+  - `forge spec from-ticket <key-or-url>` imports a ticket into a draft spec
+  - Drives the dogfooding loop: operators (including the founder) pull real Linear/Jira work into Forge plans without leaving the tool
 
 ### Deliberately out of scope
 - New execution layer (Forge's existing execution is fine for now)
