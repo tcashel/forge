@@ -107,7 +107,7 @@ export function listGhAccounts(host: string = DEFAULT_HOST): { user: string; act
     // `gh auth status` exits non-zero when any account is degraded. The
     // stdout/stderr is still on the error object — parse what we can.
     const err = e as { stdout?: string; stderr?: string };
-    raw = (err.stdout ?? "") + "\n" + (err.stderr ?? "");
+    raw = `${err.stdout ?? ""}\n${err.stderr ?? ""}`;
   }
   if (!raw) return [];
 

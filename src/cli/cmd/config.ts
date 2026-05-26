@@ -11,6 +11,7 @@
  */
 
 import { parseArgs } from "node:util";
+import { validateAgentModelPairs } from "../../core/agent-models.ts";
 import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
@@ -180,6 +181,25 @@ async function runSet(argv: string[], store: ForgeStore): Promise<void> {
   }
   const validated = validateValue(key, rawValue);
   const patch = { [key]: validated } as Partial<RepoConfig>;
+
+  // Catch orphan model/agent pairs at write time (e.g. setting
+  // improverModel to "gpt-5.5" while improverAgent is unset and
+  // defaults to claude). Falls back to DEFAULT_FALLBACK_AGENT when no
+  // agent is pinned.
+  const current = store.getRepoConfig(repoRoot);
+  const pairErrors = validateAgentModelPairs(patch as Record<string, unknown>, current as Record<string, unknown>);
+  if (pairErrors.length > 0) {
+    const e = pairErrors[0];
+    throw new CliError(
+      "MODEL_NOT_IN_AGENT",
+      `${e.modelKey} "${e.model}" is not a known model for agent "${e.agent}" (resolved via ${e.agentKey}).`,
+      {
+        hint: `Allowed: ${e.allowed.join(", ")}. Set ${e.agentKey} to match, or use --custom (forthcoming) to bypass.`,
+        exitCode: 1,
+      },
+    );
+  }
+
   store.setRepoConfig(repoRoot, patch);
 
   if (key === "defaultAgent" || key === "defaultModel") {

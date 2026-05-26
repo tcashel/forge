@@ -6,8 +6,8 @@
 // initial mount + when the user clicks Reload. Mid-edit polls don't
 // recreate any input nodes, so cursor + characters survive.
 import { type Signal, useSignal } from "@preact/signals";
-import { useEffect, useRef } from "preact/hooks";
-import { type ApiError, apiPost } from "../../lib/api";
+import { useEffect, useRef, useState } from "preact/hooks";
+import { type ApiError, apiGet, apiPost } from "../../lib/api";
 import { showToast } from "../../lib/toast";
 import {
   type RepoConfig,
@@ -18,6 +18,111 @@ import {
   settingsRepo,
 } from "../../signals/settings";
 import { selectedRepo } from "../../signals/ui";
+import type { AgentModelRegistry, AgentName } from "../../types";
+
+const CUSTOM_SENTINEL = "__custom__";
+
+interface ModelFieldProps {
+  id: string;
+  label: string;
+  signal: Signal<string>;
+  agentSignal: Signal<string>;
+  defaultAgentSignal: Signal<string>;
+  registry: AgentModelRegistry | null;
+  placeholder?: string;
+}
+function ModelField({ id, label, signal, agentSignal, defaultAgentSignal, registry, placeholder }: ModelFieldProps) {
+  const explicit = agentSignal.value as AgentName | "";
+  const fallback = (defaultAgentSignal.value as AgentName) || "claude";
+  const effectiveAgent: AgentName = (explicit || fallback) as AgentName;
+  const known = registry?.[effectiveAgent] ?? [];
+
+  const isCustomValue = signal.value !== "" && !known.includes(signal.value);
+  const [customMode, setCustomMode] = useState(isCustomValue);
+
+  // When the agent changes, if the current model isn't in the new
+  // agent's list and we're in select-mode, clear it so the user must
+  // pick deliberately. (Custom-mode values are preserved.)
+  useEffect(() => {
+    if (!customMode && signal.value && !known.includes(signal.value)) {
+      signal.value = "";
+    }
+    // intentionally depend only on effectiveAgent + known set membership
+  }, [effectiveAgent]);
+
+  // If we're in customMode but the value happens to match a known
+  // model (e.g. user picked one), drop back to select-mode silently.
+  useEffect(() => {
+    if (customMode && known.includes(signal.value)) setCustomMode(false);
+  }, [signal.value, customMode]);
+
+  if (registry === null) {
+    // Registry still loading — render plain text input so user isn't blocked.
+    return <TextField id={id} label={label} signal={signal} placeholder={placeholder} />;
+  }
+
+  if (customMode) {
+    return (
+      <label class="settings-field" for={id}>
+        <span>
+          {label}{" "}
+          <small style="color:var(--dim);font-weight:400">
+            (custom for {effectiveAgent} —{" "}
+            <button
+              type="button"
+              style="background:none;border:0;padding:0;color:var(--primary);cursor:pointer;font:inherit"
+              onClick={() => {
+                signal.value = "";
+                setCustomMode(false);
+              }}
+            >
+              pick from list
+            </button>
+            )
+          </small>
+        </span>
+        <input
+          id={id}
+          type="text"
+          value={signal.value}
+          placeholder={placeholder || ""}
+          onInput={(e) => {
+            signal.value = (e.currentTarget as HTMLInputElement).value;
+          }}
+        />
+      </label>
+    );
+  }
+
+  return (
+    <label class="settings-field" for={id}>
+      <span>
+        {label} <small style="color:var(--dim);font-weight:400">for {effectiveAgent}</small>
+      </span>
+      <select
+        id={id}
+        value={signal.value}
+        onChange={(e) => {
+          const v = (e.currentTarget as HTMLSelectElement).value;
+          if (v === CUSTOM_SENTINEL) {
+            setCustomMode(true);
+            signal.value = "";
+            return;
+          }
+          signal.value = v;
+        }}
+      >
+        <option value="">Unset (use default)</option>
+        {known.map((m) => (
+          <option key={m} value={m}>
+            {m}
+          </option>
+        ))}
+        <option value={CUSTOM_SENTINEL}>Custom…</option>
+      </select>
+    </label>
+  );
+}
 
 const AGENTS = ["", "claude", "codex", "opencode", "gemini"];
 const EFFORTS = ["", "low", "medium", "high", "xhigh"];
@@ -218,6 +323,26 @@ export function SettingsForm() {
   const initialized = useRef<boolean>(false);
   const lastSavedAt = useSignal<Date | null>(null);
   const saving = useSignal<boolean>(false);
+  const modelRegistry = useSignal<AgentModelRegistry | null>(null);
+
+  // Fetch the agent→models registry once per mount. Drives the
+  // ModelField dropdowns and lets the UI prevent orphan pairs that
+  // the server would reject anyway.
+  useEffect(() => {
+    if (modelRegistry.value !== null) return;
+    let cancelled = false;
+    apiGet<{ models: AgentModelRegistry }>("/api/agents/models")
+      .then((r) => {
+        if (cancelled) return;
+        modelRegistry.value = r.models;
+      })
+      .catch(() => {
+        // Soft-fail: registry stays null → ModelField falls back to plain text input.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   const form: FormSignals = {
     defaultAgent: useSignal(""),
@@ -371,7 +496,15 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Use CLI default"
           />
-          <TextField id="cfg-defaultModel" label="Default model" signal={form.defaultModel} placeholder="gpt-5-codex" />
+          <ModelField
+            id="cfg-defaultModel"
+            label="Default model"
+            signal={form.defaultModel}
+            agentSignal={form.defaultAgent}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
+            placeholder="claude-opus-4-7"
+          />
         </div>
       </section>
       <section class="settings-section">
@@ -384,10 +517,13 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField
+          <ModelField
             id="cfg-reviewerModel"
             label="Reviewer model"
             signal={form.reviewerModel}
+            agentSignal={form.reviewerAgent}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
             placeholder="claude-opus-4-7"
           />
           <SelectField
@@ -404,7 +540,15 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField id="cfg-fixerModel" label="Fixer model" signal={form.fixerModel} placeholder="gpt-5-codex" />
+          <ModelField
+            id="cfg-fixerModel"
+            label="Fixer model"
+            signal={form.fixerModel}
+            agentSignal={form.fixerAgent}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
+            placeholder="claude-opus-4-7"
+          />
           <SelectField
             id="cfg-fixerReasoning"
             label="Fixer reasoning"
@@ -431,10 +575,13 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField
+          <ModelField
             id="cfg-critiqueModelA"
             label="Critic A model"
             signal={form.critiqueModelA}
+            agentSignal={form.critiqueAgentA}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
             placeholder="claude-opus-4-7"
           />
           <SelectField
@@ -451,10 +598,13 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField
+          <ModelField
             id="cfg-critiqueModelB"
             label="Critic B model"
             signal={form.critiqueModelB}
+            agentSignal={form.critiqueAgentB}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
             placeholder="gpt-5-codex"
           />
           <SelectField
@@ -471,11 +621,14 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField
+          <ModelField
             id="cfg-critiqueModelSynth"
             label="Synthesizer model"
             signal={form.critiqueModelSynth}
-            placeholder="gpt-5-codex"
+            agentSignal={form.critiqueAgentSynth}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
+            placeholder="claude-opus-4-7"
           />
           <SelectField
             id="cfg-critiqueReasoningSynth"
@@ -496,11 +649,14 @@ export function SettingsForm() {
             values={AGENTS}
             emptyLabel="Unset"
           />
-          <TextField
+          <ModelField
             id="cfg-improverModel"
             label="Improver model"
             signal={form.improverModel}
-            placeholder="gpt-5-codex"
+            agentSignal={form.improverAgent}
+            defaultAgentSignal={form.defaultAgent}
+            registry={modelRegistry.value}
+            placeholder="claude-opus-4-7"
           />
           <SelectField
             id="cfg-improverReasoning"
