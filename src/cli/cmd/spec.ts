@@ -318,12 +318,11 @@ export function persistImproveOutcome(taskId: string, improve: ImproveResult, st
   const lastImproveError = improve.error
     ? { mode: improve.mode, error: improve.error, at: new Date().toISOString() }
     : null;
-  if (
-    (current.lastImproveError?.error ?? null) === (lastImproveError?.error ?? null) &&
-    (current.lastImproveError?.mode ?? null) === (lastImproveError?.mode ?? null)
-  ) {
-    return;
-  }
+  // Only dedup identical null→null (steady-state success). Always update
+  // on failure — even same-error-repeated — so the chip's tooltip shows
+  // when the most recent failure actually happened. Without this, repeated
+  // retries that all fail look frozen at the first failure's timestamp.
+  if (current.lastImproveError === null && lastImproveError === null) return;
   store.upsertTask({ ...current, lastImproveError });
 }
 

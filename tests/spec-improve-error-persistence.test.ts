@@ -118,7 +118,12 @@ test("persistImproveOutcome is a no-op when the task is missing", (t) => {
   assert.equal(store.getTask("never-existed"), null);
 });
 
-test("persistImproveOutcome skips an upsert when the error is unchanged", (t) => {
+test("persistImproveOutcome refreshes `at` when the same error repeats", (t) => {
+  // Repeated failures with the same message must refresh the timestamp so
+  // the UI's chip tooltip reflects when the most recent failure occurred,
+  // not the first one. Without this refresh, retries that keep failing
+  // for the same reason look frozen and the user can't tell whether the
+  // latest click did anything.
   const store = withTmpHome(t);
   const original = seedDraft(store, "task-stable", {
     mode: "skipped",
@@ -129,8 +134,26 @@ test("persistImproveOutcome skips an upsert when the error is unchanged", (t) =>
   persistImproveOutcome("task-stable", SKIPPED_RESULT, store);
 
   const after = store.getTask("task-stable");
-  // Same error + mode → existing record (including its `at` timestamp) is kept untouched.
-  assert.equal(after?.lastImproveError?.at, original.lastImproveError?.at);
+  assert.notEqual(after?.lastImproveError?.at, original.lastImproveError?.at);
+  assert.equal(after?.lastImproveError?.error, SKIPPED_RESULT.error);
+  assert.match(after?.lastImproveError?.at ?? "", /^\d{4}-\d{2}-\d{2}T/);
+});
+
+test("persistImproveOutcome is a no-op when both prior and new are clean (null → null)", (t) => {
+  // Successful apply on a task with no prior error → don't bother rewriting
+  // the index for a no-change update. Pure perf/quiet-log optimisation.
+  const store = withTmpHome(t);
+  const original = seedDraft(store, "task-clean", null);
+  const createdAt = original.createdAt;
+
+  persistImproveOutcome("task-clean", APPLIED_RESULT, store);
+
+  const after = store.getTask("task-clean");
+  assert.equal(after?.lastImproveError, null);
+  // createdAt is a proxy for "record untouched" — if upsertTask had run,
+  // nothing else would change but we'd still see the upsert as a fresh
+  // write. Assert the record is identical instead.
+  assert.equal(after?.createdAt, createdAt);
 });
 
 test("TaskRecord.lastImproveError survives a fresh ForgeStore load (load-time default + persistence)", (t) => {
