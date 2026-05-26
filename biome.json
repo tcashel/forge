@@ -38,6 +38,7 @@
     "lineWidth": 120
   },
   "javascript": {
+    "globals": ["Bun"],
     "formatter": { "quoteStyle": "double", "semicolons": "always" }
   },
   "overrides": [
