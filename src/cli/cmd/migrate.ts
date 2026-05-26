@@ -11,7 +11,6 @@
 
 import { parseArgs } from "node:util";
 import { backfillFromJson } from "../../core/db/backfill.ts";
-import { ForgeDb } from "../../core/db/connection.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
@@ -51,13 +50,8 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   }
 
   const flags = parseFlags(rest);
-  const db = new ForgeDb({ forgeDir: store.forgeDir });
-  try {
-    const counts = backfillFromJson(store, db.db);
-    emitOk({ ok: true, counts }, flags.json, () => formatHuman(counts));
-  } finally {
-    db.close();
-  }
+  const counts = backfillFromJson(store, store.db.db);
+  emitOk({ ok: true, counts }, flags.json, () => formatHuman(counts));
 }
 
 function formatHuman(counts: Record<string, number>): string {

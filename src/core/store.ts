@@ -9,6 +9,7 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.js";
+import { ForgeDb } from "./db/connection.ts";
 import { withFileLock } from "./file-lock.js";
 
 export type TaskStatus =
@@ -186,6 +187,8 @@ export class ForgeStore {
 
   readonly repoConfigFile: string;
 
+  #db: ForgeDb | null = null;
+
   constructor(opts: ForgeStoreOptions = {}) {
     this.forgeDir = opts.forgeDir ?? path.join(os.homedir(), ".forge");
     this.specsDir = path.join(this.forgeDir, "specs");
@@ -196,6 +199,18 @@ export class ForgeStore {
     fs.mkdirSync(this.specsDir, { recursive: true });
     fs.mkdirSync(this.runsDir, { recursive: true });
     fs.mkdirSync(this.critiquesDir, { recursive: true });
+  }
+
+  /**
+   * Lazy SQLite handle. Constructed on first access; migrations run
+   * eagerly inside ForgeDb. Subcommands that touch the database go
+   * through `store.db.db.prepare(...)`.
+   */
+  get db(): ForgeDb {
+    if (!this.#db) {
+      this.#db = new ForgeDb({ forgeDir: this.forgeDir });
+    }
+    return this.#db;
   }
 
   // ── Per-repo config (JIRA defaults, etc.) ───────────────────────────────

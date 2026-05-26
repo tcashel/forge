@@ -14,6 +14,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWriteText } from "./atomic-write.js";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
+import { recordPlanVersionAdded } from "./db/writes.ts";
 import { agentCommand } from "./launch.js";
 import type { ForgeStore } from "./store.js";
 
@@ -491,7 +492,9 @@ export async function runImprover(
     critiqueId,
   });
   store.writeSpec(config.taskId, newFullSpec);
-  store.upsertTask({ ...task, specVersion: nextSpecVersion });
+  const updatedTask = { ...task, specVersion: nextSpecVersion };
+  store.upsertTask(updatedTask);
+  recordPlanVersionAdded(store.db.db, updatedTask, nextSpecVersion, newFullSpec);
 
   // ── Step 12: Mark the critique viewed ───────────────────────────────────
   store.markCritiqueViewed(config.taskId, critiqueId);

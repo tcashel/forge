@@ -20,6 +20,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import type { CritiqueAgent } from "../../core/critique.ts";
+import { recordPlanCreated } from "../../core/db/writes.ts";
 import { type ImproveResult, runImprover } from "../../core/improve.ts";
 import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig, TaskRecord } from "../../core/store.ts";
@@ -278,9 +279,11 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
   };
 
   const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
-  const specPath = store.writeSpec(id, frontmatter + opts.body);
+  const fullSpec = frontmatter + opts.body;
+  const specPath = store.writeSpec(id, fullSpec);
   task.specFile = specPath;
   store.upsertTask(task);
+  recordPlanCreated(store.db.db, task, fullSpec);
 
   const repoConfig = store.getRepoConfig(opts.repoRoot);
   const skip = opts.autoImprove === false || repoConfig.autoImprove === false || hasFrontmatter;
