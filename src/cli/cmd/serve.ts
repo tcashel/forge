@@ -93,6 +93,7 @@ interface TaskView {
   hasSpec: boolean;
   hasLog: boolean;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
+  lastImproveError: { mode: string; error: string; at: string } | null;
 }
 
 interface RepoView {
@@ -405,6 +406,7 @@ function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
     hasSpec: !!spec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     critique: info.critique,
+    lastImproveError: task.lastImproveError,
   };
 }
 

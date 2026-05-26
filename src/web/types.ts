@@ -47,6 +47,13 @@ export interface TaskView {
   hasSpec: boolean;
   hasLog: boolean;
   critique: CritiqueRef | null;
+  lastImproveError: LastImproveError | null;
+}
+
+export interface LastImproveError {
+  mode: string;
+  error: string;
+  at: string;
 }
 
 export interface WorkbenchContext {

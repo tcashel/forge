@@ -274,6 +274,7 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
     jiraTicket: opts.jiraTicket ?? null,
     specFile: "", // filled below
     specVersion: 1,
+    lastImproveError: null,
   };
 
   const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
@@ -298,9 +299,32 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
         error: `IMPROVE_FAILED: ${msg}`,
       };
     }
+    persistImproveOutcome(task.id, improve, store);
   }
 
   return { taskId: id, specPath, branch, status: "draft", improve };
+}
+
+/**
+ * Record the most recent auto-improve outcome on the task so the Workbench
+ * can surface a failure chip + recovery buttons. Successful applies (and
+ * no-op results that didn't error) clear any prior error.
+ *
+ * Exported for tests.
+ */
+export function persistImproveOutcome(taskId: string, improve: ImproveResult, store: ForgeStore): void {
+  const current = store.getTask(taskId);
+  if (!current) return;
+  const lastImproveError = improve.error
+    ? { mode: improve.mode, error: improve.error, at: new Date().toISOString() }
+    : null;
+  if (
+    (current.lastImproveError?.error ?? null) === (lastImproveError?.error ?? null) &&
+    (current.lastImproveError?.mode ?? null) === (lastImproveError?.mode ?? null)
+  ) {
+    return;
+  }
+  store.upsertTask({ ...current, lastImproveError });
 }
 
 async function runSave(argv: string[], store: ForgeStore): Promise<void> {
@@ -411,7 +435,20 @@ export async function improveSpec(taskId: string, store: ForgeStore): Promise<Im
       { exitCode: 1 },
     );
   }
-  const improve = await runAutoImprove(task, store);
+  let improve: ImproveResult;
+  try {
+    improve = await runAutoImprove(task, store);
+  } catch (e: unknown) {
+    const msg = e instanceof Error ? e.message : String(e);
+    improve = {
+      critiqueId: "",
+      applied: false,
+      changeCount: 0,
+      mode: "skipped",
+      error: `IMPROVE_FAILED: ${msg}`,
+    };
+  }
+  persistImproveOutcome(task.id, improve, store);
   return { taskId: task.id, improve };
 }
 

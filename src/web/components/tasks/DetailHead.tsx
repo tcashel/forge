@@ -19,7 +19,12 @@ type ActionId =
   | "open-pr"
   | "launch"
   | "critique"
+  | "improve"
   | "kill";
+
+function needsRecovery(t: TaskView): boolean {
+  return t.section === "drafting" && (!!t.lastImproveError || t.critique?.status === "failed");
+}
 
 function actionsFor(t: TaskView): ActionDef[] {
   const items: ActionDef[] = [];
@@ -28,6 +33,13 @@ function actionsFor(t: TaskView): ActionDef[] {
     if (t.tmuxAlive) items.push({ label: "Attach tmux", cls: "btn-secondary", action: "copy-attach" });
     if (t.prUrl) items.push({ label: "Open PR draft", cls: "btn-ghost", action: "open-pr" });
     items.push({ label: "Kill", cls: "btn-ghost", action: "kill" });
+  } else if (needsRecovery(t)) {
+    // Auto-improve or critique failed — surface recovery affordances so the
+    // user can retry, push past the failure, or read the spec to decide.
+    items.push({ label: "Retry improve", cls: "btn-primary", action: "improve" });
+    items.push({ label: "Retry critique", cls: "btn-secondary", action: "critique" });
+    items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
+    items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
   } else if (t.kind === "critique-ready") {
     items.push({ label: "Review critique", cls: "btn-attention", action: "review-critique" });
     items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
@@ -79,6 +91,12 @@ function dispatch(t: TaskView, action: ActionId): void | Promise<void> {
         { successMsg: `Critique queued for ${t.id}` },
         refreshTasks,
       );
+    case "improve":
+      return runAction(
+        `/api/tasks/${encodeURIComponent(t.id)}/improve`,
+        { successMsg: `Improve queued for ${t.id}` },
+        refreshTasks,
+      );
     case "kill":
       return runAction(
         `/api/tasks/${encodeURIComponent(t.id)}/kill`,
@@ -123,6 +141,17 @@ export function DetailHead({ t }: { t: TaskView }) {
         <span class={`stat-pill ${statClass(t)}`}>{t.statLabel}</span>
         {t.kind === "critique-ready" ? (
           <span style="color:var(--attention);font-size:11.5px;font-weight:600">● critique waiting</span>
+        ) : null}
+        {t.lastImproveError ? (
+          <span
+            style="color:var(--failed,#c0392b);font-size:11.5px;font-weight:600;cursor:help"
+            title={t.lastImproveError.error}
+          >
+            ● improve failed
+          </span>
+        ) : null}
+        {t.critique?.status === "failed" && !t.lastImproveError ? (
+          <span style="color:var(--failed,#c0392b);font-size:11.5px;font-weight:600">● critique failed</span>
         ) : null}
         {t.tmuxAlive ? <span style="color:var(--running);font-size:11.5px;font-weight:600">● tmux alive</span> : null}
       </div>

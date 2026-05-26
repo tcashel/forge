@@ -50,6 +50,7 @@ function seedTask(store: ForgeStore, id: string, body: string): TaskRecord {
     jiraTicket: null,
     specFile: "",
     specVersion: 1,
+    lastImproveError: null,
   };
   const fm = [
     "---",
