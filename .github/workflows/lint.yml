@@ -14,12 +14,16 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: oven-sh/setup-bun@v2
+      - name: Setup Bun
+        id: setup-bun
+        uses: oven-sh/setup-bun@v2
         with:
           bun-version: "1"
+        continue-on-error: true
 
       - name: Install deps
         id: install
+        if: steps.setup-bun.outcome == 'success'
         run: bun install --frozen-lockfile 2>&1 | tee /tmp/install.log
         continue-on-error: true
 
@@ -30,13 +34,17 @@ jobs:
         continue-on-error: true
 
       - name: Post diagnostics on failure
-        if: failure() || steps.install.outcome == 'failure' || steps.lint.outcome == 'failure'
+        if: always() && (steps.setup-bun.outcome == 'failure' || steps.install.outcome == 'failure' || steps.lint.outcome == 'failure')
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require('fs');
+            const { execSync } = require('child_process');
             let body = '### CI Lint Diagnostics\n\n';
-            body += '**bun version:** ' + require('child_process').execSync('bun --version').toString().trim() + '\n\n';
+            body += '**setup-bun outcome:** ' + '${{ steps.setup-bun.outcome }}' + '\n';
+            body += '**install outcome:** ' + '${{ steps.install.outcome }}' + '\n';
+            body += '**lint outcome:** ' + '${{ steps.lint.outcome }}' + '\n\n';
+            try { body += '**bun version:** ' + execSync('bun --version 2>&1').toString().trim() + '\n\n'; } catch(e) { body += '**bun:** not available\n\n'; }
             if (fs.existsSync('/tmp/install.log')) {
               const log = fs.readFileSync('/tmp/install.log', 'utf8').slice(-3000);
               body += '<details><summary>Install output</summary>\n\n```\n' + log + '\n```\n</details>\n\n';
@@ -56,5 +64,5 @@ jobs:
             }
 
       - name: Fail if any step failed
-        if: steps.install.outcome == 'failure' || steps.lint.outcome == 'failure'
+        if: always() && (steps.setup-bun.outcome == 'failure' || steps.install.outcome == 'failure' || steps.lint.outcome == 'failure')
         run: exit 1
