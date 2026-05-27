@@ -1392,11 +1392,8 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
     const child = spawnForgeCli(["spec", "improve", planId, "--json"], {
       cwd: task.repoRoot,
-      detached: true,
-      stdio: "ignore",
       env: process.env,
     });
-    child.unref();
     return jsonOk({ planId, queued: true, pid: child.pid });
   }
 
