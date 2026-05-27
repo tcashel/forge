@@ -24,13 +24,13 @@ import {
   syncCritiqueState,
   syncJobState,
 } from "../src/core/db/writes.ts";
-import { type CritiqueMeta, ForgeStore, type RunMeta, type TaskRecord } from "../src/core/store.ts";
+import { type CritiqueMeta, ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 function tmpForgeDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "forge-crit-"));
 }
 
-function task(): TaskRecord {
+function task(): Plan {
   return {
     id: "plan-c1",
     title: "Critique sync",
@@ -60,7 +60,7 @@ function makeCritique(status: CritiqueMeta["status"]): CritiqueMeta {
   const agentStatus = status === "done" ? "done" : status === "failed" ? "failed" : "pending";
   return {
     schemaVersion: 1,
-    taskId: "plan-c1",
+    planId: "plan-c1",
     critiqueId: "crit-xyz",
     specTitle: "Critique sync",
     repoRoot: "/repo/x",
@@ -147,7 +147,7 @@ test("syncJobState moves the latest job to succeeded and advances plan/tasks sta
 
     const startedAt = "2026-04-05T10:00:00.000Z";
     const meta: RunMeta = {
-      taskId: t.id,
+      planId: t.id,
       tmuxSession: "forge-plan-c1",
       logFile: "/dev/null",
       agent: "claude",

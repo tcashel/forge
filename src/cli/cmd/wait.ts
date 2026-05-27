@@ -22,7 +22,7 @@
 
 import { parseArgs } from "node:util";
 import { isTmuxSessionAlive } from "../../core/launch.ts";
-import type { ForgeStore, TaskStatus } from "../../core/store.ts";
+import type { ForgeStore, PlanStatus } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 
 export const HELP = `forge wait <task-id> [...flags]
@@ -45,7 +45,7 @@ stdout as a single JSON object.
 Exit codes: 0 satisfied, 3 stalled, 4 timeout, 1 unknown task.
 `;
 
-const TERMINAL_DEFAULT: TaskStatus[] = ["done", "failed", "quality_failed"];
+const TERMINAL_DEFAULT: PlanStatus[] = ["done", "failed", "quality_failed"];
 
 function parseDuration(s: string): number {
   const m = s.match(/^(\d+)\s*(ms|s|m|h)?$/);
@@ -56,7 +56,7 @@ function parseDuration(s: string): number {
 }
 
 interface UntilSpec {
-  statuses: Set<TaskStatus>;
+  statuses: Set<PlanStatus>;
   prRequired: boolean;
 }
 
@@ -69,7 +69,7 @@ function parseUntil(csv: string | undefined): UntilSpec {
       out.statuses.add("done");
       out.prRequired = true;
     } else {
-      out.statuses.add(p as TaskStatus);
+      out.statuses.add(p as PlanStatus);
     }
   }
   return out;
@@ -91,7 +91,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const id = positionals[0];
   if (!id) throw new CliError("MISSING_ARG", "Usage: forge wait <task-id>", { exitCode: 1 });
 
-  const initial = store.getTask(id);
+  const initial = store.getPlan(id);
   if (!initial) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
 
   const until = parseUntil(values.until as string | undefined);
@@ -101,15 +101,15 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const start = Date.now();
 
   while (true) {
-    const t = store.getTask(id);
+    const t = store.getPlan(id);
     if (!t) throw new CliError("DISAPPEARED", `Task ${id} disappeared mid-wait.`, { exitCode: 3 });
-    store.syncTaskStatus(t);
-    const cur = store.getTask(id) ?? t;
+    store.syncPlanStatus(t);
+    const cur = store.getPlan(id) ?? t;
 
     const satisfied = until.statuses.has(cur.status) && (!until.prRequired || cur.prUrl != null);
     if (satisfied) {
       const out = {
-        taskId: id,
+        planId: id,
         status: cur.status,
         satisfied: cur.status,
         prUrl: cur.prUrl,
@@ -138,7 +138,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
     const heartbeat = {
       type: "heartbeat",
-      taskId: id,
+      planId: id,
       status: cur.status,
       tmuxAlive,
       prUrl: cur.prUrl,

@@ -10,21 +10,21 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { CritiqueMeta, RunMeta, TaskRecord } from "../store.ts";
+import type { CritiqueMeta, Plan, RunMeta } from "../store.ts";
 
-export function livePlanVersionId(taskId: string, version: number): string {
-  return `pv-${taskId}-v${version}`;
+export function livePlanVersionId(planId: string, version: number): string {
+  return `pv-${planId}-v${version}`;
 }
 
-export function liveTaskId(taskId: string): string {
-  return `t-${taskId}`;
+export function liveTaskId(planId: string): string {
+  return `t-${planId}`;
 }
 
-export function liveJobId(taskId: string, runNumber: number): string {
-  return `j-${taskId}-r${runNumber}`;
+export function liveJobId(planId: string, runNumber: number): string {
+  return `j-${planId}-r${runNumber}`;
 }
 
-function planStageForStatus(status: TaskRecord["status"]): string {
+function planStageForStatus(status: Plan["status"]): string {
   switch (status) {
     case "draft":
       return "drafting";
@@ -42,7 +42,7 @@ function planStageForStatus(status: TaskRecord["status"]): string {
   }
 }
 
-function taskStateForStatus(status: TaskRecord["status"]): string {
+function taskStateForStatus(status: Plan["status"]): string {
   switch (status) {
     case "draft":
       return "ready";
@@ -61,7 +61,7 @@ function taskStateForStatus(status: TaskRecord["status"]): string {
   }
 }
 
-function planMetadata(task: TaskRecord): string {
+function planMetadata(task: Plan): string {
   return JSON.stringify({
     repoName: task.repoName,
     worktree: task.worktree,
@@ -83,7 +83,7 @@ function planMetadata(task: TaskRecord): string {
  * Writes the plan row, the v1 plan_version, and the synthetic tasks
  * row (sequence=1) jobs will attach to. Sets current_version_id to v1.
  */
-export function recordPlanCreated(db: Database, task: TaskRecord, body: string): void {
+export function recordPlanCreated(db: Database, task: Plan, body: string): void {
   const planVersionId = livePlanVersionId(task.id, 1);
   const taskRowId = liveTaskId(task.id);
 
@@ -136,12 +136,12 @@ export function recordPlanCreated(db: Database, task: TaskRecord, body: string):
  * synthetic tasks row at the new version.
  *
  * Self-heals: if the plan or synthetic task doesn't exist yet (task
- * predates dual-write, or test constructed it via upsertTask without
- * saveSpec), they're created lazily from the TaskRecord. The synthetic
+ * predates dual-write, or test constructed it via upsertPlan without
+ * saveSpec), they're created lazily from the Plan. The synthetic
  * task is matched by `(plan_id, sequence=1)` so backfilled IDs (`bf-t-*`)
  * and live IDs (`t-*`) both work.
  */
-export function recordPlanVersionAdded(db: Database, task: TaskRecord, version: number, body: string): void {
+export function recordPlanVersionAdded(db: Database, task: Plan, version: number, body: string): void {
   const planVersionId = livePlanVersionId(task.id, version);
   const now = new Date().toISOString();
 
@@ -175,7 +175,7 @@ export function recordPlanVersionAdded(db: Database, task: TaskRecord, version: 
  * same task always produce a fresh row (no INSERT OR IGNORE) — that's
  * the whole point of versioned jobs.
  */
-export function recordJobStarted(db: Database, task: TaskRecord, meta: RunMeta): number {
+export function recordJobStarted(db: Database, task: Plan, meta: RunMeta): number {
   let runNumber = 0;
 
   db.transaction(() => {
@@ -253,7 +253,7 @@ function mapCritiqueAgentState(s: CritiqueMeta["criticA"]["status"]): string {
  *
  * Idempotent — re-running on the same critiqueId is a no-op.
  */
-export function recordCritiqueStarted(db: Database, task: TaskRecord, meta: CritiqueMeta): void {
+export function recordCritiqueStarted(db: Database, task: Plan, meta: CritiqueMeta): void {
   db.transaction(() => {
     ensurePlanAndSyntheticTask(db, task);
 
@@ -400,7 +400,7 @@ function insertLiveCriticRun(
  * reads RunMeta and notices a status transition that the bash runner
  * wrote to meta.json but the DB hasn't seen yet.
  */
-export function syncJobState(db: Database, task: TaskRecord, meta: Partial<RunMeta>): void {
+export function syncJobState(db: Database, task: Plan, meta: Partial<RunMeta>): void {
   const taskRow = db.prepare("SELECT id FROM tasks WHERE plan_id = ? AND sequence = 1").get(task.id) as
     | { id: string }
     | undefined;
@@ -450,7 +450,7 @@ function mapMetaStatusToJobState(status: string | undefined): string {
   }
 }
 
-function ensurePlanAndSyntheticTask(db: Database, task: TaskRecord): void {
+function ensurePlanAndSyntheticTask(db: Database, task: Plan): void {
   const planRow = db.prepare("SELECT id FROM plans WHERE id = ?").get(task.id);
   if (!planRow) {
     db.prepare(

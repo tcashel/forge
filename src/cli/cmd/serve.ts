@@ -37,10 +37,10 @@ import type {
   CritiqueMeta,
   ForgeStore,
   LaunchTarget,
+  Plan,
+  PlanStatus,
   ReasoningEffort,
   RepoConfig,
-  TaskRecord,
-  TaskStatus,
 } from "../../core/store.ts";
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
@@ -68,10 +68,10 @@ const DEFAULT_HOST = "127.0.0.1";
 
 type WorkbenchSection = "running" | "attention" | "ready" | "drafting" | "done";
 
-interface TaskView {
+interface PlanView {
   id: string;
   title: string;
-  status: TaskStatus;
+  status: PlanStatus;
   section: WorkbenchSection;
   statLabel: string;
   statClass: WorkbenchSection;
@@ -101,7 +101,7 @@ interface RepoView {
   name: string;
   root: string;
   branch: string | null;
-  taskCount: number;
+  planCount: number;
   registered: boolean;
   current: boolean;
   reachable: boolean;
@@ -203,7 +203,7 @@ function blurbFromSpec(specBody: string): string | null {
 }
 
 function statusInfo(
-  task: TaskRecord,
+  task: Plan,
   store: ForgeStore,
 ): {
   section: WorkbenchSection;
@@ -211,7 +211,7 @@ function statusInfo(
   statClass: WorkbenchSection;
   kind?: "critique-ready" | "failed";
   error: string | null;
-  critique: TaskView["critique"];
+  critique: PlanView["critique"];
 } {
   const latestCritiqueId = store.getLatestCritique(task.id);
   const critiqueMeta = latestCritiqueId ? store.readCritiqueMeta(task.id, latestCritiqueId) : null;
@@ -276,7 +276,7 @@ function statusInfo(
   }
 }
 
-function failureMessage(task: TaskRecord, store: ForgeStore): string | null {
+function failureMessage(task: Plan, store: ForgeStore): string | null {
   const meta = store.readRunMeta(task.id);
   if (task.status === "quality_failed") {
     const results = (meta?.qualityResults as { command: string; ok: boolean }[] | undefined) ?? [];
@@ -391,7 +391,7 @@ function validateConfigPatch(
   return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
-function viewTask(task: TaskRecord, store: ForgeStore): TaskView {
+function viewTask(task: Plan, store: ForgeStore): PlanView {
   const info = statusInfo(task, store);
   const ageRef = task.launchedAt ?? task.createdAt;
   const age = timeAgo(ageRef);
@@ -434,7 +434,7 @@ function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: st
   const ensure = (input: {
     name: string;
     root: string;
-    taskCount?: number;
+    planCount?: number;
     registered?: boolean;
     current?: boolean;
   }) => {
@@ -444,7 +444,7 @@ function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: st
       name: input.name,
       root: input.root,
       branch: info.branch,
-      taskCount: (existing?.taskCount ?? 0) + (input.taskCount ?? 0),
+      planCount: (existing?.planCount ?? 0) + (input.planCount ?? 0),
       registered: (existing?.registered ?? false) || input.registered === true,
       current: (existing?.current ?? false) || input.current === true,
       reachable: info.reachable,
@@ -459,17 +459,17 @@ function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: st
   for (const repo of store.getWorkbenchRepos()) ensure({ name: repo.name, root: repo.root, registered: true });
 
   const counts = new Map<string, { name: string; root: string; count: number }>();
-  for (const t of store.getTasks()) {
+  for (const t of store.getPlans()) {
     const entry = counts.get(t.repoRoot) ?? { name: t.repoName, root: t.repoRoot, count: 0 };
     entry.count += 1;
     counts.set(t.repoRoot, entry);
   }
-  for (const repo of counts.values()) ensure({ name: repo.name, root: repo.root, taskCount: repo.count });
+  for (const repo of counts.values()) ensure({ name: repo.name, root: repo.root, planCount: repo.count });
 
   return Array.from(byRoot.values()).sort((a, b) => {
     if (a.current !== b.current) return a.current ? -1 : 1;
     if (a.stale !== b.stale) return a.stale ? 1 : -1;
-    return b.taskCount - a.taskCount || a.name.localeCompare(b.name) || a.root.localeCompare(b.root);
+    return b.planCount - a.planCount || a.name.localeCompare(b.name) || a.root.localeCompare(b.root);
   });
 }
 
@@ -668,11 +668,11 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ repo: target, config: store.getRepoConfig(target.root) });
   }
 
-  // GET /api/tasks?repo=<name>&section=<...>
-  if (pathname === "/api/tasks") {
+  // GET /api/plans?repo=<name>&section=<...>
+  if (pathname === "/api/plans") {
     const repo = url.searchParams.get("repo") || undefined;
     const section = url.searchParams.get("section") || undefined;
-    let tasks = store.getTasks();
+    let tasks = store.getPlans();
     if (repo) tasks = tasks.filter((t) => t.repoName === repo || t.repoRoot === repo);
     // Sync any running tasks so the UI sees fresh statuses on every poll.
     for (const t of tasks) {
@@ -682,27 +682,27 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
         t.status === "creating_pr" ||
         t.status === "fixing"
       ) {
-        store.syncTaskStatus(t);
+        store.syncPlanStatus(t);
       }
     }
     // Re-read after the sync to pick up any status changes.
-    let synced = store.getTasks();
+    let synced = store.getPlans();
     if (repo) synced = synced.filter((t) => t.repoName === repo || t.repoRoot === repo);
     let views = synced.map((t) => viewTask(t, store));
     if (section) views = views.filter((v) => v.section === section);
-    return jsonOk({ tasks: views });
+    return jsonOk({ plans: views });
   }
 
-  // GET /api/tasks/:id
-  // GET /api/tasks/:id/spec
-  // GET /api/tasks/:id/log    (SSE)
-  // GET /api/tasks/:id/critique
-  // GET /api/tasks/:id/critiques  (list of all attempts for visibility)
-  const taskMatch = pathname.match(/^\/api\/tasks\/([^/]+)(?:\/(spec|log|critique|critiques))?$/);
+  // GET /api/plans/:id
+  // GET /api/plans/:id/spec
+  // GET /api/plans/:id/log    (SSE)
+  // GET /api/plans/:id/critique
+  // GET /api/plans/:id/critiques  (list of all attempts for visibility)
+  const taskMatch = pathname.match(/^\/api\/plans\/([^/]+)(?:\/(spec|log|critique|critiques))?$/);
   if (taskMatch) {
     const id = decodeURIComponent(taskMatch[1]);
     const sub = taskMatch[2];
-    const task = store.getTask(id);
+    const task = store.getPlan(id);
     if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${id}".`);
 
     if (!sub) {
@@ -715,7 +715,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       const spec = store.getSpec(id);
       if (spec === null) return jsonErr(404, "NO_SPEC", `No spec on disk for task "${id}".`);
       const stripped = url.searchParams.get("raw") === "1" ? stripFrontmatter(spec) : spec;
-      return jsonOk({ taskId: id, body: stripped });
+      return jsonOk({ planId: id, body: stripped });
     }
 
     if (sub === "critiques") {
@@ -738,14 +738,14 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
           };
         })
         .filter((a): a is NonNullable<typeof a> => a !== null);
-      return jsonOk({ taskId: id, attempts });
+      return jsonOk({ planId: id, attempts });
     }
 
     if (sub === "critique") {
       const critiqueId = url.searchParams.get("critiqueId") || store.getLatestCritique(id);
-      if (!critiqueId) return jsonOk({ taskId: id, critique: null });
+      if (!critiqueId) return jsonOk({ planId: id, critique: null });
       const meta = store.readCritiqueMeta(id, critiqueId);
-      if (!meta) return jsonOk({ taskId: id, critique: null });
+      if (!meta) return jsonOk({ planId: id, critique: null });
       const dir = store.getCritiqueDir(id, critiqueId);
       const recPath = path.join(dir, "recommendations.md");
       const recommendations = fs.existsSync(recPath) ? fs.readFileSync(recPath, "utf-8") : null;
@@ -753,7 +753,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       const critB = path.join(dir, "critic-b.md");
       const synth = path.join(dir, "synth.md");
       return jsonOk({
-        taskId: id,
+        planId: id,
         critique: {
           meta,
           recommendations,
@@ -776,10 +776,10 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // GET /api/specs/:id/plan-history → { messages: [...] }
   const specPlanHistoryMatch = pathname.match(/^\/api\/specs\/([^/]+)\/plan-history$/);
   if (specPlanHistoryMatch) {
-    const taskId = decodeURIComponent(specPlanHistoryMatch[1]);
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
-    const history = loadPlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    const planId = decodeURIComponent(specPlanHistoryMatch[1]);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
+    const history = loadPlanHistory(store.forgeDir, { kind: "spec", id: planId });
     return jsonOk({ messages: history.messages });
   }
 
@@ -820,7 +820,7 @@ function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoVie
 
 // ─── POST routes ─────────────────────────────────────────────────────────────
 
-const ACTION_TASK_PATH = /^\/api\/tasks\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
+const ACTION_TASK_PATH = /^\/api\/plans\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
 const SPEC_PLAN_CHAT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat$/;
 const SPEC_PLAN_CHAT_ABORT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat\/abort$/;
 const SPEC_PLAN_HISTORY_PATH = /^\/api\/specs\/([^/]+)\/plan-history$/;
@@ -909,7 +909,7 @@ const VALID_ACTION_AGENTS = new Set(["claude", "codex", "opencode", "gemini"]);
 function optAgent(
   body: Record<string, unknown>,
   key: string,
-): { ok: true; value: TaskRecord["agent"] } | { ok: false; error: Response } {
+): { ok: true; value: Plan["agent"] } | { ok: false; error: Response } {
   const v = body[key];
   if (v === undefined || v === null || v === "") return { ok: true, value: null };
   if (typeof v !== "string" || !VALID_ACTION_AGENTS.has(v)) {
@@ -918,12 +918,12 @@ function optAgent(
       error: jsonErr(400, "BAD_REQUEST", `\`${key}\` must be one of: ${Array.from(VALID_ACTION_AGENTS).join(", ")}.`),
     };
   }
-  return { ok: true, value: v as TaskRecord["agent"] };
+  return { ok: true, value: v as Plan["agent"] };
 }
 
 // Statuses where a `kill` is meaningful — only running-family tasks. Killing
 // a `done`/`failed`/`draft` task would silently rewrite the completion record.
-const KILLABLE_STATUSES: Set<TaskStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
+const KILLABLE_STATUSES: Set<PlanStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
 
 async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
   try {
@@ -938,8 +938,8 @@ async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Res
   }
 }
 
-function getSpecBodyStripped(store: ForgeStore, taskId: string): string | null {
-  const raw = store.getSpec(taskId);
+function getSpecBodyStripped(store: ForgeStore, planId: string): string | null {
+  const raw = store.getSpec(planId);
   if (raw === null) return null;
   return stripFrontmatter(raw);
 }
@@ -999,9 +999,9 @@ function planChatSseResponse(opts: {
   });
 }
 
-function resolveSpecModel(store: ForgeStore, taskId: string, override: string | undefined): string | undefined {
+function resolveSpecModel(store: ForgeStore, planId: string, override: string | undefined): string | undefined {
   if (override) return override;
-  const task = store.getTask(taskId);
+  const task = store.getPlan(planId);
   if (!task) return undefined;
   const cfg = store.getRepoConfig(task.repoRoot);
   return cfg.defaultModel ?? task.model ?? undefined;
@@ -1013,10 +1013,10 @@ async function handleApiDelete(url: URL, ctx: RouteCtx): Promise<Response> {
 
   const specHistoryMatch = pathname.match(SPEC_PLAN_HISTORY_PATH);
   if (specHistoryMatch) {
-    const taskId = decodeURIComponent(specHistoryMatch[1]);
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
-    wipePlanHistory(store.forgeDir, { kind: "spec", id: taskId });
+    const planId = decodeURIComponent(specHistoryMatch[1]);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
+    wipePlanHistory(store.forgeDir, { kind: "spec", id: planId });
     return jsonOk({ ok: true });
   }
 
@@ -1040,11 +1040,11 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   // POST /api/specs/:id/plan-chat/abort
   const specAbortMatch = pathname.match(SPEC_PLAN_CHAT_ABORT_PATH);
   if (specAbortMatch) {
-    const taskId = decodeURIComponent(specAbortMatch[1]);
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
-    const killed = abortInFlight({ kind: "spec", id: taskId });
-    return jsonOk({ aborted: killed, taskId });
+    const planId = decodeURIComponent(specAbortMatch[1]);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
+    const killed = abortInFlight({ kind: "spec", id: planId });
+    return jsonOk({ aborted: killed, planId });
   }
 
   // POST /api/plan-chat/draft/:draftId/abort
@@ -1065,23 +1065,23 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   // POST /api/specs/:id/plan-chat → SSE
   const specChatMatch = pathname.match(SPEC_PLAN_CHAT_PATH);
   if (specChatMatch) {
-    const taskId = decodeURIComponent(specChatMatch[1]);
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const planId = decodeURIComponent(specChatMatch[1]);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
     const parsed = await readJsonBody(req);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;
     const message = reqString(body, "message");
     if (!message) return jsonErr(400, "BAD_REQUEST", "`message` is required.");
-    const model = resolveSpecModel(store, taskId, optString(body, "model"));
-    const specBody = getSpecBodyStripped(store, taskId);
+    const model = resolveSpecModel(store, planId, optString(body, "model"));
+    const specBody = getSpecBodyStripped(store, planId);
     // Spec scope: server resolves the working directory from the task
     // record so the planner runs against the right repo regardless of
     // where `forge serve` was launched. Falls through to runChatTurn's
     // BAD_CWD validation if the task's repoRoot has been deleted.
     return planChatSseResponse({
       store,
-      scope: { kind: "spec", id: taskId },
+      scope: { kind: "spec", id: planId },
       message,
       model,
       specBody,
@@ -1129,18 +1129,18 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const parsed = await readJsonBody(req);
     if ("error" in parsed) return parsed.error;
     const body = parsed.body;
-    const taskId = reqString(body, "taskId");
-    if (!taskId) return jsonErr(400, "BAD_REQUEST", "`taskId` is required.");
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const planId = reqString(body, "planId");
+    if (!planId) return jsonErr(400, "BAD_REQUEST", "`planId` is required.");
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
     try {
       abortInFlight({ kind: "draft", id: draftId });
-      promotePlanDraft(store.forgeDir, draftId, taskId);
+      promotePlanDraft(store.forgeDir, draftId, planId);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return jsonErr(409, "PROMOTE_CONFLICT", msg);
     }
-    return jsonOk({ ok: true, taskId, draftId });
+    return jsonOk({ ok: true, planId, draftId });
   }
 
   // ── JSON-bodied POSTs ──────────────────────────────────────────────
@@ -1202,7 +1202,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
 
   const m = pathname.match(ACTION_TASK_PATH);
   if (!m) return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
-  const taskId = decodeURIComponent(m[1]);
+  const planId = decodeURIComponent(m[1]);
   const action = m[2];
 
   if (action === "resume") {
@@ -1210,29 +1210,29 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
       501,
       "NOT_IMPLEMENTED",
       "forge resume is not wired in this version.",
-      "Re-launch from scratch with POST /api/tasks/:id/launch.",
+      "Re-launch from scratch with POST /api/plans/:id/launch.",
     );
   }
 
   if (action === "kill") {
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
     if (!KILLABLE_STATUSES.has(task.status)) {
       return jsonErr(
         409,
         "BAD_STATE",
-        `Task ${taskId} is in state "${task.status}" — only running tasks can be killed.`,
+        `Task ${planId} is in state "${task.status}" — only running tasks can be killed.`,
       );
     }
     if (!task.tmuxSession) {
-      return jsonErr(400, "NO_TMUX_SESSION", `Task ${taskId} has no tmux session — it hasn't been launched.`);
+      return jsonErr(400, "NO_TMUX_SESSION", `Task ${planId} has no tmux session — it hasn't been launched.`);
     }
     killTmuxSession(task.tmuxSession);
     // Locked merge: the runner's bash set_status writes meta concurrently,
     // so a naive read-spread-write would lose either field.
-    store.mergeRunMeta(taskId, { errorMessage: "Killed by user", status: "failed" });
-    store.upsertTask({ ...task, status: "failed", completedAt: new Date().toISOString() });
-    return jsonOk({ killed: true, taskId });
+    store.mergeRunMeta(planId, { errorMessage: "Killed by user", status: "failed" });
+    store.upsertPlan({ ...task, status: "failed", completedAt: new Date().toISOString() });
+    return jsonOk({ killed: true, planId });
   }
 
   if (action === "launch") {
@@ -1240,7 +1240,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     if (!agentResult.ok) return agentResult.error;
     try {
       const result = await doLaunch(
-        { taskId, agent: agentResult.value ?? undefined, model: optString(body, "model") },
+        { planId, agent: agentResult.value ?? undefined, model: optString(body, "model") },
         store,
       );
       return jsonOk(result);
@@ -1252,7 +1252,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
 
   if (action === "critique") {
     try {
-      const result = await doCritique({ taskId }, store);
+      const result = await doCritique({ planId }, store);
       return jsonOk(result);
     } catch (e) {
       if (e instanceof CliError) return fromCliError(e);
@@ -1261,13 +1261,13 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   }
 
   if (action === "improve") {
-    const task = store.getTask(taskId);
-    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${taskId}".`);
+    const task = store.getPlan(planId);
+    if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
     if (task.status !== "draft") {
       return jsonErr(
         409,
         "BAD_STATE",
-        `Task ${taskId} is in state "${task.status}" — improve only runs on draft specs.`,
+        `Task ${planId} is in state "${task.status}" — improve only runs on draft specs.`,
       );
     }
     // runImprover uses synchronous execSync to drive critic + synth + improver
@@ -1276,14 +1276,14 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     // behind it). Spawn a detached child running the equivalent CLI so the
     // request returns immediately. The next 3s task poll picks up the
     // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
-    const child = spawn(process.execPath, [process.argv[1], "spec", "improve", taskId, "--json"], {
+    const child = spawn(process.execPath, [process.argv[1], "spec", "improve", planId, "--json"], {
       cwd: task.repoRoot,
       detached: true,
       stdio: "ignore",
       env: process.env,
     });
     child.unref();
-    return jsonOk({ taskId, queued: true, pid: child.pid });
+    return jsonOk({ planId, queued: true, pid: child.pid });
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
@@ -1322,12 +1322,12 @@ const STALE_IMPROVE_MS = 10 * 60_000;
 function reapStaleCritiques(store: ForgeStore): number {
   const now = Date.now();
   let swept = 0;
-  for (const { taskId, critiqueId, meta } of store.getPendingCritiques()) {
+  for (const { planId, critiqueId, meta } of store.getPendingCritiques()) {
     if (meta.status !== "running_critics" && meta.status !== "running_synth") continue;
     const startedMs = new Date(meta.startedAt).getTime();
     if (Number.isNaN(startedMs)) continue;
     if (now - startedMs < STALE_IMPROVE_MS) continue;
-    store.writeCritiqueMeta(taskId, critiqueId, {
+    store.writeCritiqueMeta(planId, critiqueId, {
       ...meta,
       status: "failed",
       completedAt: new Date().toISOString(),
@@ -1441,6 +1441,15 @@ export async function startServer(
             "access-control-allow-headers": "content-type",
           },
         });
+      }
+
+      if (pathname.startsWith("/api/tasks")) {
+        // Phase 3.5 — `/api/tasks/*` was renamed to `/api/plans/*`. Old
+        // browser tabs and shell scripts can still hit the legacy path
+        // for one release; 308 keeps the method + body intact across
+        // POST/DELETE redirects (vs. 301 which downgrades to GET).
+        const redirected = `/api/plans${pathname.slice("/api/tasks".length)}${url.search}`;
+        return new Response(null, { status: 308, headers: { location: redirected } });
       }
 
       if (pathname.startsWith("/api/")) {

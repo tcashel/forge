@@ -12,8 +12,8 @@ export interface LogStreamHandlers {
   onDisconnect?: () => void;
 }
 
-export function openLogStream(taskId: string, lines: number, handlers: LogStreamHandlers): EventSource {
-  const url = `/api/tasks/${encodeURIComponent(taskId)}/log?lines=${lines}`;
+export function openLogStream(planId: string, lines: number, handlers: LogStreamHandlers): EventSource {
+  const url = `/api/plans/${encodeURIComponent(planId)}/log?lines=${lines}`;
   const src = new EventSource(url);
   src.addEventListener("snapshot", (e) => handlers.onLines((e as MessageEvent).data));
   src.addEventListener("append", (e) => handlers.onLines((e as MessageEvent).data));

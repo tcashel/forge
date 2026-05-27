@@ -1,10 +1,10 @@
 import { useEffect, useState } from "preact/hooks";
 import { type ApiError, apiGet } from "../../../lib/api";
 import { renderMarkdown } from "../../../lib/markdown";
-import type { TaskView } from "../../../types";
+import type { PlanView } from "../../../types";
 
 interface SpecResponse {
-  taskId: string;
+  planId: string;
   body: string;
 }
 
@@ -14,12 +14,12 @@ interface State {
   error: string | null;
 }
 
-export function SpecTab({ t }: { t: TaskView }) {
+export function SpecTab({ t }: { t: PlanView }) {
   const [s, setS] = useState<State>({ loading: true, html: null, error: null });
   useEffect(() => {
     let cancelled = false;
     setS({ loading: true, html: null, error: null });
-    apiGet<SpecResponse>(`/api/tasks/${encodeURIComponent(t.id)}/spec?raw=1`)
+    apiGet<SpecResponse>(`/api/plans/${encodeURIComponent(t.id)}/spec?raw=1`)
       .then((data) => {
         if (cancelled) return;
         setS({ loading: false, html: renderMarkdown(data.body || ""), error: null });

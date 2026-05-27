@@ -13,13 +13,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { recordJobStarted, recordPlanCreated } from "../src/core/db/writes.ts";
-import { ForgeStore, type RunMeta, type TaskRecord } from "../src/core/store.ts";
+import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 function tmpForgeDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "forge-jobs-"));
 }
 
-function makeTask(): TaskRecord {
+function makeTask(): Plan {
   return {
     id: "task-jv-1",
     title: "Job versioning",
@@ -44,9 +44,9 @@ function makeTask(): TaskRecord {
   };
 }
 
-function makeMeta(task: TaskRecord, startedAt: string): RunMeta {
+function makeMeta(task: Plan, startedAt: string): RunMeta {
   return {
-    taskId: task.id,
+    planId: task.id,
     tmuxSession: `forge-${task.id}`,
     logFile: "/dev/null",
     agent: "claude",

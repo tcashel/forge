@@ -1,15 +1,15 @@
-import type { TaskView, WorkbenchSection } from "../../types";
-import { TaskRow } from "./TaskRow";
+import type { PlanView, WorkbenchSection } from "../../types";
+import { PlanRow } from "./PlanRow";
 
 interface SectionProps {
   section: Exclude<WorkbenchSection, "done">;
   ic: string;
   name: string;
   help: string;
-  rows: TaskView[];
+  rows: PlanView[];
 }
 
-export function TaskSection({ section, ic, name, help, rows }: SectionProps) {
+export function PlanSection({ section, ic, name, help, rows }: SectionProps) {
   // Always-render section headers (matches legacy: counts visible at 0).
   return (
     <>
@@ -21,7 +21,7 @@ export function TaskSection({ section, ic, name, help, rows }: SectionProps) {
       </header>
       <div id={`list-${section}`}>
         {rows.map((t) => (
-          <TaskRow key={t.id} t={t} />
+          <PlanRow key={t.id} t={t} />
         ))}
       </div>
     </>
@@ -29,7 +29,7 @@ export function TaskSection({ section, ic, name, help, rows }: SectionProps) {
 }
 
 interface DoneProps {
-  rows: TaskView[];
+  rows: PlanView[];
 }
 
 export function DoneSection({ rows }: DoneProps) {
@@ -46,7 +46,7 @@ export function DoneSection({ rows }: DoneProps) {
       </summary>
       <div id="list-done">
         {rows.map((t) => (
-          <TaskRow key={t.id} t={t} />
+          <PlanRow key={t.id} t={t} />
         ))}
       </div>
     </details>

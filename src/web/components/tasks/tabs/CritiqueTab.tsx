@@ -3,15 +3,15 @@ import { runAction } from "../../../lib/actions";
 import { type ApiError, apiGet } from "../../../lib/api";
 import { renderMarkdown } from "../../../lib/markdown";
 import { refreshTasks } from "../../../signals/tasks";
-import type { CritiqueAgentMeta, CritiqueAttemptSummary, CritiquePayload, TaskView } from "../../../types";
+import type { CritiqueAgentMeta, CritiqueAttemptSummary, CritiquePayload, PlanView } from "../../../types";
 
 interface CritiqueResponse {
-  taskId: string;
+  planId: string;
   critique: CritiquePayload | null;
 }
 
 interface CritiquesListResponse {
-  taskId: string;
+  planId: string;
   attempts: CritiqueAttemptSummary[];
 }
 
@@ -77,7 +77,7 @@ function CritiqueCard({
   );
 }
 
-export function CritiqueTab({ t }: { t: TaskView }) {
+export function CritiqueTab({ t }: { t: PlanView }) {
   const [s, setS] = useState<State>({
     loading: true,
     attempts: [],
@@ -91,7 +91,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
   // both mount + poller without flashing the UI.
   const refetchAttempts = async (selectedId: string | null): Promise<void> => {
     try {
-      const list = await apiGet<CritiquesListResponse>(`/api/tasks/${encodeURIComponent(t.id)}/critiques`);
+      const list = await apiGet<CritiquesListResponse>(`/api/plans/${encodeURIComponent(t.id)}/critiques`);
       const attempts = list.attempts;
       // Selection: keep existing if it still exists, otherwise newest.
       const nextSelected = attempts.find((a) => a.id === selectedId)?.id ?? attempts[0]?.id ?? null;
@@ -100,7 +100,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
       if (nextSelected && nextSelected !== selectedId) {
         try {
           const detail = await apiGet<CritiqueResponse>(
-            `/api/tasks/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(nextSelected)}`,
+            `/api/plans/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(nextSelected)}`,
           );
           setS((prev) => ({
             ...prev,
@@ -130,7 +130,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
     setS({ loading: true, attempts: [], selectedId: null, selected: null, error: null });
     (async () => {
       try {
-        const list = await apiGet<CritiquesListResponse>(`/api/tasks/${encodeURIComponent(t.id)}/critiques`);
+        const list = await apiGet<CritiquesListResponse>(`/api/plans/${encodeURIComponent(t.id)}/critiques`);
         if (cancelled) return;
         const newest = list.attempts[0]?.id ?? null;
         if (!newest) {
@@ -138,7 +138,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
           return;
         }
         const detail = await apiGet<CritiqueResponse>(
-          `/api/tasks/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(newest)}`,
+          `/api/plans/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(newest)}`,
         );
         if (cancelled) return;
         setS({
@@ -186,7 +186,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
     setS((prev) => ({ ...prev, selectedId: id, selected: null }));
     try {
       const detail = await apiGet<CritiqueResponse>(
-        `/api/tasks/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(id)}`,
+        `/api/plans/${encodeURIComponent(t.id)}/critique?critiqueId=${encodeURIComponent(id)}`,
       );
       setS((prev) => ({ ...prev, selectedId: id, selected: detail.critique, error: null }));
     } catch (e) {
@@ -208,7 +208,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
           id="crit-run"
           onClick={() =>
             runAction(
-              `/api/tasks/${encodeURIComponent(t.id)}/critique`,
+              `/api/plans/${encodeURIComponent(t.id)}/critique`,
               { successMsg: `Critique queued for ${t.id}` },
               refreshTasks,
             )
@@ -234,7 +234,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
               style="font-size:11.5px;padding:4px 10px"
               onClick={() =>
                 runAction(
-                  `/api/tasks/${encodeURIComponent(t.id)}/improve`,
+                  `/api/plans/${encodeURIComponent(t.id)}/improve`,
                   { successMsg: `Improve queued for ${t.id}` },
                   refreshTasks,
                 )
@@ -249,7 +249,7 @@ export function CritiqueTab({ t }: { t: TaskView }) {
               style="font-size:11.5px;padding:4px 10px"
               onClick={() =>
                 runAction(
-                  `/api/tasks/${encodeURIComponent(t.id)}/critique`,
+                  `/api/plans/${encodeURIComponent(t.id)}/critique`,
                   { successMsg: `Critique queued for ${t.id}` },
                   refreshTasks,
                 )

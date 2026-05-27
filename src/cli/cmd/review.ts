@@ -105,7 +105,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     const prInfo = JSON.parse(prInfoJson) as { headRefName?: string };
     const branch = prInfo.headRefName;
     if (branch) {
-      const tasks = store.getTasks(repo.root);
+      const tasks = store.getPlans(repo.root);
       const match = tasks.find((t) => t.branch === branch);
       if (match) {
         linkedTaskId = match.id;

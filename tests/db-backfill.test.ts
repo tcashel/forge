@@ -1,7 +1,7 @@
 /**
  * Phase 2 — backfill from ~/.forge/ JSON into the SQLite contract.
  *
- * Builds a synthetic ~/.forge/ tree with two TaskRecords, a spec body,
+ * Builds a synthetic ~/.forge/ tree with two Plans, a spec body,
  * a completed critique, and a finished run meta. Runs backfill and
  * asserts each table has the expected row counts and key fields, then
  * runs it a second time and asserts zero new rows (idempotent).
@@ -14,27 +14,27 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { backfillFromJson } from "../src/core/db/backfill.ts";
 import { ForgeDb } from "../src/core/db/connection.ts";
-import { type CritiqueMeta, ForgeStore, type RunMeta, type TaskRecord } from "../src/core/store.ts";
+import { type CritiqueMeta, ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 function tmpForgeDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "forge-backfill-"));
 }
 
-function seedTask(store: ForgeStore, task: TaskRecord, specBody: string): void {
-  store.upsertTask(task);
+function seedTask(store: ForgeStore, task: Plan, specBody: string): void {
+  store.upsertPlan(task);
   store.writeSpec(task.id, specBody);
 }
 
-function seedRunMeta(store: ForgeStore, taskId: string, meta: RunMeta): void {
-  store.ensureRunDir(taskId);
-  store.writeRunMeta(taskId, meta);
+function seedRunMeta(store: ForgeStore, planId: string, meta: RunMeta): void {
+  store.ensureRunDir(planId);
+  store.writeRunMeta(planId, meta);
 }
 
-function seedCritique(store: ForgeStore, taskId: string, meta: CritiqueMeta): void {
-  store.writeCritiqueMeta(taskId, meta.critiqueId, meta);
+function seedCritique(store: ForgeStore, planId: string, meta: CritiqueMeta): void {
+  store.writeCritiqueMeta(planId, meta.critiqueId, meta);
 }
 
-function baseTask(overrides: Partial<TaskRecord>): TaskRecord {
+function baseTask(overrides: Partial<Plan>): Plan {
   return {
     id: "task-1",
     title: "Test task",
@@ -83,7 +83,7 @@ test("backfill produces plans, plan_versions, synthetic tasks, jobs, and critiqu
     seedTask(store, done, "# Done\nBody v2");
 
     seedRunMeta(store, done.id, {
-      taskId: done.id,
+      planId: done.id,
       tmuxSession: "forge-done-1",
       logFile: store.getLogFile(done.id),
       agent: "claude",
@@ -99,7 +99,7 @@ test("backfill produces plans, plan_versions, synthetic tasks, jobs, and critiqu
 
     seedCritique(store, draft.id, {
       schemaVersion: 1,
-      taskId: draft.id,
+      planId: draft.id,
       critiqueId: "crit-abc",
       specTitle: draft.title,
       repoRoot: draft.repoRoot,
@@ -143,6 +143,35 @@ test("backfill produces plans, plan_versions, synthetic tasks, jobs, and critiqu
     assert.ok(synth, "synthesis row points at the draft's plan_version");
     const runIds = JSON.parse(synth.critic_run_ids as string) as string[];
     assert.deepEqual(runIds, ["bf-cr-crit-abc-a", "bf-cr-crit-abc-b"]);
+
+    db.close();
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
+test("backfill reads legacy `tasks` key from pre-rename index.json", () => {
+  // Phase 3.5 renamed the in-memory map key from `tasks` to `plans` but
+  // on-disk JSON predates the rename. Migrate must still find these.
+  const forgeDir = tmpForgeDir();
+  try {
+    const store = new ForgeStore({ forgeDir });
+    const db = new ForgeDb({ forgeDir });
+
+    // Hand-write the legacy shape — bypass store.upsertPlan which writes
+    // the new shape.
+    const legacyIndex = {
+      version: 1,
+      tasks: {
+        "legacy-1": baseTask({ id: "legacy-1", title: "Legacy plan" }),
+      },
+    };
+    fs.writeFileSync(path.join(forgeDir, "index.json"), JSON.stringify(legacyIndex));
+    store.writeSpec("legacy-1", "# Legacy\nBody");
+
+    const counts = backfillFromJson(store, db.db);
+    assert.equal(counts.plans, 1, "legacy plan was picked up");
+    assert.equal(counts.tasks, 1, "synthetic task created");
 
     db.close();
   } finally {

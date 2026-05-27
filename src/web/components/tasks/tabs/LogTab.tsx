@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { copyCmd } from "../../../lib/actions";
 import { openLogStream } from "../../../lib/sse";
-import type { TaskView } from "../../../types";
+import type { PlanView } from "../../../types";
 
 function classifyLogLine(line: string): string {
   if (/✗|✘|FAIL|error|fatal|exit 1|\bERR\b/i.test(line)) return "err";
@@ -26,7 +26,7 @@ function appendLogLines(box: HTMLElement, text: string) {
   if (wasAtBottom) box.scrollTop = box.scrollHeight;
 }
 
-export function LogTab({ t }: { t: TaskView }) {
+export function LogTab({ t }: { t: PlanView }) {
   const isLive = t.section === "running";
   const boxRef = useRef<HTMLDivElement | null>(null);
   const [disconnected, setDisconnected] = useState(false);

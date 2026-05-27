@@ -12,7 +12,7 @@ import {
   rewriteSpec,
   runImprover,
 } from "../src/core/improve.ts";
-import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
+import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 // ─── Helpers ──────────────────────────────────────────────────────────────────
 
@@ -29,8 +29,8 @@ function withTmpHome(t: { after: (fn: () => void) => void }): { home: string; st
   return { home, store };
 }
 
-function seedTask(store: ForgeStore, id: string, body: string): TaskRecord {
-  const task: TaskRecord = {
+function seedTask(store: ForgeStore, id: string, body: string): Plan {
+  const task: Plan = {
     id,
     title: "Original title",
     repoRoot: "/tmp/repo",
@@ -65,16 +65,16 @@ function seedTask(store: ForgeStore, id: string, body: string): TaskRecord {
     "",
   ].join("\n");
   task.specFile = store.writeSpec(id, fm + body);
-  store.upsertTask(task);
+  store.upsertPlan(task);
   return task;
 }
 
 const AGENT_CLAUDE = { agent: "claude", model: "claude-opus-4-7" } as const;
 const AGENT_CODEX = { agent: "codex", model: "gpt-5-codex" } as const;
 
-function buildConfig(task: TaskRecord, body: string): ImproveConfig {
+function buildConfig(task: Plan, body: string): ImproveConfig {
   return {
-    taskId: task.id,
+    planId: task.id,
     repoRoot: task.repoRoot,
     repoName: task.repoName,
     specTitle: task.title,
@@ -152,14 +152,14 @@ Two findings.
 
 function makeCritiqueMock(recsBody: string): ImproveOverrides["runCritiqueSync"] {
   return async (config: CritiqueConfig, store: ForgeStore): Promise<CritiqueSyncResult> => {
-    const dir = store.getCritiqueDir(config.taskId, config.critiqueId);
+    const dir = store.getCritiqueDir(config.planId, config.critiqueId);
     fs.mkdirSync(dir, { recursive: true });
     const recsPath = path.join(dir, "recommendations.md");
     fs.writeFileSync(recsPath, recsBody);
     // Also seed critique-meta.json so markCritiqueViewed works on the no-op path.
-    store.writeCritiqueMeta(config.taskId, config.critiqueId, {
+    store.writeCritiqueMeta(config.planId, config.critiqueId, {
       schemaVersion: 1,
-      taskId: config.taskId,
+      planId: config.planId,
       critiqueId: config.critiqueId,
       specTitle: config.specTitle,
       repoRoot: config.repoRoot,
@@ -316,8 +316,8 @@ test("runImprover applied path bumps specVersion and writes frontmatter", async 
   assert.equal(result.applied, true);
   assert.equal(result.changeCount, 2);
 
-  // TaskRecord.specVersion bumped 1 → 2.
-  const updated = store.getTask(task.id);
+  // Plan.specVersion bumped 1 → 2.
+  const updated = store.getPlan(task.id);
   assert.equal(updated?.specVersion, 2);
 
   // Spec frontmatter contains the three new keys plus all originals.
@@ -381,10 +381,10 @@ test("runImprover is cumulative — two passes bump specVersion 1 → 2 → 3", 
     ),
   });
   assert.equal(r1.applied, true);
-  assert.equal(store.getTask(task.id)?.specVersion, 2);
+  assert.equal(store.getPlan(task.id)?.specVersion, 2);
 
   // Second pass uses the already-improved body.
-  const taskAfter = store.getTask(task.id);
+  const taskAfter = store.getPlan(task.id);
   if (!taskAfter) throw new Error("task missing");
   const bodyAfter1 = (store.getSpec(task.id) ?? "").replace(/^---[\s\S]*?---\n/, "");
   const r2 = await runImprover(buildConfig(taskAfter, bodyAfter1), store, {
@@ -398,7 +398,7 @@ test("runImprover is cumulative — two passes bump specVersion 1 → 2 → 3", 
   assert.equal(r2.applied, true);
   assert.notEqual(r1.critiqueId, r2.critiqueId, "each pass generates a new critiqueId");
 
-  const final = store.getTask(task.id);
+  const final = store.getPlan(task.id);
   assert.equal(final?.specVersion, 3);
 
   const liveSpec = store.getSpec(task.id) ?? "";

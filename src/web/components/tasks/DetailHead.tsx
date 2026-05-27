@@ -2,7 +2,7 @@ import { copyCmd, runAction } from "../../lib/actions";
 import { statClass } from "../../lib/format";
 import { currentTab, refreshTasks } from "../../signals/tasks";
 import { selectedRepo } from "../../signals/ui";
-import type { TaskView } from "../../types";
+import type { PlanView } from "../../types";
 
 interface ActionDef {
   label: string;
@@ -22,7 +22,7 @@ type ActionId =
   | "improve"
   | "kill";
 
-function actionsFor(t: TaskView): ActionDef[] {
+function actionsFor(t: PlanView): ActionDef[] {
   const items: ActionDef[] = [];
   if (t.section === "running") {
     items.push({ label: "Tail log", cls: "btn-primary", action: "tail-log" });
@@ -65,7 +65,7 @@ function actionsFor(t: TaskView): ActionDef[] {
   return items;
 }
 
-function dispatch(t: TaskView, action: ActionId): void | Promise<void> {
+function dispatch(t: PlanView, action: ActionId): void | Promise<void> {
   switch (action) {
     case "tail-log":
     case "open-log":
@@ -84,25 +84,25 @@ function dispatch(t: TaskView, action: ActionId): void | Promise<void> {
       return;
     case "launch":
       return runAction(
-        `/api/tasks/${encodeURIComponent(t.id)}/launch`,
+        `/api/plans/${encodeURIComponent(t.id)}/launch`,
         { successMsg: `Launching ${t.id}…` },
         refreshTasks,
       );
     case "critique":
       return runAction(
-        `/api/tasks/${encodeURIComponent(t.id)}/critique`,
+        `/api/plans/${encodeURIComponent(t.id)}/critique`,
         { successMsg: `Critique queued for ${t.id}` },
         refreshTasks,
       );
     case "improve":
       return runAction(
-        `/api/tasks/${encodeURIComponent(t.id)}/improve`,
+        `/api/plans/${encodeURIComponent(t.id)}/improve`,
         { successMsg: `Improve queued for ${t.id}` },
         refreshTasks,
       );
     case "kill":
       return runAction(
-        `/api/tasks/${encodeURIComponent(t.id)}/kill`,
+        `/api/plans/${encodeURIComponent(t.id)}/kill`,
         {
           successMsg: `Killed ${t.id}`,
           confirm: "Kill this run?\n\nThe tmux session will be terminated and the task marked failed.",
@@ -112,7 +112,7 @@ function dispatch(t: TaskView, action: ActionId): void | Promise<void> {
   }
 }
 
-function ActionButton({ t, def }: { t: TaskView; def: ActionDef }) {
+function ActionButton({ t, def }: { t: PlanView; def: ActionDef }) {
   const onClick = async (e: MouseEvent) => {
     const btn = e.currentTarget as HTMLButtonElement;
     if (btn.disabled) return;
@@ -136,7 +136,7 @@ function ActionButton({ t, def }: { t: TaskView; def: ActionDef }) {
   );
 }
 
-export function DetailHead({ t }: { t: TaskView }) {
+export function DetailHead({ t }: { t: PlanView }) {
   const acts = actionsFor(t);
   return (
     <div class="detail-head" id="detail-head">

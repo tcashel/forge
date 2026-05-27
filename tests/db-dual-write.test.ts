@@ -11,13 +11,13 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { recordPlanCreated, recordPlanVersionAdded } from "../src/core/db/writes.ts";
-import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
+import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 function tmpForgeDir(): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), "forge-dual-"));
 }
 
-function makeTask(overrides: Partial<TaskRecord> = {}): TaskRecord {
+function makeTask(overrides: Partial<Plan> = {}): Plan {
   return {
     id: "task-dw-1",
     title: "Dual write smoke",
@@ -104,9 +104,9 @@ test("recordPlanVersionAdded advances plans.current_version_id and tasks.plan_ve
 });
 
 test("recordPlanVersionAdded self-heals when plan + synthetic task don't exist yet", () => {
-  // Models the case where a task pre-dates dual-write: only TaskRecord on
+  // Models the case where a task pre-dates dual-write: only Plan on
   // disk, no plan rows in DB. The improver should still succeed and the
-  // helper should backfill the missing rows from the TaskRecord.
+  // helper should backfill the missing rows from the Plan.
   const forgeDir = tmpForgeDir();
   try {
     const store = new ForgeStore({ forgeDir });

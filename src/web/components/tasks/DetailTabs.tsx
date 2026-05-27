@@ -1,5 +1,5 @@
 import { currentTab } from "../../signals/tasks";
-import type { TabId, TaskView } from "../../types";
+import type { PlanView, TabId } from "../../types";
 
 interface TabDef {
   id: TabId;
@@ -9,7 +9,7 @@ interface TabDef {
   badgeText?: string;
 }
 
-function tabsFor(t: TaskView): TabDef[] {
+function tabsFor(t: PlanView): TabDef[] {
   const isRun = t.section === "running";
   return [
     {
@@ -30,7 +30,7 @@ function tabsFor(t: TaskView): TabDef[] {
   ];
 }
 
-export function DetailTabs({ t }: { t: TaskView }) {
+export function DetailTabs({ t }: { t: PlanView }) {
   const active = currentTab.value;
   return (
     <nav class="tabs" id="detail-tabs">

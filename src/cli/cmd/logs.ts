@@ -36,7 +36,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     throw new CliError("MISSING_ARG", "Usage: forge logs <task-id>", { exitCode: 1 });
   }
 
-  const task = store.getTask(id);
+  const task = store.getPlan(id);
   if (!task) {
     throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
   }

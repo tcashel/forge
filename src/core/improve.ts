@@ -4,8 +4,8 @@
  * Runs the two-critic + synthesizer pipeline synchronously, then asks the
  * `forge-spec-improver` skill to apply the actionable findings to the spec
  * body. The original spec is preserved under
- * ~/.forge/critiques/<taskId>/<critiqueId>/spec-original.md so users can
- * diff before/after with `forge spec diff <taskId>`.
+ * ~/.forge/critiques/<planId>/<critiqueId>/spec-original.md so users can
+ * diff before/after with `forge spec diff <planId>`.
  */
 
 import { execSync } from "node:child_process";
@@ -21,7 +21,7 @@ import type { ForgeStore } from "./store.js";
 // ─── Types ────────────────────────────────────────────────────────────────────
 
 export interface ImproveConfig {
-  taskId: string;
+  planId: string;
   repoRoot: string;
   repoName: string;
   specTitle: string;
@@ -340,11 +340,11 @@ export async function runImprover(
 
   // ── Step 1: Allocate critique dir ────────────────────────────────────────
   const critiqueId = store.generateCritiqueId();
-  const critiqueDir = store.getCritiqueDir(config.taskId, critiqueId);
+  const critiqueDir = store.getCritiqueDir(config.planId, critiqueId);
   fs.mkdirSync(critiqueDir, { recursive: true });
 
   // ── Step 2: Snapshot the live spec (with frontmatter) ────────────────────
-  const liveSpec = store.getSpec(config.taskId);
+  const liveSpec = store.getSpec(config.planId);
   if (liveSpec === null) {
     return { critiqueId, applied: false, changeCount: 0, mode: "skipped", error: "IMPROVE_FAILED: spec missing" };
   }
@@ -354,7 +354,7 @@ export async function runImprover(
   const critiqueRunner = overrides.runCritiqueSync ?? runCritiqueSync;
   const critiqueResult = await critiqueRunner(
     {
-      taskId: config.taskId,
+      planId: config.planId,
       critiqueId,
       specBody: config.specBody,
       specTitle: config.specTitle,
@@ -398,7 +398,7 @@ export async function runImprover(
   // ── Step 5: No-op short-circuit ─────────────────────────────────────────
   if (changeCount === 0) {
     atomicWriteText(path.join(critiqueDir, "change-summary.md"), "no-op\n");
-    store.markCritiqueViewed(config.taskId, critiqueId);
+    store.markCritiqueViewed(config.planId, critiqueId);
     return { critiqueId, applied: false, changeCount: 0, mode: "no-op", error: null };
   }
 
@@ -473,8 +473,8 @@ export async function runImprover(
   atomicWriteText(path.join(critiqueDir, "spec-improved.md"), `${parsed.improvedSpec}\n`);
   atomicWriteText(path.join(critiqueDir, "change-summary.md"), `${parsed.changeSummary}\n`);
 
-  // ── Step 11: Rewrite the live spec on disk + bump TaskRecord ────────────
-  const task = store.getTask(config.taskId);
+  // ── Step 11: Rewrite the live spec on disk + bump Plan ────────────
+  const task = store.getPlan(config.planId);
   if (!task) {
     return {
       critiqueId,
@@ -491,13 +491,13 @@ export async function runImprover(
     improvedAt: improvedAtIso,
     critiqueId,
   });
-  store.writeSpec(config.taskId, newFullSpec);
+  store.writeSpec(config.planId, newFullSpec);
   const updatedTask = { ...task, specVersion: nextSpecVersion };
-  store.upsertTask(updatedTask);
+  store.upsertPlan(updatedTask);
   recordPlanVersionAdded(store.db.db, updatedTask, nextSpecVersion, newFullSpec);
 
   // ── Step 12: Mark the critique viewed ───────────────────────────────────
-  store.markCritiqueViewed(config.taskId, critiqueId);
+  store.markCritiqueViewed(config.planId, critiqueId);
 
   return { critiqueId, applied: true, changeCount, mode: "applied", error: null };
 }

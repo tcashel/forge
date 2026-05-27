@@ -51,7 +51,7 @@ async function main() {
   const runDir = path.join(tmpBase, "run");
   const argsFile = path.join(tmpBase, "args.json");
   const args = {
-    taskId: "smoke-test",
+    planId: "smoke-test",
     runDir,
     promptFile,
     worktreePath: tmpBase,

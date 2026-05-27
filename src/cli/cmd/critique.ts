@@ -86,14 +86,14 @@ export interface CritiqueAgentOverride {
 }
 
 export interface DoCritiqueOpts {
-  taskId: string;
+  planId: string;
   criticA?: CritiqueAgentOverride;
   criticB?: CritiqueAgentOverride;
   synth?: CritiqueAgentOverride;
 }
 
 export interface DoCritiqueResult {
-  taskId: string;
+  planId: string;
   critiqueId: string;
   tmuxSession: string;
   critiqueDir: string;
@@ -105,12 +105,12 @@ export interface DoCritiqueResult {
  * both the CLI shell and the HTTP server. Throws CliError on failure.
  */
 export async function doCritique(opts: DoCritiqueOpts, store: ForgeStore): Promise<DoCritiqueResult> {
-  const task = store.getTask(opts.taskId);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.taskId}".`, { exitCode: 1 });
+  const task = store.getPlan(opts.planId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.planId}".`, { exitCode: 1 });
   if (task.status !== "draft") {
     throw new CliError(
       "BAD_STATE",
-      `Task ${opts.taskId} is in state "${task.status}" — critique only runs on draft specs.`,
+      `Task ${opts.planId} is in state "${task.status}" — critique only runs on draft specs.`,
       { exitCode: 1 },
     );
   }
@@ -157,7 +157,7 @@ export async function doCritique(opts: DoCritiqueOpts, store: ForgeStore): Promi
 
   const result = await launchCritique(
     {
-      taskId: task.id,
+      planId: task.id,
       critiqueId,
       specBody,
       specTitle: task.title,
@@ -174,7 +174,7 @@ export async function doCritique(opts: DoCritiqueOpts, store: ForgeStore): Promi
   if (result.error) throw new CliError("CRITIQUE_FAIL", `Critique launch failed: ${result.error}`, { exitCode: 3 });
 
   return {
-    taskId: task.id,
+    planId: task.id,
     critiqueId,
     tmuxSession: result.tmuxSession,
     critiqueDir: store.getCritiqueDir(task.id, critiqueId),
@@ -206,7 +206,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
   const result = await doCritique(
     {
-      taskId: id,
+      planId: id,
       criticA: {
         agent: values["critic-a-agent"] as LaunchTarget | undefined,
         model: values["critic-a-model"] as string | undefined,

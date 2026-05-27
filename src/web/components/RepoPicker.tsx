@@ -53,7 +53,7 @@ export function RepoPicker() {
 
   const list = repos.value;
   const sel = selectedRepo.value;
-  const totalTaskCount = list.reduce((acc, r) => acc + (r.taskCount || 0), 0);
+  const totalTaskCount = list.reduce((acc, r) => acc + (r.planCount || 0), 0);
   const active = list.filter((r) => !r.stale);
   const stale = list.filter((r) => r.stale && r.registered);
   const f = filter.toLowerCase().trim();
@@ -177,7 +177,7 @@ export function RepoPicker() {
                     {r.current ? " · current" : ""}
                   </span>
                   <span class="branch-mini">{r.branch || ""}</span>
-                  <span class="repo-count">{r.taskCount}</span>
+                  <span class="repo-count">{r.planCount}</span>
                   <span class="check">✓</span>
                 </button>
               ))}
@@ -199,7 +199,7 @@ export function RepoPicker() {
                       <span class="repo-name">{r.name}</span>
                       <span class="branch-mini">{r.branch || ""}</span>
                       <span class="repo-state">stale</span>
-                      <span class="repo-count">{r.taskCount}</span>
+                      <span class="repo-count">{r.planCount}</span>
                       <span class="check">✓</span>
                     </button>
                   ))}

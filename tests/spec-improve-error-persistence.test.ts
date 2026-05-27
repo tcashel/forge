@@ -5,7 +5,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { persistImproveOutcome } from "../src/cli/cmd/spec.ts";
 import type { ImproveResult } from "../src/core/improve.ts";
-import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
+import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 function withTmpHome(t: { after: (fn: () => void) => void }): ForgeStore {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "forge-improve-persist-"));
@@ -19,8 +19,8 @@ function withTmpHome(t: { after: (fn: () => void) => void }): ForgeStore {
   return new ForgeStore();
 }
 
-function seedDraft(store: ForgeStore, id: string, lastImproveError: TaskRecord["lastImproveError"] = null): TaskRecord {
-  const task: TaskRecord = {
+function seedDraft(store: ForgeStore, id: string, lastImproveError: Plan["lastImproveError"] = null): Plan {
+  const task: Plan = {
     id,
     title: id,
     repoRoot: "/tmp/repo",
@@ -42,7 +42,7 @@ function seedDraft(store: ForgeStore, id: string, lastImproveError: TaskRecord["
     specVersion: 1,
     lastImproveError,
   };
-  store.upsertTask(task);
+  store.upsertPlan(task);
   return task;
 }
 
@@ -76,7 +76,7 @@ test("persistImproveOutcome stores the error string + mode + timestamp on skippe
 
   persistImproveOutcome("task-skip", SKIPPED_RESULT, store);
 
-  const after = store.getTask("task-skip");
+  const after = store.getPlan("task-skip");
   assert.ok(after?.lastImproveError, "lastImproveError should be set");
   assert.equal(after.lastImproveError?.mode, "skipped");
   assert.equal(after.lastImproveError?.error, SKIPPED_RESULT.error);
@@ -93,7 +93,7 @@ test("persistImproveOutcome clears prior error on applied", (t) => {
 
   persistImproveOutcome("task-clear", APPLIED_RESULT, store);
 
-  const after = store.getTask("task-clear");
+  const after = store.getPlan("task-clear");
   assert.equal(after?.lastImproveError, null, "applied result must clear prior error");
 });
 
@@ -107,7 +107,7 @@ test("persistImproveOutcome clears prior error on no-op", (t) => {
 
   persistImproveOutcome("task-noop", NOOP_RESULT, store);
 
-  const after = store.getTask("task-noop");
+  const after = store.getPlan("task-noop");
   assert.equal(after?.lastImproveError, null, "no-op without error must clear prior error");
 });
 
@@ -115,7 +115,7 @@ test("persistImproveOutcome is a no-op when the task is missing", (t) => {
   const store = withTmpHome(t);
   // No task created — should not throw and should not invent a record.
   persistImproveOutcome("never-existed", SKIPPED_RESULT, store);
-  assert.equal(store.getTask("never-existed"), null);
+  assert.equal(store.getPlan("never-existed"), null);
 });
 
 test("persistImproveOutcome refreshes `at` when the same error repeats", (t) => {
@@ -133,7 +133,7 @@ test("persistImproveOutcome refreshes `at` when the same error repeats", (t) => 
 
   persistImproveOutcome("task-stable", SKIPPED_RESULT, store);
 
-  const after = store.getTask("task-stable");
+  const after = store.getPlan("task-stable");
   assert.notEqual(after?.lastImproveError?.at, original.lastImproveError?.at);
   assert.equal(after?.lastImproveError?.error, SKIPPED_RESULT.error);
   assert.match(after?.lastImproveError?.at ?? "", /^\d{4}-\d{2}-\d{2}T/);
@@ -148,22 +148,22 @@ test("persistImproveOutcome is a no-op when both prior and new are clean (null �
 
   persistImproveOutcome("task-clean", APPLIED_RESULT, store);
 
-  const after = store.getTask("task-clean");
+  const after = store.getPlan("task-clean");
   assert.equal(after?.lastImproveError, null);
-  // createdAt is a proxy for "record untouched" — if upsertTask had run,
+  // createdAt is a proxy for "record untouched" — if upsertPlan had run,
   // nothing else would change but we'd still see the upsert as a fresh
   // write. Assert the record is identical instead.
   assert.equal(after?.createdAt, createdAt);
 });
 
-test("TaskRecord.lastImproveError survives a fresh ForgeStore load (load-time default + persistence)", (t) => {
+test("Plan.lastImproveError survives a fresh ForgeStore load (load-time default + persistence)", (t) => {
   const store = withTmpHome(t);
   seedDraft(store, "task-roundtrip");
   persistImproveOutcome("task-roundtrip", SKIPPED_RESULT, store);
 
   // New store instance reading the same forge dir on disk.
   const reopened = new ForgeStore({ forgeDir: store.forgeDir });
-  const task = reopened.getTask("task-roundtrip");
+  const task = reopened.getPlan("task-roundtrip");
   assert.equal(task?.lastImproveError?.error, SKIPPED_RESULT.error);
   assert.equal(task?.lastImproveError?.mode, "skipped");
 });

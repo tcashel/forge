@@ -1,7 +1,7 @@
 // Thin API wrapper. Server returns `{ ok, data, error }` envelopes; legacy
 // callers throw with `code` / `hint` populated on failures, and we keep
 // that contract so existing toast logic still surfaces backend hints.
-import type { TaskView } from "../types";
+import type { PlanView } from "../types";
 
 export class ApiError extends Error {
   code: string;
@@ -48,11 +48,11 @@ export async function apiPost<T = unknown>(path: string, body?: unknown): Promis
   return readEnvelope<T>(res, path);
 }
 
-export interface TasksResponse {
-  tasks: TaskView[];
+export interface PlansResponse {
+  plans: PlanView[];
 }
 
-export function getTasks(repo?: string): Promise<TasksResponse> {
+export function getPlans(repo?: string): Promise<PlansResponse> {
   const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
-  return apiGet<TasksResponse>(`/api/tasks${q}`);
+  return apiGet<PlansResponse>(`/api/plans${q}`);
 }

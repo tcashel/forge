@@ -7,7 +7,7 @@ import { LogTab } from "./tabs/LogTab";
 import { PlanTab } from "./tabs/PlanTab";
 import { SpecTab } from "./tabs/SpecTab";
 
-export function TaskDetail() {
+export function PlanDetail() {
   const t = currentTask.value;
   if (!t) {
     return (

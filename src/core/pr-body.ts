@@ -26,7 +26,7 @@ import type { LaunchTarget } from "./store.js";
 // ─── Public types ─────────────────────────────────────────────────────────────
 
 export interface PrBodyInput {
-  taskId: string;
+  planId: string;
   specBody: string;
   branch: string;
   baseRef: string;
@@ -196,7 +196,7 @@ function renderForgeRunDetails(input: PrBodyInput, strippedSpec: string): string
 
   // Always include the forge meta line so the run is traceable, even when
   // nothing else surfaced (e.g. zero commits captured for some reason).
-  const metaLine = `forge: \`${input.taskId}\` · \`${input.agent}\` / \`${input.model}\``;
+  const metaLine = `forge: \`${input.planId}\` · \`${input.agent}\` / \`${input.model}\``;
   parts.push(metaLine);
 
   if (parts.length === 1 && !strippedSpec && input.commits.length === 0 && input.qualityResults.length === 0) {

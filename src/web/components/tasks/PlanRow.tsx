@@ -1,7 +1,7 @@
 import { statClass } from "../../lib/format";
 import { currentTaskId, selectTask } from "../../signals/tasks";
 import { selectedRepo } from "../../signals/ui";
-import type { TaskView } from "../../types";
+import type { PlanView } from "../../types";
 
 interface MetaItem {
   key: string;
@@ -11,7 +11,7 @@ interface MetaItem {
   text?: string;
 }
 
-function buildMeta(t: TaskView, hideRepo: boolean): MetaItem[] {
+function buildMeta(t: PlanView, hideRepo: boolean): MetaItem[] {
   const items: MetaItem[] = [];
   if (!hideRepo) items.push({ key: "repo", repo: t.repo });
   if (t.repoStale) items.push({ key: "stale", cls: "err", text: "stale repo" });
@@ -24,7 +24,7 @@ function buildMeta(t: TaskView, hideRepo: boolean): MetaItem[] {
   return items;
 }
 
-export function TaskRow({ t }: { t: TaskView }) {
+export function PlanRow({ t }: { t: PlanView }) {
   const cls = statClass(t);
   const selected = currentTaskId.value === t.id;
   const items = buildMeta(t, !!selectedRepo.value);

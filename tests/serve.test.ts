@@ -56,7 +56,7 @@ async function bootServer(
 interface Envelope {
   ok: boolean;
   data?: {
-    tasks?: TaskView[];
+    plans?: PlanView[];
     repos?: RepoView[];
     repo?: RepoView;
     registeredRepos?: RepoView[];
@@ -64,7 +64,7 @@ interface Envelope {
     prs?: GhPr[];
     me?: string;
     repoRoot?: string | null;
-    task?: TaskView;
+    task?: PlanView;
     body?: string;
     ok?: boolean;
     version?: string;
@@ -73,7 +73,7 @@ interface Envelope {
   error?: { code: string; message: string; hint?: string };
 }
 
-interface TaskView {
+interface PlanView {
   id: string;
   title: string;
   section: string;
@@ -88,7 +88,7 @@ interface TaskView {
 interface RepoView {
   name: string;
   root: string;
-  taskCount: number;
+  planCount: number;
   current?: boolean;
   registered?: boolean;
   reachable?: boolean;
@@ -113,7 +113,7 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, repoName
   const now = new Date().toISOString();
   const specBody = `# ${title}\n\nA short blurb describing the work.\n\n## Acceptance criteria\n\n- it does the thing\n`;
   const specPath = store.writeSpec(id, specBody);
-  store.upsertTask({
+  store.upsertPlan({
     id,
     title,
     repoRoot,
@@ -164,6 +164,20 @@ function makeGitRepo(prefix: string): string {
   return repo;
 }
 
+test("legacy /api/tasks/* redirects to /api/plans/* with 308 (Phase 3.5 alias)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // 308 preserves method + body across the redirect, so POST/DELETE keep working.
+  const res = await fetch(`${h.baseUrl}/api/tasks/some-id/spec`, { redirect: "manual" });
+  assert.equal(res.status, 308);
+  assert.equal(res.headers.get("location"), "/api/plans/some-id/spec");
+
+  // Query strings ride through.
+  const res2 = await fetch(`${h.baseUrl}/api/tasks?repo=foo`, { redirect: "manual" });
+  assert.equal(res2.status, 308);
+  assert.equal(res2.headers.get("location"), "/api/plans?repo=foo");
+});
+
 test("GET /api/health returns ok", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
@@ -187,13 +201,13 @@ test("GET / returns the workbench HTML", async (t) => {
   assert.doesNotMatch(html, /\/app\.js/);
 });
 
-test("empty index → /api/tasks returns []", async (t) => {
+test("empty index → /api/plans returns []", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await getJson(`${h.baseUrl}/api/tasks`);
+  const { status, body } = await getJson(`${h.baseUrl}/api/plans`);
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.deepEqual(body.data!.tasks, []);
+  assert.deepEqual(body.data!.plans, []);
 });
 
 test("empty index → /api/repos still exposes the current repo context", async (t) => {
@@ -258,14 +272,14 @@ test("POST /api/config rejects invalid values", async (t) => {
   assert.equal(body.error!.code, "BAD_VALUE");
 });
 
-test("single draft → /api/tasks enriches with section + statLabel + blurb", async (t) => {
+test("single draft → /api/plans enriches with section + statLabel + blurb", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-foo", h.tmpHome, "demo", "feat(demo): add the thing");
-  const { body } = await getJson(`${h.baseUrl}/api/tasks`);
+  const { body } = await getJson(`${h.baseUrl}/api/plans`);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.tasks.length, 1);
-  const task = body.data!.tasks[0];
+  assert.equal(body.data!.plans.length, 1);
+  const task = body.data!.plans[0];
   assert.equal(task.id, "draft-foo");
   assert.equal(task.title, "feat(demo): add the thing");
   assert.equal(task.section, "drafting");
@@ -274,21 +288,21 @@ test("single draft → /api/tasks enriches with section + statLabel + blurb", as
   assert.equal(task.repo, "demo");
 });
 
-test("single draft → /api/tasks/:id returns full record", async (t) => {
+test("single draft → /api/plans/:id returns full record", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-bar", h.tmpHome, "demo", "feat(demo): bar");
-  const { body } = await getJson(`${h.baseUrl}/api/tasks/draft-bar`);
+  const { body } = await getJson(`${h.baseUrl}/api/plans/draft-bar`);
   assert.equal(body.ok, true);
   assert.equal(body.data!.task.id, "draft-bar");
   assert.equal(body.data!.task.section, "drafting");
 });
 
-test("/api/tasks/:id/spec returns markdown body", async (t) => {
+test("/api/plans/:id/spec returns markdown body", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-spec", h.tmpHome, "demo", "feat(demo): spec");
-  const { body } = await getJson(`${h.baseUrl}/api/tasks/draft-spec/spec`);
+  const { body } = await getJson(`${h.baseUrl}/api/plans/draft-spec/spec`);
   assert.equal(body.ok, true);
   assert.match(body.data!.body, /^# feat\(demo\): spec/);
 });
@@ -296,7 +310,7 @@ test("/api/tasks/:id/spec returns markdown body", async (t) => {
 test("unknown task id → 404 envelope", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await getJson(`${h.baseUrl}/api/tasks/nope`);
+  const { status, body } = await getJson(`${h.baseUrl}/api/plans/nope`);
   assert.equal(status, 404);
   assert.equal(body.ok, false);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
@@ -307,10 +321,10 @@ test("repo filter returns only the requested repo's tasks", async (t) => {
   t.after(() => h.stop());
   makeDraftTask(h.store, "draft-a", "/repo-a", "alpha", "feat(alpha): a");
   makeDraftTask(h.store, "draft-b", "/repo-b", "beta", "feat(beta): b");
-  const { body } = await getJson(`${h.baseUrl}/api/tasks?repo=alpha`);
+  const { body } = await getJson(`${h.baseUrl}/api/plans?repo=alpha`);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.tasks.length, 1);
-  assert.equal(body.data!.tasks[0].repo, "alpha");
+  assert.equal(body.data!.plans.length, 1);
+  assert.equal(body.data!.plans[0].repo, "alpha");
 });
 
 test("/api/repos groups by repoRoot with a task count", async (t) => {
@@ -322,8 +336,8 @@ test("/api/repos groups by repoRoot with a task count", async (t) => {
   const { body } = await getJson(`${h.baseUrl}/api/repos`);
   assert.equal(body.ok, true);
   const byName = new Map((body.data!.repos ?? []).map((r) => [r.name, r] as const));
-  assert.equal(byName.get("alpha")!.taskCount, 2);
-  assert.equal(byName.get("beta")!.taskCount, 1);
+  assert.equal(byName.get("alpha")!.planCount, 2);
+  assert.equal(byName.get("beta")!.planCount, 1);
 });
 
 test("POST /api/repos registers a git repo with no tasks", async (t) => {
@@ -339,7 +353,7 @@ test("POST /api/repos registers a git repo with no tasks", async (t) => {
   const after = await getJson(`${h.baseUrl}/api/repos`);
   const registered = after.body.data!.repos!.find((r) => r.root === repo);
   assert.ok(registered, "registered repo should be listed");
-  assert.equal(registered.taskCount, 0);
+  assert.equal(registered.planCount, 0);
   assert.equal(registered.registered, true);
   assert.equal(registered.stale, false);
 });
@@ -440,7 +454,7 @@ test("GET /api/prs prefers reachable current repo over stale same-name task repo
   assert.equal(seenCwd, process.cwd());
 });
 
-test("missing task repoRoot is marked stale in /api/repos and /api/tasks", async (t) => {
+test("missing task repoRoot is marked stale in /api/repos and /api/plans", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const missing = path.join(h.tmpHome, "missing-repo");
@@ -453,8 +467,8 @@ test("missing task repoRoot is marked stale in /api/repos and /api/tasks", async
   assert.equal(staleRepo!.hasGit, false);
   assert.equal(staleRepo!.stale, true);
 
-  const tasks = await getJson(`${h.baseUrl}/api/tasks`);
-  const task = tasks.body.data!.tasks!.find((x) => x.id === "stale-repo-task");
+  const tasks = await getJson(`${h.baseUrl}/api/plans`);
+  const task = tasks.body.data!.plans!.find((x) => x.id === "stale-repo-task");
   assert.equal(task!.repoStale, true);
 });
 
@@ -464,7 +478,7 @@ test("running task surfaces section=running + log file path", async (t) => {
   // Seed a running task by hand.
   const id = "run-baz";
   const now = new Date().toISOString();
-  h.store.upsertTask({
+  h.store.upsertPlan({
     id,
     title: "feat(demo): running",
     repoRoot: h.tmpHome,
@@ -490,8 +504,8 @@ test("running task surfaces section=running + log file path", async (t) => {
   fs.mkdirSync(path.join(h.store.runsDir, id), { recursive: true });
   fs.writeFileSync(h.store.getLogFile(id), "[12:00:00] starting up\n[12:00:01] working\n");
 
-  const { body } = await getJson(`${h.baseUrl}/api/tasks`);
-  const task = (body.data!.tasks ?? []).find((x) => x.id === id);
+  const { body } = await getJson(`${h.baseUrl}/api/plans`);
+  const task = (body.data!.plans ?? []).find((x) => x.id === id);
   assert.ok(task, "task should be in the list");
   assert.equal(task.section, "running");
   assert.equal(task.hasLog, true);
@@ -521,7 +535,7 @@ test("path traversal under / is blocked", async (t) => {
 test("POST is rejected on read endpoints", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const res = await fetch(`${h.baseUrl}/api/tasks`, { method: "POST" });
+  const res = await fetch(`${h.baseUrl}/api/plans`, { method: "POST" });
   assert.equal(res.status, 405);
   const body = (await res.json()) as Envelope;
   assert.equal(body.error!.code, "METHOD_NOT_ALLOWED");
@@ -589,36 +603,36 @@ test("POST /api/specs rejects non-git repoRoot", async (t) => {
   assert.equal(body.error!.code, "NOT_A_REPO");
 });
 
-test("POST /api/tasks/:id/launch returns 404 for unknown task", async (t) => {
+test("POST /api/plans/:id/launch returns 404 for unknown task", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/launch`, {});
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/nope/launch`, {});
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
-test("POST /api/tasks/:id/critique returns 404 for unknown task", async (t) => {
+test("POST /api/plans/:id/critique returns 404 for unknown task", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/critique`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/nope/critique`);
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
-test("POST /api/tasks/:id/improve returns 404 for unknown task", async (t) => {
+test("POST /api/plans/:id/improve returns 404 for unknown task", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nope/improve`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/nope/improve`);
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
-test("POST /api/tasks/:id/improve queues a draft task (returns immediately, no event-loop block)", async (t) => {
+test("POST /api/plans/:id/improve queues a draft task (returns immediately, no event-loop block)", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "improve-queue", h.tmpHome, "demo", "feat(demo): improvable");
   const start = Date.now();
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/improve-queue/improve`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/improve-queue/improve`);
   const elapsed = Date.now() - start;
   assert.equal(status, 200);
   assert.equal(body.ok, true);
@@ -635,15 +649,15 @@ test("startServer reaps stale critique-meta on boot", async (t) => {
   const store = new ForgeStore({ forgeDir });
   // Seed a critique-meta in `running_critics` with a startedAt 30 minutes ago.
   // We expect the reaper at startServer to mark it failed.
-  const taskId = "reap-target";
-  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): reap me");
+  const planId = "reap-target";
+  makeDraftTask(store, planId, tmpHome, "demo", "feat(demo): reap me");
   const critiqueId = "crit-stale-001";
-  const dir = store.getCritiqueDir(taskId, critiqueId);
+  const dir = store.getCritiqueDir(planId, critiqueId);
   fs.mkdirSync(dir, { recursive: true });
   const oldStartedAt = new Date(Date.now() - 30 * 60_000).toISOString();
-  store.writeCritiqueMeta(taskId, critiqueId, {
+  store.writeCritiqueMeta(planId, critiqueId, {
     schemaVersion: 1,
-    taskId,
+    planId,
     critiqueId,
     specTitle: "feat(demo): reap me",
     repoRoot: tmpHome,
@@ -676,7 +690,7 @@ test("startServer reaps stale critique-meta on boot", async (t) => {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  const meta = store.readCritiqueMeta(planId, critiqueId);
   assert.equal(meta!.status, "failed");
   assert.ok(meta!.completedAt, "reaped record should have a completedAt");
 });
@@ -685,16 +699,16 @@ test("startServer leaves recent critique-meta alone (under stale threshold)", as
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-reap-recent-"));
   const forgeDir = path.join(tmpHome, ".forge");
   const store = new ForgeStore({ forgeDir });
-  const taskId = "recent-improving";
-  makeDraftTask(store, taskId, tmpHome, "demo", "feat(demo): recent");
+  const planId = "recent-improving";
+  makeDraftTask(store, planId, tmpHome, "demo", "feat(demo): recent");
   const critiqueId = "crit-recent-001";
-  const dir = store.getCritiqueDir(taskId, critiqueId);
+  const dir = store.getCritiqueDir(planId, critiqueId);
   fs.mkdirSync(dir, { recursive: true });
   // 30 seconds ago — well under the 10-minute stale threshold.
   const recentStartedAt = new Date(Date.now() - 30_000).toISOString();
-  store.writeCritiqueMeta(taskId, critiqueId, {
+  store.writeCritiqueMeta(planId, critiqueId, {
     schemaVersion: 1,
-    taskId,
+    planId,
     critiqueId,
     specTitle: "feat(demo): recent",
     repoRoot: tmpHome,
@@ -727,25 +741,25 @@ test("startServer leaves recent critique-meta alone (under stale threshold)", as
     fs.rmSync(tmpHome, { recursive: true, force: true });
   });
 
-  const meta = store.readCritiqueMeta(taskId, critiqueId);
+  const meta = store.readCritiqueMeta(planId, critiqueId);
   assert.equal(meta!.status, "running_critics", "recent record must not be reaped");
 });
 
-test("POST /api/tasks/:id/resume returns 501", async (t) => {
+test("POST /api/plans/:id/resume returns 501", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/anything/resume`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/anything/resume`);
   assert.equal(status, 501);
   assert.equal(body.error!.code, "NOT_IMPLEMENTED");
 });
 
-test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta", async (t) => {
+test("POST /api/plans/:id/kill flips status, merges errorMessage into run-meta", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
 
   const id = "kill-target";
   const now = new Date().toISOString();
-  h.store.upsertTask({
+  h.store.upsertPlan({
     id,
     title: "feat(demo): killable",
     repoRoot: h.tmpHome,
@@ -773,7 +787,7 @@ test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta",
   // Seed run-meta with an unrelated key so we can assert merge (not overwrite).
   fs.mkdirSync(path.join(h.store.runsDir, id), { recursive: true });
   h.store.writeRunMeta(id, {
-    taskId: id,
+    planId: id,
     tmuxSession: "forge-noop-12345",
     logFile: "/tmp/x.log",
     agent: "claude",
@@ -785,33 +799,33 @@ test("POST /api/tasks/:id/kill flips status, merges errorMessage into run-meta",
     qualityResults: [{ command: "lint", ok: true, durationMs: 10 }],
   });
 
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/kill`);
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.data!.killed, true);
 
-  const task = h.store.getTask(id);
+  const task = h.store.getPlan(id);
   assert.equal(task!.status, "failed");
   const meta = h.store.readRunMeta(id);
   assert.equal(meta!.errorMessage, "Killed by user");
   assert.deepEqual(meta!.qualityResults, [{ command: "lint", ok: true, durationMs: 10 }]);
 });
 
-test("POST /api/tasks/:id/kill rejects draft (non-running) tasks with 409", async (t) => {
+test("POST /api/plans/:id/kill rejects draft (non-running) tasks with 409", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "nokill-draft", h.tmpHome, "demo", "feat(demo): draft");
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/nokill-draft/kill`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/nokill-draft/kill`);
   assert.equal(status, 409);
   assert.equal(body.error!.code, "BAD_STATE");
 });
 
-test("POST /api/tasks/:id/kill rejects already-done tasks (no state corruption)", async (t) => {
+test("POST /api/plans/:id/kill rejects already-done tasks (no state corruption)", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const id = "done-task";
   const now = new Date().toISOString();
-  h.store.upsertTask({
+  h.store.upsertPlan({
     id,
     title: "feat(demo): merged",
     repoRoot: h.tmpHome,
@@ -833,11 +847,11 @@ test("POST /api/tasks/:id/kill rejects already-done tasks (no state corruption)"
     specVersion: 1,
     lastImproveError: null,
   });
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/kill`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/kill`);
   assert.equal(status, 409);
   assert.equal(body.error!.code, "BAD_STATE");
   // Status must still be "done" — kill should not have touched it.
-  assert.equal(h.store.getTask(id)!.status, "done");
+  assert.equal(h.store.getPlan(id)!.status, "done");
 });
 
 test("POST /api/specs rejects invalid agent value", async (t) => {
@@ -853,12 +867,12 @@ test("POST /api/specs rejects invalid agent value", async (t) => {
   assert.match(body.error!.message, /agent/);
 });
 
-test("POST /api/tasks/:id/improve rejects non-draft tasks with 409", async (t) => {
+test("POST /api/plans/:id/improve rejects non-draft tasks with 409", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const id = "improve-running";
   const now = new Date().toISOString();
-  h.store.upsertTask({
+  h.store.upsertPlan({
     id,
     title: "feat(demo): improving running",
     repoRoot: h.tmpHome,
@@ -880,17 +894,17 @@ test("POST /api/tasks/:id/improve rejects non-draft tasks with 409", async (t) =
     specVersion: 1,
     lastImproveError: null,
   });
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/improve`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/improve`);
   assert.equal(status, 409);
   assert.equal(body.error!.code, "BAD_STATE");
 });
 
-test("POST /api/tasks/:id/critique rejects non-draft tasks with 409", async (t) => {
+test("POST /api/plans/:id/critique rejects non-draft tasks with 409", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const id = "critique-done";
   const now = new Date().toISOString();
-  h.store.upsertTask({
+  h.store.upsertPlan({
     id,
     title: "feat(demo): critique on done",
     repoRoot: h.tmpHome,
@@ -912,7 +926,7 @@ test("POST /api/tasks/:id/critique rejects non-draft tasks with 409", async (t) 
     specVersion: 1,
     lastImproveError: null,
   });
-  const { status, body } = await postJson(`${h.baseUrl}/api/tasks/${id}/critique`);
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/critique`);
   assert.equal(status, 409);
   assert.equal(body.error!.code, "BAD_STATE");
 });

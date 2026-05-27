@@ -18,7 +18,7 @@ const STRUCTURED_AGENT_SUMMARY = `## Summary
 
 function baseInput(overrides?: Partial<PrBodyInput>): PrBodyInput {
   return {
-    taskId: "task-abc123",
+    planId: "task-abc123",
     specBody: `---
 id: task-abc123
 repo: /tmp/repo

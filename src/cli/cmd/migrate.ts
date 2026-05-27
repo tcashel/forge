@@ -1,7 +1,7 @@
 /**
  * forge migrate — one-time backfill from ~/.forge/ JSON into forge.db.
  *
- * Phase 2 of the SQLite cutover (COO-84). Reads every TaskRecord, spec
+ * Phase 2 of the SQLite cutover (COO-84). Reads every Plan, spec
  * markdown, critique-meta.json, and run meta.json under ~/.forge/, then
  * inserts the corresponding rows into the SCHEMA.md tables.
  *

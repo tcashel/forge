@@ -13,7 +13,7 @@ import { ForgeDb } from "./db/connection.ts";
 import { syncJobState } from "./db/writes.ts";
 import { withFileLock } from "./file-lock.js";
 
-export type TaskStatus =
+export type PlanStatus =
   | "draft"
   | "running"
   | "quality_check"
@@ -25,14 +25,14 @@ export type TaskStatus =
 
 export type LaunchTarget = "claude" | "codex" | "opencode" | "gemini";
 
-export interface TaskRecord {
+export interface Plan {
   id: string;
   title: string;
   repoRoot: string;
   repoName: string;
   branch: string;
   worktree: string | null;
-  status: TaskStatus;
+  status: PlanStatus;
   agent: LaunchTarget | null;
   model: string | null;
   createdAt: string;
@@ -55,7 +55,7 @@ export interface TaskRecord {
 
 export interface ForgeIndex {
   version: 1;
-  tasks: Record<string, TaskRecord>;
+  plans: Record<string, Plan>;
 }
 
 /**
@@ -68,13 +68,13 @@ export type ReasoningEffort = "low" | "medium" | "high" | "xhigh";
 export type ReviewVerdict = "approve" | "request-changes" | "block";
 
 export interface RunMeta {
-  taskId: string;
+  planId: string;
   tmuxSession: string;
   logFile: string;
   agent: LaunchTarget;
   model: string;
   worktree: string;
-  status: TaskStatus | "reviewing";
+  status: PlanStatus | "reviewing";
   startedAt: string;
   prUrl: string | null;
   endedAt?: string;
@@ -154,7 +154,7 @@ export interface CritiqueAgentMeta {
 
 export interface CritiqueMeta {
   schemaVersion: 1;
-  taskId: string;
+  planId: string;
   critiqueId: string;
   specTitle: string;
   repoRoot: string;
@@ -266,20 +266,20 @@ export class ForgeStore {
   }
 
   readIndex(): ForgeIndex {
-    if (!fs.existsSync(this.indexFile)) return { version: 1, tasks: {} };
+    if (!fs.existsSync(this.indexFile)) return { version: 1, plans: {} };
     try {
       const index = JSON.parse(fs.readFileSync(this.indexFile, "utf-8")) as ForgeIndex;
-      for (const t of Object.values(index.tasks)) {
-        if (typeof (t as Partial<TaskRecord>).specVersion !== "number") {
-          (t as TaskRecord).specVersion = 1;
+      for (const p of Object.values(index.plans)) {
+        if (typeof (p as Partial<Plan>).specVersion !== "number") {
+          (p as Plan).specVersion = 1;
         }
-        if (!("lastImproveError" in t)) {
-          (t as TaskRecord).lastImproveError = null;
+        if (!("lastImproveError" in p)) {
+          (p as Plan).lastImproveError = null;
         }
       }
       return index;
     } catch {
-      return { version: 1, tasks: {} };
+      return { version: 1, plans: {} };
     }
   }
 
@@ -287,67 +287,67 @@ export class ForgeStore {
     atomicWriteJSON(this.indexFile, index);
   }
 
-  getTask(id: string): TaskRecord | null {
-    return this.readIndex().tasks[id] ?? null;
+  getPlan(id: string): Plan | null {
+    return this.readIndex().plans[id] ?? null;
   }
 
-  upsertTask(task: TaskRecord): void {
+  upsertPlan(plan: Plan): void {
     withFileLock(`${this.indexFile}.lock`, () => {
       const index = this.readIndex();
-      index.tasks[task.id] = task;
+      index.plans[plan.id] = plan;
       this.writeIndex(index);
     });
   }
 
-  getTasks(repoRoot?: string): TaskRecord[] {
-    const all = Object.values(this.readIndex().tasks);
-    const tasks = repoRoot ? all.filter((t) => t.repoRoot === repoRoot) : all;
-    return tasks.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+  getPlans(repoRoot?: string): Plan[] {
+    const all = Object.values(this.readIndex().plans);
+    const plans = repoRoot ? all.filter((p) => p.repoRoot === repoRoot) : all;
+    return plans.sort((a, b) => b.createdAt.localeCompare(a.createdAt));
   }
 
-  getRunningTasks(excludeRepo?: string): TaskRecord[] {
-    return Object.values(this.readIndex().tasks).filter(
-      (t) =>
-        (t.status === "running" ||
-          t.status === "quality_check" ||
-          t.status === "creating_pr" ||
-          t.status === "fixing") &&
-        (!excludeRepo || t.repoRoot !== excludeRepo),
+  getRunningPlans(excludeRepo?: string): Plan[] {
+    return Object.values(this.readIndex().plans).filter(
+      (p) =>
+        (p.status === "running" ||
+          p.status === "quality_check" ||
+          p.status === "creating_pr" ||
+          p.status === "fixing") &&
+        (!excludeRepo || p.repoRoot !== excludeRepo),
     );
   }
 
-  getSpec(taskId: string): string | null {
-    const p = path.join(this.specsDir, `${taskId}.md`);
+  getSpec(planId: string): string | null {
+    const p = path.join(this.specsDir, `${planId}.md`);
     if (!fs.existsSync(p)) return null;
     return fs.readFileSync(p, "utf-8");
   }
 
-  writeSpec(taskId: string, content: string): string {
-    const p = path.join(this.specsDir, `${taskId}.md`);
+  writeSpec(planId: string, content: string): string {
+    const p = path.join(this.specsDir, `${planId}.md`);
     atomicWriteText(p, content);
     return p;
   }
 
-  ensureRunDir(taskId: string): string {
-    const d = path.join(this.runsDir, taskId);
+  ensureRunDir(planId: string): string {
+    const d = path.join(this.runsDir, planId);
     fs.mkdirSync(d, { recursive: true });
     return d;
   }
 
-  getLogFile(taskId: string): string {
-    return path.join(this.runsDir, taskId, "agent.log");
+  getLogFile(planId: string): string {
+    return path.join(this.runsDir, planId, "agent.log");
   }
 
-  getRunnerScript(taskId: string): string {
-    return path.join(this.runsDir, taskId, "run.sh");
+  getRunnerScript(planId: string): string {
+    return path.join(this.runsDir, planId, "run.sh");
   }
 
-  getPromptFile(taskId: string): string {
-    return path.join(this.runsDir, taskId, "prompt.txt");
+  getPromptFile(planId: string): string {
+    return path.join(this.runsDir, planId, "prompt.txt");
   }
 
-  readRunMeta(taskId: string): Record<string, unknown> | null {
-    const p = path.join(this.runsDir, taskId, "meta.json");
+  readRunMeta(planId: string): Record<string, unknown> | null {
+    const p = path.join(this.runsDir, planId, "meta.json");
     if (!fs.existsSync(p)) return null;
     try {
       return JSON.parse(fs.readFileSync(p, "utf-8"));
@@ -356,19 +356,19 @@ export class ForgeStore {
     }
   }
 
-  writeRunMeta(taskId: string, meta: RunMeta): void {
-    const p = path.join(this.runsDir, taskId, "meta.json");
+  writeRunMeta(planId: string, meta: RunMeta): void {
+    const p = path.join(this.runsDir, planId, "meta.json");
     atomicWriteJSON(p, meta);
   }
 
   /**
    * Merge a partial RunMeta patch into the existing file under a per-task
    * lock so concurrent writers (the bash runner script's set_status, plus
-   * HTTP handlers like /api/tasks/:id/kill) can't lose updates. Returns
+   * HTTP handlers like /api/plans/:id/kill) can't lose updates. Returns
    * the merged meta, or null if no meta exists yet.
    */
-  mergeRunMeta(taskId: string, patch: Partial<RunMeta>): RunMeta | null {
-    const p = path.join(this.runsDir, taskId, "meta.json");
+  mergeRunMeta(planId: string, patch: Partial<RunMeta>): RunMeta | null {
+    const p = path.join(this.runsDir, planId, "meta.json");
     return withFileLock(`${p}.lock`, () => {
       if (!fs.existsSync(p)) return null;
       const current = JSON.parse(fs.readFileSync(p, "utf-8")) as RunMeta;
@@ -378,26 +378,26 @@ export class ForgeStore {
     });
   }
 
-  /** Read meta.json status and sync back to index if changed. Returns updated task or null. */
-  syncTaskStatus(task: TaskRecord): TaskRecord | null {
-    if (task.status === "done" || task.status === "failed" || task.status === "draft") return null;
-    const meta = this.readRunMeta(task.id);
+  /** Read meta.json status and sync back to index if changed. Returns updated plan or null. */
+  syncPlanStatus(plan: Plan): Plan | null {
+    if (plan.status === "done" || plan.status === "failed" || plan.status === "draft") return null;
+    const meta = this.readRunMeta(plan.id);
     if (!meta) return null;
 
-    const newStatus = meta.status as TaskStatus | undefined;
+    const newStatus = meta.status as PlanStatus | undefined;
     const prUrl = meta.prUrl as string | undefined;
-    if (!newStatus || newStatus === task.status) return null;
+    if (!newStatus || newStatus === plan.status) return null;
 
-    const updated: TaskRecord = {
-      ...task,
+    const updated: Plan = {
+      ...plan,
       status: newStatus,
-      prUrl: prUrl ?? task.prUrl,
+      prUrl: prUrl ?? plan.prUrl,
       completedAt:
         newStatus === "done" || newStatus === "failed" || newStatus === "quality_failed"
           ? new Date().toISOString()
-          : task.completedAt,
+          : plan.completedAt,
     };
-    this.upsertTask(updated);
+    this.upsertPlan(updated);
 
     // Phase 3 dual-write: keep the DB job row coherent with the bash
     // runner's meta.json transitions. Doesn't fail the sync if DB hiccups.
@@ -405,7 +405,7 @@ export class ForgeStore {
       syncJobState(this.db.db, updated, meta as Partial<RunMeta>);
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`warn: syncJobState failed for ${task.id}: ${msg}\n`);
+      process.stderr.write(`warn: syncJobState failed for ${plan.id}: ${msg}\n`);
     }
     return updated;
   }
@@ -421,8 +421,8 @@ export class ForgeStore {
   }
 
   /** Read the last N lines of a log file */
-  tailLog(taskId: string, lines = 8): string[] {
-    const logFile = this.getLogFile(taskId);
+  tailLog(planId: string, lines = 8): string[] {
+    const logFile = this.getLogFile(planId);
     if (!fs.existsSync(logFile)) return [];
     try {
       const content = fs.readFileSync(logFile, "utf-8");
@@ -438,12 +438,12 @@ export class ForgeStore {
     return `crit-${Date.now().toString(36)}`;
   }
 
-  getCritiqueDir(taskId: string, critiqueId: string): string {
-    return path.join(this.critiquesDir, taskId, critiqueId);
+  getCritiqueDir(planId: string, critiqueId: string): string {
+    return path.join(this.critiquesDir, planId, critiqueId);
   }
 
-  listCritiques(taskId: string): string[] {
-    const dir = path.join(this.critiquesDir, taskId);
+  listCritiques(planId: string): string[] {
+    const dir = path.join(this.critiquesDir, planId);
     if (!fs.existsSync(dir)) return [];
     try {
       return fs
@@ -456,13 +456,13 @@ export class ForgeStore {
     }
   }
 
-  getLatestCritique(taskId: string): string | null {
-    const ids = this.listCritiques(taskId);
+  getLatestCritique(planId: string): string | null {
+    const ids = this.listCritiques(planId);
     return ids[0] ?? null;
   }
 
-  readCritiqueMeta(taskId: string, critiqueId: string): CritiqueMeta | null {
-    const p = path.join(this.getCritiqueDir(taskId, critiqueId), "critique-meta.json");
+  readCritiqueMeta(planId: string, critiqueId: string): CritiqueMeta | null {
+    const p = path.join(this.getCritiqueDir(planId, critiqueId), "critique-meta.json");
     if (!fs.existsSync(p)) return null;
     try {
       return JSON.parse(fs.readFileSync(p, "utf-8")) as CritiqueMeta;
@@ -471,33 +471,33 @@ export class ForgeStore {
     }
   }
 
-  writeCritiqueMeta(taskId: string, critiqueId: string, meta: CritiqueMeta): void {
-    const dir = this.getCritiqueDir(taskId, critiqueId);
+  writeCritiqueMeta(planId: string, critiqueId: string, meta: CritiqueMeta): void {
+    const dir = this.getCritiqueDir(planId, critiqueId);
     fs.mkdirSync(dir, { recursive: true });
     atomicWriteJSON(path.join(dir, "critique-meta.json"), meta);
   }
 
-  markCritiqueViewed(taskId: string, critiqueId: string): void {
-    const meta = this.readCritiqueMeta(taskId, critiqueId);
+  markCritiqueViewed(planId: string, critiqueId: string): void {
+    const meta = this.readCritiqueMeta(planId, critiqueId);
     if (!meta || meta.viewedAt) return;
     meta.viewedAt = new Date().toISOString();
-    this.writeCritiqueMeta(taskId, critiqueId, meta);
+    this.writeCritiqueMeta(planId, critiqueId, meta);
   }
 
-  getRecommendationsFile(taskId: string, critiqueId: string): string {
-    return path.join(this.getCritiqueDir(taskId, critiqueId), "recommendations.md");
+  getRecommendationsFile(planId: string, critiqueId: string): string {
+    return path.join(this.getCritiqueDir(planId, critiqueId), "recommendations.md");
   }
 
-  getPendingCritiques(repoRoot?: string): Array<{ taskId: string; critiqueId: string; meta: CritiqueMeta }> {
-    const results: Array<{ taskId: string; critiqueId: string; meta: CritiqueMeta }> = [];
+  getPendingCritiques(repoRoot?: string): Array<{ planId: string; critiqueId: string; meta: CritiqueMeta }> {
+    const results: Array<{ planId: string; critiqueId: string; meta: CritiqueMeta }> = [];
     if (!fs.existsSync(this.critiquesDir)) return results;
     try {
-      for (const taskEntry of fs.readdirSync(this.critiquesDir, { withFileTypes: true })) {
-        if (!taskEntry.isDirectory()) continue;
-        const taskDir = path.join(this.critiquesDir, taskEntry.name);
-        for (const critEntry of fs.readdirSync(taskDir, { withFileTypes: true })) {
+      for (const planEntry of fs.readdirSync(this.critiquesDir, { withFileTypes: true })) {
+        if (!planEntry.isDirectory()) continue;
+        const planDir = path.join(this.critiquesDir, planEntry.name);
+        for (const critEntry of fs.readdirSync(planDir, { withFileTypes: true })) {
           if (!critEntry.isDirectory() || !critEntry.name.startsWith("crit-")) continue;
-          const metaPath = path.join(taskDir, critEntry.name, "critique-meta.json");
+          const metaPath = path.join(planDir, critEntry.name, "critique-meta.json");
           if (!fs.existsSync(metaPath)) continue;
           try {
             const meta = JSON.parse(fs.readFileSync(metaPath, "utf-8")) as CritiqueMeta;
@@ -508,7 +508,7 @@ export class ForgeStore {
               meta.status === "failed";
             if (!isPending) continue;
             if (repoRoot && meta.repoRoot !== repoRoot) continue;
-            results.push({ taskId: taskEntry.name, critiqueId: critEntry.name, meta });
+            results.push({ planId: planEntry.name, critiqueId: critEntry.name, meta });
           } catch {
             /* corrupted meta — skip */
           }

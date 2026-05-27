@@ -3,7 +3,7 @@
  *
  * Spawns the `claude` CLI per turn and streams its stdout as Server-Sent
  * Events. Persists chat history under either:
- *   - `~/.forge/specs/<taskId>/plan-history.json`  (existing spec)
+ *   - `~/.forge/specs/<planId>/plan-history.json`  (existing spec)
  *   - `~/.forge/plan-drafts/<draftId>/history.json` (new-spec modal)
  *
  * Each turn writes a transient prompt file (`turn-<N>.txt`) inside the
@@ -101,8 +101,8 @@ export function isValidDraftId(s: string): boolean {
 
 // ─── Path helpers ───────────────────────────────────────────────────────────
 
-function specChatDir(forgeDir: string, taskId: string): string {
-  return path.join(forgeDir, "specs", taskId);
+function specChatDir(forgeDir: string, planId: string): string {
+  return path.join(forgeDir, "specs", planId);
 }
 
 function draftDir(forgeDir: string, draftId: string): string {
@@ -185,24 +185,24 @@ export function deleteDraft(forgeDir: string, draftId: string): void {
 
 /**
  * Move a draft folder onto the spec scope — called by the new-spec save
- * flow once the spec has been persisted and a taskId minted.
+ * flow once the spec has been persisted and a planId minted.
  *
  * Atomic on the same filesystem; falls back to a copy + rm if rename fails
  * (different mounts / cross-device link). After rename the file is
  * renamed `plan-history.json` to match the spec layout.
  */
-export function promoteDraft(forgeDir: string, draftId: string, taskId: string): void {
+export function promoteDraft(forgeDir: string, draftId: string, planId: string): void {
   const draftRoot = draftDir(forgeDir, draftId);
   const draftHistory = path.join(draftRoot, "history.json");
   if (!fs.existsSync(draftHistory)) return; // nothing to promote — no-op
 
-  const specDir = specChatDir(forgeDir, taskId);
+  const specDir = specChatDir(forgeDir, planId);
   fs.mkdirSync(specDir, { recursive: true });
   const target = path.join(specDir, "plan-history.json");
 
   if (fs.existsSync(target)) {
     // Don't clobber an existing history file. Caller is wrong to call us.
-    throw new Error(`promoteDraft: spec ${taskId} already has a plan-history.json — refusing to overwrite.`);
+    throw new Error(`promoteDraft: spec ${planId} already has a plan-history.json — refusing to overwrite.`);
   }
 
   try {

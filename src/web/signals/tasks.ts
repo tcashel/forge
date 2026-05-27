@@ -6,19 +6,19 @@
 // the poll, so the search input (and any future Preact-controlled input)
 // keeps focus across ticks.
 import { computed, signal } from "@preact/signals";
-import { type ApiError, getTasks } from "../lib/api";
+import { type ApiError, getPlans } from "../lib/api";
 import { taskRepoKey } from "../lib/format";
 import { showToast } from "../lib/toast";
-import type { TabId, TaskView } from "../types";
+import type { PlanView, TabId } from "../types";
 import { searchQuery, selectedRepo } from "./ui";
 
-export const tasks = signal<TaskView[]>([]);
+export const tasks = signal<PlanView[]>([]);
 export const currentTaskId = signal<string | null>(null);
 export const currentTab = signal<TabId>("spec");
 export const lastRefreshAt = signal<Date | null>(null);
 export const lastRefreshOk = signal<boolean>(true);
 
-export const visibleTasks = computed<TaskView[]>(() => {
+export const visibleTasks = computed<PlanView[]>(() => {
   const sel = selectedRepo.value;
   let list = sel ? tasks.value.filter((t) => taskRepoKey(t) === sel) : tasks.value.slice();
   const q = (searchQuery.value || "").toLowerCase().trim();
@@ -33,7 +33,7 @@ export const visibleTasks = computed<TaskView[]>(() => {
   return list;
 });
 
-export const currentTask = computed<TaskView | null>(() => {
+export const currentTask = computed<PlanView | null>(() => {
   const id = currentTaskId.value;
   if (!id) return null;
   return tasks.value.find((t) => t.id === id) ?? null;
@@ -43,8 +43,8 @@ let pollHandle: ReturnType<typeof setInterval> | null = null;
 
 export async function refreshTasks(): Promise<void> {
   try {
-    const data = await getTasks();
-    tasks.value = data.tasks || [];
+    const data = await getPlans();
+    tasks.value = data.plans || [];
     lastRefreshOk.value = true;
     lastRefreshAt.value = new Date();
   } catch (e) {
@@ -70,7 +70,7 @@ export function stopTaskPolling(): void {
 
 // Picks a sensible default tab when a task is selected without an
 // explicit override. Mirrors legacy selectTask().
-export function defaultTabFor(t: TaskView): TabId {
+export function defaultTabFor(t: PlanView): TabId {
   if (t.section === "running") return "log";
   if (t.kind === "critique-ready") return "critique";
   return "spec";

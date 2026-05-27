@@ -1,7 +1,7 @@
 /**
  * One-time backfill from `~/.forge/` JSON state into the SQLite contract.
  *
- * Reads every TaskRecord, spec markdown, critique-meta.json, and run
+ * Reads every Plan, spec markdown, critique-meta.json, and run
  * meta.json, then emits the corresponding `plans`, `plan_versions`,
  * `tasks` (synthetic 1:1 row per plan), `critic_configs`, `sessions`,
  * `critic_runs`, `critic_syntheses`, and `jobs` rows.
@@ -21,7 +21,32 @@
  */
 
 import type { Database } from "bun:sqlite";
-import type { CritiqueAgentMeta, CritiqueMeta, ForgeStore, RunMeta, TaskRecord } from "../store.ts";
+import * as fs from "node:fs";
+import * as path from "node:path";
+import type { CritiqueAgentMeta, CritiqueMeta, ForgeStore, Plan, RunMeta } from "../store.ts";
+
+/**
+ * Legacy ~/.forge/index.json shape. Phase 3.5 renamed the in-memory map key
+ * from `tasks` to `plans`, but on-disk JSON files written before the rename
+ * still use `tasks`. Backfill is the migration bridge so it must accept both.
+ */
+interface LegacyIndex {
+  version: 1;
+  tasks?: Record<string, Plan>;
+  plans?: Record<string, Plan>;
+}
+
+function readPlansFromIndex(store: ForgeStore): Plan[] {
+  const indexFile = path.join(store.forgeDir, "index.json");
+  if (!fs.existsSync(indexFile)) return [];
+  try {
+    const raw = JSON.parse(fs.readFileSync(indexFile, "utf-8")) as LegacyIndex;
+    const map = raw.plans ?? raw.tasks ?? {};
+    return Object.values(map);
+  } catch {
+    return [];
+  }
+}
 
 export interface BackfillCounts {
   plans: number;
@@ -47,7 +72,7 @@ const ZERO_COUNTS: BackfillCounts = {
 
 // ── status / stage mappings (see docs/SCHEMA.md enums) ──────────────────────
 
-function mapPlanStage(status: TaskRecord["status"]): string {
+function mapPlanStage(status: Plan["status"]): string {
   switch (status) {
     case "draft":
       return "drafting";
@@ -65,7 +90,7 @@ function mapPlanStage(status: TaskRecord["status"]): string {
   }
 }
 
-function mapTaskState(status: TaskRecord["status"]): string {
+function mapTaskState(status: Plan["status"]): string {
   switch (status) {
     case "draft":
       return "ready";
@@ -134,16 +159,16 @@ function safe(s: string): string {
   return s.replace(/[^a-z0-9_-]/gi, "_");
 }
 
-function planVersionId(taskId: string, version: number): string {
-  return `bf-pv-${taskId}-v${version}`;
+function planVersionId(planId: string, version: number): string {
+  return `bf-pv-${planId}-v${version}`;
 }
 
-function syntheticTaskId(taskId: string): string {
-  return `bf-t-${taskId}`;
+function syntheticTaskId(planId: string): string {
+  return `bf-t-${planId}`;
 }
 
-function jobId(taskId: string): string {
-  return `bf-j-${taskId}-r1`;
+function jobId(planId: string): string {
+  return `bf-j-${planId}-r1`;
 }
 
 function criticConfigId(agent: string, model: string): string {
@@ -193,22 +218,22 @@ function diffCounts(before: BackfillCounts, after: BackfillCounts): BackfillCoun
 }
 
 export function backfillFromJson(store: ForgeStore, db: Database): BackfillCounts {
-  const index = store.readIndex();
+  const plans = readPlansFromIndex(store);
   const before = snapshotCounts(db);
 
   const tx = db.transaction(() => {
-    for (const task of Object.values(index.tasks)) {
-      insertPlan(db, task);
-      const pv = insertPlanVersion(db, task, store);
-      insertSyntheticTask(db, task, pv.id);
+    for (const plan of plans) {
+      insertPlan(db, plan);
+      const pv = insertPlanVersion(db, plan, store);
+      insertSyntheticTask(db, plan, pv.id);
       // current_version_id depends on plan_versions existing first
-      db.prepare("UPDATE plans SET current_version_id = ? WHERE id = ?").run(pv.id, task.id);
-      insertJobFromRunMeta(db, task, store);
+      db.prepare("UPDATE plans SET current_version_id = ? WHERE id = ?").run(pv.id, plan.id);
+      insertJobFromRunMeta(db, plan, store);
 
-      for (const critiqueId of store.listCritiques(task.id)) {
-        const meta = store.readCritiqueMeta(task.id, critiqueId);
+      for (const critiqueId of store.listCritiques(plan.id)) {
+        const meta = store.readCritiqueMeta(plan.id, critiqueId);
         if (!meta) continue;
-        insertCritiqueRecords(db, task, pv.id, meta);
+        insertCritiqueRecords(db, plan, pv.id, meta);
       }
     }
   });
@@ -219,72 +244,72 @@ export function backfillFromJson(store: ForgeStore, db: Database): BackfillCount
 
 // ── per-record inserts ──────────────────────────────────────────────────────
 
-function insertPlan(db: Database, task: TaskRecord): void {
+function insertPlan(db: Database, plan: Plan): void {
   const metadata = {
-    repoName: task.repoName,
-    worktree: task.worktree,
-    agent: task.agent,
-    model: task.model,
-    prUrl: task.prUrl,
-    prNumber: task.prNumber,
-    jiraTicket: task.jiraTicket,
-    tmuxSession: task.tmuxSession,
-    logFile: task.logFile,
-    lastImproveError: task.lastImproveError,
-    originalStatus: task.status,
+    repoName: plan.repoName,
+    worktree: plan.worktree,
+    agent: plan.agent,
+    model: plan.model,
+    prUrl: plan.prUrl,
+    prNumber: plan.prNumber,
+    jiraTicket: plan.jiraTicket,
+    tmuxSession: plan.tmuxSession,
+    logFile: plan.logFile,
+    lastImproveError: plan.lastImproveError,
+    originalStatus: plan.status,
   };
-  const updatedAt = task.completedAt ?? task.launchedAt ?? task.createdAt;
+  const updatedAt = plan.completedAt ?? plan.launchedAt ?? plan.createdAt;
   db.prepare(
     `INSERT OR IGNORE INTO plans
      (id, title, repo_path, repo_branch, stage, intent, current_version_id, created_at, updated_at, metadata)
      VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
   ).run(
-    task.id,
-    task.title,
-    task.repoRoot,
-    task.branch,
-    mapPlanStage(task.status),
-    task.createdAt,
+    plan.id,
+    plan.title,
+    plan.repoRoot,
+    plan.branch,
+    mapPlanStage(plan.status),
+    plan.createdAt,
     updatedAt,
     JSON.stringify(metadata),
   );
 }
 
-function insertPlanVersion(db: Database, task: TaskRecord, store: ForgeStore): { id: string } {
-  const version = Math.max(1, task.specVersion ?? 1);
-  const id = planVersionId(task.id, version);
-  const document = store.getSpec(task.id) ?? "";
+function insertPlanVersion(db: Database, plan: Plan, store: ForgeStore): { id: string } {
+  const version = Math.max(1, plan.specVersion ?? 1);
+  const id = planVersionId(plan.id, version);
+  const document = store.getSpec(plan.id) ?? "";
   db.prepare(
     `INSERT OR IGNORE INTO plan_versions
      (id, plan_id, version_number, document, sections, open_questions, created_by, created_at, notes)
      VALUES (?, ?, ?, ?, '{}', NULL, 'backfill', ?, NULL)`,
-  ).run(id, task.id, version, document, task.createdAt);
+  ).run(id, plan.id, version, document, plan.createdAt);
   return { id };
 }
 
-function insertSyntheticTask(db: Database, task: TaskRecord, planVersionId: string): void {
-  const updatedAt = task.completedAt ?? task.launchedAt ?? task.createdAt;
+function insertSyntheticTask(db: Database, plan: Plan, planVersionId: string): void {
+  const updatedAt = plan.completedAt ?? plan.launchedAt ?? plan.createdAt;
   db.prepare(
     `INSERT OR IGNORE INTO tasks
      (id, plan_id, plan_version_id, sequence, title, spec, plan_section_refs, estimated_diff_size,
       dependencies, state, agent_preference, created_at, updated_at, started_at, completed_at)
      VALUES (?, ?, ?, 1, ?, '', NULL, NULL, NULL, ?, ?, ?, ?, ?, ?)`,
   ).run(
-    syntheticTaskId(task.id),
-    task.id,
+    syntheticTaskId(plan.id),
+    plan.id,
     planVersionId,
-    task.title,
-    mapTaskState(task.status),
-    task.agent,
-    task.createdAt,
+    plan.title,
+    mapTaskState(plan.status),
+    plan.agent,
+    plan.createdAt,
     updatedAt,
-    task.launchedAt,
-    task.completedAt,
+    plan.launchedAt,
+    plan.completedAt,
   );
 }
 
-function insertJobFromRunMeta(db: Database, task: TaskRecord, store: ForgeStore): void {
-  const metaRaw = store.readRunMeta(task.id);
+function insertJobFromRunMeta(db: Database, plan: Plan, store: ForgeStore): void {
+  const metaRaw = store.readRunMeta(plan.id);
   if (!metaRaw) return;
   const meta = metaRaw as Partial<RunMeta>;
   db.prepare(
@@ -293,14 +318,14 @@ function insertJobFromRunMeta(db: Database, task: TaskRecord, store: ForgeStore)
       blocker_summary, eta_seconds, started_at, finished_at, exit_code, summary)
      VALUES (?, ?, 1, 'initial', NULL, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)`,
   ).run(
-    jobId(task.id),
-    syntheticTaskId(task.id),
-    meta.worktree ?? task.worktree,
-    task.branch,
+    jobId(plan.id),
+    syntheticTaskId(plan.id),
+    meta.worktree ?? plan.worktree,
+    plan.branch,
     mapJobState(meta.status),
     meta.errorMessage ?? null,
-    meta.startedAt ?? task.launchedAt,
-    meta.endedAt ?? task.completedAt,
+    meta.startedAt ?? plan.launchedAt,
+    meta.endedAt ?? plan.completedAt,
     meta.errorMessage ?? null,
   );
 }
@@ -313,7 +338,7 @@ function insertCriticConfig(db: Database, agent: string, model: string, createdA
   ).run(criticConfigId(agent, model), `${agent}:${model}`, agent, model, createdAt, createdAt);
 }
 
-function insertCritiqueRecords(db: Database, _task: TaskRecord, planVersionId: string, meta: CritiqueMeta): void {
+function insertCritiqueRecords(db: Database, _task: Plan, planVersionId: string, meta: CritiqueMeta): void {
   insertCriticConfig(db, meta.criticA.agent, meta.criticA.model, meta.startedAt);
   insertCriticConfig(db, meta.criticB.agent, meta.criticB.model, meta.startedAt);
   insertCriticConfig(db, meta.synthesizer.agent, meta.synthesizer.model, meta.startedAt);

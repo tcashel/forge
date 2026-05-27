@@ -12,7 +12,7 @@ import type { GhTarget } from "../core/gh.js";
 import { fetchPrs, type GhPr } from "../core/gh-pr.js";
 import { isTmuxSessionAlive } from "../core/launch.js";
 import type { RepoProfile } from "../core/repo.js";
-import type { ForgeStore, TaskRecord, TaskStatus } from "../core/store.js";
+import type { ForgeStore, Plan, PlanStatus } from "../core/store.js";
 import { Key, matchesKey } from "./keys.js";
 import { truncateToWidth, visibleWidth } from "./width.js";
 
@@ -46,7 +46,7 @@ function sep(width: number, char = "─"): string {
   return char.repeat(width);
 }
 
-function statusIcon(theme: Theme, status: TaskStatus, tmuxSession: string | null): string {
+function statusIcon(theme: Theme, status: PlanStatus, tmuxSession: string | null): string {
   const alive = tmuxSession ? isTmuxSessionAlive(tmuxSession) : false;
   switch (status) {
     case "done":
@@ -65,12 +65,12 @@ function statusIcon(theme: Theme, status: TaskStatus, tmuxSession: string | null
   }
 }
 
-function statusLabel(theme: Theme, status: TaskStatus, tmuxSession: string | null): string {
+function statusLabel(theme: Theme, status: PlanStatus, tmuxSession: string | null): string {
   const alive = tmuxSession ? isTmuxSessionAlive(tmuxSession) : false;
   if ((status === "running" || status === "quality_check" || status === "creating_pr") && !alive) {
     return theme.fg("error", "dead");
   }
-  const map: Record<TaskStatus, [string, string]> = {
+  const map: Record<PlanStatus, [string, string]> = {
     draft: ["dim", "draft"],
     running: ["warning", "agent ⟳"],
     quality_check: ["warning", "quality ⟳"],
@@ -116,21 +116,21 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 
 export type DashboardAction =
   | { type: "new_spec" }
-  | { type: "edit_spec"; task: TaskRecord }
-  | { type: "view_spec"; task: TaskRecord }
-  | { type: "launch"; task: TaskRecord }
-  | { type: "attach"; task: TaskRecord }
-  | { type: "kill"; task: TaskRecord }
-  | { type: "run_critique"; task: TaskRecord }
-  | { type: "view_critique"; task: TaskRecord; critiqueId: string }
-  | { type: "discuss_critique"; task: TaskRecord; critiqueId: string }
+  | { type: "edit_spec"; task: Plan }
+  | { type: "view_spec"; task: Plan }
+  | { type: "launch"; task: Plan }
+  | { type: "attach"; task: Plan }
+  | { type: "kill"; task: Plan }
+  | { type: "run_critique"; task: Plan }
+  | { type: "view_critique"; task: Plan; critiqueId: string }
+  | { type: "discuss_critique"; task: Plan; critiqueId: string }
   | { type: "settings" }
-  | { type: "resume"; task: TaskRecord }
+  | { type: "resume"; task: Plan }
   | { type: "close" };
 
 export class ForgeDashboard {
-  private tasks: TaskRecord[] = [];
-  private otherTasks: TaskRecord[] = [];
+  private tasks: Plan[] = [];
+  private otherTasks: Plan[] = [];
   private prs: GhPr[] = [];
   private selectedIdx = 0;
   private prMode = false;
@@ -279,8 +279,8 @@ export class ForgeDashboard {
       this.syncStatuses();
 
       // Load tasks
-      this.tasks = this.store.getTasks(this.repo.root);
-      this.otherTasks = this.store.getRunningTasks(this.repo.root);
+      this.tasks = this.store.getPlans(this.repo.root);
+      this.otherTasks = this.store.getRunningPlans(this.repo.root);
 
       // Yield so the spinner paints before the network call
       await Promise.resolve();
@@ -337,20 +337,20 @@ export class ForgeDashboard {
 
   private syncAndRender(): void {
     this.syncStatuses();
-    this.tasks = this.store.getTasks(this.repo.root);
-    this.otherTasks = this.store.getRunningTasks(this.repo.root);
+    this.tasks = this.store.getPlans(this.repo.root);
+    this.otherTasks = this.store.getRunningPlans(this.repo.root);
     this.invalidate();
     this.tui.requestRender();
   }
 
   private syncStatuses(): void {
     // Read meta.json for all running tasks and sync back to index
-    const allRunning = this.store.getRunningTasks();
+    const allRunning = this.store.getRunningPlans();
     const repoRunning = this.store
-      .getTasks(this.repo.root)
+      .getPlans(this.repo.root)
       .filter((t) => t.status === "running" || t.status === "quality_check" || t.status === "creating_pr");
     for (const task of [...allRunning, ...repoRunning]) {
-      this.store.syncTaskStatus(task);
+      this.store.syncPlanStatus(task);
     }
   }
 
@@ -488,7 +488,7 @@ export class ForgeDashboard {
     this.drawActionBar(lines, width, allTasks[this.selectedIdx]);
   }
 
-  private drawTask(lines: string[], width: number, task: TaskRecord, _idx: number, selected: boolean): void {
+  private drawTask(lines: string[], width: number, task: Plan, _idx: number, selected: boolean): void {
     const { theme } = this;
     const cursor = selected ? theme.fg("accent", "▶") : " ";
     const icon = statusIcon(theme, task.status, task.tmuxSession);
@@ -536,7 +536,7 @@ export class ForgeDashboard {
   // Failure sub-line for failed / quality_failed tasks. See description in
   // failedSubLines() below — surfaces meta.errorMessage on the row so the
   // user doesn't have to attach to tmux just to learn why a run died.
-  private failedSubLines(task: TaskRecord, width: number): string[] {
+  private failedSubLines(task: Plan, width: number): string[] {
     const { theme } = this;
     const out: string[] = [];
 
@@ -574,7 +574,7 @@ export class ForgeDashboard {
     return out;
   }
 
-  private progressLines(task: TaskRecord, width: number): string[] {
+  private progressLines(task: Plan, width: number): string[] {
     const { theme } = this;
     const tail = this.store.tailLog(task.id, 1);
     if (tail[0]) {
@@ -586,7 +586,7 @@ export class ForgeDashboard {
 
   // ── Critique sub-line for tasks ───────────────────────────────────────────
 
-  private critiqueSubLine(task: TaskRecord, width: number): string | null {
+  private critiqueSubLine(task: Plan, width: number): string | null {
     const { theme } = this;
     const latestId = this.store.getLatestCritique(task.id);
     if (!latestId) return null;
@@ -756,13 +756,13 @@ export class ForgeDashboard {
 
   // ── Helpers ──────────────────────────────────────────────────────────────────
 
-  resolveSpecPath(task: TaskRecord): string {
+  resolveSpecPath(task: Plan): string {
     return task.specFile || path.join(this.store.specsDir, `${task.id}.md`);
   }
 
   // ── Drawing: Action bar ──────────────────────────────────────────────────────
 
-  private drawActionBar(lines: string[], width: number, selected: TaskRecord | undefined): void {
+  private drawActionBar(lines: string[], width: number, selected: Plan | undefined): void {
     const { theme } = this;
     const canAttach = selected?.tmuxSession && isTmuxSessionAlive(selected.tmuxSession);
     const canLaunch = selected?.status === "draft" || selected?.status === "failed";

@@ -1,5 +1,5 @@
-// Mirror of TaskView/RepoView shapes from src/cli/cmd/serve.ts.
-// Phase 2 only needs RepoView; TaskView is stubbed for later phases.
+// Mirror of PlanView/RepoView shapes from src/cli/cmd/serve.ts.
+// Phase 2 only needs RepoView; PlanView is stubbed for later phases.
 
 export type WorkbenchSection = "running" | "attention" | "ready" | "drafting" | "done";
 
@@ -7,7 +7,7 @@ export interface RepoView {
   name: string;
   root: string;
   branch: string | null;
-  taskCount: number;
+  planCount: number;
   registered: boolean;
   current: boolean;
   reachable: boolean;
@@ -21,7 +21,7 @@ export interface CritiqueRef {
   viewedAt: string | null;
 }
 
-export interface TaskView {
+export interface PlanView {
   id: string;
   title: string;
   status: string;
@@ -56,7 +56,7 @@ export interface LastImproveError {
   at: string;
 }
 
-// Mirror of the per-attempt projection returned by GET /api/tasks/:id/critiques.
+// Mirror of the per-attempt projection returned by GET /api/plans/:id/critiques.
 export interface CritiqueAttemptSummary {
   id: string;
   status: string;

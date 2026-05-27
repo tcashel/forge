@@ -31,7 +31,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     });
   }
 
-  const task = store.getTask(id);
+  const task = store.getPlan(id);
   if (!task) {
     throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
   }

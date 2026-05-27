@@ -24,7 +24,7 @@ function runWorker(id: string, home: string): Promise<{ code: number; stderr: st
   });
 }
 
-test("concurrent upsertTask writers preserve all entries", async (t) => {
+test("concurrent upsertPlan writers preserve all entries", async (t) => {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-atomic-"));
   t.after(() => fs.rmSync(tmpHome, { recursive: true, force: true }));
 
@@ -44,7 +44,7 @@ test("concurrent upsertTask writers preserve all entries", async (t) => {
   assert.equal(parsed.version, 1);
 
   // Lock around read-modify-write must preserve every entry.
-  const stored = Object.keys(parsed.tasks).sort();
+  const stored = Object.keys(parsed.plans).sort();
   assert.deepEqual(stored, ids.sort(), "every concurrently-written task should be in the final index");
 });
 

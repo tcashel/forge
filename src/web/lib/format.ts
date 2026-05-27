@@ -1,6 +1,6 @@
 // Tiny formatting helpers used by Preact components. Mirrors the subset of
 // legacy `dom.js` / `render.js` we still need after Phase 3.
-import type { TaskView, WorkbenchSection } from "../types";
+import type { PlanView, WorkbenchSection } from "../types";
 
 export function escapeHTML(s: unknown): string {
   return String(s ?? "").replace(
@@ -16,7 +16,7 @@ export function escapeHTML(s: unknown): string {
   );
 }
 
-export function statClass(task: TaskView): WorkbenchSection {
+export function statClass(task: PlanView): WorkbenchSection {
   return task.statClass || "drafting";
 }
 
