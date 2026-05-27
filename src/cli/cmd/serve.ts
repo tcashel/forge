@@ -251,7 +251,7 @@ function statusInfo(
         critique,
       };
     case "done":
-      return { section: "done", statLabel: "Merged", statClass: "done", error: null, critique };
+      return { section: "done", statLabel: "PR opened", statClass: "done", error: null, critique };
     case "draft": {
       if (critiqueMeta?.status === "done" && !critiqueMeta.viewedAt) {
         return {
