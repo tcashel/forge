@@ -49,22 +49,21 @@ export function HistoryTab({ t }: { t: PlanView }) {
 
   return (
     <div class="history">
-      <ol class="timeline" style="list-style:none;padding-left:0">
+      <ol class="timeline" style="list-style:none;padding-left:0;margin:0">
         {s.events.map((e) => (
           <li
             key={`${e.ref}:${e.kind}:${e.ts}`}
-            style="display:grid;grid-template-columns:auto 1fr;gap:0.75rem;padding:0.4rem 0;border-bottom:1px solid var(--border)"
+            style="display:grid;grid-template-columns:max-content max-content 1fr;gap:0.75rem;align-items:baseline;padding:0.4rem 0;border-bottom:1px solid var(--border)"
           >
-            <span style="color:var(--dim);font-family:var(--mono, monospace);white-space:nowrap">{formatTs(e.ts)}</span>
-            <span>
-              <span
-                class="pill"
-                style={`background:${kindColor(e.kind)};color:var(--bg);padding:0 0.4rem;border-radius:0.2rem;margin-right:0.5rem`}
-              >
-                {labelFor(e.kind)}
-              </span>
-              {e.summary}
+            <span style="color:var(--dim);font-family:'JetBrains Mono', monospace;white-space:nowrap;font-size:11px">
+              {formatTs(e.ts)}
             </span>
+            <span
+              style={`background:${kindColor(e.kind)};color:#fff;font-size:10px;font-weight:700;letter-spacing:0.04em;text-transform:uppercase;padding:2px 7px;border-radius:4px;white-space:nowrap`}
+            >
+              {labelFor(e.kind)}
+            </span>
+            <span style="line-height:1.4">{e.summary}</span>
           </li>
         ))}
       </ol>

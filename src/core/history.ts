@@ -77,7 +77,7 @@ export function buildPlanHistory(db: Database, planId: string): PlanHistoryEvent
         ts: j.started_at,
         kind: "launch_started",
         ref: j.id,
-        summary: `launch r${j.run_number} started`,
+        summary: `r${j.run_number} started`,
       });
     }
     if (j.finished_at) {
@@ -95,7 +95,7 @@ export function buildPlanHistory(db: Database, planId: string): PlanHistoryEvent
       ts: c.started_at,
       kind: "critique_started",
       ref: c.critique_id,
-      summary: `critique ${c.critique_id} launched (${c.agents})`,
+      summary: `${c.critique_id} — ${c.agents}`,
     });
   }
 
@@ -167,20 +167,20 @@ function selectSyntheses(db: Database, planId: string): SynthesisRow[] {
 // ── formatters ─────────────────────────────────────────────────────────────
 
 function formatSpecSaved(v: PlanVersionRow): string {
-  if (v.created_by === "improver") return `spec v${v.version_number} saved (auto-improved)`;
-  if (v.created_by === "backfill") return `spec v${v.version_number} (backfilled from JSON)`;
-  return `spec v${v.version_number} saved`;
+  if (v.created_by === "improver") return `v${v.version_number} (auto-improved)`;
+  if (v.created_by === "backfill") return `v${v.version_number} (backfilled from JSON)`;
+  return `v${v.version_number} saved`;
 }
 
 function formatLaunchCompleted(j: JobRow): string {
   const tail = j.summary ?? j.blocker_summary;
-  const tailFmt = tail ? `: ${truncate(tail, 60)}` : "";
-  return `launch r${j.run_number} ${j.state}${tailFmt}`;
+  const tailFmt = tail ? ` — ${truncate(tail, 60)}` : "";
+  return `r${j.run_number} ${j.state}${tailFmt}`;
 }
 
 function formatSynthesis(s: SynthesisRow): string {
-  if (!s.recommendation) return "critique synthesized";
-  return `critique synthesized: ${truncate(s.recommendation, 60)}`;
+  if (!s.recommendation) return "ready";
+  return truncate(s.recommendation, 80);
 }
 
 function truncate(s: string, max: number): string {
