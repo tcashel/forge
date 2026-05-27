@@ -167,7 +167,11 @@ function selectSyntheses(db: Database, planId: string): SynthesisRow[] {
 // ── formatters ─────────────────────────────────────────────────────────────
 
 function formatSpecSaved(v: PlanVersionRow): string {
-  if (v.created_by === "improver") return `v${v.version_number} (auto-improved)`;
+  // Live writer stamps "agent:improver"; older rows / a planned future
+  // surface for other agents may use the "agent:" prefix more broadly.
+  if (v.created_by === "agent:improver" || v.created_by === "improver") {
+    return `v${v.version_number} (auto-improved)`;
+  }
   if (v.created_by === "backfill") return `v${v.version_number} (backfilled from JSON)`;
   return `v${v.version_number} saved`;
 }
