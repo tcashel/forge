@@ -88,8 +88,77 @@ export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;
 }
 
-export type ViewMode = "tasks" | "prs" | "settings";
-export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done";
+export type ViewMode = "tasks" | "prs" | "settings" | "activity";
+export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity";
+
+// ─── Agent Activity ─────────────────────────────────────────────────────────
+
+export type ActivityFilter =
+  | "all"
+  | "live"
+  | "failed"
+  | "execution"
+  | "critique"
+  | "synthesis"
+  | "improvement"
+  | "drafting"
+  | "review"
+  | "fix"
+  | "agent:claude"
+  | "agent:codex"
+  | "agent:opencode"
+  | "agent:gemini";
+
+export interface AgentActivityRow {
+  id: string;
+  purpose: string;
+  relatedId: string | null;
+  agentAdapter: string;
+  model: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  state: string;
+  exitCode: number | null;
+  metrics: {
+    durationMs?: number | null;
+    tokensIn?: number | null;
+    tokensOut?: number | null;
+    cacheRead?: number | null;
+    cacheCreate?: number | null;
+    costUsd?: number | null;
+    costSource?: "provider" | "estimate" | null;
+    modelPricedAt?: string | null;
+    planId?: string;
+    scopeKind?: "draft" | "spec";
+    reasoningEffort?: string | null;
+  };
+  jobRunNumber: number | null;
+  branchName: string | null;
+  plan: { id: string; title: string; repo: string | null } | null;
+}
+
+export type ActivityDetailKind =
+  | "execution"
+  | "critique"
+  | "synthesis"
+  | "improvement"
+  | "drafting"
+  | "review"
+  | "fix"
+  | "unknown";
+
+export interface ActivityDetailResponse {
+  session: AgentActivityRow;
+  detail:
+    | { kind: "execution"; logStreamUrl: string }
+    | { kind: "review"; logStreamUrl: string }
+    | { kind: "fix"; logStreamUrl: string }
+    | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
+    | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
+    | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
+    | { kind: "drafting"; planHistory: ChatMessage[] }
+    | { kind: "unknown" };
+}
 export type Theme = "light" | "dark";
 export type TabId = "log" | "spec" | "plan" | "critique" | "gates" | "history" | "runs";
 

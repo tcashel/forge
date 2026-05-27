@@ -1,9 +1,9 @@
 import { useComputed } from "@preact/signals";
-import { enterPrMode, enterSettingsMode, enterTaskMode } from "../lib/modes";
+import { enterActivityMode, enterPrMode, enterSettingsMode, enterTaskMode } from "../lib/modes";
 import { showToast } from "../lib/toast";
 import { repos } from "../signals/repos";
-import { modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
-import type { RepoView, SidebarFilter } from "../types";
+import { activityFilter, modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
+import type { ActivityFilter, RepoView, SidebarFilter } from "../types";
 
 interface NavTarget {
   id: SidebarFilter;
@@ -20,6 +20,24 @@ const NAV: NavTarget[] = [
   { id: "backlog", label: "Backlog", ic: "★", color: "var(--ready)", countId: "count-backlog" },
   { id: "prs", label: "Open PRs", ic: "⇪", color: "var(--primary)", countId: "count-prs" },
   { id: "done", label: "Recently done", ic: "✓", color: "var(--done)", countId: "count-done" },
+];
+
+interface ActivityChip {
+  id: ActivityFilter;
+  label: string;
+}
+
+const ACTIVITY_CHIPS: ActivityChip[] = [
+  { id: "all", label: "All" },
+  { id: "live", label: "Live" },
+  { id: "failed", label: "Failed" },
+  { id: "execution", label: "Execution" },
+  { id: "critique", label: "Critique" },
+  { id: "improvement", label: "Improvement" },
+  { id: "drafting", label: "Drafting" },
+  { id: "review", label: "Review" },
+  { id: "agent:claude", label: "claude" },
+  { id: "agent:codex", label: "codex" },
 ];
 
 function repoKey(r: RepoView): string {
@@ -65,6 +83,19 @@ export function Sidebar() {
   const onSettings = () => {
     sidebarFilter.value = "all";
     enterSettingsMode();
+  };
+
+  const onActivity = () => {
+    sidebarFilter.value = "activity";
+    enterActivityMode();
+  };
+
+  const onActivityChip = (id: ActivityFilter) => {
+    activityFilter.value = id;
+    if (viewMode.value !== "activity") {
+      sidebarFilter.value = "activity";
+      enterActivityMode();
+    }
   };
 
   const onNewSpec = () => {
@@ -117,6 +148,32 @@ export function Sidebar() {
             </button>
           );
         })}
+        <div class="nav-section">Observability</div>
+        <button
+          type="button"
+          class={`nav-item${mode === "activity" ? " active" : ""}`}
+          id="nav-activity"
+          onClick={onActivity}
+        >
+          <span class="ic" style="color:var(--primary)">
+            ◌
+          </span>
+          <span class="lbl">Agent Activity</span>
+        </button>
+        {mode === "activity" ? (
+          <div class="nav-chips">
+            {ACTIVITY_CHIPS.map((c) => (
+              <button
+                key={c.id}
+                type="button"
+                class={`nav-chip${activityFilter.value === c.id ? " active" : ""}`}
+                onClick={() => onActivityChip(c.id)}
+              >
+                {c.label}
+              </button>
+            ))}
+          </div>
+        ) : null}
         <div class="nav-section">Reference</div>
         <button
           type="button"

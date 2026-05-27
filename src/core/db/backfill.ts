@@ -366,7 +366,7 @@ function insertCriticConfig(db: Database, agent: string, model: string, createdA
   ).run(criticConfigId(agent, model), `${agent}:${model}`, agent, model, createdAt, createdAt);
 }
 
-function insertCritiqueRecords(db: Database, _task: Plan, planVersionId: string, meta: CritiqueMeta): void {
+function insertCritiqueRecords(db: Database, task: Plan, planVersionId: string, meta: CritiqueMeta): void {
   insertCriticConfig(db, meta.criticA.agent, meta.criticA.model, meta.startedAt);
   insertCriticConfig(db, meta.criticB.agent, meta.criticB.model, meta.startedAt);
   insertCriticConfig(db, meta.synthesizer.agent, meta.synthesizer.model, meta.startedAt);
@@ -375,9 +375,9 @@ function insertCritiqueRecords(db: Database, _task: Plan, planVersionId: string,
   const sessionForB = critiqueSessionId(meta.critiqueId, "critic-b");
   const sessionForSynth = critiqueSessionId(meta.critiqueId, "synth");
 
-  insertCritiqueSession(db, sessionForA, "critique", meta.critiqueId, meta.criticA, meta);
-  insertCritiqueSession(db, sessionForB, "critique", meta.critiqueId, meta.criticB, meta);
-  insertCritiqueSession(db, sessionForSynth, "synthesis", meta.critiqueId, meta.synthesizer, meta);
+  insertCritiqueSession(db, sessionForA, "critique", meta.critiqueId, meta.criticA, meta, task.id);
+  insertCritiqueSession(db, sessionForB, "critique", meta.critiqueId, meta.criticB, meta, task.id);
+  insertCritiqueSession(db, sessionForSynth, "synthesis", meta.critiqueId, meta.synthesizer, meta, task.id);
 
   insertCriticRun(db, criticRunId(meta.critiqueId, "a"), meta.criticA, sessionForA, planVersionId, meta);
   insertCriticRun(db, criticRunId(meta.critiqueId, "b"), meta.criticB, sessionForB, planVersionId, meta);
@@ -406,8 +406,16 @@ function insertCritiqueSession(
   relatedId: string,
   agent: CritiqueAgentMeta,
   meta: CritiqueMeta,
+  planId: string,
 ): void {
   const finishedAt = agent.status === "done" || agent.status === "failed" ? meta.completedAt : null;
+  // Synthesis sessions can't be resolved to a plan via critic_runs, so
+  // stash planId in metrics so the Activity view's directPlanId path works.
+  const metrics: Record<string, unknown> = {
+    durationMs: agent.durationMs,
+    reasoningEffort: agent.reasoningEffort,
+  };
+  if (purpose === "synthesis") metrics.planId = planId;
   db.prepare(
     `INSERT OR IGNORE INTO sessions
      (id, purpose, related_id, agent_adapter, model, started_at, finished_at, state,
@@ -423,7 +431,7 @@ function insertCritiqueSession(
     finishedAt,
     mapCritiqueSessionState(agent.status),
     meta.tmuxSession,
-    JSON.stringify({ durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort }),
+    JSON.stringify(metrics),
   );
 }
 

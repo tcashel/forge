@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
-import { syncJobState } from "../../core/db/writes.ts";
+import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { buildPlanHistory } from "../../core/history.ts";
@@ -878,6 +878,54 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ messages: history.messages });
   }
 
+  // GET /api/agent-activity
+  // Returns the cross-cutting "every forge-spawned agent run" feed for
+  // the Agent Activity view. Supported filters: state | purpose | agent
+  // | repo | since | limit. Plan linkage is resolved per-purpose by
+  // resolvePlanRefForRow (jobs.session_id for execution, plan_versions
+  // for critique/synthesis, metrics.planId for improvement/drafting).
+  if (pathname === "/api/agent-activity") {
+    // Best-effort reconciliation so phantom `running` execution sessions
+    // (runner died before forge_session_finish) clear before display.
+    try {
+      reconcileExecutionSessions(store.db.db, new Date().toISOString());
+    } catch {
+      /* non-fatal */
+    }
+    const rows = listAgentActivity(store, {
+      state: url.searchParams.get("state") ?? undefined,
+      purpose: url.searchParams.get("purpose") ?? undefined,
+      agent: url.searchParams.get("agent") ?? undefined,
+      repo: url.searchParams.get("repo") ?? undefined,
+      since: url.searchParams.get("since") ?? undefined,
+      limit: url.searchParams.get("limit") ?? undefined,
+    });
+    return jsonOk({ rows });
+  }
+
+  // GET /api/agent-activity/:sessionId — detail pane payload.
+  const activityDetailMatch = pathname.match(/^\/api\/agent-activity\/([^/]+)$/);
+  if (activityDetailMatch) {
+    const sessionId = decodeURIComponent(activityDetailMatch[1]);
+    const detail = buildAgentActivityDetail(store, sessionId);
+    if (!detail) return jsonErr(404, "UNKNOWN_SESSION", `No session with id "${sessionId}".`);
+    return jsonOk(detail);
+  }
+
+  // GET /api/sessions/:sessionId/log — SSE log stream for a recorded
+  // session (execution / review / fix). The path resolves per purpose:
+  // job/review/fix all share $RUN_DIR/agent.log today; once the runner
+  // adopts session-id-keyed logs, this endpoint flips to the new path.
+  const sessionLogMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/log$/);
+  if (sessionLogMatch) {
+    const sessionId = decodeURIComponent(sessionLogMatch[1]);
+    const logFile = resolveSessionLogFile(store, sessionId);
+    if (!logFile) return jsonErr(404, "UNKNOWN_SESSION", `No session with id "${sessionId}".`);
+    const linesParam = url.searchParams.get("lines");
+    const initial = Math.max(0, Math.min(2000, Number.parseInt(linesParam ?? "200", 10) || 200));
+    return logSseResponse(logFile, initial);
+  }
+
   // GET /api/prs?repo=<name>
   if (pathname === "/api/prs") {
     const repoName = url.searchParams.get("repo") || undefined;
@@ -901,6 +949,340 @@ function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoVie
   const byName = repos.filter((r) => r.name === repoName);
   const reachableByName = byName.find((r) => !r.stale);
   if (reachableByName) return reachableByName;
+  return null;
+}
+
+// ─── Agent Activity (cross-cutting sessions feed) ────────────────────────────
+
+interface AgentActivityRow {
+  id: string;
+  purpose: string;
+  relatedId: string | null;
+  agentAdapter: string;
+  model: string | null;
+  startedAt: string;
+  finishedAt: string | null;
+  state: string;
+  exitCode: number | null;
+  metrics: Record<string, unknown>;
+  jobRunNumber: number | null;
+  branchName: string | null;
+  plan: { id: string; title: string; repo: string | null } | null;
+}
+
+interface AgentActivityFilters {
+  state?: string;
+  purpose?: string;
+  agent?: string;
+  repo?: string;
+  since?: string;
+  limit?: string;
+}
+
+interface RawSessionRow {
+  id: string;
+  purpose: string;
+  related_id: string | null;
+  agent_adapter: string;
+  model: string | null;
+  started_at: string;
+  finished_at: string | null;
+  state: string;
+  exit_code: number | null;
+  metrics: string | null;
+  run_number: number | null;
+  branch_name: string | null;
+}
+
+function parseMetricsBlob(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentActivityRow[] {
+  const wheres: string[] = [];
+  const params: Array<string | number> = [];
+  if (f.state) {
+    wheres.push("s.state = ?");
+    params.push(f.state);
+  }
+  if (f.purpose) {
+    wheres.push("s.purpose = ?");
+    params.push(f.purpose);
+  }
+  if (f.agent) {
+    wheres.push("s.agent_adapter = ?");
+    params.push(f.agent);
+  }
+  if (f.since) {
+    wheres.push("s.started_at >= ?");
+    params.push(f.since);
+  }
+  const limit = Math.max(1, Math.min(1000, Number.parseInt(f.limit ?? "200", 10) || 200));
+  const sql = `SELECT s.id, s.purpose, s.related_id, s.agent_adapter, s.model,
+                      s.started_at, s.finished_at, s.state, s.exit_code, s.metrics,
+                      j.run_number, j.branch_name
+                 FROM sessions s
+                 LEFT JOIN jobs j ON j.session_id = s.id
+                ${wheres.length > 0 ? `WHERE ${wheres.join(" AND ")}` : ""}
+                ORDER BY s.started_at DESC
+                LIMIT ?`;
+  const rows = store.db.db.prepare(sql).all(...params, limit) as RawSessionRow[];
+
+  const projected = rows.map<AgentActivityRow>((r) => {
+    const metrics = parseMetricsBlob(r.metrics);
+    return {
+      id: r.id,
+      purpose: r.purpose,
+      relatedId: r.related_id,
+      agentAdapter: r.agent_adapter,
+      model: r.model,
+      startedAt: r.started_at,
+      finishedAt: r.finished_at,
+      state: r.state,
+      exitCode: r.exit_code,
+      metrics,
+      jobRunNumber: r.run_number,
+      branchName: r.branch_name,
+      plan: resolvePlanRefForRow(store, r, metrics),
+    };
+  });
+
+  if (f.repo) {
+    return projected.filter((r) => r.plan?.repo === f.repo || r.plan?.id === f.repo);
+  }
+  return projected;
+}
+
+function resolvePlanRefForRow(
+  store: ForgeStore,
+  row: RawSessionRow,
+  metrics: Record<string, unknown>,
+): AgentActivityRow["plan"] {
+  const directPlanId = typeof metrics.planId === "string" ? metrics.planId : null;
+  let planId: string | null = directPlanId;
+
+  if (!planId) {
+    if (row.purpose === "execution") {
+      planId = lookupPlanIdViaJob(store, row.id);
+    } else if (row.purpose === "critique") {
+      planId = lookupPlanIdViaCritique(store, row.id);
+    } else if (row.purpose === "synthesis") {
+      // Synthesis sessions are never written into critic_runs.session_id;
+      // resolve by walking related_id (= critiqueId) → critic_runs (slot a)
+      // → plan_versions. New writes also stash metrics.planId (preferred).
+      planId = lookupPlanIdViaSynthesis(store, row.related_id);
+    } else if (row.purpose === "drafting" && metrics.scopeKind === "spec") {
+      planId = row.related_id;
+    }
+  }
+  if (!planId) return null;
+  const planRow = store.db.db.prepare("SELECT id, title, repo_path FROM plans WHERE id = ?").get(planId) as
+    | { id: string; title: string; repo_path: string | null }
+    | undefined;
+  if (!planRow) return null;
+  return { id: planRow.id, title: planRow.title, repo: planRow.repo_path };
+}
+
+function lookupPlanIdViaJob(store: ForgeStore, sessionId: string): string | null {
+  const row = store.db.db
+    .prepare(
+      `SELECT t.plan_id
+         FROM jobs j JOIN tasks t ON j.task_id = t.id
+         WHERE j.session_id = ?`,
+    )
+    .get(sessionId) as { plan_id: string } | undefined;
+  return row?.plan_id ?? null;
+}
+
+function lookupPlanIdViaCritique(store: ForgeStore, sessionId: string): string | null {
+  const row = store.db.db
+    .prepare(
+      `SELECT pv.plan_id
+         FROM critic_runs cr
+         JOIN plan_versions pv ON pv.id = cr.target_id AND cr.target_kind = 'plan_version'
+         WHERE cr.session_id = ?`,
+    )
+    .get(sessionId) as { plan_id: string } | undefined;
+  return row?.plan_id ?? null;
+}
+
+function lookupPlanIdViaSynthesis(store: ForgeStore, critiqueId: string | null): string | null {
+  if (!critiqueId) return null;
+  // Either critic_run shares the same critique target plan version.
+  const row = store.db.db
+    .prepare(
+      `SELECT pv.plan_id
+         FROM critic_runs cr
+         JOIN plan_versions pv ON pv.id = cr.target_id AND cr.target_kind = 'plan_version'
+         WHERE cr.id LIKE ?
+         LIMIT 1`,
+    )
+    .get(`cr-${critiqueId}-%`) as { plan_id: string } | undefined;
+  return row?.plan_id ?? null;
+}
+
+interface AgentActivityDetailPayload {
+  session: AgentActivityRow;
+  detail:
+    | { kind: "execution"; logStreamUrl: string }
+    | { kind: "review"; logStreamUrl: string }
+    | { kind: "fix"; logStreamUrl: string }
+    | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
+    | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
+    | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
+    | { kind: "drafting"; planHistory: unknown[] }
+    | { kind: "unknown" };
+}
+
+function buildAgentActivityDetail(store: ForgeStore, sessionId: string): AgentActivityDetailPayload | null {
+  const row = store.db.db
+    .prepare(
+      `SELECT s.id, s.purpose, s.related_id, s.agent_adapter, s.model,
+              s.started_at, s.finished_at, s.state, s.exit_code, s.metrics,
+              j.run_number, j.branch_name
+         FROM sessions s
+         LEFT JOIN jobs j ON j.session_id = s.id
+         WHERE s.id = ?`,
+    )
+    .get(sessionId) as RawSessionRow | undefined;
+  if (!row) return null;
+
+  const metrics = parseMetricsBlob(row.metrics);
+  const session: AgentActivityRow = {
+    id: row.id,
+    purpose: row.purpose,
+    relatedId: row.related_id,
+    agentAdapter: row.agent_adapter,
+    model: row.model,
+    startedAt: row.started_at,
+    finishedAt: row.finished_at,
+    state: row.state,
+    exitCode: row.exit_code,
+    metrics,
+    jobRunNumber: row.run_number,
+    branchName: row.branch_name,
+    plan: resolvePlanRefForRow(store, row, metrics),
+  };
+
+  const logStreamUrl = `/api/sessions/${encodeURIComponent(sessionId)}/log`;
+  let detail: AgentActivityDetailPayload["detail"];
+
+  if (row.purpose === "execution") {
+    detail = { kind: "execution", logStreamUrl };
+  } else if (row.purpose === "review") {
+    detail = { kind: "review", logStreamUrl };
+  } else if (row.purpose === "fix") {
+    detail = { kind: "fix", logStreamUrl };
+  } else if (row.purpose === "critique") {
+    const { content, path: markdownPath } = readCritiqueMarkdownForSession(store, session);
+    detail = { kind: "critique", markdownContent: content, markdownPath };
+  } else if (row.purpose === "synthesis") {
+    const { content, path: markdownPath } = readSynthMarkdownForSession(store, session);
+    detail = { kind: "synthesis", markdownContent: content, markdownPath };
+  } else if (row.purpose === "improvement") {
+    const { content, path: markdownPath, diffPath } = readImproverMarkdownForSession(store, session);
+    detail = { kind: "improvement", markdownContent: content, markdownPath, diffPath };
+  } else if (row.purpose === "drafting") {
+    detail = { kind: "drafting", planHistory: loadDraftingHistory(store, session) };
+  } else {
+    detail = { kind: "unknown" };
+  }
+
+  return { session, detail };
+}
+
+// 256 KB inline cap (per spec). Larger markdown files are surfaced via
+// `markdownPath` and the client can fetch lazily.
+const MAX_INLINE_MD_BYTES = 256 * 1024;
+
+function readMdFileWithCap(filePath: string): { content: string | null; path: string } {
+  if (!fs.existsSync(filePath)) return { content: null, path: filePath };
+  try {
+    const stat = fs.statSync(filePath);
+    if (stat.size > MAX_INLINE_MD_BYTES) return { content: null, path: filePath };
+    return { content: fs.readFileSync(filePath, "utf-8"), path: filePath };
+  } catch {
+    return { content: null, path: filePath };
+  }
+}
+
+function readCritiqueMarkdownForSession(
+  store: ForgeStore,
+  session: AgentActivityRow,
+): { content: string | null; path: string | null } {
+  // session id format: s-critique-<critiqueId>-<a|b>; related_id = critiqueId.
+  const planId = session.plan?.id;
+  const critiqueId = session.relatedId;
+  if (!planId || !critiqueId) return { content: null, path: null };
+  const slot = session.id.endsWith("-b") ? "critique-b.md" : "critique-a.md";
+  const filePath = path.join(store.getCritiqueDir(planId, critiqueId), slot);
+  return readMdFileWithCap(filePath);
+}
+
+function readSynthMarkdownForSession(
+  store: ForgeStore,
+  session: AgentActivityRow,
+): { content: string | null; path: string | null } {
+  const planId = session.plan?.id;
+  const critiqueId = session.relatedId;
+  if (!planId || !critiqueId) return { content: null, path: null };
+  const filePath = path.join(store.getCritiqueDir(planId, critiqueId), "recommendations.md");
+  return readMdFileWithCap(filePath);
+}
+
+function readImproverMarkdownForSession(
+  store: ForgeStore,
+  session: AgentActivityRow,
+): { content: string | null; path: string | null; diffPath: string | null } {
+  const planId = (session.metrics.planId as string | undefined) ?? session.plan?.id;
+  const critiqueId = session.relatedId;
+  if (!planId || !critiqueId) return { content: null, path: null, diffPath: null };
+  const dir = store.getCritiqueDir(planId, critiqueId);
+  const mdPath = path.join(dir, "improver-output.md");
+  const diffPath = path.join(dir, "spec-improved.md");
+  const md = readMdFileWithCap(mdPath);
+  return {
+    content: md.content,
+    path: md.content === null && fs.existsSync(mdPath) ? mdPath : md.content !== null ? mdPath : null,
+    diffPath: fs.existsSync(diffPath) ? diffPath : null,
+  };
+}
+
+function loadDraftingHistory(store: ForgeStore, session: AgentActivityRow): unknown[] {
+  const scopeKind = session.metrics.scopeKind;
+  if (scopeKind === "spec") {
+    const history = loadPlanHistory(store.forgeDir, { kind: "spec", id: session.relatedId ?? "" });
+    return history.messages;
+  }
+  if (scopeKind === "draft" && isValidDraftId(session.relatedId ?? "")) {
+    const history = loadPlanHistory(store.forgeDir, { kind: "draft", id: session.relatedId ?? "" });
+    return history.messages;
+  }
+  return [];
+}
+
+function resolveSessionLogFile(store: ForgeStore, sessionId: string): string | null {
+  const row = store.db.db.prepare("SELECT purpose, related_id FROM sessions WHERE id = ?").get(sessionId) as
+    | { purpose: string; related_id: string | null }
+    | undefined;
+  if (!row) return null;
+  // execution / review / fix all share the job's main agent.log today.
+  if (row.purpose === "execution" || row.purpose === "review" || row.purpose === "fix") {
+    const job = store.db.db
+      .prepare(
+        `SELECT t.plan_id
+           FROM jobs j JOIN tasks t ON j.task_id = t.id
+           WHERE j.session_id = ? OR j.id = ?`,
+      )
+      .get(sessionId, row.related_id) as { plan_id: string } | undefined;
+    if (job) return store.getLogFile(job.plan_id);
+  }
   return null;
 }
 
@@ -1082,6 +1464,7 @@ function planChatSseResponse(opts: {
       model: opts.model,
       specBody: opts.specBody,
       cwd: opts.cwd,
+      db: opts.store.db,
     });
   } catch (e) {
     // BAD_CWD is the only typed failure runChatTurn throws synchronously.
@@ -1262,6 +1645,14 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     try {
       abortInFlight({ kind: "draft", id: draftId });
       promotePlanDraft(store.forgeDir, draftId, planId);
+      // Move the draft's Activity rows onto the spec. Without this the
+      // Spec column keeps showing the draft slug after promotion.
+      try {
+        promoteDraftingSessions(store.db.db, draftId, planId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`promote: promoteDraftingSessions failed: ${msg}\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return jsonErr(409, "PROMOTE_CONFLICT", msg);

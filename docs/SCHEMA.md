@@ -160,8 +160,8 @@ Required for the lock gate: a plan version cannot be locked unless every disagre
 ```sql
 CREATE TABLE sessions (
     id              TEXT PRIMARY KEY,
-    purpose         TEXT NOT NULL,                  -- drafting | critique | synthesis
-                                                    -- (decomposition | execution | review | fix added in phase 2+)
+    purpose         TEXT NOT NULL,                  -- drafting | critique | synthesis | execution | review | fix | improvement
+                                                    -- (decomposition added later)
     related_id      TEXT,                           -- FK varies by purpose
     agent_adapter   TEXT NOT NULL,
     model           TEXT,

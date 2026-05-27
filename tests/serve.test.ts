@@ -213,6 +213,38 @@ function makeJobMeta(planId: string, startedAt: string): RunMeta {
   };
 }
 
+test("GET /api/agent-activity returns rows for execution sessions", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-act-1");
+  // recordJobStarted seeds the execution session via upsertSession.
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T09:00:00.000Z"));
+
+  const { body } = await getJson(`${h.baseUrl}/api/agent-activity`);
+  assert.equal(body.ok, true);
+  const rows = (body.data as { rows: Array<{ purpose: string; state: string; plan: { id: string } | null }> }).rows;
+  assert.ok(rows.length >= 1, "at least one session row");
+  const exec = rows.find((r) => r.purpose === "execution");
+  assert.ok(exec, "execution session shows up");
+  assert.equal(exec?.state, "running");
+  assert.equal(exec?.plan?.id, plan.id);
+});
+
+test("GET /api/agent-activity filters by state", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-act-2");
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T09:00:00.000Z"));
+
+  const liveResp = await getJson(`${h.baseUrl}/api/agent-activity?state=running`);
+  const liveRows = (liveResp.body.data as { rows: Array<{ state: string }> }).rows;
+  assert.ok(liveRows.every((r) => r.state === "running"));
+
+  const failedResp = await getJson(`${h.baseUrl}/api/agent-activity?state=failed`);
+  const failedRows = (failedResp.body.data as { rows: Array<unknown> }).rows;
+  assert.equal(failedRows.length, 0);
+});
+
 test("legacy /api/tasks/* redirects to /api/plans/* with 308 (Phase 3.5 alias)", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
