@@ -96,6 +96,7 @@ interface PlanView {
   hasLog: boolean;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
   lastImproveError: { mode: string; error: string; at: string } | null;
+  provenance: { specVersion: number; priorRuns: number; lastRunState: string | null } | null;
 }
 
 interface RepoView {
@@ -426,7 +427,38 @@ function viewTask(task: Plan, store: ForgeStore): PlanView {
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     critique: info.critique,
     lastImproveError: task.lastImproveError,
+    provenance: planProvenance(task, store),
   };
+}
+
+/**
+ * SQLite-backed enrichment for the "ready" section so the operator can see
+ * "v2 spec, launched 2× — last attempt: failed" at a glance, without opening
+ * the Runs tab. Returns null for plans with no DB row (legacy data) or
+ * mid-flight states — those have other context already on the row.
+ */
+function planProvenance(task: Plan, store: ForgeStore): PlanView["provenance"] {
+  try {
+    const row = store.db.db
+      .prepare(
+        `SELECT
+            (SELECT MAX(version_number) FROM plan_versions WHERE plan_id = p.id) AS spec_version,
+            (SELECT COUNT(*) FROM jobs j JOIN tasks t ON j.task_id = t.id WHERE t.plan_id = p.id) AS prior_runs,
+            (SELECT j.state FROM jobs j JOIN tasks t ON j.task_id = t.id
+              WHERE t.plan_id = p.id ORDER BY j.run_number DESC LIMIT 1) AS last_run_state
+         FROM plans p WHERE p.id = ?`,
+      )
+      .get(task.id) as { spec_version: number | null; prior_runs: number; last_run_state: string | null } | undefined;
+    if (!row) return null;
+    return {
+      specVersion: row.spec_version ?? task.specVersion ?? 1,
+      priorRuns: row.prior_runs ?? 0,
+      lastRunState: row.last_run_state,
+    };
+  } catch {
+    // DB miss or transient error — fall back to JSON-only data on the row.
+    return null;
+  }
 }
 
 function buildRepoViews(store: ForgeStore, currentRepo: { name: string; root: string } | null): RepoView[] {

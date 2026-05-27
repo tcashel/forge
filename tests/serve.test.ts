@@ -384,6 +384,22 @@ test("GET /api/plans/:id/history returns the unified timeline (Phase 4)", async 
   );
 });
 
+test("PlanView includes provenance: spec version + prior-run count + last state (Phase 4e)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-prov");
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T10:00:00.000Z"));
+  syncJobState(h.store.db.db, plan, { status: "failed", endedAt: "2026-05-01T10:30:00.000Z" });
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T11:00:00.000Z"));
+
+  const { body } = await getJson(`${h.baseUrl}/api/plans/${plan.id}`);
+  const view = body.data!.task as { provenance: { specVersion: number; priorRuns: number; lastRunState: string } };
+  assert.ok(view.provenance, "provenance is populated for plans with a DB row");
+  assert.equal(view.provenance.specVersion, 1);
+  assert.equal(view.provenance.priorRuns, 2);
+  assert.equal(view.provenance.lastRunState, "running");
+});
+
 test("GET /api/plans/:id/jobs returns all prior launches newest-first (Phase 4)", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());

@@ -48,6 +48,18 @@ export interface PlanView {
   hasLog: boolean;
   critique: CritiqueRef | null;
   lastImproveError: LastImproveError | null;
+  /**
+   * Provenance snapshot — currently only attached to "ready" plans so the
+   * sidebar can show "v2 · launched 2× — last: failed" without an extra
+   * round trip. Phase 4e of COO-84; expand if other sections want it.
+   */
+  provenance: PlanProvenance | null;
+}
+
+export interface PlanProvenance {
+  specVersion: number;
+  priorRuns: number;
+  lastRunState: string | null;
 }
 
 export interface LastImproveError {
