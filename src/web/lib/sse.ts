@@ -39,12 +39,16 @@ export function openLogStream(planId: string, lines: number, handlers: LogStream
 //   - `event: tool_result` data: {toolUseId, output, isError, truncated}
 //   - `event: rate_limit`  data: {status, resetsAt}
 //   - `event: done`        data: {messageId, fullText, durationMs?, totalCostUsd?, numTurns?}
-//   - `event: error`       data: {message}
+//   - `event: error`       data: {message, exitCode, signal, stderrTail, promptFile}
 //
 // Listeners get fine-grained callbacks; the returned promise resolves
 // after the stream closes (regardless of done/error). Callers pass an
 // `AbortSignal` to cancel — it triggers the underlying `fetch` abort,
-// which the server interprets as "kill the spawned claude".
+// which the server interprets as "kill the spawned claude". If the
+// server closes the stream silently (no `done`, no `error` — e.g. a
+// reverse proxy dropped the keepalive, or claude crashed before its
+// close handler ran), `startChatStream` synthesises a `ChatErrorEvent`
+// so the UI never sees an empty failure.
 
 export interface ChatMeta {
   sessionId: string | null;
@@ -84,6 +88,26 @@ export interface ChatDoneEvent {
   stopReason: string | null;
 }
 
+/**
+ * Structured payload of an `error` SSE frame. Mirrors the shape the
+ * server emits from `src/core/plan-chat.ts` when the spawned `claude`
+ * exits non-zero, is killed by a signal, or fails to start. `message`
+ * is what we show verbatim in the chat banner; the other fields are
+ * surfaced in an expandable detail block for debugging.
+ *
+ * `promptFile` points at the retained `turn-N.txt` / `plan-turn-N.txt`
+ * the user can inspect to see exactly what the planner was asked to do.
+ * `stderrTail` is the last ≤500 chars of the child's stderr, with C0/C1
+ * control chars stripped but newlines preserved.
+ */
+export interface ChatErrorEvent {
+  message: string;
+  exitCode: number | null;
+  signal: string | null;
+  stderrTail: string | null;
+  promptFile: string | null;
+}
+
 export interface ChatStreamListeners {
   /** Back-compat alias receiving the latest text snapshot for callers that
    *  don't care about block boundaries. Invoked alongside `onTextDelta`
@@ -95,7 +119,7 @@ export interface ChatStreamListeners {
   onToolResult?: (e: ChatToolResultEvent) => void;
   onRateLimit?: (e: ChatRateLimit) => void;
   onDone: (final: ChatDoneEvent) => void;
-  onError: (message: string) => void;
+  onError: (e: ChatErrorEvent) => void;
 }
 
 export interface StartChatStreamOptions {
@@ -170,6 +194,27 @@ function parseFrame(frame: string): SseEvent | null {
 
 export async function startChatStream(opts: StartChatStreamOptions): Promise<void> {
   const { url, body, signal, listeners } = opts;
+
+  // Wrap the listeners so we can detect a silent close — i.e. the stream
+  // ends without ever firing `done` or `error`. The original failure
+  // mode this PR is chasing surfaced as exactly that: the SSE response
+  // closed cleanly mid-turn, the fetch resolved, and the chat UI fell
+  // into the generic "Failed to fetch" fallback. We replace that with a
+  // structured `ChatErrorEvent` whose message points at the retained
+  // prompt file so the user has somewhere to look.
+  let sawTerminal = false;
+  const wrapped: ChatStreamListeners = {
+    ...listeners,
+    onDone: (e) => {
+      sawTerminal = true;
+      listeners.onDone(e);
+    },
+    onError: (e) => {
+      sawTerminal = true;
+      listeners.onError(e);
+    },
+  };
+
   let res: Response;
   try {
     res = await fetch(url, {
@@ -181,7 +226,13 @@ export async function startChatStream(opts: StartChatStreamOptions): Promise<voi
   } catch (e) {
     // Aborts surface as DOMException name=AbortError; treat as silent close.
     if (signal?.aborted) return;
-    listeners.onError(e instanceof Error ? e.message : String(e));
+    wrapped.onError({
+      message: e instanceof Error ? e.message : String(e),
+      exitCode: null,
+      signal: null,
+      stderrTail: null,
+      promptFile: null,
+    });
     return;
   }
   if (!res.ok || !res.body) {
@@ -192,16 +243,37 @@ export async function startChatStream(opts: StartChatStreamOptions): Promise<voi
     } catch {
       /* noop */
     }
-    listeners.onError(msg);
+    wrapped.onError({ message: msg, exitCode: null, signal: null, stderrTail: null, promptFile: null });
     return;
   }
   try {
     for await (const evt of parseSseStream(res.body)) {
-      dispatchChatEvent(evt, listeners);
+      dispatchChatEvent(evt, wrapped);
     }
   } catch (e) {
     if (signal?.aborted) return;
-    listeners.onError(e instanceof Error ? e.message : String(e));
+    wrapped.onError({
+      message: e instanceof Error ? e.message : String(e),
+      exitCode: null,
+      signal: null,
+      stderrTail: null,
+      promptFile: null,
+    });
+    return;
+  }
+  if (!sawTerminal && !signal?.aborted) {
+    // Server closed the stream without emitting `done` or `error`. The
+    // most common cause we've seen is a reverse-proxy / Bun fetch idle
+    // drop between heartbeats; secondarily, claude crashing in a way
+    // that escaped the close handler. Synthesise an actionable banner
+    // rather than letting the caller's fallback say "network error".
+    wrapped.onError({
+      message: "planner stream closed before `done` — claude may have exited silently",
+      exitCode: null,
+      signal: null,
+      stderrTail: null,
+      promptFile: null,
+    });
   }
 }
 
@@ -269,8 +341,14 @@ export function dispatchChatEvent(evt: SseEvent, listeners: ChatStreamListeners)
       stopReason: typeof parsed?.stopReason === "string" ? parsed.stopReason : null,
     });
   } else if (evt.event === "error") {
-    const parsed = safeParse<{ message?: string }>(evt.data);
-    listeners.onError(parsed?.message || "stream error");
+    const parsed = safeParse<Partial<ChatErrorEvent>>(evt.data);
+    listeners.onError({
+      message: typeof parsed?.message === "string" && parsed.message ? parsed.message : "stream error",
+      exitCode: typeof parsed?.exitCode === "number" ? parsed.exitCode : null,
+      signal: typeof parsed?.signal === "string" ? parsed.signal : null,
+      stderrTail: typeof parsed?.stderrTail === "string" ? parsed.stderrTail : null,
+      promptFile: typeof parsed?.promptFile === "string" ? parsed.promptFile : null,
+    });
   } else if (evt.event === "delta") {
     // Legacy event name (pre-stream-json). Forward to onDelta for any
     // caller still reading from older servers.

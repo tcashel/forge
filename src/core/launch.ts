@@ -208,13 +208,15 @@ ${qualityCheck}
         } > "$RUN_DIR/review-prompt.txt"
 
         if ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1; then
+          # Same last-match strategy as the first reviewer pass — see
+          # rationale on the original verdict extractor above.
           NEW_VERDICT=$(python3 -c "
 import re, sys, json
 raw = open(sys.argv[1]).read()
-m = re.search(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL)
-if not m:
+matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
+if not matches:
     sys.exit(2)
-block = m.group(1)
+block = matches[-1].group(1)
 open(sys.argv[2], 'w').write(block)
 verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
 verdict = verdict_match.group(1).strip().lower() if verdict_match else None
@@ -603,14 +605,19 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
 
   log "Running reviewer: ${config.reviewerTarget} / ${config.reviewerModel}"
   if ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1; then
-    # Extract the forge-review fenced block and verdict
+    # Extract the forge-review fenced block and verdict.
+    # Take the LAST matching block, not the first: codex-as-reviewer echoes
+    # the SKILL.md prompt verbatim (which contains a template forge-review
+    # block with `<approve | request-changes | block>` as a literal
+    # placeholder), and may also re-emit its own reply. The real review is
+    # always last. Paired with the fixture in tests/fixtures/reviewer/.
     VERDICT=$(python3 -c "
 import re, sys, json
 raw = open(sys.argv[1]).read()
-m = re.search(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL)
-if not m:
+matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
+if not matches:
     sys.exit(2)
-block = m.group(1)
+block = matches[-1].group(1)
 open(sys.argv[2], 'w').write(block)
 verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
 verdict = verdict_match.group(1).strip().lower() if verdict_match else None

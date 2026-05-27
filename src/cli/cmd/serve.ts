@@ -256,6 +256,7 @@ function statusInfo(
       // Archived plans are filtered out of /api/plans, but keep this exhaustive
       // so the type checker stays happy and a stray archived plan doesn't crash.
       return { section: "drafting", statLabel: "Archived", statClass: "drafting", error: null, critique };
+
     case "draft": {
       if (critiqueMeta?.status === "done" && !critiqueMeta.viewedAt) {
         return {
@@ -1088,7 +1089,12 @@ function planChatSseResponse(opts: {
     // browser sees the same shape as a runtime stream failure rather
     // than a JSON 400 mid-`fetch`.
     if (e instanceof BadCwdError) {
-      const payload = `event: error\ndata: ${JSON.stringify({ message: e.message })}\n\n`;
+      const payload = `event: error\ndata: ${JSON.stringify({
+        message: e.message,
+        exitCode: null,
+        signal: null,
+        stderrTail: null,
+      })}\n\n`;
       const stream = new ReadableStream<Uint8Array>({
         start(controller) {
           controller.enqueue(new TextEncoder().encode(payload));
