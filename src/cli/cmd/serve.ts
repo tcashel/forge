@@ -17,6 +17,7 @@ import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
+import { buildPlanHistory } from "../../core/history.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import {
   abortInFlight,
@@ -698,7 +699,9 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // GET /api/plans/:id/log    (SSE)
   // GET /api/plans/:id/critique
   // GET /api/plans/:id/critiques  (list of all attempts for visibility)
-  const taskMatch = pathname.match(/^\/api\/plans\/([^/]+)(?:\/(spec|log|critique|critiques))?$/);
+  // GET /api/plans/:id/history    (unified timeline — Phase 4)
+  // GET /api/plans/:id/jobs       (every prior launch — Phase 4)
+  const taskMatch = pathname.match(/^\/api\/plans\/([^/]+)(?:\/(spec|log|critique|critiques|history|jobs))?$/);
   if (taskMatch) {
     const id = decodeURIComponent(taskMatch[1]);
     const sub = taskMatch[2];
@@ -770,6 +773,50 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       const initial = Math.max(0, Math.min(2000, Number.parseInt(linesParam ?? "200", 10) || 200));
       return logSseResponse(logFile, initial);
     }
+
+    if (sub === "history") {
+      const events = buildPlanHistory(store.db.db, id);
+      return jsonOk({ planId: id, events });
+    }
+
+    if (sub === "jobs") {
+      const jobs = listJobsForPlan(store, id);
+      return jsonOk({ planId: id, jobs });
+    }
+  }
+
+  // GET /api/jobs/:id — single-job detail (Phase 4).
+  const jobMatch = pathname.match(/^\/api\/jobs\/([^/]+)$/);
+  if (jobMatch) {
+    const jobId = decodeURIComponent(jobMatch[1]);
+    const job = findJobById(store, jobId);
+    if (!job) return jsonErr(404, "UNKNOWN_JOB", `No job with id "${jobId}".`);
+    const artifacts = listArtifactsForJob(store, jobId);
+    return jsonOk({ job, artifacts });
+  }
+
+  // GET /api/sessions/:id/events?after=<rowid>&limit=<n>
+  // ADR-0019 escape-hatch — primary UI is jobs/history, this is for debug
+  // drill-down. Paged by rowid so large session histories stay cheap.
+  const sessionEventsMatch = pathname.match(/^\/api\/sessions\/([^/]+)\/events$/);
+  if (sessionEventsMatch) {
+    const sessionId = decodeURIComponent(sessionEventsMatch[1]);
+    const session = store.db.db
+      .prepare("SELECT id, purpose, state, started_at, finished_at FROM sessions WHERE id = ?")
+      .get(sessionId);
+    if (!session) return jsonErr(404, "UNKNOWN_SESSION", `No session with id "${sessionId}".`);
+    const after = Number.parseInt(url.searchParams.get("after") ?? "0", 10) || 0;
+    const limit = Math.max(1, Math.min(1000, Number.parseInt(url.searchParams.get("limit") ?? "200", 10) || 200));
+    const events = store.db.db
+      .prepare(
+        `SELECT id, sequence, timestamp, kind, payload
+         FROM session_events
+         WHERE session_id = ? AND id > ?
+         ORDER BY id ASC
+         LIMIT ?`,
+      )
+      .all(sessionId, after, limit);
+    return jsonOk({ sessionId, session, events });
   }
 
   // ── Planner chat — GETs ──────────────────────────────────────────────
@@ -816,6 +863,40 @@ function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoVie
   const reachableByName = byName.find((r) => !r.stale);
   if (reachableByName) return reachableByName;
   return null;
+}
+
+// ─── Job / artifact lookups (Phase 4) ────────────────────────────────────────
+
+function listJobsForPlan(store: ForgeStore, planId: string): unknown[] {
+  return store.db.db
+    .prepare(
+      `SELECT j.id, j.run_number, j.run_kind, j.state, j.branch_name, j.worktree_path,
+              j.started_at, j.finished_at, j.exit_code, j.summary, j.blocker_summary, j.session_id
+       FROM jobs j JOIN tasks t ON j.task_id = t.id
+       WHERE t.plan_id = ?
+       ORDER BY j.run_number DESC`,
+    )
+    .all(planId);
+}
+
+function findJobById(store: ForgeStore, jobId: string): unknown {
+  return store.db.db
+    .prepare(
+      `SELECT id, task_id, run_number, run_kind, state, branch_name, worktree_path,
+              started_at, finished_at, exit_code, summary, blocker_summary, session_id
+       FROM jobs WHERE id = ?`,
+    )
+    .get(jobId);
+}
+
+function listArtifactsForJob(store: ForgeStore, jobId: string): unknown[] {
+  return store.db.db
+    .prepare(
+      `SELECT id, kind, path, content, content_blob_id, metadata, created_at
+       FROM artifacts WHERE job_id = ?
+       ORDER BY created_at ASC`,
+    )
+    .all(jobId);
 }
 
 // ─── POST routes ─────────────────────────────────────────────────────────────

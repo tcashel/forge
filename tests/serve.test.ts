@@ -13,8 +13,9 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
+import { recordJobStarted, recordPlanCreated, syncJobState } from "../src/core/db/writes.ts";
 import type { GhFetchOpts, GhPr } from "../src/core/gh-pr.ts";
-import { ForgeStore } from "../src/core/store.ts";
+import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 interface ServerHandle {
   baseUrl: string;
@@ -162,6 +163,52 @@ function makeGitRepo(prefix: string): string {
   const repo = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
   execFileSync("git", ["init"], { cwd: repo, stdio: "ignore" });
   return repo;
+}
+
+// Phase 4 helpers: makeDraftTask only writes the JSON index. The new
+// observability endpoints read from SQLite, so the tests below need a
+// plan with its plans + plan_versions + synthetic tasks rows.
+function makeBackedPlan(store: ForgeStore, id: string): Plan {
+  const plan: Plan = {
+    id,
+    title: `Plan ${id}`,
+    repoRoot: "/tmp/repo",
+    repoName: "repo",
+    branch: `forge/${id}`,
+    worktree: null,
+    status: "draft",
+    agent: null,
+    model: null,
+    createdAt: "2026-05-01T08:00:00.000Z",
+    launchedAt: null,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: `${id}.md`,
+    specVersion: 1,
+    lastImproveError: null,
+  };
+  store.upsertPlan(plan);
+  store.writeSpec(id, `# Plan ${id}\nbody`);
+  recordPlanCreated(store.db.db, plan, `# Plan ${id}\nbody`);
+  return plan;
+}
+
+function makeJobMeta(planId: string, startedAt: string): RunMeta {
+  return {
+    planId,
+    tmuxSession: `forge-${planId}`,
+    logFile: "/dev/null",
+    agent: "claude",
+    model: "sonnet-4-6",
+    worktree: "/tmp/wt",
+    status: "running",
+    startedAt,
+    prUrl: null,
+  };
 }
 
 test("legacy /api/tasks/* redirects to /api/plans/* with 308 (Phase 3.5 alias)", async (t) => {
@@ -314,6 +361,93 @@ test("unknown task id → 404 envelope", async (t) => {
   assert.equal(status, 404);
   assert.equal(body.ok, false);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+test("GET /api/plans/:id/history returns the unified timeline (Phase 4)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-hist");
+  // Two launches → four launch events on the timeline (started + completed × 2).
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T10:00:00.000Z"));
+  syncJobState(h.store.db.db, plan, { status: "failed", endedAt: "2026-05-01T10:30:00.000Z" });
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T11:00:00.000Z"));
+
+  const { body } = await getJson(`${h.baseUrl}/api/plans/${plan.id}/history`);
+  assert.equal(body.ok, true);
+  assert.equal(body.data!.planId, plan.id);
+  const events = body.data!.events as Array<{ kind: string; ts: string }>;
+  // 1 spec_saved + 2 launch_started + 1 launch_completed = 4 events.
+  assert.equal(events.length, 4);
+  assert.deepEqual(
+    events.map((e) => e.kind),
+    ["launch_started", "launch_completed", "launch_started", "spec_saved"],
+  );
+});
+
+test("GET /api/plans/:id/jobs returns all prior launches newest-first (Phase 4)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-jobs");
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T10:00:00.000Z"));
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T11:00:00.000Z"));
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T12:00:00.000Z"));
+
+  const { body } = await getJson(`${h.baseUrl}/api/plans/${plan.id}/jobs`);
+  assert.equal(body.ok, true);
+  const jobs = body.data!.jobs as Array<{ run_number: number }>;
+  assert.deepEqual(
+    jobs.map((j) => j.run_number),
+    [3, 2, 1],
+  );
+});
+
+test("GET /api/jobs/:id returns the single job + its (empty) artifacts (Phase 4)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const plan = makeBackedPlan(h.store, "plan-jobid");
+  recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T10:00:00.000Z"));
+  const { body } = await getJson(`${h.baseUrl}/api/jobs/j-${plan.id}-r1`);
+  assert.equal(body.ok, true);
+  assert.equal((body.data!.job as { run_number: number }).run_number, 1);
+  assert.deepEqual(body.data!.artifacts, []);
+});
+
+test("GET /api/jobs/:id returns 404 UNKNOWN_JOB for a bogus id", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/jobs/does-not-exist`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_JOB");
+});
+
+test("GET /api/sessions/:id/events paginates session_events by rowid (Phase 4)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Hand-seed a session + events because we don't have a writer for
+  // session_events yet — Phase 4's job is to surface them, not record them.
+  h.store.db.db
+    .prepare(
+      `INSERT INTO sessions (id, purpose, related_id, agent_adapter, model, started_at, state)
+       VALUES ('s-evt', 'critique', 'crit-x', 'claude', 'sonnet-4-6', '2026-05-01T10:00:00.000Z', 'running')`,
+    )
+    .run();
+  const insertEvent = h.store.db.db.prepare(
+    `INSERT INTO session_events (session_id, sequence, timestamp, kind, payload) VALUES (?, ?, ?, ?, ?)`,
+  );
+  for (let i = 0; i < 5; i++) {
+    insertEvent.run("s-evt", i, `2026-05-01T10:0${i}:00.000Z`, "stdout", `chunk-${i}`);
+  }
+
+  const { body } = await getJson(`${h.baseUrl}/api/sessions/s-evt/events?limit=3`);
+  assert.equal(body.ok, true);
+  const events = body.data!.events as Array<{ id: number; kind: string }>;
+  assert.equal(events.length, 3);
+  assert.equal(events[0].kind, "stdout");
+
+  // Use the last event's id as the `after` cursor to fetch the remaining two.
+  const lastId = events[2].id;
+  const { body: body2 } = await getJson(`${h.baseUrl}/api/sessions/s-evt/events?after=${lastId}`);
+  assert.equal((body2.data!.events as unknown[]).length, 2);
 });
 
 test("repo filter returns only the requested repo's tasks", async (t) => {
