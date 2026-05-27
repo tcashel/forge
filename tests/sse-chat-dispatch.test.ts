@@ -9,6 +9,7 @@ import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import {
   type ChatDoneEvent,
+  type ChatErrorEvent,
   type ChatMeta,
   type ChatRateLimit,
   type ChatStreamListeners,
@@ -17,6 +18,7 @@ import {
   type ChatToolUseEvent,
   dispatchChatEvent,
   type SseEvent,
+  startChatStream,
 } from "../src/web/lib/sse.ts";
 
 interface Captured {
@@ -26,7 +28,7 @@ interface Captured {
   toolResult: ChatToolResultEvent[];
   rate: ChatRateLimit[];
   done: ChatDoneEvent[];
-  error: string[];
+  error: ChatErrorEvent[];
   delta: string[];
 }
 
@@ -48,7 +50,7 @@ function makeListeners(): { captured: Captured; listeners: ChatStreamListeners }
     onToolResult: (e) => captured.toolResult.push(e),
     onRateLimit: (e) => captured.rate.push(e),
     onDone: (e) => captured.done.push(e),
-    onError: (m) => captured.error.push(m),
+    onError: (e) => captured.error.push(e),
     onDelta: (t) => captured.delta.push(t),
   };
   return { captured, listeners };
@@ -104,7 +106,43 @@ test("dispatchChatEvent treats malformed JSON as a silent no-op (except error �
   assert.equal(captured.text.length, 0);
   assert.equal(captured.toolUse.length, 0);
   // error always invokes onError — falls back to the default message.
-  assert.deepEqual(captured.error, ["stream error"]);
+  assert.equal(captured.error.length, 1);
+  assert.equal(captured.error[0].message, "stream error");
+  assert.equal(captured.error[0].exitCode, null);
+  assert.equal(captured.error[0].signal, null);
+  assert.equal(captured.error[0].stderrTail, null);
+  assert.equal(captured.error[0].promptFile, null);
+});
+
+test("dispatchChatEvent surfaces the structured error payload verbatim", () => {
+  const { captured, listeners } = makeListeners();
+  dispatchChatEvent(
+    frame("error", {
+      message: "claude exited with code 1: ENOENT: claude binary missing",
+      exitCode: 1,
+      signal: null,
+      stderrTail: "ENOENT: claude binary missing\nat /usr/bin/claude",
+      promptFile: "/home/u/.forge/plan-drafts/d_abc/turn-3.txt",
+    }),
+    listeners,
+  );
+  assert.equal(captured.error.length, 1);
+  const e = captured.error[0];
+  assert.equal(e.message, "claude exited with code 1: ENOENT: claude binary missing");
+  assert.equal(e.exitCode, 1);
+  assert.equal(e.signal, null);
+  assert.equal(e.stderrTail, "ENOENT: claude binary missing\nat /usr/bin/claude");
+  assert.equal(e.promptFile, "/home/u/.forge/plan-drafts/d_abc/turn-3.txt");
+});
+
+test("dispatchChatEvent: signal-only error frame preserves the signal name", () => {
+  const { captured, listeners } = makeListeners();
+  dispatchChatEvent(
+    frame("error", { message: "claude exited via signal SIGTERM", exitCode: null, signal: "SIGTERM" }),
+    listeners,
+  );
+  assert.equal(captured.error[0].signal, "SIGTERM");
+  assert.equal(captured.error[0].exitCode, null);
 });
 
 test("dispatchChatEvent forwards legacy `delta` events to onDelta only", () => {
@@ -129,4 +167,109 @@ test("dispatchChatEvent ignores unknown event names", () => {
       captured.delta.length,
     0,
   );
+});
+
+// ─── startChatStream — silent close detection ───────────────────────────────
+//
+// The original "transient network error" the surrounding PR is chasing
+// manifested as the SSE stream closing without ever emitting `done` or
+// `error`. Without the wrapper below, the caller's `finally` block
+// fell into the generic "Failed to fetch" fallback. We assert here that
+// `startChatStream` synthesises a structured `ChatErrorEvent` whose
+// message is specific enough to be actionable.
+
+/** Build a `fetch`-compatible mock that returns a fixed SSE body. */
+function mockFetchOk(sseBody: string): typeof fetch {
+  return async (_url: string | URL | Request) => {
+    return new Response(sseBody, {
+      status: 200,
+      headers: { "content-type": "text/event-stream" },
+    });
+  };
+}
+
+test("startChatStream surfaces a specific banner when the server closes after `text` but before `done`", async () => {
+  const { captured, listeners } = makeListeners();
+  const origFetch = globalThis.fetch;
+  const sseBody = ["event: text", `data: ${JSON.stringify({ blockId: "b1", text: "partial reply" })}`, "", ""].join(
+    "\n",
+  );
+  globalThis.fetch = mockFetchOk(sseBody) as typeof fetch;
+  try {
+    await startChatStream({
+      url: "/api/plan-chat/draft/d_test/message",
+      body: { message: "hi" },
+      listeners,
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert.equal(captured.text.length, 1, "the text frame must still dispatch normally");
+  assert.equal(captured.text[0].text, "partial reply");
+  assert.equal(captured.done.length, 0, "no done frame arrived");
+  assert.equal(captured.error.length, 1, "silent close must synthesise an error frame");
+  // The banner string is intentionally specific so the user knows what
+  // happened — NOT a generic "stream error" / "network error".
+  assert.match(captured.error[0].message, /stream closed before .*done/);
+  // Synthesised events from the silent-close detector carry no exit
+  // info — that's a server-side property the wire never delivered.
+  assert.equal(captured.error[0].exitCode, null);
+  assert.equal(captured.error[0].signal, null);
+});
+
+test("startChatStream does NOT synthesise an error when the server emits `done`", async () => {
+  const { captured, listeners } = makeListeners();
+  const origFetch = globalThis.fetch;
+  const sseBody = [
+    "event: text",
+    `data: ${JSON.stringify({ blockId: "b1", text: "hi" })}`,
+    "",
+    "event: done",
+    `data: ${JSON.stringify({ messageId: "m_1", fullText: "hi" })}`,
+    "",
+    "",
+  ].join("\n");
+  globalThis.fetch = mockFetchOk(sseBody) as typeof fetch;
+  try {
+    await startChatStream({
+      url: "/api/plan-chat/draft/d_test/message",
+      body: { message: "hi" },
+      listeners,
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  assert.equal(captured.done.length, 1);
+  assert.equal(captured.error.length, 0, "no synthetic error when done arrived");
+});
+
+test("startChatStream does NOT double-fire when the server already emitted a structured error", async () => {
+  const { captured, listeners } = makeListeners();
+  const origFetch = globalThis.fetch;
+  const sseBody = [
+    "event: error",
+    `data: ${JSON.stringify({
+      message: "claude exited with code 2: bad model",
+      exitCode: 2,
+      signal: null,
+      stderrTail: "bad model",
+      promptFile: "/tmp/turn-1.txt",
+    })}`,
+    "",
+    "",
+  ].join("\n");
+  globalThis.fetch = mockFetchOk(sseBody) as typeof fetch;
+  try {
+    await startChatStream({
+      url: "/api/plan-chat/draft/d_test/message",
+      body: { message: "hi" },
+      listeners,
+    });
+  } finally {
+    globalThis.fetch = origFetch;
+  }
+  // Exactly one error frame — the server's. No silent-close synthesis.
+  assert.equal(captured.error.length, 1);
+  assert.equal(captured.error[0].exitCode, 2);
+  assert.equal(captured.error[0].promptFile, "/tmp/turn-1.txt");
 });

@@ -74,6 +74,7 @@ These live alongside this `SKILL.md` in the plugin's `skills/forge-planner/` dir
 
 ## Things to avoid
 
+- **Calling `ExitPlanMode` from the Workbench planner chat.** This skill is loaded by the Workbench's in-page planner chat, which spawns `claude --print` non-interactively — there is no IDE host listening for a plan-mode handoff. Calling `ExitPlanMode` (or `EnterPlanMode`) from this surface ends the turn before you've replied to the user, and the SSE stream closes without a `done` frame. Treat plan-mode tools as unavailable here; respond in plain assistant text and save via `forge spec save` like the rest of the workflow.
 - **Drafting on turn 1 without research** unless plan mode already did the research for you. Even then, glance at the named files to confirm they exist and the diff target is what the plan assumed.
 - **Adding YAML frontmatter to your draft.** Forge's `spec save` adds it. Start at `# Title`.
 - **Saving silently.** Surface the `taskId` and ask before launching. The user might want to critique the spec first (`forge critique <id>`) before committing tokens to a launch.
