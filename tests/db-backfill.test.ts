@@ -179,6 +179,53 @@ test("backfill reads legacy `tasks` key from pre-rename index.json", () => {
   }
 });
 
+test("backfill survives mixed state — plan already has live DB rows (regression)", () => {
+  // Reproduces the real-world bug seen on a populated ~/.forge/: a plan that
+  // already lives in the DB (via Phase 3 dual-write) and again in index.json.
+  // The first migrate run hit UNIQUE(plan_id, version_number) on plan_versions,
+  // INSERT OR IGNORE silently no-op'd, and the downstream FK lookup against
+  // the never-created `bf-pv-*` id crashed insertSyntheticTask.
+  const forgeDir = tmpForgeDir();
+  try {
+    const store = new ForgeStore({ forgeDir });
+    const db = new ForgeDb({ forgeDir });
+
+    const plan = baseTask({ id: "mixed-1", title: "Mixed live + JSON", specVersion: 1 });
+    seedTask(store, plan, "# body");
+
+    // Live writer landed a plan + plan_version + synthetic-task before the
+    // migrate run — exactly what dual-write produces on every saveSpec.
+    db.db
+      .prepare(
+        `INSERT INTO plans (id, title, repo_path, repo_branch, stage, created_at, updated_at)
+         VALUES (?, ?, ?, ?, 'drafting', ?, ?)`,
+      )
+      .run(plan.id, plan.title, plan.repoRoot, plan.branch, plan.createdAt, plan.createdAt);
+    db.db
+      .prepare(
+        `INSERT INTO plan_versions (id, plan_id, version_number, document, sections, created_by, created_at)
+         VALUES (?, ?, 1, '# body', '{}', 'user', ?)`,
+      )
+      .run(`pv-${plan.id}-v1`, plan.id, plan.createdAt);
+    db.db
+      .prepare(
+        `INSERT INTO tasks (id, plan_id, plan_version_id, sequence, title, spec, state, created_at, updated_at)
+         VALUES (?, ?, ?, 1, ?, '', 'ready', ?, ?)`,
+      )
+      .run(`t-${plan.id}`, plan.id, `pv-${plan.id}-v1`, plan.title, plan.createdAt, plan.createdAt);
+
+    // Migrate must not crash. New rows are zero (live writer already covered
+    // the plan), but the bridge resolves the existing live ids without choking.
+    const counts = backfillFromJson(store, db.db);
+    assert.equal(counts.plans, 0, "plan already in DB — no insert");
+    assert.equal(counts.planVersions, 0, "version already in DB — no insert");
+    assert.equal(counts.tasks, 0, "synthetic task already in DB — no insert");
+    db.close();
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
 test("backfill is idempotent — second run inserts zero rows", () => {
   const forgeDir = tmpForgeDir();
   try {

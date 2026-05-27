@@ -277,18 +277,31 @@ function insertPlan(db: Database, plan: Plan): void {
 
 function insertPlanVersion(db: Database, plan: Plan, store: ForgeStore): { id: string } {
   const version = Math.max(1, plan.specVersion ?? 1);
-  const id = planVersionId(plan.id, version);
+  const desiredId = planVersionId(plan.id, version);
   const document = store.getSpec(plan.id) ?? "";
   db.prepare(
     `INSERT OR IGNORE INTO plan_versions
      (id, plan_id, version_number, document, sections, open_questions, created_by, created_at, notes)
      VALUES (?, ?, ?, ?, '{}', NULL, 'backfill', ?, NULL)`,
-  ).run(id, plan.id, version, document, plan.createdAt);
-  return { id };
+  ).run(desiredId, plan.id, version, document, plan.createdAt);
+  // UNIQUE(plan_id, version_number) can block the insert when a live writer
+  // already wrote a `pv-{plan}-v{n}` row; INSERT OR IGNORE silently no-ops
+  // and the bf- id is never persisted. Resolve to whatever id actually
+  // owns this (plan_id, version_number) pair so the downstream FK holds.
+  const existing = db
+    .prepare("SELECT id FROM plan_versions WHERE plan_id = ? AND version_number = ?")
+    .get(plan.id, version) as { id: string } | undefined;
+  return { id: existing?.id ?? desiredId };
 }
 
 function insertSyntheticTask(db: Database, plan: Plan, planVersionId: string): void {
   const updatedAt = plan.completedAt ?? plan.launchedAt ?? plan.createdAt;
+  // Same hazard as plan_versions: the live writer's `t-{plan}` row may
+  // already own (plan_id, sequence=1). Skip the insert in that case — the
+  // synthetic row exists, just under a different id, and downstream queries
+  // resolve it by (plan_id, sequence) not by id.
+  const existing = db.prepare("SELECT id FROM tasks WHERE plan_id = ? AND sequence = 1").get(plan.id);
+  if (existing) return;
   db.prepare(
     `INSERT OR IGNORE INTO tasks
      (id, plan_id, plan_version_id, sequence, title, spec, plan_section_refs, estimated_diff_size,
@@ -312,6 +325,13 @@ function insertJobFromRunMeta(db: Database, plan: Plan, store: ForgeStore): void
   const metaRaw = store.readRunMeta(plan.id);
   if (!metaRaw) return;
   const meta = metaRaw as Partial<RunMeta>;
+  // Resolve the actual synthetic-task id (live `t-*` or backfill `bf-t-*`)
+  // by the (plan_id, sequence=1) lookup so the FK holds regardless of
+  // which writer got there first.
+  const taskRow = db.prepare("SELECT id FROM tasks WHERE plan_id = ? AND sequence = 1").get(plan.id) as
+    | { id: string }
+    | undefined;
+  if (!taskRow) return;
   db.prepare(
     `INSERT OR IGNORE INTO jobs
      (id, task_id, run_number, run_kind, session_id, worktree_path, branch_name, state,
@@ -319,7 +339,7 @@ function insertJobFromRunMeta(db: Database, plan: Plan, store: ForgeStore): void
      VALUES (?, ?, 1, 'initial', NULL, ?, ?, ?, ?, NULL, ?, ?, NULL, ?)`,
   ).run(
     jobId(plan.id),
-    syntheticTaskId(plan.id),
+    taskRow.id,
     meta.worktree ?? plan.worktree,
     plan.branch,
     mapJobState(meta.status),
