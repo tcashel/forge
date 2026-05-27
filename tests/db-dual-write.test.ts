@@ -39,6 +39,7 @@ function makeTask(overrides: Partial<Plan> = {}): Plan {
     specFile: "task-dw-1.md",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
     ...overrides,
   };
 }

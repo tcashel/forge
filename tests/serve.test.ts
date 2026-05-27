@@ -135,6 +135,7 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, repoName
     specFile: specPath,
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
 }
 
@@ -190,6 +191,7 @@ function makeBackedPlan(store: ForgeStore, id: string): Plan {
     specFile: `${id}.md`,
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
   store.upsertPlan(plan);
   store.writeSpec(id, `# Plan ${id}\nbody`);
@@ -649,6 +651,7 @@ test("running task surfaces section=running + log file path", async (t) => {
     specFile: h.store.writeSpec(id, "# running task\n"),
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
   // Drop a log file so hasLog flips true.
   fs.mkdirSync(path.join(h.store.runsDir, id), { recursive: true });
@@ -932,6 +935,7 @@ test("POST /api/plans/:id/kill flips status, merges errorMessage into run-meta",
     specFile: h.store.writeSpec(id, "# kill\n"),
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
 
   // Seed run-meta with an unrelated key so we can assert merge (not overwrite).
@@ -996,6 +1000,7 @@ test("POST /api/plans/:id/kill rejects already-done tasks (no state corruption)"
     specFile: h.store.writeSpec(id, "# done\n"),
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/kill`);
   assert.equal(status, 409);
@@ -1043,6 +1048,7 @@ test("POST /api/plans/:id/improve rejects non-draft tasks with 409", async (t) =
     specFile: h.store.writeSpec(id, "# x\n"),
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/improve`);
   assert.equal(status, 409);
@@ -1075,8 +1081,99 @@ test("POST /api/plans/:id/critique rejects non-draft tasks with 409", async (t) 
     specFile: h.store.writeSpec(id, "# x\n"),
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/plans/${id}/critique`);
   assert.equal(status, 409);
   assert.equal(body.error!.code, "BAD_STATE");
+});
+
+test("POST /api/plans/:id/archive hides a draft from /api/plans (and unarchive restores it)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "arc-route", h.tmpHome, "demo", "feat(demo): archivable");
+
+  const archived = await postJson(`${h.baseUrl}/api/plans/arc-route/archive`);
+  assert.equal(archived.status, 200);
+  assert.equal(archived.body.data!.status, "archived");
+  assert.ok(typeof archived.body.data!.archivedAt === "string");
+
+  const list = await getJson(`${h.baseUrl}/api/plans`);
+  const found = (list.body.data!.plans ?? []).find((p) => p.id === "arc-route");
+  assert.equal(found, undefined, "archived task must not surface in /api/plans");
+
+  const unarchived = await postJson(`${h.baseUrl}/api/plans/arc-route/unarchive`);
+  assert.equal(unarchived.body.data!.status, "draft");
+  assert.equal(unarchived.body.data!.archivedAt, null);
+
+  const list2 = await getJson(`${h.baseUrl}/api/plans`);
+  const back = (list2.body.data!.plans ?? []).find((p) => p.id === "arc-route");
+  assert.ok(back, "unarchived task reappears in /api/plans");
+});
+
+test("POST /api/plans/:id/archive rejects post-launch tasks with 409 BAD_STATE", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const now = new Date().toISOString();
+  h.store.upsertPlan({
+    id: "arc-running",
+    title: "feat(demo): running",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/arc-running",
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: "forge-arc-running",
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec("arc-running", "# x\n"),
+    specVersion: 1,
+    lastImproveError: null,
+    archivedAt: null,
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/arc-running/archive`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BAD_STATE");
+  assert.match(body.error!.message, /running/);
+});
+
+test("POST /api/plans/:id/archive returns 409 BUSY while a critique is mid-flight", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "arc-busy-http", h.tmpHome, "demo", "feat(demo): busy");
+  const critiqueId = "crit-busy-http";
+  h.store.writeCritiqueMeta("arc-busy-http", critiqueId, {
+    schemaVersion: 1,
+    planId: "arc-busy-http",
+    critiqueId,
+    specTitle: "feat(demo): busy",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    status: "running_critics",
+    startedAt: new Date().toISOString(),
+    completedAt: null,
+    viewedAt: null,
+    tmuxSession: `forge-${critiqueId}`,
+    criticA: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
+    criticB: { agent: "codex", model: "gpt-5-codex", status: "pending", durationMs: null },
+    synthesizer: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
+  });
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/arc-busy-http/archive`);
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "BUSY");
+});
+
+test("POST /api/plans/:id/archive returns 404 for unknown task", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/plans/nope/archive`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_TASK");
 });

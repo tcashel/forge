@@ -56,6 +56,7 @@ function baseTask(overrides: Partial<Plan>): Plan {
     specFile: "task-1.md",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
     ...overrides,
   };
 }

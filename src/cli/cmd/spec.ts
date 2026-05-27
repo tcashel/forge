@@ -1,5 +1,5 @@
 /**
- * forge spec <save|ls|show|improve|diff> — manage Forge specs.
+ * forge spec <save|ls|show|improve|diff|archive|unarchive> — manage Forge specs.
  *
  * - `forge spec save` reads body from stdin (or --from-file), generates
  *   YAML frontmatter, writes to ~/.forge/specs/<id>.md, registers the
@@ -10,8 +10,10 @@
  *   already-saved spec. Repeat invocations are cumulative.
  * - `forge spec diff <id>` prints a unified diff of the original vs. the
  *   live spec for the most recent critique (or `--from <critiqueId>`).
- * - `forge spec ls` lists known specs.
+ * - `forge spec ls` lists known specs (drafts by default).
  * - `forge spec show <id>` prints a saved spec (with --raw for body only).
+ * - `forge spec archive <id>` / `unarchive <id>` soft-archive a draft so
+ *   it stops surfacing in `ls` and the Workbench. Files stay on disk.
  */
 
 import { execFileSync } from "node:child_process";
@@ -20,7 +22,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import type { CritiqueAgent } from "../../core/critique.ts";
-import { recordPlanCreated } from "../../core/db/writes.ts";
+import { recordPlanArchived, recordPlanCreated, recordPlanUnarchived } from "../../core/db/writes.ts";
 import { type ImproveResult, runImprover } from "../../core/improve.ts";
 import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, Plan, ReasoningEffort, RepoConfig } from "../../core/store.ts";
@@ -29,7 +31,7 @@ import { CliError, emitOk } from "../output.ts";
 import { readStdin } from "../pickers.ts";
 import { renderMarkdown } from "../render-md.ts";
 
-export const HELP = `forge spec <save|ls|show|improve|diff> [...flags]
+export const HELP = `forge spec <save|ls|show|improve|diff|archive|unarchive> [...flags]
 
 Manage Forge specs.
 
@@ -68,11 +70,21 @@ forge spec diff <task-id> [--from <critiqueId>]
   (frontmatter stripped from both). Without --from, uses the most recent
   critique. Exit codes: 0 = identical, 1 = diff present, 2 = error.
 
-forge spec ls [--all] [--json]
-  List draft specs (current repo by default).
+forge spec ls [--archived | --all] [--json]
+  List saved specs in the current repo. By default lists drafts only.
+  --archived shows only archived specs; --all shows both.
 
 forge spec show <task-id> [--raw] [--json]
-  Print a saved spec. --raw strips frontmatter.
+  Print a saved spec. --raw strips frontmatter. Works on archived specs.
+
+forge spec archive <task-id> [--json]
+  Soft-archive a draft spec so it stops cluttering \`forge spec ls\` and
+  the Workbench Drafting section. The spec file and any critique
+  artifacts stay on disk; reverse with \`forge spec unarchive\`.
+  Rejected on post-launch tasks and while a critique/improve is in flight.
+
+forge spec unarchive <task-id> [--json]
+  Restore an archived spec to draft.
 `;
 
 function deriveTitle(body: string, override?: string): string {
@@ -276,6 +288,7 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
     specFile: "", // filled below
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
 
   const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
@@ -430,6 +443,11 @@ export interface ImproveSpecResult {
 export async function improveSpec(planId: string, store: ForgeStore): Promise<ImproveSpecResult> {
   const task = store.getPlan(planId);
   if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${planId}".`, { exitCode: 1 });
+  if (task.status === "archived") {
+    throw new CliError("BAD_STATE", `Task ${planId} is archived — run \`forge spec unarchive ${planId}\` first.`, {
+      exitCode: 1,
+    });
+  }
   if (task.status !== "draft") {
     throw new CliError(
       "BAD_STATE",
@@ -488,6 +506,116 @@ async function runImproveCmd(argv: string[], store: ForgeStore): Promise<void> {
     if (im.mode === "no-op") return `no actionable findings for ${result.planId}`;
     return `improve skipped for ${result.planId}: ${im.error ?? "unknown"}`;
   });
+}
+
+// ─── archive / unarchive ────────────────────────────────────────────────────
+
+export interface ArchiveSpecResult {
+  planId: string;
+  status: Plan["status"];
+  archivedAt: string | null;
+}
+
+/**
+ * Returns true when an auto-improve or critique is mid-flight for this plan
+ * — same signal `reapStaleCritiques` and the Workbench "Improving" pill use.
+ * Used to refuse archive while the spec is actively being rewritten.
+ */
+function isCritiqueInFlight(planId: string, store: ForgeStore): boolean {
+  const critiqueId = store.getLatestCritique(planId);
+  if (!critiqueId) return false;
+  const meta = store.readCritiqueMeta(planId, critiqueId);
+  if (!meta) return false;
+  return meta.status === "running_critics" || meta.status === "running_synth";
+}
+
+/**
+ * Soft-archive a draft spec. Programmatic core for `forge spec archive`;
+ * called by both the CLI shell and the HTTP server. Throws CliError on
+ * invalid state. Idempotent on already-archived specs.
+ */
+export function archiveSpec(planId: string, store: ForgeStore): ArchiveSpecResult {
+  const task = store.getPlan(planId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${planId}".`, { exitCode: 1 });
+  if (task.status === "archived") {
+    return { planId: task.id, status: task.status, archivedAt: task.archivedAt };
+  }
+  if (task.status !== "draft") {
+    throw new CliError("BAD_STATE", `Task ${planId} is in state "${task.status}" — archive only runs on draft specs.`, {
+      exitCode: 1,
+    });
+  }
+  if (isCritiqueInFlight(planId, store)) {
+    throw new CliError(
+      "BUSY",
+      `Task ${planId} has a critique/improve in flight — wait for it to finish (or fail) before archiving.`,
+      { exitCode: 1 },
+    );
+  }
+  const archivedAt = new Date().toISOString();
+  const updated: Plan = { ...task, status: "archived", archivedAt };
+  store.upsertPlan(updated);
+  try {
+    recordPlanArchived(store.db.db, task.id, archivedAt);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: recordPlanArchived failed for ${planId}: ${msg}\n`);
+  }
+  return { planId: task.id, status: updated.status, archivedAt };
+}
+
+/**
+ * Restore an archived spec to draft. Idempotent on already-draft specs.
+ */
+export function unarchiveSpec(planId: string, store: ForgeStore): ArchiveSpecResult {
+  const task = store.getPlan(planId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${planId}".`, { exitCode: 1 });
+  if (task.status === "draft") {
+    return { planId: task.id, status: task.status, archivedAt: null };
+  }
+  if (task.status !== "archived") {
+    throw new CliError(
+      "BAD_STATE",
+      `Task ${planId} is in state "${task.status}" — unarchive only runs on archived specs.`,
+      { exitCode: 1 },
+    );
+  }
+  const updatedAt = new Date().toISOString();
+  const updated: Plan = { ...task, status: "draft", archivedAt: null };
+  store.upsertPlan(updated);
+  try {
+    recordPlanUnarchived(store.db.db, task.id, updated.status, updatedAt);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: recordPlanUnarchived failed for ${planId}: ${msg}\n`);
+  }
+  return { planId: task.id, status: updated.status, archivedAt: null };
+}
+
+async function runArchiveCmd(argv: string[], store: ForgeStore): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: { json: { type: "boolean", default: false } },
+    strict: false,
+    allowPositionals: true,
+  });
+  const id = positionals[0];
+  if (!id) throw new CliError("MISSING_ARG", "Usage: forge spec archive <task-id> [--json]", { exitCode: 1 });
+  const result = archiveSpec(id, store);
+  emitOk(result, values.json === true, () => `archived ${result.planId}`);
+}
+
+async function runUnarchiveCmd(argv: string[], store: ForgeStore): Promise<void> {
+  const { values, positionals } = parseArgs({
+    args: argv,
+    options: { json: { type: "boolean", default: false } },
+    strict: false,
+    allowPositionals: true,
+  });
+  const id = positionals[0];
+  if (!id) throw new CliError("MISSING_ARG", "Usage: forge spec unarchive <task-id> [--json]", { exitCode: 1 });
+  const result = unarchiveSpec(id, store);
+  emitOk(result, values.json === true, () => `unarchived ${result.planId}`);
 }
 
 // ─── diff ───────────────────────────────────────────────────────────────────
@@ -581,20 +709,39 @@ async function runLs(argv: string[], store: ForgeStore): Promise<void> {
     options: {
       json: { type: "boolean", default: false },
       all: { type: "boolean", default: false },
+      archived: { type: "boolean", default: false },
     },
     strict: false,
     allowPositionals: true,
   });
 
-  let repoRoot: string | undefined;
-  if (!values.all) {
-    const detected = detectRepo(process.cwd());
-    repoRoot = detected?.root;
+  if (values.all && values.archived) {
+    throw new CliError("BAD_FLAGS", "--all and --archived are mutually exclusive.", { exitCode: 1 });
   }
 
-  const tasks = store.getPlans(repoRoot).filter((t) => t.status === "draft");
+  const detected = detectRepo(process.cwd());
+  const repoRoot = detected?.root;
+
+  const allTasks = store.getPlans(repoRoot);
+  let tasks: Plan[];
+  if (values.archived) {
+    tasks = allTasks.filter((t) => t.status === "archived");
+  } else if (values.all) {
+    tasks = allTasks.filter((t) => t.status === "draft" || t.status === "archived");
+  } else {
+    tasks = allTasks.filter((t) => t.status === "draft");
+  }
+
+  const empty = values.archived ? "(no archived specs)" : "(no draft specs)";
   emitOk({ tasks }, values.json === true, () =>
-    tasks.length === 0 ? "(no draft specs)" : tasks.map((t) => `  ${t.id}  ${t.title}  (${t.branch})`).join("\n"),
+    tasks.length === 0
+      ? empty
+      : tasks
+          .map((t) => {
+            const flag = t.status === "archived" ? " [archived]" : "";
+            return `  ${t.id}  ${t.title}  (${t.branch})${flag}`;
+          })
+          .join("\n"),
   );
 }
 
@@ -638,7 +785,7 @@ async function runShow(argv: string[], store: ForgeStore): Promise<void> {
 export async function run(argv: string[], store: ForgeStore): Promise<void> {
   const sub = argv[0];
   if (!sub || sub === "--help") {
-    process.stderr.write("Usage: forge spec <save|ls|show|improve|diff> [...args]\n");
+    process.stderr.write("Usage: forge spec <save|ls|show|improve|diff|archive|unarchive> [...args]\n");
     process.exit(sub ? 0 : 1);
   }
   switch (sub) {
@@ -652,9 +799,13 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
       return runImproveCmd(argv.slice(1), store);
     case "diff":
       return runDiff(argv.slice(1), store);
+    case "archive":
+      return runArchiveCmd(argv.slice(1), store);
+    case "unarchive":
+      return runUnarchiveCmd(argv.slice(1), store);
     default:
       throw new CliError("UNKNOWN_SUBCMD", `Unknown spec subcommand: ${sub}`, {
-        hint: "Try: forge spec save | ls | show | improve | diff",
+        hint: "Try: forge spec save | ls | show | improve | diff | archive | unarchive",
         exitCode: 1,
       });
   }

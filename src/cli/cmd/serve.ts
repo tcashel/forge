@@ -48,7 +48,7 @@ import type {
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
-import { saveSpec } from "./spec.ts";
+import { archiveSpec, saveSpec, unarchiveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
 
@@ -251,7 +251,12 @@ function statusInfo(
         critique,
       };
     case "done":
-      return { section: "done", statLabel: "PR opened", statClass: "done", error: null, critique };
+      return { section: "done", statLabel: "Merged", statClass: "done", error: null, critique };
+    case "archived":
+      // Archived plans are filtered out of /api/plans, but keep this exhaustive
+      // so the type checker stays happy and a stray archived plan doesn't crash.
+      return { section: "drafting", statLabel: "Archived", statClass: "drafting", error: null, critique };
+
     case "draft": {
       if (critiqueMeta?.status === "done" && !critiqueMeta.viewedAt) {
         return {
@@ -707,7 +712,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   if (pathname === "/api/plans") {
     const repo = url.searchParams.get("repo") || undefined;
     const section = url.searchParams.get("section") || undefined;
-    let tasks = store.getPlans();
+    let tasks = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) tasks = tasks.filter((t) => t.repoName === repo || t.repoRoot === repo);
     // Sync any running tasks so the UI sees fresh statuses on every poll.
     for (const t of tasks) {
@@ -721,7 +726,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       }
     }
     // Re-read after the sync to pick up any status changes.
-    let synced = store.getPlans();
+    let synced = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) synced = synced.filter((t) => t.repoName === repo || t.repoRoot === repo);
     let views = synced.map((t) => viewTask(t, store));
     if (section) views = views.filter((v) => v.section === section);
@@ -935,7 +940,7 @@ function listArtifactsForJob(store: ForgeStore, jobId: string): unknown[] {
 
 // ─── POST routes ─────────────────────────────────────────────────────────────
 
-const ACTION_TASK_PATH = /^\/api\/plans\/([^/]+)\/(launch|critique|improve|kill|resume)$/;
+const ACTION_TASK_PATH = /^\/api\/plans\/([^/]+)\/(launch|critique|improve|kill|resume|archive|unarchive)$/;
 const SPEC_PLAN_CHAT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat$/;
 const SPEC_PLAN_CHAT_ABORT_PATH = /^\/api\/specs\/([^/]+)\/plan-chat\/abort$/;
 const SPEC_PLAN_HISTORY_PATH = /^\/api\/specs\/([^/]+)\/plan-history$/;
@@ -972,6 +977,7 @@ function httpStatusFor(err: CliError): number {
     case "UNKNOWN_TASK":
       return 404;
     case "BAD_STATE":
+    case "BUSY":
       return 409;
     case "EMPTY_INPUT":
     case "NOT_A_REPO":
@@ -1387,6 +1393,26 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   if (action === "critique") {
     try {
       const result = await doCritique({ planId }, store);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  if (action === "archive") {
+    try {
+      const result = archiveSpec(planId, store);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
+  }
+
+  if (action === "unarchive") {
+    try {
+      const result = unarchiveSpec(planId, store);
       return jsonOk(result);
     } catch (e) {
       if (e instanceof CliError) return fromCliError(e);

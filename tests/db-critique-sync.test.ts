@@ -52,6 +52,7 @@ function task(): Plan {
     specFile: "plan-c1.md",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
 }
 

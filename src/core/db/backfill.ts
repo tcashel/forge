@@ -85,6 +85,8 @@ function mapPlanStage(status: Plan["status"]): string {
     case "failed":
     case "quality_failed":
       return "completed";
+    case "archived":
+      return "archived";
     default:
       return "drafting";
   }
@@ -258,11 +260,11 @@ function insertPlan(db: Database, plan: Plan): void {
     lastImproveError: plan.lastImproveError,
     originalStatus: plan.status,
   };
-  const updatedAt = plan.completedAt ?? plan.launchedAt ?? plan.createdAt;
+  const updatedAt = plan.archivedAt ?? plan.completedAt ?? plan.launchedAt ?? plan.createdAt;
   db.prepare(
     `INSERT OR IGNORE INTO plans
-     (id, title, repo_path, repo_branch, stage, intent, current_version_id, created_at, updated_at, metadata)
-     VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)`,
+     (id, title, repo_path, repo_branch, stage, intent, current_version_id, created_at, updated_at, archived_at, metadata)
+     VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?, ?)`,
   ).run(
     plan.id,
     plan.title,
@@ -271,6 +273,7 @@ function insertPlan(db: Database, plan: Plan): void {
     mapPlanStage(plan.status),
     plan.createdAt,
     updatedAt,
+    plan.archivedAt,
     JSON.stringify(metadata),
   );
 }

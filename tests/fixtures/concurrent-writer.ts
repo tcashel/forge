@@ -35,6 +35,7 @@ const task: Plan = {
   specFile: `/tmp/specs/${id}.md`,
   specVersion: 1,
   lastImproveError: null,
+  archivedAt: null,
 };
 
 store.upsertPlan(task);

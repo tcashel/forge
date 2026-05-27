@@ -20,7 +20,8 @@ type ActionId =
   | "launch"
   | "critique"
   | "improve"
-  | "kill";
+  | "kill"
+  | "archive";
 
 function actionsFor(t: PlanView): ActionDef[] {
   const items: ActionDef[] = [];
@@ -33,6 +34,7 @@ function actionsFor(t: PlanView): ActionDef[] {
     items.push({ label: "Review critique", cls: "btn-attention", action: "review-critique" });
     items.push({ label: "Launch anyway", cls: "btn-secondary", action: "launch" });
     items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
+    items.push({ label: "Archive", cls: "btn-ghost", action: "archive" });
   } else if (t.kind === "failed") {
     items.push({ label: "Open log", cls: "btn-primary", action: "open-log" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
@@ -41,10 +43,12 @@ function actionsFor(t: PlanView): ActionDef[] {
     items.push({ label: "Launch", cls: "btn-primary", action: "launch" });
     items.push({ label: "Critique", cls: "btn-secondary", action: "critique" });
     items.push({ label: "View spec", cls: "btn-ghost", action: "view-spec" });
+    items.push({ label: "Archive", cls: "btn-ghost", action: "archive" });
   } else if (t.section === "drafting") {
     items.push({ label: "View spec", cls: "btn-primary", action: "view-spec" });
     items.push({ label: "Run critique", cls: "btn-secondary", action: "critique" });
     items.push({ label: "Launch", cls: "btn-ghost", action: "launch" });
+    items.push({ label: "Archive", cls: "btn-ghost", action: "archive" });
   } else if (t.section === "done") {
     if (t.prUrl) items.push({ label: "Open PR", cls: "btn-primary", action: "open-pr" });
     items.push({ label: "View spec", cls: "btn-secondary", action: "view-spec" });
@@ -106,6 +110,15 @@ function dispatch(t: PlanView, action: ActionId): void | Promise<void> {
         {
           successMsg: `Killed ${t.id}`,
           confirm: "Kill this run?\n\nThe tmux session will be terminated and the task marked failed.",
+        },
+        refreshTasks,
+      );
+    case "archive":
+      return runAction(
+        `/api/plans/${encodeURIComponent(t.id)}/archive`,
+        {
+          successMsg: `Archived ${t.id}`,
+          confirm: "Archive this spec?",
         },
         refreshTasks,
       );

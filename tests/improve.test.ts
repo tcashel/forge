@@ -51,6 +51,7 @@ function seedTask(store: ForgeStore, id: string, body: string): Plan {
     specFile: "",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
   const fm = [
     "---",

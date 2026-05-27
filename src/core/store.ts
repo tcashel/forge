@@ -21,7 +21,8 @@ export type PlanStatus =
   | "done"
   | "failed"
   | "quality_failed"
-  | "fixing";
+  | "fixing"
+  | "archived";
 
 export type LaunchTarget = "claude" | "codex" | "opencode" | "gemini";
 
@@ -51,6 +52,12 @@ export interface Plan {
    * Surfaced in the Workbench so the user can retry or launch anyway.
    */
   lastImproveError: { mode: string; error: string; at: string } | null;
+  /**
+   * When the spec was soft-archived. Null while the spec is live; set on
+   * `forge spec archive`; cleared on `forge spec unarchive`. Paired with
+   * `status === "archived"`: status gates UI/CLI filters, archivedAt records when.
+   */
+  archivedAt: string | null;
 }
 
 export interface ForgeIndex {
@@ -284,6 +291,9 @@ export class ForgeStore {
         if (!("lastImproveError" in p)) {
           (p as Plan).lastImproveError = null;
         }
+        if (!("archivedAt" in p)) {
+          (p as Plan).archivedAt = null;
+        }
       }
       return index;
     } catch {
@@ -388,7 +398,8 @@ export class ForgeStore {
 
   /** Read meta.json status and sync back to index if changed. Returns updated plan or null. */
   syncPlanStatus(plan: Plan): Plan | null {
-    if (plan.status === "done" || plan.status === "failed" || plan.status === "draft") return null;
+    if (plan.status === "done" || plan.status === "failed" || plan.status === "draft" || plan.status === "archived")
+      return null;
     const meta = this.readRunMeta(plan.id);
     if (!meta) return null;
 

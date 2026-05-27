@@ -110,6 +110,7 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, title: s
     specFile: specPath,
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
   store.upsertPlan(task);
   return task;
