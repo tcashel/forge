@@ -102,6 +102,15 @@ function parseMetrics(raw: string | null | undefined): SessionMetrics {
  */
 export function upsertSession(db: Database, input: UpsertSessionInput): void {
   const merged = mergeMetrics(defaultMetrics(), input.metrics);
+  const state = input.state ?? "running";
+  // Re-running a deterministic id (e.g. fixer round n bumped to n again
+  // after a crash) must drop stale terminal fields when the caller is
+  // starting a fresh run — otherwise live duration and status semantics
+  // show a running session with last run's finished_at / exit_code.
+  // Caller intent: a terminal state passed in means "record a finalized
+  // row" (rare on insert), so we only clear when entering a non-terminal
+  // state.
+  const clearTerminal = state === "running";
   db.prepare(
     `INSERT INTO sessions
      (id, purpose, related_id, agent_adapter, model, started_at, finished_at, state,
@@ -117,7 +126,10 @@ export function upsertSession(db: Database, input: UpsertSessionInput): void {
        pid = excluded.pid,
        cwd = excluded.cwd,
        command_line = excluded.command_line,
-       metrics = excluded.metrics`,
+       metrics = excluded.metrics,
+       finished_at = CASE WHEN ? = 1 THEN NULL ELSE sessions.finished_at END,
+       exit_code   = CASE WHEN ? = 1 THEN NULL ELSE sessions.exit_code END,
+       error       = CASE WHEN ? = 1 THEN NULL ELSE sessions.error END`,
   ).run(
     input.id,
     input.purpose,
@@ -125,11 +137,14 @@ export function upsertSession(db: Database, input: UpsertSessionInput): void {
     input.agentAdapter,
     input.model,
     input.startedAt,
-    input.state ?? "running",
+    state,
     input.pid ?? null,
     input.cwd ?? null,
     input.commandLine ?? null,
     JSON.stringify(merged),
+    clearTerminal ? 1 : 0,
+    clearTerminal ? 1 : 0,
+    clearTerminal ? 1 : 0,
   );
 }
 
@@ -151,6 +166,22 @@ export function finalizeSession(db: Database, input: FinalizeSessionInput): void
   db.prepare(
     "UPDATE sessions SET finished_at = ?, state = ?, exit_code = ?, error = COALESCE(?, error), metrics = ? WHERE id = ?",
   ).run(input.finishedAt, input.state, input.exitCode ?? null, input.error ?? null, JSON.stringify(merged), input.id);
+}
+
+/**
+ * Promote drafting sessions for `draftId` so their Activity row links to
+ * the just-minted spec. Called from the draft promotion path — without
+ * this, promoted drafting rows keep `scopeKind='draft'` and the Spec
+ * column shows the draft slug forever.
+ */
+export function promoteDraftingSessions(db: Database, draftId: string, planId: string): void {
+  const rows = db
+    .prepare("SELECT id, metrics FROM sessions WHERE purpose = 'drafting' AND related_id = ?")
+    .all(draftId) as Array<{ id: string; metrics: string | null }>;
+  for (const row of rows) {
+    const merged = mergeMetrics(parseMetrics(row.metrics), { planId, scopeKind: "spec" });
+    db.prepare("UPDATE sessions SET metrics = ? WHERE id = ?").run(JSON.stringify(merged), row.id);
+  }
 }
 
 /**
@@ -481,9 +512,9 @@ export function recordCritiqueStarted(db: Database, task: Plan, meta: CritiqueMe
     insertCriticConfigIfMissing(db, meta.criticB.agent, meta.criticB.model, meta.startedAt);
     insertCriticConfigIfMissing(db, meta.synthesizer.agent, meta.synthesizer.model, meta.startedAt);
 
-    insertCritiqueSession(db, meta, "critic-a", "critique", meta.criticA);
-    insertCritiqueSession(db, meta, "critic-b", "critique", meta.criticB);
-    insertCritiqueSession(db, meta, "synth", "synthesis", meta.synthesizer);
+    insertCritiqueSession(db, meta, "critic-a", "critique", meta.criticA, task.id);
+    insertCritiqueSession(db, meta, "critic-b", "critique", meta.criticB, task.id);
+    insertCritiqueSession(db, meta, "synth", "synthesis", meta.synthesizer, task.id);
 
     insertLiveCriticRun(db, meta, "a", targetVersionId, meta.criticA);
     insertLiveCriticRun(db, meta, "b", targetVersionId, meta.criticB);
@@ -556,7 +587,13 @@ function insertCritiqueSession(
   slot: "critic-a" | "critic-b" | "synth",
   purpose: "critique" | "synthesis",
   agent: CritiqueMeta["criticA"],
+  planId: string,
 ): void {
+  // Synthesis sessions are not joinable to plans via critic_runs (only
+  // critic-a/b are), so stash planId in metrics so the Activity view can
+  // resolve the spec link without a fragile fallback.
+  const metrics: Record<string, unknown> = { reasoningEffort: agent.reasoningEffort };
+  if (purpose === "synthesis") metrics.planId = planId;
   db.prepare(
     `INSERT OR IGNORE INTO sessions
      (id, purpose, related_id, agent_adapter, model, started_at, finished_at, state,
@@ -570,7 +607,7 @@ function insertCritiqueSession(
     agent.model,
     meta.startedAt,
     meta.tmuxSession,
-    JSON.stringify({ reasoningEffort: agent.reasoningEffort }),
+    JSON.stringify(metrics),
   );
 }
 
@@ -582,10 +619,25 @@ function updateCritiqueSession(
 ): void {
   const state = mapCritiqueAgentState(agent.status);
   const done = agent.status === "done" || agent.status === "failed";
+  // Preserve metrics.planId (stashed by synthesis writers) across syncs.
+  // Without the merge, `syncCritiqueState` clobbers the synthesis session's
+  // plan linkage on every read-path call.
+  const existing = db.prepare("SELECT metrics FROM sessions WHERE id = ?").get(sessionId) as
+    | { metrics: string | null }
+    | undefined;
+  let merged: Record<string, unknown> = { durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort };
+  if (existing?.metrics) {
+    try {
+      const prior = JSON.parse(existing.metrics) as Record<string, unknown>;
+      if (typeof prior.planId === "string") merged.planId = prior.planId;
+    } catch {
+      // ignore parse errors; existing metrics blob may be corrupt
+    }
+  }
   db.prepare("UPDATE sessions SET state = ?, finished_at = ?, metrics = ? WHERE id = ?").run(
     state,
     done ? finishedAt : null,
-    JSON.stringify({ durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort }),
+    JSON.stringify(merged),
     sessionId,
   );
 }

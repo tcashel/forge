@@ -128,7 +128,12 @@ export function agentCommand(
  * shape so the runner can `tee -a $LOG_FILE` outside of this helper.
  */
 export function claudeJobCommand(model: string, promptFile: string, streamPath: string): string {
-  const jq = `jq -r --unbuffered 'if .type=="assistant" then (.message.content[]? | select(.type=="text") | .text) elif .type=="result" then (.result // empty) else empty end'`;
+  // The `result` event repeats the final assistant text, so projecting
+  // both `assistant` and `result` writes the answer twice. `claude
+  // --print` (no stream-json) only emits the final answer, so we mirror
+  // that by projecting `result` only — this preserves LogTab's existing
+  // shape (AC11).
+  const jq = `jq -r --unbuffered 'if .type=="result" then (.result // empty) else empty end'`;
   return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${jq}`;
 }
 

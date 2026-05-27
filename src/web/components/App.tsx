@@ -41,7 +41,7 @@ export function App() {
           {inTasks ? <PickupSection /> : null}
         </section>
         {inActivity ? (
-          <main class={`detail-pane activity-full-pane`} id="detail-pane">
+          <main class={`activity-full-pane`} id="detail-pane">
             <ActivityView />
           </main>
         ) : (

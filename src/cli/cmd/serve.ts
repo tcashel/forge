@@ -16,7 +16,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
-import { reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
+import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { buildPlanHistory } from "../../core/history.ts";
@@ -1070,8 +1070,13 @@ function resolvePlanRefForRow(
   if (!planId) {
     if (row.purpose === "execution") {
       planId = lookupPlanIdViaJob(store, row.id);
-    } else if (row.purpose === "critique" || row.purpose === "synthesis") {
+    } else if (row.purpose === "critique") {
       planId = lookupPlanIdViaCritique(store, row.id);
+    } else if (row.purpose === "synthesis") {
+      // Synthesis sessions are never written into critic_runs.session_id;
+      // resolve by walking related_id (= critiqueId) → critic_runs (slot a)
+      // → plan_versions. New writes also stash metrics.planId (preferred).
+      planId = lookupPlanIdViaSynthesis(store, row.related_id);
     } else if (row.purpose === "drafting" && metrics.scopeKind === "spec") {
       planId = row.related_id;
     }
@@ -1104,6 +1109,21 @@ function lookupPlanIdViaCritique(store: ForgeStore, sessionId: string): string |
          WHERE cr.session_id = ?`,
     )
     .get(sessionId) as { plan_id: string } | undefined;
+  return row?.plan_id ?? null;
+}
+
+function lookupPlanIdViaSynthesis(store: ForgeStore, critiqueId: string | null): string | null {
+  if (!critiqueId) return null;
+  // Either critic_run shares the same critique target plan version.
+  const row = store.db.db
+    .prepare(
+      `SELECT pv.plan_id
+         FROM critic_runs cr
+         JOIN plan_versions pv ON pv.id = cr.target_id AND cr.target_kind = 'plan_version'
+         WHERE cr.id LIKE ?
+         LIMIT 1`,
+    )
+    .get(`cr-${critiqueId}-%`) as { plan_id: string } | undefined;
   return row?.plan_id ?? null;
 }
 
@@ -1625,6 +1645,14 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     try {
       abortInFlight({ kind: "draft", id: draftId });
       promotePlanDraft(store.forgeDir, draftId, planId);
+      // Move the draft's Activity rows onto the spec. Without this the
+      // Spec column keeps showing the draft slug after promotion.
+      try {
+        promoteDraftingSessions(store.db.db, draftId, planId);
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`promote: promoteDraftingSessions failed: ${msg}\n`);
+      }
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
       return jsonErr(409, "PROMOTE_CONFLICT", msg);
