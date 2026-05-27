@@ -268,7 +268,15 @@ export class ForgeStore {
   readIndex(): ForgeIndex {
     if (!fs.existsSync(this.indexFile)) return { version: 1, plans: {} };
     try {
-      const index = JSON.parse(fs.readFileSync(this.indexFile, "utf-8")) as ForgeIndex;
+      // Pre-rename index files used `tasks` as the top-level map key. The
+      // backfill reader accepts both shapes (see backfill.ts readPlansFromIndex);
+      // mirror that here so the live reader doesn't silently lose every saved
+      // plan on installs that haven't been re-written yet.
+      const raw = JSON.parse(fs.readFileSync(this.indexFile, "utf-8")) as ForgeIndex & {
+        tasks?: Record<string, Plan>;
+      };
+      const plans = raw.plans ?? raw.tasks ?? {};
+      const index: ForgeIndex = { version: 1, plans };
       for (const p of Object.values(index.plans)) {
         if (typeof (p as Partial<Plan>).specVersion !== "number") {
           (p as Plan).specVersion = 1;

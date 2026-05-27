@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
+import { syncJobState } from "../../core/db/writes.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { buildPlanHistory } from "../../core/history.ts";
@@ -1345,7 +1346,21 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     // Locked merge: the runner's bash set_status writes meta concurrently,
     // so a naive read-spread-write would lose either field.
     store.mergeRunMeta(planId, { errorMessage: "Killed by user", status: "failed" });
-    store.upsertPlan({ ...task, status: "failed", completedAt: new Date().toISOString() });
+    const killedAt = new Date().toISOString();
+    store.upsertPlan({ ...task, status: "failed", completedAt: killedAt });
+    // Sync the SQLite jobs row too. syncPlanStatus early-returns once a plan
+    // is terminal, so without this the killed run stays `running` in DB
+    // surfaces (`forge run ls`, Runs tab, history) indefinitely.
+    try {
+      syncJobState(
+        store.db.db,
+        { ...task, status: "failed" },
+        { status: "failed", endedAt: killedAt, errorMessage: "Killed by user" },
+      );
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: syncJobState failed on kill for ${planId}: ${msg}\n`);
+    }
     return jsonOk({ killed: true, planId });
   }
 

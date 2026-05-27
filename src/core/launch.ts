@@ -778,18 +778,6 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
   };
   store.writeRunMeta(config.planId, meta);
 
-  // Phase 3 dual-write: also record this launch as a versioned jobs row.
-  // Failure here doesn't break the launch — the JSON meta.json above is
-  // still the live source of truth during the cutover. Dropped to a
-  // warning so the launch path stays robust to DB hiccups.
-  try {
-    const task = store.getPlan(config.planId);
-    if (task) recordJobStarted(store.db.db, task, meta);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    process.stderr.write(`warn: failed to record jobs row for ${config.planId}: ${msg}\n`);
-  }
-
   // Kill any stale session with the same name
   killTmuxSession(tmuxSession);
 
@@ -804,6 +792,20 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     if (!isTmuxSessionAlive(tmuxSession)) {
       return { tmuxSession, logFile, error: "tmux session died immediately — check runner script" };
     }
+
+    // Phase 3 dual-write: record the jobs row only after tmux is confirmed
+    // alive. Inserting earlier leaves a phantom `running` row when tmux
+    // fails — no later sync path covers a launch that never started.
+    // Failure here doesn't break the launch; meta.json is still the live
+    // source of truth during the cutover.
+    try {
+      const task = store.getPlan(config.planId);
+      if (task) recordJobStarted(store.db.db, task, meta);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: failed to record jobs row for ${config.planId}: ${msg}\n`);
+    }
+
     return { tmuxSession, logFile, error: null };
   } catch (e: any) {
     return { tmuxSession, logFile, error: `Failed to start tmux: ${e.message ?? e}` };

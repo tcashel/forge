@@ -288,9 +288,14 @@ function insertPlanVersion(db: Database, plan: Plan, store: ForgeStore): { id: s
   // already wrote a `pv-{plan}-v{n}` row; INSERT OR IGNORE silently no-ops
   // and the bf- id is never persisted. Resolve to whatever id actually
   // owns this (plan_id, version_number) pair so the downstream FK holds.
+  // ensurePlanAndSyntheticTask may also have minted an empty placeholder v1
+  // ahead of us — if we have the real document on disk, backfill that in.
   const existing = db
-    .prepare("SELECT id FROM plan_versions WHERE plan_id = ? AND version_number = ?")
-    .get(plan.id, version) as { id: string } | undefined;
+    .prepare("SELECT id, document FROM plan_versions WHERE plan_id = ? AND version_number = ?")
+    .get(plan.id, version) as { id: string; document: string } | undefined;
+  if (existing && existing.document === "" && document !== "") {
+    db.prepare("UPDATE plan_versions SET document = ? WHERE id = ?").run(document, existing.id);
+  }
   return { id: existing?.id ?? desiredId };
 }
 
@@ -374,7 +379,10 @@ function insertCritiqueRecords(db: Database, _task: Plan, planVersionId: string,
   insertCriticRun(db, criticRunId(meta.critiqueId, "a"), meta.criticA, sessionForA, planVersionId, meta);
   insertCriticRun(db, criticRunId(meta.critiqueId, "b"), meta.criticB, sessionForB, planVersionId, meta);
 
-  if (meta.status === "done" || meta.status === "failed") {
+  // Only "done" critiques produced a real synthesis. Inserting a synthesis
+  // row for a failed critique would render in history as the misleading
+  // literal "ready" (see history.ts:formatSynthesis on NULL recommendation).
+  if (meta.status === "done") {
     db.prepare(
       `INSERT OR IGNORE INTO critic_syntheses
        (id, target_kind, target_id, critic_run_ids, agreements, disagreements, recommendation, created_at)

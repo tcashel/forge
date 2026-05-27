@@ -303,8 +303,11 @@ export function syncCritiqueState(db: Database, meta: CritiqueMeta): void {
       liveCriticRunId(meta.critiqueId, "b"),
     );
 
-    // Synthesis row appears when the critique reaches a terminal state.
-    if (meta.status === "done" || meta.status === "failed") {
+    // Synthesis row only appears when the synthesizer actually produced
+    // output. Failed critiques have no synthesis — inserting a row with a
+    // NULL recommendation would surface in history.ts:formatSynthesis as
+    // the misleading literal "ready".
+    if (meta.status === "done") {
       const targetRow = db
         .prepare("SELECT target_id FROM critic_runs WHERE id = ? LIMIT 1")
         .get(liveCriticRunId(meta.critiqueId, "a")) as { target_id: string } | undefined;
@@ -488,6 +491,15 @@ function ensurePlanAndSyntheticTask(db: Database, task: Plan): void {
        (id, plan_id, version_number, document, sections, open_questions, created_by, created_at, notes)
        VALUES (?, ?, 1, '', '{}', NULL, 'backfill', ?, NULL)`,
     ).run(firstVersionId, task.id, task.createdAt);
+    // Point the plan at the placeholder we just minted. Without this,
+    // recordCritiqueStarted's `if (!targetVersionId) return` short-circuits
+    // and the first critique on a self-healed legacy plan never lands its
+    // sessions/critic_runs in SQLite. The `IS NULL` guard avoids clobbering
+    // a pointer set by a concurrent writer (backfill, saveSpec).
+    db.prepare("UPDATE plans SET current_version_id = ? WHERE id = ? AND current_version_id IS NULL").run(
+      firstVersionId,
+      task.id,
+    );
   }
 
   db.prepare(
