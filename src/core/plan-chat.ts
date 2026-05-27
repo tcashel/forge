@@ -405,6 +405,45 @@ function turnPromptFile(chatDir: string, scope: ScopeRef, turn: number): string 
 /** Cap on a single tool_result `output` string before we mark it truncated. */
 const TOOL_RESULT_MAX_BYTES = 4 * 1024;
 
+/** Max bytes of stderr forwarded to the client in an `error` SSE frame. */
+const STDERR_TAIL_MAX = 500;
+
+/** Take the first non-empty line of `text` so the banner summary stays compact. */
+function firstLine(text: string): string {
+  for (const line of text.split("\n")) {
+    const t = line.trim();
+    if (t.length > 0) return t.length > 200 ? `${t.slice(0, 200)}…` : t;
+  }
+  return "";
+}
+
+/**
+ * Trim the trailing slice of `stderrBuf` to ≤500 chars and strip C0/C1
+ * control characters except `\n` and `\t` — preserves newlines so the UI
+ * can render multi-line stderr legibly while keeping ANSI escapes and
+ * terminal-control noise out of the JSON payload.
+ */
+export function cleanStderrTail(stderrBuf: string): string | null {
+  if (!stderrBuf) return null;
+  const sliced = stderrBuf.slice(-STDERR_TAIL_MAX);
+  let out = "";
+  for (let i = 0; i < sliced.length; i++) {
+    const code = sliced.charCodeAt(i);
+    // Keep \t (0x09) and \n (0x0a) so multi-line stderr stays legible.
+    // Drop other C0 controls (0x00-0x1f), DEL (0x7f), and C1 (0x80-0x9f) —
+    // they'd otherwise smuggle ANSI escapes / terminal noise into JSON.
+    if (code === 0x09 || code === 0x0a) {
+      out += sliced[i];
+    } else if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
+      continue;
+    } else {
+      out += sliced[i];
+    }
+  }
+  const trimmed = out.trim();
+  return trimmed.length > 0 ? trimmed : null;
+}
+
 /**
  * Stringify and truncate a tool_result `content` payload. Claude returns
  * either a plain string or an array of `{type:"text",text:string}` blocks
@@ -445,7 +484,7 @@ export function summarizeToolResultContent(content: unknown): { output: string; 
  *   - `event: tool_result` data: {toolUseId, output, isError, truncated}
  *   - `event: rate_limit`  data: {status, resetsAt}
  *   - `event: done`        data: {messageId, fullText, durationMs, totalCostUsd, numTurns, stopReason}
- *   - `event: error`       data: {message}
+ *   - `event: error`       data: {message, exitCode, signal, stderrTail, promptFile}
  *
  * Also writes periodic SSE comment lines (`: hb\n\n`) to keep WebKit
  * fetch and intermediate proxies from timing out the read during long
@@ -453,13 +492,20 @@ export function summarizeToolResultContent(content: unknown): { output: string; 
  * `system/api_retry` notices are forwarded as SSE comments for the same
  * reason. Comments are ignored by SSE consumers.
  *
- * Side effects: writes the user message to history before spawn, and the
- * assistant message (with both `text` and `blocks`) after the child
- * exits *as long as we accumulated any blocks* — including when the
- * client already disconnected. That way a transient SSE break (the
- * browser fetch dropping mid-stream) doesn't lose the agent's reply.
- * Removes the per-turn prompt file on success; keeps it on failure for
- * debugging.
+ * Side effects:
+ *  - Writes the user message to history before spawn.
+ *  - On clean exit (code 0) with any accumulated content, persists the
+ *    assistant message (with both `text` and `blocks`) — even when the
+ *    client already disconnected. That way a transient SSE break (browser
+ *    fetch dropping mid-stream) doesn't lose the agent's reply.
+ *  - On non-zero exit or signal-terminated exit, does NOT persist the
+ *    partial turn (so a re-send doesn't inherit poisoned context) and
+ *    emits a structured `error` SSE frame whose payload includes
+ *    `exitCode`, `signal`, `stderrTail`, and the retained prompt file
+ *    path so the UI can show the user what actually went wrong instead
+ *    of a generic network error.
+ *  - Removes the per-turn prompt file on success; keeps it on failure
+ *    for debugging.
  */
 export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const { forgeDir, scope, message } = opts;
@@ -775,7 +821,13 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       });
 
       child.on("error", (err) => {
-        send("error", { message: `spawn error: ${err.message}` });
+        send("error", {
+          message: `spawn error: ${err.message}`,
+          exitCode: null,
+          signal: null,
+          stderrTail: cleanStderrTail(stderrBuf),
+          promptFile,
+        });
         close();
       });
 
@@ -791,7 +843,7 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           .map((b) => b.text)
           .join("\n")
           .trim();
-        // We persist whenever we have accumulated content, even if the
+        // We persist on clean exit (code 0) with content even if the
         // client already disconnected (`cancelled === true`). This is the
         // recovery path for a transient SSE break: the browser's fetch
         // can die mid-stream (WebKit "Load failed"), but the spawned
@@ -801,11 +853,18 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
         // only their question with no reply, even though the agent
         // finished.
         //
+        // Crucially, we do NOT persist partial blocks when claude exits
+        // non-zero or via signal: a re-send would otherwise inherit a
+        // poisoned conversation with a half-baked assistant turn the
+        // user never saw a `done` for. The UI keeps the partial blocks
+        // visible alongside the structured error banner so the user can
+        // still read what arrived.
+        //
         // The `done` and `error` SSE frames are still gated on the
         // controller being live (`!cancelled`) because nothing's
         // listening on the other side when it's not.
         const haveContent = turnBlocks.length > 0 || fullText.length > 0;
-        const cleanExit = (code === 0 || cancelled) && haveContent;
+        const cleanExit = code === 0 && haveContent;
         if (cleanExit) {
           const assistantMsg: ChatMessage = {
             id: newMessageId(),
@@ -835,17 +894,29 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           } catch (e) {
             const msg = e instanceof Error ? e.message : String(e);
             // Best effort: only the live-stream path gets the error frame.
-            if (!cancelled) send("error", { message: `failed to persist assistant message: ${msg}` });
+            if (!cancelled) {
+              send("error", {
+                message: `failed to persist assistant message: ${msg}`,
+                exitCode: code,
+                signal,
+                stderrTail: cleanStderrTail(stderrBuf),
+                promptFile,
+              });
+            }
           }
         } else if (!cancelled) {
           // Non-zero exit OR no content, and the client is still
-          // listening — keep the prompt file for debug, surface why.
-          const why = signal
-            ? `claude exited via signal ${signal}`
+          // listening — keep the prompt file for debug, surface the
+          // structured payload so the UI can show what actually went
+          // wrong (exit code / signal / stderr tail / prompt file path)
+          // instead of a generic "network error".
+          const tail = cleanStderrTail(stderrBuf);
+          const message = signal
+            ? `claude exited via signal ${signal}${tail ? `: ${firstLine(tail)}` : ""}`
             : code !== 0
-              ? `claude exited with code ${code}${stderrBuf ? `: ${stderrBuf.trim().slice(0, 500)}` : ""}`
-              : "claude produced no output";
-          send("error", { message: why });
+              ? `claude exited with code ${code}${tail ? `: ${firstLine(tail)}` : ""}`
+              : "claude produced no output before exiting cleanly";
+          send("error", { message, exitCode: code, signal, stderrTail: tail, promptFile });
         }
         close();
       });

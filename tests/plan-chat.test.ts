@@ -17,7 +17,14 @@ import * as path from "node:path";
 import { PassThrough, Readable } from "node:stream";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
-import { BadCwdError, type ChatMessage as ChatMsgType, loadHistory, runChatTurn } from "../src/core/plan-chat.ts";
+import {
+  BadCwdError,
+  type ChatMessage as ChatMsgType,
+  cleanStderrTail,
+  loadHistory,
+  loadSkillPrompt,
+  runChatTurn,
+} from "../src/core/plan-chat.ts";
 import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -366,7 +373,9 @@ test("POST /api/specs/:id/plan-chat/abort returns aborted: false when nothing in
 
 interface StubChildOptions {
   stdout?: string;
-  exitCode?: number;
+  stderr?: string;
+  exitCode?: number | null;
+  exitSignal?: NodeJS.Signals | null;
 }
 
 function makeStubChild(opts: StubChildOptions = {}): EventEmitter & {
@@ -380,12 +389,12 @@ function makeStubChild(opts: StubChildOptions = {}): EventEmitter & {
     kill: (sig?: string) => boolean;
   };
   emitter.stdout = Readable.from(Buffer.from(opts.stdout ?? "ok\n"));
-  emitter.stderr = Readable.from(Buffer.from(""));
+  emitter.stderr = Readable.from(Buffer.from(opts.stderr ?? ""));
   emitter.kill = () => true;
   // Defer the close event to the next tick so the consumer has time to
   // wire up its `data` / `close` handlers in the ReadableStream start().
   setImmediate(() => {
-    emitter.emit("close", opts.exitCode ?? 0, null);
+    emitter.emit("close", opts.exitCode ?? 0, opts.exitSignal ?? null);
   });
   return emitter;
 }
@@ -1082,4 +1091,201 @@ test("runChatTurn does NOT persist an empty turn when the client disconnects bef
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
+});
+
+// ─── Structured error frame on failure (Suspects 2, 3, 4) ──────────────────
+//
+// These are synthetic reproductions for the failure mode this PR chases:
+// the planner chat occasionally dies as a generic "network error" with no
+// actionable detail. We exercise the three plausible server-side root
+// causes from the spec — non-zero exit with stderr (Suspect 2), child
+// SIGTERM'd mid-stream (Suspect 3), and a silent close from the route
+// handler / proxy (Suspect 4, covered client-side in sse-chat-dispatch
+// tests). For each, the SSE `error` frame must carry the structured
+// `{message, exitCode, signal, stderrTail, promptFile}` payload so the
+// chat UI can show the user what actually went wrong instead of swallowing
+// it in favor of "Failed to fetch".
+
+function findErrorFrame(frames: ParsedFrame[]): ParsedFrame | undefined {
+  return frames.find((f) => f.event === "error");
+}
+
+test("Suspect 2 — claude exits non-zero with stderr: server emits structured error SSE frame", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-nonzero-exit-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    // Realistic stream-json prefix + a recognisable stderr fragment + non-
+    // zero exit. Mirrors what we'd see if claude ran for a bit, hit a
+    // failure case, and aborted.
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+      `{"type":"assistant","message":{"id":"msg_a","content":[{"type":"text","text":"starting to think…"}]},"session_id":"sX"}`,
+      "",
+    ].join("\n");
+    const stderr =
+      "Error: ENOENT no such directory '/repo'\n  at Module._resolveFilename (node:internal/modules/cjs/loader)\n";
+
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_err00001" },
+      message: "do the thing",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => makeStubChild({ stdout, stderr, exitCode: 2 }) as never,
+    });
+    const sse = await drainSse(result.stream);
+    const frames = parseSseFrames(sse);
+
+    const err = findErrorFrame(frames);
+    assert.ok(err, "non-zero exit must emit an `error` SSE frame");
+    const data = err!.data as {
+      message: string;
+      exitCode: number | null;
+      signal: string | null;
+      stderrTail: string | null;
+      promptFile: string;
+    };
+    assert.equal(data.exitCode, 2, "exit code must be carried verbatim");
+    assert.equal(data.signal, null);
+    assert.ok(data.stderrTail, "stderrTail must be populated");
+    assert.match(data.stderrTail!, /ENOENT no such directory/, "stderr fragment must be preserved");
+    assert.match(data.message, /code 2/, "message references exit code 2 so the user knows it failed");
+    assert.match(data.message, /ENOENT/, "message includes a recognisable fragment of stderr");
+    assert.ok(typeof data.promptFile === "string" && data.promptFile.length > 0, "promptFile must be set");
+    assert.match(data.promptFile, /turn-\d+\.txt$/, "promptFile points at the retained turn file");
+    assert.equal(fs.existsSync(data.promptFile), true, "prompt file must remain on disk for post-mortem");
+
+    // Partial assistant turn must NOT be persisted to history — otherwise
+    // a re-send would inherit the broken context. The UI keeps the
+    // already-streamed blocks visible until the next user turn (frontend
+    // failedBlocks signal in PlannerChat.tsx).
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_err00001" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.equal(assistant, undefined, "non-zero exit must not persist a partial assistant turn");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("Suspect 3 — claude SIGTERM'd mid-stream: error frame carries the signal name", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-sigterm-mid-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+
+    const ctl = makeControllableChild();
+    const result = runChatTurn({
+      forgeDir,
+      scope: { kind: "draft", id: "d_sigterm0" },
+      message: "hi",
+      cwd: repoRoot,
+      heartbeatIntervalMs: 0,
+      spawnImpl: () => ctl.child as never,
+    });
+
+    // Emit a partial text block, then "reap" the child mid-stream (the
+    // 5-min reaper does exactly this via SIGTERM). Crucially the client
+    // is still listening — this is NOT a cancel, it's a server-side
+    // teardown — so we must surface a structured error.
+    ctl.pushLine(
+      `{"type":"system","subtype":"init","cwd":"/x","session_id":"sX","tools":[],"model":"m","permissionMode":"bypassPermissions"}`,
+    );
+    ctl.pushLine(
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"about to be killed"}]},"session_id":"sX"}`,
+    );
+    // Drain a couple of chunks so the parser has consumed both lines
+    // before the child dies — otherwise the assistant frame races with
+    // the close.
+    const reader = result.stream.getReader();
+    const dec = new TextDecoder();
+    let raw = "";
+    for (let i = 0; i < 6; i++) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      raw += dec.decode(value, { stream: true });
+      if (/event: text/.test(raw)) break;
+    }
+    // Now SIGTERM. code=null, signal="SIGTERM".
+    ctl.exit(null as unknown as number, "SIGTERM");
+    while (true) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      if (value) raw += dec.decode(value, { stream: true });
+    }
+    raw += dec.decode();
+
+    const frames = parseSseFrames(raw);
+    const err = findErrorFrame(frames);
+    assert.ok(err, "signal-terminated child must emit an `error` SSE frame");
+    const data = err!.data as {
+      message: string;
+      exitCode: number | null;
+      signal: string | null;
+      promptFile: string;
+    };
+    assert.equal(data.signal, "SIGTERM", "signal name must be forwarded");
+    assert.match(data.message, /SIGTERM/, "banner message names the signal");
+    assert.equal(fs.existsSync(data.promptFile), true, "prompt file retained for post-mortem");
+
+    // History must NOT contain the partial reply.
+    const history = loadHistory(forgeDir, { kind: "draft", id: "d_sigterm0" });
+    const assistant = history.messages.find((m) => m.role === "assistant");
+    assert.equal(assistant, undefined, "signal-killed turn must not persist its partial blocks to history");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("cleanStderrTail strips control chars but preserves newlines and tabs", () => {
+  // ANSI escape sequence + tab + newline + DEL + visible text. We want
+  // the newline and tab kept, the escape and DEL stripped.
+  const raw = "[31mError[0m:\tunexpected\ntab and newline survive";
+  const cleaned = cleanStderrTail(raw);
+  assert.ok(cleaned);
+  assert.equal(cleaned!.includes(""), false, "ANSI escape stripped");
+  assert.equal(cleaned!.includes(""), false, "DEL stripped");
+  // `\t` (0x09) must survive. The leftover `[31m` / `[0m` fragments come
+  // from the original ANSI escape (the `\x1b` got stripped but the visible
+  // suffix didn't). The point is the tab is still there.
+  assert.ok(cleaned!.includes("\tunexpected"), "tab character preserved");
+  assert.match(cleaned!, /tab and newline survive/, "post-newline content preserved");
+  assert.ok(cleaned!.includes("\n"), "newline preserved");
+});
+
+test("cleanStderrTail returns null for empty / whitespace-only / null-byte stderr", () => {
+  assert.equal(cleanStderrTail(""), null);
+  assert.equal(cleanStderrTail("   "), null);
+  assert.equal(cleanStderrTail("   "), null);
+});
+
+test("cleanStderrTail caps the result at the last ≤500 chars", () => {
+  const raw = "x".repeat(800) + "\nfinal-line";
+  const cleaned = cleanStderrTail(raw);
+  assert.ok(cleaned);
+  // Final line survives at the tail.
+  assert.match(cleaned!, /final-line$/);
+  // No more than the cap.
+  assert.ok(cleaned!.length <= 500);
+});
+
+test("loadSkillPrompt forbids calling ExitPlanMode from the Workbench planner chat", () => {
+  const prompt = loadSkillPrompt();
+  // The skill is shared across the Forge planner CLI and the Workbench
+  // chat surface. The chat surface runs non-interactively, so we must
+  // explicitly tell the model not to invoke plan-mode tools — calling
+  // ExitPlanMode here ends the turn before the model replies and the SSE
+  // stream closes without a `done` frame.
+  assert.match(prompt, /ExitPlanMode/i, "the prompt must mention ExitPlanMode by name");
+  // The instruction must be a prohibition, not a hint. Look for one of
+  // the conventional negative-instruction phrasings.
+  assert.match(
+    prompt,
+    /(do not call|do not invoke|don't call|don't invoke|never call|never invoke|treat plan-mode tools as unavailable)/i,
+  );
 });

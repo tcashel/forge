@@ -10,7 +10,7 @@
 import { type Signal, useSignal } from "@preact/signals";
 import { useEffect, useRef } from "preact/hooks";
 import { type ApiError, apiGet, apiPost } from "../../lib/api";
-import { type ChatMeta, type ChatRateLimit, startChatStream } from "../../lib/sse";
+import { type ChatErrorEvent, type ChatMeta, type ChatRateLimit, startChatStream } from "../../lib/sse";
 import { showToast } from "../../lib/toast";
 import type { ChatBlock, ChatMessage as ChatMessageType, PlanHistoryResponse } from "../../types";
 import { ChatMessage } from "./ChatMessage";
@@ -78,7 +78,12 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
   const streamingRate = useSignal<ChatRateLimit | null>(null);
   const isStreaming = useSignal<boolean>(false);
   const loading = useSignal<boolean>(true);
-  const error = useSignal<string | null>(null);
+  const error = useSignal<ChatErrorEvent | null>(null);
+  // Partial blocks captured from the last failed turn. The server does
+  // not persist these to history (would poison the next turn), but the
+  // user still wants to see what arrived alongside the error banner.
+  // Cleared on the next `send()`.
+  const failedBlocks = useSignal<ChatBlock[]>([]);
 
   const scrollRef = useRef<HTMLDivElement | null>(null);
   // Track an active AbortController so the user-initiated Stop button
@@ -101,7 +106,13 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
       })
       .catch((e: ApiError) => {
         if (cancelled) return;
-        error.value = e.message || "Failed to load chat history.";
+        error.value = {
+          message: e.message || "Failed to load chat history.",
+          exitCode: null,
+          signal: null,
+          stderrTail: null,
+          promptFile: null,
+        };
         loading.value = false;
       });
     return () => {
@@ -154,6 +165,9 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
     // a follow-up.
     draft.value = "";
     error.value = null;
+    // Drop the previous turn's failed-partial bubble on send — the user
+    // has chosen to move past it.
+    failedBlocks.value = [];
 
     // Optimistically render the user message (the server appends it
     // synchronously before spawning, so this just hides latency).
@@ -237,14 +251,17 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
               .trim();
             receivedFullText = final.fullText || fallback;
           },
-          onError: (msg) => {
-            error.value = msg;
+          onError: (e) => {
+            error.value = e;
           },
         },
       });
     } finally {
       isStreaming.value = false;
       abortRef.current = null;
+      // Snapshot what we'd already streamed before swapping out the live
+      // bubble — used below if the turn ended in failure.
+      const snapshot = workingBlocks.slice();
       streamingBlocks.value = [];
       streamingMeta.value = null;
       streamingRate.value = null;
@@ -277,11 +294,28 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
         try {
           await refreshHistory();
           const latest = messages.value[messages.value.length - 1];
-          if (latest && latest.role === "assistant") error.value = null;
+          if (latest && latest.role === "assistant") {
+            error.value = null;
+            failedBlocks.value = [];
+          } else if (snapshot.length > 0) {
+            // Server did NOT persist the partial reply (non-zero exit).
+            // Keep the blocks visible alongside the error banner so the
+            // user can see what arrived before the failure.
+            failedBlocks.value = snapshot;
+          }
         } catch (e) {
           const apiErr = e as ApiError;
           // Don't clobber a more specific stream error if one's already set.
-          if (!error.value) error.value = apiErr.message || "Failed to refresh history.";
+          if (!error.value) {
+            error.value = {
+              message: apiErr.message || "Failed to refresh history.",
+              exitCode: null,
+              signal: null,
+              stderrTail: null,
+              promptFile: null,
+            };
+          }
+          if (snapshot.length > 0) failedBlocks.value = snapshot;
         }
       }
       requestAnimationFrame(scrollToBottom);
@@ -316,6 +350,8 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       messages.value = [];
       streamingBlocks.value = [];
+      failedBlocks.value = [];
+      error.value = null;
       showToast("Plan-chat history wiped.", "info");
     } catch (e) {
       showToast(`Wipe failed: ${e instanceof Error ? e.message : String(e)}`, "error");
@@ -365,10 +401,11 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
         {messages.value.map((m) => (
           <ChatMessage key={m.id} m={m} />
         ))}
+        {!isStreaming.value && failedBlocks.value.length > 0 ? <FailedBubble blocks={failedBlocks.value} /> : null}
         {isStreaming.value ? (
           <StreamingBubble blocks={streamingBlocks.value} meta={streamingMeta.value} rate={streamingRate.value} />
         ) : null}
-        {error.value ? <div class="chat-error">{error.value}</div> : null}
+        {error.value ? <ChatErrorBanner error={error.value} /> : null}
       </div>
       <ChatComposer
         draft={draft}
@@ -501,6 +538,77 @@ function StreamingBubble({ blocks, meta, rate }: StreamingBubbleProps) {
           <div class="chat-stream-rate">rate-limit: {rate.status}</div>
         ) : null}
       </div>
+    </div>
+  );
+}
+
+// ─── Failed bubble ─────────────────────────────────────────────────────────
+// Renders the partial blocks captured from a turn that ended in failure.
+// Visually distinct from the live streaming bubble (no cursor, no
+// "thinking…" placeholder) so the user can see immediately that this is
+// the trailing edge of a failed turn rather than something still in
+// progress. The server does NOT persist these blocks to history.
+
+interface FailedBubbleProps {
+  blocks: ChatBlock[];
+}
+
+function FailedBubble({ blocks }: FailedBubbleProps) {
+  const resultsById = new Map<string, Extract<ChatBlock, { type: "tool_result" }>>();
+  for (const b of blocks) if (b.type === "tool_result") resultsById.set(b.toolUseId, b);
+  const segments = blocks.filter((b) => b.type !== "tool_result");
+  if (segments.length === 0) return null;
+  return (
+    <div class="chat-message assistant failed">
+      <div class="chat-bubble">
+        {segments.map((b, i) => {
+          if (b.type === "text") {
+            return (
+              <p key={`ft-${i}`} class="chat-stream-text">
+                {b.text}
+              </p>
+            );
+          }
+          if (b.type === "tool_use") {
+            return <ChatToolCard key={`ftu-${b.id}`} use={b} result={resultsById.get(b.id) ?? null} />;
+          }
+          return null;
+        })}
+      </div>
+    </div>
+  );
+}
+
+// ─── Error banner ──────────────────────────────────────────────────────────
+// Renders the structured `ChatErrorEvent` payload. `message` is shown
+// verbatim — that's the server's actual explanation of what went wrong
+// (exit code, signal, etc.), not a generic "network error". The
+// remaining fields are tucked behind a `<details>` so a curious user
+// can copy the prompt-file path or scan the stderr tail.
+
+function ChatErrorBanner({ error }: { error: ChatErrorEvent }) {
+  const hasDetails =
+    error.exitCode !== null || error.signal !== null || error.stderrTail !== null || error.promptFile !== null;
+  return (
+    <div class="chat-error">
+      <div class="chat-error-message">{error.message}</div>
+      {hasDetails ? (
+        <details class="chat-error-details">
+          <summary>Details</summary>
+          {error.exitCode !== null ? <div>exit code: {error.exitCode}</div> : null}
+          {error.signal !== null ? <div>signal: {error.signal}</div> : null}
+          {error.promptFile !== null ? (
+            <div>
+              prompt file: <code>{error.promptFile}</code>
+            </div>
+          ) : null}
+          {error.stderrTail !== null ? (
+            <pre class="chat-error-stderr">
+              <code>{error.stderrTail}</code>
+            </pre>
+          ) : null}
+        </details>
+      ) : null}
     </div>
   );
 }
