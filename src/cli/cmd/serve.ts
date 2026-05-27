@@ -1390,11 +1390,16 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     // behind it). Spawn a detached child running the equivalent CLI so the
     // request returns immediately. The next 3s task poll picks up the
     // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
-    const child = spawnForgeCli(["spec", "improve", planId, "--json"], {
-      cwd: task.repoRoot,
-      env: process.env,
-    });
-    return jsonOk({ planId, queued: true, pid: child.pid });
+    try {
+      const child = spawnForgeCli(["spec", "improve", planId, "--json"], {
+        cwd: task.repoRoot,
+        env: process.env,
+      });
+      return jsonOk({ planId, queued: true, pid: child.pid });
+    } catch (e) {
+      if (e instanceof CliError) return fromCliError(e);
+      throw e;
+    }
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);

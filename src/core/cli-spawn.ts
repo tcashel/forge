@@ -25,8 +25,16 @@
  * The next person to look at this: do not "simplify" back to
  * node:child_process or to `process.execPath`. Both fail in ways that
  * are hard to reproduce locally but bite real users on real machines.
+ *
+ * One more landmine to know about: bun #24012 — Bun.spawn reports
+ * "ENOENT posix_spawn '<bun-path>'" when the *cwd* doesn't exist,
+ * lying about which path it couldn't find. We `statSync` cwd up front
+ * and throw a real error so the next time a plan has a stale repoRoot,
+ * the failure surfaces as "plan's repoRoot does not exist" instead of
+ * a wild goose chase through bun internals.
  */
 
+import * as fs from "node:fs";
 import { CliError } from "../cli/output.ts";
 
 export interface SpawnForgeCliOptions {
@@ -44,6 +52,12 @@ export function spawnForgeCli(args: string[], opts: SpawnForgeCliOptions = {}): 
   if (!bunPath) {
     throw new CliError("INTERNAL", "Bun.which('bun') returned null — cannot locate bun on PATH");
   }
+  if (opts.cwd && !isExistingDirectory(opts.cwd)) {
+    throw new CliError(
+      "BAD_STATE",
+      `Working directory does not exist: ${opts.cwd}. Likely a plan with a stale repoRoot pointing at a deleted worktree or scratch path.`,
+    );
+  }
   const proc = Bun.spawn({
     cmd: [bunPath, scriptPath, ...args],
     cwd: opts.cwd,
@@ -52,4 +66,12 @@ export function spawnForgeCli(args: string[], opts: SpawnForgeCliOptions = {}): 
   });
   proc.unref();
   return proc;
+}
+
+function isExistingDirectory(p: string): boolean {
+  try {
+    return fs.statSync(p).isDirectory();
+  } catch {
+    return false;
+  }
 }
