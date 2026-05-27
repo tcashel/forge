@@ -180,7 +180,14 @@ export function promoteDraftingSessions(db: Database, draftId: string, planId: s
     .all(draftId) as Array<{ id: string; metrics: string | null }>;
   for (const row of rows) {
     const merged = mergeMetrics(parseMetrics(row.metrics), { planId, scopeKind: "spec" });
-    db.prepare("UPDATE sessions SET metrics = ? WHERE id = ?").run(JSON.stringify(merged), row.id);
+    // related_id is the authoritative pointer for downstream readers
+    // (loadDraftingHistory, resolvePlanRefForRow). Update it too so they
+    // resolve against the new spec id, not the now-deleted draft path.
+    db.prepare("UPDATE sessions SET metrics = ?, related_id = ? WHERE id = ?").run(
+      JSON.stringify(merged),
+      planId,
+      row.id,
+    );
   }
 }
 

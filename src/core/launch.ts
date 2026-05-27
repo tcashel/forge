@@ -124,17 +124,31 @@ export function agentCommand(
  * empirically wired for them yet.
  *
  * `streamPath` is where the runner stages the JSONL output; the projection
- * (via jq) becomes the visible log. Output goes to stdout in the human
- * shape so the runner can `tee -a $LOG_FILE` outside of this helper.
+ * (via the bun filter below) becomes the visible log. Output goes to stdout
+ * in the human shape so the runner can `tee -a $LOG_FILE` outside of this
+ * helper.
  */
+
+/**
+ * Shell-quoted bun command that reads stream-json line-by-line from stdin
+ * and emits the final assistant text exactly once. Exported so tests can
+ * pipe fixtures through the same projection that production uses.
+ *
+ * Why bun and not jq: README only lists bun/tmux/git/gh and the agent CLIs
+ * as launcher requirements. Adding jq as a soft dep would silently break
+ * launches on hosts where it isn't installed (jq missing → exit 127 under
+ * `set -uo pipefail`, run marked failed even though claude ran fine).
+ *
+ * Why project only the `result` event: `claude --print --output-format
+ * stream-json` emits the final answer twice — once on the last
+ * `assistant` content block and again on the terminating `result` event.
+ * Plain `claude --print` (no stream-json) emits it once, and AC11 says
+ * LogTab must keep that original shape.
+ */
+export const claudeJobStreamFilter = `bun -e "const rl=require('readline').createInterface({input:process.stdin});rl.on('line',l=>{try{const e=JSON.parse(l);if(e.type==='result'&&typeof e.result==='string')process.stdout.write(e.result+'\\n')}catch{}})"`;
+
 export function claudeJobCommand(model: string, promptFile: string, streamPath: string): string {
-  // The `result` event repeats the final assistant text, so projecting
-  // both `assistant` and `result` writes the answer twice. `claude
-  // --print` (no stream-json) only emits the final answer, so we mirror
-  // that by projecting `result` only — this preserves LogTab's existing
-  // shape (AC11).
-  const jq = `jq -r --unbuffered 'if .type=="result" then (.result // empty) else empty end'`;
-  return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${jq}`;
+  return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${claudeJobStreamFilter}`;
 }
 
 // ─── Runner script ────────────────────────────────────────────────────────────
