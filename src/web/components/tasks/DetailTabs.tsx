@@ -27,6 +27,11 @@ function tabsFor(t: PlanView): TabDef[] {
       badgeKind: t.kind === "critique-ready" ? "alert" : undefined,
     },
     { id: "gates", label: "Quality gates", enabled: isRun || t.kind === "failed" || t.section === "done" },
+    // History + Runs are always available — even a freshly drafted plan has
+    // its plan_versions row, which makes "what changed since v1" the
+    // shortest meaningful timeline.
+    { id: "history", label: "History", enabled: true },
+    { id: "runs", label: "Runs", enabled: true },
   ];
 }
 

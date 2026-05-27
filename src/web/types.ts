@@ -79,7 +79,36 @@ export interface WorkbenchContext {
 export type ViewMode = "tasks" | "prs" | "settings";
 export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done";
 export type Theme = "light" | "dark";
-export type TabId = "log" | "spec" | "plan" | "critique" | "gates";
+export type TabId = "log" | "spec" | "plan" | "critique" | "gates" | "history" | "runs";
+
+export type PlanHistoryEventKind =
+  | "spec_saved"
+  | "critique_started"
+  | "critique_synthesized"
+  | "launch_started"
+  | "launch_completed";
+
+export interface PlanHistoryEvent {
+  ts: string;
+  kind: PlanHistoryEventKind;
+  ref: string;
+  summary: string;
+}
+
+export interface JobView {
+  id: string;
+  run_number: number;
+  run_kind: string;
+  state: string;
+  branch_name: string | null;
+  worktree_path: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  summary: string | null;
+  blocker_summary: string | null;
+  session_id: string | null;
+}
 
 export interface CritiqueAgentMeta {
   agent: string;
