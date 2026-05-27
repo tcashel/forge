@@ -17,6 +17,7 @@ import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
 import * as migrate from "./cmd/migrate.ts";
 import * as review from "./cmd/review.ts";
+import * as run_ from "./cmd/run.ts";
 import * as serve from "./cmd/serve.ts";
 import * as spec from "./cmd/spec.ts";
 import * as status from "./cmd/status.ts";
@@ -36,6 +37,7 @@ const HELP_BY_CMD: Record<string, string> = {
   ls: ls.HELP,
   migrate: migrate.HELP,
   review: review.HELP,
+  run: run_.HELP,
   serve: serve.HELP,
   spec: spec.HELP,
   status: status.HELP,
@@ -61,6 +63,8 @@ Commands:
   logs <id>        Print or tail (-f) the run log
   wait <id>        Block until the task reaches a terminal state
   history <id>     Unified timeline of every event recorded for a plan
+  run ls <id>      List every prior job for a plan
+  run show         Detail for one job (forge run show <plan-id> <run-number>)
   migrate          One-time backfill of ~/.forge/ JSON into forge.db
 
   config get <k>           Read a per-repo setting
@@ -148,6 +152,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "history":
         await history.run(rest, store);
+        return;
+      case "run":
+        await run_.run(rest, store);
         return;
       case "wait":
         await wait.run(rest, store);
