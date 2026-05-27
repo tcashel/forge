@@ -1,8 +1,8 @@
+import { strict as assert } from "node:assert";
 import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
-import { strict as assert } from "node:assert";
 import { test } from "node:test";
 import { buildReviewerPrompt } from "../src/core/reviewer.ts";
 
@@ -79,7 +79,10 @@ print(json.dumps(verdict))
 `;
 
 function runVerdictParser(rawPath: string): { verdict: string | null; reviewBody: string; exitCode: number } {
-  const reviewPath = path.join(os.tmpdir(), `forge-test-review-${Date.now()}-${Math.random().toString(36).slice(2)}.md`);
+  const reviewPath = path.join(
+    os.tmpdir(),
+    `forge-test-review-${Date.now()}-${Math.random().toString(36).slice(2)}.md`,
+  );
   try {
     const stdout = execFileSync("python3", ["-c", VERDICT_PARSER_PY, rawPath, reviewPath], {
       encoding: "utf-8",

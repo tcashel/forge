@@ -632,7 +632,7 @@ function updateCritiqueSession(
   const existing = db.prepare("SELECT metrics FROM sessions WHERE id = ?").get(sessionId) as
     | { metrics: string | null }
     | undefined;
-  let merged: Record<string, unknown> = { durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort };
+  const merged: Record<string, unknown> = { durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort };
   if (existing?.metrics) {
     try {
       const prior = JSON.parse(existing.metrics) as Record<string, unknown>;

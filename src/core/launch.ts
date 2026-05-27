@@ -711,10 +711,11 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
     forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
     # Extract the forge-review fenced block and verdict.
     # Take the LAST matching block, not the first: codex-as-reviewer echoes
-    # the SKILL.md prompt verbatim (which contains a template forge-review
-    # block with `<approve | request-changes | block>` as a literal
-    # placeholder), and may also re-emit its own reply. The real review is
-    # always last. Paired with the fixture in tests/fixtures/reviewer/.
+    # the SKILL.md prompt verbatim, which contains a template forge-review
+    # block whose verdict line is a literal angle-bracketed placeholder
+    # (approve | request-changes | block in angle brackets), not a real
+    # verdict. The real review is always last. Paired with the fixture in
+    # tests/fixtures/reviewer/.
     VERDICT=$(python3 -c "
 import re, sys, json
 raw = open(sys.argv[1]).read()

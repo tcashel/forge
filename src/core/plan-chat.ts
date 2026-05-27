@@ -444,7 +444,6 @@ export function cleanStderrTail(stderrBuf: string): string | null {
     if (code === 0x09 || code === 0x0a) {
       out += sliced[i];
     } else if (code < 0x20 || code === 0x7f || (code >= 0x80 && code <= 0x9f)) {
-      continue;
     } else {
       out += sliced[i];
     }
