@@ -41,6 +41,7 @@ function makeTask(): Plan {
     specFile: "task-jv-1.md",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
 }
 

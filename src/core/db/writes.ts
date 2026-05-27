@@ -37,6 +37,8 @@ function planStageForStatus(status: Plan["status"]): string {
     case "failed":
     case "quality_failed":
       return "completed";
+    case "archived":
+      return "archived";
     default:
       return "drafting";
   }
@@ -394,6 +396,32 @@ function insertLiveCriticRun(
     targetVersionId,
     liveCritiqueSessionId(meta.critiqueId, slot === "a" ? "critic-a" : "critic-b"),
     meta.startedAt,
+  );
+}
+
+/**
+ * Soft-archive a plan: stage='archived' + archived_at populated. No-op if
+ * the plans row hasn't been created yet (legacy task that never saw a
+ * dual-write); the JSON index is still the source of truth for status.
+ */
+export function recordPlanArchived(db: Database, planId: string, archivedAt: string): void {
+  db.prepare("UPDATE plans SET stage = 'archived', archived_at = ?, updated_at = ? WHERE id = ?").run(
+    archivedAt,
+    archivedAt,
+    planId,
+  );
+}
+
+/**
+ * Reverse of `recordPlanArchived`. `status` is the plan's post-unarchive
+ * status (always "draft" today) — we map it back to the SQLite stage and
+ * clear archived_at.
+ */
+export function recordPlanUnarchived(db: Database, planId: string, status: Plan["status"], updatedAt: string): void {
+  db.prepare("UPDATE plans SET stage = ?, archived_at = NULL, updated_at = ? WHERE id = ?").run(
+    planStageForStatus(status),
+    updatedAt,
+    planId,
   );
 }
 

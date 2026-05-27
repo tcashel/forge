@@ -49,6 +49,7 @@ function makePlan(): Plan {
     specFile: "plan-h1.md",
     specVersion: 1,
     lastImproveError: null,
+    archivedAt: null,
   };
 }
 

@@ -41,6 +41,7 @@ function seedDraft(store: ForgeStore, id: string, lastImproveError: Plan["lastIm
     specFile: "",
     specVersion: 1,
     lastImproveError,
+    archivedAt: null,
   };
   store.upsertPlan(task);
   return task;
