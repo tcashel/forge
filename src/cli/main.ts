@@ -11,6 +11,7 @@ import * as attach from "./cmd/attach.ts";
 import * as config from "./cmd/config.ts";
 import * as critique from "./cmd/critique.ts";
 import * as dash from "./cmd/dash.ts";
+import * as history from "./cmd/history.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
@@ -29,6 +30,7 @@ const HELP_BY_CMD: Record<string, string> = {
   config: config.HELP,
   critique: critique.HELP,
   dash: dash.HELP,
+  history: history.HELP,
   launch: launch.HELP,
   logs: logs.HELP,
   ls: ls.HELP,
@@ -58,6 +60,7 @@ Commands:
   status <id>      Show task and run state
   logs <id>        Print or tail (-f) the run log
   wait <id>        Block until the task reaches a terminal state
+  history <id>     Unified timeline of every event recorded for a plan
   migrate          One-time backfill of ~/.forge/ JSON into forge.db
 
   config get <k>           Read a per-repo setting
@@ -142,6 +145,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "migrate":
         await migrate.run(rest, store);
+        return;
+      case "history":
+        await history.run(rest, store);
         return;
       case "wait":
         await wait.run(rest, store);
