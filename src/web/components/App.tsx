@@ -7,8 +7,8 @@ import { Sidebar } from "./Sidebar";
 import { SettingsForm } from "./settings/SettingsForm";
 import { SettingsRepoList } from "./settings/SettingsRepoList";
 import { Topbar } from "./Topbar";
-import { TaskDetail } from "./tasks/TaskDetail";
-import { TaskList } from "./tasks/TaskList";
+import { PlanDetail } from "./tasks/PlanDetail";
+import { PlanList } from "./tasks/PlanList";
 
 // Phase 5: Preact now owns the pickup/list/detail panes for all three
 // view modes (tasks / prs / settings). The new-spec modal is always
@@ -39,12 +39,12 @@ export function App() {
           {inTasks ? <PickupSection /> : null}
         </section>
         <aside class={listPaneClass} id="list-pane">
-          {inTasks ? <TaskList /> : null}
+          {inTasks ? <PlanList /> : null}
           {inPrs ? <PrList /> : null}
           {inSettings ? <SettingsRepoList /> : null}
         </aside>
         <main class={detailPaneClass} id="detail-pane">
-          {inTasks ? <TaskDetail /> : null}
+          {inTasks ? <PlanDetail /> : null}
           {inPrs ? <PrDetail /> : null}
           {inSettings ? <SettingsForm /> : null}
         </main>

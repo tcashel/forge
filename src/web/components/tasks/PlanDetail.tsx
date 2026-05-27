@@ -3,11 +3,13 @@ import { DetailHead } from "./DetailHead";
 import { DetailTabs } from "./DetailTabs";
 import { CritiqueTab } from "./tabs/CritiqueTab";
 import { GatesTab } from "./tabs/GatesTab";
+import { HistoryTab } from "./tabs/HistoryTab";
 import { LogTab } from "./tabs/LogTab";
 import { PlanTab } from "./tabs/PlanTab";
+import { RunsTab } from "./tabs/RunsTab";
 import { SpecTab } from "./tabs/SpecTab";
 
-export function TaskDetail() {
+export function PlanDetail() {
   const t = currentTask.value;
   if (!t) {
     return (
@@ -27,6 +29,8 @@ export function TaskDetail() {
         {tab === "plan" ? <PlanTab t={t} /> : null}
         {tab === "critique" ? <CritiqueTab t={t} /> : null}
         {tab === "gates" ? <GatesTab t={t} /> : null}
+        {tab === "history" ? <HistoryTab t={t} /> : null}
+        {tab === "runs" ? <RunsTab t={t} /> : null}
       </div>
     </>
   );

@@ -10,12 +10,13 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { recordJobStarted } from "./db/writes.ts";
 import { bashGhEnvExport } from "./gh.js";
 import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
 
 export interface LaunchConfig {
-  taskId: string;
+  planId: string;
   specContent: string; // raw spec markdown (body only, no frontmatter)
   specTitle: string;
   target: LaunchTarget;
@@ -82,9 +83,9 @@ export function attachToSession(session: string): void {
   spawnSync("tmux", ["attach-session", "-t", session], { stdio: "inherit" });
 }
 
-export function tmuxSessionName(taskId: string): string {
+export function tmuxSessionName(planId: string): string {
   // tmux names: 16 chars max for readability, use last part of id which has the timestamp
-  return `forge-${taskId.slice(-14)}`;
+  return `forge-${planId.slice(-14)}`;
 }
 
 // ─── Agent command builder ────────────────────────────────────────────────────
@@ -278,11 +279,11 @@ function fixQualityBlock(qualityCommands: string[]): string {
 }
 
 function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
-  const runDir = store.ensureRunDir(config.taskId);
-  const logFile = store.getLogFile(config.taskId);
+  const runDir = store.ensureRunDir(config.planId);
+  const logFile = store.getLogFile(config.planId);
   const metaFile = path.join(runDir, "meta.json");
-  const promptFile = store.getPromptFile(config.taskId);
-  const specFile = path.join(store.specsDir, `${config.taskId}.md`);
+  const promptFile = store.getPromptFile(config.planId);
+  const specFile = path.join(store.specsDir, `${config.planId}.md`);
   const extDir = path.dirname(fileURLToPath(import.meta.url));
   const prBodyTsPath = path.join(extDir, "pr-body.ts");
   const prBodyArgsTsPath = path.join(extDir, "pr-body-args.ts");
@@ -325,10 +326,10 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
     : "  # auto-fix disabled";
 
   return `#!/usr/bin/env bash
-# Forge runner — task: ${config.taskId}
+# Forge runner — task: ${config.planId}
 set -uo pipefail
 
-TASK_ID="${config.taskId}"
+TASK_ID="${config.planId}"
 WORKTREE="${config.worktreePath}"
 META_FILE="${metaFile}"
 LOG_FILE="${logFile}"
@@ -369,7 +370,7 @@ mkdir -p "$(dirname "$LOG_FILE")"
 : > "$LOG_FILE"  # truncate / create
 
 log "╔══════════════════════════════════════════════════════╗"
-log "  FORGE — ${config.taskId}"
+log "  FORGE — ${config.planId}"
 log "  Agent : ${config.target} / ${config.model}"
 log "  Repo  : ${config.repoName}  branch: ${config.branch}"
 log "  Start : $(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -516,7 +517,7 @@ if [ "$PR_BODY_BUILT" -eq 0 ]; then
 ## Summary
 
 - PR body builder failed during this Forge run. The agent committed the work; please review the diff directly.
-- Run logs: see \`~/.forge/runs/${config.taskId}/agent.log\`.
+- Run logs: see \`~/.forge/runs/${config.planId}/agent.log\`.
 
 ## Test plan
 
@@ -685,7 +686,7 @@ ${config.specContent}
    experiments). Anything left uncommitted will be surfaced as a warning
    and will NOT make it into the PR.
 6. Before exiting (after committing), write a structured PR summary to
-   \`${path.join(store.runsDir, config.taskId, "agent-summary.md")}\`.
+   \`${path.join(store.runsDir, config.planId, "agent-summary.md")}\`.
    The file MUST contain EXACTLY these two top-level sections (no others,
    no YAML frontmatter):
 
@@ -729,16 +730,16 @@ export interface LaunchResult {
 // runner gains structured state capture.
 
 export async function launchAgent(config: LaunchConfig, store: ForgeStore): Promise<LaunchResult> {
-  const tmuxSession = tmuxSessionName(config.taskId);
-  store.ensureRunDir(config.taskId);
-  const logFile = store.getLogFile(config.taskId);
+  const tmuxSession = tmuxSessionName(config.planId);
+  store.ensureRunDir(config.planId);
+  const logFile = store.getLogFile(config.planId);
 
   // Write agent prompt
   const prompt = buildAgentPrompt(config, store);
-  fs.writeFileSync(store.getPromptFile(config.taskId), prompt, "utf-8");
+  fs.writeFileSync(store.getPromptFile(config.planId), prompt, "utf-8");
 
   // Snapshot the spec body so it's preserved alongside run artifacts
-  const runDir = store.ensureRunDir(config.taskId);
+  const runDir = store.ensureRunDir(config.planId);
   fs.writeFileSync(path.join(runDir, "spec-snapshot.md"), config.specContent, "utf-8");
 
   // Write reviewer prompt prefix for the post-PR reviewer step.
@@ -756,12 +757,12 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
 
   // Write runner script
   const script = generateRunnerScript(config, store);
-  const runnerPath = store.getRunnerScript(config.taskId);
+  const runnerPath = store.getRunnerScript(config.planId);
   fs.writeFileSync(runnerPath, script, { mode: 0o755 });
 
   // Seed meta.json so bash script can update it
   const meta: RunMeta = {
-    taskId: config.taskId,
+    planId: config.planId,
     tmuxSession,
     logFile,
     agent: config.target,
@@ -775,7 +776,7 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     reviewerModel: config.reviewerModel,
     reviewerReasoningEffort: config.reviewerReasoningEffort,
   };
-  store.writeRunMeta(config.taskId, meta);
+  store.writeRunMeta(config.planId, meta);
 
   // Kill any stale session with the same name
   killTmuxSession(tmuxSession);
@@ -791,6 +792,20 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     if (!isTmuxSessionAlive(tmuxSession)) {
       return { tmuxSession, logFile, error: "tmux session died immediately — check runner script" };
     }
+
+    // Phase 3 dual-write: record the jobs row only after tmux is confirmed
+    // alive. Inserting earlier leaves a phantom `running` row when tmux
+    // fails — no later sync path covers a launch that never started.
+    // Failure here doesn't break the launch; meta.json is still the live
+    // source of truth during the cutover.
+    try {
+      const task = store.getPlan(config.planId);
+      if (task) recordJobStarted(store.db.db, task, meta);
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: failed to record jobs row for ${config.planId}: ${msg}\n`);
+    }
+
     return { tmuxSession, logFile, error: null };
   } catch (e: any) {
     return { tmuxSession, logFile, error: `Failed to start tmux: ${e.message ?? e}` };

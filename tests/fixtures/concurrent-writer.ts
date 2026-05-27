@@ -2,10 +2,10 @@
  * Worker for store-atomic.test.ts.
  *
  * Reads HOME from the environment so the test can isolate ~/.forge to
- * a tempdir. Calls upsertTask once with the id passed via argv.
+ * a tempdir. Calls upsertPlan once with the id passed via argv.
  */
 
-import { ForgeStore, type TaskRecord } from "../../src/core/store.ts";
+import { ForgeStore, type Plan } from "../../src/core/store.ts";
 
 const id = process.argv[2];
 if (!id) {
@@ -14,7 +14,7 @@ if (!id) {
 }
 
 const store = new ForgeStore();
-const task: TaskRecord = {
+const task: Plan = {
   id,
   title: `task-${id}`,
   repoRoot: "/tmp/repo",
@@ -37,4 +37,4 @@ const task: TaskRecord = {
   lastImproveError: null,
 };
 
-store.upsertTask(task);
+store.upsertPlan(task);

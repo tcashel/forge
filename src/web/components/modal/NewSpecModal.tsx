@@ -33,7 +33,7 @@ function toast(msg: string, kind: "info" | "error" = "info") {
 }
 
 interface NewSpecResponse {
-  taskId: string;
+  planId: string;
 }
 
 export function NewSpecModal() {
@@ -205,9 +205,9 @@ export function NewSpecModal() {
       // minted. Best-effort: if promotion fails (the spec already has a
       // history.json, etc), surface a toast but still close the modal.
       const dId = draftId.value;
-      if (dId && data.taskId) {
+      if (dId && data.planId) {
         try {
-          await apiPost(`/api/plan-chat/draft/${encodeURIComponent(dId)}/promote`, { taskId: data.taskId });
+          await apiPost(`/api/plan-chat/draft/${encodeURIComponent(dId)}/promote`, { planId: data.planId });
           promoted.current = true;
         } catch (err) {
           const e3 = err as ApiError;
@@ -223,12 +223,12 @@ export function NewSpecModal() {
       autoImprove.value = true;
       modalOpen.value = false;
       await refreshTasks();
-      if (data.taskId) {
-        window.__forge?.api?.selectTask?.(data.taskId);
+      if (data.planId) {
+        window.__forge?.api?.selectTask?.(data.planId);
       }
-      if (auto && data.taskId) {
-        toast(`Saved ${data.taskId} — auto-improve running in background…`, "info");
-        apiPost(`/api/tasks/${encodeURIComponent(data.taskId)}/improve`, {}).catch((err) => {
+      if (auto && data.planId) {
+        toast(`Saved ${data.planId} — auto-improve running in background…`, "info");
+        apiPost(`/api/plans/${encodeURIComponent(data.planId)}/improve`, {}).catch((err) => {
           const e2 = err as ApiError;
           toast(
             e2.hint ? `Auto-improve failed: ${e2.message} — ${e2.hint}` : `Auto-improve failed: ${e2.message}`,
@@ -236,7 +236,7 @@ export function NewSpecModal() {
           );
         });
       } else {
-        toast(`Saved spec ${data.taskId}`, "info");
+        toast(`Saved spec ${data.planId}`, "info");
       }
     } catch (err) {
       const e2 = err as ApiError;

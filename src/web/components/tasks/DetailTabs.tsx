@@ -1,5 +1,5 @@
 import { currentTab } from "../../signals/tasks";
-import type { TabId, TaskView } from "../../types";
+import type { PlanView, TabId } from "../../types";
 
 interface TabDef {
   id: TabId;
@@ -9,7 +9,7 @@ interface TabDef {
   badgeText?: string;
 }
 
-function tabsFor(t: TaskView): TabDef[] {
+function tabsFor(t: PlanView): TabDef[] {
   const isRun = t.section === "running";
   return [
     {
@@ -27,10 +27,15 @@ function tabsFor(t: TaskView): TabDef[] {
       badgeKind: t.kind === "critique-ready" ? "alert" : undefined,
     },
     { id: "gates", label: "Quality gates", enabled: isRun || t.kind === "failed" || t.section === "done" },
+    // History + Runs are always available — even a freshly drafted plan has
+    // its plan_versions row, which makes "what changed since v1" the
+    // shortest meaningful timeline.
+    { id: "history", label: "History", enabled: true },
+    { id: "runs", label: "Runs", enabled: true },
   ];
 }
 
-export function DetailTabs({ t }: { t: TaskView }) {
+export function DetailTabs({ t }: { t: PlanView }) {
   const active = currentTab.value;
   return (
     <nav class="tabs" id="detail-tabs">

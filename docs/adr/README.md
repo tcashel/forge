@@ -36,6 +36,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0020 | [Hook-policy enforcement at agent level](./0020-hook-policy-at-agent-level.md)              | Accepted                        |
 | 0021 | [Two-track build path: TS prototype → Rust product](./0021-two-track-build-path.md)         | Accepted                        |
 | 0022 | [Skill + CLI as the agent↔orchestrator contract (no MCP)](./0022-skill-cli-as-agent-contract.md) | Accepted                        |
+| 0023 | [SQLite cutover for Track A (Forge)](./0023-sqlite-cutover-track-a.md)                       | Accepted                        |
 
 ## Foundational ADRs
 

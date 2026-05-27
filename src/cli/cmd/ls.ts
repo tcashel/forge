@@ -11,7 +11,7 @@
 import { parseArgs } from "node:util";
 import { isTmuxSessionAlive } from "../../core/launch.ts";
 import { detectRepo } from "../../core/repo.ts";
-import type { ForgeStore, TaskRecord, TaskStatus } from "../../core/store.ts";
+import type { ForgeStore, Plan, PlanStatus } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
 export const HELP = `forge ls [...flags]
@@ -25,10 +25,10 @@ Flags:
   --json                    Machine-readable output
 `;
 
-export interface TaskSummary {
+export interface PlanSummary {
   id: string;
   title: string;
-  status: TaskStatus;
+  status: PlanStatus;
   agent: string | null;
   branch: string;
   repo: string;
@@ -37,7 +37,7 @@ export interface TaskSummary {
   tmuxAlive: boolean;
 }
 
-function summarize(t: TaskRecord): TaskSummary {
+function summarize(t: Plan): PlanSummary {
   return {
     id: t.id,
     title: t.title,
@@ -51,7 +51,7 @@ function summarize(t: TaskRecord): TaskSummary {
   };
 }
 
-function statusIcon(s: TaskStatus): string {
+function statusIcon(s: PlanStatus): string {
   switch (s) {
     case "done":
       return "✓";
@@ -65,7 +65,7 @@ function statusIcon(s: TaskStatus): string {
   }
 }
 
-function humanFormat(tasks: TaskSummary[]): string {
+function humanFormat(tasks: PlanSummary[]): string {
   if (tasks.length === 0) return "(no tasks)";
   return tasks
     .map((t) => {
@@ -106,11 +106,11 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     repoRoot = detected.root;
   }
 
-  let tasks = store.getTasks(repoRoot).map(summarize);
+  let plans = store.getPlans(repoRoot).map(summarize);
   if (typeof values.status === "string") {
     const wanted = new Set(values.status.split(",").map((s) => s.trim()));
-    tasks = tasks.filter((t) => wanted.has(t.status));
+    plans = plans.filter((t) => wanted.has(t.status));
   }
 
-  emitOk({ tasks }, json, () => humanFormat(tasks));
+  emitOk({ plans }, json, () => humanFormat(plans));
 }

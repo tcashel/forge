@@ -20,9 +20,10 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { parseArgs } from "node:util";
 import type { CritiqueAgent } from "../../core/critique.ts";
+import { recordPlanCreated } from "../../core/db/writes.ts";
 import { type ImproveResult, runImprover } from "../../core/improve.ts";
 import { detectRepo } from "../../core/repo.ts";
-import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig, TaskRecord } from "../../core/store.ts";
+import type { ForgeStore, LaunchTarget, Plan, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { makeTheme } from "../../tui/theme.ts";
 import { CliError, emitOk } from "../output.ts";
 import { readStdin } from "../pickers.ts";
@@ -60,7 +61,7 @@ forge spec save [...flags]
 forge spec improve <task-id> [--json]
   Runs the auto-improve loop on an already-saved spec. Always sync mode.
   Each invocation generates a new critiqueId and bumps specVersion.
-  JSON envelope: { taskId, improve: {...} }.
+  JSON envelope: { planId, improve: {...} }.
 
 forge spec diff <task-id> [--from <critiqueId>]
   Prints a unified diff of spec-original.md vs. the live spec body
@@ -108,7 +109,7 @@ function deriveBranch(title: string, override?: string): string {
   return `forge/${slug || "untitled"}`;
 }
 
-function buildFrontmatter(task: TaskRecord, agent?: string, model?: string): string {
+function buildFrontmatter(task: Plan, agent?: string, model?: string): string {
   const lines: string[] = ["---", `id: ${task.id}`, `repo: ${task.repoRoot}`, `repoName: ${task.repoName}`];
   lines.push(`createdAt: ${task.createdAt}`);
   lines.push(`status: ${task.status}`);
@@ -182,7 +183,7 @@ function resolveCriticAgents(repoConfig: RepoConfig): CritiqueResolution {
   return { criticA, criticB, synthesizer, improver };
 }
 
-async function runAutoImprove(task: TaskRecord, store: ForgeStore): Promise<ImproveResult> {
+async function runAutoImprove(task: Plan, store: ForgeStore): Promise<ImproveResult> {
   const repoConfig = store.getRepoConfig(task.repoRoot);
   const repo = detectRepo(task.repoRoot);
   const contextContent = repo?.contextContent ?? null;
@@ -193,7 +194,7 @@ async function runAutoImprove(task: TaskRecord, store: ForgeStore): Promise<Impr
 
   return await runImprover(
     {
-      taskId: task.id,
+      planId: task.id,
       repoRoot: task.repoRoot,
       repoName: task.repoName,
       specTitle: task.title,
@@ -224,7 +225,7 @@ export interface SaveSpecOpts {
 }
 
 export interface SaveSpecResult {
-  taskId: string;
+  planId: string;
   specPath: string;
   branch: string;
   status: "draft";
@@ -254,7 +255,7 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
   const id = store.generateId(title);
   const branch = deriveBranch(title, opts.branch);
 
-  const task: TaskRecord = {
+  const task: Plan = {
     id,
     title,
     repoRoot: opts.repoRoot,
@@ -278,9 +279,11 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
   };
 
   const frontmatter = hasFrontmatter ? "" : buildFrontmatter(task, task.agent ?? undefined, task.model ?? undefined);
-  const specPath = store.writeSpec(id, frontmatter + opts.body);
+  const fullSpec = frontmatter + opts.body;
+  const specPath = store.writeSpec(id, fullSpec);
   task.specFile = specPath;
-  store.upsertTask(task);
+  store.upsertPlan(task);
+  recordPlanCreated(store.db.db, task, fullSpec);
 
   const repoConfig = store.getRepoConfig(opts.repoRoot);
   const skip = opts.autoImprove === false || repoConfig.autoImprove === false || hasFrontmatter;
@@ -302,7 +305,7 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
     persistImproveOutcome(task.id, improve, store);
   }
 
-  return { taskId: id, specPath, branch, status: "draft", improve };
+  return { planId: id, specPath, branch, status: "draft", improve };
 }
 
 /**
@@ -312,8 +315,8 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
  *
  * Exported for tests.
  */
-export function persistImproveOutcome(taskId: string, improve: ImproveResult, store: ForgeStore): void {
-  const current = store.getTask(taskId);
+export function persistImproveOutcome(planId: string, improve: ImproveResult, store: ForgeStore): void {
+  const current = store.getPlan(planId);
   if (!current) return;
   const lastImproveError = improve.error
     ? { mode: improve.mode, error: improve.error, at: new Date().toISOString() }
@@ -323,7 +326,7 @@ export function persistImproveOutcome(taskId: string, improve: ImproveResult, st
   // when the most recent failure actually happened. Without this, repeated
   // retries that all fail look frozen at the first failure's timestamp.
   if (current.lastImproveError === null && lastImproveError === null) return;
-  store.upsertTask({ ...current, lastImproveError });
+  store.upsertPlan({ ...current, lastImproveError });
 }
 
 async function runSave(argv: string[], store: ForgeStore): Promise<void> {
@@ -396,7 +399,7 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
   }
 
   emitOk(result, values.json === true, () => {
-    const lines = [`saved spec ${result.taskId}`, `  path: ${result.specPath}`, `  branch: ${result.branch}`];
+    const lines = [`saved spec ${result.planId}`, `  path: ${result.specPath}`, `  branch: ${result.branch}`];
     if (result.improve) {
       if (result.improve.mode === "applied") {
         lines.push(
@@ -415,7 +418,7 @@ async function runSave(argv: string[], store: ForgeStore): Promise<void> {
 // ─── improve ────────────────────────────────────────────────────────────────
 
 export interface ImproveSpecResult {
-  taskId: string;
+  planId: string;
   improve: ImproveResult;
 }
 
@@ -424,13 +427,13 @@ export interface ImproveSpecResult {
  * `forge spec improve`; called by both the CLI shell and the HTTP server.
  * Throws CliError on failure.
  */
-export async function improveSpec(taskId: string, store: ForgeStore): Promise<ImproveSpecResult> {
-  const task = store.getTask(taskId);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${taskId}".`, { exitCode: 1 });
+export async function improveSpec(planId: string, store: ForgeStore): Promise<ImproveSpecResult> {
+  const task = store.getPlan(planId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${planId}".`, { exitCode: 1 });
   if (task.status !== "draft") {
     throw new CliError(
       "BAD_STATE",
-      `Task ${taskId} is in state "${task.status}" — improve only runs on draft specs (rewriting a launched spec corrupts the snapshot the agent is implementing against).`,
+      `Task ${planId} is in state "${task.status}" — improve only runs on draft specs (rewriting a launched spec corrupts the snapshot the agent is implementing against).`,
       { exitCode: 1 },
     );
   }
@@ -448,7 +451,7 @@ export async function improveSpec(taskId: string, store: ForgeStore): Promise<Im
     };
   }
   persistImproveOutcome(task.id, improve, store);
-  return { taskId: task.id, improve };
+  return { planId: task.id, improve };
 }
 
 async function runImproveCmd(argv: string[], store: ForgeStore): Promise<void> {
@@ -481,9 +484,9 @@ async function runImproveCmd(argv: string[], store: ForgeStore): Promise<void> {
   emitOk(result, values.json === true, () => {
     const im = result.improve;
     if (im.mode === "applied")
-      return `improved ${result.taskId}: ${im.changeCount} change(s) (critique ${im.critiqueId})`;
-    if (im.mode === "no-op") return `no actionable findings for ${result.taskId}`;
-    return `improve skipped for ${result.taskId}: ${im.error ?? "unknown"}`;
+      return `improved ${result.planId}: ${im.changeCount} change(s) (critique ${im.critiqueId})`;
+    if (im.mode === "no-op") return `no actionable findings for ${result.planId}`;
+    return `improve skipped for ${result.planId}: ${im.error ?? "unknown"}`;
   });
 }
 
@@ -505,7 +508,7 @@ async function runDiff(argv: string[], store: ForgeStore): Promise<void> {
     process.exit(2);
   }
 
-  const task = store.getTask(id);
+  const task = store.getPlan(id);
   if (!task) {
     process.stderr.write(`error: no task with id "${id}"\n`);
     process.exit(2);
@@ -589,7 +592,7 @@ async function runLs(argv: string[], store: ForgeStore): Promise<void> {
     repoRoot = detected?.root;
   }
 
-  const tasks = store.getTasks(repoRoot).filter((t) => t.status === "draft");
+  const tasks = store.getPlans(repoRoot).filter((t) => t.status === "draft");
   emitOk({ tasks }, values.json === true, () =>
     tasks.length === 0 ? "(no draft specs)" : tasks.map((t) => `  ${t.id}  ${t.title}  (${t.branch})`).join("\n"),
   );
@@ -618,7 +621,7 @@ async function runShow(argv: string[], store: ForgeStore): Promise<void> {
   }
 
   if (values.json) {
-    emitOk({ taskId: id, body: spec }, true);
+    emitOk({ planId: id, body: spec }, true);
     return;
   }
 

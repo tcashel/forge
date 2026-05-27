@@ -3,7 +3,7 @@ import { test } from "node:test";
 import { buildArgs } from "../src/core/pr-body-args.ts";
 
 const baseInput = {
-  taskId: "task-abc",
+  planId: "task-abc",
   branch: "feat/x",
   baseRef: "origin/main",
   runDir: "/tmp/forge-runs/task-abc",
@@ -29,7 +29,7 @@ test("happy path: all gatherers return data → args JSON has expected shape", (
   assert.equal(args.outputPath, "/tmp/forge-runs/task-abc/pr-body.md");
   assert.equal(args.agentSummaryPath, "/tmp/forge-runs/task-abc/agent-summary.md");
 
-  assert.equal(args.input.taskId, "task-abc");
+  assert.equal(args.input.planId, "task-abc");
   assert.equal(args.input.branch, "feat/x");
   assert.equal(args.input.baseRef, "origin/main");
   assert.equal(args.input.commits.length, 2);

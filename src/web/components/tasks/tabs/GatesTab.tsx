@@ -1,10 +1,10 @@
 import { useEffect, useState } from "preact/hooks";
 import { type ApiError, apiGet } from "../../../lib/api";
 import { formatDur } from "../../../lib/format";
-import type { QualityResult, TaskView } from "../../../types";
+import type { PlanView, QualityResult } from "../../../types";
 
 interface TaskResponse {
-  task: TaskView;
+  task: PlanView;
   meta: { qualityResults?: QualityResult[] } | null;
 }
 
@@ -14,12 +14,12 @@ interface State {
   error: string | null;
 }
 
-export function GatesTab({ t }: { t: TaskView }) {
+export function GatesTab({ t }: { t: PlanView }) {
   const [s, setS] = useState<State>({ loading: true, results: [], error: null });
   useEffect(() => {
     let cancelled = false;
     setS({ loading: true, results: [], error: null });
-    apiGet<TaskResponse>(`/api/tasks/${encodeURIComponent(t.id)}`)
+    apiGet<TaskResponse>(`/api/plans/${encodeURIComponent(t.id)}`)
       .then((data) => {
         if (cancelled) return;
         const r = data.meta?.qualityResults || [];

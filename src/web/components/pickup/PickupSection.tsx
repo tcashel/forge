@@ -33,7 +33,7 @@ export function PickupSection() {
       </div>
       <div class="pickup-cards" id="pickup-cards">
         {list.map((p) => (
-          <PickupRow key={p.taskId} p={p} />
+          <PickupRow key={p.planId} p={p} />
         ))}
       </div>
     </>

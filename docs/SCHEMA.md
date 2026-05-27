@@ -205,13 +205,11 @@ CREATE VIRTUAL TABLE plan_search_index USING fts5(
     plan_id UNINDEXED,
     title,
     document,
-    intent,
-    content='plan_versions',
-    content_rowid='rowid'
+    intent
 );
 ```
 
-Populated via triggers on `plan_versions`.
+Populated via an `AFTER INSERT ON plan_versions` trigger that joins `plans` to pull in `title` + `intent` (those columns live on `plans`, not `plan_versions`, so the external-content shape originally specified here can't satisfy FTS5's column list). The trigger copies the relevant text into the FTS index at insert time. See [ADR-0023](./adr/0023-sqlite-cutover-track-a.md) for the implementation context.
 
 ### `settings`
 
@@ -430,18 +428,16 @@ CREATE TABLE juice_sync_state (
 
 ## Storage location
 
-**Track A (Forge):**
+**Track A (Forge):** lives under `~/.forge/` rather than macOS Application Support so the database sits alongside the existing markdown specs, agent logs, and per-repo config that predate the SQLite cutover. See [ADR-0023](./adr/0023-sqlite-cutover-track-a.md) for the rationale; this is a deliberate Track A deviation, not a product decision.
 ```
-~/Library/Application Support/Forge/
+~/.forge/
 ├── forge.db
 ├── forge.db-wal
 ├── forge.db-shm
-├── worktrees/                 # phase A2+
-│   └── <repo-id>/
-│       └── <task-id>/
-├── blobs/
-└── logs/
-    └── forge.log
+├── specs/                     # markdown spec bodies (kept on disk for `git diff`)
+├── runs/                      # agent.log + meta.json (deprecating in COO-84 Phase 5)
+├── critiques/                 # per-attempt critic + synth output
+└── logs/                      # Phase 5: agent.log relocates to logs/<job_id>.log
 ```
 
 **Track B (Juicer):**

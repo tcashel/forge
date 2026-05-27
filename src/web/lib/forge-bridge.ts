@@ -7,7 +7,7 @@
 // UI. Don't widen the surface beyond that purpose.
 
 import type { effect as effectFn, Signal } from "@preact/signals";
-import type { RepoView, TabId, TaskView, Theme, ViewMode } from "../types";
+import type { PlanView, RepoView, TabId, Theme, ViewMode } from "../types";
 
 export interface ForgeSignalBag {
   searchQuery: Signal<string>;
@@ -15,7 +15,7 @@ export interface ForgeSignalBag {
   viewMode: Signal<ViewMode>;
   theme: Signal<Theme>;
   repos: Signal<RepoView[]>;
-  tasks: Signal<TaskView[]>;
+  tasks: Signal<PlanView[]>;
   currentTaskId: Signal<string | null>;
   currentTab: Signal<TabId>;
   modalOpen: Signal<boolean>;

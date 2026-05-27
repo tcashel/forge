@@ -1,5 +1,5 @@
 // Single chat component used in two integration points:
-//   - Plan tab on each task → scope="spec", id=taskId
+//   - Plan tab on each task → scope="spec", id=planId
 //   - New-spec modal left rail → scope="draft", id=draftId
 //
 // Owns history hydration, the in-progress streaming bubble, the

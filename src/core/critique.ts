@@ -4,13 +4,14 @@
  *
  * Each critique run gets its own tmux session: forge-crit-<short-id>
  * Critics run in parallel, then the synthesizer merges their output.
- * Status is written to ~/.forge/critiques/<taskId>/<critiqueId>/critique-meta.json.
+ * Status is written to ~/.forge/critiques/<planId>/<critiqueId>/critique-meta.json.
  */
 
 import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { recordCritiqueStarted } from "./db/writes.ts";
 import { agentCommand, isTmuxSessionAlive, killTmuxSession } from "./launch.js";
 import type { CritiqueMeta, ForgeStore, LaunchTarget, ReasoningEffort } from "./store.js";
 
@@ -23,7 +24,7 @@ export interface CritiqueAgent {
 }
 
 export interface CritiqueConfig {
-  taskId: string;
+  planId: string;
   critiqueId: string;
   specBody: string;
   specTitle: string;
@@ -110,7 +111,7 @@ function escapeSQ(s: string): string {
 }
 
 function generateRunnerScript(config: CritiqueConfig, store: ForgeStore): string {
-  const dir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const dir = store.getCritiqueDir(config.planId, config.critiqueId);
   const metaFile = path.join(dir, "critique-meta.json");
 
   const promptA = path.join(dir, "critic-a.txt");
@@ -171,7 +172,7 @@ Read the original spec and both critiques above. Produce your recommendations in
 `);
 
   return `#!/usr/bin/env bash
-# Forge critique runner — task: ${config.taskId} critique: ${config.critiqueId}
+# Forge critique runner — task: ${config.planId} critique: ${config.critiqueId}
 set -uo pipefail
 
 META_FILE="${metaFile}"
@@ -300,7 +301,7 @@ echo "Recommendations: ${outputRec}"
  * `launchCritique` (tmux/background) and `runCritiqueSync` (synchronous).
  */
 function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession: string): { runnerPath: string } {
-  const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const critiqueDir = store.getCritiqueDir(config.planId, config.critiqueId);
   fs.mkdirSync(critiqueDir, { recursive: true });
 
   fs.writeFileSync(path.join(critiqueDir, "critic-a.txt"), buildCriticPrompt(config, "A"), "utf-8");
@@ -308,7 +309,7 @@ function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession:
 
   const meta: CritiqueMeta = {
     schemaVersion: 1,
-    taskId: config.taskId,
+    planId: config.planId,
     critiqueId: config.critiqueId,
     specTitle: config.specTitle,
     repoRoot: config.repoRoot,
@@ -340,7 +341,18 @@ function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession:
       durationMs: null,
     },
   };
-  store.writeCritiqueMeta(config.taskId, config.critiqueId, meta);
+  store.writeCritiqueMeta(config.planId, config.critiqueId, meta);
+
+  // Phase 3 dual-write: record critique start in SQLite. DB failure is
+  // warned, not fatal — the critique-meta.json above is the live source
+  // of truth during the dual-write window.
+  try {
+    const task = store.getPlan(config.planId);
+    if (task) recordCritiqueStarted(store.db.db, task, meta);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record critique_runs for ${config.critiqueId}: ${msg}\n`);
+  }
 
   const script = generateRunnerScript(config, store);
   const runnerPath = path.join(critiqueDir, "run.sh");
@@ -353,7 +365,7 @@ function prepareCritique(config: CritiqueConfig, store: ForgeStore, tmuxSession:
 
 export async function launchCritique(config: CritiqueConfig, store: ForgeStore): Promise<CritiqueResult> {
   const tmuxSession = `forge-crit-${config.critiqueId.slice(-14)}`;
-  const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const critiqueDir = store.getCritiqueDir(config.planId, config.critiqueId);
   const logFile = path.join(critiqueDir, "agent-a.log");
 
   const { runnerPath } = prepareCritique(config, store, tmuxSession);
@@ -390,7 +402,7 @@ export interface CritiqueSyncResult {
  */
 export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore): Promise<CritiqueSyncResult> {
   const tmuxSession = `forge-crit-${config.critiqueId.slice(-14)}`;
-  const critiqueDir = store.getCritiqueDir(config.taskId, config.critiqueId);
+  const critiqueDir = store.getCritiqueDir(config.planId, config.critiqueId);
   const recommendationsPath = path.join(critiqueDir, "recommendations.md");
   const runnerLog = path.join(critiqueDir, "runner.log");
 
@@ -407,12 +419,12 @@ export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore)
     }
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
-    const finalMeta = store.readCritiqueMeta(config.taskId, config.critiqueId);
+    const finalMeta = store.readCritiqueMeta(config.planId, config.critiqueId);
     const detail = finalMeta?.status === "failed" ? "critics or synthesizer failed" : msg;
     return { recommendationsPath, critiqueId: config.critiqueId, error: `critique runner failed: ${detail}` };
   }
 
-  const finalMeta = store.readCritiqueMeta(config.taskId, config.critiqueId);
+  const finalMeta = store.readCritiqueMeta(config.planId, config.critiqueId);
   if (!finalMeta || finalMeta.status !== "done") {
     return {
       recommendationsPath,

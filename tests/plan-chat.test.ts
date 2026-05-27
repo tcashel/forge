@@ -18,7 +18,7 @@ import { PassThrough, Readable } from "node:stream";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
 import { BadCwdError, type ChatMessage as ChatMsgType, loadHistory, runChatTurn } from "../src/core/plan-chat.ts";
-import { ForgeStore, type TaskRecord } from "../src/core/store.ts";
+import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 interface ServerHandle {
   baseUrl: string;
@@ -52,7 +52,7 @@ async function bootServer(): Promise<ServerHandle> {
 
 interface Envelope {
   ok: boolean;
-  data?: Record<string, unknown> & { messages?: unknown[]; draftId?: string; taskId?: string };
+  data?: Record<string, unknown> & { messages?: unknown[]; draftId?: string; planId?: string };
   error?: { code: string; message: string };
 }
 
@@ -78,11 +78,11 @@ async function delJson(url: string): Promise<{ status: number; body: Envelope }>
   return { status: res.status, body: parsed };
 }
 
-function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, title: string): TaskRecord {
+function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, title: string): Plan {
   const now = new Date().toISOString();
   const specBody = `# ${title}\n\nA stub spec body for chat tests.\n`;
   const specPath = store.writeSpec(id, specBody);
-  const task: TaskRecord = {
+  const task: Plan = {
     id,
     title,
     repoRoot,
@@ -104,7 +104,7 @@ function makeDraftTask(store: ForgeStore, id: string, repoRoot: string, title: s
     specVersion: 1,
     lastImproveError: null,
   };
-  store.upsertTask(task);
+  store.upsertPlan(task);
   return task;
 }
 
@@ -223,10 +223,10 @@ test("GET /api/specs/:id/plan-history returns 404 for unknown task", async (t) =
 test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const taskId = "wipe-target";
-  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): wipe");
+  const planId = "wipe-target";
+  makeDraftTask(h.store, planId, h.tmpHome, "feat(demo): wipe");
   // Hand-write some history.
-  const dir = path.join(h.forgeDir, "specs", taskId);
+  const dir = path.join(h.forgeDir, "specs", planId);
   fs.mkdirSync(dir, { recursive: true });
   const histFile = path.join(dir, "plan-history.json");
   fs.writeFileSync(
@@ -240,23 +240,23 @@ test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => 
     }),
   );
   // Sanity: GET sees both messages.
-  const before = await getJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  const before = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.equal((before.body.data!.messages as unknown[]).length, 2);
 
-  const { status, body } = await delJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  const { status, body } = await delJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.equal(status, 200);
   assert.equal(body.data!.ok, true);
   assert.equal(fs.existsSync(histFile), false);
 
-  const after = await getJson(`${h.baseUrl}/api/specs/${taskId}/plan-history`);
+  const after = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.deepEqual(after.body.data!.messages, []);
 });
 
 test("POST /api/plan-chat/draft/:id/promote moves draft history into the spec dir", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const taskId = "promote-target";
-  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): promote");
+  const planId = "promote-target";
+  makeDraftTask(h.store, planId, h.tmpHome, "feat(demo): promote");
 
   // Mint a draft and hand-write some history into it.
   const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
@@ -271,27 +271,27 @@ test("POST /api/plan-chat/draft/:id/promote moves draft history into the spec di
   };
   fs.writeFileSync(draftFile, JSON.stringify(sample));
 
-  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { taskId });
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { planId });
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.taskId, taskId);
+  assert.equal(body.data!.planId, planId);
 
   // Draft folder gone, spec history file present with the original payload.
   const draftDir = path.join(h.forgeDir, "plan-drafts", draftId);
   assert.equal(fs.existsSync(draftDir), false);
-  const targetFile = path.join(h.forgeDir, "specs", taskId, "plan-history.json");
+  const targetFile = path.join(h.forgeDir, "specs", planId, "plan-history.json");
   assert.equal(fs.existsSync(targetFile), true);
   const moved = JSON.parse(fs.readFileSync(targetFile, "utf-8"));
   assert.deepEqual(moved.messages, sample.messages);
 });
 
-test("POST /api/plan-chat/draft/:id/promote 404s for an unknown taskId", async (t) => {
+test("POST /api/plan-chat/draft/:id/promote 404s for an unknown planId", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const created = await postJson(`${h.baseUrl}/api/plan-chat/draft`);
   const draftId = created.body.data!.draftId as string;
   const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, {
-    taskId: "does-not-exist",
+    planId: "does-not-exist",
   });
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
@@ -300,10 +300,10 @@ test("POST /api/plan-chat/draft/:id/promote 404s for an unknown taskId", async (
 test("POST /api/plan-chat/draft/:id/promote rejects when spec already has plan history", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  const taskId = "promote-conflict";
-  makeDraftTask(h.store, taskId, h.tmpHome, "feat(demo): conflict");
+  const planId = "promote-conflict";
+  makeDraftTask(h.store, planId, h.tmpHome, "feat(demo): conflict");
   // Pre-seed an existing plan-history.json on the spec.
-  const dir = path.join(h.forgeDir, "specs", taskId);
+  const dir = path.join(h.forgeDir, "specs", planId);
   fs.mkdirSync(dir, { recursive: true });
   fs.writeFileSync(
     path.join(dir, "plan-history.json"),
@@ -317,12 +317,12 @@ test("POST /api/plan-chat/draft/:id/promote rejects when spec already has plan h
     JSON.stringify({ version: 1, messages: [] }),
   );
 
-  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { taskId });
+  const { status, body } = await postJson(`${h.baseUrl}/api/plan-chat/draft/${draftId}/promote`, { planId });
   assert.equal(status, 409);
   assert.equal(body.error!.code, "PROMOTE_CONFLICT");
 });
 
-test("POST /api/specs/:id/plan-chat returns 404 for unknown taskId", async (t) => {
+test("POST /api/specs/:id/plan-chat returns 404 for unknown planId", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const { status, body } = await postJson(`${h.baseUrl}/api/specs/nope/plan-chat`, { message: "hi" });

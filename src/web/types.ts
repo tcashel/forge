@@ -1,5 +1,5 @@
-// Mirror of TaskView/RepoView shapes from src/cli/cmd/serve.ts.
-// Phase 2 only needs RepoView; TaskView is stubbed for later phases.
+// Mirror of PlanView/RepoView shapes from src/cli/cmd/serve.ts.
+// Phase 2 only needs RepoView; PlanView is stubbed for later phases.
 
 export type WorkbenchSection = "running" | "attention" | "ready" | "drafting" | "done";
 
@@ -7,7 +7,7 @@ export interface RepoView {
   name: string;
   root: string;
   branch: string | null;
-  taskCount: number;
+  planCount: number;
   registered: boolean;
   current: boolean;
   reachable: boolean;
@@ -21,7 +21,7 @@ export interface CritiqueRef {
   viewedAt: string | null;
 }
 
-export interface TaskView {
+export interface PlanView {
   id: string;
   title: string;
   status: string;
@@ -48,6 +48,18 @@ export interface TaskView {
   hasLog: boolean;
   critique: CritiqueRef | null;
   lastImproveError: LastImproveError | null;
+  /**
+   * Provenance snapshot — currently only attached to "ready" plans so the
+   * sidebar can show "v2 · launched 2× — last: failed" without an extra
+   * round trip. Phase 4e of COO-84; expand if other sections want it.
+   */
+  provenance: PlanProvenance | null;
+}
+
+export interface PlanProvenance {
+  specVersion: number;
+  priorRuns: number;
+  lastRunState: string | null;
 }
 
 export interface LastImproveError {
@@ -56,7 +68,7 @@ export interface LastImproveError {
   at: string;
 }
 
-// Mirror of the per-attempt projection returned by GET /api/tasks/:id/critiques.
+// Mirror of the per-attempt projection returned by GET /api/plans/:id/critiques.
 export interface CritiqueAttemptSummary {
   id: string;
   status: string;
@@ -79,7 +91,36 @@ export interface WorkbenchContext {
 export type ViewMode = "tasks" | "prs" | "settings";
 export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done";
 export type Theme = "light" | "dark";
-export type TabId = "log" | "spec" | "plan" | "critique" | "gates";
+export type TabId = "log" | "spec" | "plan" | "critique" | "gates" | "history" | "runs";
+
+export type PlanHistoryEventKind =
+  | "spec_saved"
+  | "critique_started"
+  | "critique_synthesized"
+  | "launch_started"
+  | "launch_completed";
+
+export interface PlanHistoryEvent {
+  ts: string;
+  kind: PlanHistoryEventKind;
+  ref: string;
+  summary: string;
+}
+
+export interface JobView {
+  id: string;
+  run_number: number;
+  run_kind: string;
+  state: string;
+  branch_name: string | null;
+  worktree_path: string | null;
+  started_at: string | null;
+  finished_at: string | null;
+  exit_code: number | null;
+  summary: string | null;
+  blocker_summary: string | null;
+  session_id: string | null;
+}
 
 export interface CritiqueAgentMeta {
   agent: string;

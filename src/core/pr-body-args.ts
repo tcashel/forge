@@ -30,7 +30,7 @@ interface BuiltArgs {
   agentSummaryPath?: string;
   outputPath: string;
   input: {
-    taskId: string;
+    planId: string;
     branch: string;
     baseRef: string;
     commits: Array<{ sha: string; subject: string }>;
@@ -128,7 +128,7 @@ function shellArg(s: string): string {
 // ─── Pure helper exposed for tests ────────────────────────────────────────────
 
 export interface BuildArgsInput {
-  taskId: string;
+  planId: string;
   branch: string;
   baseRef: string;
   runDir: string;
@@ -157,7 +157,7 @@ export function buildArgs(opts: BuildArgsInput): BuiltArgs {
     agentSummaryPath: path.join(opts.runDir, "agent-summary.md"),
     outputPath: path.join(opts.runDir, "pr-body.md"),
     input: {
-      taskId: opts.taskId,
+      planId: opts.planId,
       branch: opts.branch,
       baseRef: opts.baseRef,
       commits,
@@ -202,7 +202,7 @@ function main(): void {
   }
 
   const args = buildArgs({
-    taskId: values["task-id"] as string,
+    planId: values["task-id"] as string,
     branch: values.branch as string,
     baseRef: values["base-ref"] as string,
     runDir: values["run-dir"] as string,

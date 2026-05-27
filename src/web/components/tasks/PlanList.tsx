@@ -2,8 +2,8 @@ import { useComputed } from "@preact/signals";
 import { repos } from "../../signals/repos";
 import { visibleTasks } from "../../signals/tasks";
 import { searchQuery, selectedRepo, sidebarFilter } from "../../signals/ui";
-import type { SidebarFilter, TaskView, WorkbenchSection } from "../../types";
-import { DoneSection, TaskSection } from "./TaskSection";
+import type { PlanView, SidebarFilter, WorkbenchSection } from "../../types";
+import { DoneSection, PlanSection } from "./PlanSection";
 
 // Which task sections each sidebar filter surfaces. "all" (Pick up here)
 // keeps the original always-show-everything behaviour. The others narrow
@@ -23,14 +23,14 @@ function shouldRender(section: WorkbenchSection, filter: SidebarFilter): boolean
 }
 
 interface SectionMap {
-  running: TaskView[];
-  attention: TaskView[];
-  ready: TaskView[];
-  drafting: TaskView[];
-  done: TaskView[];
+  running: PlanView[];
+  attention: PlanView[];
+  ready: PlanView[];
+  drafting: PlanView[];
+  done: PlanView[];
 }
 
-function bucketize(tasks: TaskView[]): SectionMap {
+function bucketize(tasks: PlanView[]): SectionMap {
   const map: SectionMap = { running: [], attention: [], ready: [], drafting: [], done: [] };
   for (const t of tasks) {
     const bucket = t.section as WorkbenchSection;
@@ -86,7 +86,7 @@ function EmptyState() {
   );
 }
 
-export function TaskList() {
+export function PlanList() {
   const buckets = useComputed(() => bucketize(visibleTasks.value));
   const map = buckets.value;
   const filter = sidebarFilter.value;
@@ -99,7 +99,7 @@ export function TaskList() {
   return (
     <>
       {shouldRender("running", filter) ? (
-        <TaskSection
+        <PlanSection
           section="running"
           ic="running"
           name="Running now"
@@ -108,7 +108,7 @@ export function TaskList() {
         />
       ) : null}
       {shouldRender("attention", filter) ? (
-        <TaskSection
+        <PlanSection
           section="attention"
           ic="attention"
           name="Needs your attention"
@@ -117,7 +117,7 @@ export function TaskList() {
         />
       ) : null}
       {shouldRender("ready", filter) ? (
-        <TaskSection
+        <PlanSection
           section="ready"
           ic="ready"
           name="Ready to launch"
@@ -126,7 +126,7 @@ export function TaskList() {
         />
       ) : null}
       {shouldRender("drafting", filter) ? (
-        <TaskSection
+        <PlanSection
           section="drafting"
           ic="drafting"
           name="Drafting"

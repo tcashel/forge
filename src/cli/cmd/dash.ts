@@ -83,7 +83,7 @@ export async function run(_argv: string[], store: ForgeStore): Promise<void> {
             } catch {
               /* session may already be dead */
             }
-            store.upsertTask({
+            store.upsertPlan({
               ...action.task,
               status: "failed",
               completedAt: new Date().toISOString(),

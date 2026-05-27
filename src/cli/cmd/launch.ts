@@ -31,7 +31,7 @@ import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { launchAgent } from "../../core/launch.ts";
 import { createWorktree, detectRepo } from "../../core/repo.ts";
-import type { ForgeStore, LaunchTarget, ReasoningEffort, RepoConfig, TaskRecord } from "../../core/store.ts";
+import type { ForgeStore, LaunchTarget, Plan, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
 export const HELP = `forge launch <task-id> [...flags]
@@ -121,7 +121,7 @@ function fmtProblems(problems: Problem[]): { message: string; hint: string } {
  */
 export function resolveLaunchConfig(
   values: Record<string, unknown>,
-  task: TaskRecord,
+  task: Plan,
   repoConfig: RepoConfig,
 ): { config: ResolvedLaunchConfig | null; problems: Problem[] } {
   const problems: Problem[] = [];
@@ -311,7 +311,7 @@ function parseEffort(v: unknown, flag: string, problems: Problem[]): ReasoningEf
 }
 
 export interface DoLaunchOpts {
-  taskId: string;
+  planId: string;
   agent?: LaunchTarget;
   model?: string;
   reasoning?: ReasoningEffort;
@@ -329,7 +329,7 @@ export interface DoLaunchOpts {
 }
 
 export interface DoLaunchResult {
-  taskId: string;
+  planId: string;
   tmuxSession: string;
   worktreePath: string;
   branch: string;
@@ -342,10 +342,10 @@ export interface DoLaunchResult {
  * both the CLI shell and the HTTP server. Throws CliError on failure.
  */
 export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<DoLaunchResult> {
-  const task = store.getTask(opts.taskId);
-  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.taskId}".`, { exitCode: 1 });
+  const task = store.getPlan(opts.planId);
+  if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${opts.planId}".`, { exitCode: 1 });
   if (task.status !== "draft" && task.status !== "failed" && task.status !== "quality_failed") {
-    throw new CliError("BAD_STATE", `Task ${opts.taskId} is in state "${task.status}" — cannot launch.`, {
+    throw new CliError("BAD_STATE", `Task ${opts.planId} is in state "${task.status}" — cannot launch.`, {
       hint: "Use `forge resume` for partial-failure recovery.",
       exitCode: 1,
     });
@@ -407,7 +407,7 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
 
     const result = await launchAgent(
       {
-        taskId: task.id,
+        planId: task.id,
         specContent: specBody,
         specTitle: task.title,
         target: resolved.agent,
@@ -436,7 +436,7 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
 
     if (result.error) throw new CliError("LAUNCH_FAIL", `Launch failed: ${result.error}`, { exitCode: 3 });
 
-    store.upsertTask({
+    store.upsertPlan({
       ...task,
       status: "running",
       agent: resolved.agent,
@@ -449,7 +449,7 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
     });
 
     return {
-      taskId: task.id,
+      planId: task.id,
       tmuxSession: result.tmuxSession,
       worktreePath,
       branch,
@@ -476,9 +476,9 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
   }
 }
 
-function dryRunHumanFormat(c: ResolvedLaunchConfig, taskId: string): string {
+function dryRunHumanFormat(c: ResolvedLaunchConfig, planId: string): string {
   const lines: string[] = [
-    `dry-run resolved config for ${taskId}`,
+    `dry-run resolved config for ${planId}`,
     `  agent: ${c.agent} (${c.agentSource})`,
     `  model: ${c.model} (${c.modelSource})`,
   ];
@@ -522,7 +522,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
   // ── --dry-run: resolve config + print without launching. CLI-only path. ─
   if (values["dry-run"] as boolean) {
-    const task = store.getTask(id);
+    const task = store.getPlan(id);
     if (!task) throw new CliError("UNKNOWN_TASK", `No task with id "${id}".`, { exitCode: 1 });
     const repoConfig = store.getRepoConfig(task.repoRoot);
     const { config: resolved, problems } = resolveLaunchConfig(values, task, repoConfig);
@@ -530,7 +530,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
       const { message, hint } = fmtProblems(problems);
       throw new CliError("MISSING_FLAGS", message, { hint: hint || undefined, detail: problems, exitCode: 1 });
     }
-    emitOk({ taskId: task.id, repoRoot: task.repoRoot, ...resolved }, values.json === true, () =>
+    emitOk({ planId: task.id, repoRoot: task.repoRoot, ...resolved }, values.json === true, () =>
       dryRunHumanFormat(resolved, task.id),
     );
     return;
@@ -538,7 +538,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
 
   const result = await doLaunch(
     {
-      taskId: id,
+      planId: id,
       agent: values.agent as LaunchTarget | undefined,
       model: values.model as string | undefined,
       reasoning: values.reasoning as ReasoningEffort | undefined,
@@ -559,6 +559,6 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   emitOk(
     result,
     values.json === true,
-    () => `✓ launched ${result.taskId}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
+    () => `✓ launched ${result.planId}\n  tmux: ${result.tmuxSession}\n  attach: tmux attach -t ${result.tmuxSession}`,
   );
 }

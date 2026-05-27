@@ -1,5 +1,5 @@
 import { selectTask } from "../../signals/tasks";
-import type { TabId, TaskView } from "../../types";
+import type { PlanView, TabId } from "../../types";
 
 export interface Pickup {
   kind: "attention" | "failed" | "running";
@@ -8,11 +8,11 @@ export interface Pickup {
   repo: string;
   title: string;
   blurb: string;
-  taskId: string;
+  planId: string;
   defaultTab: TabId;
 }
 
-export function derivePickups(visibleTasks: TaskView[]): Pickup[] {
+export function derivePickups(visibleTasks: PlanView[]): Pickup[] {
   const out: Pickup[] = [];
   for (const t of visibleTasks) {
     if (t.kind === "critique-ready") {
@@ -23,7 +23,7 @@ export function derivePickups(visibleTasks: TaskView[]): Pickup[] {
         repo: t.repo,
         title: t.title,
         blurb: t.blurb || "Critique finished — review before launching.",
-        taskId: t.id,
+        planId: t.id,
         defaultTab: "critique",
       });
     }
@@ -37,7 +37,7 @@ export function derivePickups(visibleTasks: TaskView[]): Pickup[] {
         repo: t.repo,
         title: t.title,
         blurb: t.error || t.blurb || "Run did not finish — open the log to inspect.",
-        taskId: t.id,
+        planId: t.id,
         defaultTab: "log",
       });
     }
@@ -52,7 +52,7 @@ export function derivePickups(visibleTasks: TaskView[]): Pickup[] {
       repo: t.repo,
       title: t.title,
       blurb: t.agentLabel ? `${t.agentLabel}. Tail the log to follow.` : "Tail the log to follow.",
-      taskId: t.id,
+      planId: t.id,
       defaultTab: "log",
     });
   }
@@ -63,7 +63,7 @@ export function PickupRow({ p }: { p: Pickup }) {
   const onKey = (e: KeyboardEvent) => {
     if (e.key === "Enter" || e.key === " ") {
       e.preventDefault();
-      selectTask(p.taskId, p.defaultTab);
+      selectTask(p.planId, p.defaultTab);
     }
   };
   return (
@@ -72,7 +72,7 @@ export function PickupRow({ p }: { p: Pickup }) {
       class={`card ${p.kind}`}
       role="button"
       tabIndex={0}
-      onClick={() => selectTask(p.taskId, p.defaultTab)}
+      onClick={() => selectTask(p.planId, p.defaultTab)}
       onKeyDown={onKey}
     >
       <div class="top">
