@@ -1155,3 +1155,102 @@ body.filtered-single .repo-chip{ display: none; }
   .settings-form{ padding:14px 16px 40px; }
   .settings-head{ flex-direction:column; }
 }
+
+/* ── Agent Activity ───────────────────────────────────────────────────────── */
+
+.nav-chips { display: flex; flex-wrap: wrap; gap: 4px; padding: 4px 12px 8px; }
+.nav-chip {
+  background: transparent;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+  border-radius: 999px;
+  padding: 2px 8px;
+  font-size: 11px;
+  cursor: pointer;
+}
+.nav-chip.active { background: var(--primary); color: var(--bg); border-color: var(--primary); }
+
+.activity-full-pane { grid-column: 2 / -1; padding: 0; }
+.activity-view {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(280px, 1fr);
+  height: 100%;
+  gap: 0;
+}
+.activity-table-wrap { overflow: auto; padding: 12px 16px; border-right: 1px solid var(--border); }
+.activity-detail-wrap { overflow: auto; padding: 12px 16px; }
+
+.activity-table table { width: 100%; border-collapse: collapse; font-size: 12px; }
+.activity-table th {
+  text-align: left;
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  color: var(--fg-dim);
+  font-weight: 500;
+  position: sticky;
+  top: 0;
+  background: var(--bg);
+  z-index: 1;
+}
+.activity-table td {
+  padding: 6px 8px;
+  border-bottom: 1px solid var(--border);
+  vertical-align: top;
+}
+.activity-row { cursor: pointer; }
+.activity-row:hover { background: var(--surface, rgba(255,255,255,0.03)); }
+.activity-row.selected { background: var(--primary-bg, rgba(99,102,241,0.12)); }
+.activity-empty { color: var(--fg-dim); padding: 12px; }
+.activity-error { color: var(--attention); padding: 8px; }
+
+.sort-btn {
+  background: transparent;
+  border: none;
+  color: inherit;
+  cursor: pointer;
+  font: inherit;
+  padding: 0;
+}
+
+.activity-status {
+  display: inline-block;
+  padding: 1px 6px;
+  border-radius: 4px;
+  font-size: 10px;
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+}
+.activity-state-running { background: var(--running); color: #fff; }
+.activity-state-completed { background: var(--done); color: #fff; }
+.activity-state-failed { background: var(--attention); color: #fff; }
+.activity-state-killed { background: var(--fg-dim); color: #fff; }
+
+.activity-detail header { margin-bottom: 12px; }
+.activity-detail .title { font-size: 14px; font-weight: 600; }
+.activity-detail .subtitle { font-size: 12px; color: var(--fg-dim); }
+.activity-detail .meta { font-size: 11px; color: var(--fg-dim); display: flex; gap: 12px; flex-wrap: wrap; margin-top: 4px; }
+.activity-detail.empty,
+.activity-detail.loading { color: var(--fg-dim); padding: 16px; }
+.activity-detail.error { color: var(--attention); padding: 16px; }
+
+.activity-log,
+.activity-markdown {
+  background: var(--bg-deep, #0a0a0a);
+  border: 1px solid var(--border);
+  padding: 10px;
+  border-radius: 6px;
+  font-family: var(--mono, monospace);
+  font-size: 11px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 600px;
+  overflow: auto;
+}
+
+.activity-history .chat-msg { padding: 6px 0; border-bottom: 1px solid var(--border); }
+.activity-history .chat-msg .role {
+  font-size: 10px;
+  text-transform: uppercase;
+  color: var(--fg-dim);
+}
+.activity-history .chat-msg .text { white-space: pre-wrap; }

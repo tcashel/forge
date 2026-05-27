@@ -19,6 +19,7 @@ import * as migrate from "./cmd/migrate.ts";
 import * as review from "./cmd/review.ts";
 import * as run_ from "./cmd/run.ts";
 import * as serve from "./cmd/serve.ts";
+import * as session from "./cmd/session.ts";
 import * as spec from "./cmd/spec.ts";
 import * as status from "./cmd/status.ts";
 import * as wait from "./cmd/wait.ts";
@@ -39,6 +40,7 @@ const HELP_BY_CMD: Record<string, string> = {
   review: review.HELP,
   run: run_.HELP,
   serve: serve.HELP,
+  session: session.HELP,
   spec: spec.HELP,
   status: status.HELP,
   wait: wait.HELP,
@@ -167,6 +169,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "serve":
         await serve.run(rest, store);
+        return;
+      case "session":
+        await session.run(rest, store);
         return;
       default: {
         const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, { exitCode: 1 });

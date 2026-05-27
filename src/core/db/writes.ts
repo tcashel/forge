@@ -10,7 +10,169 @@
  */
 
 import type { Database } from "bun:sqlite";
+import type { CostSource } from "../pricing.ts";
 import type { CritiqueMeta, Plan, RunMeta } from "../store.ts";
+
+/**
+ * On-disk shape stored as JSON in `sessions.metrics`. Only this file
+ * mints and updates these rows; the Agent Activity view reads them back
+ * as `unknown` and parses leniently — older rows (`metrics='{}'`) must
+ * keep rendering.
+ */
+export interface SessionMetrics {
+  durationMs: number | null;
+  reasoningEffort: "low" | "medium" | "high" | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  cacheRead: number | null;
+  cacheCreate: number | null;
+  costUsd: number | null;
+  costSource: CostSource | null;
+  /** ISO date — populated only when costSource === "estimate". */
+  modelPricedAt: string | null;
+  /** Joinable plan id when known (improvement, drafting after promotion, …). */
+  planId?: string;
+  /** Drafting only — "draft" until promotion, then "spec". */
+  scopeKind?: "draft" | "spec";
+}
+
+export type SessionPurpose = "drafting" | "critique" | "synthesis" | "execution" | "review" | "fix" | "improvement";
+
+export type SessionState = "running" | "completed" | "failed" | "killed";
+
+export interface UpsertSessionInput {
+  id: string;
+  purpose: SessionPurpose;
+  relatedId: string | null;
+  agentAdapter: string;
+  model: string | null;
+  startedAt: string;
+  pid?: number | null;
+  cwd?: string | null;
+  commandLine?: string | null;
+  /** Initial state — defaults to "running". */
+  state?: SessionState;
+  metrics?: Partial<SessionMetrics>;
+}
+
+export interface FinalizeSessionInput {
+  id: string;
+  finishedAt: string;
+  state: SessionState;
+  exitCode?: number | null;
+  error?: string | null;
+  metrics?: Partial<SessionMetrics>;
+}
+
+function defaultMetrics(): SessionMetrics {
+  return {
+    durationMs: null,
+    reasoningEffort: null,
+    tokensIn: null,
+    tokensOut: null,
+    cacheRead: null,
+    cacheCreate: null,
+    costUsd: null,
+    costSource: null,
+    modelPricedAt: null,
+  };
+}
+
+function mergeMetrics(base: SessionMetrics, patch: Partial<SessionMetrics> | undefined): SessionMetrics {
+  if (!patch) return base;
+  return { ...base, ...patch };
+}
+
+function parseMetrics(raw: string | null | undefined): SessionMetrics {
+  if (!raw) return defaultMetrics();
+  try {
+    const parsed = JSON.parse(raw) as Record<string, unknown>;
+    return { ...defaultMetrics(), ...(parsed as Partial<SessionMetrics>) };
+  } catch {
+    return defaultMetrics();
+  }
+}
+
+/**
+ * Insert-or-update a sessions row keyed by deterministic `id`. Re-runs
+ * with the same id replace the prior row's mutable fields (state,
+ * metrics, …) so callers don't need to track "did I already start this
+ * session?" across processes. New ids (e.g. round 2 of a fixer)
+ * naturally land as new rows.
+ */
+export function upsertSession(db: Database, input: UpsertSessionInput): void {
+  const merged = mergeMetrics(defaultMetrics(), input.metrics);
+  db.prepare(
+    `INSERT INTO sessions
+     (id, purpose, related_id, agent_adapter, model, started_at, finished_at, state,
+      pid, cwd, command_line, exit_code, error, metrics)
+     VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?, ?, NULL, NULL, ?)
+     ON CONFLICT(id) DO UPDATE SET
+       purpose = excluded.purpose,
+       related_id = excluded.related_id,
+       agent_adapter = excluded.agent_adapter,
+       model = excluded.model,
+       started_at = excluded.started_at,
+       state = excluded.state,
+       pid = excluded.pid,
+       cwd = excluded.cwd,
+       command_line = excluded.command_line,
+       metrics = excluded.metrics`,
+  ).run(
+    input.id,
+    input.purpose,
+    input.relatedId,
+    input.agentAdapter,
+    input.model,
+    input.startedAt,
+    input.state ?? "running",
+    input.pid ?? null,
+    input.cwd ?? null,
+    input.commandLine ?? null,
+    JSON.stringify(merged),
+  );
+}
+
+/**
+ * Finalize a session row — set finished_at / state / exit_code / error
+ * and merge in any new metrics fields. Looks up the existing metrics
+ * blob and merges patch on top so partial updates (e.g. just costUsd
+ * after a stream-json parse) don't clobber durationMs already written.
+ *
+ * No-op if the row doesn't exist (best-effort finalize from CLI helpers
+ * that may race a missing session).
+ */
+export function finalizeSession(db: Database, input: FinalizeSessionInput): void {
+  const row = db.prepare("SELECT metrics FROM sessions WHERE id = ?").get(input.id) as
+    | { metrics: string | null }
+    | undefined;
+  if (!row) return;
+  const merged = mergeMetrics(parseMetrics(row.metrics), input.metrics);
+  db.prepare(
+    "UPDATE sessions SET finished_at = ?, state = ?, exit_code = ?, error = COALESCE(?, error), metrics = ? WHERE id = ?",
+  ).run(input.finishedAt, input.state, input.exitCode ?? null, input.error ?? null, JSON.stringify(merged), input.id);
+}
+
+/**
+ * Sweep any `state='running'` execution sessions whose backing job row
+ * shows a terminal job state. Read-path safety net for the case where
+ * the bash runner dies before invoking `forge session finish` — without
+ * this, the Activity view's "Live" filter shows phantom running rows.
+ */
+export function reconcileExecutionSessions(db: Database, now: string): void {
+  db.prepare(
+    `UPDATE sessions
+        SET state = CASE WHEN j.state IN ('succeeded') THEN 'completed'
+                         WHEN j.state IN ('failed','timeout','cancelled','hook_denied') THEN 'failed'
+                         ELSE sessions.state END,
+            finished_at = COALESCE(sessions.finished_at, j.finished_at, ?)
+       FROM jobs j
+      WHERE sessions.purpose = 'execution'
+        AND sessions.state = 'running'
+        AND j.session_id = sessions.id
+        AND j.state IN ('succeeded','failed','timeout','cancelled','hook_denied')`,
+  ).run(now);
+}
 
 export function livePlanVersionId(planId: string, version: number): string {
   return `pv-${planId}-v${version}`;
@@ -22,6 +184,40 @@ export function liveTaskId(planId: string): string {
 
 export function liveJobId(planId: string, runNumber: number): string {
   return `j-${planId}-r${runNumber}`;
+}
+
+// ─── Deterministic session ids ────────────────────────────────────────────────
+//
+// Format documented in the Agent Activity spec. ActivityTable parses the
+// slot suffix to derive a display label (critic-a / critic-b / …) so the
+// `purpose` enum stays compact.
+
+export function executionSessionId(jobId: string): string {
+  return `s-execution-${jobId}`;
+}
+
+export function critiqueSessionId(critiqueId: string, slot: "a" | "b"): string {
+  return `s-critique-${critiqueId}-${slot}`;
+}
+
+export function synthesisSessionId(critiqueId: string): string {
+  return `s-synthesis-${critiqueId}`;
+}
+
+export function improvementSessionId(critiqueId: string, round: number): string {
+  return `s-improvement-${critiqueId}-r${round}`;
+}
+
+export function reviewSessionId(jobId: string, round: number): string {
+  return `s-review-${jobId}-r${round}`;
+}
+
+export function fixSessionId(jobId: string, round: number): string {
+  return `s-fix-${jobId}-r${round}`;
+}
+
+export function draftingSessionId(scopeId: string): string {
+  return `s-drafting-${scopeId}`;
 }
 
 function planStageForStatus(status: Plan["status"]): string {
@@ -193,12 +389,27 @@ export function recordJobStarted(db: Database, task: Plan, meta: RunMeta): numbe
       .get(taskRowId) as { n: number };
     runNumber = maxRow.n + 1;
 
+    const jobId = liveJobId(task.id, runNumber);
+    const sessionId = executionSessionId(jobId);
+    // Seed the session row before the jobs row so the FK from
+    // jobs.session_id holds. The bash runner's `forge session start`
+    // upserts the same id with richer metadata once the agent launches.
+    upsertSession(db, {
+      id: sessionId,
+      purpose: "execution",
+      relatedId: jobId,
+      agentAdapter: task.agent ?? "claude",
+      model: task.model,
+      startedAt: meta.startedAt,
+      state: "running",
+      cwd: meta.worktree,
+    });
     db.prepare(
       `INSERT INTO jobs
        (id, task_id, run_number, run_kind, session_id, worktree_path, branch_name, state,
         blocker_summary, eta_seconds, started_at, finished_at, exit_code, summary)
-       VALUES (?, ?, ?, 'initial', NULL, ?, ?, 'running', NULL, NULL, ?, NULL, NULL, NULL)`,
-    ).run(liveJobId(task.id, runNumber), taskRowId, runNumber, meta.worktree, task.branch, meta.startedAt);
+       VALUES (?, ?, ?, 'initial', ?, ?, ?, 'running', NULL, NULL, ?, NULL, NULL, NULL)`,
+    ).run(jobId, taskRowId, runNumber, sessionId, meta.worktree, task.branch, meta.startedAt);
 
     db.prepare("UPDATE plans SET stage = 'running', updated_at = ? WHERE id = ?").run(meta.startedAt, task.id);
 
@@ -221,7 +432,8 @@ function liveCriticConfigId(agent: string, model: string): string {
 }
 
 function liveCritiqueSessionId(critiqueId: string, slot: "critic-a" | "critic-b" | "synth"): string {
-  return `s-${critiqueId}-${slot}`;
+  if (slot === "synth") return synthesisSessionId(critiqueId);
+  return critiqueSessionId(critiqueId, slot === "critic-a" ? "a" : "b");
 }
 
 function liveCriticRunId(critiqueId: string, slot: "a" | "b"): string {

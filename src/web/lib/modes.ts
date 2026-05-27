@@ -44,3 +44,9 @@ export function enterSettingsMode(): void {
   setMobileButtonActive(false, false);
   clearDetail();
 }
+
+export function enterActivityMode(): void {
+  viewMode.value = "activity";
+  setMobileButtonActive(false, false);
+  clearDetail();
+}

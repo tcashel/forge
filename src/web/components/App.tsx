@@ -1,4 +1,5 @@
 import { viewMode } from "../signals/ui";
+import { ActivityView } from "./activity/ActivityView";
 import { NewSpecModal } from "./modal/NewSpecModal";
 import { PickupSection } from "./pickup/PickupSection";
 import { PrDetail } from "./prs/PrDetail";
@@ -28,8 +29,9 @@ export function App() {
   const inTasks = mode === "tasks";
   const inPrs = mode === "prs";
   const inSettings = mode === "settings";
-  const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}`;
-  const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}`;
+  const inActivity = mode === "activity";
+  const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}${inActivity ? " activity-list-pane" : ""}`;
+  const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}${inActivity ? " activity-detail-pane" : ""}`;
   return (
     <div class="app">
       <Sidebar />
@@ -38,16 +40,24 @@ export function App() {
         <section class="pickup" id="pickup-section">
           {inTasks ? <PickupSection /> : null}
         </section>
-        <aside class={listPaneClass} id="list-pane">
-          {inTasks ? <PlanList /> : null}
-          {inPrs ? <PrList /> : null}
-          {inSettings ? <SettingsRepoList /> : null}
-        </aside>
-        <main class={detailPaneClass} id="detail-pane">
-          {inTasks ? <PlanDetail /> : null}
-          {inPrs ? <PrDetail /> : null}
-          {inSettings ? <SettingsForm /> : null}
-        </main>
+        {inActivity ? (
+          <main class={`detail-pane activity-full-pane`} id="detail-pane">
+            <ActivityView />
+          </main>
+        ) : (
+          <>
+            <aside class={listPaneClass} id="list-pane">
+              {inTasks ? <PlanList /> : null}
+              {inPrs ? <PrList /> : null}
+              {inSettings ? <SettingsRepoList /> : null}
+            </aside>
+            <main class={detailPaneClass} id="detail-pane">
+              {inTasks ? <PlanDetail /> : null}
+              {inPrs ? <PrDetail /> : null}
+              {inSettings ? <SettingsForm /> : null}
+            </main>
+          </>
+        )}
       </div>
       <NewSpecModal />
     </div>

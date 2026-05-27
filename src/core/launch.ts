@@ -10,7 +10,7 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { recordJobStarted } from "./db/writes.ts";
+import { executionSessionId, liveJobId, recordJobStarted } from "./db/writes.ts";
 import { bashGhEnvExport } from "./gh.js";
 import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
@@ -114,11 +114,47 @@ export function agentCommand(
   }
 }
 
+/**
+ * Job-runner-only claude invocation. Emits stream-json so the runner can
+ * tee the raw events into a sidecar file (for token + cost extraction)
+ * and pipe a human-readable projection to the log file.
+ *
+ * Non-claude agents continue to use `agentCommand` — switching them would
+ * require their own stream-json contract, and we don't have token-capture
+ * empirically wired for them yet.
+ *
+ * `streamPath` is where the runner stages the JSONL output; the projection
+ * (via jq) becomes the visible log. Output goes to stdout in the human
+ * shape so the runner can `tee -a $LOG_FILE` outside of this helper.
+ */
+export function claudeJobCommand(model: string, promptFile: string, streamPath: string): string {
+  const jq = `jq -r --unbuffered 'if .type=="assistant" then (.message.content[]? | select(.type=="text") | .text) elif .type=="result" then (.result // empty) else empty end'`;
+  return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${jq}`;
+}
+
 // ─── Runner script ────────────────────────────────────────────────────────────
 
 function conventionalCommitPrefix(branch: string): string {
   const m = branch.match(/^(feat|fix|chore|docs|refactor|test|ci|style|perf|build)\//);
   return m ? m[1] : "feat";
+}
+
+/**
+ * Bash snippet emitted at the top of every runner script: defines
+ * `forge_session_start` / `forge_session_finish` helpers that call the
+ * forge CLI for session recording. Failures route to a side log so the
+ * job itself is never blocked on DB write success.
+ */
+function forgeSessionHelperShell(forgeBin: string, runDir: string): string {
+  const helperLog = path.join(runDir, "session-helper.log");
+  return `FORGE_BIN="${forgeBin}"
+SESSION_HELPER_LOG="${helperLog}"
+forge_session_start() {
+  bun "$FORGE_BIN" session start "$@" >/dev/null 2>>"$SESSION_HELPER_LOG" || true
+}
+forge_session_finish() {
+  bun "$FORGE_BIN" session finish "$@" >/dev/null 2>>"$SESSION_HELPER_LOG" || true
+}`;
 }
 
 function generateAutoFixBlock(config: LaunchConfig, runDir: string, fixerCmd: string, reviewerCmd: string): string {
@@ -154,7 +190,10 @@ except Exception:
     } > "$RUN_DIR/fix-prompt.txt"
 
     # Run fixer agent
+    FIX_SESSION_ID="s-fix-$JOB_ID-r$FIX_ROUND"
+    forge_session_start --id "$FIX_SESSION_ID" --purpose fix --agent "${config.fixerTarget}" --model "${config.fixerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
     if ${fixerCmd} > "$RUN_DIR/fix-raw-$FIX_ROUND.md" 2>&1; then
+      forge_session_finish --id "$FIX_SESSION_ID" --exit-code 0
       log "✓ Fixer completed"
 
       # Re-run quality gates
@@ -207,7 +246,10 @@ ${qualityCheck}
           echo 'Now produce the review in a single \`\`\`forge-review fenced block per the skill instructions.'
         } > "$RUN_DIR/review-prompt.txt"
 
+        REVIEW_SESSION_ID="s-review-$JOB_ID-r$(( FIX_ROUND + 1 ))"
+        forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
         if ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1; then
+          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
           # Same last-match strategy as the first reviewer pass — see
           # rationale on the original verdict extractor above.
           NEW_VERDICT=$(python3 -c "
@@ -242,6 +284,7 @@ print(json.dumps(verdict))
           fi
         else
           RE_EXIT=$?
+          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$RE_EXIT"
           log "⚠  Re-reviewer failed (exit $RE_EXIT) — stopping auto-fix"
           set_meta_field "reviewError" '"re-reviewer process failed"'
           break
@@ -252,6 +295,7 @@ print(json.dumps(verdict))
       fi
     else
       FIX_EXIT=$?
+      forge_session_finish --id "$FIX_SESSION_ID" --exit-code "$FIX_EXIT"
       log "⚠  Fixer agent failed (exit $FIX_EXIT) — stopping auto-fix"
       set_meta_field "reviewError" '"fixer agent failed"'
       break
@@ -280,7 +324,28 @@ function fixQualityBlock(qualityCommands: string[]): string {
     .join("\n");
 }
 
-function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
+/**
+ * Compute the run number the next job for this plan will be assigned.
+ * Mirrors the `MAX(run_number) + 1` logic in `recordJobStarted`. Used
+ * to embed the deterministic execution session id into the runner
+ * script before tmux is started.
+ */
+function nextJobRunNumber(store: ForgeStore, planId: string): number {
+  try {
+    const row = store.db.db
+      .prepare(
+        `SELECT COALESCE(MAX(j.run_number), 0) AS n
+           FROM jobs j JOIN tasks t ON j.task_id = t.id
+           WHERE t.plan_id = ?`,
+      )
+      .get(planId) as { n: number } | undefined;
+    return (row?.n ?? 0) + 1;
+  } catch {
+    return 1;
+  }
+}
+
+function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jobRunNumber: number }): string {
   const runDir = store.ensureRunDir(config.planId);
   const logFile = store.getLogFile(config.planId);
   const metaFile = path.join(runDir, "meta.json");
@@ -289,11 +354,17 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore): string {
   const extDir = path.dirname(fileURLToPath(import.meta.url));
   const prBodyTsPath = path.join(extDir, "pr-body.ts");
   const prBodyArgsTsPath = path.join(extDir, "pr-body-args.ts");
+  // bin/forge.ts is two levels up from src/core/launch.ts.
+  const forgeBin = path.join(extDir, "..", "..", "bin", "forge.ts");
+  const sessionHelper = forgeSessionHelperShell(forgeBin, runDir);
 
   // ── claude / codex bash runner ──────────────────────────────
-  const agentCmd = agentCommand(config.target, config.model, promptFile, {
-    reasoningEffort: config.reasoningEffort,
-  });
+  const streamFile = path.join(runDir, "agent.stream.jsonl");
+  const agentCmd =
+    config.target === "claude"
+      ? claudeJobCommand(config.model, promptFile, streamFile)
+      : agentCommand(config.target, config.model, promptFile, { reasoningEffort: config.reasoningEffort });
+  const agentStreamFile = config.target === "claude" ? streamFile : "";
   // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
   // because long titles render badly in GitHub's PR list.
   const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
@@ -366,6 +437,9 @@ with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
 
 set_status() { set_meta_field "status" ""$1""; }
 
+# ── Session-recording helpers (no-op on DB failure) ──────────────────────────
+${sessionHelper}
+
 # ── Init ──────────────────────────────────────────────────────────────────────
 
 mkdir -p "$(dirname "$LOG_FILE")"
@@ -390,8 +464,14 @@ set_meta_field "baseSha" ""$BASE_SHA""
 # ── Run Agent ─────────────────────────────────────────────────────────────────
 
 log "═══ AGENT (${config.target}) ═══"
+EXEC_SESSION_ID="${executionSessionId(liveJobId(config.planId, ids.jobRunNumber))}"
+JOB_ID="${liveJobId(config.planId, ids.jobRunNumber)}"
+forge_session_start --id "$EXEC_SESSION_ID" --purpose execution --agent "${config.target}" --model "${config.model}" --related-id "$JOB_ID" --cwd "$WORKTREE"
+
 ${agentCmd} 2>&1 | tee -a "$LOG_FILE"
 AGENT_EXIT=$?  # correct because pipefail is set
+
+forge_session_finish --id "$EXEC_SESSION_ID" --exit-code "$AGENT_EXIT"${agentStreamFile ? ` --stream-json-path "${agentStreamFile}"` : ""}
 
 if [ "$AGENT_EXIT" -ne 0 ]; then
   log ""
@@ -604,7 +684,12 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
   } > "$RUN_DIR/review-prompt.txt"
 
   log "Running reviewer: ${config.reviewerTarget} / ${config.reviewerModel}"
+  REVIEW_SESSION_ID="s-review-${liveJobId(config.planId, ids.jobRunNumber)}-r1"
+  forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
+  REV_EXIT=0
   if ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1; then
+    REV_EXIT=$?
+    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
     # Extract the forge-review fenced block and verdict.
     # Take the LAST matching block, not the first: codex-as-reviewer echoes
     # the SKILL.md prompt verbatim (which contains a template forge-review
@@ -641,6 +726,7 @@ print(json.dumps(verdict))
     fi
   else
     REVIEWER_EXIT=$?
+    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$REVIEWER_EXIT"
     log "⚠  Reviewer process failed (exit $REVIEWER_EXIT)"
     set_meta_field "reviewVerdict" "null"
     set_meta_field "reviewError" ""reviewer process exited with code $REVIEWER_EXIT""
@@ -762,8 +848,11 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
   const fixerPrefix = buildFixerPromptPrefix({ skillsDir: path.join(skillsRoot, "forge-fixer") });
   fs.writeFileSync(path.join(runDir, "fixer-prompt-prefix.txt"), fixerPrefix, "utf-8");
 
-  // Write runner script
-  const script = generateRunnerScript(config, store);
+  // Write runner script. Compute the expected run number now so the
+  // deterministic session ids it embeds match the jobs row recorded
+  // post-tmux-alive below.
+  const jobRunNumber = nextJobRunNumber(store, config.planId);
+  const script = generateRunnerScript(config, store, { jobRunNumber });
   const runnerPath = store.getRunnerScript(config.planId);
   fs.writeFileSync(runnerPath, script, { mode: 0o755 });
 

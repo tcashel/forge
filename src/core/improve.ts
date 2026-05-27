@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWriteText } from "./atomic-write.js";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
-import { recordPlanVersionAdded } from "./db/writes.ts";
+import { finalizeSession, improvementSessionId, recordPlanVersionAdded, upsertSession } from "./db/writes.ts";
 import { agentCommand } from "./launch.js";
 import type { ForgeStore } from "./store.js";
 
@@ -59,6 +59,11 @@ export interface ImproveOverrides {
 }
 
 // ─── Skill loader ─────────────────────────────────────────────────────────────
+
+function normalizeReasoning(effort: string | undefined): "low" | "medium" | "high" | null {
+  if (effort === "low" || effort === "medium" || effort === "high") return effort;
+  return null;
+}
 
 function skillBody(): string {
   // improve.ts lives at src/core/, but skills/ is at the repo root.
@@ -411,11 +416,45 @@ export async function runImprover(
   const outputPath = path.join(critiqueDir, "improver-output.md");
   const errLogPath = path.join(critiqueDir, "improver.log");
   const runAgent = overrides.runImproverAgent ?? defaultRunImproverAgent;
+
+  const improverSessionId = improvementSessionId(critiqueId, 1);
+  const improverStartedAt = new Date().toISOString();
+  try {
+    upsertSession(store.db.db, {
+      id: improverSessionId,
+      purpose: "improvement",
+      relatedId: critiqueId,
+      agentAdapter: config.improver.agent,
+      model: config.improver.model,
+      startedAt: improverStartedAt,
+      state: "running",
+      cwd: config.repoRoot,
+      metrics: {
+        reasoningEffort: normalizeReasoning(config.improver.reasoningEffort),
+        planId: config.planId,
+      },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`improve: upsertSession failed: ${msg}\n`);
+  }
+
   let exitCode: number;
   try {
     exitCode = await runAgent({ promptFile, outputPath, errLogPath, config });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
+    try {
+      finalizeSession(store.db.db, {
+        id: improverSessionId,
+        finishedAt: new Date().toISOString(),
+        state: "failed",
+        exitCode: null,
+        error: msg,
+      });
+    } catch {
+      /* noop */
+    }
     return {
       critiqueId,
       applied: false,
@@ -424,6 +463,21 @@ export async function runImprover(
       error: `IMPROVE_FAILED: improver agent threw: ${msg}`,
     };
   }
+
+  try {
+    const durationMs = Date.now() - new Date(improverStartedAt).getTime();
+    finalizeSession(store.db.db, {
+      id: improverSessionId,
+      finishedAt: new Date().toISOString(),
+      state: exitCode === 0 ? "completed" : "failed",
+      exitCode,
+      metrics: { durationMs },
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`improve: finalizeSession failed: ${msg}\n`);
+  }
+
   if (exitCode !== 0) {
     return {
       critiqueId,

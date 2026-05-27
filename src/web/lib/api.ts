@@ -1,7 +1,7 @@
 // Thin API wrapper. Server returns `{ ok, data, error }` envelopes; legacy
 // callers throw with `code` / `hint` populated on failures, and we keep
 // that contract so existing toast logic still surfaces backend hints.
-import type { PlanView } from "../types";
+import type { ActivityDetailResponse, AgentActivityRow, PlanView } from "../types";
 
 export class ApiError extends Error {
   code: string;
@@ -55,4 +55,31 @@ export interface PlansResponse {
 export function getPlans(repo?: string): Promise<PlansResponse> {
   const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
   return apiGet<PlansResponse>(`/api/plans${q}`);
+}
+
+export interface AgentActivityResponse {
+  rows: AgentActivityRow[];
+}
+
+export interface FetchAgentActivityParams {
+  state?: string;
+  purpose?: string;
+  agent?: string;
+  repo?: string;
+  since?: string;
+  limit?: number;
+}
+
+export function fetchAgentActivity(params: FetchAgentActivityParams = {}): Promise<AgentActivityResponse> {
+  const q = new URLSearchParams();
+  for (const [k, v] of Object.entries(params)) {
+    if (v === undefined || v === null || v === "") continue;
+    q.set(k, String(v));
+  }
+  const qs = q.toString();
+  return apiGet<AgentActivityResponse>(`/api/agent-activity${qs ? `?${qs}` : ""}`);
+}
+
+export function fetchAgentActivityDetail(sessionId: string): Promise<ActivityDetailResponse> {
+  return apiGet<ActivityDetailResponse>(`/api/agent-activity/${encodeURIComponent(sessionId)}`);
 }

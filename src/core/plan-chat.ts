@@ -23,6 +23,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.ts";
+import { parseResultEvent } from "./claude-stream.ts";
+import type { ForgeDb } from "./db/connection.ts";
+import { draftingSessionId, finalizeSession, upsertSession } from "./db/writes.ts";
 import { withFileLock } from "./file-lock.ts";
 
 // ─── Types ──────────────────────────────────────────────────────────────────
@@ -349,6 +352,12 @@ export interface RunChatTurnOptions {
    * pass 0 to disable.
    */
   heartbeatIntervalMs?: number;
+  /**
+   * SQLite handle used to write a `purpose='drafting'` session row at
+   * spawn and finalize it on exit. Omitted in tests that don't need
+   * Agent Activity coverage.
+   */
+  db?: ForgeDb;
 }
 
 /**
@@ -560,6 +569,31 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   ];
   const child = spawnFn("claude", args, opts.cwd);
 
+  // Record an Agent Activity row for this chat turn. Failure is non-fatal
+  // — the planner still streams; the row just won't appear in the dashboard.
+  const sessionId = draftingSessionId(scope.id);
+  const sessionStartedAt = new Date().toISOString();
+  if (opts.db) {
+    try {
+      upsertSession(opts.db.db, {
+        id: sessionId,
+        purpose: "drafting",
+        relatedId: scope.id,
+        agentAdapter: "claude",
+        model,
+        startedAt: sessionStartedAt,
+        state: "running",
+        pid: child.pid ?? null,
+        cwd: opts.cwd ?? null,
+        commandLine: `claude ${args.join(" ")}`,
+        metrics: { scopeKind: scope.kind },
+      });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`plan-chat: upsertSession failed: ${msg}\n`);
+    }
+  }
+
   // Pipe the prompt file into claude's stdin. Defensive error handlers:
   // claude may exit before consuming stdin (bad model, missing binary)
   // and the resulting EPIPE / ENOENT must not crash the server — let
@@ -618,6 +652,10 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
       let resultTotalCostUsd: number | null = null;
       let resultNumTurns: number | null = null;
       let resultStopReason: string | null = null;
+      let resultTokensIn: number | null = null;
+      let resultTokensOut: number | null = null;
+      let resultCacheRead: number | null = null;
+      let resultCacheCreate: number | null = null;
 
       let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
       let lastWriteAt = Date.now();
@@ -778,10 +816,17 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           // message ready regardless of whether `result` arrived first
           // or got cut off). Capture the metadata here so we can forward
           // it into the `done` frame.
-          if (typeof evt.duration_ms === "number") resultDurationMs = evt.duration_ms;
-          if (typeof evt.total_cost_usd === "number") resultTotalCostUsd = evt.total_cost_usd;
-          if (typeof evt.num_turns === "number") resultNumTurns = evt.num_turns;
-          if (typeof evt.stop_reason === "string") resultStopReason = evt.stop_reason;
+          const parsed = parseResultEvent(evt);
+          if (parsed) {
+            resultDurationMs = parsed.durationMs;
+            resultTotalCostUsd = parsed.totalCostUsd;
+            resultNumTurns = parsed.numTurns;
+            resultStopReason = parsed.stopReason;
+            resultTokensIn = parsed.tokensIn;
+            resultTokensOut = parsed.tokensOut;
+            resultCacheRead = parsed.cacheRead;
+            resultCacheCreate = parsed.cacheCreate;
+          }
           return;
         }
         // Anything else (e.g. future event types) — ignore.
@@ -837,6 +882,29 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
         if (lineBuf.length > 0) {
           flushLine(lineBuf);
           lineBuf = "";
+        }
+        if (opts.db) {
+          try {
+            const finalState = code === 0 ? "completed" : cancelled ? "killed" : "failed";
+            finalizeSession(opts.db.db, {
+              id: sessionId,
+              finishedAt: new Date().toISOString(),
+              state: finalState,
+              exitCode: typeof code === "number" ? code : null,
+              metrics: {
+                durationMs: resultDurationMs,
+                tokensIn: resultTokensIn,
+                tokensOut: resultTokensOut,
+                cacheRead: resultCacheRead,
+                cacheCreate: resultCacheCreate,
+                costUsd: resultTotalCostUsd,
+                costSource: resultTotalCostUsd !== null ? "provider" : null,
+              },
+            });
+          } catch (e) {
+            const msg = e instanceof Error ? e.message : String(e);
+            process.stderr.write(`plan-chat: finalizeSession failed: ${msg}\n`);
+          }
         }
         const fullText = turnBlocks
           .filter((b): b is { type: "text"; text: string } => b.type === "text")
