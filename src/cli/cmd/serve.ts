@@ -15,6 +15,7 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
+import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
 import { buildPlanHistory } from "../../core/history.ts";
@@ -884,35 +885,6 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
 }
 
-/**
- * Decide how to spawn `forge spec improve` from inside a running server.
- *
- * Two failure modes we've actually hit in the wild:
- *   1. `process.execPath` rots: long-lived `forge serve` caches the bun
- *      binary path, and a partial `brew upgrade bun` makes posix_spawn
- *      return ENOENT against the cached cellar path.
- *   2. Direct shebang execution fails when `process.argv[1]` isn't a
- *      `chmod +x` script — e.g., under `bun test` where argv[1] is the
- *      test file itself.
- *
- * Strategy: prefer shebang execution when the script is executable (the
- * production case — `bin/forge.ts` is +x and `#!/usr/bin/env bun` resolves
- * via PATH at exec time). Otherwise spawn a fresh bun via PATH and pass
- * the script as the first argument. Either path sidesteps the brittle
- * cached execPath.
- */
-function improverSpawn(planId: string): { cmd: string; args: string[] } | null {
-  const scriptPath = process.argv[1];
-  if (!scriptPath) return null;
-  try {
-    fs.accessSync(scriptPath, fs.constants.X_OK);
-    return { cmd: scriptPath, args: ["spec", "improve", planId, "--json"] };
-  } catch {
-    // Script isn't directly executable — call bun on it explicitly.
-    return { cmd: "bun", args: [scriptPath, "spec", "improve", planId, "--json"] };
-  }
-}
-
 function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
   const reachable = repos.filter((r) => !r.stale);
   if (!repoName) return reachable[0] ?? repos[0] ?? null;
@@ -1418,9 +1390,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     // behind it). Spawn a detached child running the equivalent CLI so the
     // request returns immediately. The next 3s task poll picks up the
     // critique-meta status flip ("Improving" pill → "Ready" / "Failed").
-    const spawnArgs = improverSpawn(planId);
-    if (!spawnArgs) return jsonErr(500, "INTERNAL", "process.argv[1] missing — cannot spawn improver");
-    const child = spawn(spawnArgs.cmd, spawnArgs.args, {
+    const child = spawnForgeCli(["spec", "improve", planId, "--json"], {
       cwd: task.repoRoot,
       detached: true,
       stdio: "ignore",
