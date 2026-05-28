@@ -88,7 +88,7 @@ export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;
 }
 
-export type ViewMode = "tasks" | "prs" | "settings" | "activity";
+export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review";
 export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity";
 
 // ─── Agent Activity ─────────────────────────────────────────────────────────
@@ -245,6 +245,51 @@ export interface PrsResponse {
   me: string;
   repo: string | null;
   repoRoot: string | null;
+}
+
+// Mirror of the per-comment shape returned by GET /api/prs/:num/review-bundle.
+export interface InlinePrComment {
+  id: number;
+  user: string;
+  body: string;
+  path: string;
+  position: number | null;
+  originalPosition: number | null;
+  line: number | null;
+  originalLine: number | null;
+  side: "RIGHT" | "LEFT" | null;
+  startLine: number | null;
+  startSide: "RIGHT" | "LEFT" | null;
+  inReplyToId: number | null;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+  commitId: string;
+}
+
+export interface IssuePrComment {
+  id: number;
+  user: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+}
+
+export interface PrBundleWarning {
+  source: "diff" | "inlineComments" | "issueComments" | "linkage";
+  message: string;
+}
+
+export interface PrReviewBundle {
+  pr: PrView;
+  diff: string;
+  diffStats: { additions: number; deletions: number; changedFiles: number };
+  inlineComments: InlinePrComment[];
+  issueComments: IssuePrComment[];
+  linkedPlanId: string | null;
+  worktreePath: string | null;
+  warnings: PrBundleWarning[];
 }
 
 // ─── Plan chat ──────────────────────────────────────────────────────────────

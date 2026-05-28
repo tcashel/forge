@@ -1,0 +1,39 @@
+diff --git a/src/alpha.ts b/src/alpha.ts
+index 1111111..2222222 100644
+--- a/src/alpha.ts
++++ b/src/alpha.ts
+@@ -1,5 +1,6 @@
+ export function alpha() {
+-  return "old";
++  return "new";
++  // appended
+ }
+
+ export const v = 1;
+diff --git a/src/beta.ts b/src/beta.ts
+index 3333333..4444444 100644
+--- a/src/beta.ts
++++ b/src/beta.ts
+@@ -1,4 +1,3 @@
+ export const x = 1;
+-export const y = 2;
+-export const z = 3;
++export const z = 3;
+ export const w = 4;
+@@ -10,3 +9,4 @@ export const tail = true;
+ const a = 0;
+ const b = 0;
+ const c = 0;
++const d = 0;
+diff --git a/src/old-name.ts b/src/new-name.ts
+similarity index 90%
+rename from src/old-name.ts
+rename to src/new-name.ts
+index 5555555..6666666 100644
+--- a/src/old-name.ts
++++ b/src/new-name.ts
+@@ -1,3 +1,3 @@
+ export const renamed = true;
+-export const value = "before";
++export const value = "after";
+ export const trailing = 0;

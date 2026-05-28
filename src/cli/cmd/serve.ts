@@ -18,7 +18,13 @@ import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.t
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
 import type { GhTarget } from "../../core/gh.ts";
-import { fetchPrs, type GhFetchOpts, type GhPr } from "../../core/gh-pr.ts";
+import {
+  fetchPrBundle as defaultFetchPrBundle,
+  type FetchPrBundleResult,
+  fetchPrs,
+  type GhFetchOpts,
+  type GhPr,
+} from "../../core/gh-pr.ts";
 import { buildPlanHistory } from "../../core/history.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import {
@@ -114,6 +120,7 @@ interface RepoView {
 }
 
 type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+type PrBundleFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
 
 const CONFIG_STRING_KEYS = new Set([
   "ghUser",
@@ -662,6 +669,7 @@ interface RouteCtx {
   webDir: string;
   currentRepo: { name: string; root: string } | null;
   prFetcher: PrFetcher;
+  prBundleFetcher: PrBundleFetcher;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -936,7 +944,87 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ prs: result.prs, me: result.me, repo: target.name, repoRoot: target.root });
   }
 
+  // GET /api/prs/:num/review-bundle?repo=<root>
+  const reviewBundleMatch = pathname.match(/^\/api\/prs\/([^/]+)\/review-bundle$/);
+  if (reviewBundleMatch) {
+    const numRaw = decodeURIComponent(reviewBundleMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    const result = await ctx.prBundleFetcher(prNum, {
+      cwd: target.root,
+      ghTarget: ghTargetForRepo(store, target.root),
+    });
+    if (!result.ok) {
+      return jsonErr(404, "PR_NOT_FOUND", result.error || `PR #${prNum} not found in ${target.name}.`);
+    }
+    const linkage = derivePrLinkage(store, target.root, prNum);
+    return jsonOk({
+      pr: result.bundle.pr,
+      diff: result.bundle.diff,
+      diffStats: result.bundle.diffStats,
+      inlineComments: result.bundle.inlineComments,
+      issueComments: result.bundle.issueComments,
+      linkedPlanId: linkage.linkedPlanId,
+      worktreePath: linkage.worktreePath,
+      warnings: [...result.bundle.warnings, ...linkage.warnings],
+    });
+  }
+
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
+}
+
+interface PrLinkage {
+  linkedPlanId: string | null;
+  worktreePath: string | null;
+  warnings: Array<{ source: "linkage"; message: string }>;
+}
+
+/**
+ * Resolve the JSON-backed plan and most recent job worktree for a given
+ * (repoRoot, prNumber) pair. Phase 2 fixers will consume these; Phase 1
+ * just persists them in the bundle response.
+ *
+ * If anything throws we degrade to nulls plus a warning rather than
+ * failing the whole bundle — the diff and comments are still useful.
+ */
+function derivePrLinkage(store: ForgeStore, repoRoot: string, prNumber: number): PrLinkage {
+  try {
+    const candidates = store.getPlans(repoRoot).filter((p) => p.status !== "archived" && p.prNumber === prNumber);
+    if (candidates.length === 0) {
+      return { linkedPlanId: null, worktreePath: null, warnings: [] };
+    }
+    // Plans don't carry an explicit updated_at; the largest of
+    // completedAt/launchedAt/createdAt is the closest analog.
+    const newest = [...candidates].sort((a, b) => {
+      const aKey = a.completedAt ?? a.launchedAt ?? a.createdAt;
+      const bKey = b.completedAt ?? b.launchedAt ?? b.createdAt;
+      return bKey.localeCompare(aKey);
+    })[0];
+    const job = store.db.db
+      .prepare(
+        `SELECT j.worktree_path AS worktreePath
+           FROM jobs j JOIN tasks t ON j.task_id = t.id
+           WHERE t.plan_id = ?
+           ORDER BY COALESCE(j.started_at, '') DESC, j.run_number DESC
+           LIMIT 1`,
+      )
+      .get(newest.id) as { worktreePath: string | null } | undefined;
+    return { linkedPlanId: newest.id, worktreePath: job?.worktreePath ?? null, warnings: [] };
+  } catch (e) {
+    return {
+      linkedPlanId: null,
+      worktreePath: null,
+      warnings: [{ source: "linkage", message: (e as Error).message }],
+    };
+  }
 }
 
 function resolvePrRepo(repos: RepoView[], repoName: string | undefined): RepoView | null {
@@ -1853,6 +1941,7 @@ export interface ServeOptions {
   host?: string;
   open?: boolean;
   prFetcher?: PrFetcher;
+  prBundleFetcher?: PrBundleFetcher;
 }
 
 /**
@@ -1968,6 +2057,7 @@ export async function startServer(
     webDir,
     currentRepo: detectedCurrentRepo ? { name: detectedCurrentRepo.name, root: detectedCurrentRepo.root } : null,
     prFetcher: opts.prFetcher ?? fetchPrs,
+    prBundleFetcher: opts.prBundleFetcher ?? defaultFetchPrBundle,
   };
 
   const server = Bun.serve({

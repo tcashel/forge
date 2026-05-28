@@ -4,6 +4,7 @@ import { NewSpecModal } from "./modal/NewSpecModal";
 import { PickupSection } from "./pickup/PickupSection";
 import { PrDetail } from "./prs/PrDetail";
 import { PrList } from "./prs/PrList";
+import { ReviewPage } from "./review/ReviewPage";
 import { Sidebar } from "./Sidebar";
 import { SettingsForm } from "./settings/SettingsForm";
 import { SettingsRepoList } from "./settings/SettingsRepoList";
@@ -30,6 +31,7 @@ export function App() {
   const inPrs = mode === "prs";
   const inSettings = mode === "settings";
   const inActivity = mode === "activity";
+  const inReview = mode === "pr-review";
   const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}${inActivity ? " activity-list-pane" : ""}`;
   const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}${inActivity ? " activity-detail-pane" : ""}`;
   return (
@@ -43,6 +45,10 @@ export function App() {
         {inActivity ? (
           <main class={`activity-full-pane`} id="detail-pane">
             <ActivityView />
+          </main>
+        ) : inReview ? (
+          <main class="review-full-pane" id="detail-pane">
+            <ReviewPage />
           </main>
         ) : (
           <>

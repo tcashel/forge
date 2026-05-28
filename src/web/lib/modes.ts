@@ -5,7 +5,7 @@
 // extra side effects (mobile-switch button activation + scroll into
 // view) the legacy functions were responsible for.
 import { currentTaskId } from "../signals/tasks";
-import { viewMode } from "../signals/ui";
+import { currentReviewPrNumber, currentReviewRepo, viewMode } from "../signals/ui";
 
 export function clearDetail(): void {
   currentTaskId.value = null;
@@ -48,5 +48,13 @@ export function enterSettingsMode(): void {
 export function enterActivityMode(): void {
   viewMode.value = "activity";
   setMobileButtonActive(false, false);
+  clearDetail();
+}
+
+export function enterReviewMode(prNumber: number, repoRoot: string): void {
+  currentReviewPrNumber.value = prNumber;
+  currentReviewRepo.value = repoRoot;
+  viewMode.value = "pr-review";
+  setMobileButtonActive(false, true);
   clearDetail();
 }
