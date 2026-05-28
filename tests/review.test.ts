@@ -65,12 +65,12 @@ test("buildReviewerPrompt truncates very large diffs and notes the truncation", 
 // runner script and can't be imported directly.
 const VERDICT_PARSER_PY = `
 import re, sys, json
-raw = open(sys.argv[1]).read()
+raw = open(sys.argv[1], encoding='utf-8').read()
 matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
 if not matches:
     sys.exit(2)
 block = matches[-1].group(1)
-open(sys.argv[2], 'w').write(block)
+open(sys.argv[2], 'w', encoding='utf-8').write(block)
 verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
 verdict = verdict_match.group(1).strip().lower() if verdict_match else None
 if verdict not in ('approve', 'request-changes', 'block'):
@@ -78,7 +78,10 @@ if verdict not in ('approve', 'request-changes', 'block'):
 print(json.dumps(verdict))
 `;
 
-function runVerdictParser(rawPath: string): { verdict: string | null; reviewBody: string; exitCode: number } {
+function runVerdictParser(
+  rawPath: string,
+  envOverride?: Record<string, string>,
+): { verdict: string | null; reviewBody: string; exitCode: number } {
   const reviewPath = path.join(
     os.tmpdir(),
     `forge-test-review-${Date.now()}-${Math.random().toString(36).slice(2)}.md`,
@@ -86,6 +89,7 @@ function runVerdictParser(rawPath: string): { verdict: string | null; reviewBody
   try {
     const stdout = execFileSync("python3", ["-c", VERDICT_PARSER_PY, rawPath, reviewPath], {
       encoding: "utf-8",
+      env: envOverride ? { ...process.env, ...envOverride } : process.env,
     });
     const verdict = JSON.parse(stdout.trim()) as string | null;
     const reviewBody = fs.existsSync(reviewPath) ? fs.readFileSync(reviewPath, "utf-8") : "";
@@ -116,6 +120,46 @@ test("verdict parser exits 2 when no forge-review block is present", () => {
   try {
     const { exitCode } = runVerdictParser(tmp);
     assert.equal(exitCode, 2);
+  } finally {
+    fs.rmSync(tmp);
+  }
+});
+
+// Regression: reviewer output is full of non-ASCII (em dashes, ✅/⚠️, smart
+// quotes). Background runners (tmux/launchd) can start under a POSIX/C locale
+// where Python's open().read() defaults to ASCII and throws UnicodeDecodeError
+// *before* writing review.md — surfacing as "verdict line missing or
+// unrecognised" even though the reviewer returned a valid verdict. The parser
+// must pin encoding='utf-8' so it survives a hostile locale. The forced env
+// below disables UTF-8 mode coercion to reproduce the broken environment.
+test("verdict parser extracts non-ASCII review under a POSIX/C locale", () => {
+  const tmp = path.join(os.tmpdir(), `forge-test-unicode-${Date.now()}.md`);
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "request-changes",
+    "",
+    "## Summary",
+    "This PR implements the spec’s singleton — I read every file.",
+    "",
+    "## Spec Adherence",
+    "- ✅ singleton helper present",
+    "- ⚠️ CI checks still pending",
+    "```",
+    "",
+  ].join("\n");
+  fs.writeFileSync(tmp, raw, "utf-8");
+  try {
+    const { verdict, reviewBody, exitCode } = runVerdictParser(tmp, {
+      LC_ALL: "C",
+      LANG: "C",
+      LC_CTYPE: "C",
+      PYTHONUTF8: "0",
+      PYTHONCOERCECLOCALE: "0",
+    });
+    assert.equal(exitCode, 0, "parser must not crash on non-ASCII under a C locale");
+    assert.equal(verdict, "request-changes");
+    assert.match(reviewBody, /✅ singleton helper present/, "review.md is written with utf-8 intact");
   } finally {
     fs.rmSync(tmp);
   }
