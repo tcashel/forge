@@ -1,12 +1,20 @@
-import { useEffect } from "preact/hooks";
+import { useEffect, useMemo } from "preact/hooks";
+import { type DiffFile, parseUnifiedDiff } from "../../lib/diff";
 import { enterPrMode } from "../../lib/modes";
 import { loadReviewBundle, reviewBundle, reviewError, reviewLoading } from "../../signals/review";
 import { currentReviewPrNumber, currentReviewRepo } from "../../signals/ui";
+import type { ForgeFinding } from "../../types";
 import { BatchBar } from "./BatchBar";
-import { DiffPane } from "./DiffPane";
+import { anchorFindings, DiffPane } from "./DiffPane";
+import { OutsideDiffFindings } from "./OutsideDiffFindings";
 import { ReviewActionBar } from "./ReviewActionBar";
 import { ReviewHeader } from "./ReviewHeader";
+import { ReviewSessionDrawer } from "./ReviewSessionDrawer";
 import { UnanchoredComments } from "./UnanchoredComments";
+
+function deriveOutside(diff: DiffFile[], findings: ForgeFinding[]): ForgeFinding[] {
+  return anchorFindings(findings, diff).outside;
+}
 
 export function ReviewPage() {
   const num = currentReviewPrNumber.value;
@@ -18,6 +26,12 @@ export function ReviewPage() {
   useEffect(() => {
     if (num != null && repo != null) void loadReviewBundle(num, repo);
   }, [num, repo]);
+
+  const outsideFindings = useMemo(() => {
+    if (!bundle) return [];
+    const parsed = parseUnifiedDiff(bundle.diff);
+    return deriveOutside(parsed, bundle.forgeFindings ?? []);
+  }, [bundle]);
 
   if (num == null || repo == null) {
     return (
@@ -39,10 +53,12 @@ export function ReviewPage() {
         <>
           <ReviewHeader bundle={bundle} />
           <DiffPane bundle={bundle} />
+          <OutsideDiffFindings findings={outsideFindings} />
           <UnanchoredComments bundle={bundle} />
         </>
       ) : null}
       <BatchBar />
+      <ReviewSessionDrawer prNumber={num} repoRoot={repo} />
     </div>
   );
 }

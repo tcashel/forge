@@ -281,6 +281,20 @@ export interface PrBundleWarning {
   message: string;
 }
 
+export type ForgeFindingSeverity = "BLOCKER" | "HIGH" | "MEDIUM" | "LOW";
+
+export interface ForgeFinding {
+  id: string;
+  severity: ForgeFindingSeverity;
+  title: string;
+  file: string;
+  lineStart: number;
+  lineEnd: number;
+  evidence: string | null;
+  why: string;
+  fix: string;
+}
+
 export interface PrReviewBundle {
   pr: PrView;
   diff: string;
@@ -289,6 +303,7 @@ export interface PrReviewBundle {
   issueComments: IssuePrComment[];
   linkedPlanId: string | null;
   worktreePath: string | null;
+  forgeFindings: ForgeFinding[];
   warnings: PrBundleWarning[];
 }
 

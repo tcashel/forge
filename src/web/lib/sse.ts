@@ -7,17 +7,55 @@
 // the consumer's appendLines callback verbatim — line splitting and
 // classification stays in the component (so DOM mutations live there).
 
+export interface LogStreamDoneEvent {
+  exitCode: number;
+  error: string | null;
+}
+
 export interface LogStreamHandlers {
   onLines: (text: string) => void;
+  onDone?: (e: LogStreamDoneEvent) => void;
+  onError?: () => void;
   onDisconnect?: () => void;
 }
 
 export function openLogStream(planId: string, lines: number, handlers: LogStreamHandlers): EventSource {
   const url = `/api/plans/${encodeURIComponent(planId)}/log?lines=${lines}`;
+  return attachLogStream(url, handlers);
+}
+
+/**
+ * Subscribe to a recorded session's log SSE stream. Adds the `done` event
+ * hook so ad-hoc review callers (the ReviewSessionDrawer) can refetch the
+ * bundle as soon as the worker exits.
+ */
+export function openSessionLogStream(sessionId: string, lines: number, handlers: LogStreamHandlers): EventSource {
+  const url = `/api/sessions/${encodeURIComponent(sessionId)}/log?lines=${lines}`;
+  return attachLogStream(url, handlers);
+}
+
+function attachLogStream(url: string, handlers: LogStreamHandlers): EventSource {
   const src = new EventSource(url);
   src.addEventListener("snapshot", (e) => handlers.onLines((e as MessageEvent).data));
   src.addEventListener("append", (e) => handlers.onLines((e as MessageEvent).data));
+  src.addEventListener("done", (e) => {
+    try {
+      const parsed = JSON.parse((e as MessageEvent).data) as Partial<LogStreamDoneEvent>;
+      handlers.onDone?.({
+        exitCode: typeof parsed.exitCode === "number" ? parsed.exitCode : -1,
+        error: typeof parsed.error === "string" ? parsed.error : null,
+      });
+    } catch {
+      handlers.onDone?.({ exitCode: -1, error: "malformed done frame" });
+    }
+    try {
+      src.close();
+    } catch {
+      /* noop */
+    }
+  });
   src.addEventListener("error", () => {
+    handlers.onError?.();
     handlers.onDisconnect?.();
     try {
       src.close();
