@@ -17,7 +17,7 @@ import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
 import * as migrate from "./cmd/migrate.ts";
 import * as review from "./cmd/review.ts";
-import { runReviewWorker } from "./cmd/review-actions.ts";
+import { runExtractReviewBlock, runReviewWorker } from "./cmd/review-actions.ts";
 import * as run_ from "./cmd/run.ts";
 import * as serve from "./cmd/serve.ts";
 import * as session from "./cmd/session.ts";
@@ -178,6 +178,11 @@ export async function run(argv: string[]): Promise<void> {
         // Internal worker spawned by runAdHocReview. Not a public CLI verb;
         // double-underscore prefix discourages accidental invocation.
         await runReviewWorker(rest, store);
+        return;
+      case "__extract-review":
+        // Internal helper the tmux launch runner calls to extract the
+        // forge-review block + verdict, replacing an inline python3 block.
+        runExtractReviewBlock(rest);
         return;
       default: {
         const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, { exitCode: 1 });

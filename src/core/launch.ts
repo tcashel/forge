@@ -271,20 +271,7 @@ ${qualityCheck}
           forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
           # Same last-match strategy as the first reviewer pass — see
           # rationale on the original verdict extractor above.
-          NEW_VERDICT=$(python3 -c "
-import re, sys, json
-raw = open(sys.argv[1], encoding='utf-8').read()
-matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
-if not matches:
-    sys.exit(2)
-block = matches[-1].group(1)
-open(sys.argv[2], 'w', encoding='utf-8').write(block)
-verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
-verdict = verdict_match.group(1).strip().lower() if verdict_match else None
-if verdict not in ('approve', 'request-changes', 'block'):
-    verdict = None
-print(json.dumps(verdict))
-" "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>/dev/null)
+          NEW_VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>/dev/null)
           RE_EXTRACT=$?
 
           if [ "$RE_EXTRACT" -eq 2 ]; then
@@ -727,20 +714,7 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
     # (approve | request-changes | block in angle brackets), not a real
     # verdict. The real review is always last. Paired with the fixture in
     # tests/fixtures/reviewer/.
-    VERDICT=$(python3 -c "
-import re, sys, json
-raw = open(sys.argv[1], encoding='utf-8').read()
-matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
-if not matches:
-    sys.exit(2)
-block = matches[-1].group(1)
-open(sys.argv[2], 'w', encoding='utf-8').write(block)
-verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
-verdict = verdict_match.group(1).strip().lower() if verdict_match else None
-if verdict not in ('approve', 'request-changes', 'block'):
-    verdict = None
-print(json.dumps(verdict))
-" "$RUN_DIR/review-raw.md" "$RUN_DIR/review.md" 2>/dev/null)
+    VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw.md" "$RUN_DIR/review.md" 2>/dev/null)
     EXTRACT_EXIT=$?
 
     if [ "$EXTRACT_EXIT" -eq 2 ]; then

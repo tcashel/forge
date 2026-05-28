@@ -29,6 +29,7 @@ import {
   extractLastForgeReviewBlock,
   type ForgeFinding,
   parseForgeReviewFindings,
+  parseForgeReviewVerdict,
 } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
 
@@ -431,6 +432,39 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
   // Always last so the client sees done AFTER it sees any error text.
   process.stdout.write(`${adHocReviewSentinelLine(exitCode, error)}\n`);
   process.exit(exitCode);
+}
+
+// ─── forge __extract-review <raw> <out> ──────────────────────────────────────
+
+/**
+ * Internal subcommand the tmux launch runner calls in place of an inline
+ * `python3` block: read the reviewer's raw output, extract the LAST
+ * ```forge-review block (nested-fence aware — see
+ * reviewer.ts:extractLastForgeReviewBlock), write it to <out>, and print
+ * the verdict as JSON on stdout.
+ *
+ * Exit codes mirror the old Python contract so the runner's branches stay
+ * unchanged: 2 = no forge-review block found, 0 = block written (verdict
+ * may still be `null` if the block lacks a recognised `## Verdict`).
+ */
+export function runExtractReviewBlock(argv: string[]): void {
+  const [rawFile, outFile] = argv;
+  if (!rawFile || !outFile) {
+    process.stderr.write("usage: forge __extract-review <raw-file> <out-file>\n");
+    process.exit(2);
+  }
+  let raw = "";
+  try {
+    raw = fs.readFileSync(rawFile, "utf-8");
+  } catch {
+    // Missing/unreadable raw output is treated the same as "no block".
+    process.exit(2);
+  }
+  const block = extractLastForgeReviewBlock(raw);
+  if (block === null) process.exit(2);
+  fs.writeFileSync(outFile, block, "utf-8");
+  process.stdout.write(`${JSON.stringify(parseForgeReviewVerdict(block))}\n`);
+  process.exit(0);
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────

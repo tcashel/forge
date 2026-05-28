@@ -2,7 +2,11 @@ import { strict as assert } from "node:assert";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
-import { extractLastForgeReviewBlock, parseForgeReviewFindings } from "../../src/core/reviewer.ts";
+import {
+  extractLastForgeReviewBlock,
+  parseForgeReviewFindings,
+  parseForgeReviewVerdict,
+} from "../../src/core/reviewer.ts";
 
 const fixturesDir = path.join(import.meta.dirname, "..", "fixtures", "reviews");
 
@@ -122,4 +126,57 @@ test("extractLastForgeReviewBlock pulls the LAST fenced block (codex echo case)"
 test("extractLastForgeReviewBlock returns null when no block is present", () => {
   assert.equal(extractLastForgeReviewBlock("no fenced block here"), null);
   assert.equal(extractLastForgeReviewBlock(""), null);
+});
+
+test("extractLastForgeReviewBlock keeps nested ```text Evidence fences", () => {
+  // Regression: the old non-greedy `(.*?)\n``` regex stopped at the FIRST
+  // inner fence — the ```text under **Evidence:** — truncating the review
+  // right after `**Evidence:**` and dropping every Why/Fix/later section.
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "request-changes",
+    "",
+    "## Summary",
+    "CI is red.",
+    "",
+    "## Findings",
+    "",
+    "### [BLOCKER] CI checks are failing",
+    "**Where:** `GitHub Actions checks for PR #1`",
+    "**Evidence:**",
+    "```text",
+    "biome    FAILURE",
+    "bun-test FAILURE",
+    "```",
+    "**Why:** required checks must be green.",
+    "**Fix:** rerun the failing jobs.",
+    "",
+    "## What I Verified",
+    "- [x] Read every changed file",
+    "```",
+    "tokens used: 1234",
+  ].join("\n");
+
+  const block = extractLastForgeReviewBlock(raw);
+  assert.ok(block, "should find a block");
+  assert.match(block ?? "", /## What I Verified/, "must not truncate at the Evidence fence");
+  assert.match(block ?? "", /biome {4}FAILURE/, "nested evidence body survives");
+
+  const findings = parseForgeReviewFindings(block ?? "");
+  assert.equal(findings.length, 1);
+  const [f] = findings;
+  assert.match(f.evidence ?? "", /biome {4}FAILURE/);
+  assert.match(f.why, /required checks must be green/);
+  assert.match(f.fix, /rerun the failing jobs/);
+  assert.equal(parseForgeReviewVerdict(block ?? ""), "request-changes");
+});
+
+test("parseForgeReviewVerdict reads the verdict line and rejects junk", () => {
+  assert.equal(parseForgeReviewVerdict("## Verdict\napprove\n\n## Summary\nok"), "approve");
+  assert.equal(parseForgeReviewVerdict("## Verdict\nrequest-changes\n"), "request-changes");
+  assert.equal(parseForgeReviewVerdict("##  Verdict \n  block\n"), "block");
+  assert.equal(parseForgeReviewVerdict("## Verdict\nmaybe\n"), null);
+  assert.equal(parseForgeReviewVerdict("## Summary\nno verdict heading"), null);
+  assert.equal(parseForgeReviewVerdict(""), null);
 });
