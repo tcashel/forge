@@ -54,6 +54,7 @@ import type {
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
+import { findLatestForgeFindings, parseAdHocReviewSentinel, runAdHocReview } from "./review-actions.ts";
 import { archiveSpec, saveSpec, unarchiveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
@@ -555,7 +556,13 @@ function tailBytes(filePath: string, lines: number): string {
   return head.join("\n");
 }
 
-function logSseResponse(logFile: string, initialLines: number): Response {
+interface LogSseOptions {
+  /** Session id whose terminal state should emit an `event: done` frame. */
+  sessionId?: string;
+  store?: ForgeStore;
+}
+
+function logSseResponse(logFile: string, initialLines: number, opts: LogSseOptions = {}): Response {
   // Cleanup is shared between start() (which builds it) and cancel()
   // (which the client fires on disconnect). Default no-op so we never
   // call undefined if cancel races ahead of start.
@@ -573,14 +580,56 @@ function logSseResponse(logFile: string, initialLines: number): Response {
         }
       };
 
+      let doneEmitted = false;
+      const emitDoneFromSentinel = (raw: string): boolean => {
+        for (const line of raw.split(/\r?\n/)) {
+          const parsed = parseAdHocReviewSentinel(line);
+          if (parsed) {
+            send("done", JSON.stringify(parsed));
+            doneEmitted = true;
+            // Sentinel is the worker's last word — tear down so the
+            // client knows the stream is truly finished.
+            queueMicrotask(() => tearDown());
+            return true;
+          }
+        }
+        return false;
+      };
+      const emitDoneFromSession = () => {
+        if (doneEmitted || !opts.sessionId || !opts.store) return false;
+        try {
+          const row = opts.store.db.db
+            .prepare("SELECT state, exit_code, error FROM sessions WHERE id = ?")
+            .get(opts.sessionId) as { state: string; exit_code: number | null; error: string | null } | undefined;
+          if (!row) return false;
+          if (row.state === "completed" || row.state === "failed" || row.state === "killed") {
+            send(
+              "done",
+              JSON.stringify({ exitCode: row.exit_code ?? (row.state === "completed" ? 0 : -1), error: row.error }),
+            );
+            doneEmitted = true;
+            queueMicrotask(() => tearDown());
+            return true;
+          }
+        } catch {
+          /* transient DB error — try again next tick */
+        }
+        return false;
+      };
+
       // 1) initial dump
-      send("snapshot", tailBytes(logFile, initialLines));
+      const snapshot = tailBytes(logFile, initialLines);
+      send("snapshot", snapshot);
+      // Snapshot may already include the sentinel if the client connects
+      // after the worker exited.
+      if (!emitDoneFromSentinel(snapshot)) emitDoneFromSession();
 
       // 2) tail-watch
       let offset = fs.existsSync(logFile) ? fs.statSync(logFile).size : 0;
       let watcher: fs.FSWatcher | null = null;
       let pollTimer: ReturnType<typeof setInterval> | null = null;
       let heartbeat: ReturnType<typeof setInterval> | null = null;
+      let sessionPollTimer: ReturnType<typeof setInterval> | null = null;
       let closed = false;
 
       const tearDown = () => {
@@ -596,6 +645,7 @@ function logSseResponse(logFile: string, initialLines: number): Response {
         }
         if (pollTimer) clearInterval(pollTimer);
         if (heartbeat) clearInterval(heartbeat);
+        if (sessionPollTimer) clearInterval(sessionPollTimer);
         try {
           controller.close();
         } catch {
@@ -615,7 +665,10 @@ function logSseResponse(logFile: string, initialLines: number): Response {
             const buf = Buffer.alloc(size - offset);
             fs.readSync(fd, buf, 0, buf.length, offset);
             const chunk = buf.toString("utf-8").replace(/\n+$/, "");
-            if (chunk) send("append", chunk);
+            if (chunk) {
+              send("append", chunk);
+              if (!doneEmitted) emitDoneFromSentinel(chunk);
+            }
           } finally {
             fs.closeSync(fd);
           }
@@ -635,6 +688,15 @@ function logSseResponse(logFile: string, initialLines: number): Response {
       // Belt-and-suspenders: poll every 1.5s in case fs.watch misses an
       // event (it does, occasionally, on macOS APFS under heavy load).
       pollTimer = setInterval(pump, 1500);
+
+      // For session-bound streams, also poll the sessions row so a worker
+      // that crashes without writing the sentinel still ends in `done`.
+      if (opts.sessionId && opts.store) {
+        sessionPollTimer = setInterval(() => {
+          if (closed) return;
+          emitDoneFromSession();
+        }, 1500);
+      }
 
       // Heartbeat every 25s so any intermediate proxy doesn't kill the
       // connection. SSE comments are ignored by the browser.
@@ -931,7 +993,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     if (!logFile) return jsonErr(404, "UNKNOWN_SESSION", `No session with id "${sessionId}".`);
     const linesParam = url.searchParams.get("lines");
     const initial = Math.max(0, Math.min(2000, Number.parseInt(linesParam ?? "200", 10) || 200));
-    return logSseResponse(logFile, initial);
+    return logSseResponse(logFile, initial, { sessionId, store });
   }
 
   // GET /api/prs?repo=<name>
@@ -966,6 +1028,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       return jsonErr(404, "PR_NOT_FOUND", result.error || `PR #${prNum} not found in ${target.name}.`);
     }
     const linkage = derivePrLinkage(store, target.root, prNum);
+    const findings = findLatestForgeFindings(store, prNum, target.root, result.bundle.pr.headRefName ?? null);
     return jsonOk({
       pr: result.bundle.pr,
       diff: result.bundle.diff,
@@ -974,6 +1037,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       issueComments: result.bundle.issueComments,
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
+      forgeFindings: findings.findings,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
   }
@@ -1355,9 +1419,9 @@ function loadDraftingHistory(store: ForgeStore, session: AgentActivityRow): unkn
   return [];
 }
 
-function resolveSessionLogFile(store: ForgeStore, sessionId: string): string | null {
-  const row = store.db.db.prepare("SELECT purpose, related_id FROM sessions WHERE id = ?").get(sessionId) as
-    | { purpose: string; related_id: string | null }
+export function resolveSessionLogFile(store: ForgeStore, sessionId: string): string | null {
+  const row = store.db.db.prepare("SELECT purpose, related_id, metrics FROM sessions WHERE id = ?").get(sessionId) as
+    | { purpose: string; related_id: string | null; metrics: string | null }
     | undefined;
   if (!row) return null;
   // execution / review / fix all share the job's main agent.log today.
@@ -1370,6 +1434,16 @@ function resolveSessionLogFile(store: ForgeStore, sessionId: string): string | n
       )
       .get(sessionId, row.related_id) as { plan_id: string } | undefined;
     if (job) return store.getLogFile(job.plan_id);
+    // Ad-hoc reviewer sessions have no joined jobs row — fall back to
+    // metrics.logFile written by runAdHocReview.
+    if (row.purpose === "review") {
+      try {
+        const metrics = JSON.parse(row.metrics ?? "{}") as { logFile?: unknown };
+        if (typeof metrics.logFile === "string" && metrics.logFile) return metrics.logFile;
+      } catch {
+        /* malformed metrics — fall through to null */
+      }
+    }
   }
   return null;
 }
@@ -1418,6 +1492,7 @@ const DRAFT_MSG_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/message$/;
 const DRAFT_ABORT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/abort$/;
 const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
 const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
+const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
@@ -1432,6 +1507,7 @@ function allowsPost(pathname: string): boolean {
     DRAFT_PROMOTE_PATH.test(pathname)
   )
     return true;
+  if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   return ACTION_TASK_PATH.test(pathname);
 }
 
@@ -1752,6 +1828,35 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const parsed = await readJsonBody(req);
   if ("error" in parsed) return parsed.error;
   const body = parsed.body;
+
+  // POST /api/prs/:num/run-review
+  const runReviewMatch = pathname.match(PR_RUN_REVIEW_PATH);
+  if (runReviewMatch) {
+    const numRaw = decodeURIComponent(runReviewMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    try {
+      const result = await runAdHocReview({ prNum, repoRoot: target.root, repoName: target.name }, store);
+      return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
+    } catch (e) {
+      if (e instanceof CliError) {
+        // Map orchestrator CliErrors to the spec'd HTTP statuses.
+        if (e.code === "PR_NOT_FOUND") return jsonErr(404, e.code, e.message, e.hint);
+        if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
+        if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
+        if (e.code === "REVIEW_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
+        return fromCliError(e);
+      }
+      throw e;
+    }
+  }
 
   // POST /api/specs
   if (pathname === "/api/repos") {
