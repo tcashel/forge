@@ -251,7 +251,7 @@ function statusInfo(
         critique,
       };
     case "done":
-      return { section: "done", statLabel: "Merged", statClass: "done", error: null, critique };
+      return { section: "done", statLabel: "PR opened", statClass: "done", error: null, critique };
     case "archived":
       // Archived plans are filtered out of /api/plans, but keep this exhaustive
       // so the type checker stays happy and a stray archived plan doesn't crash.
