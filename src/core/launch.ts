@@ -273,12 +273,12 @@ ${qualityCheck}
           # rationale on the original verdict extractor above.
           NEW_VERDICT=$(python3 -c "
 import re, sys, json
-raw = open(sys.argv[1]).read()
+raw = open(sys.argv[1], encoding='utf-8').read()
 matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
 if not matches:
     sys.exit(2)
 block = matches[-1].group(1)
-open(sys.argv[2], 'w').write(block)
+open(sys.argv[2], 'w', encoding='utf-8').write(block)
 verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
 verdict = verdict_match.group(1).strip().lower() if verdict_match else None
 if verdict not in ('approve', 'request-changes', 'block'):
@@ -420,6 +420,17 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jo
   return `#!/usr/bin/env bash
 # Forge runner — task: ${config.planId}
 set -uo pipefail
+
+# Background runners (tmux/launchd) frequently start under a POSIX/C locale.
+# There, Python's text-mode open().read() defaults to ASCII and raises
+# UnicodeDecodeError on agent output containing em dashes / ✅ / ⚠️ / smart
+# quotes — which silently broke verdict extraction (run ended "verdict line
+# missing or unrecognised" with no review.md written, even when the reviewer
+# returned a perfectly good verdict). PYTHONUTF8 forces Python's UTF-8 mode
+# regardless of locale; the LANG default covers gh/git/agent CLIs without
+# clobbering a locale the operator already set.
+export PYTHONUTF8=1
+export LANG="\${LANG:-en_US.UTF-8}"
 
 TASK_ID="${config.planId}"
 WORKTREE="${config.worktreePath}"
@@ -718,12 +729,12 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
     # tests/fixtures/reviewer/.
     VERDICT=$(python3 -c "
 import re, sys, json
-raw = open(sys.argv[1]).read()
+raw = open(sys.argv[1], encoding='utf-8').read()
 matches = list(re.finditer(r'\`\`\`forge-review\\s*\\n(.*?)\\n\`\`\`', raw, re.DOTALL))
 if not matches:
     sys.exit(2)
 block = matches[-1].group(1)
-open(sys.argv[2], 'w').write(block)
+open(sys.argv[2], 'w', encoding='utf-8').write(block)
 verdict_match = re.search(r'^##\\s*Verdict\\s*\\n\\s*(\\S+)', block, re.MULTILINE)
 verdict = verdict_match.group(1).strip().lower() if verdict_match else None
 if verdict not in ('approve', 'request-changes', 'block'):
