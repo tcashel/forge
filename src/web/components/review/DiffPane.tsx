@@ -1,6 +1,6 @@
 import { useMemo } from "preact/hooks";
 import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff } from "../../lib/diff";
-import type { InlinePrComment, PrReviewBundle } from "../../types";
+import type { ForgeFinding, InlinePrComment, PrReviewBundle } from "../../types";
 import { CommentThread, type InlineThread } from "./CommentThread";
 
 interface Props {
@@ -69,13 +69,77 @@ function anchorThreads(
   return { anchored, stale };
 }
 
+/**
+ * Anchor forge findings the same way we anchor comments: by newLine →
+ * findRow → diffPosition. A finding without a line range or whose
+ * lineStart doesn't resolve falls through to the "outside the diff"
+ * section.
+ */
+function anchorFindings(
+  findings: ForgeFinding[],
+  diff: DiffFile[],
+): { anchored: Map<string, ForgeFinding[]>; outside: ForgeFinding[] } {
+  const anchored = new Map<string, ForgeFinding[]>();
+  const outside: ForgeFinding[] = [];
+  for (const f of findings) {
+    if (!f.file || f.lineStart <= 0) {
+      outside.push(f);
+      continue;
+    }
+    const row = findRow(diff, f.file, { newLine: f.lineStart });
+    if (!row) {
+      outside.push(f);
+      continue;
+    }
+    const key = `${f.file}@${row.diffPosition}`;
+    const arr = anchored.get(key) ?? [];
+    arr.push(f);
+    anchored.set(key, arr);
+  }
+  return { anchored, outside };
+}
+
 function rowGutter(r: DiffRow): string {
   if (r.kind === "addition") return "+";
   if (r.kind === "deletion") return "−";
   return " ";
 }
 
-function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnchor: Map<string, InlineThread[]> }) {
+function FindingRow({ finding }: { finding: ForgeFinding }) {
+  const range =
+    finding.lineEnd > finding.lineStart ? `${finding.lineStart}-${finding.lineEnd}` : String(finding.lineStart);
+  return (
+    <div class={`review-finding inline severity-${finding.severity.toLowerCase()}`} data-source="forge">
+      <header>
+        <span class={`finding-severity sev-${finding.severity.toLowerCase()}`}>{finding.severity}</span>
+        <span class="finding-source-badge">forge</span>
+        <span class="finding-title">{finding.title}</span>
+        <span class="finding-where">{`${finding.file}:${range}`}</span>
+      </header>
+      {finding.evidence ? <pre class="finding-evidence">{finding.evidence}</pre> : null}
+      {finding.why ? (
+        <p class="finding-why">
+          <strong>Why:</strong> {finding.why}
+        </p>
+      ) : null}
+      {finding.fix ? (
+        <p class="finding-fix">
+          <strong>Fix:</strong> {finding.fix}
+        </p>
+      ) : null}
+    </div>
+  );
+}
+
+function DiffFileCard({
+  file,
+  threadsByAnchor,
+  findingsByAnchor,
+}: {
+  file: DiffFile;
+  threadsByAnchor: Map<string, InlineThread[]>;
+  findingsByAnchor: Map<string, ForgeFinding[]>;
+}) {
   return (
     <details class="review-file" open>
       <summary>
@@ -94,6 +158,7 @@ function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnch
               {h.rows.map((r, ri) => {
                 const key = `${file.path}@${r.diffPosition}`;
                 const threads = threadsByAnchor.get(key);
+                const findings = findingsByAnchor.get(key);
                 return (
                   <div key={`${hi}-${ri}`}>
                     <div class={`review-row row-${r.kind}`} data-position={r.diffPosition}>
@@ -102,6 +167,7 @@ function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnch
                       <span class="gutter">{rowGutter(r)}</span>
                       <span class="content">{r.content}</span>
                     </div>
+                    {findings ? findings.map((f) => <FindingRow key={`forge-${f.id}`} finding={f} />) : null}
                     {threads ? threads.map((t) => <CommentThread key={`thread-${t.root.id}`} thread={t} />) : null}
                   </div>
                 );
@@ -115,10 +181,14 @@ function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnch
 }
 
 export function DiffPane({ bundle }: Props) {
-  const { diff, inlineComments } = bundle;
+  const { diff, inlineComments, forgeFindings } = bundle;
   const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
   const threads = useMemo(() => groupIntoThreads(inlineComments), [inlineComments]);
   const { anchored } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
+  const { anchored: findingsAnchored } = useMemo(
+    () => anchorFindings(forgeFindings ?? [], parsed),
+    [forgeFindings, parsed],
+  );
 
   if (parsed.length === 0) {
     return (
@@ -131,10 +201,10 @@ export function DiffPane({ bundle }: Props) {
   return (
     <section class="review-diff">
       {parsed.map((file) => (
-        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} />
+        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} findingsByAnchor={findingsAnchored} />
       ))}
     </section>
   );
 }
 
-export { anchorThreads, groupIntoThreads };
+export { anchorFindings, anchorThreads, groupIntoThreads };

@@ -2,7 +2,7 @@
 // from `GET /api/prs/:num/review-bundle` plus the selection/status state
 // the Phase 2 fix UI will mutate; nothing here triggers any POST yet.
 import { signal } from "@preact/signals";
-import { type ApiError, apiGet } from "../lib/api";
+import { type ApiError, apiGet, apiPost } from "../lib/api";
 import type { PrReviewBundle } from "../types";
 
 export const reviewBundle = signal<PrReviewBundle | null>(null);
@@ -18,6 +18,10 @@ export type CommentStatus = "pending" | "disputed" | "fixing" | "fixed";
 export const selectedComments = signal<Set<string>>(new Set());
 export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
 
+// Ad-hoc reviewer session signal — non-null while an ad-hoc review is
+// running for the active PR. The ReviewSessionDrawer subscribes to it.
+export const activeReviewSession = signal<{ sessionId: string; prNum: number } | null>(null);
+
 export function toggleCommentSelection(commentId: string | number): void {
   const next = new Set(selectedComments.value);
   const key = String(commentId);
@@ -31,6 +35,7 @@ export function clearReviewState(): void {
   reviewError.value = null;
   selectedComments.value = new Set();
   commentStatuses.value = new Map();
+  activeReviewSession.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {
@@ -47,4 +52,13 @@ export async function loadReviewBundle(prNumber: number, repoRoot: string): Prom
   } finally {
     reviewLoading.value = false;
   }
+}
+
+export interface RunReviewResponse {
+  sessionId: string;
+  logStreamUrl: string;
+}
+
+export async function startAdHocReview(prNumber: number, repoRoot: string): Promise<RunReviewResponse> {
+  return apiPost<RunReviewResponse>(`/api/prs/${prNumber}/run-review`, { repo: repoRoot });
 }

@@ -1,5 +1,6 @@
+import { useState } from "preact/hooks";
 import { enterPrMode } from "../../lib/modes";
-import { loadReviewBundle } from "../../signals/review";
+import { activeReviewSession, loadReviewBundle, startAdHocReview } from "../../signals/review";
 
 interface Props {
   prNumber: number;
@@ -12,6 +13,26 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
   const onRefresh = () => {
     void loadReviewBundle(prNumber, repoRoot);
   };
+  const [starting, setStarting] = useState(false);
+  const [startError, setStartError] = useState<string | null>(null);
+  const activeSession = activeReviewSession.value;
+  const reviewRunning = activeSession !== null && activeSession.prNum === prNumber;
+
+  const onRunReview = async () => {
+    if (starting || reviewRunning) return;
+    setStarting(true);
+    setStartError(null);
+    try {
+      const res = await startAdHocReview(prNumber, repoRoot);
+      activeReviewSession.value = { sessionId: res.sessionId, prNum: prNumber };
+    } catch (e) {
+      const err = e as { message?: string; hint?: string | null };
+      setStartError(err.hint ? `${err.message ?? "error"} — ${err.hint}` : (err.message ?? "Failed to start review."));
+    } finally {
+      setStarting(false);
+    }
+  };
+
   return (
     <div class="review-action-bar">
       <button type="button" class="btn btn-ghost" onClick={onBack}>
@@ -20,6 +41,23 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
       <button type="button" class="btn btn-secondary" disabled={loading} onClick={onRefresh}>
         {loading ? "Refreshing…" : "Refresh"}
       </button>
+      <button
+        type="button"
+        class="btn btn-primary"
+        disabled={starting || reviewRunning}
+        onClick={onRunReview}
+        title={
+          reviewRunning ? "A Forge review is already running for this PR." : "Run the Forge reviewer agent on this PR"
+        }
+      >
+        {starting ? "Starting…" : reviewRunning ? "Forge review running…" : "Run Forge review"}
+      </button>
+      {reviewRunning ? <span class="review-running-badge">review running…</span> : null}
+      {startError ? (
+        <span class="review-status error" style={{ padding: "4px 8px" }}>
+          {startError}
+        </span>
+      ) : null}
     </div>
   );
 }
