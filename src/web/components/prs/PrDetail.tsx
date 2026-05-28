@@ -1,5 +1,6 @@
 import { copyCmd } from "../../lib/actions";
-import { currentPr, prFilterMine, prMe, prsError, prsLoading, prsRepoName } from "../../signals/prs";
+import { enterReviewMode } from "../../lib/modes";
+import { currentPr, prFilterMine, prMe, prsError, prsLoading, prsRepoName, prsRepoRoot } from "../../signals/prs";
 import { repos } from "../../signals/repos";
 import { selectedRepo } from "../../signals/ui";
 import type { PrView, RepoView } from "../../types";
@@ -47,10 +48,14 @@ interface PrBodyProps {
 
 function PrBody({ pr }: PrBodyProps) {
   const label = repoLabel(repos.value, selectedRepo.value, prsRepoName.value);
+  const repoRoot = prsRepoRoot.value;
   const onOpen = () => {
     window.open(pr.url, "_blank");
   };
-  const onReview = () => {
+  const onReviewPage = () => {
+    if (repoRoot) enterReviewMode(pr.number, repoRoot);
+  };
+  const onCopyReviewCmd = () => {
     void copyCmd(`forge review ${pr.number}`);
   };
   const onCopyUrl = () => {
@@ -82,10 +87,19 @@ function PrBody({ pr }: PrBodyProps) {
           </span>
         </div>
         <div class="detail-actions">
-          <button type="button" class="btn btn-primary" data-pr-action="open" onClick={onOpen}>
+          <button
+            type="button"
+            class="btn btn-primary"
+            data-pr-action="review-page"
+            disabled={repoRoot == null}
+            onClick={onReviewPage}
+          >
+            Review
+          </button>
+          <button type="button" class="btn btn-secondary" data-pr-action="open" onClick={onOpen}>
             Open PR
           </button>
-          <button type="button" class="btn btn-secondary" data-pr-action="review" onClick={onReview}>
+          <button type="button" class="btn btn-ghost" data-pr-action="review" onClick={onCopyReviewCmd}>
             Copy review cmd
           </button>
           <button type="button" class="btn btn-ghost" data-pr-action="copy-url" onClick={onCopyUrl}>

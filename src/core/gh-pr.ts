@@ -119,6 +119,250 @@ export async function fetchMinePrNumbers(opts: GhFetchOpts): Promise<Set<number>
   }
 }
 
+// ─── Single-PR review bundle (Phase 1 of the PR review page) ─────────────────
+
+export interface PrInlineComment {
+  id: number;
+  user: string;
+  body: string;
+  path: string;
+  position: number | null;
+  originalPosition: number | null;
+  line: number | null;
+  originalLine: number | null;
+  side: "RIGHT" | "LEFT" | null;
+  startLine: number | null;
+  startSide: "RIGHT" | "LEFT" | null;
+  inReplyToId: number | null;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+  commitId: string;
+}
+
+export interface PrIssueComment {
+  id: number;
+  user: string;
+  body: string;
+  createdAt: string;
+  updatedAt: string;
+  htmlUrl: string;
+}
+
+export interface PrBundleWarning {
+  source: "diff" | "inlineComments" | "issueComments" | "linkage";
+  message: string;
+}
+
+export interface PrBundle {
+  pr: GhPr;
+  diff: string;
+  diffStats: { additions: number; deletions: number; changedFiles: number };
+  inlineComments: PrInlineComment[];
+  issueComments: PrIssueComment[];
+  warnings: PrBundleWarning[];
+}
+
+export type FetchPrBundleResult = { ok: true; bundle: PrBundle } | { ok: false; error: string };
+
+interface RawPrView {
+  number: number;
+  title: string;
+  headRefName: string;
+  baseRefName: string;
+  url: string;
+  isDraft: boolean;
+  statusCheckRollup: Array<{ state?: string; conclusion?: string }> | null;
+  reviewDecision: string | null;
+  author: { login?: string } | null;
+  updatedAt: string;
+  additions: number;
+  deletions: number;
+  changedFiles: number;
+}
+
+interface RawInlineComment {
+  id: number;
+  user?: { login?: string } | null;
+  body?: string;
+  path?: string;
+  position?: number | null;
+  original_position?: number | null;
+  line?: number | null;
+  original_line?: number | null;
+  side?: string | null;
+  start_line?: number | null;
+  start_side?: string | null;
+  in_reply_to_id?: number | null;
+  created_at?: string;
+  updated_at?: string;
+  html_url?: string;
+  commit_id?: string;
+}
+
+interface RawIssueComment {
+  id: number;
+  user?: { login?: string } | null;
+  body?: string;
+  created_at?: string;
+  updated_at?: string;
+  html_url?: string;
+}
+
+function rollupCiStatus(checks: Array<{ state?: string; conclusion?: string }> | null): string | null {
+  const arr = checks ?? [];
+  const hasFailure = arr.some((c) => c.state === "FAILURE" || c.conclusion === "FAILURE");
+  const allSuccess = arr.length > 0 && arr.every((c) => c.state === "SUCCESS" || c.conclusion === "SUCCESS");
+  const hasPending = arr.some((c) => c.state === "PENDING" || c.conclusion === null);
+  return hasFailure ? "FAILURE" : allSuccess ? "SUCCESS" : hasPending ? "PENDING" : null;
+}
+
+function normalizeSide(value: string | null | undefined): "RIGHT" | "LEFT" | null {
+  if (value === "RIGHT" || value === "LEFT") return value;
+  return null;
+}
+
+function parseNameWithOwner(url: string): { owner: string; repo: string } | null {
+  // gh urls look like https://github.com/owner/repo/pull/N (or enterprise host).
+  const m = url.match(/https?:\/\/[^/]+\/([^/]+)\/([^/]+)\/(?:pull|pulls)\/\d+/);
+  if (!m) return null;
+  return { owner: m[1], repo: m[2] };
+}
+
+/**
+ * Fetch everything the PR review page needs in a single fan-out.
+ *
+ * `pr view` is the only mandatory call — if it fails we return `ok: false`
+ * (the route maps this to a 404). The other three calls each carry their
+ * own try-block so a single gh hiccup degrades to a warning rather than
+ * failing the whole bundle.
+ */
+export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<FetchPrBundleResult> {
+  const prJsonFields =
+    "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles";
+  const prViewPromise = runGh(["pr", "view", String(prNum), "--json", prJsonFields], opts);
+  const diffPromise = runGh(["pr", "diff", String(prNum)], opts);
+
+  // The two comment endpoints need {owner}/{repo} which `gh api` doesn't
+  // template for us; resolve once in parallel with pr view + diff.
+  const repoPromise = runGh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], opts);
+
+  const [prViewRes, diffRes, repoRes] = await Promise.all([prViewPromise, diffPromise, repoPromise]);
+
+  if (!prViewRes.ok || !prViewRes.stdout) {
+    return { ok: false, error: prViewRes.stdout || `gh pr view ${prNum} failed` };
+  }
+  let raw: RawPrView;
+  try {
+    raw = JSON.parse(prViewRes.stdout) as RawPrView;
+  } catch (e) {
+    return { ok: false, error: `gh pr view returned invalid JSON: ${(e as Error).message}` };
+  }
+
+  const warnings: PrBundleWarning[] = [];
+  let diff = "";
+  if (diffRes.ok) {
+    diff = diffRes.stdout;
+  } else {
+    warnings.push({ source: "diff", message: `gh pr diff ${prNum} failed` });
+  }
+
+  let inlineComments: PrInlineComment[] = [];
+  let issueComments: PrIssueComment[] = [];
+
+  const ownerRepo = repoRes.ok && repoRes.stdout ? repoRes.stdout : null;
+  const fallback = parseNameWithOwner(raw.url);
+  const resolved = ownerRepo ? { full: ownerRepo } : fallback ? { full: `${fallback.owner}/${fallback.repo}` } : null;
+
+  if (!resolved) {
+    warnings.push({ source: "inlineComments", message: "could not resolve owner/repo for gh api calls" });
+    warnings.push({ source: "issueComments", message: "could not resolve owner/repo for gh api calls" });
+  } else {
+    const inlineRes = await runGh(["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate"], opts).catch(
+      () => ({ ok: false, stdout: "" }),
+    );
+    if (inlineRes.ok && inlineRes.stdout) {
+      try {
+        const parsed = JSON.parse(inlineRes.stdout) as RawInlineComment[];
+        inlineComments = parsed.map((c) => ({
+          id: c.id,
+          user: c.user?.login ?? "",
+          body: c.body ?? "",
+          path: c.path ?? "",
+          position: c.position ?? null,
+          originalPosition: c.original_position ?? null,
+          line: c.line ?? null,
+          originalLine: c.original_line ?? null,
+          side: normalizeSide(c.side),
+          startLine: c.start_line ?? null,
+          startSide: normalizeSide(c.start_side),
+          inReplyToId: c.in_reply_to_id ?? null,
+          createdAt: c.created_at ?? "",
+          updatedAt: c.updated_at ?? "",
+          htmlUrl: c.html_url ?? "",
+          commitId: c.commit_id ?? "",
+        }));
+      } catch (e) {
+        warnings.push({ source: "inlineComments", message: `parse error: ${(e as Error).message}` });
+      }
+    } else {
+      warnings.push({ source: "inlineComments", message: `gh api pulls/${prNum}/comments failed` });
+    }
+
+    const issueRes = await runGh(["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate"], opts).catch(
+      () => ({ ok: false, stdout: "" }),
+    );
+    if (issueRes.ok && issueRes.stdout) {
+      try {
+        const parsed = JSON.parse(issueRes.stdout) as RawIssueComment[];
+        issueComments = parsed.map((c) => ({
+          id: c.id,
+          user: c.user?.login ?? "",
+          body: c.body ?? "",
+          createdAt: c.created_at ?? "",
+          updatedAt: c.updated_at ?? "",
+          htmlUrl: c.html_url ?? "",
+        }));
+      } catch (e) {
+        warnings.push({ source: "issueComments", message: `parse error: ${(e as Error).message}` });
+      }
+    } else {
+      warnings.push({ source: "issueComments", message: `gh api issues/${prNum}/comments failed` });
+    }
+  }
+
+  const pr: GhPr = {
+    number: raw.number,
+    title: raw.title,
+    headRefName: raw.headRefName,
+    baseRefName: raw.baseRefName,
+    url: raw.url,
+    isDraft: raw.isDraft,
+    statusCheckRollup: rollupCiStatus(raw.statusCheckRollup),
+    reviewDecision: raw.reviewDecision,
+    author: raw.author?.login ?? "",
+    updatedAt: raw.updatedAt,
+    additions: raw.additions,
+    deletions: raw.deletions,
+    changedFiles: raw.changedFiles,
+    commentsCount: inlineComments.length + issueComments.length,
+    reviewsCount: 0,
+    isMine: false,
+  };
+
+  return {
+    ok: true,
+    bundle: {
+      pr,
+      diff,
+      diffStats: { additions: raw.additions, deletions: raw.deletions, changedFiles: raw.changedFiles },
+      inlineComments,
+      issueComments,
+      warnings,
+    },
+  };
+}
+
 export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: string }> {
   const [me, mineNumbers] = await Promise.all([currentLogin(opts), fetchMinePrNumbers(opts)]);
   // Use gh's built-in `--jq` to project the (potentially huge) `comments`

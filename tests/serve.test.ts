@@ -14,7 +14,7 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
 import { recordJobStarted, recordPlanCreated, syncJobState } from "../src/core/db/writes.ts";
-import type { GhFetchOpts, GhPr } from "../src/core/gh-pr.ts";
+import type { FetchPrBundleResult, GhFetchOpts, GhPr, PrBundle } from "../src/core/gh-pr.ts";
 import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -25,7 +25,10 @@ interface ServerHandle {
 }
 
 async function bootServer(
-  opts: { prFetcher?: (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }> } = {},
+  opts: {
+    prFetcher?: (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+    prBundleFetcher?: (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
+  } = {},
 ): Promise<ServerHandle> {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-serve-"));
   const forgeDir = path.join(tmpHome, ".forge");
@@ -33,7 +36,12 @@ async function bootServer(
     // Pass forgeDir explicitly: os.homedir() is captured at process start
     // and won't pick up mid-run HOME tweaks, so we can't isolate via env.
     const store = new ForgeStore({ forgeDir });
-    const { port, stop } = await startServer(store, { port: 0, host: "127.0.0.1", prFetcher: opts.prFetcher });
+    const { port, stop } = await startServer(store, {
+      port: 0,
+      host: "127.0.0.1",
+      prFetcher: opts.prFetcher,
+      prBundleFetcher: opts.prBundleFetcher,
+    });
     return {
       baseUrl: `http://127.0.0.1:${port}`,
       store,
@@ -636,6 +644,109 @@ test("GET /api/prs prefers reachable current repo over stale same-name task repo
   assert.equal(body.data!.prs![0].number, 404);
   assert.equal(body.data!.repoRoot, process.cwd());
   assert.equal(seenCwd, process.cwd());
+});
+
+function fakeBundle(prNum: number): PrBundle {
+  return {
+    pr: { ...fakePr(prNum), isMine: false, reviewsCount: 0, commentsCount: 0 },
+    diff: "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
+    diffStats: { additions: 1, deletions: 1, changedFiles: 1 },
+    inlineComments: [],
+    issueComments: [],
+    warnings: [],
+  };
+}
+
+test("GET /api/prs/:num/review-bundle returns merged bundle for a known PR", async (t) => {
+  const h = await bootServer({
+    prBundleFetcher: async (num) => ({ ok: true, bundle: fakeBundle(num) }),
+  });
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/42/review-bundle`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const data = body.data as {
+    pr: { number: number };
+    diff: string;
+    inlineComments: unknown[];
+    issueComments: unknown[];
+    linkedPlanId: string | null;
+    worktreePath: string | null;
+    warnings: unknown[];
+  };
+  assert.equal(data.pr.number, 42);
+  assert.match(data.diff, /diff --git/);
+  assert.deepEqual(data.inlineComments, []);
+  assert.deepEqual(data.issueComments, []);
+  assert.equal(data.linkedPlanId, null);
+  assert.equal(data.worktreePath, null);
+  assert.deepEqual(data.warnings, []);
+});
+
+test("GET /api/prs/:num/review-bundle rejects non-numeric PR numbers", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/abc/review-bundle`);
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "INVALID_PR_NUMBER");
+});
+
+test("GET /api/prs/:num/review-bundle 404s when gh pr view fails", async (t) => {
+  const h = await bootServer({
+    prBundleFetcher: async () => ({ ok: false, error: "could not find pull request" }),
+  });
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/9999/review-bundle`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "PR_NOT_FOUND");
+  assert.match(body.error!.message, /could not find/);
+});
+
+test("GET /api/prs/:num/review-bundle 404s when the repo is unknown", async (t) => {
+  const h = await bootServer({
+    prBundleFetcher: async (num) => ({ ok: true, bundle: fakeBundle(num) }),
+  });
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/1/review-bundle?repo=/tmp/no-such-repo`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_REPO");
+});
+
+test("GET /api/prs/:num/review-bundle links to a matching plan by repoRoot+prNumber", async (t) => {
+  const h = await bootServer({
+    prBundleFetcher: async (num) => ({ ok: true, bundle: fakeBundle(num) }),
+  });
+  t.after(() => h.stop());
+  const id = "plan-pr-link";
+  const now = new Date().toISOString();
+  const repoRoot = process.cwd();
+  h.store.upsertPlan({
+    id,
+    title: "feat(demo): link",
+    repoRoot,
+    repoName: path.basename(repoRoot),
+    branch: `forge/${id}`,
+    worktree: null,
+    status: "done",
+    agent: null,
+    model: null,
+    createdAt: now,
+    launchedAt: now,
+    completedAt: now,
+    prUrl: "https://example.com/pull/77",
+    prNumber: 77,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec(id, "# spec\n"),
+    specVersion: 1,
+    lastImproveError: null,
+    archivedAt: null,
+  });
+
+  const { body } = await getJson(`${h.baseUrl}/api/prs/77/review-bundle`);
+  assert.equal(body.ok, true);
+  assert.equal((body.data as { linkedPlanId: string | null }).linkedPlanId, id);
 });
 
 test("missing task repoRoot is marked stale in /api/repos and /api/plans", async (t) => {
