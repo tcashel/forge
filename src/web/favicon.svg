@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" width="32" height="32">
+  <!-- Forge workbench mark: the sidebar .glyph — a rounded square with a
+       conic sweep through the four status colors (running / attention /
+       primary / done). Conic gradients aren't portable in SVG, so we
+       approximate the sweep with four wedges meeting at the center. -->
+  <defs>
+    <clipPath id="r">
+      <rect x="0" y="0" width="32" height="32" rx="7" ry="7"/>
+    </clipPath>
+  </defs>
+  <g clip-path="url(#r)">
+    <path d="M0 0 H32 L16 16 Z" fill="#C77F1F"/>
+    <path d="M32 0 V32 L16 16 Z" fill="#B8489B"/>
+    <path d="M32 32 H0 L16 16 Z" fill="#3C7E5A"/>
+    <path d="M0 32 V0 L16 16 Z" fill="#2A8DB0"/>
+  </g>
+</svg>
