@@ -93,6 +93,56 @@ function rowTotalTokens(r: AgentActivityRow): number | null {
   return (tokensIn ?? 0) + (tokensOut ?? 0);
 }
 
+export interface ActivitySummaryByModel {
+  model: string;
+  tokensIn: number;
+  tokensOut: number;
+}
+
+export interface ActivitySummary {
+  runCount: number;
+  tokensIn: number;
+  tokensOut: number;
+  costUsd: number;
+  byModel: ActivitySummaryByModel[];
+}
+
+/**
+ * Roll up the visible activity rows into the totals strip and the
+ * tokens-by-model chart. Null/undefined metric values are treated as 0
+ * (a row with no token data contributes nothing) so the strip never
+ * renders NaN. `costUsd` sums only non-null `metrics.costUsd`.
+ */
+export function summarizeActivity(rows: AgentActivityRow[]): ActivitySummary {
+  let tokensIn = 0;
+  let tokensOut = 0;
+  let costUsd = 0;
+  const byModelMap = new Map<string, { tokensIn: number; tokensOut: number }>();
+  for (const r of rows) {
+    const ti = typeof r.metrics.tokensIn === "number" ? r.metrics.tokensIn : 0;
+    const to = typeof r.metrics.tokensOut === "number" ? r.metrics.tokensOut : 0;
+    tokensIn += ti;
+    tokensOut += to;
+    if (typeof r.metrics.costUsd === "number") costUsd += r.metrics.costUsd;
+    if (ti || to) {
+      const key = r.model ?? "—";
+      const acc = byModelMap.get(key) ?? { tokensIn: 0, tokensOut: 0 };
+      acc.tokensIn += ti;
+      acc.tokensOut += to;
+      byModelMap.set(key, acc);
+    }
+  }
+  const byModel: ActivitySummaryByModel[] = Array.from(byModelMap.entries())
+    .map(([model, v]) => ({ model, tokensIn: v.tokensIn, tokensOut: v.tokensOut }))
+    .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
+  return { runCount: rows.length, tokensIn, tokensOut, costUsd, byModel };
+}
+
+function formatTotalCost(v: number): string {
+  if (v <= 0) return "—";
+  return `$${v.toFixed(2)}`;
+}
+
 function applySort(rows: AgentActivityRow[], sort: SortState): AgentActivityRow[] {
   const sorted = [...rows];
   const now = Date.now();
@@ -156,6 +206,8 @@ export function ActivityTable() {
     return applySort(filtered, sort.value);
   });
 
+  const summary = useComputed(() => summarizeActivity(filteredSorted.value));
+
   const toggleSort = (key: SortKey) => {
     if (sort.value.key === key) {
       sort.value = { key, dir: sort.value.dir === "asc" ? "desc" : "asc" };
@@ -171,6 +223,7 @@ export function ActivityTable() {
   return (
     <div class="activity-table">
       {error.value ? <div class="activity-error">{error.value}</div> : null}
+      <ActivitySummaryStrip summary={summary.value} />
       <table>
         <thead>
           <tr>
@@ -241,6 +294,58 @@ export function ActivityTable() {
           })}
         </tbody>
       </table>
+    </div>
+  );
+}
+
+function ActivitySummaryStrip({ summary }: { summary: ActivitySummary }) {
+  return (
+    <div class="activity-summary">
+      <div class="activity-summary-totals">
+        <div class="activity-summary-stat">
+          <span class="activity-summary-label">Runs</span>
+          <span class="activity-summary-value">{summary.runCount.toLocaleString()}</span>
+        </div>
+        <div class="activity-summary-stat">
+          <span class="activity-summary-label">Tokens in</span>
+          <span class="activity-summary-value">{summary.tokensIn.toLocaleString()}</span>
+        </div>
+        <div class="activity-summary-stat">
+          <span class="activity-summary-label">Tokens out</span>
+          <span class="activity-summary-value">{summary.tokensOut.toLocaleString()}</span>
+        </div>
+        <div class="activity-summary-stat">
+          <span class="activity-summary-label">Cost</span>
+          <span class="activity-summary-value">{formatTotalCost(summary.costUsd)}</span>
+        </div>
+      </div>
+      <ActivityByModelChart byModel={summary.byModel} />
+    </div>
+  );
+}
+
+function ActivityByModelChart({ byModel }: { byModel: ActivitySummaryByModel[] }) {
+  const max = byModel.reduce((m, r) => Math.max(m, r.tokensIn + r.tokensOut), 0);
+  if (byModel.length === 0 || max === 0) {
+    return <div class="activity-summary-chart-empty">No token data in the current filter.</div>;
+  }
+  return (
+    <div class="activity-summary-chart">
+      {byModel.map((row) => {
+        const total = row.tokensIn + row.tokensOut;
+        const width = Math.max(2, Math.round((total / max) * 100));
+        return (
+          <div class="activity-summary-bar-row" key={row.model}>
+            <span class="activity-summary-bar-label" title={row.model}>
+              {row.model}
+            </span>
+            <span class="activity-summary-bar-track">
+              <span class="activity-summary-bar-fill" style={{ width: `${width}%` }} />
+            </span>
+            <span class="activity-summary-bar-value">{total.toLocaleString()}</span>
+          </div>
+        );
+      })}
     </div>
   );
 }
