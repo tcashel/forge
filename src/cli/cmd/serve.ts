@@ -54,7 +54,13 @@ import type {
 import { CliError } from "../output.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
-import { findLatestForgeFindings, parseAdHocReviewSentinel, runAdHocReview } from "./review-actions.ts";
+import {
+  findLatestForgeFindings,
+  listForgeReviews,
+  loadForgeReview,
+  parseAdHocReviewSentinel,
+  runAdHocReview,
+} from "./review-actions.ts";
 import { archiveSpec, saveSpec, unarchiveSpec } from "./spec.ts";
 
 export const HELP = `forge serve [...flags]
@@ -1040,6 +1046,45 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       forgeFindings: findings.findings,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
+  }
+
+  // GET /api/prs/:num/reviews?repo=<root>
+  const reviewListMatch = pathname.match(/^\/api\/prs\/([^/]+)\/reviews$/);
+  if (reviewListMatch) {
+    const numRaw = decodeURIComponent(reviewListMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    return jsonOk({ reviews: listForgeReviews(store, prNum, target.root) });
+  }
+
+  // GET /api/prs/:num/reviews/:sessionId?repo=<root>
+  const reviewDetailMatch = pathname.match(/^\/api\/prs\/([^/]+)\/reviews\/([^/]+)$/);
+  if (reviewDetailMatch) {
+    const numRaw = decodeURIComponent(reviewDetailMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const sessionId = decodeURIComponent(reviewDetailMatch[2]);
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    const detail = loadForgeReview(store, prNum, target.root, sessionId);
+    if (!detail) {
+      return jsonErr(404, "REVIEW_NOT_FOUND", `No review with id "${sessionId}" for PR #${prNum} in ${target.name}.`);
+    }
+    return jsonOk(detail);
   }
 
   return jsonErr(404, "NOT_FOUND", `No such endpoint: ${pathname}`);
