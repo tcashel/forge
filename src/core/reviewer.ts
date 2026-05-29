@@ -143,22 +143,82 @@ export interface ForgeFinding {
 const VALID_SEVERITIES: ReadonlySet<ForgeFindingSeverity> = new Set(["BLOCKER", "HIGH", "MEDIUM", "LOW"]);
 
 /**
+ * Detect a fenced-code-block marker line (``` or ~~~, optionally indented).
+ * An info string after the fence (```text, ```diff, …) marks an *opening*
+ * fence; a bare fence closes the innermost open block.
+ */
+function classifyFence(line: string): { fence: boolean; opening: boolean } {
+  const m = line.match(/^\s{0,3}(`{3,}|~{3,})(.*)$/);
+  if (!m) return { fence: false, opening: false };
+  return { fence: true, opening: m[2].trim().length > 0 };
+}
+
+/**
  * Extract the LAST ```forge-review fenced block from raw reviewer output.
  *
  * Codex-as-reviewer echoes the SKILL.md template (whose verdict line is a
  * literal angle-bracketed placeholder) before producing the real review, so
  * we always take the last match. Returns null if no fenced block is found.
+ *
+ * The reviewer routinely nests fenced code blocks inside the review — most
+ * commonly a ```text / ```diff under **Evidence:**. A naive non-greedy
+ * `(.*?)\n```` regex stops at the FIRST inner fence, truncating the block
+ * right after the first `**Evidence:**` and silently dropping every Why /
+ * Fix / later finding. We instead scan line-by-line and track fence depth
+ * so nested code blocks are preserved and only the matching outer fence
+ * closes the review.
  */
 export function extractLastForgeReviewBlock(rawMd: string): string | null {
   if (!rawMd) return null;
-  const re = /```forge-review\s*\n([\s\S]*?)\n```/g;
+  const lines = rawMd.split(/\r?\n/);
   let last: string | null = null;
-  let match: RegExpExecArray | null = re.exec(rawMd);
-  while (match !== null) {
-    last = match[1];
-    match = re.exec(rawMd);
+  let i = 0;
+  while (i < lines.length) {
+    if (!/^\s{0,3}```forge-review\s*$/.test(lines[i])) {
+      i++;
+      continue;
+    }
+    // Opening forge-review fence — capture until the matching close,
+    // tracking nested fences so an inner ```text doesn't end the block.
+    const buf: string[] = [];
+    let depth = 1;
+    i++;
+    while (i < lines.length && depth > 0) {
+      const line = lines[i];
+      const f = classifyFence(line);
+      if (f.fence && f.opening) {
+        depth++;
+        buf.push(line);
+      } else if (f.fence) {
+        depth--;
+        // A bare fence at depth>0 closes a *nested* block — keep it. At
+        // depth 0 it closes the forge-review block itself — drop it.
+        if (depth > 0) buf.push(line);
+      } else {
+        buf.push(line);
+      }
+      i++;
+    }
+    last = buf.join("\n");
   }
   return last;
+}
+
+export type ReviewVerdict = "approve" | "request-changes" | "block";
+
+const VALID_VERDICTS: ReadonlySet<ReviewVerdict> = new Set(["approve", "request-changes", "block"]);
+
+/**
+ * Parse the `## Verdict` line from an extracted forge-review block. Returns
+ * null when the heading is missing or the value isn't one of the three
+ * recognised verdicts.
+ */
+export function parseForgeReviewVerdict(block: string): ReviewVerdict | null {
+  if (!block) return null;
+  const m = block.match(/^##\s*Verdict\s*\n\s*(\S+)/m);
+  if (!m) return null;
+  const verdict = m[1].trim().toLowerCase();
+  return VALID_VERDICTS.has(verdict as ReviewVerdict) ? (verdict as ReviewVerdict) : null;
 }
 
 interface WhereLocation {
