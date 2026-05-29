@@ -3,6 +3,7 @@
 // the Phase 2 fix UI will mutate; nothing here triggers any POST yet.
 import { computed, signal } from "@preact/signals";
 import { type ApiError, apiGet, apiPost } from "../lib/api";
+import type { FixTarget } from "../lib/review-targets";
 import type { ForgeFinding, PrReviewBundle, ReviewRunDetail, ReviewRunSummary } from "../types";
 
 export const reviewBundle = signal<PrReviewBundle | null>(null);
@@ -11,11 +12,11 @@ export const reviewError = signal<string | null>(null);
 
 export type CommentStatus = "pending" | "disputed" | "fixing" | "fixed";
 
-// Selection state for the per-comment checkboxes; Phase 2 fixers will
-// consume these to drive the BatchBar "Fix N selected" action. The Set
-// uses comment id (number) coerced to string so the same signal can host
-// future ad-hoc identifiers (e.g. unanchored heuristics) without retype.
-export const selectedComments = signal<Set<string>>(new Set());
+// Selection state for the unified triage checkboxes; the BatchBar "Fix N
+// selected" action consumes these. The Set holds `source:id` fix-target
+// tokens (see lib/review-targets) so a single signal hosts Forge findings,
+// inline comments, and review summaries uniformly.
+export const selectedTargets = signal<Set<string>>(new Set());
 export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
 
 // Ad-hoc reviewer session signal — non-null while an ad-hoc review is
@@ -47,24 +48,23 @@ export const displayedFindings = computed<ForgeFinding[]>(() => {
 // the validate-then-fix worker spawned by `Fix N selected`.
 export const activeCommentFixSession = signal<{ sessionId: string; prNum: number } | null>(null);
 
-export function toggleCommentSelection(commentId: string | number): void {
-  const next = new Set(selectedComments.value);
-  const key = String(commentId);
-  if (next.has(key)) next.delete(key);
-  else next.add(key);
-  selectedComments.value = next;
+export function toggleTargetSelection(token: string): void {
+  const next = new Set(selectedTargets.value);
+  if (next.has(token)) next.delete(token);
+  else next.add(token);
+  selectedTargets.value = next;
 }
 
-export function setCommentStatuses(ids: Array<string | number>, status: CommentStatus): void {
+export function setTargetStatuses(tokens: string[], status: CommentStatus): void {
   const next = new Map(commentStatuses.value);
-  for (const id of ids) next.set(String(id), status);
+  for (const token of tokens) next.set(token, status);
   commentStatuses.value = next;
 }
 
 export function clearReviewState(): void {
   reviewBundle.value = null;
   reviewError.value = null;
-  selectedComments.value = new Set();
+  selectedTargets.value = new Set();
   commentStatuses.value = new Map();
   activeReviewSession.value = null;
   reviewRuns.value = [];
@@ -159,10 +159,10 @@ export interface RunCommentFixResponse {
 export async function startCommentFix(
   prNumber: number,
   repoRoot: string,
-  commentIds: number[],
+  targets: FixTarget[],
 ): Promise<RunCommentFixResponse> {
   return apiPost<RunCommentFixResponse>(`/api/prs/${prNumber}/fix-comments`, {
     repo: repoRoot,
-    commentIds,
+    targets,
   });
 }

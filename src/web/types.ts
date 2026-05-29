@@ -314,8 +314,19 @@ export interface IssuePrComment {
   htmlUrl: string;
 }
 
+// Mirror of `PrReview` from src/core/gh-pr.ts — submitted review summaries
+// (top-level body text from human/AI reviewers).
+export interface PrReview {
+  id: number;
+  user: string;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED";
+  body: string;
+  submittedAt: string | null;
+  htmlUrl: string;
+}
+
 export interface PrBundleWarning {
-  source: "diff" | "inlineComments" | "issueComments" | "linkage";
+  source: "diff" | "inlineComments" | "issueComments" | "prReviews" | "linkage";
   message: string;
 }
 
@@ -348,6 +359,7 @@ export interface PrReviewBundle {
   diffStats: { additions: number; deletions: number; changedFiles: number };
   inlineComments: InlinePrComment[];
   issueComments: IssuePrComment[];
+  prReviews: PrReview[];
   linkedPlanId: string | null;
   worktreePath: string | null;
   forgeFindings: ForgeFinding[];
