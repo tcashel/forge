@@ -503,7 +503,7 @@ export function SettingsForm() {
             agentSignal={form.defaultAgent}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
         </div>
       </section>
@@ -524,7 +524,7 @@ export function SettingsForm() {
             agentSignal={form.reviewerAgent}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
           <SelectField
             id="cfg-reviewerReasoning"
@@ -547,7 +547,7 @@ export function SettingsForm() {
             agentSignal={form.fixerAgent}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
           <SelectField
             id="cfg-fixerReasoning"
@@ -582,7 +582,7 @@ export function SettingsForm() {
             agentSignal={form.critiqueAgentA}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
           <SelectField
             id="cfg-critiqueReasoningA"
@@ -605,7 +605,7 @@ export function SettingsForm() {
             agentSignal={form.critiqueAgentB}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="gpt-5-codex"
+            placeholder="gpt-5.5"
           />
           <SelectField
             id="cfg-critiqueReasoningB"
@@ -628,7 +628,7 @@ export function SettingsForm() {
             agentSignal={form.critiqueAgentSynth}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
           <SelectField
             id="cfg-critiqueReasoningSynth"
@@ -656,7 +656,7 @@ export function SettingsForm() {
             agentSignal={form.improverAgent}
             defaultAgentSignal={form.defaultAgent}
             registry={modelRegistry.value}
-            placeholder="claude-opus-4-7"
+            placeholder="claude-opus-4-8"
           />
           <SelectField
             id="cfg-improverReasoning"

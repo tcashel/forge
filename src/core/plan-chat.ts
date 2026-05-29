@@ -379,7 +379,7 @@ export interface RunChatTurnResult {
   abort: () => void;
 }
 
-const DEFAULT_MODEL = "claude-opus-4-7";
+const DEFAULT_MODEL = "claude-opus-4-8";
 
 function defaultSpawn(binary: string, args: string[], cwd?: string): ChildProcess {
   // argv-style spawn (no shell). The prompt file is piped to stdin from

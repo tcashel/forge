@@ -324,13 +324,13 @@ test("GET /api/workbench/context returns current repo and registered repos", asy
 test("GET /api/config returns current repo config", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
-  h.store.setRepoConfig(process.cwd(), { defaultAgent: "codex", defaultModel: "gpt-5-codex" });
+  h.store.setRepoConfig(process.cwd(), { defaultAgent: "codex", defaultModel: "gpt-5.5" });
 
   const { status, body } = await getJson(`${h.baseUrl}/api/config`);
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.data!.repo!.root, process.cwd());
-  assert.deepEqual(body.data!.config, { defaultAgent: "codex", defaultModel: "gpt-5-codex" });
+  assert.deepEqual(body.data!.config, { defaultAgent: "codex", defaultModel: "gpt-5.5" });
 });
 
 test("POST /api/config saves validated repo settings", async (t) => {
@@ -974,7 +974,7 @@ test("startServer reaps stale critique-meta on boot", async (t) => {
       status: "pending",
       durationMs: null,
     },
-    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    criticB: { agent: "codex", model: "gpt-5.5", reasoningEffort: undefined, status: "pending", durationMs: null },
     synthesizer: {
       agent: "claude",
       model: "claude-opus-4-7",
@@ -1025,7 +1025,7 @@ test("startServer leaves recent critique-meta alone (under stale threshold)", as
       status: "pending",
       durationMs: null,
     },
-    criticB: { agent: "codex", model: "gpt-5-codex", reasoningEffort: undefined, status: "pending", durationMs: null },
+    criticB: { agent: "codex", model: "gpt-5.5", reasoningEffort: undefined, status: "pending", durationMs: null },
     synthesizer: {
       agent: "claude",
       model: "claude-opus-4-7",
@@ -1309,7 +1309,7 @@ test("POST /api/plans/:id/archive returns 409 BUSY while a critique is mid-fligh
     viewedAt: null,
     tmuxSession: `forge-${critiqueId}`,
     criticA: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
-    criticB: { agent: "codex", model: "gpt-5-codex", status: "pending", durationMs: null },
+    criticB: { agent: "codex", model: "gpt-5.5", status: "pending", durationMs: null },
     synthesizer: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
   });
   const { status, body } = await postJson(`${h.baseUrl}/api/plans/arc-busy-http/archive`);

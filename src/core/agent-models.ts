@@ -16,10 +16,14 @@ import type { LaunchTarget } from "./store.ts";
 
 export type AgentModelRegistry = Record<LaunchTarget, readonly string[]>;
 
+// The first entry per agent is treated as the conventional default (it
+// surfaces first in the settings dropdown). gpt-5-codex is intentionally
+// NOT listed: it requires Codex-specific auth that ChatGPT-account logins
+// reject, which silently breaks runs — gpt-5.5 is the codex default.
 export const AGENT_MODELS: AgentModelRegistry = {
-  claude: ["claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-haiku-4-5-20251001"],
-  codex: ["gpt-5-codex", "gpt-5.5", "gpt-5", "gpt-5-mini", "o3", "o3-mini"],
-  opencode: ["claude-opus-4-7", "claude-sonnet-4-6", "gpt-5", "gpt-5-mini"],
+  claude: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "claude-haiku-4-5", "claude-haiku-4-5-20251001"],
+  codex: ["gpt-5.5", "gpt-5", "gpt-5-mini", "o3", "o3-mini"],
+  opencode: ["claude-opus-4-8", "claude-opus-4-7", "claude-sonnet-4-6", "gpt-5", "gpt-5-mini"],
   gemini: ["gemini-2.0-pro", "gemini-2.0-flash", "gemini-1.5-pro", "gemini-1.5-flash"],
 };
 

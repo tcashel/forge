@@ -61,6 +61,14 @@ export function setTargetStatuses(tokens: string[], status: CommentStatus): void
   commentStatuses.value = next;
 }
 
+// Reset only the per-PR triage selection + live status tracking. Called when
+// the active PR changes so a new PR opens with nothing selected, without
+// flashing the whole page to a null bundle the way clearReviewState() does.
+export function clearSelection(): void {
+  selectedTargets.value = new Set();
+  commentStatuses.value = new Map();
+}
+
 export function clearReviewState(): void {
   reviewBundle.value = null;
   reviewError.value = null;

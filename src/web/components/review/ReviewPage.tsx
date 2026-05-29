@@ -3,6 +3,7 @@ import { parseUnifiedDiff } from "../../lib/diff";
 import { enterPrMode } from "../../lib/modes";
 import {
   clearSelectedReviewRun,
+  clearSelection,
   displayedFindings,
   loadReviewBundle,
   loadReviewRuns,
@@ -34,8 +35,10 @@ export function ReviewPage() {
   useEffect(() => {
     if (num != null && repo != null) {
       // Switching PR/repo or remounting the page: drop any prior run
-      // selection so the new PR opens on its bundle defaults.
+      // selection so the new PR opens on its bundle defaults, and clear the
+      // triage selection so checkboxes don't leak across PRs.
       clearSelectedReviewRun();
+      clearSelection();
       void loadReviewBundle(num, repo);
       void loadReviewRuns(num, repo);
     }
