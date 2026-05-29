@@ -307,7 +307,8 @@ export function parseForgeReviewFindings(block: string): ForgeFinding[] {
 export type CommentValidationVerdict = "valid" | "disputed";
 
 export interface CommentValidationEntry {
-  commentId: number;
+  /** `source:id` fix-target token (e.g. `comment:12345`, `finding:ab12cd`). */
+  targetId: string;
   verdict: CommentValidationVerdict;
   reason: string;
 }
@@ -316,15 +317,32 @@ export interface CommentValidationEntry {
  * Extract the first ```forge-comment-validation fenced block from raw agent
  * output and parse it as JSONL. Each well-formed line yields one entry:
  *
- *   {"commentId": 12345, "verdict": "valid", "reason": "..."}
+ *   {"targetId": "comment:12345", "verdict": "valid", "reason": "..."}
  *
- * Malformed lines, duplicate commentIds (first occurrence wins), and
- * entries with non-positive ids or empty reasons are skipped. The caller
- * is responsible for cross-checking commentIds against the requested set
- * and for filling in any omitted requests as `disputed`.
+ * The legacy `{"commentId": 12345, ...}` shape is still accepted and coerced
+ * to the `comment:<id>` token so older runs and skills keep parsing.
+ *
+ * Malformed lines, duplicate targetIds (first occurrence wins), and
+ * entries with empty ids or empty reasons are skipped. The caller is
+ * responsible for cross-checking targetIds against the requested set and
+ * for filling in any omitted requests as `disputed`.
  *
  * Returns [] when no block exists or the block is empty.
  */
+/**
+ * Resolve a validation line's target token. Prefers an explicit string
+ * `targetId`; falls back to a legacy positive-integer `commentId` coerced to
+ * the `comment:<id>` token. Returns null when neither is usable.
+ */
+function normalizeTargetId(targetIdRaw: unknown, commentIdRaw: unknown): string | null {
+  if (typeof targetIdRaw === "string" && targetIdRaw.trim().length > 0) {
+    return targetIdRaw.trim();
+  }
+  const legacy = typeof commentIdRaw === "number" ? commentIdRaw : Number.parseInt(String(commentIdRaw), 10);
+  if (Number.isFinite(legacy) && legacy > 0) return `comment:${legacy}`;
+  return null;
+}
+
 export function parseCommentValidation(rawMd: string): CommentValidationEntry[] {
   if (!rawMd) return [];
   const lines = rawMd.split(/\r?\n/);
@@ -336,7 +354,7 @@ export function parseCommentValidation(rawMd: string): CommentValidationEntry[] 
     }
     i++;
     const entries: CommentValidationEntry[] = [];
-    const seen = new Set<number>();
+    const seen = new Set<string>();
     while (i < lines.length) {
       const line = lines[i];
       if (/^\s{0,3}```\s*$/.test(line)) {
@@ -346,20 +364,18 @@ export function parseCommentValidation(rawMd: string): CommentValidationEntry[] 
       if (trimmed.length > 0) {
         try {
           const parsed = JSON.parse(trimmed) as Record<string, unknown>;
-          const idRaw = parsed.commentId;
-          const commentId = typeof idRaw === "number" ? idRaw : Number.parseInt(String(idRaw), 10);
+          const targetId = normalizeTargetId(parsed.targetId, parsed.commentId);
           const verdict = parsed.verdict;
           const reason = parsed.reason;
           if (
-            Number.isFinite(commentId) &&
-            commentId > 0 &&
-            !seen.has(commentId) &&
+            targetId &&
+            !seen.has(targetId) &&
             (verdict === "valid" || verdict === "disputed") &&
             typeof reason === "string" &&
             reason.trim().length > 0
           ) {
-            entries.push({ commentId, verdict, reason: reason.trim() });
-            seen.add(commentId);
+            entries.push({ targetId, verdict, reason: reason.trim() });
+            seen.add(targetId);
           }
         } catch {
           /* malformed JSON line — skipped silently */

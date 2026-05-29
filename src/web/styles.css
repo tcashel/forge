@@ -1468,6 +1468,84 @@ body.filtered-single .repo-chip{ display: none; }
   flex-wrap: wrap;
 }
 
+/* Unified rail: per-row selection checkbox + finding/comment/review rows */
+.review-rail-finding > header,
+.review-rail-comment > header,
+.review-rail-review > header {
+  display: flex;
+  align-items: flex-start;
+  gap: 4px;
+}
+.review-rail-select { display: flex; align-items: center; padding: 6px 0 0 6px; }
+.review-rail-select input { cursor: pointer; }
+.review-rail-select input:disabled { cursor: not-allowed; opacity: 0.5; }
+
+.review-rail-comment,
+.review-rail-review {
+  background: var(--panel);
+  border-left: 3px solid var(--border);
+  border-radius: 4px;
+  overflow: hidden;
+}
+.review-rail-list.stale .review-rail-comment { opacity: 0.65; }
+.review-rail-comment-summary,
+.review-rail-review-summary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  width: 100%;
+  text-align: left;
+  background: transparent;
+  border: none;
+  padding: 6px 8px;
+  color: var(--fg);
+  font: inherit;
+}
+.review-rail-comment-summary { cursor: pointer; }
+.review-rail-comment-summary:hover:not(:disabled) { background: var(--panel-2); }
+.review-rail-comment-summary:disabled { cursor: default; }
+.review-rail-comment-user { font-weight: 500; font-size: 12px; }
+.review-rail-comment-where {
+  font-family: var(--mono, monospace);
+  font-size: 10px;
+  color: var(--fg-dim);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 55%;
+}
+.review-rail-comment-snippet { flex-basis: 100%; font-size: 11px; color: var(--fg-dim); }
+.review-rail-review-state {
+  font-size: 9px;
+  font-weight: 600;
+  letter-spacing: 0.04em;
+  padding: 1px 5px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--fg-dim);
+}
+.review-rail-review-state.state-approved { color: #2ea043; border-color: #2ea043; }
+.review-rail-review-state.state-changes-requested { color: var(--blocker); border-color: var(--blocker); }
+
+/* Fix-status badges — shared by the rail and the inline diff threads */
+.review-rail-badge,
+.review-thread-badge {
+  font-size: 10px;
+  margin: 0 8px 6px;
+  padding: 2px 6px;
+  border-radius: 4px;
+  display: inline-block;
+}
+.review-rail-badge .badge-label,
+.review-thread-badge .badge-label { font-weight: 600; }
+.review-rail-badge .badge-reason,
+.review-thread-badge .badge-reason { color: var(--fg-dim); }
+.badge-fixed { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
+.badge-disputed { background: rgba(245, 165, 36, 0.15); color: var(--high); }
+.badge-failed { background: rgba(229, 72, 77, 0.15); color: var(--blocker); }
+.badge-fixing { background: var(--panel-2); color: var(--fg-dim); }
+
 /* Intent panel */
 .review-intent {
   background: var(--panel);

@@ -149,8 +149,23 @@ export interface PrIssueComment {
   htmlUrl: string;
 }
 
+/**
+ * A submitted PR review — the top-level summary text that humans and AI
+ * reviewers (CodeRabbit, Copilot, Gemini, …) attach to an APPROVE /
+ * REQUEST_CHANGES / COMMENT submission. Distinct from inline comments, which
+ * come from the `/pulls/{n}/comments` endpoint.
+ */
+export interface PrReview {
+  id: number;
+  user: string;
+  state: "APPROVED" | "CHANGES_REQUESTED" | "COMMENTED";
+  body: string;
+  submittedAt: string | null;
+  htmlUrl: string;
+}
+
 export interface PrBundleWarning {
-  source: "diff" | "inlineComments" | "issueComments" | "linkage";
+  source: "diff" | "inlineComments" | "issueComments" | "prReviews" | "linkage";
   message: string;
 }
 
@@ -160,6 +175,7 @@ export interface PrBundle {
   diffStats: { additions: number; deletions: number; changedFiles: number };
   inlineComments: PrInlineComment[];
   issueComments: PrIssueComment[];
+  prReviews: PrReview[];
   warnings: PrBundleWarning[];
 }
 
@@ -207,6 +223,20 @@ interface RawIssueComment {
   created_at?: string;
   updated_at?: string;
   html_url?: string;
+}
+
+interface RawPrReview {
+  id: number;
+  user?: { login?: string } | null;
+  body?: string;
+  state?: string;
+  submitted_at?: string | null;
+  html_url?: string;
+}
+
+function normalizeReviewState(value: string | undefined): PrReview["state"] | null {
+  if (value === "APPROVED" || value === "CHANGES_REQUESTED" || value === "COMMENTED") return value;
+  return null;
 }
 
 function rollupCiStatus(checks: Array<{ state?: string; conclusion?: string }> | null): string | null {
@@ -285,6 +315,7 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
 
   let inlineComments: PrInlineComment[] = [];
   let issueComments: PrIssueComment[] = [];
+  let prReviews: PrReview[] = [];
 
   const ownerRepo = repoRes.ok && repoRes.stdout ? repoRes.stdout : null;
   const fallback = parseNameWithOwner(raw.url);
@@ -299,6 +330,7 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
   if (!resolved) {
     warnings.push({ source: "inlineComments", message: "could not resolve owner/repo for gh api calls" });
     warnings.push({ source: "issueComments", message: "could not resolve owner/repo for gh api calls" });
+    warnings.push({ source: "prReviews", message: "could not resolve owner/repo for gh api calls" });
   } else {
     const inlineRes = await runGh(
       ["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate", ...hostArgs],
@@ -353,6 +385,38 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
     } else {
       warnings.push({ source: "issueComments", message: `gh api issues/${prNum}/comments failed` });
     }
+
+    const reviewsRes = await runGh(
+      ["api", `repos/${resolved.full}/pulls/${prNum}/reviews`, "--paginate", ...hostArgs],
+      opts,
+    ).catch(() => ({ ok: false, stdout: "" }));
+    if (reviewsRes.ok && reviewsRes.stdout) {
+      try {
+        const parsed = JSON.parse(reviewsRes.stdout) as RawPrReview[];
+        prReviews = parsed
+          .map((r) => {
+            const state = normalizeReviewState(r.state);
+            const body = (r.body ?? "").trim();
+            // Keep only reviews that carry a usable summary. PENDING/DISMISSED
+            // states normalize to null; empty-body APPROVE/COMMENT reviews are
+            // just a thumbs-up with nothing to act on.
+            if (!state || body.length === 0) return null;
+            return {
+              id: r.id,
+              user: r.user?.login ?? "",
+              state,
+              body,
+              submittedAt: r.submitted_at ?? null,
+              htmlUrl: r.html_url ?? "",
+            } satisfies PrReview;
+          })
+          .filter((r): r is PrReview => r !== null);
+      } catch (e) {
+        warnings.push({ source: "prReviews", message: `parse error: ${(e as Error).message}` });
+      }
+    } else {
+      warnings.push({ source: "prReviews", message: `gh api pulls/${prNum}/reviews failed` });
+    }
   }
 
   const pr: GhPr = {
@@ -382,6 +446,7 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
       diffStats: { additions: raw.additions, deletions: raw.deletions, changedFiles: raw.changedFiles },
       inlineComments,
       issueComments,
+      prReviews,
       warnings,
     },
   };
