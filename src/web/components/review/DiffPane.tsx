@@ -1,15 +1,16 @@
-import { useMemo } from "preact/hooks";
+import { useEffect, useMemo, useState } from "preact/hooks";
 import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff } from "../../lib/diff";
+import { detectLang, ensureLang, onHighlighterReady, tokenizeRow } from "../../lib/highlight";
+import { fileDomId, rowDomId } from "../../lib/review-scroll";
 import type { ForgeFinding, InlinePrComment, PrReviewBundle } from "../../types";
 import { CommentThread, type InlineThread } from "./CommentThread";
 
 interface Props {
   bundle: PrReviewBundle;
   /**
-   * Optional override for which findings the diff is annotated with.
-   * When unset the component falls back to `bundle.forgeFindings` so
-   * existing callers that don't track a selected historical run keep
-   * rendering today's "latest" findings.
+   * Kept for source-compat with prior call sites; the three-pane review
+   * surface routes findings to the right-rail FindingsRail and the
+   * DiffPane only renders rows + inline reviewer comments.
    */
   findings?: ForgeFinding[];
 }
@@ -85,8 +86,14 @@ function anchorThreads(
 function anchorFindings(
   findings: ForgeFinding[],
   diff: DiffFile[],
-): { anchored: Map<string, ForgeFinding[]>; outside: ForgeFinding[] } {
+): {
+  anchored: Map<string, ForgeFinding[]>;
+  /** flat list with the resolved diffPosition stamped on each entry */
+  anchoredFlat: Array<{ finding: ForgeFinding; diffPosition: number }>;
+  outside: ForgeFinding[];
+} {
   const anchored = new Map<string, ForgeFinding[]>();
+  const anchoredFlat: Array<{ finding: ForgeFinding; diffPosition: number }> = [];
   const outside: ForgeFinding[] = [];
   for (const f of findings) {
     if (!f.file || f.lineStart <= 0) {
@@ -102,8 +109,9 @@ function anchorFindings(
     const arr = anchored.get(key) ?? [];
     arr.push(f);
     anchored.set(key, arr);
+    anchoredFlat.push({ finding: f, diffPosition: row.diffPosition });
   }
-  return { anchored, outside };
+  return { anchored, anchoredFlat, outside };
 }
 
 function rowGutter(r: DiffRow): string {
@@ -112,43 +120,41 @@ function rowGutter(r: DiffRow): string {
   return " ";
 }
 
-function FindingRow({ finding }: { finding: ForgeFinding }) {
-  const range =
-    finding.lineEnd > finding.lineStart ? `${finding.lineStart}-${finding.lineEnd}` : String(finding.lineStart);
+function RowContent({ row, lang }: { row: DiffRow; lang: ReturnType<typeof detectLang> }) {
+  const tokens = lang ? tokenizeRow(row.content, lang) : null;
+  if (!tokens) {
+    return <span class="content">{row.content}</span>;
+  }
   return (
-    <div class={`review-finding inline severity-${finding.severity.toLowerCase()}`} data-source="forge">
-      <header>
-        <span class={`finding-severity sev-${finding.severity.toLowerCase()}`}>{finding.severity}</span>
-        <span class="finding-source-badge">forge</span>
-        <span class="finding-title">{finding.title}</span>
-        <span class="finding-where">{`${finding.file}:${range}`}</span>
-      </header>
-      {finding.evidence ? <pre class="finding-evidence">{finding.evidence}</pre> : null}
-      {finding.why ? (
-        <p class="finding-why">
-          <strong>Why:</strong> {finding.why}
-        </p>
-      ) : null}
-      {finding.fix ? (
-        <p class="finding-fix">
-          <strong>Fix:</strong> {finding.fix}
-        </p>
-      ) : null}
-    </div>
+    <span class="content">
+      {tokens.map((t, i) => (
+        // biome-ignore lint/suspicious/noArrayIndexKey: tokens are stable per render
+        <span key={i} style={t.color ? { color: t.color } : undefined}>
+          {t.text}
+        </span>
+      ))}
+    </span>
   );
 }
 
 function DiffFileCard({
   file,
   threadsByAnchor,
-  findingsByAnchor,
+  highlightTick,
 }: {
   file: DiffFile;
   threadsByAnchor: Map<string, InlineThread[]>;
-  findingsByAnchor: Map<string, ForgeFinding[]>;
+  highlightTick: number;
 }) {
+  const lang = useMemo(() => detectLang(file.path), [file.path]);
+  useEffect(() => {
+    if (lang && !file.isBinary) ensureLang(lang);
+  }, [lang, file.isBinary]);
+  // Re-render on highlighter readiness so freshly-loaded grammars
+  // light up in place.
+  void highlightTick;
   return (
-    <details class="review-file" open>
+    <details class="review-file" id={fileDomId(file.path)} open>
       <summary>
         <span class="path">{file.isRename && file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}</span>
         <span class="counts">
@@ -165,16 +171,18 @@ function DiffFileCard({
               {h.rows.map((r, ri) => {
                 const key = `${file.path}@${r.diffPosition}`;
                 const threads = threadsByAnchor.get(key);
-                const findings = findingsByAnchor.get(key);
                 return (
                   <div key={`${hi}-${ri}`}>
-                    <div class={`review-row row-${r.kind}`} data-position={r.diffPosition}>
+                    <div
+                      class={`review-row row-${r.kind}`}
+                      data-position={r.diffPosition}
+                      id={rowDomId(file.path, r.diffPosition)}
+                    >
                       <span class="ln old">{r.oldLine ?? ""}</span>
                       <span class="ln new">{r.newLine ?? ""}</span>
                       <span class="gutter">{rowGutter(r)}</span>
-                      <span class="content">{r.content}</span>
+                      <RowContent row={r} lang={lang} />
                     </div>
-                    {findings ? findings.map((f) => <FindingRow key={`forge-${f.id}`} finding={f} />) : null}
                     {threads ? threads.map((t) => <CommentThread key={`thread-${t.root.id}`} thread={t} />) : null}
                   </div>
                 );
@@ -187,16 +195,18 @@ function DiffFileCard({
   );
 }
 
-export function DiffPane({ bundle, findings }: Props) {
-  const { diff, inlineComments, forgeFindings } = bundle;
-  const effectiveFindings = findings ?? forgeFindings ?? [];
+export function DiffPane({ bundle, findings: _findings }: Props) {
+  const { diff, inlineComments } = bundle;
   const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
   const threads = useMemo(() => groupIntoThreads(inlineComments), [inlineComments]);
   const { anchored } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
-  const { anchored: findingsAnchored } = useMemo(
-    () => anchorFindings(effectiveFindings, parsed),
-    [effectiveFindings, parsed],
-  );
+
+  // Tick that bumps every time a grammar finishes loading so rows
+  // re-render with their now-available tokens.
+  const [highlightTick, setHighlightTick] = useState(0);
+  useEffect(() => {
+    return onHighlighterReady(() => setHighlightTick((t) => t + 1));
+  }, []);
 
   if (parsed.length === 0) {
     return (
@@ -209,7 +219,7 @@ export function DiffPane({ bundle, findings }: Props) {
   return (
     <section class="review-diff">
       {parsed.map((file) => (
-        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} findingsByAnchor={findingsAnchored} />
+        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} highlightTick={highlightTick} />
       ))}
     </section>
   );
