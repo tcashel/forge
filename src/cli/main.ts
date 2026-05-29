@@ -25,6 +25,7 @@ import * as session from "./cmd/session.ts";
 import * as spec from "./cmd/spec.ts";
 import * as status from "./cmd/status.ts";
 import * as wait from "./cmd/wait.ts";
+import * as worktree from "./cmd/worktree.ts";
 import { CliError, emitError } from "./output.ts";
 
 const VERSION = "0.4.0-dev";
@@ -46,6 +47,7 @@ const HELP_BY_CMD: Record<string, string> = {
   spec: spec.HELP,
   status: status.HELP,
   wait: wait.HELP,
+  worktree: worktree.HELP,
 };
 
 function printUsage(): void {
@@ -77,6 +79,12 @@ Commands:
 
   dash                     Open the mission-control TUI dashboard
   serve                    Serve the Workbench (web UI) on localhost
+
+  worktree list            List Forge worktrees with safety badges
+  worktree remove <t>      Remove one worktree (clears Plan.worktree)
+  worktree clean-merged    Bulk-remove worktrees whose PR is merged/closed
+  worktree test <t>        Park a worktree and test its branch in main
+  worktree restore         Undo \`worktree test\`
 
 Global flags:
   --json                   Machine-readable output
@@ -174,6 +182,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "session":
         await session.run(rest, store);
+        return;
+      case "worktree":
+        await worktree.run(rest, store);
         return;
       case "__review-worker":
         // Internal worker spawned by runAdHocReview. Not a public CLI verb;
