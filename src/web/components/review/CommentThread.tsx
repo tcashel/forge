@@ -1,5 +1,6 @@
 import { renderMarkdown } from "../../lib/markdown";
-import { commentStatuses, reviewBundle, selectedComments, toggleCommentSelection } from "../../signals/review";
+import { targetKey } from "../../lib/review-targets";
+import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
 import type { InlinePrComment } from "../../types";
 import { timeAgo } from "../prs/pr-format";
 
@@ -37,10 +38,10 @@ interface StatusBadge {
   reason?: string;
 }
 
-function statusBadgeFor(id: number): StatusBadge | null {
-  const live = commentStatuses.value.get(String(id));
+function statusBadgeFor(token: string): StatusBadge | null {
+  const live = commentStatuses.value.get(token);
   if (live === "fixing") return { label: "fixing…", className: "fixing" };
-  const persisted = reviewBundle.value?.commentFixState?.[String(id)];
+  const persisted = reviewBundle.value?.commentFixState?.[token];
   if (!persisted) return null;
   if (persisted.status === "fixed") return { label: "fixed", className: "fixed", reason: persisted.reason };
   if (persisted.status === "disputed") return { label: "disputed", className: "disputed", reason: persisted.reason };
@@ -49,16 +50,17 @@ function statusBadgeFor(id: number): StatusBadge | null {
 }
 
 export function CommentThread({ thread, anchored = true }: Props) {
-  const sel = selectedComments.value;
+  const sel = selectedTargets.value;
   const id = thread.root.id;
-  const checked = sel.has(String(id));
-  const badge = statusBadgeFor(id);
+  const token = targetKey("comment", id);
+  const checked = sel.has(token);
+  const badge = statusBadgeFor(token);
   const fixing = badge?.className === "fixing";
   const fixed = badge?.className === "fixed";
   const disabled = !anchored || fixing || fixed;
   const onToggle = () => {
     if (disabled) return;
-    toggleCommentSelection(id);
+    toggleTargetSelection(token);
   };
   return (
     <div class="review-thread">

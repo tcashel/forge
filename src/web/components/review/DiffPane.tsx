@@ -50,9 +50,12 @@ function anchorThreads(
   diff: DiffFile[],
 ): {
   anchored: Map<string, InlineThread[]>;
+  /** flat list with the resolved diffPosition stamped on each thread (rail use) */
+  anchoredFlat: Array<{ thread: InlineThread; diffPosition: number }>;
   stale: InlineThread[];
 } {
   const anchored = new Map<string, InlineThread[]>();
+  const anchoredFlat: Array<{ thread: InlineThread; diffPosition: number }> = [];
   const stale: InlineThread[] = [];
   for (const t of threads) {
     const c = t.root;
@@ -73,8 +76,9 @@ function anchorThreads(
     const arr = anchored.get(k) ?? [];
     arr.push(t);
     anchored.set(k, arr);
+    anchoredFlat.push({ thread: t, diffPosition: key.position });
   }
-  return { anchored, stale };
+  return { anchored, anchoredFlat, stale };
 }
 
 /**

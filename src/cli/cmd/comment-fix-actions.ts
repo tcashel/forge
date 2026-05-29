@@ -24,12 +24,20 @@ import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliError } from "../../cli/output.ts";
 import { finalizeSession, upsertSession } from "../../core/db/writes.ts";
+import {
+  type FixTarget,
+  type FixTargetSource,
+  isFixTargetSource,
+  parseTargetKey,
+  targetKey,
+} from "../../core/fix-targets.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
 import { fetchPrBundle } from "../../core/gh-pr.ts";
 import { agentCommand } from "../../core/launch.ts";
 import { detectRepo } from "../../core/repo.ts";
-import { type CommentValidationEntry, parseCommentValidation } from "../../core/reviewer.ts";
+import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
+import { findLatestForgeFindings } from "./review-actions.ts";
 
 const SCHEMA_VERSION = 1;
 const COMMENT_VIEW_FIELDS = "headRefName";
@@ -53,11 +61,36 @@ export interface ValidationFileEntry extends CommentValidationEntry {
   status: CommentFixStatus;
 }
 
+/** Legacy on-disk validation entry (pre-token): keyed by numeric commentId. */
+interface LegacyValidationFileEntry {
+  commentId?: number;
+  targetId?: string;
+  status?: CommentFixStatus;
+  reason?: string;
+}
+
+/**
+ * A fix target resolved against the current PR + worktree, ready to hand to
+ * the agent. `comment`/`finding` carry a line anchor + surrounding hunk;
+ * `review` summaries are PR-wide (no path/line/hunk).
+ */
+interface EnrichedTarget {
+  token: string;
+  source: FixTargetSource;
+  /** Human-readable kind label for the prompt (e.g. "inline comment"). */
+  kind: string;
+  path: string | null;
+  line: number | null;
+  body: string;
+  commitId: string;
+  currentHunk: string | null;
+}
+
 export interface RunCommentFixInput {
   prNum: number;
   repoRoot: string;
   repoName: string;
-  commentIds: number[];
+  targets: FixTarget[];
 }
 
 export interface RunCommentFixResult {
@@ -78,7 +111,7 @@ interface CommentFixMeta {
   completedAt: string | null;
   status: "running" | "completed" | "failed";
   exitCode: number | null;
-  commentIds: number[];
+  targets: FixTarget[];
   quality: { ok: boolean; failedCommand: string | null } | null;
 }
 
@@ -100,17 +133,61 @@ function commentFixSentinelLine(exitCode: number, error: string | null): string 
   return `[forge:session-done ${JSON.stringify({ exitCode, error })}]`;
 }
 
+/** Normalize + dedupe a raw target list (by `source:id` token, first wins). */
+function dedupeTargets(targets: unknown[]): FixTarget[] {
+  const seen = new Set<string>();
+  const out: FixTarget[] = [];
+  for (const raw of targets) {
+    if (!raw || typeof raw !== "object") continue;
+    const o = raw as Record<string, unknown>;
+    if (!isFixTargetSource(o.source)) continue;
+    const id = String(o.id ?? "").trim();
+    if (!id) continue;
+    const key = targetKey(o.source, id);
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({ source: o.source, id });
+  }
+  return out;
+}
+
+/** Compose a fix-able body for a Forge finding from its structured fields. */
+function composeFindingBody(f: ForgeFinding): string {
+  const parts: string[] = [`[${f.severity}] ${f.title}`];
+  if (f.why?.trim()) parts.push(`\nWhy: ${f.why.trim()}`);
+  if (f.fix?.trim()) parts.push(`\nSuggested fix: ${f.fix.trim()}`);
+  if (f.evidence?.trim()) parts.push(`\nEvidence:\n${f.evidence.trim()}`);
+  return parts.join("\n");
+}
+
+/** Human summary like "2 comments, 1 finding" for logs + commit messages. */
+function summarizeTargets(targets: FixTarget[]): string {
+  const counts: Record<FixTargetSource, number> = { finding: 0, comment: 0, review: 0 };
+  for (const t of targets) counts[t.source]++;
+  const label: Record<FixTargetSource, [string, string]> = {
+    comment: ["comment", "comments"],
+    finding: ["finding", "findings"],
+    review: ["review", "reviews"],
+  };
+  const segs: string[] = [];
+  for (const src of ["comment", "finding", "review"] as FixTargetSource[]) {
+    const n = counts[src];
+    if (n > 0) segs.push(`${n} ${label[src][n === 1 ? 0 : 1]}`);
+  }
+  return segs.length > 0 ? segs.join(", ") : "0 targets";
+}
+
 // ─── Parent: runCommentFix ───────────────────────────────────────────────────
 
 export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore): Promise<RunCommentFixResult> {
-  const { prNum, repoRoot, repoName, commentIds } = input;
+  const { prNum, repoRoot, repoName, targets } = input;
 
-  if (!Array.isArray(commentIds) || commentIds.length === 0) {
-    throw new CliError("NO_COMMENTS", "`commentIds` must contain at least one comment id.", { exitCode: 1 });
+  if (!Array.isArray(targets) || targets.length === 0) {
+    throw new CliError("NO_COMMENTS", "`targets` must contain at least one fix target.", { exitCode: 1 });
   }
-  const uniqueIds = Array.from(new Set(commentIds.filter((n) => Number.isFinite(n) && n > 0)));
-  if (uniqueIds.length === 0) {
-    throw new CliError("NO_COMMENTS", "`commentIds` contained no positive integers.", { exitCode: 1 });
+  const uniqueTargets = dedupeTargets(targets);
+  if (uniqueTargets.length === 0) {
+    throw new CliError("NO_COMMENTS", "`targets` contained no valid fix targets.", { exitCode: 1 });
   }
 
   // 1) repoConfig — reuse the reviewer's configured agent.
@@ -215,7 +292,10 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     });
   }
 
-  // 7) Match commentIds against the PR's currently-anchored inline comments.
+  // 7) Match each target against what's actually fixable on the PR:
+  //    - comment → a still-anchored inline comment
+  //    - review  → a submitted review summary
+  //    - finding → a Forge finding (by id) that names a file
   const bundle = await fetchPrBundle(prNum, {
     cwd: repoRoot,
     ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
@@ -223,14 +303,25 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
   if (!bundle.ok) {
     throw new CliError("PR_NOT_FOUND", `Could not load PR bundle: ${bundle.error}`, { exitCode: 1 });
   }
-  const anchoredIds = new Set(
+  const anchoredCommentIds = new Set(
     bundle.bundle.inlineComments.filter((c) => c.position != null || c.line != null).map((c) => c.id),
   );
-  const fixableIds = uniqueIds.filter((id) => anchoredIds.has(id));
-  if (fixableIds.length === 0) {
+  const reviewIds = new Set(bundle.bundle.prReviews.map((r) => r.id));
+  const findingIds = new Set(
+    findLatestForgeFindings(store, prNum, repoRoot, headRefName)
+      .findings.filter((f) => f.file)
+      .map((f) => f.id),
+  );
+  const fixableTargets = uniqueTargets.filter((t) => {
+    if (t.source === "comment") return anchoredCommentIds.has(Number(t.id));
+    if (t.source === "review") return reviewIds.has(Number(t.id));
+    if (t.source === "finding") return findingIds.has(t.id);
+    return false;
+  });
+  if (fixableTargets.length === 0) {
     throw new CliError(
       "NO_COMMENTS",
-      "None of the supplied commentIds match a still-anchored inline comment on this PR.",
+      "None of the supplied targets match a fixable Forge finding, anchored inline comment, or review summary on this PR.",
       { exitCode: 1 },
     );
   }
@@ -274,7 +365,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     completedAt: null,
     status: "running",
     exitCode: null,
-    commentIds: fixableIds,
+    targets: fixableTargets,
     quality: null,
   };
   fs.writeFileSync(path.join(runDir, "meta.json"), `${JSON.stringify(seedMeta, null, 2)}\n`, "utf-8");
@@ -296,7 +387,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
         prNum,
         repoRoot,
         worktreePath,
-        commentIds: fixableIds,
+        targets: fixableTargets,
       } as unknown as Partial<import("../../core/db/writes.ts").SessionMetrics>),
     },
   });
@@ -382,13 +473,10 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   const prNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
   const repoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
   const worktreePath = typeof metrics.worktreePath === "string" ? metrics.worktreePath : null;
-  const rawIds = Array.isArray(metrics.commentIds) ? (metrics.commentIds as unknown[]) : [];
-  const commentIds = rawIds
-    .map((v) => (typeof v === "number" ? v : Number.parseInt(String(v), 10)))
-    .filter((n) => Number.isFinite(n) && n > 0);
+  const targets = dedupeTargets(Array.isArray(metrics.targets) ? (metrics.targets as unknown[]) : []);
 
-  if (!runDir || prNum == null || !repoRoot || !worktreePath || commentIds.length === 0) {
-    const err = "session row missing runDir/prNum/repoRoot/worktreePath/commentIds in metrics";
+  if (!runDir || prNum == null || !repoRoot || !worktreePath || targets.length === 0) {
+    const err = "session row missing runDir/prNum/repoRoot/worktreePath/targets in metrics";
     finalizeSession(store.db.db, {
       id: sessionId,
       finishedAt: new Date().toISOString(),
@@ -410,7 +498,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   const ghEnvResult = resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost });
   const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
 
-  process.stdout.write(`[forge:comment-fix-worker] starting fix on PR #${prNum} (${commentIds.length} comment(s))\n`);
+  process.stdout.write(`[forge:comment-fix-worker] starting fix on PR #${prNum} (${summarizeTargets(targets)})\n`);
   process.stdout.write(`[forge:comment-fix-worker] worktree=${worktreePath}\n`);
   process.stdout.write(`[forge:comment-fix-worker] agent=${row.agent_adapter} model=${row.model ?? "(unset)"}\n`);
 
@@ -431,33 +519,88 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
     }
 
     // Re-fetch the bundle from the worktree so the agent sees up-to-date
-    // anchors. We restricted the commentIds at the parent stage but the
-    // worker still wants the comment bodies and commitIds.
+    // anchors. We restricted the targets at the parent stage but the worker
+    // still wants current comment/review bodies and commitIds.
     const bundle = await fetchPrBundle(prNum, {
       cwd: repoRoot,
       ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
     });
     if (!bundle.ok) throw new Error(`gh pr bundle fetch failed: ${bundle.error}`);
 
-    const selectedComments = bundle.bundle.inlineComments.filter((c) => commentIds.includes(c.id));
-    if (selectedComments.length === 0) {
-      throw new Error("no matching inline comments found on PR (all may have been resolved or moved)");
+    // Resolve each requested target against the freshly-fetched bundle and
+    // the latest Forge findings. comment/finding carry a line anchor + the
+    // surrounding hunk; review summaries are PR-wide (no path/line/hunk).
+    // Targets that no longer resolve are tracked so we stamp them `disputed`
+    // below rather than dropping them silently.
+    const inlineById = new Map(bundle.bundle.inlineComments.map((c) => [c.id, c]));
+    const reviewById = new Map(bundle.bundle.prReviews.map((r) => [r.id, r]));
+    const findingById = new Map(
+      findLatestForgeFindings(store, prNum, repoRoot, headRefName).findings.map((f) => [f.id, f]),
+    );
+
+    const enriched: EnrichedTarget[] = [];
+    const unresolved = new Set<string>();
+    for (const t of targets) {
+      const token = targetKey(t.source, t.id);
+      if (t.source === "comment") {
+        const c = inlineById.get(Number(t.id));
+        if (!c) {
+          unresolved.add(token);
+          continue;
+        }
+        enriched.push({
+          token,
+          source: "comment",
+          kind: "inline comment",
+          path: c.path,
+          line: c.line,
+          body: c.body,
+          commitId: c.commitId,
+          currentHunk: resolveCurrentHunk(worktreePath, c.path, c.line, c.commitId),
+        });
+      } else if (t.source === "review") {
+        const r = reviewById.get(Number(t.id));
+        if (!r) {
+          unresolved.add(token);
+          continue;
+        }
+        enriched.push({
+          token,
+          source: "review",
+          kind: `review summary (${r.state})`,
+          path: null,
+          line: null,
+          body: r.body,
+          commitId: "",
+          currentHunk: null,
+        });
+      } else {
+        const f = findingById.get(t.id);
+        if (!f) {
+          unresolved.add(token);
+          continue;
+        }
+        const line = f.lineStart > 0 ? f.lineStart : null;
+        enriched.push({
+          token,
+          source: "finding",
+          kind: `forge finding (${f.severity})`,
+          path: f.file || null,
+          line,
+          body: composeFindingBody(f),
+          commitId: "HEAD",
+          currentHunk: f.file && line ? resolveCurrentHunk(worktreePath, f.file, line, "HEAD") : null,
+        });
+      }
+    }
+    if (enriched.length === 0) {
+      throw new Error(
+        "no fix targets could be resolved against the current PR (comments/reviews/findings may have changed)",
+      );
     }
 
     const diff = runGhSafe(["pr", "diff", String(prNum)], ghEnv, repoRoot);
     const linkedSpec = lookupLinkedSpec(store, repoRoot, headRefName);
-
-    // Pull the current hunk surrounding each selected comment. If we can't
-    // resolve it from worktree HEAD the agent will auto-mark the comment
-    // disputed per the skill.
-    const enrichedComments = selectedComments.map((c) => ({
-      id: c.id,
-      path: c.path,
-      line: c.line,
-      body: c.body,
-      commitId: c.commitId,
-      currentHunk: resolveCurrentHunk(worktreePath, c.path, c.line, c.commitId),
-    }));
 
     const prompt = buildCommentFixerPrompt({
       prNum,
@@ -465,7 +608,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       skillsDir: commentFixerSkillsDir(),
       diff,
       linkedSpec,
-      comments: enrichedComments,
+      targets: enriched,
     });
     const promptFile = path.join(runDir, "comment-fix-prompt.txt");
     fs.writeFileSync(promptFile, prompt, "utf-8");
@@ -488,37 +631,36 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       throw new Error(`agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
     }
 
-    // Parse validation block.
+    // Parse validation block, keyed by fix-target token.
     const raw = fs.existsSync(rawFile) ? fs.readFileSync(rawFile, "utf-8") : "";
     const validation = parseCommentValidation(raw);
-    const validationByCommentId = new Map<number, CommentValidationEntry>();
+    const allTokens = targets.map((t) => targetKey(t.source, t.id));
+    const requested = new Set(allTokens);
+    const byToken = new Map<string, CommentValidationEntry>();
     for (const entry of validation) {
-      if (!commentIds.includes(entry.commentId)) {
-        process.stdout.write(
-          `[forge:comment-fix-worker] dropping verdict for commentId=${entry.commentId} (not in request)\n`,
-        );
+      if (!requested.has(entry.targetId)) {
+        process.stdout.write(`[forge:comment-fix-worker] dropping verdict for ${entry.targetId} (not in request)\n`);
         continue;
       }
-      if (validationByCommentId.has(entry.commentId)) {
-        process.stdout.write(
-          `[forge:comment-fix-worker] dropping duplicate verdict for commentId=${entry.commentId}\n`,
-        );
+      if (byToken.has(entry.targetId)) {
+        process.stdout.write(`[forge:comment-fix-worker] dropping duplicate verdict for ${entry.targetId}\n`);
         continue;
       }
-      validationByCommentId.set(entry.commentId, entry);
+      byToken.set(entry.targetId, entry);
     }
-    // Backfill omitted comments as disputed.
-    for (const id of commentIds) {
-      if (!validationByCommentId.has(id)) {
-        validationByCommentId.set(id, { commentId: id, verdict: "disputed", reason: "agent did not emit a verdict" });
+    // Backfill omitted (and unresolved) targets as disputed.
+    for (const token of allTokens) {
+      if (!byToken.has(token)) {
+        const reason = unresolved.has(token) ? "target no longer present on the PR" : "agent did not emit a verdict";
+        byToken.set(token, { targetId: token, verdict: "disputed", reason });
       }
     }
 
     // Optimistically stamp `valid` rows as `fixed` and `disputed` rows as `disputed`.
     // We'll re-stamp `valid` rows to `failed` if quality fails below.
     const validationEntries: ValidationFileEntry[] = [];
-    for (const id of commentIds) {
-      const v = validationByCommentId.get(id);
+    for (const token of allTokens) {
+      const v = byToken.get(token);
       if (!v) continue;
       validationEntries.push({ ...v, status: v.verdict === "valid" ? "fixed" : "disputed" });
     }
@@ -553,7 +695,8 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
         throw new Error(`quality gate failed: ${qualityResult.failedCommand ?? "unknown"}`);
       }
       // Stage and commit only the files the agent changed (no `git add -A`).
-      commitAndPush(worktreePath, changedFiles, commentIds);
+      const validTokens = validationEntries.filter((v) => v.status === "fixed").map((v) => v.targetId);
+      commitAndPush(worktreePath, changedFiles, validTokens);
     }
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
@@ -575,7 +718,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
     completedAt,
     status,
     exitCode,
-    commentIds,
+    targets,
     quality: qualityResult,
   });
 
@@ -680,9 +823,11 @@ export function buildCommentFixerPrompt(args: {
   skillsDir: string;
   diff: string;
   linkedSpec: string | null;
-  comments: Array<{
-    id: number;
-    path: string;
+  targets: Array<{
+    token: string;
+    source: FixTargetSource;
+    kind: string;
+    path: string | null;
     line: number | null;
     body: string;
     commitId: string;
@@ -706,23 +851,31 @@ export function buildCommentFixerPrompt(args: {
     ? `## Linked Forge spec\n\n\`\`\`markdown\n${args.linkedSpec}\n\`\`\`\n`
     : "## Linked Forge spec\n\n(no forge spec linked to this branch — treat the PR description as the contract)\n";
 
-  const commentsSection = args.comments
-    .map(
-      (c) => `### Comment #${c.id}
-- **File:** \`${c.path || "(unknown)"}\`
-- **Line:** ${c.line ?? "(unanchored)"}
-- **Commit:** \`${c.commitId || "(unknown)"}\`
+  const targetsSection = args.targets
+    .map((t) => {
+      const hunkLine =
+        t.source === "review"
+          ? "_PR-wide review summary — no single anchor. Act only on concrete, diff-scoped asks; dispute the rest._"
+          : t.currentHunk
+            ? `\`\`\`diff\n${t.currentHunk}\n\`\`\``
+            : t.source === "comment"
+              ? '_anchor not resolvable — auto-mark this comment as disputed with reason "comment anchor is stale"._'
+              : "_no line anchor — open the file at the path above and locate the issue described in the body._";
+      return `### Target \`${t.token}\` (${t.kind})
+- **File:** \`${t.path || "(PR-wide)"}\`
+- **Line:** ${t.line ?? "(unanchored)"}
+- **Commit:** \`${t.commitId || "(HEAD)"}\`
 
 **Body:**
-${c.body || "(empty)"}
+${t.body || "(empty)"}
 
 **Current hunk (worktree HEAD):**
-${c.currentHunk ? `\`\`\`diff\n${c.currentHunk}\n\`\`\`` : '_anchor not resolvable — auto-mark this comment as disputed with reason "comment anchor is stale"._'}`,
-    )
+${hunkLine}`;
+    })
     .join("\n\n");
 
   return [
-    `You are fixing PR #${args.prNum} in ${args.repoName} based on operator-selected inline comments.`,
+    `You are fixing PR #${args.prNum} in ${args.repoName} based on operator-selected review items (Forge findings, inline comments, and/or review summaries).`,
     "",
     "## forge-comment-fixer skill",
     "",
@@ -736,11 +889,11 @@ ${c.currentHunk ? `\`\`\`diff\n${c.currentHunk}\n\`\`\`` : '_anchor not resolvab
     diffSlice,
     "```",
     "",
-    "## Selected comments to validate, then fix",
+    "## Selected targets to validate, then fix",
     "",
-    commentsSection,
+    targetsSection,
     "",
-    "Emit the `forge-comment-validation` block first, then make the code edits for `valid` entries.",
+    "Emit the `forge-comment-validation` block first (one line per target, keyed by `targetId`), then make the code edits for `valid` entries.",
   ].join("\n");
 }
 
@@ -858,14 +1011,12 @@ function rollbackWorktree(worktreePath: string, headSha: string, files: string[]
   }
 }
 
-function commitAndPush(worktreePath: string, files: string[], commentIds: number[]): void {
+function commitAndPush(worktreePath: string, files: string[], validTokens: string[]): void {
   // Stage only the files the agent changed — never `git add -A`.
   execFileSync("git", ["-C", worktreePath, "add", "--", ...files], { stdio: ["pipe", "inherit", "inherit"] });
-  const idsLabel = commentIds
-    .slice()
-    .sort((a, b) => a - b)
-    .join(",");
-  const msg = `fix(review): address PR comments ${idsLabel}`;
+  const fixed = dedupeTargets(validTokens.map((tok) => parseTargetKey(tok)).filter((t): t is FixTarget => t !== null));
+  const summary = summarizeTargets(fixed);
+  const msg = `fix(review): address PR feedback (${summary})`;
   execFileSync("git", ["-C", worktreePath, "commit", "-m", msg], { stdio: ["pipe", "inherit", "inherit"] });
   execFileSync("git", ["-C", worktreePath, "push"], { stdio: ["pipe", "inherit", "inherit"] });
 }
@@ -910,12 +1061,22 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
     if (typeof meta.repoRoot === "string" && meta.repoRoot !== repoRoot) continue;
     try {
       const raw = fs.readFileSync(path.join(c.runDir, "validation.json"), "utf-8");
-      const parsed = JSON.parse(raw) as ValidationFileEntry[];
+      const parsed = JSON.parse(raw) as LegacyValidationFileEntry[];
       if (!Array.isArray(parsed)) continue;
       const sessionFailed = meta.status === "failed";
       const out: CommentFixState = {};
       for (const entry of parsed) {
-        if (!entry || typeof entry.commentId !== "number") continue;
+        if (!entry || !entry.status) continue;
+        // Prefer the `source:id` token; fall back to a legacy numeric
+        // commentId (coerced to `comment:<id>`) so pre-token runs still
+        // surface their status in the UI.
+        const token =
+          typeof entry.targetId === "string" && entry.targetId.length > 0
+            ? entry.targetId
+            : typeof entry.commentId === "number"
+              ? `comment:${entry.commentId}`
+              : null;
+        if (!token) continue;
         // Promote `valid`+`fixed` entries to `failed` when the whole
         // session failed (e.g. agent error post-validation, before we
         // re-stamped). The on-disk stamp is the source of truth, but if
@@ -923,7 +1084,7 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
         // fixed.
         let status = entry.status;
         if (sessionFailed && status === "fixed") status = "failed";
-        out[String(entry.commentId)] = { status, reason: entry.reason };
+        out[token] = { status, reason: entry.reason };
       }
       return out;
     } catch {}

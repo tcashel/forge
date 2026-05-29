@@ -13,7 +13,7 @@ import {
 import { currentReviewPrNumber, currentReviewRepo } from "../../signals/ui";
 import type { ForgeFindingSeverity } from "../../types";
 import { BatchBar } from "./BatchBar";
-import { anchorFindings, DiffPane } from "./DiffPane";
+import { anchorFindings, anchorThreads, DiffPane, groupIntoThreads } from "./DiffPane";
 import { FindingsRail } from "./FindingsRail";
 import { IntentPanel } from "./IntentPanel";
 import { LeftNav } from "./LeftNav";
@@ -46,6 +46,15 @@ export function ReviewPage() {
     if (!bundle) return { anchored: new Map(), anchoredFlat: [], outside: [] };
     return anchorFindings(findings, parsedDiff);
   }, [bundle, findings, parsedDiff]);
+
+  // Anchor inline comment threads the same way the diff does, so the rail can
+  // list them (anchored → jump-to-diff; stale → not fixable) alongside findings.
+  const commentAnchoring = useMemo(() => {
+    if (!bundle) return { anchoredFlat: [] as ReturnType<typeof anchorThreads>["anchoredFlat"], stale: [] };
+    const threads = groupIntoThreads(bundle.inlineComments);
+    const { anchoredFlat: ca, stale } = anchorThreads(threads, parsedDiff);
+    return { anchoredFlat: ca, stale };
+  }, [bundle, parsedDiff]);
 
   const findingsByFile = useMemo<Map<string, ForgeFindingSeverity>>(() => {
     const rank: Record<ForgeFindingSeverity, number> = { BLOCKER: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
@@ -88,7 +97,15 @@ export function ReviewPage() {
       <aside class="review-rail">
         <ReviewHistoryPicker prNumber={num} repoRoot={repo} />
         {bundle?.linkedPlanId ? <IntentPanel planId={bundle.linkedPlanId} /> : null}
-        {bundle ? <FindingsRail anchored={anchoredFlat} outside={outside} /> : null}
+        {bundle ? (
+          <FindingsRail
+            anchoredFindings={anchoredFlat}
+            outsideFindings={outside}
+            anchoredComments={commentAnchoring.anchoredFlat}
+            staleComments={commentAnchoring.stale}
+            reviews={bundle.prReviews}
+          />
+        ) : null}
         <div class="review-rail-batch">
           <BatchBar prNumber={num} repoRoot={repo} />
         </div>

@@ -17,6 +17,7 @@ import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
+import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
   fetchPrBundle as defaultFetchPrBundle,
@@ -1043,6 +1044,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       diffStats: result.bundle.diffStats,
       inlineComments: result.bundle.inlineComments,
       issueComments: result.bundle.issueComments,
+      prReviews: result.bundle.prReviews,
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
       forgeFindings: findings.findings,
@@ -1926,20 +1928,35 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const repos = buildRepoViews(store, ctx.currentRepo);
     const target = resolvePrRepo(repos, repoParam);
     if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
-    const rawIds = body.commentIds;
-    if (!Array.isArray(rawIds)) {
-      return jsonErr(400, "BAD_REQUEST", "`commentIds` must be an array of integers.");
-    }
-    const commentIds: number[] = [];
-    for (const raw of rawIds) {
-      const id = typeof raw === "number" ? raw : Number.NaN;
-      if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) {
-        return jsonErr(400, "BAD_REQUEST", "`commentIds` must contain positive integers only.");
+    // Preferred shape: `targets: [{source, id}]`. Legacy: `commentIds: [int]`.
+    const targets: FixTarget[] = [];
+    const rawTargets = body.targets;
+    if (Array.isArray(rawTargets)) {
+      for (const raw of rawTargets) {
+        if (!raw || typeof raw !== "object") {
+          return jsonErr(400, "BAD_REQUEST", "`targets` entries must be objects {source, id}.");
+        }
+        const o = raw as Record<string, unknown>;
+        if (!isFixTargetSource(o.source)) {
+          return jsonErr(400, "BAD_REQUEST", "`targets[].source` must be one of finding|comment|review.");
+        }
+        const id = String(o.id ?? "").trim();
+        if (!id) return jsonErr(400, "BAD_REQUEST", "`targets[].id` must be a non-empty value.");
+        targets.push({ source: o.source, id });
       }
-      commentIds.push(id);
+    } else if (Array.isArray(body.commentIds)) {
+      for (const raw of body.commentIds) {
+        const id = typeof raw === "number" ? raw : Number.NaN;
+        if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) {
+          return jsonErr(400, "BAD_REQUEST", "`commentIds` must contain positive integers only.");
+        }
+        targets.push({ source: "comment", id: String(id) });
+      }
+    } else {
+      return jsonErr(400, "BAD_REQUEST", "`targets` must be an array of {source, id} objects.");
     }
     try {
-      const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, commentIds }, store);
+      const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, targets }, store);
       return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
     } catch (e) {
       if (e instanceof CliError) {

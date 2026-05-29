@@ -656,6 +656,7 @@ function fakeBundle(prNum: number): PrBundle {
     diffStats: { additions: 1, deletions: 1, changedFiles: 1 },
     inlineComments: [],
     issueComments: [],
+    prReviews: [],
     warnings: [],
   };
 }
