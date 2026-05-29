@@ -88,8 +88,8 @@ export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;
 }
 
-export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review";
-export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity";
+export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review" | "worktrees";
+export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity" | "worktrees";
 
 // ─── Agent Activity ─────────────────────────────────────────────────────────
 
@@ -238,6 +238,44 @@ export interface PrView {
   commentsCount: number;
   reviewsCount: number;
   isMine: boolean;
+  /**
+   * Cheap snapshot of the Forge-managed worktree linked to this PR.
+   * Null when there is no managed worktree (chip will render "will rehydrate
+   * on fix"). Computed without network I/O — full safety verdict (with PR
+   * state) lives in GET /api/worktrees.
+   */
+  worktree: WorktreeChipInfo | null;
+}
+
+export type WorktreeSafety = "unmanaged" | "in-use" | "unsafe" | "safe" | "removable" | "unknown";
+export type WorktreePrState = "open" | "merged" | "closed" | "unknown" | "unlinked";
+
+export interface WorktreeChipInfo {
+  path: string;
+  safety: WorktreeSafety;
+  reason: string;
+}
+
+export interface WorktreeEntry {
+  path: string;
+  branch: string | null;
+  head: string;
+  prNumber: number | null;
+  prState: WorktreePrState;
+  planId: string | null;
+  dirty: boolean;
+  unpushed: boolean;
+  unpushedReason: string | null;
+  inFlight: boolean;
+  managed: boolean;
+  safety: WorktreeSafety;
+  reason: string;
+}
+
+export interface WorktreesResponse {
+  worktrees: WorktreeEntry[];
+  repo: string | null;
+  repoRoot: string | null;
 }
 
 export interface PrsResponse {

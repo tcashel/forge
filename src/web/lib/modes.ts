@@ -51,6 +51,12 @@ export function enterActivityMode(): void {
   clearDetail();
 }
 
+export function enterWorktreesMode(): void {
+  viewMode.value = "worktrees";
+  setMobileButtonActive(false, false);
+  clearDetail();
+}
+
 export function enterReviewMode(prNumber: number, repoRoot: string): void {
   currentReviewPrNumber.value = prNumber;
   currentReviewRepo.value = repoRoot;

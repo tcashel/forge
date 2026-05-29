@@ -16,6 +16,7 @@ const FILTER_SECTIONS: Record<SidebarFilter, Set<WorkbenchSection> | "all"> = {
   done: new Set<WorkbenchSection>(["done"]),
   prs: "all", // unreachable here — prs flips viewMode, not just the filter
   activity: "all", // unreachable here — activity flips viewMode, not just the filter
+  worktrees: "all", // unreachable — worktrees flips viewMode, not just the filter
 };
 
 function shouldRender(section: WorkbenchSection, filter: SidebarFilter): boolean {
