@@ -74,7 +74,7 @@ export function ReviewPage() {
           <UnanchoredComments bundle={bundle} />
         </>
       ) : null}
-      <BatchBar />
+      <BatchBar prNumber={num} repoRoot={repo} />
       <ReviewSessionDrawer prNumber={num} repoRoot={repo} />
     </div>
   );

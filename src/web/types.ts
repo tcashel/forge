@@ -295,6 +295,15 @@ export interface ForgeFinding {
   fix: string;
 }
 
+export type CommentFixStatus = "fixed" | "disputed" | "failed";
+
+export interface CommentFixStateEntry {
+  status: CommentFixStatus;
+  reason?: string;
+}
+
+export type CommentFixState = Record<string, CommentFixStateEntry>;
+
 export interface PrReviewBundle {
   pr: PrView;
   diff: string;
@@ -304,6 +313,7 @@ export interface PrReviewBundle {
   linkedPlanId: string | null;
   worktreePath: string | null;
   forgeFindings: ForgeFinding[];
+  commentFixState: CommentFixState;
   warnings: PrBundleWarning[];
 }
 

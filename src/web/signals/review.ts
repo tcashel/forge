@@ -43,6 +43,9 @@ export const displayedFindings = computed<ForgeFinding[]>(() => {
   if (run && selectedReviewRunId.value === run.sessionId) return run.findings;
   return reviewBundle.value?.forgeFindings ?? [];
 });
+// Active comment-fix session — analogous to activeReviewSession but for
+// the validate-then-fix worker spawned by `Fix N selected`.
+export const activeCommentFixSession = signal<{ sessionId: string; prNum: number } | null>(null);
 
 export function toggleCommentSelection(commentId: string | number): void {
   const next = new Set(selectedComments.value);
@@ -50,6 +53,12 @@ export function toggleCommentSelection(commentId: string | number): void {
   if (next.has(key)) next.delete(key);
   else next.add(key);
   selectedComments.value = next;
+}
+
+export function setCommentStatuses(ids: Array<string | number>, status: CommentStatus): void {
+  const next = new Map(commentStatuses.value);
+  for (const id of ids) next.set(String(id), status);
+  commentStatuses.value = next;
 }
 
 export function clearReviewState(): void {
@@ -63,6 +72,7 @@ export function clearReviewState(): void {
   selectedReviewRunId.value = null;
   selectedReviewRun.value = null;
   selectedReviewRunError.value = null;
+  activeCommentFixSession.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {
@@ -139,4 +149,18 @@ export function clearSelectedReviewRun(): void {
   selectedReviewRunId.value = null;
   selectedReviewRun.value = null;
   selectedReviewRunError.value = null;
+export interface RunCommentFixResponse {
+  sessionId: string;
+  logStreamUrl: string;
+}
+
+export async function startCommentFix(
+  prNumber: number,
+  repoRoot: string,
+  commentIds: number[],
+): Promise<RunCommentFixResponse> {
+  return apiPost<RunCommentFixResponse>(`/api/prs/${prNumber}/fix-comments`, {
+    repo: repoRoot,
+    commentIds,
+  });
 }

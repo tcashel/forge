@@ -52,6 +52,7 @@ import type {
   RepoConfig,
 } from "../../core/store.ts";
 import { CliError } from "../output.ts";
+import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
 import { doLaunch } from "./launch.ts";
 import {
@@ -1035,6 +1036,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
     const linkage = derivePrLinkage(store, target.root, prNum);
     const findings = findLatestForgeFindings(store, prNum, target.root, result.bundle.pr.headRefName ?? null);
+    const commentFixState: CommentFixState = findLatestCommentFixState(store, prNum, target.root);
     return jsonOk({
       pr: result.bundle.pr,
       diff: result.bundle.diff,
@@ -1044,6 +1046,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
       forgeFindings: findings.findings,
+      commentFixState,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
   }
@@ -1470,7 +1473,12 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
     | undefined;
   if (!row) return null;
   // execution / review / fix all share the job's main agent.log today.
-  if (row.purpose === "execution" || row.purpose === "review" || row.purpose === "fix") {
+  if (
+    row.purpose === "execution" ||
+    row.purpose === "review" ||
+    row.purpose === "fix" ||
+    row.purpose === "comment-fix"
+  ) {
     const job = store.db.db
       .prepare(
         `SELECT t.plan_id
@@ -1479,9 +1487,9 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
       )
       .get(sessionId, row.related_id) as { plan_id: string } | undefined;
     if (job) return store.getLogFile(job.plan_id);
-    // Ad-hoc reviewer sessions have no joined jobs row — fall back to
-    // metrics.logFile written by runAdHocReview.
-    if (row.purpose === "review") {
+    // Ad-hoc reviewer and comment-fix sessions have no joined jobs row —
+    // fall back to metrics.logFile written by the parent orchestrator.
+    if (row.purpose === "review" || row.purpose === "comment-fix") {
       try {
         const metrics = JSON.parse(row.metrics ?? "{}") as { logFile?: unknown };
         if (typeof metrics.logFile === "string" && metrics.logFile) return metrics.logFile;
@@ -1538,6 +1546,7 @@ const DRAFT_ABORT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/abort$/;
 const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
 const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
+const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
@@ -1553,6 +1562,7 @@ function allowsPost(pathname: string): boolean {
   )
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
+  if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
   return ACTION_TASK_PATH.test(pathname);
 }
 
@@ -1897,6 +1907,51 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
         if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
         if (e.code === "REVIEW_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
+        return fromCliError(e);
+      }
+      throw e;
+    }
+  }
+
+  // POST /api/prs/:num/fix-comments
+  const fixCommentsMatch = pathname.match(PR_FIX_COMMENTS_PATH);
+  if (fixCommentsMatch) {
+    const numRaw = decodeURIComponent(fixCommentsMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const rawIds = body.commentIds;
+    if (!Array.isArray(rawIds)) {
+      return jsonErr(400, "BAD_REQUEST", "`commentIds` must be an array of integers.");
+    }
+    const commentIds: number[] = [];
+    for (const raw of rawIds) {
+      const id = typeof raw === "number" ? raw : Number.NaN;
+      if (!Number.isFinite(id) || !Number.isInteger(id) || id <= 0) {
+        return jsonErr(400, "BAD_REQUEST", "`commentIds` must contain positive integers only.");
+      }
+      commentIds.push(id);
+    }
+    try {
+      const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, commentIds }, store);
+      return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
+    } catch (e) {
+      if (e instanceof CliError) {
+        if (e.code === "PR_NOT_FOUND") return jsonErr(404, e.code, e.message, e.hint);
+        if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
+        if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
+        if (e.code === "FIX_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
+        if (e.code === "NO_WORKTREE") return jsonErr(422, e.code, e.message, e.hint);
+        if (e.code === "WORKTREE_BRANCH_MISMATCH" || e.code === "WORKTREE_DIRTY") {
+          return jsonErr(409, e.code, e.message, e.hint);
+        }
+        if (e.code === "NO_COMMENTS") return jsonErr(400, e.code, e.message, e.hint);
         return fromCliError(e);
       }
       throw e;
