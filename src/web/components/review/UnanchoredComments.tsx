@@ -21,7 +21,7 @@ export function UnanchoredComments({ bundle }: Props) {
       </p>
       <div class="review-stale-list">
         {stale.map((t) => (
-          <CommentThread key={`stale-${t.root.id}`} thread={t} />
+          <CommentThread key={`stale-${t.root.id}`} thread={t} anchored={false} />
         ))}
       </div>
     </section>
