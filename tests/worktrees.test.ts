@@ -16,10 +16,30 @@ import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 import {
   computeSafety,
   ensureWorktreeForBranch,
+  isCleanMergedTarget,
   listWorktrees,
   resolveWorktreeTarget,
   type WorktreeEntry,
 } from "../src/core/worktrees.ts";
+
+function makeEntry(overrides: Partial<WorktreeEntry> = {}): WorktreeEntry {
+  return {
+    path: "/tmp/wt",
+    branch: "feature",
+    head: "deadbeef",
+    prNumber: 1,
+    prState: "open",
+    planId: "plan-1",
+    dirty: false,
+    unpushed: false,
+    unpushedReason: null,
+    inFlight: false,
+    managed: true,
+    safety: "removable",
+    reason: "",
+    ...overrides,
+  };
+}
 
 function tmpDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -166,6 +186,24 @@ test("computeSafety: clean + unknown state → unknown (never safe)", () => {
     prState: "unknown",
   });
   assert.equal(out.safety, "unknown");
+});
+
+test("isCleanMergedTarget: merged + safe → eligible", () => {
+  assert.equal(isCleanMergedTarget(makeEntry({ safety: "safe", prState: "merged" })), true);
+});
+
+test("isCleanMergedTarget: closed (no merge) + safe → SKIP (must be removed explicitly)", () => {
+  // Regression: clean-merged previously deleted closed-but-unmerged worktrees.
+  // The spec reserves bulk-cleanup for merged PRs only.
+  assert.equal(isCleanMergedTarget(makeEntry({ safety: "safe", prState: "closed" })), false);
+});
+
+test("isCleanMergedTarget: removable (open PR) → SKIP", () => {
+  assert.equal(isCleanMergedTarget(makeEntry({ safety: "removable", prState: "open" })), false);
+});
+
+test("isCleanMergedTarget: unsafe → SKIP regardless of prState", () => {
+  assert.equal(isCleanMergedTarget(makeEntry({ safety: "unsafe", prState: "merged" })), false);
 });
 
 test("computeSafety: clean + unlinked → removable (no PR yet)", () => {

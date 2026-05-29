@@ -17,6 +17,7 @@ import { parseArgs } from "node:util";
 import { detectRepo } from "../../core/repo.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import {
+  isCleanMergedTarget,
   listWorktrees,
   parkWorktreeForTest,
   removeWorktreeUnsafe,
@@ -41,6 +42,7 @@ Subcommands:
     --dry-run                Print what would be removed without removing
     --yes                    Skip the TTY confirmation
   test <target>              Park the worktree and check its branch out in main
+    --force                  Override the unsafe refusal (does not override in-use/dirty-main)
   restore                    Restore main to its prior ref (undo \`test\`)
 
 The "safety" verdict is computed live from \`git worktree list\` +
@@ -179,8 +181,8 @@ async function runCleanMerged(argv: string[], store: ForgeStore): Promise<void> 
   });
   const repoRoot = resolveRepoRoot();
   const entries = listWorktrees(repoRoot, store);
-  const safe = entries.filter((e) => e.safety === "safe");
-  const skipped = entries.filter((e) => e.safety !== "safe").map((entry) => ({ entry, reason: skipReason(entry) }));
+  const safe = entries.filter(isCleanMergedTarget);
+  const skipped = entries.filter((e) => !isCleanMergedTarget(e)).map((entry) => ({ entry, reason: skipReason(entry) }));
 
   if (values["dry-run"]) {
     emitOk({ removed: safe, skipped, dryRun: true }, values.json === true, () =>
@@ -219,6 +221,10 @@ async function runCleanMerged(argv: string[], store: ForgeStore): Promise<void> 
 }
 
 function skipReason(e: WorktreeEntry): string {
+  // `safe` with a closed (non-merged) PR is bulk-cleanup-skipped on purpose.
+  if (e.safety === "safe" && e.prState === "closed") {
+    return "closed without merge — remove explicitly";
+  }
   switch (e.safety) {
     case "in-use":
       return "in-use";
@@ -260,6 +266,7 @@ async function runTest(argv: string[], store: ForgeStore): Promise<void> {
       pr: { type: "string" },
       branch: { type: "string" },
       path: { type: "string" },
+      force: { type: "boolean", default: false },
       json: { type: "boolean", default: false },
     },
     strict: false,
@@ -274,7 +281,7 @@ async function runTest(argv: string[], store: ForgeStore): Promise<void> {
     path: typeof values.path === "string" ? values.path : undefined,
   });
   try {
-    const result = parkWorktreeForTest(store, repoRoot, entry);
+    const result = parkWorktreeForTest(store, repoRoot, entry, { force: values.force === true });
     emitOk(
       result,
       values.json === true,
