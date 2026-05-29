@@ -317,6 +317,42 @@ export interface PrReviewBundle {
   warnings: PrBundleWarning[];
 }
 
+// ─── Forge review history (GET /api/prs/:num/reviews) ───────────────────────
+
+export type ReviewRunStatus = "running" | "completed" | "failed" | "killed";
+export type ReviewVerdict = "approve" | "request-changes" | "block";
+
+export interface ReviewSeverityCounts {
+  BLOCKER: number;
+  HIGH: number;
+  MEDIUM: number;
+  LOW: number;
+}
+
+export interface ReviewRunSummary {
+  sessionId: string;
+  agent: string;
+  model: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  status: ReviewRunStatus;
+  verdict: ReviewVerdict | null;
+  findingsTotal: number;
+  findingCounts: ReviewSeverityCounts;
+}
+
+export interface ReviewRunDetail {
+  sessionId: string;
+  status: ReviewRunStatus;
+  agent: string;
+  model: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  verdict: ReviewVerdict | null;
+  summary: string;
+  findings: ForgeFinding[];
+}
+
 // ─── Plan chat ──────────────────────────────────────────────────────────────
 // Mirror of `ChatMessage` from src/core/plan-chat.ts. The web layer only
 // needs the structural shape; the role union is intentionally narrowed

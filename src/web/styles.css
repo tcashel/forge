@@ -1527,3 +1527,43 @@ body.filtered-single .repo-chip{ display: none; }
   word-break: break-word;
 }
 
+/* ── Past Forge reviews picker ──────────────────────────────────────── */
+.review-history { display: flex; flex-direction: column; gap: 6px; }
+.review-history-header { display: flex; align-items: center; gap: 8px; }
+.review-history-header h2 { margin: 0; font-size: 13px; font-weight: 600; color: var(--fg-dim); }
+.review-history-actions { display: flex; gap: 8px; align-items: center; margin-left: auto; }
+.review-history-status { font-size: 11px; color: var(--fg-dim); }
+.review-history-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.review-history-row {
+  display: grid;
+  grid-template-columns: 80px 90px 110px 1fr auto;
+  gap: 10px;
+  align-items: center;
+  width: 100%;
+  text-align: left;
+  padding: 6px 10px;
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  font-size: 12px;
+  color: var(--fg);
+  cursor: pointer;
+}
+.review-history-row:hover:not(:disabled) { background: var(--panel-2); }
+.review-history-row.selected { border-color: var(--primary); }
+.review-history-row.latest { border-style: dashed; }
+.review-history-row.running { opacity: 0.7; cursor: default; }
+.review-history-when { font-family: var(--mono, monospace); color: var(--fg-dim); }
+.review-history-status.status-running { color: var(--primary); }
+.review-history-status.status-failed { color: var(--attention); }
+.review-history-counts { color: var(--fg-dim); }
+.review-history-badge {
+  font-size: 10px;
+  padding: 1px 6px;
+  border-radius: 3px;
+  background: var(--panel-2);
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+

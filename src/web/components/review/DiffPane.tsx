@@ -5,6 +5,13 @@ import { CommentThread, type InlineThread } from "./CommentThread";
 
 interface Props {
   bundle: PrReviewBundle;
+  /**
+   * Optional override for which findings the diff is annotated with.
+   * When unset the component falls back to `bundle.forgeFindings` so
+   * existing callers that don't track a selected historical run keep
+   * rendering today's "latest" findings.
+   */
+  findings?: ForgeFinding[];
 }
 
 interface AnchorKey {
@@ -180,14 +187,15 @@ function DiffFileCard({
   );
 }
 
-export function DiffPane({ bundle }: Props) {
+export function DiffPane({ bundle, findings }: Props) {
   const { diff, inlineComments, forgeFindings } = bundle;
+  const effectiveFindings = findings ?? forgeFindings ?? [];
   const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
   const threads = useMemo(() => groupIntoThreads(inlineComments), [inlineComments]);
   const { anchored } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
   const { anchored: findingsAnchored } = useMemo(
-    () => anchorFindings(forgeFindings ?? [], parsed),
-    [forgeFindings, parsed],
+    () => anchorFindings(effectiveFindings, parsed),
+    [effectiveFindings, parsed],
   );
 
   if (parsed.length === 0) {

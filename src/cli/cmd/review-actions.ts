@@ -501,6 +501,195 @@ function runGhSafe(args: string[], env: Record<string, string>, cwd: string): st
   }
 }
 
+// ─── Review history (used by the /api/prs/:num/reviews routes) ──────────────
+
+export type ReviewRunStatus = "running" | "completed" | "failed" | "killed";
+
+export type ReviewSeverityCounts = {
+  BLOCKER: number;
+  HIGH: number;
+  MEDIUM: number;
+  LOW: number;
+};
+
+export interface ReviewRunSummary {
+  sessionId: string;
+  agent: string;
+  model: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  status: ReviewRunStatus;
+  verdict: "approve" | "request-changes" | "block" | null;
+  findingsTotal: number;
+  findingCounts: ReviewSeverityCounts;
+}
+
+export interface ReviewRunDetail {
+  sessionId: string;
+  status: ReviewRunStatus;
+  agent: string;
+  model: string | null;
+  startedAt: string;
+  completedAt: string | null;
+  verdict: "approve" | "request-changes" | "block" | null;
+  summary: string;
+  findings: ForgeFinding[];
+}
+
+interface ReviewSessionRow {
+  id: string;
+  agent_adapter: string;
+  model: string | null;
+  started_at: string;
+  finished_at: string | null;
+  state: string;
+  metrics: string | null;
+}
+
+function parseReviewMetricsBlob(raw: string | null): Record<string, unknown> {
+  if (!raw) return {};
+  try {
+    const parsed = JSON.parse(raw);
+    return parsed && typeof parsed === "object" && !Array.isArray(parsed) ? parsed : {};
+  } catch {
+    return {};
+  }
+}
+
+function readReviewFindingsAt(runDir: string): ForgeFinding[] {
+  try {
+    const raw = fs.readFileSync(path.join(runDir, "findings.json"), "utf-8");
+    const parsed = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed as ForgeFinding[];
+  } catch {
+    return [];
+  }
+}
+
+function tallySeverities(findings: ForgeFinding[]): ReviewSeverityCounts {
+  const counts: ReviewSeverityCounts = { BLOCKER: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
+  for (const f of findings) {
+    if (f && (f.severity === "BLOCKER" || f.severity === "HIGH" || f.severity === "MEDIUM" || f.severity === "LOW")) {
+      counts[f.severity]++;
+    }
+  }
+  return counts;
+}
+
+function formatSeveritySummary(counts: ReviewSeverityCounts): string {
+  const parts: string[] = [];
+  if (counts.BLOCKER > 0) parts.push(`${counts.BLOCKER} BLOCKER`);
+  if (counts.HIGH > 0) parts.push(`${counts.HIGH} HIGH`);
+  if (counts.MEDIUM > 0) parts.push(`${counts.MEDIUM} MEDIUM`);
+  if (counts.LOW > 0) parts.push(`${counts.LOW} LOW`);
+  if (parts.length === 0) return "No findings";
+  return parts.join(", ");
+}
+
+function readReviewVerdictAt(runDir: string): "approve" | "request-changes" | "block" | null {
+  try {
+    const reviewMd = fs.readFileSync(path.join(runDir, "review.md"), "utf-8");
+    return parseForgeReviewVerdict(reviewMd);
+  } catch {
+    return null;
+  }
+}
+
+function normalizeReviewStatus(state: string): ReviewRunStatus {
+  if (state === "running" || state === "completed" || state === "failed" || state === "killed") return state;
+  return "failed";
+}
+
+/**
+ * List every recorded ad-hoc review for a (prNum, repoRoot), newest first.
+ * Scope is the `sessions` table — launch auto-review findings are NOT
+ * included here (they have no review session row).
+ */
+export function listForgeReviews(store: ForgeStore, prNum: number, repoRoot: string): ReviewRunSummary[] {
+  const rows = store.db.db
+    .prepare(
+      `SELECT id, agent_adapter, model, started_at, finished_at, state, metrics
+         FROM sessions
+        WHERE purpose = 'review'
+          AND json_extract(metrics, '$.prNum') = ?
+          AND json_extract(metrics, '$.repoRoot') = ?
+        ORDER BY started_at DESC`,
+    )
+    .all(prNum, repoRoot) as ReviewSessionRow[];
+
+  const out: ReviewRunSummary[] = [];
+  for (const row of rows) {
+    const metrics = parseReviewMetricsBlob(row.metrics);
+    const rowPrNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
+    const rowRepoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
+    if (rowPrNum !== prNum || rowRepoRoot !== repoRoot) continue;
+
+    const status = normalizeReviewStatus(row.state);
+    const runDir = adHocRunDir(store, prNum, row.id);
+    const findings = readReviewFindingsAt(runDir);
+    const findingCounts = tallySeverities(findings);
+    const verdict = status === "running" ? null : readReviewVerdictAt(runDir);
+    out.push({
+      sessionId: row.id,
+      agent: row.agent_adapter,
+      model: row.model,
+      startedAt: row.started_at,
+      completedAt: row.finished_at,
+      status,
+      verdict,
+      findingsTotal: findings.length,
+      findingCounts,
+    });
+  }
+  return out;
+}
+
+/**
+ * Load a single recorded review's findings + verdict + derived summary.
+ * Returns null when the session row doesn't exist or its metrics don't
+ * match the requested (prNum, repoRoot) — guards against reading an
+ * arbitrary run dir from a maliciously crafted sessionId.
+ */
+export function loadForgeReview(
+  store: ForgeStore,
+  prNum: number,
+  repoRoot: string,
+  sessionId: string,
+): ReviewRunDetail | null {
+  const row = store.db.db
+    .prepare(
+      `SELECT id, agent_adapter, model, started_at, finished_at, state, metrics
+         FROM sessions
+        WHERE id = ? AND purpose = 'review'`,
+    )
+    .get(sessionId) as ReviewSessionRow | undefined;
+  if (!row) return null;
+
+  const metrics = parseReviewMetricsBlob(row.metrics);
+  const rowPrNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
+  const rowRepoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
+  if (rowPrNum !== prNum || rowRepoRoot !== repoRoot) return null;
+
+  const status = normalizeReviewStatus(row.state);
+  const runDir = adHocRunDir(store, prNum, row.id);
+  const findings = readReviewFindingsAt(runDir);
+  const verdict = status === "running" ? null : readReviewVerdictAt(runDir);
+  const summary = formatSeveritySummary(tallySeverities(findings));
+
+  return {
+    sessionId: row.id,
+    status,
+    agent: row.agent_adapter,
+    model: row.model,
+    startedAt: row.started_at,
+    completedAt: row.finished_at,
+    verdict,
+    summary,
+    findings,
+  };
+}
+
 // ─── findings lookup helpers (used by the review-bundle route) ───────────────
 
 export interface FindingsLookupResult {
