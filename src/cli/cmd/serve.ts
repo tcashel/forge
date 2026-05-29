@@ -16,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
+import { reconcileCritiqueSessions } from "../../core/critique.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
@@ -966,6 +967,15 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     // (runner died before forge_session_finish) clear before display.
     try {
       reconcileExecutionSessions(store.db.db, new Date().toISOString());
+    } catch {
+      /* non-fatal */
+    }
+    // Background critiques (launchCritique → tmux) write their meta
+    // file when the runner finishes, but the original TS process is
+    // already gone — so the DB sessions stay `running`. Parse sidecars
+    // and sync token/cost into sessions.metrics before the list is read.
+    try {
+      await reconcileCritiqueSessions(store);
     } catch {
       /* non-fatal */
     }

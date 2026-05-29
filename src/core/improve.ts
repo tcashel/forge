@@ -13,9 +13,10 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { atomicWriteText } from "./atomic-write.js";
+import { readResultFromFile } from "./claude-stream.ts";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
 import { finalizeSession, improvementSessionId, recordPlanVersionAdded, upsertSession } from "./db/writes.ts";
-import { agentCommand } from "./launch.js";
+import { agentCommand, claudeJobCommand } from "./launch.js";
 import type { ForgeStore } from "./store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -48,12 +49,15 @@ export interface ImproveOverrides {
   /**
    * Run the improver agent. Must write its forge-spec-improved output to
    * `outputPath` and return the exit code (0 = success). Stderr should go
-   * to `errLogPath`.
+   * to `errLogPath`. For claude runs, `sidecarPath` is where the raw
+   * stream-json must be teed so `runImprover` can extract token / cost
+   * data; non-claude runs ignore it.
    */
   runImproverAgent?: (args: {
     promptFile: string;
     outputPath: string;
     errLogPath: string;
+    sidecarPath: string;
     config: ImproveConfig;
   }) => Promise<number>;
 }
@@ -300,11 +304,15 @@ async function defaultRunImproverAgent(args: {
   promptFile: string;
   outputPath: string;
   errLogPath: string;
+  sidecarPath: string;
   config: ImproveConfig;
 }): Promise<number> {
-  const cmd = agentCommand(args.config.improver.agent, args.config.improver.model, args.promptFile, {
-    reasoningEffort: args.config.improver.reasoningEffort,
-  });
+  const cmd =
+    args.config.improver.agent === "claude"
+      ? claudeJobCommand(args.config.improver.model, args.promptFile, args.sidecarPath)
+      : agentCommand(args.config.improver.agent, args.config.improver.model, args.promptFile, {
+          reasoningEffort: args.config.improver.reasoningEffort,
+        });
   const out = fs.openSync(args.outputPath, "w");
   const err = fs.openSync(args.errLogPath, "w");
   try {
@@ -415,6 +423,7 @@ export async function runImprover(
   // ── Step 7: Run improver agent ──────────────────────────────────────────
   const outputPath = path.join(critiqueDir, "improver-output.md");
   const errLogPath = path.join(critiqueDir, "improver.log");
+  const sidecarPath = path.join(critiqueDir, "improver.stream.jsonl");
   const runAgent = overrides.runImproverAgent ?? defaultRunImproverAgent;
 
   const improverSessionId = improvementSessionId(critiqueId, 1);
@@ -441,7 +450,7 @@ export async function runImprover(
 
   let exitCode: number;
   try {
-    exitCode = await runAgent({ promptFile, outputPath, errLogPath, config });
+    exitCode = await runAgent({ promptFile, outputPath, errLogPath, sidecarPath, config });
   } catch (e: unknown) {
     const msg = e instanceof Error ? e.message : String(e);
     try {
@@ -466,12 +475,27 @@ export async function runImprover(
 
   try {
     const durationMs = Date.now() - new Date(improverStartedAt).getTime();
+    const metricsPatch: Parameters<typeof finalizeSession>[1]["metrics"] = { durationMs };
+    if (config.improver.agent === "claude" && fs.existsSync(sidecarPath)) {
+      const r = await readResultFromFile(sidecarPath);
+      // Drop r.durationMs — the wall-clock above (process startup + teardown
+      // included) is authoritative; the sidecar's duration only covers the
+      // claude API turn.
+      if (r.tokensIn !== null || r.tokensOut !== null || r.totalCostUsd !== null) {
+        metricsPatch.tokensIn = r.tokensIn;
+        metricsPatch.tokensOut = r.tokensOut;
+        metricsPatch.cacheRead = r.cacheRead;
+        metricsPatch.cacheCreate = r.cacheCreate;
+        metricsPatch.costUsd = r.totalCostUsd;
+        metricsPatch.costSource = r.totalCostUsd !== null ? "provider" : null;
+      }
+    }
     finalizeSession(store.db.db, {
       id: improverSessionId,
       finishedAt: new Date().toISOString(),
       state: exitCode === 0 ? "completed" : "failed",
       exitCode,
-      metrics: { durationMs },
+      metrics: metricsPatch,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
