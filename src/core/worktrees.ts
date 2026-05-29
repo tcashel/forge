@@ -13,6 +13,7 @@
 import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
+import { resolveGhEnv } from "./gh.ts";
 import { createWorktree, detectRepo } from "./repo.ts";
 import type { ForgeStore } from "./store.ts";
 
@@ -73,10 +74,15 @@ export function listWorktrees(repoRoot: string, store: ForgeStore, opts: ListWor
   const realRepoRoot = realPathOrSelf(repoRoot);
   const repoBase = path.join(path.dirname(realRepoRoot), "worktrees");
   const runningCwds = readRunningSessionCwds(store);
+  // Scope `gh pr view` to this repo's configured account/host so multi-account
+  // and Enterprise setups resolve PR state with the right token. resolveGhEnv
+  // returns {} (no override, no `gh` call) when ghUser/ghHost are unset.
+  const repoConfig = store.getRepoConfig(repoRoot);
+  const ghEnv = { ...process.env, ...resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost }).env };
   const prStateCache = new Map<number, WorktreePrState>();
   const resolvePrState = (prNumber: number): WorktreePrState => {
     if (prStateCache.has(prNumber)) return prStateCache.get(prNumber) as WorktreePrState;
-    const v = opts.ghPrState ? opts.ghPrState(prNumber, repoRoot) : queryPrState(prNumber, repoRoot);
+    const v = opts.ghPrState ? opts.ghPrState(prNumber, repoRoot) : queryPrState(prNumber, repoRoot, ghEnv);
     const finalV = v ?? "unknown";
     prStateCache.set(prNumber, finalV);
     return finalV;
@@ -210,14 +216,21 @@ export async function ensureWorktreeForBranch(
   }
 
   // 2) Fetch the branch ref from the remote so `git worktree add <path> <branch>` resolves.
+  // Force-update (`+`) the local ref: if the PR branch was force-pushed/rebased the local
+  // copy has diverged, a plain `branch:branch` fetch fails non-fast-forward, and we'd
+  // otherwise check out a stale revision below. For rehydration the remote PR branch is the
+  // source of truth. We only reach this path when no live worktree holds the branch (step 1
+  // returned early), so resetting the dangling local ref is safe — and if the branch is
+  // checked out in main, `worktree add` would refuse regardless.
   try {
-    execFileSync("git", ["-C", repoRoot, "fetch", "origin", `${branch}:${branch}`], {
+    execFileSync("git", ["-C", repoRoot, "fetch", "origin", `+${branch}:${branch}`], {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 60_000,
     });
   } catch {
-    // Branch may already be local — try fetching the remote ref without forcing.
-    // If neither works the branch is genuinely gone; surface a NO_WORKTREE-class error.
+    // Force refspec can still fail (e.g. branch checked out elsewhere) — fall back to
+    // fetching just the remote ref. If neither works the branch is genuinely gone;
+    // surface a NO_WORKTREE-class error.
     try {
       execFileSync("git", ["-C", repoRoot, "fetch", "origin", branch], {
         stdio: ["pipe", "pipe", "pipe"],
@@ -397,12 +410,13 @@ function derivePlanLinkage(
   }
 }
 
-function queryPrState(prNumber: number, repoRoot: string): WorktreePrState {
+function queryPrState(prNumber: number, repoRoot: string, env: NodeJS.ProcessEnv = process.env): WorktreePrState {
   try {
     const out = execFileSync("gh", ["pr", "view", String(prNumber), "--json", "state,mergedAt"], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
       cwd: repoRoot,
+      env,
       timeout: 10_000,
     }).trim();
     const parsed = JSON.parse(out) as { state?: string; mergedAt?: string | null };
