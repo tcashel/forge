@@ -230,6 +230,22 @@ function parseNameWithOwner(url: string): { owner: string; repo: string } | null
 }
 
 /**
+ * Host the PR lives on, parsed from its url. `gh api` (unlike `gh pr view`)
+ * defaults to github.com and does NOT auto-detect the host from the local
+ * git remote, so enterprise PRs need the host pinned via --hostname or the
+ * comment endpoints 404. Returns null for github.com (the default) so we
+ * only add the flag when it changes behaviour.
+ */
+function parseApiHost(url: string): string | null {
+  try {
+    const host = new URL(url).hostname;
+    return host && host !== "github.com" ? host : null;
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Fetch everything the PR review page needs in a single fan-out.
  *
  * `pr view` is the only mandatory call — if it fails we return `ok: false`
@@ -274,13 +290,20 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
   const fallback = parseNameWithOwner(raw.url);
   const resolved = ownerRepo ? { full: ownerRepo } : fallback ? { full: `${fallback.owner}/${fallback.repo}` } : null;
 
+  // `gh api` defaults to github.com and won't infer the enterprise host from
+  // the local git remote the way `gh pr view`/`pr diff` do, so pin it from the
+  // PR url. Empty array for github.com PRs leaves the call unchanged.
+  const apiHost = parseApiHost(raw.url);
+  const hostArgs = apiHost ? ["--hostname", apiHost] : [];
+
   if (!resolved) {
     warnings.push({ source: "inlineComments", message: "could not resolve owner/repo for gh api calls" });
     warnings.push({ source: "issueComments", message: "could not resolve owner/repo for gh api calls" });
   } else {
-    const inlineRes = await runGh(["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate"], opts).catch(
-      () => ({ ok: false, stdout: "" }),
-    );
+    const inlineRes = await runGh(
+      ["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate", ...hostArgs],
+      opts,
+    ).catch(() => ({ ok: false, stdout: "" }));
     if (inlineRes.ok && inlineRes.stdout) {
       try {
         const parsed = JSON.parse(inlineRes.stdout) as RawInlineComment[];
@@ -309,9 +332,10 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
       warnings.push({ source: "inlineComments", message: `gh api pulls/${prNum}/comments failed` });
     }
 
-    const issueRes = await runGh(["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate"], opts).catch(
-      () => ({ ok: false, stdout: "" }),
-    );
+    const issueRes = await runGh(
+      ["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate", ...hostArgs],
+      opts,
+    ).catch(() => ({ ok: false, stdout: "" }));
     if (issueRes.ok && issueRes.stdout) {
       try {
         const parsed = JSON.parse(issueRes.stdout) as RawIssueComment[];

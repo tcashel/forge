@@ -180,12 +180,13 @@ test("dispatchChatEvent ignores unknown event names", () => {
 
 /** Build a `fetch`-compatible mock that returns a fixed SSE body. */
 function mockFetchOk(sseBody: string): typeof fetch {
-  return async (_url: string | URL | Request) => {
+  const fn = async (_url: string | URL | Request) => {
     return new Response(sseBody, {
       status: 200,
       headers: { "content-type": "text/event-stream" },
     });
   };
+  return fn as unknown as typeof fetch;
 }
 
 test("startChatStream surfaces a specific banner when the server closes after `text` but before `done`", async () => {

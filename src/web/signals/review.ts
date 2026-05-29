@@ -149,6 +149,8 @@ export function clearSelectedReviewRun(): void {
   selectedReviewRunId.value = null;
   selectedReviewRun.value = null;
   selectedReviewRunError.value = null;
+}
+
 export interface RunCommentFixResponse {
   sessionId: string;
   logStreamUrl: string;
