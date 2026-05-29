@@ -329,7 +329,7 @@ test("GET /api/config returns current repo config", async (t) => {
   const { status, body } = await getJson(`${h.baseUrl}/api/config`);
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.repo.root, process.cwd());
+  assert.equal(body.data!.repo!.root, process.cwd());
   assert.deepEqual(body.data!.config, { defaultAgent: "codex", defaultModel: "gpt-5-codex" });
 });
 
@@ -343,9 +343,10 @@ test("POST /api/config saves validated repo settings", async (t) => {
   });
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.config.defaultAgent, "claude");
-  assert.equal(body.data!.config.autoImprove, false);
-  assert.equal(body.data!.config.autoFixRounds, 2);
+  const cfg = body.data!.config as { defaultAgent: string; autoImprove: boolean; autoFixRounds: number };
+  assert.equal(cfg.defaultAgent, "claude");
+  assert.equal(cfg.autoImprove, false);
+  assert.equal(cfg.autoFixRounds, 2);
   assert.equal(h.store.getRepoConfig(process.cwd()).ghHost, "github.com");
 });
 
@@ -367,13 +368,13 @@ test("single draft → /api/plans enriches with section + statLabel + blurb", as
   makeDraftTask(h.store, "draft-foo", h.tmpHome, "demo", "feat(demo): add the thing");
   const { body } = await getJson(`${h.baseUrl}/api/plans`);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.plans.length, 1);
-  const task = body.data!.plans[0];
+  assert.equal(body.data!.plans!.length, 1);
+  const task = body.data!.plans![0];
   assert.equal(task.id, "draft-foo");
   assert.equal(task.title, "feat(demo): add the thing");
   assert.equal(task.section, "drafting");
   assert.equal(task.statLabel, "Drafting");
-  assert.match(task.blurb, /short blurb/);
+  assert.match(task.blurb as string, /short blurb/);
   assert.equal(task.repo, "demo");
 });
 
@@ -383,8 +384,8 @@ test("single draft → /api/plans/:id returns full record", async (t) => {
   makeDraftTask(h.store, "draft-bar", h.tmpHome, "demo", "feat(demo): bar");
   const { body } = await getJson(`${h.baseUrl}/api/plans/draft-bar`);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.task.id, "draft-bar");
-  assert.equal(body.data!.task.section, "drafting");
+  assert.equal(body.data!.task!.id, "draft-bar");
+  assert.equal(body.data!.task!.section, "drafting");
 });
 
 test("/api/plans/:id/spec returns markdown body", async (t) => {
@@ -393,7 +394,7 @@ test("/api/plans/:id/spec returns markdown body", async (t) => {
   makeDraftTask(h.store, "draft-spec", h.tmpHome, "demo", "feat(demo): spec");
   const { body } = await getJson(`${h.baseUrl}/api/plans/draft-spec/spec`);
   assert.equal(body.ok, true);
-  assert.match(body.data!.body, /^# feat\(demo\): spec/);
+  assert.match(body.data!.body as string, /^# feat\(demo\): spec/);
 });
 
 test("unknown task id → 404 envelope", async (t) => {
@@ -435,7 +436,9 @@ test("PlanView includes provenance: spec version + prior-run count + last state 
   recordJobStarted(h.store.db.db, plan, makeJobMeta(plan.id, "2026-05-01T11:00:00.000Z"));
 
   const { body } = await getJson(`${h.baseUrl}/api/plans/${plan.id}`);
-  const view = body.data!.task as { provenance: { specVersion: number; priorRuns: number; lastRunState: string } };
+  const view = body.data!.task as unknown as {
+    provenance: { specVersion: number; priorRuns: number; lastRunState: string };
+  };
   assert.ok(view.provenance, "provenance is populated for plans with a DB row");
   assert.equal(view.provenance.specVersion, 1);
   assert.equal(view.provenance.priorRuns, 2);
@@ -515,8 +518,8 @@ test("repo filter returns only the requested repo's tasks", async (t) => {
   makeDraftTask(h.store, "draft-b", "/repo-b", "beta", "feat(beta): b");
   const { body } = await getJson(`${h.baseUrl}/api/plans?repo=alpha`);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.plans.length, 1);
-  assert.equal(body.data!.plans[0].repo, "alpha");
+  assert.equal(body.data!.plans!.length, 1);
+  assert.equal(body.data!.plans![0].repo, "alpha");
 });
 
 test("/api/repos groups by repoRoot with a task count", async (t) => {
@@ -540,7 +543,7 @@ test("POST /api/repos registers a git repo with no tasks", async (t) => {
   const { status, body } = await postJson(`${h.baseUrl}/api/repos`, { repoRoot: repo });
   assert.equal(status, 200);
   assert.equal(body.ok, true);
-  assert.equal(body.data!.repo.root, repo);
+  assert.equal(body.data!.repo!.root, repo);
 
   const after = await getJson(`${h.baseUrl}/api/repos`);
   const registered = after.body.data!.repos!.find((r) => r.root === repo);

@@ -20,7 +20,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0004 | [Bring your own agent](./0004-bring-your-own-agent.md)                                      | Accepted                        |
 | 0005 | [Plan-as-document, not plan-as-chat](./0005-plan-as-document.md)                            | Accepted                        |
 | 0006 | [Subprocess agents](./0006-subprocess-agents.md)                                            | Accepted                        |
-| 0007 | [Git worktree per task](./0007-worktrees-per-task.md)                                       | Accepted                        |
+| 0007 | [Git worktree per task](./0007-worktrees-per-task.md)                                       | Accepted (clarified by 0024)    |
 | 0008 | [Critics are agents](./0008-critics-are-agents.md)                                          | Accepted                        |
 | 0009 | [Workspace crate structure (Track B); mirror module names (Track A)](./0009-workspace-crate-structure.md) | Accepted (clarified by 0021) |
 | 0010 | [Permissive licenses only](./0010-permissive-licenses-only.md)                              | Accepted                        |
@@ -37,6 +37,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0021 | [Two-track build path: TS prototype → Rust product](./0021-two-track-build-path.md)         | Accepted                        |
 | 0022 | [Skill + CLI as the agent↔orchestrator contract (no MCP)](./0022-skill-cli-as-agent-contract.md) | Accepted                        |
 | 0023 | [SQLite cutover for Track A (Forge)](./0023-sqlite-cutover-track-a.md)                       | Accepted                        |
+| 0024 | [Worktrees are disposable: lifecycle UI + lazy rehydration](./0024-worktrees-disposable-lifecycle.md) | Accepted               |
 
 ## Foundational ADRs
 
@@ -55,7 +56,7 @@ Forward-looking decisions to capture as ADRs when they're made. Pulled from the 
 - Track A UI shell: web dashboard vs. Tauri wrapper (Phase A0)
 - GPUI version pinning strategy (after Phase B0)
 - Plan document representation: markdown vs. AST (early Phase A1)
-- Worktree root location (Phase A2)
+- Worktree root location (Phase A2) — still open; [`0024`](./0024-worktrees-disposable-lifecycle.md) keeps the `<parent>/worktrees/` status quo without deciding it
 - ~~Agent stdio protocol: per-adapter vs. unified JSON-lines (Phase A2)~~ — resolved by [`0022`](./0022-skill-cli-as-agent-contract.md) (skill + CLI; no stdio protocol)
 - Synthesis approach: agent-based vs. rule-based (Phase A1)
 - Disagreement adjudication UX: inline vs. modal vs. separate workspace (Phase A1)

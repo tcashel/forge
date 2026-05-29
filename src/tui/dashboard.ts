@@ -78,6 +78,8 @@ function statusLabel(theme: Theme, status: PlanStatus, tmuxSession: string | nul
     done: ["success", "done"],
     failed: ["error", "failed"],
     quality_failed: ["warning", "quality ✗"],
+    fixing: ["warning", "fixing ⟳"],
+    archived: ["dim", "archived"],
   };
   const [color, label] = map[status] ?? ["dim", status];
   return theme.fg(color, label);
@@ -153,7 +155,7 @@ export class ForgeDashboard {
   onClose: () => void = () => {};
 
   constructor(
-    readonly _theme: Theme,
+    readonly theme: Theme,
     private readonly tui: Tui,
     private readonly store: ForgeStore,
     private readonly repo: RepoProfile,

@@ -2,10 +2,11 @@
 
 A control plane for one-shot agentic coding runs. You hand it a spec; it spins up `claude` or `codex` in a fresh git worktree under tmux, runs your quality gates, opens a draft PR, and sends a different model in to review the diff.
 
-Two artifacts ship from this repo:
+Three artifacts ship from this repo:
 
 - **`forge` CLI** — a `bun`-runtime binary you run from any shell.
 - **Claude Code plugin** (`cc-plugin/`) — slash commands and skills that drive the CLI from inside Claude Code.
+- **opencode plugin** (`opencode-plugin/`) — slash commands and skills that drive the CLI from inside opencode.
 
 ## Prerequisites
 
@@ -34,6 +35,19 @@ bun install -g <git-url>
 ### Claude Code plugin
 
 Symlink `cc-plugin/` into wherever your Claude Code install loads plugins from (typically `~/.claude/plugins/forge/` — exact path depends on your Claude Code version). The plugin assumes `forge` is on `PATH`.
+
+### opencode plugin
+
+Add the repo plugin path to `~/.config/opencode/opencode.jsonc` and restart opencode:
+
+```jsonc
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["<forge-repo>/opencode-plugin/plugin.ts"]
+}
+```
+
+The plugin assumes `forge` is on `PATH`.
 
 ## Quickstart
 
@@ -135,6 +149,10 @@ forge/
 │   ├── .claude-plugin/plugin.json
 │   ├── commands/             # 7 slash commands
 │   ├── skills -> ../skills   # symlink so the plugin loader sees the same skills
+│   └── README.md
+├── opencode-plugin/          # opencode plugin (in tree)
+│   ├── plugin.ts             # registers commands + skills via config hook
+│   ├── commands/             # 7 slash commands
 │   └── README.md
 └── tests/                    # bun test
 ```
