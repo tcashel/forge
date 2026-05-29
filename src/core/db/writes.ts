@@ -36,7 +36,15 @@ export interface SessionMetrics {
   scopeKind?: "draft" | "spec";
 }
 
-export type SessionPurpose = "drafting" | "critique" | "synthesis" | "execution" | "review" | "fix" | "improvement";
+export type SessionPurpose =
+  | "drafting"
+  | "critique"
+  | "synthesis"
+  | "execution"
+  | "review"
+  | "fix"
+  | "comment-fix"
+  | "improvement";
 
 export type SessionState = "running" | "completed" | "failed" | "killed";
 

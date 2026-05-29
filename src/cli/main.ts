@@ -8,6 +8,7 @@
 
 import { ForgeStore } from "../core/store.ts";
 import * as attach from "./cmd/attach.ts";
+import { runCommentFixWorker } from "./cmd/comment-fix-actions.ts";
 import * as config from "./cmd/config.ts";
 import * as critique from "./cmd/critique.ts";
 import * as dash from "./cmd/dash.ts";
@@ -178,6 +179,10 @@ export async function run(argv: string[]): Promise<void> {
         // Internal worker spawned by runAdHocReview. Not a public CLI verb;
         // double-underscore prefix discourages accidental invocation.
         await runReviewWorker(rest, store);
+        return;
+      case "__comment-fix-worker":
+        // Internal worker spawned by runCommentFix.
+        await runCommentFixWorker(rest, store);
         return;
       case "__extract-review":
         // Internal helper the tmux launch runner calls to extract the

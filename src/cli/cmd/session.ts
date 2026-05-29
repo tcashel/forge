@@ -30,7 +30,7 @@ runner keeps going even if SQLite is wedged.
          [--stream-json-path <file>] [--reason <text>]
 `;
 
-const VALID_PURPOSES: SessionPurpose[] = ["execution", "review", "fix"];
+const VALID_PURPOSES: SessionPurpose[] = ["execution", "review", "fix", "comment-fix"];
 
 function logErr(msg: string): void {
   // Send to stderr but always exit 0. The bash runner pipes stderr into

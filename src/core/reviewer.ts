@@ -302,6 +302,77 @@ export function parseForgeReviewFindings(block: string): ForgeFinding[] {
   return out;
 }
 
+// ─── Comment-fix validation block parser ─────────────────────────────────────
+
+export type CommentValidationVerdict = "valid" | "disputed";
+
+export interface CommentValidationEntry {
+  commentId: number;
+  verdict: CommentValidationVerdict;
+  reason: string;
+}
+
+/**
+ * Extract the first ```forge-comment-validation fenced block from raw agent
+ * output and parse it as JSONL. Each well-formed line yields one entry:
+ *
+ *   {"commentId": 12345, "verdict": "valid", "reason": "..."}
+ *
+ * Malformed lines, duplicate commentIds (first occurrence wins), and
+ * entries with non-positive ids or empty reasons are skipped. The caller
+ * is responsible for cross-checking commentIds against the requested set
+ * and for filling in any omitted requests as `disputed`.
+ *
+ * Returns [] when no block exists or the block is empty.
+ */
+export function parseCommentValidation(rawMd: string): CommentValidationEntry[] {
+  if (!rawMd) return [];
+  const lines = rawMd.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length) {
+    if (!/^\s{0,3}```forge-comment-validation\s*$/.test(lines[i])) {
+      i++;
+      continue;
+    }
+    i++;
+    const entries: CommentValidationEntry[] = [];
+    const seen = new Set<number>();
+    while (i < lines.length) {
+      const line = lines[i];
+      if (/^\s{0,3}```\s*$/.test(line)) {
+        return entries;
+      }
+      const trimmed = line.trim();
+      if (trimmed.length > 0) {
+        try {
+          const parsed = JSON.parse(trimmed) as Record<string, unknown>;
+          const idRaw = parsed.commentId;
+          const commentId = typeof idRaw === "number" ? idRaw : Number.parseInt(String(idRaw), 10);
+          const verdict = parsed.verdict;
+          const reason = parsed.reason;
+          if (
+            Number.isFinite(commentId) &&
+            commentId > 0 &&
+            !seen.has(commentId) &&
+            (verdict === "valid" || verdict === "disputed") &&
+            typeof reason === "string" &&
+            reason.trim().length > 0
+          ) {
+            entries.push({ commentId, verdict, reason: reason.trim() });
+            seen.add(commentId);
+          }
+        } catch {
+          /* malformed JSON line — skipped silently */
+        }
+      }
+      i++;
+    }
+    // Block never closed; return what we got.
+    return entries;
+  }
+  return [];
+}
+
 function parseFindingBody(body: string, severity: ForgeFindingSeverity, title: string): ForgeFinding | null {
   // Find the labelled lines in order so we can slice between them.
   const labels = [

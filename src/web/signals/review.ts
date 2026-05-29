@@ -22,6 +22,10 @@ export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
 // running for the active PR. The ReviewSessionDrawer subscribes to it.
 export const activeReviewSession = signal<{ sessionId: string; prNum: number } | null>(null);
 
+// Active comment-fix session — analogous to activeReviewSession but for
+// the validate-then-fix worker spawned by `Fix N selected`.
+export const activeCommentFixSession = signal<{ sessionId: string; prNum: number } | null>(null);
+
 export function toggleCommentSelection(commentId: string | number): void {
   const next = new Set(selectedComments.value);
   const key = String(commentId);
@@ -30,12 +34,19 @@ export function toggleCommentSelection(commentId: string | number): void {
   selectedComments.value = next;
 }
 
+export function setCommentStatuses(ids: Array<string | number>, status: CommentStatus): void {
+  const next = new Map(commentStatuses.value);
+  for (const id of ids) next.set(String(id), status);
+  commentStatuses.value = next;
+}
+
 export function clearReviewState(): void {
   reviewBundle.value = null;
   reviewError.value = null;
   selectedComments.value = new Set();
   commentStatuses.value = new Map();
   activeReviewSession.value = null;
+  activeCommentFixSession.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {
@@ -61,4 +72,20 @@ export interface RunReviewResponse {
 
 export async function startAdHocReview(prNumber: number, repoRoot: string): Promise<RunReviewResponse> {
   return apiPost<RunReviewResponse>(`/api/prs/${prNumber}/run-review`, { repo: repoRoot });
+}
+
+export interface RunCommentFixResponse {
+  sessionId: string;
+  logStreamUrl: string;
+}
+
+export async function startCommentFix(
+  prNumber: number,
+  repoRoot: string,
+  commentIds: number[],
+): Promise<RunCommentFixResponse> {
+  return apiPost<RunCommentFixResponse>(`/api/prs/${prNumber}/fix-comments`, {
+    repo: repoRoot,
+    commentIds,
+  });
 }
