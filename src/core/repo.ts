@@ -259,6 +259,29 @@ export interface CreateWorktreeOptions {
   onProgress?: (msg: string) => void;
   /** Skip bootstrap (deps install). Use when the launch is in a hurry. */
   skipBootstrap?: boolean;
+  /**
+   * Branch intent.
+   * - "create-branch" (default): `git worktree add -b <branch> <path>` — fresh branch off HEAD.
+   * - "checkout-existing": `git worktree add <path> <branch>` — assumes the branch already exists.
+   */
+  mode?: "create-branch" | "checkout-existing";
+}
+
+/**
+ * Returns true when the worktree appears to already have its deps installed —
+ * a marker file (e.g. node_modules/, .venv/) is present. Used by the
+ * rehydration path so a second fix doesn't re-run install.
+ */
+function isBootstrapped(worktreePath: string, stack: Stack): boolean {
+  switch (stack) {
+    case "js-ts":
+    case "nuxt":
+      return fs.existsSync(path.join(worktreePath, "node_modules"));
+    case "python":
+      return fs.existsSync(path.join(worktreePath, ".venv"));
+    default:
+      return true;
+  }
 }
 
 export async function createWorktree(
@@ -268,12 +291,15 @@ export async function createWorktree(
   stack: Stack,
   options: CreateWorktreeOptions = {},
 ): Promise<{ worktreePath: string; error: string | null }> {
-  const { onProgress, skipBootstrap } = options;
+  const { onProgress, skipBootstrap, mode = "create-branch" } = options;
   const progress = (msg: string) => onProgress?.(msg);
   const sanitized = branch.replace(/[/\\]/g, "-");
   const worktreePath = path.join(path.dirname(root), "worktrees", sanitized);
 
-  if (worktreeScript) {
+  // The custom worktree.sh script only knows the "create" verb (creates a
+  // brand-new branch). For checkout-existing we fall back to plain git;
+  // repos with worktree.sh + checkout-existing get the plain-git path.
+  if (worktreeScript && mode === "create-branch") {
     progress(`Running worktree.sh create ${branch}…`);
     const res = await spawnAsync("bash", [worktreeScript, "create", branch], {
       cwd: root,
@@ -284,9 +310,13 @@ export async function createWorktree(
     return { worktreePath, error: null };
   }
 
-  // Plain git worktree add
+  // Plain git worktree add — pick form based on mode.
+  const addArgs =
+    mode === "checkout-existing"
+      ? ["worktree", "add", worktreePath, branch]
+      : ["worktree", "add", "-b", branch, worktreePath];
   progress(`git worktree add ${branch}…`);
-  const wt = await spawnAsync("git", ["worktree", "add", "-b", branch, worktreePath], {
+  const wt = await spawnAsync("git", addArgs, {
     cwd: root,
     timeoutMs: 60_000,
     onLine: (line) => progress(line.slice(0, 120)),
@@ -294,6 +324,9 @@ export async function createWorktree(
   if (!wt.ok) return { worktreePath, error: `git worktree add failed: ${wt.error}` };
 
   if (skipBootstrap) return { worktreePath, error: null };
+  if (mode === "checkout-existing" && isBootstrapped(worktreePath, stack)) {
+    return { worktreePath, error: null };
+  }
 
   // Bootstrap based on stack
   const bootstrap: Record<Stack, [string, string[]] | null> = {
