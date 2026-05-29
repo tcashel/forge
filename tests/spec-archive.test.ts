@@ -73,7 +73,7 @@ function writeCritique(store: ForgeStore, planId: string, status: CritiqueMeta["
     viewedAt: null,
     tmuxSession: `forge-${critiqueId}`,
     criticA: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
-    criticB: { agent: "codex", model: "gpt-5-codex", status: "pending", durationMs: null },
+    criticB: { agent: "codex", model: "gpt-5.5", status: "pending", durationMs: null },
     synthesizer: { agent: "claude", model: "claude-opus-4-7", status: "pending", durationMs: null },
   });
   return critiqueId;

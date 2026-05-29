@@ -41,9 +41,9 @@ Common keys:
 
 Examples:
   forge config set defaultAgent codex
-  forge config set defaultModel gpt-5-codex
+  forge config set defaultModel gpt-5.5
   forge config set reviewerAgent claude
-  forge config set reviewerModel claude-opus-4-7
+  forge config set reviewerModel claude-opus-4-8
 `;
 
 const STRING_KEYS = [

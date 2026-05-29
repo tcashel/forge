@@ -147,8 +147,8 @@ interface CritiqueResolution {
   improver: CritiqueAgent;
 }
 
-const DEFAULT_AGENT: { agent: LaunchTarget; model: string } = { agent: "claude", model: "claude-opus-4-7" };
-const DEFAULT_CRITIC_B: { agent: LaunchTarget; model: string } = { agent: "codex", model: "gpt-5-codex" };
+const DEFAULT_AGENT: { agent: LaunchTarget; model: string } = { agent: "claude", model: "claude-opus-4-8" };
+const DEFAULT_CRITIC_B: { agent: LaunchTarget; model: string } = { agent: "codex", model: "gpt-5.5" };
 
 function resolveCriticAgents(repoConfig: RepoConfig): CritiqueResolution {
   const fallback = (
