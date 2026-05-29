@@ -2137,10 +2137,6 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
 
 // ─── server boot ─────────────────────────────────────────────────────────────
 
-declare const Bun: {
-  serve: (opts: unknown) => { port: number; hostname: string; stop: (closeActive?: boolean) => void };
-};
-
 export interface ServeOptions {
   port?: number;
   host?: string;

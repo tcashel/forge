@@ -1,9 +1,9 @@
 # ADR 0007 — Git worktree per task
 
-**Status:** Accepted
+**Status:** Accepted (clarified by [`0024-worktrees-disposable-lifecycle`](./0024-worktrees-disposable-lifecycle.md))
 **Deciders:** Tripp
 **Date:** 2026-05-10
-**Related:** [`0006-subprocess-agents`](./0006-subprocess-agents.md), [`../ARCHITECTURE.md`](../ARCHITECTURE.md), [`../ROADMAP.md`](../ROADMAP.md)
+**Related:** [`0006-subprocess-agents`](./0006-subprocess-agents.md), [`0024-worktrees-disposable-lifecycle`](./0024-worktrees-disposable-lifecycle.md), [`../ARCHITECTURE.md`](../ARCHITECTURE.md), [`../ROADMAP.md`](../ROADMAP.md)
 
 ## Context
 

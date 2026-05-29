@@ -93,6 +93,7 @@ You draft a real spec in the plan workspace, run multi-critic synthesis on it, a
   - Manual edit/reorder before dispatch
 - **Headless execution**
   - Worktree-per-task management
+    - Worktree lifecycle: inventory, safe-to-delete status, remove, bulk "clean merged", "test locally" (checkout branch into main), and lazy rehydration on fix (see [ADR-0024](adr/0024-worktrees-disposable-lifecycle.md))
   - Claude Code subprocess orchestration
   - Hook-policy assumption: Forge does not prompt for tool permissions; agent's hook config governs
   - Subprocess supervisor: spawn, monitor, capture artifact, handle exit

@@ -15,6 +15,7 @@ const FILTER_SECTIONS: Record<SidebarFilter, Set<WorkbenchSection> | "all"> = {
   backlog: new Set<WorkbenchSection>(["ready", "drafting", "attention"]),
   done: new Set<WorkbenchSection>(["done"]),
   prs: "all", // unreachable here — prs flips viewMode, not just the filter
+  activity: "all", // unreachable here — activity flips viewMode, not just the filter
 };
 
 function shouldRender(section: WorkbenchSection, filter: SidebarFilter): boolean {

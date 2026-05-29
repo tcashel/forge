@@ -10,7 +10,7 @@
  */
 
 import { parseArgs } from "node:util";
-import { backfillFromJson } from "../../core/db/backfill.ts";
+import { type BackfillCounts, backfillFromJson } from "../../core/db/backfill.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
@@ -54,7 +54,7 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
   emitOk({ ok: true, counts }, flags.json, () => formatHuman(counts));
 }
 
-function formatHuman(counts: Record<string, number>): string {
+function formatHuman(counts: BackfillCounts): string {
   const lines = ["forge migrate from-json — done", ""];
   for (const [k, v] of Object.entries(counts)) {
     lines.push(`  ${k.padEnd(18)} ${v}`);
