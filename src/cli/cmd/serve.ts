@@ -53,6 +53,16 @@ import type {
   ReasoningEffort,
   RepoConfig,
 } from "../../core/store.ts";
+import {
+  listWorktrees,
+  parkWorktreeForTest,
+  removeWorktreeUnsafe,
+  resolveWorktreeTarget,
+  restoreFromTestState,
+  summarizeWorktreeForPr,
+  TestLocallyError,
+  type WorktreeEntry,
+} from "../../core/worktrees.ts";
 import { CliError } from "../output.ts";
 import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
@@ -1021,7 +1031,24 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     const target = resolvePrRepo(repos, repoName);
     if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
     const result = await ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
-    return jsonOk({ prs: result.prs, me: result.me, repo: target.name, repoRoot: target.root });
+    // Attach a cheap worktree snapshot per PR (path + safety only — no
+    // gh state lookup or git fetch). The dedicated /api/worktrees view
+    // does the full enrichment.
+    const enriched = result.prs.map((pr) => ({
+      ...pr,
+      worktree: summarizeWorktreeForPr(store, target.root, pr.number),
+    }));
+    return jsonOk({ prs: enriched, me: result.me, repo: target.name, repoRoot: target.root });
+  }
+
+  // GET /api/worktrees?repo=<name>
+  if (pathname === "/api/worktrees") {
+    const repoName = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoName);
+    if (!target) return jsonOk({ worktrees: [], repo: null, repoRoot: null });
+    const worktrees = listWorktrees(target.root, store);
+    return jsonOk({ worktrees, repo: target.name, repoRoot: target.root });
   }
 
   // GET /api/prs/:num/review-bundle?repo=<root>
@@ -1148,6 +1175,96 @@ function derivePrLinkage(store: ForgeStore, repoRoot: string, prNumber: number):
       worktreePath: null,
       warnings: [{ source: "linkage", message: (e as Error).message }],
     };
+  }
+}
+
+// ─── Worktree route helpers ─────────────────────────────────────────────────
+
+function pickEntryFromBody(
+  entries: WorktreeEntry[],
+  body: Record<string, unknown>,
+): { ok: true; entry: WorktreeEntry } | { ok: false; error: Response } {
+  const targetVal = optString(body, "target");
+  const prVal = optString(body, "pr") ?? (typeof body.pr === "number" ? String(body.pr) : undefined);
+  const branchVal = optString(body, "branch");
+  const pathVal = optString(body, "path");
+  const explicit = (prVal ? 1 : 0) + (branchVal ? 1 : 0) + (pathVal ? 1 : 0);
+  if (explicit > 1) {
+    return { ok: false, error: jsonErr(400, "AMBIGUOUS_TARGET", "Pass only one of `pr`, `branch`, `path`.") };
+  }
+  if (pathVal) {
+    const want = path.resolve(pathVal);
+    const hit = entries.find((e) => path.resolve(e.path) === want);
+    if (!hit)
+      return { ok: false, error: jsonErr(404, "WORKTREE_NOT_FOUND", `No Forge worktree at path "${pathVal}".`) };
+    return { ok: true, entry: hit };
+  }
+  if (prVal) {
+    const num = Number.parseInt(prVal, 10);
+    if (!Number.isFinite(num) || num <= 0) {
+      return { ok: false, error: jsonErr(400, "BAD_PR", `\`pr\` must be a positive integer (got "${prVal}").`) };
+    }
+    const hit = entries.filter((e) => e.prNumber === num);
+    if (hit.length === 0) {
+      return { ok: false, error: jsonErr(404, "WORKTREE_NOT_FOUND", `No Forge worktree linked to PR #${num}.`) };
+    }
+    if (hit.length > 1) {
+      return { ok: false, error: jsonErr(409, "AMBIGUOUS_TARGET", `Multiple worktrees linked to PR #${num}.`) };
+    }
+    return { ok: true, entry: hit[0] };
+  }
+  if (branchVal) {
+    const hit = entries.filter((e) => e.branch === branchVal);
+    if (hit.length === 0) {
+      return {
+        ok: false,
+        error: jsonErr(404, "WORKTREE_NOT_FOUND", `No Forge worktree on branch "${branchVal}".`),
+      };
+    }
+    if (hit.length > 1) {
+      return { ok: false, error: jsonErr(409, "AMBIGUOUS_TARGET", `Multiple worktrees on branch "${branchVal}".`) };
+    }
+    return { ok: true, entry: hit[0] };
+  }
+  if (!targetVal) {
+    return { ok: false, error: jsonErr(400, "MISSING_TARGET", "Provide `target`, `pr`, `branch`, or `path`.") };
+  }
+  const resolved = resolveWorktreeTarget(entries, targetVal);
+  if (resolved.kind === "ok") return { ok: true, entry: resolved.entry };
+  const status = resolved.kind === "ambiguous" ? 409 : 404;
+  const code = resolved.kind === "ambiguous" ? "AMBIGUOUS_TARGET" : "WORKTREE_NOT_FOUND";
+  return { ok: false, error: jsonErr(status, code, resolved.reason) };
+}
+
+function cleanSkipReason(e: WorktreeEntry): string {
+  switch (e.safety) {
+    case "in-use":
+      return "in-use";
+    case "unsafe":
+      return `unsafe (${e.reason})`;
+    case "unmanaged":
+      return "unmanaged";
+    case "unknown":
+      return "unknown PR state";
+    case "removable":
+      return "still open / unmerged";
+    default:
+      return e.safety;
+  }
+}
+
+function httpStatusForTestError(code: string): number {
+  switch (code) {
+    case "TEST_STATE_EXISTS":
+    case "MAIN_DIRTY":
+    case "WORKTREE_DETACHED":
+    case "WORKTREE_IN_USE":
+    case "WORKTREE_UNSAFE":
+      return 409;
+    case "BAD_STATE_FILE":
+      return 500;
+    default:
+      return 500;
   }
 }
 
@@ -1559,6 +1676,10 @@ const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
 const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
+const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
+const WORKTREES_CLEAN_MERGED_PATH = "/api/worktrees/clean-merged";
+const WORKTREES_TEST_PATH = "/api/worktrees/test-locally";
+const WORKTREES_RESTORE_PATH = "/api/worktrees/restore";
 
 function allowsPost(pathname: string): boolean {
   if (pathname === "/api/specs") return true;
@@ -1575,6 +1696,13 @@ function allowsPost(pathname: string): boolean {
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
+  if (
+    pathname === WORKTREES_REMOVE_PATH ||
+    pathname === WORKTREES_CLEAN_MERGED_PATH ||
+    pathname === WORKTREES_TEST_PATH ||
+    pathname === WORKTREES_RESTORE_PATH
+  )
+    return true;
   return ACTION_TASK_PATH.test(pathname);
 }
 
@@ -1984,6 +2112,96 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         return fromCliError(e);
       }
       throw e;
+    }
+  }
+
+  // POST /api/worktrees/remove — body { repo, target?, pr?, branch?, path?, force? }
+  if (pathname === WORKTREES_REMOVE_PATH) {
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const force = body.force === true;
+    const entries = listWorktrees(target.root, store);
+    const entry = pickEntryFromBody(entries, body);
+    if (!entry.ok) return entry.error;
+    if (entry.entry.safety === "in-use") {
+      return jsonErr(409, "WORKTREE_IN_USE", `Worktree ${entry.entry.path} is in use by a running session.`);
+    }
+    if (entry.entry.safety === "unsafe" && !force) {
+      return jsonErr(409, "WORKTREE_UNSAFE", `Worktree ${entry.entry.path} is unsafe to remove: ${entry.entry.reason}`);
+    }
+    if (entry.entry.safety === "unmanaged") {
+      return jsonErr(422, "WORKTREE_UNMANAGED", `Worktree ${entry.entry.path} is not Forge-managed.`);
+    }
+    const res = removeWorktreeUnsafe(target.root, entry.entry.path, { force, store });
+    if (!res.ok) {
+      return jsonErr(500, "WORKTREE_REMOVE_FAILED", `git worktree remove failed: ${res.error ?? "(unknown)"}`);
+    }
+    return jsonOk({ removed: entry.entry });
+  }
+
+  // POST /api/worktrees/clean-merged — body { repo, dryRun? }
+  if (pathname === WORKTREES_CLEAN_MERGED_PATH) {
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const dryRun = body.dryRun === true;
+    const entries = listWorktrees(target.root, store);
+    const safe = entries.filter((e) => e.safety === "safe");
+    const skipped = entries
+      .filter((e) => e.safety !== "safe")
+      .map((entry) => ({ entry, reason: cleanSkipReason(entry) }));
+    if (dryRun) {
+      return jsonOk({ removed: safe, skipped, dryRun: true });
+    }
+    const removed: WorktreeEntry[] = [];
+    const failed: Array<{ entry: WorktreeEntry; reason: string }> = [];
+    for (const entry of safe) {
+      const res = removeWorktreeUnsafe(target.root, entry.path, { force: false, store });
+      if (res.ok) removed.push(entry);
+      else failed.push({ entry, reason: res.error ?? "(unknown error)" });
+    }
+    return jsonOk({ removed, skipped, failed, dryRun: false });
+  }
+
+  // POST /api/worktrees/test-locally — body { repo, target?, pr?, branch?, path? }
+  if (pathname === WORKTREES_TEST_PATH) {
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const entries = listWorktrees(target.root, store);
+    const picked = pickEntryFromBody(entries, body);
+    if (!picked.ok) return picked.error;
+    try {
+      const result = parkWorktreeForTest(store, target.root, picked.entry);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof TestLocallyError) return jsonErr(httpStatusForTestError(e.code), e.code, e.message, e.hint);
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonErr(500, "TEST_LOCALLY_FAILED", msg);
+    }
+  }
+
+  // POST /api/worktrees/restore — body { repo }
+  if (pathname === WORKTREES_RESTORE_PATH) {
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    try {
+      const result = restoreFromTestState(store, target.root);
+      return jsonOk(result);
+    } catch (e) {
+      if (e instanceof TestLocallyError) return jsonErr(httpStatusForTestError(e.code), e.code, e.message, e.hint);
+      const msg = e instanceof Error ? e.message : String(e);
+      return jsonErr(500, "RESTORE_FAILED", msg);
     }
   }
 

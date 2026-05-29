@@ -3,7 +3,7 @@ import { enterReviewMode } from "../../lib/modes";
 import { currentPr, prFilterMine, prMe, prsError, prsLoading, prsRepoName, prsRepoRoot } from "../../signals/prs";
 import { repos } from "../../signals/repos";
 import { selectedRepo } from "../../signals/ui";
-import type { PrView, RepoView } from "../../types";
+import type { PrView, RepoView, WorktreeChipInfo } from "../../types";
 import { ciClass, ciLabel, reviewClass, reviewLabel, timeAgo } from "./pr-format";
 
 function selectedRepoName(repoList: RepoView[], sel: string): string {
@@ -46,6 +46,29 @@ interface PrBodyProps {
   pr: PrView;
 }
 
+function worktreeChipLabel(wt: WorktreeChipInfo | null): string {
+  if (!wt) return "No worktree — will rehydrate on fix";
+  switch (wt.safety) {
+    case "in-use":
+      return "Worktree: session running";
+    case "unsafe":
+      return "Worktree: has local changes";
+    case "safe":
+      return "Worktree: safe to delete";
+    case "removable":
+      return "Worktree: removable";
+    case "unmanaged":
+      return "Worktree: unmanaged (manual checkout)";
+    default:
+      return "Worktree: status unknown";
+  }
+}
+
+function worktreeChipClass(wt: WorktreeChipInfo | null): string {
+  if (!wt) return "pr-tag wt-chip wt-chip-absent";
+  return `pr-tag wt-chip wt-chip-${wt.safety}`;
+}
+
 function PrBody({ pr }: PrBodyProps) {
   const label = repoLabel(repos.value, selectedRepo.value, prsRepoName.value);
   const repoRoot = prsRepoRoot.value;
@@ -73,6 +96,9 @@ function PrBody({ pr }: PrBodyProps) {
           {pr.isMine ? <span class="pr-tag mine">mine</span> : null}
           <span class={`pr-status ${ciClass(pr.statusCheckRollup)}`}>{ciLabel(pr.statusCheckRollup)}</span>
           <span class={`pr-status ${reviewClass(pr.reviewDecision)}`}>{reviewLabel(pr.reviewDecision)}</span>
+          <span class={worktreeChipClass(pr.worktree)} title={pr.worktree?.path ?? ""}>
+            {worktreeChipLabel(pr.worktree)}
+          </span>
         </div>
         <h1>{pr.title}</h1>
         <div class="meta">

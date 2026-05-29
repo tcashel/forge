@@ -1937,3 +1937,67 @@ body.filtered-single .repo-chip{ display: none; }
   letter-spacing: 0.04em;
 }
 
+
+/* ─── Worktrees view ────────────────────────────────────────────────── */
+.worktrees-full-pane { padding: 18px 24px 60px; }
+.wt-panel { display: flex; flex-direction: column; gap: 14px; }
+.wt-panel-head {
+  display: flex; align-items: center; justify-content: space-between; gap: 12px;
+  padding: 0 4px 12px;
+  border-bottom: 1px solid var(--rule);
+}
+.wt-panel-head h2 { margin: 0; font-size: 15px; color: var(--text); font-weight: 700; }
+.wt-panel-head p { margin: 2px 0 0; font-size: 12px; color: var(--dim); font-family: 'JetBrains Mono', monospace; }
+.wt-panel-actions { display: flex; gap: 8px; align-items: center; }
+.wt-rows { display: flex; flex-direction: column; gap: 8px; }
+.wt-row {
+  display: flex; flex-direction: column; gap: 6px;
+  padding: 12px 14px;
+  border: 1px solid var(--rule);
+  border-radius: 8px;
+  background: var(--panel);
+}
+.wt-row-head { display: flex; align-items: center; gap: 10px; }
+.wt-path {
+  font-family: 'JetBrains Mono', monospace; font-size: 12px; color: var(--text);
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; flex: 1;
+}
+.wt-row-meta {
+  display: flex; gap: 14px; flex-wrap: wrap;
+  font-size: 12px; color: var(--dim); font-family: 'JetBrains Mono', monospace;
+}
+.wt-row-meta b { color: var(--text-2); font-weight: 600; }
+.wt-row-meta em { font-style: normal; color: var(--text-2); }
+.wt-flag {
+  display: inline-flex; padding: 1px 6px; border-radius: 3px;
+  background: var(--running-soft); color: var(--running);
+  font-size: 10px; font-weight: 700; text-transform: uppercase;
+}
+.wt-row-reason { font-size: 12px; color: var(--dim); }
+.wt-row-actions { display: flex; gap: 8px; }
+.wt-empty {
+  margin: 14px 4px; padding: 28px 18px;
+  border: 1px dashed var(--rule-2); border-radius: 8px;
+  color: var(--dim); text-align: center; font-size: 13px;
+}
+.wt-empty.error { color: var(--failed); border-color: var(--failed-border-soft); }
+.wt-badge {
+  display: inline-flex; padding: 2px 8px; border-radius: 4px;
+  font-family: 'JetBrains Mono', monospace; font-size: 10.5px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.04em;
+}
+.wt-badge-safe { background: var(--done-soft); color: var(--done); }
+.wt-badge-removable { background: var(--ready-soft, var(--panel-2)); color: var(--ready, var(--text-2)); }
+.wt-badge-in-use { background: var(--running-soft); color: var(--running); }
+.wt-badge-unsafe { background: var(--failed-soft); color: var(--failed); }
+.wt-badge-unmanaged { background: var(--panel-3); color: var(--dim); }
+.wt-badge-unknown { background: var(--panel-2); color: var(--dim); }
+
+/* Worktree chip on PrDetail */
+.wt-chip-safe { background: var(--done-soft); color: var(--done); }
+.wt-chip-removable { background: var(--panel-2); color: var(--text-2); }
+.wt-chip-in-use { background: var(--running-soft); color: var(--running); }
+.wt-chip-unsafe { background: var(--failed-soft); color: var(--failed); }
+.wt-chip-unmanaged { background: var(--panel-3); color: var(--dim); }
+.wt-chip-unknown { background: var(--panel-2); color: var(--dim); }
+.wt-chip-absent { background: var(--panel-3); color: var(--dim); }

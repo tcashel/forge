@@ -11,6 +11,7 @@ import { SettingsRepoList } from "./settings/SettingsRepoList";
 import { Topbar } from "./Topbar";
 import { PlanDetail } from "./tasks/PlanDetail";
 import { PlanList } from "./tasks/PlanList";
+import { WorktreeList } from "./worktrees/WorktreeList";
 
 // Phase 5: Preact now owns the pickup/list/detail panes for all three
 // view modes (tasks / prs / settings). The new-spec modal is always
@@ -32,6 +33,7 @@ export function App() {
   const inSettings = mode === "settings";
   const inActivity = mode === "activity";
   const inReview = mode === "pr-review";
+  const inWorktrees = mode === "worktrees";
   const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}${inActivity ? " activity-list-pane" : ""}`;
   const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}${inActivity ? " activity-detail-pane" : ""}`;
   return (
@@ -49,6 +51,10 @@ export function App() {
         ) : inReview ? (
           <main class="review-full-pane" id="detail-pane">
             <ReviewPage />
+          </main>
+        ) : inWorktrees ? (
+          <main class="worktrees-full-pane" id="detail-pane">
+            <WorktreeList />
           </main>
         ) : (
           <>
