@@ -2244,7 +2244,14 @@ export async function startServer(
       format: "esm",
       minify: false,
       sourcemap: "inline",
-      naming: "[name].js",
+      // Code splitting keeps lazy-loaded modules (e.g. Shiki grammars on
+      // the review page) out of the main bundle so the workbench shell
+      // loads fast and only review users pay for the highlighter.
+      splitting: true,
+      naming: {
+        entry: "[name].js",
+        chunk: "chunk-[name]-[hash].js",
+      },
     });
     if (!result.success) {
       console.error("[forge serve] web bundle failed:", result.logs);
