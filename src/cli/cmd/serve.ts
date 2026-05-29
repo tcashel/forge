@@ -54,6 +54,7 @@ import type {
   RepoConfig,
 } from "../../core/store.ts";
 import {
+  isCleanMergedTarget,
   listWorktrees,
   parkWorktreeForTest,
   removeWorktreeUnsafe,
@@ -1237,6 +1238,10 @@ function pickEntryFromBody(
 }
 
 function cleanSkipReason(e: WorktreeEntry): string {
+  // `safe` with a closed (non-merged) PR is bulk-cleanup-skipped on purpose.
+  if (e.safety === "safe" && e.prState === "closed") {
+    return "closed without merge — remove explicitly";
+  }
   switch (e.safety) {
     case "in-use":
       return "in-use";
@@ -2151,9 +2156,9 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
     const dryRun = body.dryRun === true;
     const entries = listWorktrees(target.root, store);
-    const safe = entries.filter((e) => e.safety === "safe");
+    const safe = entries.filter(isCleanMergedTarget);
     const skipped = entries
-      .filter((e) => e.safety !== "safe")
+      .filter((e) => !isCleanMergedTarget(e))
       .map((entry) => ({ entry, reason: cleanSkipReason(entry) }));
     if (dryRun) {
       return jsonOk({ removed: safe, skipped, dryRun: true });
@@ -2179,7 +2184,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const picked = pickEntryFromBody(entries, body);
     if (!picked.ok) return picked.error;
     try {
-      const result = parkWorktreeForTest(store, target.root, picked.entry);
+      const result = parkWorktreeForTest(store, target.root, picked.entry, { force: body.force === true });
       return jsonOk(result);
     } catch (e) {
       if (e instanceof TestLocallyError) return jsonErr(httpStatusForTestError(e.code), e.code, e.message, e.hint);

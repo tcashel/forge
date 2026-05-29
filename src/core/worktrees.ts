@@ -133,6 +133,16 @@ export interface SafetyInputs {
   prState: WorktreePrState;
 }
 
+/**
+ * `clean-merged` only removes entries whose PR was actually merged.
+ * Closed-but-not-merged PRs are individually `safe` but require an
+ * explicit `forge worktree remove` per the spec, so they're skipped by
+ * bulk cleanup. Exported for callers and tests to share one definition.
+ */
+export function isCleanMergedTarget(entry: WorktreeEntry): boolean {
+  return entry.safety === "safe" && entry.prState === "merged";
+}
+
 export function computeSafety(i: SafetyInputs): { safety: WorktreeSafety; reason: string } {
   // 1) unmanaged — outside <parent>/worktrees/ OR has no Forge linkage.
   if (!i.managed) {
@@ -629,6 +639,7 @@ export function parkWorktreeForTest(
   store: ForgeStore,
   repoRoot: string,
   entry: WorktreeEntry,
+  opts: { force?: boolean } = {},
 ): { parked: WorktreeEntry; priorRef: string; repoRoot: string } {
   const statePath = testStateFilePath(store, repoRoot);
   if (fs.existsSync(statePath)) {
@@ -648,10 +659,12 @@ export function parkWorktreeForTest(
   if (!entry.branch) {
     throw new TestLocallyError("WORKTREE_DETACHED", `Worktree ${entry.path} is detached — no branch to test.`);
   }
+  // `--force` only overrides `unsafe`; in-use, dirty main, and existing
+  // test state remain hard refusals.
   if (entry.safety === "in-use") {
     throw new TestLocallyError("WORKTREE_IN_USE", `Worktree ${entry.path} is in use by a running session.`);
   }
-  if (entry.safety === "unsafe") {
+  if (entry.safety === "unsafe" && !opts.force) {
     throw new TestLocallyError("WORKTREE_UNSAFE", `Worktree ${entry.path} is unsafe to park: ${entry.reason}`);
   }
 
@@ -716,22 +729,29 @@ export function restoreFromTestState(
   } catch (e) {
     throw new TestLocallyError("BAD_STATE_FILE", `Could not read ${statePath}: ${(e as Error).message}`);
   }
-  if (fs.existsSync(state.parkedWorktreePath)) {
-    const reattach = spawnSync("git", ["-C", state.parkedWorktreePath, "checkout", state.targetBranch], {
-      stdio: "pipe",
-    });
-    if (reattach.status !== 0) {
-      process.stderr.write(
-        `warn: could not re-attach ${state.parkedWorktreePath} to ${state.targetBranch}: ${reattach.stderr?.toString().trim()}\n`,
-      );
-    }
-  }
+  // Order matters: the main repo is still holding the target branch, so we
+  // can't re-attach the parked worktree to that branch until main releases
+  // it. Checkout priorRef in main first, then reattach the parked worktree.
   const co = spawnSync("git", ["-C", repoRoot, "checkout", state.priorRef], { stdio: "pipe" });
   if (co.status !== 0) {
     throw new TestLocallyError(
       "RESTORE_FAILED",
       `Could not checkout ${state.priorRef} in main: ${co.stderr?.toString().trim()}`,
     );
+  }
+  if (fs.existsSync(state.parkedWorktreePath)) {
+    const reattach = spawnSync("git", ["-C", state.parkedWorktreePath, "checkout", state.targetBranch], {
+      stdio: "pipe",
+    });
+    if (reattach.status !== 0) {
+      // Leave the state file behind so the operator can retry after fixing
+      // whatever blocked the reattach (e.g. another worktree on the branch).
+      throw new TestLocallyError(
+        "RESTORE_FAILED",
+        `Main repo restored to ${state.priorRef}, but could not re-attach ${state.parkedWorktreePath} to ${state.targetBranch}: ${reattach.stderr?.toString().trim()}`,
+        "Resolve the conflict (e.g. delete the colliding worktree) then re-run restore.",
+      );
+    }
   }
   fs.unlinkSync(statePath);
   return { restoredTo: state.priorRef, repoRoot };
