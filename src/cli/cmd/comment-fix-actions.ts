@@ -233,14 +233,10 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     });
   }
 
-  // 4) Resolve worktree (must exist on disk + be a git worktree).
-  const worktreePath = resolveWorktreePathForPr(store, repoRoot, prNum);
-  if (!worktreePath) {
-    throw new CliError("NO_WORKTREE", `PR #${prNum} has no Forge worktree to fix in.`, {
-      hint: "Re-launch this branch via Forge so a worktree exists, then retry.",
-      exitCode: 1,
-    });
-  }
+  // 4) Resolve worktree. Prefer a Forge-launched worktree for this PR; for any
+  //    other PR, provision one on demand by checking out its head branch.
+  const worktreePath =
+    resolveWorktreePathForPr(store, repoRoot, prNum) ?? ensureWorktreeForPr(repoRoot, prNum, headRefName, ghEnv);
   if (!fs.existsSync(worktreePath)) {
     throw new CliError("NO_WORKTREE", `Worktree ${worktreePath} no longer exists on disk.`, { exitCode: 1 });
   }
@@ -758,6 +754,97 @@ function resolveWorktreePathForPr(store: ForgeStore, repoRoot: string, prNumber:
   } catch {
     return null;
   }
+}
+
+/**
+ * Provision a worktree for a PR Forge didn't launch itself. Checks out the
+ * PR's existing head branch (via `gh pr checkout`, which handles forks and
+ * configures push) into a deterministic `worktrees/pr-<num>-<branch>` dir, so
+ * the comment-fix worker's `git push` lands on the PR branch.
+ *
+ * Reuses an existing provisioned worktree when one is already present and
+ * valid; rebuilds it if the directory is stale/corrupt. Synchronous to match
+ * the rest of runCommentFix's request-thread flow.
+ */
+function ensureWorktreeForPr(
+  repoRoot: string,
+  prNum: number,
+  headRefName: string | null,
+  ghEnv: Record<string, string>,
+): string {
+  const sanitized = (headRefName || `pr-${prNum}`).replace(/[/\\]/g, "-");
+  const worktreePath = path.join(path.dirname(repoRoot), "worktrees", `pr-${prNum}-${sanitized}`);
+
+  const isValidWorktree = (p: string): boolean => {
+    try {
+      const root = execFileSync("git", ["-C", p, "rev-parse", "--show-toplevel"], {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+      return root.length > 0;
+    } catch {
+      return false;
+    }
+  };
+
+  // Reuse a still-valid worktree; runCommentFix's branch/clean checks gate it.
+  if (fs.existsSync(worktreePath) && isValidWorktree(worktreePath)) {
+    return worktreePath;
+  }
+
+  // Stale leftover (dir present but not a worktree): tear it down so the add
+  // below starts clean. `git worktree remove` clears git's bookkeeping.
+  if (fs.existsSync(worktreePath)) {
+    try {
+      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      /* best effort */
+    }
+    try {
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    } catch {
+      /* best effort */
+    }
+  }
+
+  // Detached add (no branch collision), then `gh pr checkout` to land the PR
+  // head branch with push configured.
+  try {
+    execFileSync("git", ["-C", repoRoot, "worktree", "add", "--detach", worktreePath, "HEAD"], {
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new CliError("WORKTREE_PROVISION", `Could not create a worktree for PR #${prNum}: ${msg}`, {
+      hint: "Check that the repo has a clean main checkout and disk space, then retry.",
+      exitCode: 1,
+    });
+  }
+  try {
+    execFileSync("gh", ["pr", "checkout", String(prNum)], {
+      cwd: worktreePath,
+      env: ghEnv,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const err = e as { stderr?: string; message?: string };
+    const detail = (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "gh pr checkout failed";
+    // Roll back the half-provisioned worktree so a retry starts clean.
+    try {
+      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
+        stdio: ["pipe", "pipe", "pipe"],
+      });
+    } catch {
+      /* best effort */
+    }
+    throw new CliError("WORKTREE_PROVISION", `Could not check out PR #${prNum} into a worktree: ${detail}`, {
+      hint: "Verify gh is authenticated for this repo's host and the PR branch is fetchable.",
+      exitCode: 1,
+    });
+  }
+  return worktreePath;
 }
 
 function readMetaSafe(metaPath: string): Record<string, unknown> | null {

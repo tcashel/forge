@@ -1975,6 +1975,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
         if (e.code === "FIX_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
         if (e.code === "NO_WORKTREE") return jsonErr(422, e.code, e.message, e.hint);
+        if (e.code === "WORKTREE_PROVISION") return jsonErr(502, e.code, e.message, e.hint);
         if (e.code === "WORKTREE_BRANCH_MISMATCH" || e.code === "WORKTREE_DIRTY") {
           return jsonErr(409, e.code, e.message, e.hint);
         }
