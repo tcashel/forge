@@ -37,6 +37,7 @@ import { fetchPrBundle } from "../../core/gh-pr.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
+import { ensureWorktreeForBranch } from "../../core/worktrees.ts";
 import { findLatestForgeFindings } from "./review-actions.ts";
 
 const SCHEMA_VERSION = 1;
@@ -233,21 +234,38 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     });
   }
 
-  // 4) Resolve worktree. Prefer a Forge-launched worktree for this PR; for any
-  //    other PR, provision one on demand by checking out its head branch.
-  const worktreePath =
-    resolveWorktreePathForPr(store, repoRoot, prNum) ?? ensureWorktreeForPr(repoRoot, prNum, headRefName, ghEnv);
-  if (!fs.existsSync(worktreePath)) {
-    throw new CliError("NO_WORKTREE", `Worktree ${worktreePath} no longer exists on disk.`, { exitCode: 1 });
+  // 4) Resolve worktree — rehydrating one from the PR head branch when missing.
+  //    A live-but-dirty / wrong-branch worktree still fails fast (validated below).
+  //    The only genuinely unrecoverable case (412/422) is the PR head branch
+  //    no longer existing on the remote — surfaced via NO_WORKTREE here.
+  let worktreePath = resolveWorktreePathForPr(store, repoRoot, prNum);
+  const recordedPath = worktreePath;
+  const needsRehydrate = !worktreePath || !fs.existsSync(worktreePath) || !isLiveWorktree(worktreePath);
+  if (needsRehydrate) {
+    if (!headRefName) {
+      throw new CliError("NO_WORKTREE", `PR #${prNum} has no head branch to rehydrate from.`, { exitCode: 1 });
+    }
+    const ensured = await ensureWorktreeForBranch(repoRoot, headRefName, {
+      onProgress: (msg) => process.stderr.write(`[forge:comment-fix] rehydrate: ${msg}\n`),
+    });
+    if (ensured.error || !ensured.worktreePath) {
+      throw new CliError(
+        "NO_WORKTREE",
+        `Could not rehydrate a worktree for PR #${prNum} on branch ${headRefName}: ${ensured.error ?? "(unknown)"}`,
+        {
+          hint: "The PR head branch may no longer exist on the remote.",
+          exitCode: 1,
+        },
+      );
+    }
+    worktreePath = ensured.worktreePath;
+    // Update Plan.worktree on the newest linked plan so future sessions
+    // and `forge worktree list` find it. `jobs` rows are append-only history.
+    updatePlanWorktreePath(store, repoRoot, prNum, worktreePath, recordedPath);
   }
-  try {
-    const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    if (!root) throw new Error("rev-parse returned empty");
-  } catch {
-    throw new CliError("NO_WORKTREE", `${worktreePath} is not a git worktree.`, { exitCode: 1 });
+  if (!worktreePath) {
+    // Unreachable: either the rehydrate branch threw or it assigned a non-empty path.
+    throw new CliError("NO_WORKTREE", `PR #${prNum} has no resolvable worktree path.`, { exitCode: 1 });
   }
 
   // 5) Worktree must be on the PR head branch.
@@ -731,6 +749,55 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
 }
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
+
+function isLiveWorktree(worktreePath: string): boolean {
+  try {
+    const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return root.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stamp the newest linked plan's `Plan.worktree` with the rehydrated path
+ * so future fix sessions and `forge worktree list` can find it. Mirrors
+ * `resolveWorktreePathForPr` in how it picks the "newest" plan.
+ */
+function updatePlanWorktreePath(
+  store: ForgeStore,
+  repoRoot: string,
+  prNumber: number,
+  newPath: string,
+  previousPath: string | null,
+): void {
+  try {
+    const candidates = store.getPlans(repoRoot).filter((p) => p.status !== "archived" && p.prNumber === prNumber);
+    if (candidates.length === 0) return;
+    const newest = [...candidates].sort((a, b) => {
+      const aKey = a.completedAt ?? a.launchedAt ?? a.createdAt;
+      const bKey = b.completedAt ?? b.launchedAt ?? b.createdAt;
+      return bKey.localeCompare(aKey);
+    })[0];
+    if (newest.worktree !== newPath) {
+      store.upsertPlan({ ...newest, worktree: newPath });
+    }
+    // If other plans still point at the now-stale path, scrub them too so
+    // listWorktrees doesn't double-count.
+    if (previousPath && previousPath !== newPath) {
+      for (const plan of candidates) {
+        if (plan.id !== newest.id && plan.worktree === previousPath) {
+          store.upsertPlan({ ...plan, worktree: null });
+        }
+      }
+    }
+  } catch {
+    /* annotation only */
+  }
+}
 
 function resolveWorktreePathForPr(store: ForgeStore, repoRoot: string, prNumber: number): string | null {
   try {
