@@ -11,9 +11,21 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { recordCritiqueStarted } from "./db/writes.ts";
-import { agentCommand, isTmuxSessionAlive, killTmuxSession } from "./launch.js";
+import { readResultFromFile } from "./claude-stream.ts";
+import { recordCritiqueStarted, type SidecarMetricsPatch, syncCritiqueState } from "./db/writes.ts";
+import { agentCommand, claudeJobCommand, isTmuxSessionAlive, killTmuxSession } from "./launch.js";
 import type { CritiqueMeta, ForgeStore, LaunchTarget, ReasoningEffort } from "./store.js";
+
+/**
+ * Derive the stream-json sidecar path for a critique slot from its `.md`
+ * output path. Single source of truth — both the bash runner and the TS
+ * finalize call site call this so they cannot drift.
+ *
+ * `critique-a.md` → `critique-a.stream.jsonl`, etc.
+ */
+export function slotSidecarPath(outputMdPath: string): string {
+  return outputMdPath.replace(/\.md$/, ".stream.jsonl");
+}
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
@@ -110,7 +122,7 @@ function escapeSQ(s: string): string {
   return s.replace(/'/g, "'\\''");
 }
 
-function generateRunnerScript(config: CritiqueConfig, store: ForgeStore): string {
+export function generateRunnerScript(config: CritiqueConfig, store: ForgeStore): string {
   const dir = store.getCritiqueDir(config.planId, config.critiqueId);
   const metaFile = path.join(dir, "critique-meta.json");
 
@@ -123,16 +135,32 @@ function generateRunnerScript(config: CritiqueConfig, store: ForgeStore): string
   const logA = path.join(dir, "agent-a.log");
   const logB = path.join(dir, "agent-b.log");
   const logSynth = path.join(dir, "synth.log");
+  const streamA = slotSidecarPath(outputA);
+  const streamB = slotSidecarPath(outputB);
+  const streamRec = slotSidecarPath(outputRec);
 
-  const cmdA = agentCommand(config.criticA.agent, config.criticA.model, promptA, {
-    reasoningEffort: config.criticA.reasoningEffort,
-  });
-  const cmdB = agentCommand(config.criticB.agent, config.criticB.model, promptB, {
-    reasoningEffort: config.criticB.reasoningEffort,
-  });
-  const cmdSynth = agentCommand(config.synthesizer.agent, config.synthesizer.model, promptSynth, {
-    reasoningEffort: config.synthesizer.reasoningEffort,
-  });
+  const cmdA =
+    config.criticA.agent === "claude"
+      ? claudeJobCommand(config.criticA.model, promptA, streamA)
+      : agentCommand(config.criticA.agent, config.criticA.model, promptA, {
+          reasoningEffort: config.criticA.reasoningEffort,
+        });
+  const cmdB =
+    config.criticB.agent === "claude"
+      ? claudeJobCommand(config.criticB.model, promptB, streamB)
+      : agentCommand(config.criticB.agent, config.criticB.model, promptB, {
+          reasoningEffort: config.criticB.reasoningEffort,
+        });
+  const cmdSynth =
+    config.synthesizer.agent === "claude"
+      ? claudeJobCommand(config.synthesizer.model, promptSynth, streamRec)
+      : agentCommand(config.synthesizer.agent, config.synthesizer.model, promptSynth, {
+          reasoningEffort: config.synthesizer.reasoningEffort,
+        });
+
+  const criticAIsClaude = config.criticA.agent === "claude";
+  const criticBIsClaude = config.criticB.agent === "claude";
+  const synthIsClaude = config.synthesizer.agent === "claude";
 
   // Build synth prompt parts for bash heredoc assembly after critics finish
   const synthSkill = readSkillFile("forge-synthesizer/SKILL.md");
@@ -231,6 +259,31 @@ wait $PID_B
 EXIT_B=$?
 CRIT_B_DUR=$(( (SECONDS - CRIT_B_START) * 1000 ))
 
+# Detect silent failure of the claude stream-json pipeline: the pipeline
+# may exit 0 with an empty sidecar or one missing the terminating
+# result event (e.g. auth dropped mid-call). Force the slot to failed
+# so synthesis does not feed garbage into the synth prompt.
+${
+  criticAIsClaude
+    ? `if [ "$EXIT_A" -eq 0 ]; then
+  if [ ! -s "${streamA}" ] || ! grep -q '"type":"result"' "${streamA}" || grep -q '"is_error":true' "${streamA}"; then
+    EXIT_A=1
+    echo "  (critic A silent failure: sidecar empty, missing result, or is_error)"
+  fi
+fi`
+    : "# critic A not claude — no stream-json sidecar check"
+}
+${
+  criticBIsClaude
+    ? `if [ "$EXIT_B" -eq 0 ]; then
+  if [ ! -s "${streamB}" ] || ! grep -q '"type":"result"' "${streamB}" || grep -q '"is_error":true' "${streamB}"; then
+    EXIT_B=1
+    echo "  (critic B silent failure: sidecar empty, missing result, or is_error)"
+  fi
+fi`
+    : "# critic B not claude — no stream-json sidecar check"
+}
+
 if [ "$EXIT_A" -eq 0 ]; then
   update_meta "criticA.status=done" "criticA.durationMs=$CRIT_A_DUR"
   echo "✓ Critic A completed (\${CRIT_A_DUR}ms)"
@@ -279,6 +332,17 @@ SYNTH_START=$SECONDS
 ${cmdSynth} > "${outputRec}" 2> "${logSynth}"
 EXIT_SYNTH=$?
 SYNTH_DUR=$(( (SECONDS - SYNTH_START) * 1000 ))
+
+${
+  synthIsClaude
+    ? `if [ "$EXIT_SYNTH" -eq 0 ]; then
+  if [ ! -s "${streamRec}" ] || ! grep -q '"type":"result"' "${streamRec}" || grep -q '"is_error":true' "${streamRec}"; then
+    EXIT_SYNTH=1
+    echo "  (synthesizer silent failure: sidecar empty, missing result, or is_error)"
+  fi
+fi`
+    : "# synthesizer not claude — no stream-json sidecar check"
+}
 
 if [ "$EXIT_SYNTH" -eq 0 ]; then
   update_meta "synthesizer.status=done" "synthesizer.durationMs=$SYNTH_DUR" "status=done" "completedAt=$(date -u +%Y-%m-%dT%H:%M:%SZ)"
@@ -408,6 +472,7 @@ export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore)
 
   const { runnerPath } = prepareCritique(config, store, tmuxSession);
 
+  let runnerError: string | null = null;
   try {
     const out = fs.openSync(runnerLog, "w");
     try {
@@ -418,13 +483,24 @@ export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore)
       fs.closeSync(out);
     }
   } catch (e: unknown) {
-    const msg = e instanceof Error ? e.message : String(e);
-    const finalMeta = store.readCritiqueMeta(config.planId, config.critiqueId);
-    const detail = finalMeta?.status === "failed" ? "critics or synthesizer failed" : msg;
-    return { recommendationsPath, critiqueId: config.critiqueId, error: `critique runner failed: ${detail}` };
+    runnerError = e instanceof Error ? e.message : String(e);
   }
 
   const finalMeta = store.readCritiqueMeta(config.planId, config.critiqueId);
+  if (finalMeta) {
+    const sidecarMetrics = await readCritiqueSidecarMetrics(finalMeta, critiqueDir);
+    try {
+      syncCritiqueState(store.db.db, finalMeta, { sidecarMetrics });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: syncCritiqueState failed for ${config.critiqueId}: ${msg}\n`);
+    }
+  }
+
+  if (runnerError !== null) {
+    const detail = finalMeta?.status === "failed" ? "critics or synthesizer failed" : runnerError;
+    return { recommendationsPath, critiqueId: config.critiqueId, error: `critique runner failed: ${detail}` };
+  }
   if (!finalMeta || finalMeta.status !== "done") {
     return {
       recommendationsPath,
@@ -440,4 +516,105 @@ export async function runCritiqueSync(config: CritiqueConfig, store: ForgeStore)
     };
   }
   return { recommendationsPath, critiqueId: config.critiqueId, error: null };
+}
+
+/**
+ * Parse stream-json sidecars for each claude slot in a critique and
+ * project the result into the patch shape `syncCritiqueState` expects.
+ * Non-claude slots are absent from the map (no sidecar exists). Missing
+ * / unreadable / is_error sidecars also leave their slot absent so prior
+ * metrics are preserved via mergeMetrics rather than clobbered with nulls.
+ */
+export async function readCritiqueSidecarMetrics(
+  meta: CritiqueMeta,
+  critiqueDir: string,
+): Promise<Partial<Record<"criticA" | "criticB" | "synth", SidecarMetricsPatch>>> {
+  const out: Partial<Record<"criticA" | "criticB" | "synth", SidecarMetricsPatch>> = {};
+  if (meta.criticA.agent === "claude") {
+    const patch = await readSidecarPatch(path.join(critiqueDir, "critique-a.stream.jsonl"));
+    if (patch) out.criticA = patch;
+  }
+  if (meta.criticB.agent === "claude") {
+    const patch = await readSidecarPatch(path.join(critiqueDir, "critique-b.stream.jsonl"));
+    if (patch) out.criticB = patch;
+  }
+  if (meta.synthesizer.agent === "claude") {
+    const patch = await readSidecarPatch(path.join(critiqueDir, "recommendations.stream.jsonl"));
+    if (patch) out.synth = patch;
+  }
+  return out;
+}
+
+/**
+ * Read-path safety net for background critiques. The tmux runner exits
+ * after writing critique-meta.json, but the original TS process that
+ * invoked `launchCritique` is long gone — so nothing on the call path
+ * has finalized the DB sessions. The Activity endpoint calls this
+ * before serving the list so terminal critiques land their tokens/cost.
+ *
+ * Idempotent: skips critiques whose sessions are no longer `running`.
+ */
+export async function reconcileCritiqueSessions(store: ForgeStore): Promise<void> {
+  const rows = store.db.db
+    .prepare(
+      `SELECT DISTINCT s.related_id AS critiqueId
+         FROM sessions s
+        WHERE s.purpose IN ('critique','synthesis')
+          AND s.state = 'running'
+          AND s.related_id IS NOT NULL`,
+    )
+    .all() as Array<{ critiqueId: string }>;
+
+  for (const { critiqueId } of rows) {
+    const planRow = store.db.db
+      .prepare(
+        `SELECT pv.plan_id AS planId
+           FROM critic_runs cr
+           JOIN plan_versions pv ON pv.id = cr.target_id AND cr.target_kind = 'plan_version'
+          WHERE cr.id LIKE ?
+          LIMIT 1`,
+      )
+      .get(`cr-${critiqueId}-%`) as { planId: string } | undefined;
+    if (!planRow) continue;
+
+    const meta = store.readCritiqueMeta(planRow.planId, critiqueId);
+    if (!meta) continue;
+    if (meta.status !== "done" && meta.status !== "failed") continue;
+
+    const dir = store.getCritiqueDir(planRow.planId, critiqueId);
+    const sidecarMetrics = await readCritiqueSidecarMetrics(meta, dir);
+    try {
+      syncCritiqueState(store.db.db, meta, { sidecarMetrics });
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      process.stderr.write(`warn: syncCritiqueState failed for ${critiqueId}: ${msg}\n`);
+    }
+  }
+}
+
+/**
+ * Read a stream-json sidecar and project the final `result` event into a
+ * SessionMetrics patch. Drops `durationMs` (the bash wall-clock in
+ * critique-meta.json is authoritative) and returns null when the sidecar
+ * is missing / has no result event / reports an empty result string — the
+ * caller treats absence as "tokens unknown" and leaves prior metrics alone.
+ */
+export async function readSidecarPatch(sidecarPath: string): Promise<SidecarMetricsPatch | null> {
+  if (!fs.existsSync(sidecarPath)) return null;
+  const r = await readResultFromFile(sidecarPath);
+  // Zero tokens + null cost means either no `result` event was found
+  // (no useful patch) or the event was an is_error / empty-result one
+  // (real claude failure — the slot will already be marked failed by
+  // the bash silent-failure check). Either way, suppress the patch so
+  // mergeMetrics preserves whatever was there before.
+  const hasTokens = (r.tokensIn ?? 0) > 0 || (r.tokensOut ?? 0) > 0;
+  if (!hasTokens && r.totalCostUsd === null) return null;
+  return {
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+    cacheRead: r.cacheRead,
+    cacheCreate: r.cacheCreate,
+    costUsd: r.totalCostUsd,
+    costSource: r.totalCostUsd !== null ? "provider" : null,
+  };
 }
