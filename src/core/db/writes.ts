@@ -541,15 +541,52 @@ export function recordCritiqueStarted(db: Database, task: Plan, meta: CritiqueMe
  * critique-meta.json. Called by API/CLI readers before returning data
  * so finished critiques land their 'completed'/'failed' state and the
  * synthesis row appears. Idempotent.
+ *
+ * `opts.sidecarMetrics` carries per-slot token/cost data extracted from
+ * the slot's `.stream.jsonl` sidecar (claude only). Slots without a
+ * sidecar (non-claude agents, or claude runs whose sidecar was missing
+ * or empty) are absent from the map — those slots keep whatever metrics
+ * they already had on disk via `mergeMetrics`.
  */
-export function syncCritiqueState(db: Database, meta: CritiqueMeta): void {
+export interface SidecarMetricsPatch {
+  tokensIn: number | null;
+  tokensOut: number | null;
+  cacheRead: number | null;
+  cacheCreate: number | null;
+  costUsd: number | null;
+  costSource: CostSource | null;
+}
+
+export interface SyncCritiqueStateOptions {
+  sidecarMetrics?: Partial<Record<"criticA" | "criticB" | "synth", SidecarMetricsPatch>>;
+}
+
+export function syncCritiqueState(db: Database, meta: CritiqueMeta, opts: SyncCritiqueStateOptions = {}): void {
   db.transaction(() => {
     const finishedAt = meta.completedAt ?? null;
 
     // Sync the three sessions
-    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "critic-a"), meta.criticA, finishedAt);
-    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "critic-b"), meta.criticB, finishedAt);
-    updateCritiqueSession(db, liveCritiqueSessionId(meta.critiqueId, "synth"), meta.synthesizer, finishedAt);
+    updateCritiqueSession(
+      db,
+      liveCritiqueSessionId(meta.critiqueId, "critic-a"),
+      meta.criticA,
+      finishedAt,
+      opts.sidecarMetrics?.criticA,
+    );
+    updateCritiqueSession(
+      db,
+      liveCritiqueSessionId(meta.critiqueId, "critic-b"),
+      meta.criticB,
+      finishedAt,
+      opts.sidecarMetrics?.criticB,
+    );
+    updateCritiqueSession(
+      db,
+      liveCritiqueSessionId(meta.critiqueId, "synth"),
+      meta.synthesizer,
+      finishedAt,
+      opts.sidecarMetrics?.synth,
+    );
 
     // Sync the two critic_runs
     db.prepare("UPDATE critic_runs SET state = ?, finished_at = ? WHERE id = ?").run(
@@ -631,30 +668,42 @@ function updateCritiqueSession(
   sessionId: string,
   agent: CritiqueMeta["criticA"],
   finishedAt: string | null,
+  sidecar?: SidecarMetricsPatch,
 ): void {
   const state = mapCritiqueAgentState(agent.status);
   const done = agent.status === "done" || agent.status === "failed";
-  // Preserve metrics.planId (stashed by synthesis writers) across syncs.
-  // Without the merge, `syncCritiqueState` clobbers the synthesis session's
-  // plan linkage on every read-path call.
+  // Merge into the existing metrics blob so we preserve fields the
+  // current call doesn't touch (planId stashed by synthesis writers;
+  // tokens captured by a prior sync if a later one runs without a
+  // sidecar handy).
   const existing = db.prepare("SELECT metrics FROM sessions WHERE id = ?").get(sessionId) as
     | { metrics: string | null }
     | undefined;
-  const merged: Record<string, unknown> = { durationMs: agent.durationMs, reasoningEffort: agent.reasoningEffort };
-  if (existing?.metrics) {
-    try {
-      const prior = JSON.parse(existing.metrics) as Record<string, unknown>;
-      if (typeof prior.planId === "string") merged.planId = prior.planId;
-    } catch {
-      // ignore parse errors; existing metrics blob may be corrupt
-    }
+  const base = parseMetrics(existing?.metrics);
+  const patch: Partial<SessionMetrics> = {
+    durationMs: agent.durationMs,
+    reasoningEffort: normalizeReasoning(agent.reasoningEffort),
+  };
+  if (sidecar) {
+    patch.tokensIn = sidecar.tokensIn;
+    patch.tokensOut = sidecar.tokensOut;
+    patch.cacheRead = sidecar.cacheRead;
+    patch.cacheCreate = sidecar.cacheCreate;
+    patch.costUsd = sidecar.costUsd;
+    patch.costSource = sidecar.costSource;
   }
+  const merged = mergeMetrics(base, patch);
   db.prepare("UPDATE sessions SET state = ?, finished_at = ?, metrics = ? WHERE id = ?").run(
     state,
     done ? finishedAt : null,
     JSON.stringify(merged),
     sessionId,
   );
+}
+
+function normalizeReasoning(effort: string | undefined): "low" | "medium" | "high" | null {
+  if (effort === "low" || effort === "medium" || effort === "high") return effort;
+  return null;
 }
 
 function insertLiveCriticRun(

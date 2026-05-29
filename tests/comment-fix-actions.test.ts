@@ -29,12 +29,12 @@ function makeStore(prefix = "forge-comment-fix-"): { store: ForgeStore; tmp: str
   return { store, tmp };
 }
 
-test("parseCommentValidation extracts a JSONL block", () => {
+test("parseCommentValidation extracts a JSONL block (native targetId + legacy commentId)", () => {
   const raw = [
     "Some preamble text.",
     "",
     "```forge-comment-validation",
-    '{"commentId": 1, "verdict": "valid", "reason": "anchor matches"}',
+    '{"targetId": "finding:ab12cd", "verdict": "valid", "reason": "anchor matches"}',
     '{"commentId": 2, "verdict": "disputed", "reason": "comment anchor is stale"}',
     "```",
     "",
@@ -42,25 +42,26 @@ test("parseCommentValidation extracts a JSONL block", () => {
   ].join("\n");
   const parsed = parseCommentValidation(raw);
   assert.equal(parsed.length, 2);
-  assert.deepEqual(parsed[0], { commentId: 1, verdict: "valid", reason: "anchor matches" });
-  assert.deepEqual(parsed[1], { commentId: 2, verdict: "disputed", reason: "comment anchor is stale" });
+  assert.deepEqual(parsed[0], { targetId: "finding:ab12cd", verdict: "valid", reason: "anchor matches" });
+  // Legacy commentId coerces to the comment:<id> token.
+  assert.deepEqual(parsed[1], { targetId: "comment:2", verdict: "disputed", reason: "comment anchor is stale" });
 });
 
 test("parseCommentValidation skips malformed lines and duplicates", () => {
   const raw = [
     "```forge-comment-validation",
     "this is not json",
-    '{"commentId": 10, "verdict": "valid", "reason": "first wins"}',
-    '{"commentId": 10, "verdict": "disputed", "reason": "duplicate dropped"}',
-    '{"commentId": 11, "verdict": "bogus", "reason": "bad verdict"}',
-    '{"commentId": 12, "verdict": "valid", "reason": ""}',
-    '{"commentId": 13, "verdict": "disputed", "reason": "ok"}',
+    '{"targetId": "comment:10", "verdict": "valid", "reason": "first wins"}',
+    '{"targetId": "comment:10", "verdict": "disputed", "reason": "duplicate dropped"}',
+    '{"targetId": "comment:11", "verdict": "bogus", "reason": "bad verdict"}',
+    '{"targetId": "comment:12", "verdict": "valid", "reason": ""}',
+    '{"targetId": "comment:13", "verdict": "disputed", "reason": "ok"}',
     "```",
   ].join("\n");
   const parsed = parseCommentValidation(raw);
   assert.deepEqual(parsed, [
-    { commentId: 10, verdict: "valid", reason: "first wins" },
-    { commentId: 13, verdict: "disputed", reason: "ok" },
+    { targetId: "comment:10", verdict: "valid", reason: "first wins" },
+    { targetId: "comment:13", verdict: "disputed", reason: "ok" },
   ]);
 });
 
@@ -69,11 +70,11 @@ test("parseCommentValidation returns [] when there's no block", () => {
   assert.deepEqual(parseCommentValidation("nothing fenced here"), []);
 });
 
-test("runCommentFix rejects empty commentIds with NO_COMMENTS", async () => {
+test("runCommentFix rejects empty targets with NO_COMMENTS", async () => {
   const { store, tmp } = makeStore();
   try {
     await assert.rejects(
-      () => runCommentFix({ prNum: 1, repoRoot: tmp, repoName: "test", commentIds: [] }, store),
+      () => runCommentFix({ prNum: 1, repoRoot: tmp, repoName: "test", targets: [] }, store),
       (err) => err instanceof CliError && err.code === "NO_COMMENTS",
     );
   } finally {
@@ -81,11 +82,13 @@ test("runCommentFix rejects empty commentIds with NO_COMMENTS", async () => {
   }
 });
 
-test("runCommentFix rejects non-positive ids before touching gh", async () => {
+test("runCommentFix rejects all-invalid targets before touching gh", async () => {
   const { store, tmp } = makeStore();
   try {
+    // Empty id and unknown source both drop during dedupe → no usable targets.
     await assert.rejects(
-      () => runCommentFix({ prNum: 1, repoRoot: tmp, repoName: "test", commentIds: [0, -3, Number.NaN] }, store),
+      () =>
+        runCommentFix({ prNum: 1, repoRoot: tmp, repoName: "test", targets: [{ source: "comment", id: "" }] }, store),
       (err) => err instanceof CliError && err.code === "NO_COMMENTS",
     );
   } finally {
@@ -99,7 +102,11 @@ test("runCommentFix surfaces REVIEWER_NOT_CONFIGURED before any gh call", async 
     // No reviewerAgent/reviewerModel set on this repo — orchestrator should
     // fail fast with the same code the reviewer uses.
     await assert.rejects(
-      () => runCommentFix({ prNum: 99, repoRoot: tmp, repoName: "test", commentIds: [42] }, store),
+      () =>
+        runCommentFix(
+          { prNum: 99, repoRoot: tmp, repoName: "test", targets: [{ source: "comment", id: "42" }] },
+          store,
+        ),
       (err) => err instanceof CliError && err.code === "REVIEWER_NOT_CONFIGURED",
     );
   } finally {
@@ -130,7 +137,7 @@ test("resolveSessionLogFile reads metrics.logFile for comment-fix sessions", () 
           prNum: 42,
           repoRoot: tmp,
           worktreePath: tmp,
-          commentIds: [1],
+          targets: [{ source: "comment", id: "1" }],
         } as unknown as Partial<import("../src/core/db/writes.ts").SessionMetrics>),
       },
     });
@@ -149,9 +156,10 @@ test("findLatestCommentFixState aggregates validation.json into the bundle shape
     const runDir = path.join(store.runsDir, "pr-comment-fix", `${prNum}-s-comment-fix-pr-x`);
     fs.mkdirSync(runDir, { recursive: true });
     const entries: ValidationFileEntry[] = [
-      { commentId: 11, verdict: "valid", reason: "fixed it", status: "fixed" },
-      { commentId: 12, verdict: "disputed", reason: "stale anchor", status: "disputed" },
-      { commentId: 13, verdict: "valid", reason: "quality failed", status: "failed" },
+      { targetId: "comment:11", verdict: "valid", reason: "fixed it", status: "fixed" },
+      { targetId: "finding:ab12cd", verdict: "valid", reason: "fixed finding", status: "fixed" },
+      { targetId: "review:777", verdict: "disputed", reason: "out of scope", status: "disputed" },
+      { targetId: "comment:13", verdict: "valid", reason: "quality failed", status: "failed" },
     ];
     fs.writeFileSync(path.join(runDir, "validation.json"), JSON.stringify(entries, null, 2));
     fs.writeFileSync(
@@ -166,9 +174,33 @@ test("findLatestCommentFixState aggregates validation.json into the bundle shape
     );
 
     const state = findLatestCommentFixState(store, prNum, tmp);
-    assert.deepEqual(state["11"], { status: "fixed", reason: "fixed it" });
-    assert.deepEqual(state["12"], { status: "disputed", reason: "stale anchor" });
-    assert.deepEqual(state["13"], { status: "failed", reason: "quality failed" });
+    assert.deepEqual(state["comment:11"], { status: "fixed", reason: "fixed it" });
+    assert.deepEqual(state["finding:ab12cd"], { status: "fixed", reason: "fixed finding" });
+    assert.deepEqual(state["review:777"], { status: "disputed", reason: "out of scope" });
+    assert.deepEqual(state["comment:13"], { status: "failed", reason: "quality failed" });
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("findLatestCommentFixState reads legacy commentId entries as comment:<id> tokens", () => {
+  const { store, tmp } = makeStore("forge-cfs-legacy-");
+  try {
+    const prNum = 4321;
+    const runDir = path.join(store.runsDir, "pr-comment-fix", `${prNum}-s-legacy`);
+    fs.mkdirSync(runDir, { recursive: true });
+    // Pre-token on-disk shape: keyed by numeric commentId.
+    fs.writeFileSync(
+      path.join(runDir, "validation.json"),
+      JSON.stringify([{ commentId: 11, verdict: "valid", reason: "fixed it", status: "fixed" }]),
+    );
+    fs.writeFileSync(
+      path.join(runDir, "meta.json"),
+      JSON.stringify({ schemaVersion: 1, repoRoot: tmp, prNum, status: "completed" }),
+    );
+
+    const state = findLatestCommentFixState(store, prNum, tmp);
+    assert.deepEqual(state["comment:11"], { status: "fixed", reason: "fixed it" });
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -206,7 +238,7 @@ test("findLatestCommentFixState picks the newest run when several exist", () => 
     );
 
     const state = findLatestCommentFixState(store, prNum, tmp);
-    assert.deepEqual(state["1"], { status: "disputed", reason: "newer wins" });
+    assert.deepEqual(state["comment:1"], { status: "disputed", reason: "newer wins" });
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }
@@ -240,7 +272,7 @@ test("findLatestCommentFixState demotes fixed→failed for failed sessions", () 
     );
 
     const state = findLatestCommentFixState(store, prNum, tmp);
-    assert.equal(state["1"]?.status, "failed");
+    assert.equal(state["comment:1"]?.status, "failed");
   } finally {
     fs.rmSync(tmp, { recursive: true, force: true });
   }

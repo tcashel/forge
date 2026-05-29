@@ -1,5 +1,5 @@
 import { useEffect, useMemo } from "preact/hooks";
-import { type DiffFile, parseUnifiedDiff } from "../../lib/diff";
+import { parseUnifiedDiff } from "../../lib/diff";
 import { enterPrMode } from "../../lib/modes";
 import {
   clearSelectedReviewRun,
@@ -11,19 +11,17 @@ import {
   reviewLoading,
 } from "../../signals/review";
 import { currentReviewPrNumber, currentReviewRepo } from "../../signals/ui";
-import type { ForgeFinding } from "../../types";
+import type { ForgeFindingSeverity } from "../../types";
 import { BatchBar } from "./BatchBar";
-import { anchorFindings, DiffPane } from "./DiffPane";
-import { OutsideDiffFindings } from "./OutsideDiffFindings";
+import { anchorFindings, anchorThreads, DiffPane, groupIntoThreads } from "./DiffPane";
+import { FindingsRail } from "./FindingsRail";
+import { IntentPanel } from "./IntentPanel";
+import { LeftNav } from "./LeftNav";
 import { ReviewActionBar } from "./ReviewActionBar";
 import { ReviewHeader } from "./ReviewHeader";
 import { ReviewHistoryPicker } from "./ReviewHistoryPicker";
 import { ReviewSessionDrawer } from "./ReviewSessionDrawer";
 import { UnanchoredComments } from "./UnanchoredComments";
-
-function deriveOutside(diff: DiffFile[], findings: ForgeFinding[]): ForgeFinding[] {
-  return anchorFindings(findings, diff).outside;
-}
 
 export function ReviewPage() {
   const num = currentReviewPrNumber.value;
@@ -43,11 +41,30 @@ export function ReviewPage() {
     }
   }, [num, repo]);
 
-  const outsideFindings = useMemo(() => {
-    if (!bundle) return [];
-    const parsed = parseUnifiedDiff(bundle.diff);
-    return deriveOutside(parsed, findings);
-  }, [bundle, findings]);
+  const parsedDiff = useMemo(() => (bundle ? parseUnifiedDiff(bundle.diff) : []), [bundle]);
+  const { anchoredFlat, outside } = useMemo(() => {
+    if (!bundle) return { anchored: new Map(), anchoredFlat: [], outside: [] };
+    return anchorFindings(findings, parsedDiff);
+  }, [bundle, findings, parsedDiff]);
+
+  // Anchor inline comment threads the same way the diff does, so the rail can
+  // list them (anchored → jump-to-diff; stale → not fixable) alongside findings.
+  const commentAnchoring = useMemo(() => {
+    if (!bundle) return { anchoredFlat: [] as ReturnType<typeof anchorThreads>["anchoredFlat"], stale: [] };
+    const threads = groupIntoThreads(bundle.inlineComments);
+    const { anchoredFlat: ca, stale } = anchorThreads(threads, parsedDiff);
+    return { anchoredFlat: ca, stale };
+  }, [bundle, parsedDiff]);
+
+  const findingsByFile = useMemo<Map<string, ForgeFindingSeverity>>(() => {
+    const rank: Record<ForgeFindingSeverity, number> = { BLOCKER: 0, HIGH: 1, MEDIUM: 2, LOW: 3 };
+    const out = new Map<string, ForgeFindingSeverity>();
+    for (const a of anchoredFlat) {
+      const cur = out.get(a.finding.file);
+      if (!cur || rank[a.finding.severity] < rank[cur]) out.set(a.finding.file, a.finding.severity);
+    }
+    return out;
+  }, [anchoredFlat]);
 
   if (num == null || repo == null) {
     return (
@@ -61,20 +78,39 @@ export function ReviewPage() {
   }
 
   return (
-    <div class="review-page">
-      <ReviewActionBar prNumber={num} repoRoot={repo} loading={loading} />
-      <ReviewHistoryPicker prNumber={num} repoRoot={repo} />
-      {loading && !bundle ? <div class="review-status">Loading PR review bundle…</div> : null}
-      {err ? <div class="review-status error">{err}</div> : null}
-      {bundle ? (
-        <>
-          <ReviewHeader bundle={bundle} />
-          <DiffPane bundle={bundle} findings={findings} />
-          <OutsideDiffFindings findings={outsideFindings} />
-          <UnanchoredComments bundle={bundle} />
-        </>
-      ) : null}
-      <BatchBar prNumber={num} repoRoot={repo} />
+    <div class="review-page review-three-pane">
+      {bundle ? <LeftNav files={parsedDiff} findingsByFile={findingsByFile} /> : <aside class="review-nav empty" />}
+
+      <main class="review-center">
+        <ReviewActionBar prNumber={num} repoRoot={repo} loading={loading} />
+        {loading && !bundle ? <div class="review-status">Loading PR review bundle…</div> : null}
+        {err ? <div class="review-status error">{err}</div> : null}
+        {bundle ? (
+          <>
+            <ReviewHeader bundle={bundle} />
+            <DiffPane bundle={bundle} findings={findings} />
+            <UnanchoredComments bundle={bundle} />
+          </>
+        ) : null}
+      </main>
+
+      <aside class="review-rail">
+        <ReviewHistoryPicker prNumber={num} repoRoot={repo} />
+        {bundle?.linkedPlanId ? <IntentPanel planId={bundle.linkedPlanId} /> : null}
+        {bundle ? (
+          <FindingsRail
+            anchoredFindings={anchoredFlat}
+            outsideFindings={outside}
+            anchoredComments={commentAnchoring.anchoredFlat}
+            staleComments={commentAnchoring.stale}
+            reviews={bundle.prReviews}
+          />
+        ) : null}
+        <div class="review-rail-batch">
+          <BatchBar prNumber={num} repoRoot={repo} />
+        </div>
+      </aside>
+
       <ReviewSessionDrawer prNumber={num} repoRoot={repo} />
     </div>
   );
