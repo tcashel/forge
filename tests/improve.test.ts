@@ -71,7 +71,7 @@ function seedTask(store: ForgeStore, id: string, body: string): Plan {
 }
 
 const AGENT_CLAUDE = { agent: "claude", model: "claude-opus-4-7" } as const;
-const AGENT_CODEX = { agent: "codex", model: "gpt-5-codex" } as const;
+const AGENT_CODEX = { agent: "codex", model: "gpt-5.5" } as const;
 
 function buildConfig(task: Plan, body: string): ImproveConfig {
   return {

@@ -1,13 +1,7 @@
 import { useState } from "preact/hooks";
 import type { ApiError } from "../../lib/api";
 import { type FixTarget, parseTargetKey } from "../../lib/review-targets";
-import {
-  activeCommentFixSession,
-  reviewBundle,
-  selectedTargets,
-  setTargetStatuses,
-  startCommentFix,
-} from "../../signals/review";
+import { activeCommentFixSession, selectedTargets, setTargetStatuses, startCommentFix } from "../../signals/review";
 
 interface Props {
   prNumber: number;
@@ -15,7 +9,6 @@ interface Props {
 }
 
 export function BatchBar({ prNumber, repoRoot }: Props) {
-  const bundle = reviewBundle.value;
   const sel = selectedTargets.value;
   const count = sel.size;
   const [submitting, setSubmitting] = useState(false);
@@ -23,11 +16,8 @@ export function BatchBar({ prNumber, repoRoot }: Props) {
 
   if (count === 0) return null;
 
-  const noWorktree = !bundle?.worktreePath;
-  const disabledReason = noWorktree ? "no-worktree" : null;
-
   const onClick = async () => {
-    if (submitting || noWorktree) return;
+    if (submitting) return;
     const tokens = Array.from(sel);
     const targets: FixTarget[] = tokens.map((t) => parseTargetKey(t)).filter((t): t is FixTarget => t !== null);
     if (targets.length === 0) return;
@@ -50,14 +40,7 @@ export function BatchBar({ prNumber, repoRoot }: Props) {
   return (
     <div class="review-batch-bar">
       <span class="review-batch-count">{count} selected</span>
-      <button
-        type="button"
-        class="btn btn-primary"
-        disabled={submitting || noWorktree}
-        data-disabled-reason={disabledReason ?? undefined}
-        title={noWorktree ? "This PR has no Forge worktree to fix in" : undefined}
-        onClick={onClick}
-      >
+      <button type="button" class="btn btn-primary" disabled={submitting} onClick={onClick}>
         {submitting ? "Starting…" : `Fix ${count} selected`}
       </button>
       {err ? <span class="review-batch-error">{err}</span> : null}

@@ -27,7 +27,7 @@ Steps:
    - `reviewerAgent`
    - `reviewerModel`
 
-   If anything in that list is missing, ask the user **once** for the values they want and run `forge config set <key> <value>` for each. Recommended starting pair: implementer = `codex` / `gpt-5-codex`, reviewer = `claude` / `claude-opus-4-7` (they must differ on agent or model).
+   If anything in that list is missing, ask the user **once** for the values they want and run `forge config set <key> <value>` for each. Recommended starting pair: implementer = `codex` / `gpt-5.5`, reviewer = `claude` / `claude-opus-4-8` (they must differ on agent or model).
 
 4. **Confirm with a dry-run.** Run `forge launch <taskId> --dry-run --json` and surface the resolved config (agent, model, reviewer, fixer, auto-fix). This is a safety net — if anything is still missing or the implementer/reviewer pair collides, the dry-run prints a single `MISSING_FLAGS` error with the exact `forge config set ...` commands to fix it. Show those to the user and stop until they're resolved.
 
