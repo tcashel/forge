@@ -21,9 +21,9 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliError } from "../../cli/output.ts";
+import { agentCommand } from "../../core/agents/index.ts";
 import { finalizeSession, upsertSession } from "../../core/db/writes.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
-import { agentCommand } from "../../core/launch.ts";
 import {
   buildReviewerPrompt,
   extractLastForgeReviewBlock,

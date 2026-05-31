@@ -3,7 +3,7 @@ import { execSync } from "node:child_process";
 import * as path from "node:path";
 import { test } from "node:test";
 import { fileURLToPath } from "node:url";
-import { claudeJobCommand, claudeJobStreamFilter } from "../src/core/launch.ts";
+import { claudeJobCommand, claudeJobStreamFilter } from "../src/core/agents/index.ts";
 
 test("claudeJobCommand emits stream-json with a tee + bun projection", () => {
   const cmd = claudeJobCommand("claude-opus-4-7", "/tmp/p.txt", "/tmp/run/agent.stream.jsonl");

@@ -18,10 +18,11 @@
  * project. Bound by the 5-minute reaper in `reapStalePlanChats`.
  */
 
-import { type ChildProcess, spawn } from "node:child_process";
+import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { defaultAgentSpawn, type AgentSpawnImpl, planChatInvocation } from "./agents/index.ts";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.ts";
 import { parseResultEvent } from "./claude-stream.ts";
 import type { ForgeDb } from "./db/connection.ts";
@@ -342,7 +343,7 @@ export interface RunChatTurnOptions {
    * bytes. Receives `(binary, args, cwd)` so tests can assert all three
    * were plumbed correctly.
    */
-  spawnImpl?: (binary: string, args: string[], cwd?: string) => ChildProcess;
+  spawnImpl?: AgentSpawnImpl;
   /**
    * Idle keepalive interval (ms). The SSE response writes a `: hb\n\n`
    * comment line whenever there's been no outbound traffic for this
@@ -386,7 +387,7 @@ function defaultSpawn(binary: string, args: string[], cwd?: string): ChildProces
   // Node in `runChatTurn` rather than via `< file` shell redirection so
   // the entire command is structurally injection-free — `model` and any
   // other field land as discrete argv entries that bash never sees.
-  return spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd });
+  return defaultAgentSpawn(binary, args, cwd);
 }
 
 function nextTurnNumber(chatDir: string): number {
@@ -556,17 +557,9 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   //    activity in the UI. `--verbose` is required when output-format is
   //    stream-json (claude rejects it otherwise). The prompt is piped to
   //    stdin from Node — argv-only, no shell, so `model` cannot inject.
-  const args = [
-    "--print",
-    "--output-format",
-    "stream-json",
-    "--verbose",
-    "--include-partial-messages",
-    "--dangerously-skip-permissions",
-    "--model",
-    model,
-  ];
-  const child = spawnFn("claude", args, opts.cwd);
+  const invocation = planChatInvocation(model);
+  const args = invocation.args;
+  const child = spawnFn(invocation.binary, invocation.args, opts.cwd);
 
   // Record an Agent Activity row for this chat turn. Failure is non-fatal
   // — the planner still streams; the row just won't appear in the dashboard.

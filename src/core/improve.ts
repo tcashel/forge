@@ -12,11 +12,11 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { agentCommand, claudeJobCommand } from "./agents/index.ts";
 import { atomicWriteText } from "./atomic-write.js";
 import { readResultFromFile } from "./claude-stream.ts";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
 import { finalizeSession, improvementSessionId, recordPlanVersionAdded, upsertSession } from "./db/writes.ts";
-import { agentCommand, claudeJobCommand } from "./launch.js";
 import type { ForgeStore } from "./store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
