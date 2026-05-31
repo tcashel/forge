@@ -41,11 +41,12 @@ You can articulate, in one sentence, why a Conductor or Superset user would swit
 **Goal:** Ship the upstream differentiator inside Forge. Plan workspace, multi-critic synthesis, lock gate, library. No new execution layer.
 
 ### Deliverables
-- **Plan workspace (single plan, document-shaped)**
-  - Structured sections: goals, constraints, non-goals, approach, risks, open questions, acceptance criteria
-  - Inline drafting-agent suggestions with accept/reject hunks
-  - Sidebar agent conversation scoped to the plan
+- **Plan workspace (single plan, conversation-led)** — see [ADR-0026](adr/0026-conversation-led-plan-authoring.md)
+  - Idea→spec happens in a persistent agent conversation (native session, [ADR-0025](adr/0025-unified-agent-interface-agent-owned-context.md)); the structured spec document is the live artifact the conversation maintains, not a form you fill in
+  - Structured sections kept always-current by the agent: goals, constraints, non-goals, approach, risks, open questions, acceptance criteria
+  - Agent spec edits surface as reviewable accept/reject diffs in a live document pane — no silent rewrites; direct human editing remains available but secondary
   - Open questions surfaced explicitly with visible counter
+  - The plan workspace is the one deliberately-watched surface; everything downstream stays headless ([ADR-0019](adr/0019-sessions-are-jobs.md))
 - **Multi-critic synthesis**
   - Critic panel configuration UI (prompt + model per critic)
   - Parallel critic invocation against locked-draft plan

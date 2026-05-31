@@ -18,7 +18,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0002 | [Rust + GPUI for Juicer (Track B)](./0002-rust-gpui-for-juicer.md)                          | Accepted (clarified by 0021)    |
 | 0003 | [Local-first, no required backend](./0003-local-first-no-backend.md)                        | Accepted                        |
 | 0004 | [Bring your own agent](./0004-bring-your-own-agent.md)                                      | Accepted                        |
-| 0005 | [Plan-as-document, not plan-as-chat](./0005-plan-as-document.md)                            | Accepted                        |
+| 0005 | [Plan-as-document, not plan-as-chat](./0005-plan-as-document.md)                            | Accepted (clarified by 0026)    |
 | 0006 | [Subprocess agents](./0006-subprocess-agents.md)                                            | Accepted                        |
 | 0007 | [Git worktree per task](./0007-worktrees-per-task.md)                                       | Accepted (clarified by 0024)    |
 | 0008 | [Critics are agents](./0008-critics-are-agents.md)                                          | Accepted                        |
@@ -38,7 +38,8 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0022 | [Skill + CLI as the agent↔orchestrator contract (no MCP)](./0022-skill-cli-as-agent-contract.md) | Accepted                        |
 | 0023 | [SQLite cutover for Track A (Forge)](./0023-sqlite-cutover-track-a.md)                       | Accepted                        |
 | 0024 | [Worktrees are disposable: lifecycle UI + lazy rehydration](./0024-worktrees-disposable-lifecycle.md) | Accepted               |
-| 0025 | [Unified agent interface; agent owns conversation context](./0025-unified-agent-interface-agent-owned-context.md) | Proposed |
+| 0025 | [Unified agent interface; agent owns conversation context](./0025-unified-agent-interface-agent-owned-context.md) | Accepted |
+| 0026 | [Plan authoring is conversation-led; the document is the maintained artifact](./0026-conversation-led-plan-authoring.md) | Proposed |
 
 ## Foundational ADRs
 
