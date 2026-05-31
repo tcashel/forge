@@ -23,6 +23,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliError } from "../../cli/output.ts";
+import { agentCommand } from "../../core/agents/index.ts";
 import { finalizeSession, upsertSession } from "../../core/db/writes.ts";
 import {
   type FixTarget,
@@ -33,7 +34,6 @@ import {
 } from "../../core/fix-targets.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
 import { fetchPrBundle } from "../../core/gh-pr.ts";
-import { agentCommand } from "../../core/launch.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";

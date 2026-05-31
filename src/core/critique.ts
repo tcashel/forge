@@ -11,9 +11,10 @@ import { execSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
+import { agentCommand, claudeJobCommand } from "./agents/index.ts";
 import { readResultFromFile } from "./claude-stream.ts";
 import { recordCritiqueStarted, type SidecarMetricsPatch, syncCritiqueState } from "./db/writes.ts";
-import { agentCommand, claudeJobCommand, isTmuxSessionAlive, killTmuxSession } from "./launch.js";
+import { isTmuxSessionAlive, killTmuxSession } from "./launch.js";
 import type { CritiqueMeta, ForgeStore, LaunchTarget, ReasoningEffort } from "./store.js";
 
 /**

@@ -5,7 +5,7 @@
 // Tokenization is row-by-row so the diff layout (gutters, line numbers,
 // add/delete backgrounds, in-line findings/comments) stays intact —
 // only the inner content is highlighted.
-import type { BundledLanguage, HighlighterCore } from "shiki/core";
+import type { HighlighterCore } from "shiki/core";
 
 type Lang = "ts" | "tsx" | "js" | "jsx" | "css" | "md" | "json" | "rs" | "py" | "go";
 
@@ -106,7 +106,7 @@ export function ensureLang(lang: Lang): void {
       const h = await getHighlighter();
       const mod = (await LANG_LOADERS[lang]()) as { default: unknown };
       // Shiki's loadLanguage accepts the grammar export (array or single object).
-      await h.loadLanguage(mod.default as unknown as BundledLanguage);
+      await h.loadLanguage(mod.default as Parameters<HighlighterCore["loadLanguage"]>[0]);
       loadedLangs.add(lang);
       notify();
     } catch {

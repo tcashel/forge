@@ -124,12 +124,18 @@ test("POST /api/plan-chat/draft mints a draftId and creates the history file", a
   assert.equal(body.ok, true);
   const draftId = body.data!.draftId as string;
   assert.match(draftId, /^d_[0-9a-f]{8}$/);
+  assert.match(body.data!.sessionId as string, /^[0-9a-f-]{36}$/);
   // Folder + history.json should exist on disk.
   const historyFile = path.join(h.forgeDir, "plan-drafts", draftId, "history.json");
   assert.equal(fs.existsSync(historyFile), true);
   const parsed = JSON.parse(fs.readFileSync(historyFile, "utf-8"));
   assert.equal(parsed.version, 1);
   assert.deepEqual(parsed.messages, []);
+  const pointer = JSON.parse(
+    fs.readFileSync(path.join(h.forgeDir, "plan-drafts", draftId, "conversation.json"), "utf-8"),
+  );
+  assert.equal(pointer.agent, "claude");
+  assert.equal(pointer.sessionId, body.data!.sessionId);
 });
 
 test("GET /api/plan-chat/draft/:id/history returns empty messages for fresh draft", async (t) => {
@@ -228,15 +234,17 @@ test("GET /api/specs/:id/plan-history returns 404 for unknown task", async (t) =
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
-test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => {
+test("DELETE /api/specs/:id/plan-history wipes saved and native chat state", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const planId = "wipe-target";
   makeDraftTask(h.store, planId, h.tmpHome, "feat(demo): wipe");
-  // Hand-write some history.
+  // Hand-write some history plus the native-session artifacts introduced by ADR-0025.
   const dir = path.join(h.forgeDir, "specs", planId);
   fs.mkdirSync(dir, { recursive: true });
   const histFile = path.join(dir, "plan-history.json");
+  const pointerFile = path.join(dir, "conversation.json");
+  const transcriptFile = path.join(dir, "native-transcript.jsonl");
   fs.writeFileSync(
     histFile,
     JSON.stringify({
@@ -247,6 +255,20 @@ test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => 
       ],
     }),
   );
+  fs.writeFileSync(
+    pointerFile,
+    JSON.stringify({
+      version: 1,
+      agent: "claude",
+      sessionId: "native-session",
+      cwd: h.tmpHome,
+      model: "claude-opus-4-8",
+      started: true,
+      createdAt: "now",
+      updatedAt: "now",
+    }),
+  );
+  fs.writeFileSync(transcriptFile, '{"native":true}\n');
   // Sanity: GET sees both messages.
   const before = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.equal((before.body.data!.messages as unknown[]).length, 2);
@@ -255,6 +277,8 @@ test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => 
   assert.equal(status, 200);
   assert.equal(body.data!.ok, true);
   assert.equal(fs.existsSync(histFile), false);
+  assert.equal(fs.existsSync(pointerFile), false, "native conversation pointer must reset on wipe");
+  assert.equal(fs.existsSync(transcriptFile), false, "spec transcript snapshot must reset on wipe");
 
   const after = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.deepEqual(after.body.data!.messages, []);
@@ -527,6 +551,104 @@ test("runChatTurn passes model as a single argv arg, not shell-interpolated", as
     assert.equal(observedArgs[i + 1], evilModel, "model must land verbatim, no shell expansion");
     // Sanity: argv must not contain bash-like wrapping.
     assert.ok(!observedArgs.includes("-lc"), "spawn must not invoke a shell wrapper");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn resumes native Claude session and sends only the new turn after seeding", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-resume-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const scope = { kind: "draft" as const, id: "d_resume1" };
+    const prompts: string[] = [];
+    const argSets: string[][] = [];
+    const stdoutFor = (text: string) =>
+      [
+        `{"type":"system","subtype":"init","cwd":"${repoRoot}","session_id":"native-s","tools":[],"model":"m"}`,
+        `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"${text}"}]}}`,
+        `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"${text}","total_cost_usd":0,"is_error":false}`,
+        "",
+      ].join("\n");
+    const spawnImpl = (_bin: string, args: string[]) => {
+      argSets.push([...args]);
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: Readable;
+        stderr: Readable;
+        stdin: PassThrough;
+        kill: () => boolean;
+      };
+      child.stdout = Readable.from(Buffer.from(stdoutFor(`reply-${argSets.length}`)));
+      child.stderr = Readable.from(Buffer.from(""));
+      child.stdin = new PassThrough();
+      child.kill = () => true;
+      let buf = "";
+      child.stdin.on("data", (chunk) => {
+        buf += chunk.toString("utf-8");
+      });
+      child.stdin.on("finish", () => prompts.push(buf));
+      setTimeout(() => child.emit("close", 0, null), 10);
+      return child as never;
+    };
+
+    await drainSse(runChatTurn({ forgeDir, scope, message: "first question", cwd: repoRoot, spawnImpl }).stream);
+    await new Promise((r) => setImmediate(r));
+    await drainSse(runChatTurn({ forgeDir, scope, message: "second question", cwd: repoRoot, spawnImpl }).stream);
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(argSets.length, 2);
+    assert.ok(argSets[0].includes("--session-id"), `first turn args: ${argSets[0].join(" ")}`);
+    assert.ok(!argSets[0].includes("--resume"), `first turn args: ${argSets[0].join(" ")}`);
+    assert.ok(argSets[1].includes("--resume"), `second turn args: ${argSets[1].join(" ")}`);
+    assert.equal(argSets[0][argSets[0].indexOf("--session-id") + 1], argSets[1][argSets[1].indexOf("--resume") + 1]);
+    assert.match(prompts[0], /# Planner skill/);
+    assert.match(prompts[0], /first question/);
+    assert.equal(prompts[1], "second question", "resumed turns must not replay Forge history");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn copies the full native transcript after spec-scoped turns", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-transcript-copy-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const claudeConfig = path.join(tmpHome, ".claude");
+    const scope = { kind: "spec" as const, id: "plan-transcript" };
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"${repoRoot}","session_id":"native-s","tools":[],"model":"m"}`,
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}]}}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"done","total_cost_usd":0,"is_error":false}`,
+      "",
+    ].join("\n");
+    const spawnImpl = (_bin: string, args: string[]) => {
+      const idx = args.indexOf("--session-id");
+      const sessionId = args[idx + 1];
+      const transcriptDir = path.join(claudeConfig, "projects", "arbitrary-hash");
+      fs.mkdirSync(transcriptDir, { recursive: true });
+      fs.writeFileSync(path.join(transcriptDir, `${sessionId}.jsonl`), '{"native":true}\n', "utf-8");
+      return fixtureChild(stdout) as never;
+    };
+
+    await drainSse(
+      runChatTurn({
+        forgeDir,
+        scope,
+        message: "copy transcript",
+        cwd: repoRoot,
+        spawnImpl,
+        transcriptConfigDir: claudeConfig,
+      }).stream,
+    );
+
+    const snapshot = path.join(forgeDir, "specs", scope.id, "native-transcript.jsonl");
+    assert.equal(fs.readFileSync(snapshot, "utf-8"), '{"native":true}\n');
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }
