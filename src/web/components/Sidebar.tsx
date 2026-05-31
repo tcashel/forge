@@ -1,8 +1,9 @@
 import { useComputed } from "@preact/signals";
-import { enterActivityMode, enterPrMode, enterSettingsMode, enterTaskMode } from "../lib/modes";
+import { enterActivityMode, enterPrMode, enterSettingsMode, enterTaskMode, enterWorktreesMode } from "../lib/modes";
 import { showToast } from "../lib/toast";
 import { repos } from "../signals/repos";
 import { activityFilter, modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
+import { refreshWorktrees } from "../signals/worktrees";
 import type { ActivityFilter, RepoView, SidebarFilter } from "../types";
 
 interface NavTarget {
@@ -90,6 +91,12 @@ export function Sidebar() {
     enterActivityMode();
   };
 
+  const onWorktrees = () => {
+    sidebarFilter.value = "worktrees";
+    enterWorktreesMode();
+    void refreshWorktrees();
+  };
+
   const onActivityChip = (id: ActivityFilter) => {
     activityFilter.value = id;
     if (viewMode.value !== "activity") {
@@ -174,6 +181,17 @@ export function Sidebar() {
             ))}
           </div>
         ) : null}
+        <button
+          type="button"
+          class={`nav-item${mode === "worktrees" ? " active" : ""}`}
+          id="nav-worktrees"
+          onClick={onWorktrees}
+        >
+          <span class="ic" style="color:var(--ready)">
+            ⌳
+          </span>
+          <span class="lbl">Worktrees</span>
+        </button>
         <div class="nav-section">Reference</div>
         <button
           type="button"

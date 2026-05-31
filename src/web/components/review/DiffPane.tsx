@@ -132,7 +132,6 @@ function RowContent({ row, lang }: { row: DiffRow; lang: ReturnType<typeof detec
   return (
     <span class="content">
       {tokens.map((t, i) => (
-        // biome-ignore lint/suspicious/noArrayIndexKey: tokens are stable per render
         <span key={i} style={t.color ? { color: t.color } : undefined}>
           {t.text}
         </span>

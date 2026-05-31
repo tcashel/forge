@@ -37,6 +37,7 @@ import { fetchPrBundle } from "../../core/gh-pr.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
+import { ensureWorktreeForBranch } from "../../core/worktrees.ts";
 import { findLatestForgeFindings } from "./review-actions.ts";
 
 const SCHEMA_VERSION = 1;
@@ -233,59 +234,25 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     });
   }
 
-  // 4) Resolve worktree. Prefer a Forge-launched worktree for this PR; for any
-  //    other PR, provision one on demand by checking out its head branch.
-  const worktreePath =
-    resolveWorktreePathForPr(store, repoRoot, prNum) ?? ensureWorktreeForPr(repoRoot, prNum, headRefName, ghEnv);
-  if (!fs.existsSync(worktreePath)) {
-    throw new CliError("NO_WORKTREE", `Worktree ${worktreePath} no longer exists on disk.`, { exitCode: 1 });
-  }
-  try {
-    const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    }).trim();
-    if (!root) throw new Error("rev-parse returned empty");
-  } catch {
-    throw new CliError("NO_WORKTREE", `${worktreePath} is not a git worktree.`, { exitCode: 1 });
-  }
+  // 4) Resolve worktree. A live, on-branch, clean worktree fails fast on
+  //    dirty/wrong-branch (those are recoverable, surface 409 immediately).
+  //    A missing worktree defers rehydration to the worker so the HTTP
+  //    response returns sessionId first and the Workbench can stream
+  //    rehydration progress via the existing log channel.
+  const recordedPath = resolveWorktreePathForPr(store, repoRoot, prNum);
+  const liveWorktreePath =
+    recordedPath && fs.existsSync(recordedPath) && isLiveWorktree(recordedPath) ? recordedPath : null;
+  const needsRehydrate = liveWorktreePath === null;
 
-  // 5) Worktree must be on the PR head branch.
-  if (headRefName) {
-    let currentBranch = "";
-    try {
-      currentBranch = execFileSync("git", ["-C", worktreePath, "branch", "--show-current"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new CliError("WORKTREE_BRANCH_MISMATCH", `Could not read worktree branch: ${msg}`, { exitCode: 1 });
-    }
-    if (currentBranch !== headRefName) {
-      throw new CliError(
-        "WORKTREE_BRANCH_MISMATCH",
-        `Worktree branch "${currentBranch}" does not match PR head "${headRefName}".`,
-        { exitCode: 1 },
-      );
-    }
-  }
-
-  // 6) Worktree must be clean.
-  let dirty = "";
-  try {
-    dirty = execFileSync("git", ["-C", worktreePath, "status", "--porcelain"], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new CliError("WORKTREE_DIRTY", `git status failed in worktree: ${msg}`, { exitCode: 1 });
-  }
-  if (dirty.trim().length > 0) {
-    throw new CliError("WORKTREE_DIRTY", `Worktree ${worktreePath} has uncommitted changes — commit or stash first.`, {
+  if (needsRehydrate && !headRefName) {
+    throw new CliError("NO_WORKTREE", `PR #${prNum} has no head branch to rehydrate from.`, {
+      hint: "The PR head branch may no longer exist on the remote.",
       exitCode: 1,
     });
+  }
+
+  if (liveWorktreePath) {
+    assertWorktreeReadyForCommentFix(liveWorktreePath, headRefName);
   }
 
   // 7) Match each target against what's actually fixable on the PR:
@@ -349,13 +316,18 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
   fs.writeFileSync(logFile, "", { flag: "a" });
 
   const startedAt = new Date().toISOString();
+  // When a rehydrate is needed, the worktree path won't be known until the
+  // worker has fetched the branch + created the worktree. Seed with the
+  // recorded path (may be a stale absolute) so the meta file is still
+  // structurally valid; the worker rewrites worktreePath after rehydrate.
+  const seedWorktreePath = liveWorktreePath ?? recordedPath ?? "";
   const seedMeta: CommentFixMeta = {
     schemaVersion: SCHEMA_VERSION,
     repoRoot,
     repoName,
     prNum,
     headRefName,
-    worktreePath,
+    worktreePath: seedWorktreePath,
     sessionId,
     startedAt,
     completedAt: null,
@@ -366,7 +338,8 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
   };
   fs.writeFileSync(path.join(runDir, "meta.json"), `${JSON.stringify(seedMeta, null, 2)}\n`, "utf-8");
 
-  // 10) Insert the session row.
+  // 10) Insert the session row. cwd is set to the recorded/live path when
+  // available; the worker updates it post-rehydrate when needed.
   upsertSession(store.db.db, {
     id: sessionId,
     purpose: "comment-fix",
@@ -374,7 +347,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     agentAdapter: repoConfig.reviewerAgent,
     model: repoConfig.reviewerModel,
     startedAt,
-    cwd: worktreePath,
+    cwd: seedWorktreePath || repoRoot,
     state: "running",
     metrics: {
       ...({
@@ -382,13 +355,16 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
         runDir,
         prNum,
         repoRoot,
-        worktreePath,
+        worktreePath: seedWorktreePath,
         targets: fixableTargets,
+        needsRehydrate,
+        headRefName,
       } as unknown as Partial<import("../../core/db/writes.ts").SessionMetrics>),
     },
   });
 
-  // 11) Spawn the detached worker.
+  // 11) Spawn the detached worker. cwd defaults to repoRoot when we need
+  //     to rehydrate (the rehydrate primitive runs `git -C <repoRoot> ...`).
   const logFd = fs.openSync(logFile, "a");
   try {
     const scriptPath = process.argv[1];
@@ -399,10 +375,11 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     if (!bunPath) {
       throw new CliError("INTERNAL", "Bun.which('bun') returned null — cannot locate bun on PATH");
     }
+    const spawnCwd = liveWorktreePath ?? repoRoot;
     const proc = Bun.spawn({
       cmd: [bunPath, scriptPath, "__comment-fix-worker", sessionId],
       stdio: ["ignore", logFd, logFd],
-      cwd: worktreePath,
+      cwd: spawnCwd,
       env: ghEnv,
     });
     proc.unref();
@@ -468,10 +445,11 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   const runDir = typeof metrics.runDir === "string" ? metrics.runDir : null;
   const prNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
   const repoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
-  const worktreePath = typeof metrics.worktreePath === "string" ? metrics.worktreePath : null;
+  let worktreePath = typeof metrics.worktreePath === "string" ? metrics.worktreePath : "";
+  const needsRehydrate = metrics.needsRehydrate === true;
   const targets = dedupeTargets(Array.isArray(metrics.targets) ? (metrics.targets as unknown[]) : []);
 
-  if (!runDir || prNum == null || !repoRoot || !worktreePath || targets.length === 0) {
+  if (!runDir || prNum == null || !repoRoot || (!worktreePath && !needsRehydrate) || targets.length === 0) {
     const err = "session row missing runDir/prNum/repoRoot/worktreePath/targets in metrics";
     finalizeSession(store.db.db, {
       id: sessionId,
@@ -495,7 +473,11 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
 
   process.stdout.write(`[forge:comment-fix-worker] starting fix on PR #${prNum} (${summarizeTargets(targets)})\n`);
-  process.stdout.write(`[forge:comment-fix-worker] worktree=${worktreePath}\n`);
+  if (needsRehydrate) {
+    process.stdout.write(`[forge:comment-fix-worker] worktree absent — will rehydrate from ${headRefName}\n`);
+  } else {
+    process.stdout.write(`[forge:comment-fix-worker] worktree=${worktreePath}\n`);
+  }
   process.stdout.write(`[forge:comment-fix-worker] agent=${row.agent_adapter} model=${row.model ?? "(unset)"}\n`);
 
   let exitCode = 0;
@@ -503,6 +485,42 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   let qualityResult: { ok: boolean; failedCommand: string | null } | null = null;
 
   try {
+    // 0) Rehydrate the worktree when missing. Progress streams to the session
+    //    log via stdout so the Workbench can watch it in real time.
+    if (needsRehydrate) {
+      if (!headRefName) {
+        throw new Error("rehydrate requested but no headRefName in meta");
+      }
+      const ensured = await ensureWorktreeForBranch(repoRoot, headRefName, {
+        onProgress: (msg) => process.stdout.write(`[forge:comment-fix-worker] rehydrate: ${msg}\n`),
+        prNumber: prNum,
+        ghEnv,
+      });
+      if (ensured.error || !ensured.worktreePath) {
+        throw new Error(
+          `could not rehydrate a worktree for PR #${prNum} on branch ${headRefName}: ${ensured.error ?? "(unknown)"}`,
+        );
+      }
+      worktreePath = ensured.worktreePath;
+      process.stdout.write(`[forge:comment-fix-worker] rehydrated worktree=${worktreePath}\n`);
+      // Persist the resolved path so future surfaces (forge worktree list,
+      // a re-run) find it. `jobs` rows are append-only history.
+      updatePlanWorktreePath(store, repoRoot, prNum, worktreePath, null);
+      // Update the session row's cwd + metrics so /api/sessions reflects reality.
+      const updatedMetrics = { ...metrics, worktreePath, needsRehydrate: false };
+      try {
+        store.db.db
+          .prepare("UPDATE sessions SET cwd = ?, metrics = ? WHERE id = ?")
+          .run(worktreePath, JSON.stringify(updatedMetrics), sessionId);
+      } catch {
+        /* annotation only */
+      }
+    }
+    if (!worktreePath) {
+      throw new Error("worker has no worktreePath after rehydrate gate");
+    }
+    assertWorktreeReadyForCommentFix(worktreePath, headRefName);
+
     // Capture HEAD so we can roll back the worktree on quality failure.
     let headSha = "";
     try {
@@ -732,6 +750,93 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+function assertWorktreeReadyForCommentFix(worktreePath: string, headRefName: string | null): void {
+  if (headRefName) {
+    let currentBranch = "";
+    try {
+      currentBranch = execFileSync("git", ["-C", worktreePath, "branch", "--show-current"], {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new CliError("WORKTREE_BRANCH_MISMATCH", `Could not read worktree branch: ${msg}`, { exitCode: 1 });
+    }
+    if (currentBranch !== headRefName) {
+      throw new CliError(
+        "WORKTREE_BRANCH_MISMATCH",
+        `Worktree branch "${currentBranch}" does not match PR head "${headRefName}".`,
+        { exitCode: 1 },
+      );
+    }
+  }
+
+  let dirty = "";
+  try {
+    dirty = execFileSync("git", ["-C", worktreePath, "status", "--porcelain"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new CliError("WORKTREE_DIRTY", `git status failed in worktree: ${msg}`, { exitCode: 1 });
+  }
+  if (dirty.trim().length > 0) {
+    throw new CliError("WORKTREE_DIRTY", `Worktree ${worktreePath} has uncommitted changes — commit or stash first.`, {
+      exitCode: 1,
+    });
+  }
+}
+
+function isLiveWorktree(worktreePath: string): boolean {
+  try {
+    const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    }).trim();
+    return root.length > 0;
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * Stamp the newest linked plan's `Plan.worktree` with the rehydrated path
+ * so future fix sessions and `forge worktree list` can find it. Mirrors
+ * `resolveWorktreePathForPr` in how it picks the "newest" plan.
+ */
+function updatePlanWorktreePath(
+  store: ForgeStore,
+  repoRoot: string,
+  prNumber: number,
+  newPath: string,
+  previousPath: string | null,
+): void {
+  try {
+    const candidates = store.getPlans(repoRoot).filter((p) => p.status !== "archived" && p.prNumber === prNumber);
+    if (candidates.length === 0) return;
+    const newest = [...candidates].sort((a, b) => {
+      const aKey = a.completedAt ?? a.launchedAt ?? a.createdAt;
+      const bKey = b.completedAt ?? b.launchedAt ?? b.createdAt;
+      return bKey.localeCompare(aKey);
+    })[0];
+    if (newest.worktree !== newPath) {
+      store.upsertPlan({ ...newest, worktree: newPath });
+    }
+    // If other plans still point at the now-stale path, scrub them too so
+    // listWorktrees doesn't double-count.
+    if (previousPath && previousPath !== newPath) {
+      for (const plan of candidates) {
+        if (plan.id !== newest.id && plan.worktree === previousPath) {
+          store.upsertPlan({ ...plan, worktree: null });
+        }
+      }
+    }
+  } catch {
+    /* annotation only */
+  }
+}
+
 function resolveWorktreePathForPr(store: ForgeStore, repoRoot: string, prNumber: number): string | null {
   try {
     const candidates = store.getPlans(repoRoot).filter((p) => p.status !== "archived" && p.prNumber === prNumber);
@@ -754,97 +859,6 @@ function resolveWorktreePathForPr(store: ForgeStore, repoRoot: string, prNumber:
   } catch {
     return null;
   }
-}
-
-/**
- * Provision a worktree for a PR Forge didn't launch itself. Checks out the
- * PR's existing head branch (via `gh pr checkout`, which handles forks and
- * configures push) into a deterministic `worktrees/pr-<num>-<branch>` dir, so
- * the comment-fix worker's `git push` lands on the PR branch.
- *
- * Reuses an existing provisioned worktree when one is already present and
- * valid; rebuilds it if the directory is stale/corrupt. Synchronous to match
- * the rest of runCommentFix's request-thread flow.
- */
-function ensureWorktreeForPr(
-  repoRoot: string,
-  prNum: number,
-  headRefName: string | null,
-  ghEnv: Record<string, string>,
-): string {
-  const sanitized = (headRefName || `pr-${prNum}`).replace(/[/\\]/g, "-");
-  const worktreePath = path.join(path.dirname(repoRoot), "worktrees", `pr-${prNum}-${sanitized}`);
-
-  const isValidWorktree = (p: string): boolean => {
-    try {
-      const root = execFileSync("git", ["-C", p, "rev-parse", "--show-toplevel"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-      return root.length > 0;
-    } catch {
-      return false;
-    }
-  };
-
-  // Reuse a still-valid worktree; runCommentFix's branch/clean checks gate it.
-  if (fs.existsSync(worktreePath) && isValidWorktree(worktreePath)) {
-    return worktreePath;
-  }
-
-  // Stale leftover (dir present but not a worktree): tear it down so the add
-  // below starts clean. `git worktree remove` clears git's bookkeeping.
-  if (fs.existsSync(worktreePath)) {
-    try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch {
-      /* best effort */
-    }
-    try {
-      fs.rmSync(worktreePath, { recursive: true, force: true });
-    } catch {
-      /* best effort */
-    }
-  }
-
-  // Detached add (no branch collision), then `gh pr checkout` to land the PR
-  // head branch with push configured.
-  try {
-    execFileSync("git", ["-C", repoRoot, "worktree", "add", "--detach", worktreePath, "HEAD"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new CliError("WORKTREE_PROVISION", `Could not create a worktree for PR #${prNum}: ${msg}`, {
-      hint: "Check that the repo has a clean main checkout and disk space, then retry.",
-      exitCode: 1,
-    });
-  }
-  try {
-    execFileSync("gh", ["pr", "checkout", String(prNum)], {
-      cwd: worktreePath,
-      env: ghEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    const err = e as { stderr?: string; message?: string };
-    const detail = (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "gh pr checkout failed";
-    // Roll back the half-provisioned worktree so a retry starts clean.
-    try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch {
-      /* best effort */
-    }
-    throw new CliError("WORKTREE_PROVISION", `Could not check out PR #${prNum} into a worktree: ${detail}`, {
-      hint: "Verify gh is authenticated for this repo's host and the PR branch is fetchable.",
-      exitCode: 1,
-    });
-  }
-  return worktreePath;
 }
 
 function readMetaSafe(metaPath: string): Record<string, unknown> | null {
