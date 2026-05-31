@@ -18,8 +18,20 @@ function tabsFor(t: PlanView): TabDef[] {
       enabled: isRun || t.kind === "failed" || t.section === "done",
       badgeKind: isRun ? "live" : undefined,
     },
-    { id: "spec", label: "Spec", enabled: t.hasSpec },
-    { id: "plan", label: "Plan chat", enabled: true },
+    {
+      id: "spec",
+      label: "Spec",
+      enabled: t.hasSpec,
+      badgeKind: t.openQuestionCount > 0 ? "pill" : undefined,
+      badgeText: t.openQuestionCount > 0 ? String(t.openQuestionCount) : undefined,
+    },
+    {
+      id: "plan",
+      label: "Plan workspace",
+      enabled: true,
+      badgeKind: t.openQuestionCount > 0 ? "pill" : undefined,
+      badgeText: t.openQuestionCount > 0 ? String(t.openQuestionCount) : undefined,
+    },
     {
       id: "critique",
       label: "Critique",

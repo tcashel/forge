@@ -60,9 +60,11 @@ interface PlannerChatProps {
    *   the task record, so passing it is a no-op symmetry with draft.
    */
   repoRoot?: string;
+  /** Fired when the server observes that the plan document or pending edit changed during a turn. */
+  onPlanUpdated?: () => void;
 }
 
-export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) {
+export function PlannerChat({ scope, id, onApply, repoRoot, onPlanUpdated }: PlannerChatProps) {
   // Server-side history (hydrated on mount + after each turn). Local
   // signals only — no global signal, since two modals could coexist
   // (Plan tab open + new-spec modal in the future).
@@ -241,6 +243,9 @@ export function PlannerChat({ scope, id, onApply, repoRoot }: PlannerChatProps) 
           },
           onRateLimit: (e) => {
             streamingRate.value = e;
+          },
+          onPlanUpdated: () => {
+            onPlanUpdated?.();
           },
           onDone: (final) => {
             receivedDone = true;

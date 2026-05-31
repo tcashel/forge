@@ -43,6 +43,15 @@ import {
   type ScopeRef,
   wipeHistory as wipePlanHistory,
 } from "../../core/plan-chat.ts";
+import { parsePlanDocument } from "../../core/plan-document.ts";
+import {
+  acceptPendingPlanEdit,
+  applyDirectPlanBodyEdit,
+  getPlanWorkspaceDocument,
+  PlanEditError,
+  rejectPendingPlanEdit,
+  summarizePlanForSse,
+} from "../../core/plan-edit.ts";
 import { detectRepo } from "../../core/repo.ts";
 import type {
   CritiqueMeta,
@@ -123,6 +132,7 @@ interface PlanView {
   tmuxAlive: boolean;
   hasSpec: boolean;
   hasLog: boolean;
+  openQuestionCount: number;
   critique: { id: string; status: CritiqueMeta["status"]; viewedAt: string | null } | null;
   lastImproveError: { mode: string; error: string; at: string } | null;
   provenance: { specVersion: number; priorRuns: number; lastRunState: string | null } | null;
@@ -434,6 +444,7 @@ function viewTask(task: Plan, store: ForgeStore): PlanView {
   const age = timeAgo(ageRef);
   const spec = store.getSpec(task.id);
   const blurb = spec ? blurbFromSpec(spec) : null;
+  const openQuestionCount = spec ? parsePlanDocument(spec).openQuestions.length : 0;
   const repoInfo = repoDiskInfo(task.repoRoot);
   return {
     id: task.id,
@@ -460,6 +471,7 @@ function viewTask(task: Plan, store: ForgeStore): PlanView {
     tmuxAlive: task.tmuxSession ? isTmuxSessionAlive(task.tmuxSession) : false,
     hasSpec: !!spec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
+    openQuestionCount,
     critique: info.critique,
     lastImproveError: task.lastImproveError,
     provenance: planProvenance(task, store),
@@ -830,7 +842,10 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // GET /api/plans/:id/critiques  (list of all attempts for visibility)
   // GET /api/plans/:id/history    (unified timeline — Phase 4)
   // GET /api/plans/:id/jobs       (every prior launch — Phase 4)
-  const taskMatch = pathname.match(/^\/api\/plans\/([^/]+)(?:\/(spec|log|critique|critiques|history|jobs))?$/);
+  // GET /api/plans/:id/plan-workspace (structured document + pending edit)
+  const taskMatch = pathname.match(
+    /^\/api\/plans\/([^/]+)(?:\/(spec|log|critique|critiques|history|jobs|plan-workspace))?$/,
+  );
   if (taskMatch) {
     const id = decodeURIComponent(taskMatch[1]);
     const sub = taskMatch[2];
@@ -848,6 +863,15 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       if (spec === null) return jsonErr(404, "NO_SPEC", `No spec on disk for task "${id}".`);
       const stripped = url.searchParams.get("raw") === "1" ? stripFrontmatter(spec) : spec;
       return jsonOk({ planId: id, body: stripped });
+    }
+
+    if (sub === "plan-workspace") {
+      try {
+        return jsonOk(getPlanWorkspaceDocument(store, id));
+      } catch (e) {
+        if (e instanceof PlanEditError) return jsonErr(e.status, e.code, e.message);
+        throw e;
+      }
     }
 
     if (sub === "critiques") {
@@ -1679,6 +1703,7 @@ const DRAFT_MSG_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/message$/;
 const DRAFT_ABORT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/abort$/;
 const DRAFT_PROMOTE_PATH = /^\/api\/plan-chat\/draft\/([^/]+)\/promote$/;
 const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
+const PLAN_EDIT_ACTION_PATH = /^\/api\/plans\/([^/]+)\/plan-edit\/(accept|reject|direct)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
 const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
@@ -1696,7 +1721,8 @@ function allowsPost(pathname: string): boolean {
     SPEC_PLAN_CHAT_ABORT_PATH.test(pathname) ||
     DRAFT_MSG_PATH.test(pathname) ||
     DRAFT_ABORT_PATH.test(pathname) ||
-    DRAFT_PROMOTE_PATH.test(pathname)
+    DRAFT_PROMOTE_PATH.test(pathname) ||
+    PLAN_EDIT_ACTION_PATH.test(pathname)
   )
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
@@ -1829,6 +1855,7 @@ function planChatSseResponse(opts: {
       specBody: opts.specBody,
       cwd: opts.cwd,
       db: opts.store.db,
+      onPlanUpdated: opts.scope.kind === "spec" ? () => summarizePlanForSse(opts.store, opts.scope.id) : undefined,
     });
   } catch (e) {
     // BAD_CWD is the only typed failure runChatTurn throws synchronously.
@@ -2029,6 +2056,23 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
   const parsed = await readJsonBody(req);
   if ("error" in parsed) return parsed.error;
   const body = parsed.body;
+
+  // POST /api/plans/:id/plan-edit/{accept|reject|direct}
+  const planEditMatch = pathname.match(PLAN_EDIT_ACTION_PATH);
+  if (planEditMatch) {
+    const planId = decodeURIComponent(planEditMatch[1]);
+    const action = planEditMatch[2];
+    try {
+      if (action === "accept") return jsonOk(acceptPendingPlanEdit(store, planId));
+      if (action === "reject") return jsonOk(rejectPendingPlanEdit(store, planId));
+      const nextBody = reqString(body, "body");
+      if (!nextBody) return jsonErr(400, "BAD_REQUEST", "`body` is required.");
+      return jsonOk(applyDirectPlanBodyEdit({ store, planId, body: nextBody, createdBy: "user" }));
+    } catch (e) {
+      if (e instanceof PlanEditError) return jsonErr(e.status, e.code, e.message);
+      throw e;
+    }
+  }
 
   // POST /api/prs/:num/run-review
   const runReviewMatch = pathname.match(PR_RUN_REVIEW_PATH);

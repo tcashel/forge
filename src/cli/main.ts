@@ -17,6 +17,7 @@ import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
 import * as ls from "./cmd/ls.ts";
 import * as migrate from "./cmd/migrate.ts";
+import * as plan from "./cmd/plan.ts";
 import * as review from "./cmd/review.ts";
 import { runExtractReviewBlock, runReviewWorker } from "./cmd/review-actions.ts";
 import * as run_ from "./cmd/run.ts";
@@ -40,6 +41,7 @@ const HELP_BY_CMD: Record<string, string> = {
   logs: logs.HELP,
   ls: ls.HELP,
   migrate: migrate.HELP,
+  plan: plan.HELP,
   review: review.HELP,
   run: run_.HELP,
   serve: serve.HELP,
@@ -69,6 +71,7 @@ Commands:
   logs <id>        Print or tail (-f) the run log
   wait <id>        Block until the task reaches a terminal state
   history <id>     Unified timeline of every event recorded for a plan
+  plan get <id>    Show structured plan sections and pending edits
   run ls <id>      List every prior job for a plan
   run show         Detail for one job (forge run show <plan-id> <run-number>)
   migrate          One-time backfill of ~/.forge/ JSON into forge.db
@@ -164,6 +167,9 @@ export async function run(argv: string[]): Promise<void> {
         return;
       case "history":
         await history.run(rest, store);
+        return;
+      case "plan":
+        await plan.run(rest, store);
         return;
       case "run":
         await run_.run(rest, store);
