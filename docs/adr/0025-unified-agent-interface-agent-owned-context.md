@@ -1,6 +1,6 @@
 # ADR 0025 — Unified agent-calling interface; the agent owns conversation context
 
-**Status:** Proposed
+**Status:** Accepted
 **Deciders:** Tripp
 **Date:** 2026-05-30
 **Related:** [`0006-subprocess-agents`](./0006-subprocess-agents.md), [`0004-bring-your-own-agent`](./0004-bring-your-own-agent.md), [`0005-plan-as-document`](./0005-plan-as-document.md), [`0019-sessions-are-jobs`](./0019-sessions-are-jobs.md), [`../ROADMAP.md`](../ROADMAP.md)
