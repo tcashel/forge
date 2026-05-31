@@ -1,7 +1,10 @@
 import { strict as assert } from "node:assert";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 import { test } from "node:test";
-import { agentCommand, planChatInvocation } from "../src/core/agents/index.ts";
+import { agentCommand, locateTranscript, mintNativeSession, planChatInvocation } from "../src/core/agents/index.ts";
 import type { LaunchTarget } from "../src/core/store.ts";
 
 interface AgentCase {
@@ -70,6 +73,42 @@ test("plan-chat legacy claude argv snapshot stays byte-identical", () => {
       "claude-opus-4-8",
     ],
   });
+});
+
+
+test("native Claude session argv and transcript lookup use assigned session id", () => {
+  const session = { agent: "claude" as const, sessionId: "11111111-2222-4333-8444-555555555555" };
+  assert.deepEqual(planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: false }).args.slice(0, 3), [
+    "--print",
+    "--session-id",
+    session.sessionId,
+  ]);
+  assert.deepEqual(planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: true }).args.slice(0, 3), [
+    "--print",
+    "--resume",
+    session.sessionId,
+  ]);
+
+  const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "forge-claude-transcript-"));
+  try {
+    const transcriptDir = path.join(tmp, "projects", "arbitrary-cwd-hash");
+    fs.mkdirSync(transcriptDir, { recursive: true });
+    const transcript = path.join(transcriptDir, `${session.sessionId}.jsonl`);
+    fs.writeFileSync(transcript, "{}\n", "utf-8");
+    assert.equal(locateTranscript(session, { configDir: tmp }), transcript);
+    assert.throws(
+      () => locateTranscript({ agent: "claude", sessionId: "missing-session" }, { configDir: tmp }),
+      /Claude transcript missing-session\.jsonl was not found/,
+    );
+  } finally {
+    fs.rmSync(tmp, { recursive: true, force: true });
+  }
+});
+
+test("mintNativeSession assigns UUID session ids", () => {
+  const session = mintNativeSession("claude");
+  assert.equal(session.agent, "claude");
+  assert.match(session.sessionId, /^[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
 });
 
 for (const c of CASES) {

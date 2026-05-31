@@ -1,4 +1,7 @@
 import { spawn, type ChildProcess } from "node:child_process";
+import { randomUUID } from "node:crypto";
+import * as fs from "node:fs";
+import * as os from "node:os";
 import * as path from "node:path";
 import type { LaunchTarget } from "../store.ts";
 
@@ -11,6 +14,15 @@ export interface AgentCommandOptions {
 export interface AgentInvocation {
   binary: string;
   args: string[];
+}
+
+export interface NativeAgentSession {
+  agent: LaunchTarget;
+  sessionId: string;
+}
+
+export interface LocateTranscriptOptions {
+  configDir?: string;
 }
 
 export function agentCommand(
@@ -64,11 +76,24 @@ export function claudeJobCommand(model: string, promptFile: string, streamPath: 
   return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${claudeJobStreamFilter}`;
 }
 
-export function planChatInvocation(model: string): AgentInvocation {
+export function mintNativeSession(agent: LaunchTarget): NativeAgentSession {
+  return { agent, sessionId: randomUUID() };
+}
+
+export function planChatInvocation(
+  model: string,
+  session?: { sessionId: string; resume: boolean },
+): AgentInvocation {
+  const sessionArgs = session
+    ? session.resume
+      ? ["--resume", session.sessionId]
+      : ["--session-id", session.sessionId]
+    : [];
   return {
     binary: "claude",
     args: [
       "--print",
+      ...sessionArgs,
       "--output-format",
       "stream-json",
       "--verbose",
@@ -82,4 +107,38 @@ export function planChatInvocation(model: string): AgentInvocation {
 
 export function defaultAgentSpawn(binary: string, args: string[], cwd?: string): ChildProcess {
   return spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd });
+}
+
+
+export function locateTranscript(session: NativeAgentSession, opts: LocateTranscriptOptions = {}): string {
+  if (session.agent !== "claude") {
+    throw new Error(`native transcript lookup is not implemented for ${session.agent}`);
+  }
+  const projectsDir = path.join(opts.configDir ?? path.join(os.homedir(), ".claude"), "projects");
+  const target = `${session.sessionId}.jsonl`;
+  const matches: string[] = [];
+
+  const visit = (dir: string) => {
+    let entries: fs.Dirent[];
+    try {
+      entries = fs.readdirSync(dir, { withFileTypes: true });
+    } catch {
+      return;
+    }
+    for (const ent of entries) {
+      const full = path.join(dir, ent.name);
+      if (ent.isDirectory()) {
+        visit(full);
+      } else if (ent.isFile() && ent.name === target) {
+        matches.push(full);
+      }
+    }
+  };
+
+  visit(projectsDir);
+  if (matches.length === 0) {
+    throw new Error(`Claude transcript ${target} was not found under ${projectsDir}`);
+  }
+  matches.sort();
+  return matches[0];
 }
