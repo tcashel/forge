@@ -124,12 +124,16 @@ test("POST /api/plan-chat/draft mints a draftId and creates the history file", a
   assert.equal(body.ok, true);
   const draftId = body.data!.draftId as string;
   assert.match(draftId, /^d_[0-9a-f]{8}$/);
+  assert.match(body.data!.sessionId as string, /^[0-9a-f-]{36}$/);
   // Folder + history.json should exist on disk.
   const historyFile = path.join(h.forgeDir, "plan-drafts", draftId, "history.json");
   assert.equal(fs.existsSync(historyFile), true);
   const parsed = JSON.parse(fs.readFileSync(historyFile, "utf-8"));
   assert.equal(parsed.version, 1);
   assert.deepEqual(parsed.messages, []);
+  const pointer = JSON.parse(fs.readFileSync(path.join(h.forgeDir, "plan-drafts", draftId, "conversation.json"), "utf-8"));
+  assert.equal(pointer.agent, "claude");
+  assert.equal(pointer.sessionId, body.data!.sessionId);
 });
 
 test("GET /api/plan-chat/draft/:id/history returns empty messages for fresh draft", async (t) => {
@@ -582,6 +586,42 @@ test("runChatTurn resumes native Claude session and sends only the new turn afte
     assert.match(prompts[0], /# Planner skill/);
     assert.match(prompts[0], /first question/);
     assert.equal(prompts[1], "second question", "resumed turns must not replay Forge history");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
+test("runChatTurn copies the full native transcript after spec-scoped turns", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-transcript-copy-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const claudeConfig = path.join(tmpHome, ".claude");
+    const scope = { kind: "spec" as const, id: "plan-transcript" };
+    const stdout = [
+      `{"type":"system","subtype":"init","cwd":"${repoRoot}","session_id":"native-s","tools":[],"model":"m"}`,
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"done"}]}}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"done","total_cost_usd":0,"is_error":false}`,
+      "",
+    ].join("\n");
+    const spawnImpl = (_bin: string, args: string[]) => {
+      const idx = args.indexOf("--session-id");
+      const sessionId = args[idx + 1];
+      const transcriptDir = path.join(claudeConfig, "projects", "arbitrary-hash");
+      fs.mkdirSync(transcriptDir, { recursive: true });
+      fs.writeFileSync(path.join(transcriptDir, `${sessionId}.jsonl`), "{\"native\":true}\n", "utf-8");
+      return fixtureChild(stdout) as never;
+    };
+
+    await drainSse(
+      runChatTurn({ forgeDir, scope, message: "copy transcript", cwd: repoRoot, spawnImpl, transcriptConfigDir: claudeConfig })
+        .stream,
+    );
+
+    const snapshot = path.join(forgeDir, "specs", scope.id, "native-transcript.jsonl");
+    assert.equal(fs.readFileSync(snapshot, "utf-8"), "{\"native\":true}\n");
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }

@@ -22,7 +22,7 @@ import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultAgentSpawn, type AgentSpawnImpl, mintNativeSession, planChatInvocation } from "./agents/index.ts";
+import { defaultAgentSpawn, type AgentSpawnImpl, locateTranscript, mintNativeSession, planChatInvocation } from "./agents/index.ts";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.ts";
 import { parseResultEvent } from "./claude-stream.ts";
 import type { ForgeDb } from "./db/connection.ts";
@@ -187,6 +187,7 @@ export function wipeHistory(forgeDir: string, scope: ScopeRef): void {
 
 export interface CreateDraftResult {
   draftId: string;
+  sessionId: string;
 }
 
 export function createDraft(forgeDir: string): CreateDraftResult {
@@ -194,7 +195,8 @@ export function createDraft(forgeDir: string): CreateDraftResult {
   const dir = draftDir(forgeDir, draftId);
   fs.mkdirSync(dir, { recursive: true });
   atomicWriteJSON(path.join(dir, "history.json"), { version: 1, messages: [] });
-  return { draftId };
+  const pointer = createConversationPointer(forgeDir, { kind: "draft", id: draftId });
+  return { draftId, sessionId: pointer.sessionId };
 }
 
 export function deleteDraft(forgeDir: string, draftId: string): void {
@@ -231,6 +233,14 @@ export function promoteDraft(forgeDir: string, draftId: string, planId: string):
     fs.copyFileSync(draftHistory, target);
     fs.rmSync(draftHistory, { force: true });
   }
+
+  const draftPointer = readConversationPointer(forgeDir, { kind: "draft", id: draftId });
+  if (draftPointer) {
+    const promotedPointer = { ...draftPointer, updatedAt: new Date().toISOString() };
+    writeConversationPointer(forgeDir, { kind: "spec", id: planId }, promotedPointer);
+    copyNativeTranscriptSnapshot(forgeDir, { kind: "spec", id: planId }, promotedPointer);
+  }
+
   // Clean up the now-empty draft folder (and any leftover prompt files).
   fs.rmSync(draftRoot, { recursive: true, force: true });
 }
@@ -327,6 +337,23 @@ function writeConversationPointer(forgeDir: string, scope: ScopeRef, pointer: Co
   atomicWriteJSON(conversationPointerPath(forgeDir, scope), pointer);
 }
 
+function createConversationPointer(forgeDir: string, scope: ScopeRef, patch: { cwd?: string | null; model?: string | null } = {}): ConversationPointer {
+  const session = mintNativeSession("claude");
+  const now = new Date().toISOString();
+  const pointer: ConversationPointer = {
+    version: 1,
+    agent: "claude",
+    sessionId: session.sessionId,
+    cwd: patch.cwd ?? null,
+    model: patch.model ?? null,
+    started: false,
+    createdAt: now,
+    updatedAt: now,
+  };
+  writeConversationPointer(forgeDir, scope, pointer);
+  return pointer;
+}
+
 function getOrCreateConversationPointer(
   forgeDir: string,
   scope: ScopeRef,
@@ -344,19 +371,7 @@ function getOrCreateConversationPointer(
     writeConversationPointer(forgeDir, scope, updated);
     return updated;
   }
-  const session = mintNativeSession("claude");
-  const created: ConversationPointer = {
-    version: 1,
-    agent: "claude",
-    sessionId: session.sessionId,
-    cwd: patch.cwd ?? null,
-    model: patch.model,
-    started: false,
-    createdAt: now,
-    updatedAt: now,
-  };
-  writeConversationPointer(forgeDir, scope, created);
-  return created;
+  return createConversationPointer(forgeDir, scope, { cwd: patch.cwd ?? null, model: patch.model });
 }
 
 function markConversationStarted(forgeDir: string, scope: ScopeRef): void {
@@ -423,6 +438,8 @@ export interface RunChatTurnOptions {
    * Agent Activity coverage.
    */
   db?: ForgeDb;
+  /** Test seam for transcript lookup. Production uses Claude's default config dir. */
+  transcriptConfigDir?: string;
 }
 
 /**
@@ -472,6 +489,21 @@ function turnPromptFile(chatDir: string, scope: ScopeRef, turn: number): string 
   // artifacts; drafts use the simpler `turn-N.txt`.
   const name = scope.kind === "spec" ? `plan-turn-${turn}.txt` : `turn-${turn}.txt`;
   return path.join(chatDir, name);
+}
+
+function transcriptSnapshotPath(forgeDir: string, planId: string): string {
+  return path.join(specChatDir(forgeDir, planId), "native-transcript.jsonl");
+}
+
+function copyNativeTranscriptSnapshot(
+  forgeDir: string,
+  scope: ScopeRef,
+  pointer: ConversationPointer,
+  opts: { configDir?: string } = {},
+): void {
+  if (scope.kind !== "spec" || !pointer.started) return;
+  const src = locateTranscript({ agent: "claude", sessionId: pointer.sessionId }, { configDir: opts.configDir });
+  fs.copyFileSync(src, transcriptSnapshotPath(forgeDir, scope.id));
 }
 
 // ─── stream-json parsing ────────────────────────────────────────────────────
@@ -1006,6 +1038,8 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
           try {
             appendMessage(forgeDir, scope, assistantMsg);
             markConversationStarted(forgeDir, scope);
+            const startedPointer = readConversationPointer(forgeDir, scope);
+            if (startedPointer) copyNativeTranscriptSnapshot(forgeDir, scope, startedPointer, { configDir: opts.transcriptConfigDir });
             // Clean up the prompt file on success.
             try {
               fs.rmSync(promptFile, { force: true });
