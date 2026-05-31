@@ -75,19 +75,16 @@ test("plan-chat legacy claude argv snapshot stays byte-identical", () => {
   });
 });
 
-
 test("native Claude session argv and transcript lookup use assigned session id", () => {
   const session = { agent: "claude" as const, sessionId: "11111111-2222-4333-8444-555555555555" };
-  assert.deepEqual(planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: false }).args.slice(0, 3), [
-    "--print",
-    "--session-id",
-    session.sessionId,
-  ]);
-  assert.deepEqual(planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: true }).args.slice(0, 3), [
-    "--print",
-    "--resume",
-    session.sessionId,
-  ]);
+  assert.deepEqual(
+    planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: false }).args.slice(0, 3),
+    ["--print", "--session-id", session.sessionId],
+  );
+  assert.deepEqual(
+    planChatInvocation("claude-opus-4-8", { sessionId: session.sessionId, resume: true }).args.slice(0, 3),
+    ["--print", "--resume", session.sessionId],
+  );
 
   const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "forge-claude-transcript-"));
   try {

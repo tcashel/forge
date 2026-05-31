@@ -22,7 +22,13 @@ import type { ChildProcess } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { defaultAgentSpawn, type AgentSpawnImpl, locateTranscript, mintNativeSession, planChatInvocation } from "./agents/index.ts";
+import {
+  type AgentSpawnImpl,
+  defaultAgentSpawn,
+  locateTranscript,
+  mintNativeSession,
+  planChatInvocation,
+} from "./agents/index.ts";
 import { atomicWriteJSON, atomicWriteText } from "./atomic-write.ts";
 import { parseResultEvent } from "./claude-stream.ts";
 import type { ForgeDb } from "./db/connection.ts";
@@ -337,7 +343,11 @@ function writeConversationPointer(forgeDir: string, scope: ScopeRef, pointer: Co
   atomicWriteJSON(conversationPointerPath(forgeDir, scope), pointer);
 }
 
-function createConversationPointer(forgeDir: string, scope: ScopeRef, patch: { cwd?: string | null; model?: string | null } = {}): ConversationPointer {
+function createConversationPointer(
+  forgeDir: string,
+  scope: ScopeRef,
+  patch: { cwd?: string | null; model?: string | null } = {},
+): ConversationPointer {
   const session = mintNativeSession("claude");
   const now = new Date().toISOString();
   const pointer: ConversationPointer = {
@@ -1039,7 +1049,8 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
             appendMessage(forgeDir, scope, assistantMsg);
             markConversationStarted(forgeDir, scope);
             const startedPointer = readConversationPointer(forgeDir, scope);
-            if (startedPointer) copyNativeTranscriptSnapshot(forgeDir, scope, startedPointer, { configDir: opts.transcriptConfigDir });
+            if (startedPointer)
+              copyNativeTranscriptSnapshot(forgeDir, scope, startedPointer, { configDir: opts.transcriptConfigDir });
             // Clean up the prompt file on success.
             try {
               fs.rmSync(promptFile, { force: true });

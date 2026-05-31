@@ -1,4 +1,4 @@
-import { spawn, type ChildProcess } from "node:child_process";
+import { type ChildProcess, spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
@@ -80,10 +80,7 @@ export function mintNativeSession(agent: LaunchTarget): NativeAgentSession {
   return { agent, sessionId: randomUUID() };
 }
 
-export function planChatInvocation(
-  model: string,
-  session?: { sessionId: string; resume: boolean },
-): AgentInvocation {
+export function planChatInvocation(model: string, session?: { sessionId: string; resume: boolean }): AgentInvocation {
   const sessionArgs = session
     ? session.resume
       ? ["--resume", session.sessionId]
@@ -108,7 +105,6 @@ export function planChatInvocation(
 export function defaultAgentSpawn(binary: string, args: string[], cwd?: string): ChildProcess {
   return spawn(binary, args, { stdio: ["pipe", "pipe", "pipe"], env: process.env, cwd });
 }
-
 
 export function locateTranscript(session: NativeAgentSession, opts: LocateTranscriptOptions = {}): string {
   if (session.agent !== "claude") {
