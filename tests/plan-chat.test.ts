@@ -532,6 +532,61 @@ test("runChatTurn passes model as a single argv arg, not shell-interpolated", as
   }
 });
 
+test("runChatTurn resumes native Claude session and sends only the new turn after seeding", async () => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-chat-resume-"));
+  try {
+    const forgeDir = path.join(tmpHome, ".forge");
+    fs.mkdirSync(forgeDir, { recursive: true });
+    const repoRoot = path.join(tmpHome, "fake-repo");
+    fs.mkdirSync(repoRoot, { recursive: true });
+    const scope = { kind: "draft" as const, id: "d_resume1" };
+    const prompts: string[] = [];
+    const argSets: string[][] = [];
+    const stdoutFor = (text: string) => [
+      `{"type":"system","subtype":"init","cwd":"${repoRoot}","session_id":"native-s","tools":[],"model":"m"}`,
+      `{"type":"assistant","message":{"id":"m1","content":[{"type":"text","text":"${text}"}]}}`,
+      `{"type":"result","subtype":"success","duration_ms":1,"num_turns":1,"result":"${text}","total_cost_usd":0,"is_error":false}`,
+      "",
+    ].join("\n");
+    const spawnImpl = (_bin: string, args: string[]) => {
+      argSets.push([...args]);
+      const child = new EventEmitter() as EventEmitter & {
+        stdout: Readable;
+        stderr: Readable;
+        stdin: PassThrough;
+        kill: () => boolean;
+      };
+      child.stdout = Readable.from(Buffer.from(stdoutFor(`reply-${argSets.length}`)));
+      child.stderr = Readable.from(Buffer.from(""));
+      child.stdin = new PassThrough();
+      child.kill = () => true;
+      let buf = "";
+      child.stdin.on("data", (chunk) => {
+        buf += chunk.toString("utf-8");
+      });
+      child.stdin.on("finish", () => prompts.push(buf));
+      setTimeout(() => child.emit("close", 0, null), 10);
+      return child as never;
+    };
+
+    await drainSse(runChatTurn({ forgeDir, scope, message: "first question", cwd: repoRoot, spawnImpl }).stream);
+    await new Promise((r) => setImmediate(r));
+    await drainSse(runChatTurn({ forgeDir, scope, message: "second question", cwd: repoRoot, spawnImpl }).stream);
+    await new Promise((r) => setImmediate(r));
+
+    assert.equal(argSets.length, 2);
+    assert.ok(argSets[0].includes("--session-id"), `first turn args: ${argSets[0].join(" ")}`);
+    assert.ok(!argSets[0].includes("--resume"), `first turn args: ${argSets[0].join(" ")}`);
+    assert.ok(argSets[1].includes("--resume"), `second turn args: ${argSets[1].join(" ")}`);
+    assert.equal(argSets[0][argSets[0].indexOf("--session-id") + 1], argSets[1][argSets[1].indexOf("--resume") + 1]);
+    assert.match(prompts[0], /# Planner skill/);
+    assert.match(prompts[0], /first question/);
+    assert.equal(prompts[1], "second question", "resumed turns must not replay Forge history");
+  } finally {
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  }
+});
+
 test("POST /api/plan-chat/draft/:id/message with bogus repoRoot returns SSE error event", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
