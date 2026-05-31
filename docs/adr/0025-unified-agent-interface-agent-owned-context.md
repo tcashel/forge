@@ -23,7 +23,7 @@ A second, deeper problem sits underneath the planning chat specifically. It does
 
 Meanwhile the agents already solve this for us, verified against current CLIs (May 2026):
 
-- **Claude Code:** `--resume <id>` / `--continue` work in `--print` + `stream-json` headless mode. `--session-id <uuid>` lets us *assign* the id at start (so Forge owns the mapping without scraping). `CLAUDE_CONFIG_DIR` relocates all session JSONL transcripts under a path Forge controls. `--no-session-persistence` and `CLAUDE_CODE_SKIP_PROMPT_HISTORY` exist if we ever want to opt out.
+- **Claude Code:** `--resume <id>` / `--continue` work in `--print` + `stream-json` headless mode. `--session-id <uuid>` lets us *assign* the id at start (so Forge owns the mapping without scraping). Session JSONL transcripts live under the default config dir at `projects/<cwd-hash>/<session-id>.jsonl`. (`CLAUDE_CONFIG_DIR` can relocate that dir, but the Decision rejects using it — it also holds credentials. `--no-session-persistence` and `CLAUDE_CODE_SKIP_PROMPT_HISTORY` exist if we ever want to opt out.)
 - **Codex:** `codex resume <SESSION_ID>` / `--last` / `--all`; transcripts under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`; a specific file can be loaded via the **experimental** `-c experimental_resume="<path>"`. Real, but rougher than Claude (path-based, no clean id assignment).
 - Other agents (opencode, gemini) have weaker or no resume story.
 
@@ -48,7 +48,7 @@ Keep reconstructing the prompt each turn, but losslessly — replay full `blocks
 
 ### B — The agent owns conversation context (native resume), Forge owns the graph
 
-Each conversation maps to a native agent session (`--session-id` / `--resume` for Claude; `resume` for Codex). Forge sends only the *new* user turn and lets the agent remember the rest. Forge relocates the agent's own transcript into its tree (`CLAUDE_CONFIG_DIR` / Codex session path) and reads that JSONL for the verbose audit trail. Forge stores a **pointer** (`{ agent, sessionId, cwd, transcriptPath }`) plus its own lightweight mirror used only for cross-conversation listing and plan links — never as the turn-by-turn source of truth.
+Each conversation maps to a native agent session (`--session-id` / `--resume` for Claude; `resume` for Codex). Forge sends only the *new* user turn and lets the agent remember the rest. The agent writes to its **own default session store** (Forge does not relocate it — see the auth correction in the Decision section); Forge **locates** that JSONL by the assigned `--session-id` and reads/copies it for the verbose audit trail. Forge stores a **pointer** (`{ agent, sessionId, cwd }`) plus, at spec state, a durable copy — never the turn-by-turn source of truth for continuity.
 
 **Pros:**
 - **Prompt caching works** → cheaper, faster.
@@ -114,9 +114,9 @@ The adapter interface is tiered and honest about asymmetry: `mint` / `resume` / 
 This ADR gates the Phase A1 plan-workspace rebuild. Recommended sequence, each step shippable and non-regressing:
 
 1. **Land the adapter seam** behind the existing behavior — `agentCommand`/`claudeJobCommand` move *inside* it; the eight call sites call the adapter but produce byte-identical invocations. Pure refactor, no behavior change, full green test suite. This is the "don't break what works" gate.
-2. **Add native-session support to the adapter** (Claude `--session-id`/`--resume`, `CLAUDE_CONFIG_DIR` relocation) as a new capability, unused by launch/critique/review yet.
+2. **Add native-session support to the adapter** (Claude `--session-id`/`--resume`) as a new capability, unused by launch/critique/review yet. The agent keeps its **default** config/session location — **no `CLAUDE_CONFIG_DIR` relocation** (it would break auth; see the Decision section). Forge **locates** the transcript by the assigned `--session-id` (glob for `<session-id>.jsonl`) and **copies** it at spec promotion, per step 4.
 3. **Cut plan-chat over to resume-based context**; delete `buildTurnPrompt` replay; UI tails the native JSONL.
-4. **Introduce the conversation-graph data model** (durable, linkable) and retire the ephemeral-draft lifecycle.
+4. **Introduce the conversation lifecycle + transcript snapshot** — auto-save conversations as pointers, archive = delete pointer row only, and the full transcript copy at spec promotion (re-copied each subsequent turn). Durable, linkable; retires the ephemeral promote-or-reap draft lifecycle.
 5. Later, opportunistically migrate launch/critique/review/comment-fix to native sessions where it buys caching; they are correct as-is on the adapter and need not change in lockstep.
 
 ### Audited agent call sites (all must route through the adapter)
