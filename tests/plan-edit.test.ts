@@ -8,6 +8,7 @@ import {
   acceptPendingPlanEdit,
   applyDirectPlanBodyEdit,
   getPlanWorkspaceDocument,
+  resolveOpenQuestion,
   stageOpenQuestion,
   stagePlanSectionEdit,
 } from "../src/core/plan-edit.ts";
@@ -109,6 +110,40 @@ test("staged planner edit is reviewable and accept writes a new plan_versions ro
   }
 });
 
+test("multiple staged planner edits accumulate into one pending diff", () => {
+  const { store, forgeDir } = makeStore();
+  try {
+    makeTask(
+      store,
+      "# feat(plan): multi edit\n\n## Goals\n\n- Old goal\n\n## Approach\n\n- Old approach\n\n## Open Questions\n\n- [ ] First?\n",
+    );
+    const first = stagePlanSectionEdit({
+      store,
+      planId: "plan-edit-test",
+      section: "goals",
+      content: "- New goal",
+    });
+    const second = stagePlanSectionEdit({
+      store,
+      planId: "plan-edit-test",
+      section: "approach",
+      content: "- New approach",
+    });
+
+    assert.equal(second.id, first.id, "subsequent edits update the existing pending edit");
+    assert.match(second.diff, /\+- New goal/);
+    assert.match(second.diff, /\+- New approach/);
+    assert.deepEqual(second.openQuestions, ["First?"]);
+
+    const accepted = acceptPendingPlanEdit(store, "plan-edit-test");
+    assert.equal(accepted.parsed.sections.goals.content, "- New goal");
+    assert.equal(accepted.parsed.sections.approach.content, "- New approach");
+    assert.equal(accepted.openQuestionCount, 1);
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
 test("open question staging drives workspace count and direct edits persist as user versions", () => {
   const { store, forgeDir } = makeStore();
   try {
@@ -129,6 +164,34 @@ test("open question staging drives workspace count and direct edits persist as u
       .get("plan-edit-test") as { created_by: string; open_questions: string | null };
     assert.equal(v2.created_by, "user");
     assert.equal(v2.open_questions, null);
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
+test("resolveOpenQuestion skips checked matches and resolves the open item", () => {
+  const { store, forgeDir } = makeStore();
+  try {
+    makeTask(
+      store,
+      [
+        "# feat(plan): questions",
+        "",
+        "## Open Questions",
+        "",
+        "- [x] Confirm owner?",
+        "- [ ] Confirm owner?",
+        "- [ ] Different question?",
+        "",
+      ].join("\n"),
+    );
+
+    const edit = resolveOpenQuestion({ store, planId: "plan-edit-test", query: "Confirm owner" });
+    const lines = edit.sections.open_questions.content.split("\n");
+    assert.equal(lines[0], "- [x] Confirm owner?");
+    assert.equal(lines[1], "- [x] Confirm owner?");
+    assert.equal(lines[2], "- [ ] Different question?");
+    assert.deepEqual(edit.openQuestions, ["Different question?"]);
   } finally {
     fs.rmSync(forgeDir, { recursive: true, force: true });
   }

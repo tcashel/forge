@@ -104,6 +104,41 @@ export function deletePendingPlanEdit(store: ForgeStore, planId: string): void {
   fs.rmSync(pendingEditPath(store, planId), { force: true });
 }
 
+function editablePlanDocument(
+  store: ForgeStore,
+  task: Plan,
+): {
+  baseDocument: string;
+  documentToEdit: string;
+  baseVersion: number;
+  existingEdit: PendingPlanEdit | null;
+} {
+  const currentDocument = requireDocument(store, task.id);
+  const currentVersion = task.specVersion ?? 1;
+  const existingEdit = readPendingPlanEdit(store, task.id);
+  if (!existingEdit) {
+    return {
+      baseDocument: currentDocument,
+      documentToEdit: currentDocument,
+      baseVersion: currentVersion,
+      existingEdit: null,
+    };
+  }
+  if (currentDocument !== existingEdit.baseDocument || currentVersion !== existingEdit.baseVersion) {
+    throw new PlanEditError(
+      "STALE_EDIT",
+      "Pending edit is based on an older spec version; reject it and ask the planner to re-apply.",
+      409,
+    );
+  }
+  return {
+    baseDocument: existingEdit.baseDocument,
+    documentToEdit: existingEdit.proposedDocument,
+    baseVersion: existingEdit.baseVersion,
+    existingEdit,
+  };
+}
+
 export function getPlanWorkspaceDocument(store: ForgeStore, planId: string): PlanWorkspaceDocument {
   const task = requireTask(store, planId);
   const document = requireDocument(store, planId);
@@ -129,24 +164,24 @@ export function stagePlanSectionEdit(opts: {
   note?: string | null;
 }): PendingPlanEdit {
   const task = requireTask(opts.store, opts.planId);
-  const baseDocument = requireDocument(opts.store, opts.planId);
-  const proposedDocument = updatePlanSection(baseDocument, opts.section, opts.content);
-  if (proposedDocument === baseDocument) {
+  const { baseDocument, documentToEdit, baseVersion, existingEdit } = editablePlanDocument(opts.store, task);
+  const proposedDocument = updatePlanSection(documentToEdit, opts.section, opts.content);
+  if (proposedDocument === documentToEdit) {
     throw new PlanEditError("NO_CHANGE", `Section "${opts.section}" already has that content.`, 409);
   }
   const now = new Date().toISOString();
   const parsed = parsePlanDocument(proposedDocument);
   const edit: PendingPlanEdit = {
     version: 1,
-    id: newPendingEditId(),
+    id: existingEdit?.id ?? newPendingEditId(),
     planId: opts.planId,
-    baseVersion: task.specVersion ?? 1,
+    baseVersion,
     baseDocument,
     proposedDocument,
     diff: unifiedDiff(stripFrontmatter(baseDocument), stripFrontmatter(proposedDocument), "current", "proposed"),
     createdBy: opts.createdBy ?? "agent:planner",
     note: opts.note ?? null,
-    createdAt: now,
+    createdAt: existingEdit?.createdAt ?? now,
     updatedAt: now,
     sections: parsed.sections,
     openQuestions: parsed.openQuestions,
@@ -161,8 +196,10 @@ export function stageOpenQuestion(opts: {
   question: string;
   createdBy?: PlanEditCreatedBy;
 }): PendingPlanEdit {
-  const current = getPlanWorkspaceDocument(opts.store, opts.planId);
-  const existing = current.parsed.sections.open_questions.content.trim();
+  const task = requireTask(opts.store, opts.planId);
+  const { documentToEdit } = editablePlanDocument(opts.store, task);
+  const parsed = parsePlanDocument(documentToEdit);
+  const existing = parsed.sections.open_questions.content.trim();
   const next = `${existing ? `${existing}\n` : ""}- [ ] ${opts.question.trim()}`;
   return stagePlanSectionEdit({
     store: opts.store,
@@ -180,16 +217,20 @@ export function resolveOpenQuestion(opts: {
   query: string;
   createdBy?: PlanEditCreatedBy;
 }): PendingPlanEdit {
-  const current = getPlanWorkspaceDocument(opts.store, opts.planId);
+  const task = requireTask(opts.store, opts.planId);
+  const { documentToEdit } = editablePlanDocument(opts.store, task);
+  const current = parsePlanDocument(documentToEdit);
   const needle = opts.query.trim().toLowerCase();
-  const lines = current.parsed.sections.open_questions.content.split("\n");
+  const lines = current.sections.open_questions.content.split("\n");
   let changed = false;
   const nextLines = lines.map((line) => {
     const normalized = line.toLowerCase();
     if (changed || !normalized.includes(needle)) return line;
+    const trimmed = line.trim();
+    if (/^[-*]\s+\[[xX]\]/.test(trimmed)) return line;
     changed = true;
-    if (/^[-*]\s+\[\s\]/.test(line.trim())) return line.replace(/\[\s\]/, "[x]");
-    if (/^[-*]\s+/.test(line.trim())) return line.replace(/^(\s*[-*]\s+)/, "$1[x] ");
+    if (/^[-*]\s+\[\s\]/.test(trimmed)) return line.replace(/\[\s\]/, "[x]");
+    if (/^[-*]\s+/.test(trimmed)) return line.replace(/^(\s*[-*]\s+)/, "$1[x] ");
     return line;
   });
   if (!changed) throw new PlanEditError("QUESTION_NOT_FOUND", `No open question matched "${opts.query}".`, 404);
