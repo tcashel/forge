@@ -252,45 +252,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
   }
 
   if (liveWorktreePath) {
-    // 5) Worktree must be on the PR head branch.
-    if (headRefName) {
-      let currentBranch = "";
-      try {
-        currentBranch = execFileSync("git", ["-C", liveWorktreePath, "branch", "--show-current"], {
-          encoding: "utf-8",
-          stdio: ["pipe", "pipe", "pipe"],
-        }).trim();
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        throw new CliError("WORKTREE_BRANCH_MISMATCH", `Could not read worktree branch: ${msg}`, { exitCode: 1 });
-      }
-      if (currentBranch !== headRefName) {
-        throw new CliError(
-          "WORKTREE_BRANCH_MISMATCH",
-          `Worktree branch "${currentBranch}" does not match PR head "${headRefName}".`,
-          { exitCode: 1 },
-        );
-      }
-    }
-
-    // 6) Worktree must be clean.
-    let dirty = "";
-    try {
-      dirty = execFileSync("git", ["-C", liveWorktreePath, "status", "--porcelain"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      throw new CliError("WORKTREE_DIRTY", `git status failed in worktree: ${msg}`, { exitCode: 1 });
-    }
-    if (dirty.trim().length > 0) {
-      throw new CliError(
-        "WORKTREE_DIRTY",
-        `Worktree ${liveWorktreePath} has uncommitted changes — commit or stash first.`,
-        { exitCode: 1 },
-      );
-    }
+    assertWorktreeReadyForCommentFix(liveWorktreePath, headRefName);
   }
 
   // 7) Match each target against what's actually fixable on the PR:
@@ -531,6 +493,8 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       }
       const ensured = await ensureWorktreeForBranch(repoRoot, headRefName, {
         onProgress: (msg) => process.stdout.write(`[forge:comment-fix-worker] rehydrate: ${msg}\n`),
+        prNumber: prNum,
+        ghEnv,
       });
       if (ensured.error || !ensured.worktreePath) {
         throw new Error(
@@ -555,6 +519,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
     if (!worktreePath) {
       throw new Error("worker has no worktreePath after rehydrate gate");
     }
+    assertWorktreeReadyForCommentFix(worktreePath, headRefName);
 
     // Capture HEAD so we can roll back the worktree on quality failure.
     let headSha = "";
@@ -785,6 +750,44 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
+function assertWorktreeReadyForCommentFix(worktreePath: string, headRefName: string | null): void {
+  if (headRefName) {
+    let currentBranch = "";
+    try {
+      currentBranch = execFileSync("git", ["-C", worktreePath, "branch", "--show-current"], {
+        encoding: "utf-8",
+        stdio: ["pipe", "pipe", "pipe"],
+      }).trim();
+    } catch (e) {
+      const msg = e instanceof Error ? e.message : String(e);
+      throw new CliError("WORKTREE_BRANCH_MISMATCH", `Could not read worktree branch: ${msg}`, { exitCode: 1 });
+    }
+    if (currentBranch !== headRefName) {
+      throw new CliError(
+        "WORKTREE_BRANCH_MISMATCH",
+        `Worktree branch "${currentBranch}" does not match PR head "${headRefName}".`,
+        { exitCode: 1 },
+      );
+    }
+  }
+
+  let dirty = "";
+  try {
+    dirty = execFileSync("git", ["-C", worktreePath, "status", "--porcelain"], {
+      encoding: "utf-8",
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    throw new CliError("WORKTREE_DIRTY", `git status failed in worktree: ${msg}`, { exitCode: 1 });
+  }
+  if (dirty.trim().length > 0) {
+    throw new CliError("WORKTREE_DIRTY", `Worktree ${worktreePath} has uncommitted changes — commit or stash first.`, {
+      exitCode: 1,
+    });
+  }
+}
+
 function isLiveWorktree(worktreePath: string): boolean {
   try {
     const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
@@ -856,97 +859,6 @@ function resolveWorktreePathForPr(store: ForgeStore, repoRoot: string, prNumber:
   } catch {
     return null;
   }
-}
-
-/**
- * Provision a worktree for a PR Forge didn't launch itself. Checks out the
- * PR's existing head branch (via `gh pr checkout`, which handles forks and
- * configures push) into a deterministic `worktrees/pr-<num>-<branch>` dir, so
- * the comment-fix worker's `git push` lands on the PR branch.
- *
- * Reuses an existing provisioned worktree when one is already present and
- * valid; rebuilds it if the directory is stale/corrupt. Synchronous to match
- * the rest of runCommentFix's request-thread flow.
- */
-function ensureWorktreeForPr(
-  repoRoot: string,
-  prNum: number,
-  headRefName: string | null,
-  ghEnv: Record<string, string>,
-): string {
-  const sanitized = (headRefName || `pr-${prNum}`).replace(/[/\\]/g, "-");
-  const worktreePath = path.join(path.dirname(repoRoot), "worktrees", `pr-${prNum}-${sanitized}`);
-
-  const isValidWorktree = (p: string): boolean => {
-    try {
-      const root = execFileSync("git", ["-C", p, "rev-parse", "--show-toplevel"], {
-        encoding: "utf-8",
-        stdio: ["pipe", "pipe", "pipe"],
-      }).trim();
-      return root.length > 0;
-    } catch {
-      return false;
-    }
-  };
-
-  // Reuse a still-valid worktree; runCommentFix's branch/clean checks gate it.
-  if (fs.existsSync(worktreePath) && isValidWorktree(worktreePath)) {
-    return worktreePath;
-  }
-
-  // Stale leftover (dir present but not a worktree): tear it down so the add
-  // below starts clean. `git worktree remove` clears git's bookkeeping.
-  if (fs.existsSync(worktreePath)) {
-    try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch {
-      /* best effort */
-    }
-    try {
-      fs.rmSync(worktreePath, { recursive: true, force: true });
-    } catch {
-      /* best effort */
-    }
-  }
-
-  // Detached add (no branch collision), then `gh pr checkout` to land the PR
-  // head branch with push configured.
-  try {
-    execFileSync("git", ["-C", repoRoot, "worktree", "add", "--detach", worktreePath, "HEAD"], {
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    throw new CliError("WORKTREE_PROVISION", `Could not create a worktree for PR #${prNum}: ${msg}`, {
-      hint: "Check that the repo has a clean main checkout and disk space, then retry.",
-      exitCode: 1,
-    });
-  }
-  try {
-    execFileSync("gh", ["pr", "checkout", String(prNum)], {
-      cwd: worktreePath,
-      env: ghEnv,
-      stdio: ["pipe", "pipe", "pipe"],
-    });
-  } catch (e) {
-    const err = e as { stderr?: string; message?: string };
-    const detail = (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "gh pr checkout failed";
-    // Roll back the half-provisioned worktree so a retry starts clean.
-    try {
-      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-    } catch {
-      /* best effort */
-    }
-    throw new CliError("WORKTREE_PROVISION", `Could not check out PR #${prNum} into a worktree: ${detail}`, {
-      hint: "Verify gh is authenticated for this repo's host and the PR branch is fetchable.",
-      exitCode: 1,
-    });
-  }
-  return worktreePath;
 }
 
 function readMetaSafe(metaPath: string): Record<string, unknown> | null {

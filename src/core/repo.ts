@@ -284,6 +284,40 @@ function isBootstrapped(worktreePath: string, stack: Stack): boolean {
   }
 }
 
+export async function bootstrapWorktree(
+  root: string,
+  worktreePath: string,
+  stack: Stack,
+  options: Pick<CreateWorktreeOptions, "onProgress" | "skipBootstrap" | "mode"> = {},
+): Promise<void> {
+  const { onProgress, skipBootstrap, mode = "create-branch" } = options;
+  const progress = (msg: string) => onProgress?.(msg);
+  if (skipBootstrap) return;
+  if (mode === "checkout-existing" && isBootstrapped(worktreePath, stack)) return;
+
+  // Bootstrap based on stack.
+  const bootstrap: Record<Stack, [string, string[]] | null> = {
+    "js-ts": fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
+    nuxt: fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
+    python: fs.existsSync(path.join(root, "pyproject.toml")) ? ["uv", ["sync"]] : null,
+    rust: null,
+    unknown: null,
+  };
+  const cmd = bootstrap[stack];
+  if (!cmd) return;
+
+  progress(`Bootstrapping deps: ${cmd[0]} ${cmd[1].join(" ")}…`);
+  const boot = await spawnAsync(cmd[0], cmd[1], {
+    cwd: worktreePath,
+    timeoutMs: 300_000,
+    onLine: (line) => progress(line.slice(0, 120)),
+  });
+  if (!boot.ok) {
+    // Non-fatal — the agent can retry. Surface a warning but keep going.
+    progress(`bootstrap warning: ${boot.error}`);
+  }
+}
+
 export async function createWorktree(
   root: string,
   branch: string,
@@ -323,32 +357,7 @@ export async function createWorktree(
   });
   if (!wt.ok) return { worktreePath, error: `git worktree add failed: ${wt.error}` };
 
-  if (skipBootstrap) return { worktreePath, error: null };
-  if (mode === "checkout-existing" && isBootstrapped(worktreePath, stack)) {
-    return { worktreePath, error: null };
-  }
-
-  // Bootstrap based on stack
-  const bootstrap: Record<Stack, [string, string[]] | null> = {
-    "js-ts": fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
-    nuxt: fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
-    python: fs.existsSync(path.join(root, "pyproject.toml")) ? ["uv", ["sync"]] : null,
-    rust: null,
-    unknown: null,
-  };
-  const cmd = bootstrap[stack];
-  if (cmd) {
-    progress(`Bootstrapping deps: ${cmd[0]} ${cmd[1].join(" ")}…`);
-    const boot = await spawnAsync(cmd[0], cmd[1], {
-      cwd: worktreePath,
-      timeoutMs: 300_000,
-      onLine: (line) => progress(line.slice(0, 120)),
-    });
-    if (!boot.ok) {
-      // Non-fatal — the agent can retry. Surface a warning but keep going.
-      progress(`bootstrap warning: ${boot.error}`);
-    }
-  }
+  await bootstrapWorktree(root, worktreePath, stack, { onProgress, skipBootstrap, mode });
 
   return { worktreePath, error: null };
 }

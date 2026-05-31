@@ -18,7 +18,10 @@ import {
   ensureWorktreeForBranch,
   isCleanMergedTarget,
   listWorktrees,
+  parkWorktreeForTest,
+  resolveMainWorktreeRoot,
   resolveWorktreeTarget,
+  restoreFromTestState,
   type WorktreeEntry,
 } from "../src/core/worktrees.ts";
 
@@ -47,6 +50,10 @@ function tmpDir(prefix: string): string {
 
 function git(repoRoot: string, args: string[]): string {
   return execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+}
+
+function gitRaw(args: string[]): string {
+  return execFileSync("git", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
 }
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
@@ -288,6 +295,11 @@ test("listWorktrees annotates a live worktree with PR linkage + safety", () => {
     // Merged + clean + (likely) unpushed/no-upstream → still "safe" because
     // merged trumps unpushed.
     assert.equal(e.safety, "safe");
+
+    const entriesFromLinkedWorktree = listWorktrees(wtPath, store, { ghPrState: () => "merged" });
+    assert.equal(entriesFromLinkedWorktree.length, 1);
+    assert.equal(entriesFromLinkedWorktree[0].managed, true);
+    assert.equal(resolveMainWorktreeRoot(wtPath), fs.realpathSync(repoDir));
   } finally {
     fs.rmSync(forgeDir, { recursive: true, force: true });
     fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
@@ -326,6 +338,95 @@ test("ensureWorktreeForBranch is idempotent when a live worktree already exists 
   } finally {
     fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("ensureWorktreeForBranch force-refreshes a stale local branch before rehydrating", async () => {
+  const root = tmpDir("forge-wt-force-fetch-");
+  const remoteDir = path.join(root, "remote.git");
+  const repoDir = path.join(root, "repo");
+  const otherDir = path.join(root, "other");
+  try {
+    gitRaw(["init", "--bare", remoteDir]);
+    gitRaw(["clone", remoteDir, repoDir]);
+    git(repoDir, ["checkout", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "main\n");
+    git(repoDir, ["add", "README.md"]);
+    git(repoDir, ["commit", "-m", "init"]);
+    git(repoDir, ["push", "-u", "origin", "HEAD:main"]);
+    git(repoDir, ["checkout", "-b", "feature"]);
+    fs.writeFileSync(path.join(repoDir, "feature.txt"), "old\n");
+    git(repoDir, ["add", "feature.txt"]);
+    git(repoDir, ["commit", "-m", "old feature"]);
+    git(repoDir, ["push", "-u", "origin", "feature"]);
+    git(repoDir, ["checkout", "main"]);
+
+    gitRaw(["clone", remoteDir, otherDir]);
+    git(otherDir, ["config", "user.email", "test@example.com"]);
+    git(otherDir, ["config", "user.name", "Test"]);
+    git(otherDir, ["checkout", "-B", "feature", "origin/main"]);
+    fs.writeFileSync(path.join(otherDir, "feature.txt"), "new\n");
+    git(otherDir, ["add", "feature.txt"]);
+    git(otherDir, ["commit", "-m", "force-pushed feature"]);
+    git(otherDir, ["push", "--force", "origin", "feature"]);
+    const remoteSha = git(otherDir, ["rev-parse", "HEAD"]);
+
+    const ensured = await ensureWorktreeForBranch(repoDir, "feature");
+    assert.equal(ensured.error, null);
+    assert.equal(git(ensured.worktreePath, ["rev-parse", "HEAD"]), remoteSha);
+    assert.equal(fs.readFileSync(path.join(ensured.worktreePath, "feature.txt"), "utf-8"), "new\n");
+  } finally {
+    fs.rmSync(path.join(root, "worktrees"), { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("ensureWorktreeForBranch can rehydrate a fork PR via gh pr checkout fallback", async () => {
+  const root = tmpDir("forge-wt-fork-pr-");
+  const remoteDir = path.join(root, "remote.git");
+  const repoDir = path.join(root, "repo");
+  const fakeBin = path.join(root, "bin");
+  try {
+    gitRaw(["init", "--bare", remoteDir]);
+    gitRaw(["clone", remoteDir, repoDir]);
+    git(repoDir, ["checkout", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "main\n");
+    git(repoDir, ["add", "README.md"]);
+    git(repoDir, ["commit", "-m", "init"]);
+    git(repoDir, ["push", "-u", "origin", "HEAD:main"]);
+
+    fs.mkdirSync(fakeBin, { recursive: true });
+    const ghScript = path.join(fakeBin, "gh");
+    fs.writeFileSync(
+      ghScript,
+      [
+        "#!/usr/bin/env bash",
+        "set -euo pipefail",
+        'if [ "$1" = "pr" ] && [ "$2" = "checkout" ] && [ "$3" = "123" ]; then',
+        "  git checkout -B fork-branch",
+        "  exit 0",
+        "fi",
+        'echo "unexpected gh args: $*" >&2',
+        "exit 1",
+        "",
+      ].join("\n"),
+    );
+    fs.chmodSync(ghScript, 0o755);
+
+    const ensured = await ensureWorktreeForBranch(repoDir, "fork-branch", {
+      prNumber: 123,
+      ghEnv: { ...process.env, PATH: `${fakeBin}${path.delimiter}${process.env.PATH ?? ""}` },
+    });
+    assert.equal(ensured.error, null);
+    assert.equal(ensured.rehydrated, true);
+    assert.equal(git(ensured.worktreePath, ["branch", "--show-current"]), "fork-branch");
+  } finally {
+    fs.rmSync(path.join(root, "worktrees"), { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
   }
 });
 
@@ -411,6 +512,40 @@ test("resolveWorktreeTarget: numeric collides with a branch literally named that
   ];
   const r = resolveWorktreeTarget(entries, "42");
   assert.equal(r.kind, "ambiguous");
+});
+
+test("restoreFromTestState restores main before reattaching the parked worktree", () => {
+  const forgeDir = tmpDir("forge-wt-restore-state-");
+  const repoDir = tmpDir("forge-wt-restore-repo-");
+  try {
+    git(repoDir, ["init", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "main\n");
+    git(repoDir, ["add", "README.md"]);
+    git(repoDir, ["commit", "-m", "init"]);
+
+    const branch = "restore-branch";
+    const worktreeRoot = path.join(path.dirname(repoDir), "worktrees");
+    fs.mkdirSync(worktreeRoot, { recursive: true });
+    const wtPath = path.join(worktreeRoot, branch);
+    git(repoDir, ["worktree", "add", "-b", branch, wtPath]);
+
+    const store = new ForgeStore({ forgeDir });
+    const entry = makeEntry({ path: wtPath, branch, safety: "removable" });
+    parkWorktreeForTest(store, repoDir, entry);
+    assert.equal(git(repoDir, ["branch", "--show-current"]), branch);
+    assert.equal(git(wtPath, ["branch", "--show-current"]), "");
+
+    const restored = restoreFromTestState(store, repoDir);
+    assert.equal(restored.restoredTo, "main");
+    assert.equal(git(repoDir, ["branch", "--show-current"]), "main");
+    assert.equal(git(wtPath, ["branch", "--show-current"]), branch);
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+    fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
+    fs.rmSync(repoDir, { recursive: true, force: true });
+  }
 });
 
 // ─── linkage via jobs table (no Plan.worktree) ─────────────────────────────

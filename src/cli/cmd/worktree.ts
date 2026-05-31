@@ -21,6 +21,7 @@ import {
   listWorktrees,
   parkWorktreeForTest,
   removeWorktreeUnsafe,
+  resolveMainWorktreeRoot,
   resolveWorktreeTarget,
   restoreFromTestState,
   TestLocallyError,
@@ -325,7 +326,7 @@ function resolveRepoRoot(): string {
   if (!repo) {
     throw new CliError("NOT_A_REPO", `Not inside a git repository: ${process.cwd()}`, { exitCode: 1 });
   }
-  return repo.root;
+  return resolveMainWorktreeRoot(repo.root);
 }
 
 function pickEntry(

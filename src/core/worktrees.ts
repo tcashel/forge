@@ -14,7 +14,7 @@ import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { resolveGhEnv } from "./gh.ts";
-import { createWorktree, detectRepo } from "./repo.ts";
+import { bootstrapWorktree, createWorktree, detectRepo, type RepoProfile } from "./repo.ts";
 import type { ForgeStore } from "./store.ts";
 
 export type WorktreeSafety = "unmanaged" | "in-use" | "unsafe" | "safe" | "removable" | "unknown";
@@ -60,6 +60,15 @@ export interface ListWorktreesOptions {
 
 export interface EnsureWorktreeOptions {
   onProgress?: (msg: string) => void;
+  /**
+   * Optional PR number for fork rehydration. When the base repo's `origin`
+   * does not contain `branch`, we can provision a detached worktree and run
+   * `gh pr checkout <prNumber>` inside it, which handles fork remotes and
+   * push setup.
+   */
+  prNumber?: number;
+  /** Env vars scoped to `gh pr checkout` (usually from resolveGhEnv). */
+  ghEnv?: NodeJS.ProcessEnv;
 }
 
 /**
@@ -71,18 +80,24 @@ export interface EnsureWorktreeOptions {
  */
 export function listWorktrees(repoRoot: string, store: ForgeStore, opts: ListWorktreesOptions = {}): WorktreeEntry[] {
   const rawWorktrees = readWorktreesPorcelain(repoRoot);
-  const realRepoRoot = realPathOrSelf(repoRoot);
+  const mainRepoRoot = resolveMainWorktreeRoot(repoRoot, rawWorktrees);
+  const realRepoRoot = realPathOrSelf(mainRepoRoot);
   const repoBase = path.join(path.dirname(realRepoRoot), "worktrees");
   const runningCwds = readRunningSessionCwds(store);
   // Scope `gh pr view` to this repo's configured account/host so multi-account
   // and Enterprise setups resolve PR state with the right token. resolveGhEnv
   // returns {} (no override, no `gh` call) when ghUser/ghHost are unset.
-  const repoConfig = store.getRepoConfig(repoRoot);
-  const ghEnv = { ...process.env, ...resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost }).env };
+  const repoConfig = store.getRepoConfig(mainRepoRoot);
+  const ghEnvResult = resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost });
+  const ghEnv = { ...process.env, ...ghEnvResult.env };
   const prStateCache = new Map<number, WorktreePrState>();
   const resolvePrState = (prNumber: number): WorktreePrState => {
     if (prStateCache.has(prNumber)) return prStateCache.get(prNumber) as WorktreePrState;
-    const v = opts.ghPrState ? opts.ghPrState(prNumber, repoRoot) : queryPrState(prNumber, repoRoot, ghEnv);
+    const v = opts.ghPrState
+      ? opts.ghPrState(prNumber, mainRepoRoot)
+      : ghEnvResult.error
+        ? null
+        : queryPrState(prNumber, mainRepoRoot, ghEnv);
     const finalV = v ?? "unknown";
     prStateCache.set(prNumber, finalV);
     return finalV;
@@ -92,7 +107,7 @@ export function listWorktrees(repoRoot: string, store: ForgeStore, opts: ListWor
   for (const raw of rawWorktrees) {
     if (samePath(raw.path, realRepoRoot)) continue; // main checkout
     if (!fs.existsSync(raw.path)) continue; // out-of-band removed
-    const linkage = derivePlanLinkage(store, repoRoot, raw.path, raw.branch);
+    const linkage = derivePlanLinkage(store, mainRepoRoot, raw.path, raw.branch);
     const prState: WorktreePrState = linkage.prNumber == null ? "unlinked" : resolvePrState(linkage.prNumber);
     const dirty = computeDirty(raw.path);
     const { unpushed, unpushedReason } = computeUnpushed(raw.path);
@@ -206,13 +221,20 @@ export async function ensureWorktreeForBranch(
   opts: EnsureWorktreeOptions = {},
 ): Promise<{ worktreePath: string; rehydrated: boolean; error: string | null }> {
   const onProgress = opts.onProgress ?? (() => {});
+  const rawWorktrees = readWorktreesPorcelain(repoRoot);
+  const mainRepoRoot = resolveMainWorktreeRoot(repoRoot, rawWorktrees);
 
   // 1) If we already have a live worktree on this branch, reuse it.
-  const existing = readWorktreesPorcelain(repoRoot).find(
-    (wt) => wt.path !== repoRoot && wt.branch === branch && fs.existsSync(wt.path),
+  const existing = rawWorktrees.find(
+    (wt) => !samePath(wt.path, mainRepoRoot) && wt.branch === branch && fs.existsSync(wt.path),
   );
   if (existing) {
     return { worktreePath: existing.path, rehydrated: false, error: null };
+  }
+
+  const repo = detectRepo(mainRepoRoot);
+  if (!repo) {
+    return { worktreePath: "", rehydrated: false, error: `Not a git repo: ${mainRepoRoot}` };
   }
 
   // 2) Fetch the branch ref from the remote so `git worktree add <path> <branch>` resolves.
@@ -223,7 +245,7 @@ export async function ensureWorktreeForBranch(
   // returned early), so resetting the dangling local ref is safe — and if the branch is
   // checked out in main, `worktree add` would refuse regardless.
   try {
-    execFileSync("git", ["-C", repoRoot, "fetch", "origin", `+${branch}:${branch}`], {
+    execFileSync("git", ["-C", mainRepoRoot, "fetch", "origin", `+${branch}:${branch}`], {
       stdio: ["pipe", "pipe", "pipe"],
       timeout: 60_000,
     });
@@ -232,12 +254,19 @@ export async function ensureWorktreeForBranch(
     // fetching just the remote ref. If neither works the branch is genuinely gone;
     // surface a NO_WORKTREE-class error.
     try {
-      execFileSync("git", ["-C", repoRoot, "fetch", "origin", branch], {
+      execFileSync("git", ["-C", mainRepoRoot, "fetch", "origin", branch], {
         stdio: ["pipe", "pipe", "pipe"],
         timeout: 60_000,
       });
     } catch (e2) {
       const msg = e2 instanceof Error ? e2.message : String(e2);
+      if (opts.prNumber != null) {
+        return ensureWorktreeViaGhPrCheckout(mainRepoRoot, branch, opts.prNumber, repo, {
+          ghEnv: opts.ghEnv,
+          onProgress,
+          fetchError: msg,
+        });
+      }
       return {
         worktreePath: "",
         rehydrated: false,
@@ -247,11 +276,7 @@ export async function ensureWorktreeForBranch(
   }
 
   // 3) Create the worktree against the existing branch.
-  const repo = detectRepo(repoRoot);
-  if (!repo) {
-    return { worktreePath: "", rehydrated: false, error: `Not a git repo: ${repoRoot}` };
-  }
-  const create = await createWorktree(repoRoot, branch, repo.worktreeScript, repo.stack, {
+  const create = await createWorktree(mainRepoRoot, branch, repo.worktreeScript, repo.stack, {
     onProgress,
     mode: "checkout-existing",
   });
@@ -300,7 +325,7 @@ export function removeWorktreeUnsafe(
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
-interface RawWorktree {
+export interface RawWorktree {
   path: string;
   branch: string | null;
   head: string;
@@ -339,6 +364,98 @@ function readWorktreesPorcelain(repoRoot: string): RawWorktree[] {
     result.push({ path: current.path, branch: current.branch ?? null, head: current.head ?? "" });
   }
   return result;
+}
+
+export function resolveMainWorktreeRoot(
+  repoRoot: string,
+  rawWorktrees: RawWorktree[] = readWorktreesPorcelain(repoRoot),
+): string {
+  const commonGitDir = runGitCapture(repoRoot, ["rev-parse", "--path-format=absolute", "--git-common-dir"]);
+  if (commonGitDir) {
+    for (const wt of rawWorktrees) {
+      if (!fs.existsSync(wt.path)) continue;
+      const gitDir = runGitCapture(wt.path, ["rev-parse", "--path-format=absolute", "--git-dir"]);
+      if (gitDir && samePath(gitDir, commonGitDir)) return wt.path;
+    }
+  }
+  // `git worktree list` emits the primary checkout first. Use it as a
+  // fallback when older git versions don't support --path-format.
+  return rawWorktrees[0]?.path ?? repoRoot;
+}
+
+async function ensureWorktreeViaGhPrCheckout(
+  repoRoot: string,
+  branch: string,
+  prNumber: number,
+  repo: RepoProfile,
+  opts: { ghEnv?: NodeJS.ProcessEnv; onProgress: (msg: string) => void; fetchError: string },
+): Promise<{ worktreePath: string; rehydrated: boolean; error: string | null }> {
+  const sanitized = branch.replace(/[/\\]/g, "-");
+  const worktreePath = path.join(path.dirname(repoRoot), "worktrees", sanitized);
+  opts.onProgress(`origin/${branch} unavailable (${opts.fetchError}); falling back to gh pr checkout ${prNumber}`);
+
+  const collision = readWorktreesPorcelain(repoRoot).find((wt) => samePath(wt.path, worktreePath));
+  if (collision) {
+    return {
+      worktreePath,
+      rehydrated: false,
+      error: `target worktree path ${worktreePath} is already registered on branch ${collision.branch ?? "(detached)"}`,
+    };
+  }
+  if (fs.existsSync(worktreePath)) {
+    try {
+      fs.rmSync(worktreePath, { recursive: true, force: true });
+    } catch (e) {
+      return {
+        worktreePath,
+        rehydrated: false,
+        error: `could not remove stale path ${worktreePath}: ${e instanceof Error ? e.message : String(e)}`,
+      };
+    }
+  }
+
+  try {
+    fs.mkdirSync(path.dirname(worktreePath), { recursive: true });
+    execFileSync("git", ["-C", repoRoot, "worktree", "add", "--detach", worktreePath, "HEAD"], {
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 60_000,
+    });
+  } catch (e) {
+    return {
+      worktreePath,
+      rehydrated: false,
+      error: `git worktree add --detach failed: ${execErrorSummary(e)}`,
+    };
+  }
+
+  try {
+    execFileSync("gh", ["pr", "checkout", String(prNumber)], {
+      cwd: worktreePath,
+      env: opts.ghEnv ?? process.env,
+      stdio: ["pipe", "pipe", "pipe"],
+      timeout: 120_000,
+    });
+  } catch (e) {
+    try {
+      execFileSync("git", ["-C", repoRoot, "worktree", "remove", "--force", worktreePath], {
+        stdio: ["pipe", "pipe", "pipe"],
+        timeout: 30_000,
+      });
+    } catch {
+      /* best effort */
+    }
+    return {
+      worktreePath,
+      rehydrated: false,
+      error: `gh pr checkout ${prNumber} failed: ${execErrorSummary(e)}`,
+    };
+  }
+
+  await bootstrapWorktree(repoRoot, worktreePath, repo.stack, {
+    onProgress: opts.onProgress,
+    mode: "checkout-existing",
+  });
+  return { worktreePath, rehydrated: true, error: null };
 }
 
 function readRunningSessionCwds(store: ForgeStore): Set<string> {
@@ -786,6 +903,12 @@ function runGitCapture(repoRoot: string, args: string[]): string | null {
   } catch {
     return null;
   }
+}
+
+function execErrorSummary(e: unknown): string {
+  const err = e as { stderr?: Buffer | string; message?: string };
+  const stderr = typeof err.stderr === "string" ? err.stderr : err.stderr?.toString();
+  return (stderr ?? err.message ?? String(e)).trim().split("\n")[0] || "unknown error";
 }
 
 export type ResolveTargetResult =
