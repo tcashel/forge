@@ -21,15 +21,14 @@ test("renders a GFM table into thead/tbody", () => {
 test("renders blockquotes, including multi-line", () => {
   const html = renderMarkdown("> first line\n> second line");
   assert.ok(html.includes("<blockquote>"));
-  assert.ok(html.includes("<p>first line</p>"));
-  assert.ok(html.includes("<p>second line</p>"));
+  assert.ok(html.includes("<p>first line\nsecond line</p>"));
   assert.ok(html.includes("</blockquote>"));
 });
 
 test("renders task-list checkboxes (checked + unchecked)", () => {
   const html = renderMarkdown("- [ ] todo\n- [x] done");
-  assert.ok(html.includes('<input type="checkbox" disabled> todo'));
-  assert.ok(html.includes('<input type="checkbox" disabled checked> done'));
+  assert.ok(html.includes('type="checkbox"> todo'));
+  assert.ok(html.includes('checked="" disabled="" type="checkbox"> done'));
 });
 
 test("escapes HTML in all extensions (no raw passthrough)", () => {
@@ -42,5 +41,5 @@ test("still renders headings, lists, and bold (regression)", () => {
   const html = renderMarkdown("# Title\n\n- one\n- two\n\n**bold**");
   assert.ok(html.includes("<h1>Title</h1>"));
   assert.ok(html.includes("<li>one</li>"));
-  assert.ok(html.includes("<b>bold</b>"));
+  assert.ok(html.includes("<strong>bold</strong>"));
 });

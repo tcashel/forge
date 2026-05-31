@@ -1,6 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { apiGet } from "../../lib/api";
-import { renderMarkdown } from "../../lib/markdown";
+import { MarkdownViewer } from "../MarkdownViewer";
 
 interface Props {
   planId: string;
@@ -41,7 +41,7 @@ export function IntentPanel({ planId }: Props) {
         <h2>Intent</h2>
         <span class="review-rail-section-sub">plan {planId.slice(0, 12)}</span>
       </header>
-      <div class="review-intent-body review-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(body) }} />
+      <MarkdownViewer markdown={body} class="review-intent-body review-md" />
     </section>
   );
 }

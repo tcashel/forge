@@ -3,6 +3,7 @@ import { useEffect } from "preact/hooks";
 import { fetchAgentActivityDetail } from "../../lib/api";
 import { activitySelectedId } from "../../signals/ui";
 import type { ActivityDetailResponse } from "../../types";
+import { MarkdownViewer } from "../MarkdownViewer";
 
 export function ActivityDetail() {
   const data = useSignal<ActivityDetailResponse | null>(null);
@@ -85,7 +86,10 @@ export function ActivityDetail() {
         <pre class="activity-log">{logLines.value.join("\n")}</pre>
       )}
       {(d.detail.kind === "critique" || d.detail.kind === "synthesis" || d.detail.kind === "improvement") && (
-        <pre class="activity-markdown">{d.detail.markdownContent ?? `(see ${d.detail.markdownPath ?? "—"})`}</pre>
+        <MarkdownViewer
+          markdown={d.detail.markdownContent ?? `(see ${d.detail.markdownPath ?? "—"})`}
+          class="activity-markdown"
+        />
       )}
       {d.detail.kind === "drafting" && (
         <div class="activity-history">

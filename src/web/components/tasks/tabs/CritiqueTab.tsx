@@ -1,9 +1,9 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { runAction } from "../../../lib/actions";
 import { type ApiError, apiGet } from "../../../lib/api";
-import { renderMarkdown } from "../../../lib/markdown";
 import { refreshTasks } from "../../../signals/tasks";
 import type { CritiqueAgentMeta, CritiqueAttemptSummary, CritiquePayload, PlanView } from "../../../types";
+import { MarkdownViewer } from "../../MarkdownViewer";
 
 interface CritiqueResponse {
   planId: string;
@@ -309,11 +309,7 @@ export function CritiqueTab({ t }: { t: PlanView }) {
           {s.selected.recommendations ? (
             <>
               <h3 style="font-size:13px;color:var(--text);margin:18px 0 6px">Recommendations</h3>
-              <div
-                class="spec"
-                style="max-width:none"
-                dangerouslySetInnerHTML={{ __html: renderMarkdown(s.selected.recommendations) }}
-              />
+              <MarkdownViewer markdown={s.selected.recommendations} class="spec" />
             </>
           ) : null}
         </>

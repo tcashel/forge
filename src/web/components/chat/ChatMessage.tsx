@@ -8,8 +8,8 @@
 // (legacy histories persisted before stream-json was wired up), we fall
 // back to the plain markdown path on `m.text`.
 import type { VNode } from "preact";
-import { renderMarkdown } from "../../lib/markdown";
 import type { ChatBlock, ChatMessage as ChatMessageType } from "../../types";
+import { MarkdownViewer } from "../MarkdownViewer";
 import { ChatToolCard } from "./ChatToolCard";
 
 export function ChatMessage({ m }: { m: ChatMessageType }) {
@@ -33,7 +33,7 @@ export function ChatMessage({ m }: { m: ChatMessageType }) {
 }
 
 function BubbleMarkdown({ text }: { text: string }) {
-  return <div dangerouslySetInnerHTML={{ __html: renderMarkdown(text) }} />;
+  return <MarkdownViewer markdown={text} class="chat-markdown" />;
 }
 
 function renderBlocks(blocks: ChatBlock[]) {

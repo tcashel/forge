@@ -1,18 +1,8 @@
 import { useEffect, useState } from "preact/hooks";
 import { type ApiError, apiGet, apiPost } from "../../../lib/api";
-import { renderMarkdown } from "../../../lib/markdown";
 import { refreshTasks } from "../../../signals/tasks";
-import type { PlanSectionKey, PlanView, PlanWorkspaceResponse } from "../../../types";
-
-const SECTION_ORDER: Array<{ key: PlanSectionKey; label: string }> = [
-  { key: "goals", label: "Goals" },
-  { key: "constraints", label: "Constraints" },
-  { key: "non_goals", label: "Non-goals" },
-  { key: "approach", label: "Approach" },
-  { key: "risks", label: "Risks" },
-  { key: "open_questions", label: "Open Questions" },
-  { key: "acceptance_criteria", label: "Acceptance Criteria" },
-];
+import type { PlanView, PlanWorkspaceResponse } from "../../../types";
+import { MarkdownViewer } from "../../MarkdownViewer";
 
 interface State {
   loading: boolean;
@@ -178,23 +168,7 @@ export function PlanDocumentPane({ t, refreshKey = 0 }: { t: PlanView; refreshKe
           </div>
         </div>
       ) : (
-        <div class="plan-section-grid">
-          {SECTION_ORDER.map((def) => {
-            const section = data.parsed.sections[def.key];
-            const html = renderMarkdown(section?.content || "_Not filled yet._");
-            return (
-              <section key={def.key} class={`plan-section-card ${section?.present ? "" : "missing"}`}>
-                <div class="plan-section-card-title">
-                  <span>{def.label}</span>
-                  {def.key === "open_questions" && data.openQuestionCount > 0 ? (
-                    <span class="pill">{data.openQuestionCount}</span>
-                  ) : null}
-                </div>
-                <div class="spec" dangerouslySetInnerHTML={{ __html: html }} />
-              </section>
-            );
-          })}
-        </div>
+        <MarkdownViewer markdown={data.body || "_No spec body yet._"} class="spec plan-markdown-document" />
       )}
     </div>
   );

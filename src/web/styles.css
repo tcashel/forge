@@ -612,6 +612,57 @@ body{
 .spec code{ font-family:'JetBrains Mono',monospace; font-size: 12.5px; background: var(--panel-3); color: var(--text); padding: 1px 6px; border-radius: 4px; }
 .spec a{ color: var(--primary); text-decoration: underline; }
 .spec hr{ border: 0; border-top: 1px solid var(--rule); margin: 18px 0; }
+.markdown-viewer table{
+  width:100%;
+  border-collapse:collapse;
+  margin:10px 0 14px;
+  font-size:13px;
+}
+.markdown-viewer th,
+.markdown-viewer td{
+  border:1px solid var(--rule);
+  padding:6px 8px;
+  vertical-align:top;
+}
+.markdown-viewer th{ background:var(--panel-2); color:var(--text); font-weight:600; }
+.markdown-viewer blockquote{
+  margin:10px 0 14px;
+  padding:8px 12px;
+  border-left:3px solid var(--primary);
+  background:var(--panel-2);
+  color:var(--text-2);
+}
+.markdown-viewer .contains-task-list{ list-style:none; padding-left:0; }
+.markdown-viewer .task-list-item{ list-style:none; }
+.markdown-viewer .task-list-item input{ margin-right:6px; vertical-align:-1px; }
+.markdown-viewer .shiki{
+  border:1px solid var(--rule);
+  border-radius:6px;
+  padding:10px 14px;
+  overflow:auto;
+  font-family:'JetBrains Mono', monospace;
+  font-size:12.5px;
+  line-height:1.55;
+}
+.markdown-viewer .markdown-code-unhighlighted{
+  border-style:dashed;
+}
+.markdown-mermaid{
+  background:var(--panel-2);
+  border:1px solid var(--rule);
+  border-radius:8px;
+  padding:12px;
+  margin:10px 0 14px;
+  overflow:auto;
+  text-align:center;
+}
+.markdown-mermaid-error{
+  text-align:left;
+  white-space:pre-wrap;
+  font-family:'JetBrains Mono', monospace;
+  font-size:12px;
+  color:var(--failed);
+}
 
 /* ─── Conversation-led plan workspace ───────────────────────────────── */
 .plan-workspace{
@@ -690,6 +741,7 @@ body{
   line-height:1.45;
   white-space:pre;
 }
+.plan-markdown-document{ max-width:none; }
 .plan-section-grid{ display:grid; grid-template-columns:1fr; gap:10px; }
 .plan-section-card{
   border:1px solid var(--rule);
@@ -1422,8 +1474,7 @@ body.filtered-single .repo-chip{ display: none; }
 .activity-detail.loading { color: var(--fg-dim); padding: 16px; }
 .activity-detail.error { color: var(--attention); padding: 16px; }
 
-.activity-log,
-.activity-markdown {
+.activity-log {
   background: var(--bg-deep, #0a0a0a);
   border: 1px solid var(--border);
   padding: 10px;
@@ -1432,6 +1483,14 @@ body.filtered-single .repo-chip{ display: none; }
   font-size: 11px;
   white-space: pre-wrap;
   word-break: break-word;
+  max-height: 600px;
+  overflow: auto;
+}
+.activity-markdown {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  padding: 12px;
+  border-radius: 6px;
   max-height: 600px;
   overflow: auto;
 }
