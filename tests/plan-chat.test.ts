@@ -234,15 +234,17 @@ test("GET /api/specs/:id/plan-history returns 404 for unknown task", async (t) =
   assert.equal(body.error!.code, "UNKNOWN_TASK");
 });
 
-test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => {
+test("DELETE /api/specs/:id/plan-history wipes saved and native chat state", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   const planId = "wipe-target";
   makeDraftTask(h.store, planId, h.tmpHome, "feat(demo): wipe");
-  // Hand-write some history.
+  // Hand-write some history plus the native-session artifacts introduced by ADR-0025.
   const dir = path.join(h.forgeDir, "specs", planId);
   fs.mkdirSync(dir, { recursive: true });
   const histFile = path.join(dir, "plan-history.json");
+  const pointerFile = path.join(dir, "conversation.json");
+  const transcriptFile = path.join(dir, "native-transcript.jsonl");
   fs.writeFileSync(
     histFile,
     JSON.stringify({
@@ -253,6 +255,20 @@ test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => 
       ],
     }),
   );
+  fs.writeFileSync(
+    pointerFile,
+    JSON.stringify({
+      version: 1,
+      agent: "claude",
+      sessionId: "native-session",
+      cwd: h.tmpHome,
+      model: "claude-opus-4-8",
+      started: true,
+      createdAt: "now",
+      updatedAt: "now",
+    }),
+  );
+  fs.writeFileSync(transcriptFile, '{"native":true}\n');
   // Sanity: GET sees both messages.
   const before = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.equal((before.body.data!.messages as unknown[]).length, 2);
@@ -261,6 +277,8 @@ test("DELETE /api/specs/:id/plan-history wipes the saved history", async (t) => 
   assert.equal(status, 200);
   assert.equal(body.data!.ok, true);
   assert.equal(fs.existsSync(histFile), false);
+  assert.equal(fs.existsSync(pointerFile), false, "native conversation pointer must reset on wipe");
+  assert.equal(fs.existsSync(transcriptFile), false, "spec transcript snapshot must reset on wipe");
 
   const after = await getJson(`${h.baseUrl}/api/specs/${planId}/plan-history`);
   assert.deepEqual(after.body.data!.messages, []);

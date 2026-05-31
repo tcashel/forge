@@ -186,6 +186,12 @@ export function wipeHistory(forgeDir: string, scope: ScopeRef): void {
   const p = historyPath(forgeDir, scope);
   withFileLock(`${p}.lock`, () => {
     if (fs.existsSync(p)) fs.rmSync(p, { force: true });
+    // Wiping visible chat history must also reset native continuity; otherwise
+    // the next turn would still resume Claude's hidden session context.
+    fs.rmSync(conversationPointerPath(forgeDir, scope), { force: true });
+    if (scope.kind === "spec") {
+      fs.rmSync(transcriptSnapshotPath(forgeDir, scope.id), { force: true });
+    }
   });
 }
 

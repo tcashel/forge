@@ -1756,6 +1756,7 @@ async function handleApiDelete(url: URL, ctx: RouteCtx): Promise<Response> {
     const planId = decodeURIComponent(specHistoryMatch[1]);
     const task = store.getPlan(planId);
     if (!task) return jsonErr(404, "UNKNOWN_TASK", `No task with id "${planId}".`);
+    abortInFlight({ kind: "spec", id: planId });
     wipePlanHistory(store.forgeDir, { kind: "spec", id: planId });
     return jsonOk({ ok: true });
   }
