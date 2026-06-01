@@ -649,6 +649,12 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
         cwd: worktreePath,
       });
     } catch (e) {
+      // Even on a non-zero exit the agent may have written a parseable
+      // sidecar before dying; capture it so the failed row still records
+      // tokens/cost, mirroring the launch bash runner's failure branch.
+      if (adapterStreamsTokens(adapter) && fs.existsSync(streamFile)) {
+        metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+      }
       const err = e as { status?: number; message?: string };
       throw new Error(`agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
     }
