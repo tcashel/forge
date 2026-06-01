@@ -1444,6 +1444,34 @@ body.filtered-single .repo-chip{ display: none; }
 }
 .activity-summary-bar-value { font-variant-numeric: tabular-nums; text-align: right; }
 
+.activity-summary-purpose {
+  grid-column: 1 / -1;
+  border-collapse: collapse;
+  font-size: 11px;
+  min-width: 0;
+}
+.activity-summary-purpose th {
+  text-align: right;
+  font-weight: 600;
+  color: var(--fg-dim);
+  text-transform: uppercase;
+  letter-spacing: 0.05em;
+  font-size: 10px;
+  padding: 2px 10px 4px;
+}
+.activity-summary-purpose th:first-child { text-align: left; }
+.activity-summary-purpose td {
+  text-align: right;
+  padding: 2px 10px;
+  font-variant-numeric: tabular-nums;
+}
+.activity-summary-purpose-label { text-align: left !important; color: var(--fg-dim); }
+.activity-summary-purpose-empty {
+  grid-column: 1 / -1;
+  font-size: 11px;
+  color: var(--fg-dim);
+}
+
 .sort-btn {
   background: transparent;
   border: none;
