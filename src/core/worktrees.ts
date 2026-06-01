@@ -219,7 +219,7 @@ export async function ensureWorktreeForBranch(
   repoRoot: string,
   branch: string,
   opts: EnsureWorktreeOptions = {},
-): Promise<{ worktreePath: string; rehydrated: boolean; error: string | null }> {
+): Promise<{ worktreePath: string; rehydrated: boolean; error: string | null; errorCode?: string }> {
   const onProgress = opts.onProgress ?? (() => {});
   const rawWorktrees = readWorktreesPorcelain(repoRoot);
   const mainRepoRoot = resolveMainWorktreeRoot(repoRoot, rawWorktrees);
@@ -230,6 +230,28 @@ export async function ensureWorktreeForBranch(
   );
   if (existing) {
     return { worktreePath: existing.path, rehydrated: false, error: null };
+  }
+
+  // 1b) The branch is checked out in the primary working tree itself — git
+  //     won't let us check it out a second time in a dedicated worktree, so
+  //     `git worktree add` below would fail with a cryptic fatal. (Step 1
+  //     already returned for non-primary worktrees, so any match here is the
+  //     primary.) Return an actionable message instead of letting git's raw
+  //     error surface.
+  const primaryCheckout = rawWorktrees.find(
+    (wt) => samePath(wt.path, mainRepoRoot) && wt.branch === branch && fs.existsSync(wt.path),
+  );
+  if (primaryCheckout) {
+    return {
+      worktreePath: "",
+      rehydrated: false,
+      errorCode: "BRANCH_BUSY_PRIMARY",
+      error:
+        `Branch "${branch}" is checked out in your main repo at ${mainRepoRoot}, ` +
+        "so Forge can't create a separate worktree for it (git won't check out one " +
+        "branch in two places). Switch your main checkout to another branch " +
+        "(e.g. `git switch main`), then retry the fix.",
+    };
   }
 
   const repo = detectRepo(mainRepoRoot);

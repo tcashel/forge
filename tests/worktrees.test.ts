@@ -341,6 +341,38 @@ test("ensureWorktreeForBranch is idempotent when a live worktree already exists 
   }
 });
 
+test("ensureWorktreeForBranch returns an actionable error when the branch is checked out in the primary worktree", async () => {
+  const root = tmpDir("forge-wt-primary-busy-");
+  const remoteDir = path.join(root, "remote.git");
+  const repoDir = path.join(root, "repo");
+  try {
+    gitRaw(["init", "--bare", remoteDir]);
+    gitRaw(["clone", remoteDir, repoDir]);
+    git(repoDir, ["checkout", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "main\n");
+    git(repoDir, ["add", "README.md"]);
+    git(repoDir, ["commit", "-m", "init"]);
+    git(repoDir, ["push", "-u", "origin", "HEAD:main"]);
+    // Create the feature branch and leave the PRIMARY checkout sitting on it.
+    git(repoDir, ["checkout", "-b", "feature"]);
+    fs.writeFileSync(path.join(repoDir, "feature.txt"), "x\n");
+    git(repoDir, ["add", "feature.txt"]);
+    git(repoDir, ["commit", "-m", "feature"]);
+    git(repoDir, ["push", "-u", "origin", "feature"]);
+
+    const ensured = await ensureWorktreeForBranch(repoDir, "feature");
+    assert.equal(ensured.worktreePath, "");
+    assert.equal(ensured.rehydrated, false);
+    assert.equal(ensured.errorCode, "BRANCH_BUSY_PRIMARY");
+    assert.match(ensured.error ?? "", /git switch/);
+  } finally {
+    fs.rmSync(path.join(root, "worktrees"), { recursive: true, force: true });
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
 test("ensureWorktreeForBranch force-refreshes a stale local branch before rehydrating", async () => {
   const root = tmpDir("forge-wt-force-fetch-");
   const remoteDir = path.join(root, "remote.git");

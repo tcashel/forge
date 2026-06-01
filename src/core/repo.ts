@@ -80,6 +80,20 @@ function pkgMgr(root: string): string {
   return "npm run";
 }
 
+/**
+ * Picks the dependency-install command for a JS/TS (or Nuxt) repo by lockfile.
+ * Bun is checked first: running `npm install` in a Bun repo writes an untracked
+ * `package-lock.json`, which dirties a freshly-rehydrated worktree and trips
+ * downstream clean-gates. Falls back to `npm` for npm/unmarked repos.
+ */
+export function jsInstallCmd(root: string): [string, string[]] {
+  if (fs.existsSync(path.join(root, "bun.lock")) || fs.existsSync(path.join(root, "bun.lockb")))
+    return ["bun", ["install"]];
+  if (fs.existsSync(path.join(root, "pnpm-lock.yaml"))) return ["pnpm", ["install"]];
+  if (fs.existsSync(path.join(root, "yarn.lock"))) return ["yarn", ["install"]];
+  return ["npm", ["install"]];
+}
+
 function detectQualityCommands(root: string, stack: Stack): string[] {
   switch (stack) {
     case "rust":
@@ -297,8 +311,8 @@ export async function bootstrapWorktree(
 
   // Bootstrap based on stack.
   const bootstrap: Record<Stack, [string, string[]] | null> = {
-    "js-ts": fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
-    nuxt: fs.existsSync(path.join(root, "pnpm-lock.yaml")) ? ["pnpm", ["install"]] : ["npm", ["install"]],
+    "js-ts": jsInstallCmd(root),
+    nuxt: jsInstallCmd(root),
     python: fs.existsSync(path.join(root, "pyproject.toml")) ? ["uv", ["sync"]] : null,
     rust: null,
     unknown: null,

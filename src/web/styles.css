@@ -1935,6 +1935,7 @@ body.filtered-single .repo-chip{ display: none; }
   align-items: center;
 }
 .review-batch-count { color: var(--fg-dim); font-size: 12px; }
+.review-batch-error { color: var(--attention); font-size: 12px; }
 
 .pr-row { cursor: pointer; }
 .pr-row:focus { outline: 2px solid var(--primary); outline-offset: -2px; }
