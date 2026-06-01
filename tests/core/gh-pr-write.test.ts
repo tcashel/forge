@@ -251,3 +251,36 @@ test("fetchReviewThreads pages through the GraphQL cursor until exhausted", asyn
     __setGhRunner(null);
   }
 });
+
+test("publishReviewFindings posts the inline comment on the diff's new path for a renamed file", async () => {
+  // Rename-with-edit: src/old.ts → src/new.ts. The finding names the old path,
+  // but the inline comment payload must carry the new path or GitHub 422s.
+  const renameDiff = [
+    "diff --git a/src/old.ts b/src/new.ts",
+    "similarity index 80%",
+    "rename from src/old.ts",
+    "rename to src/new.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/old.ts",
+    "+++ b/src/new.ts",
+    "@@ -1,2 +1,3 @@",
+    " a",
+    "+b",
+    " c",
+  ].join("\n");
+  const renamed = makeFinding({ id: "aa11bb22cc33", file: "src/old.ts", lineStart: 2, lineEnd: 2 });
+  const { calls, runner } = makeRunner({});
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [renamed], diff: renameDiff, commitId: "sha1" }, OPTS);
+    assert.equal(res.posted, 1);
+    const posts = postReviewCalls(calls);
+    assert.equal(posts.length, 1);
+    const payload = posts[0].inputJson as { comments: Array<{ path: string; line: number }> };
+    assert.equal(payload.comments.length, 1);
+    assert.equal(payload.comments[0].path, "src/new.ts", "payload uses the new (post-rename) path");
+    assert.equal(payload.comments[0].line, 2);
+  } finally {
+    __setGhRunner(null);
+  }
+});

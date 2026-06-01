@@ -164,3 +164,40 @@ test("partitionFindingsByDiff counts a genuine space-prefixed blank context line
     ["phantom5"],
   );
 });
+
+test("partitionFindingsByDiff anchors with the diff's new path (non-renamed file)", () => {
+  // For a non-renamed file the anchor path is just the finding's file.
+  const inHunk = makeFinding({ id: "in", file: "src/foo.ts", lineStart: 2, lineEnd: 2 });
+  const { inDiff } = partitionFindingsByDiff([inHunk], SAMPLE_DIFF);
+  assert.equal(inDiff.length, 1);
+  assert.equal(inDiff[0].path, "src/foo.ts");
+});
+
+test("partitionFindingsByDiff anchors a finding on the OLD path of a renamed file using the NEW path", () => {
+  // A rename-with-edit diff: src/old.ts → src/new.ts. The finding references
+  // the pre-rename (old) path, but the RIGHT-side comment must anchor on the
+  // new path or GitHub 422s the whole batched review.
+  const renameDiff = [
+    "diff --git a/src/old.ts b/src/new.ts",
+    "similarity index 80%",
+    "rename from src/old.ts",
+    "rename to src/new.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/old.ts",
+    "+++ b/src/new.ts",
+    "@@ -1,3 +1,4 @@",
+    " line1",
+    "+added2",
+    " line3",
+    " line4",
+  ].join("\n");
+  // RIGHT-side lines on the new file: 1 (ctx), 2 (add), 3 (ctx), 4 (ctx).
+  const onOldPath = makeFinding({ id: "renamed", file: "src/old.ts", lineStart: 2, lineEnd: 2 });
+  const { inDiff, outOfDiff } = partitionFindingsByDiff([onOldPath], renameDiff);
+  assert.equal(inDiff.length, 1, "finding on the old path still anchors");
+  assert.equal(outOfDiff.length, 0);
+  assert.equal(inDiff[0].finding.id, "renamed");
+  assert.equal(inDiff[0].finding.file, "src/old.ts", "the finding still carries its original (old) file");
+  assert.equal(inDiff[0].path, "src/new.ts", "but the anchor path is the diff's new path");
+  assert.equal(inDiff[0].line, 2);
+});

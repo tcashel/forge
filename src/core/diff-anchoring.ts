@@ -13,6 +13,13 @@ import type { ForgeFinding } from "./reviewer.ts";
 
 export interface AnchoredFinding {
   finding: ForgeFinding;
+  /**
+   * The diff's NEW (post-rename, RIGHT-side) path for the file. This is what
+   * the GitHub inline-comment payload must use — a RIGHT-side anchor on a
+   * renamed file's OLD path 422s the whole batched review. Equal to
+   * `finding.file` for non-renamed files.
+   */
+  path: string;
   /** RIGHT-side line the comment anchors to (the end of the range). */
   line: number;
   side: "RIGHT";
@@ -183,7 +190,9 @@ export function partitionFindingsByDiff(findings: ForgeFinding[], diff: string):
       outOfDiff.push(finding);
       continue;
     }
-    const anchored: AnchoredFinding = { finding, line: end, side: "RIGHT" };
+    // Anchor on the diff's NEW path, not finding.file: a finding may name the
+    // pre-rename (old) path, but the RIGHT-side comment must use the new one.
+    const anchored: AnchoredFinding = { finding, path: parsed.path, line: end, side: "RIGHT" };
     // Multi-line range: carry startLine only when start and end share a hunk.
     if (finding.lineStart > 0 && finding.lineStart < end) {
       const endHunk = hunkContaining(parsed.hunks, end);

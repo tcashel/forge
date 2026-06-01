@@ -388,7 +388,9 @@ export async function publishReviewFindings(
   }
 
   const inline: InlineCommentInput[] = newInDiff.map((a) => ({
-    path: a.finding.file,
+    // Use the anchor's NEW (post-rename) path, not finding.file — a RIGHT-side
+    // comment on a renamed file's old path 422s the whole batched review.
+    path: a.path,
     line: a.line,
     startLine: a.startLine,
     side: a.side,
