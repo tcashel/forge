@@ -3,6 +3,9 @@ import { randomUUID } from "node:crypto";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
+import { readResultFromFile } from "../claude-stream.ts";
+import { readCodexResultFromFile } from "../codex-stream.ts";
+import { type CostSource, estimateCost } from "../pricing.ts";
 import type { LaunchTarget } from "../store.ts";
 
 export type AgentSpawnImpl = (binary: string, args: string[], cwd?: string) => ChildProcess;
@@ -74,6 +77,104 @@ export const claudeJobStreamFilter = `bun -e "const rl=require('readline').creat
  */
 export function claudeJobCommand(model: string, promptFile: string, streamPath: string): string {
   return `claude --print --output-format stream-json --verbose --dangerously-skip-permissions --model "${model}" < "${promptFile}" | tee "${streamPath}" | ${claudeJobStreamFilter}`;
+}
+
+/**
+ * Codex analogue of `claudeJobStreamFilter`. `codex exec --json` emits one
+ * JSONL event per line; the final answer arrives as an `item.completed`
+ * event whose `item.type === "agent_message"`. Project each agent message's
+ * text so downstream consumers (review-verdict extraction, log files) keep
+ * seeing plain text exactly as the non-streaming `codex exec` did.
+ */
+export const codexJobStreamFilter = `bun -e "const rl=require('readline').createInterface({input:process.stdin});rl.on('line',l=>{try{const e=JSON.parse(l);if(e.type==='item.completed'&&e.item&&e.item.type==='agent_message'&&typeof e.item.text==='string')process.stdout.write(e.item.text+'\\n')}catch{}})"`;
+
+/**
+ * Job-runner-only codex invocation. Mirrors `claudeJobCommand`: runs
+ * `codex exec --json`, tees the raw JSONL events into a sidecar (for token
+ * extraction via readCodexResultFromFile) and projects the final assistant
+ * message to stdout via `codexJobStreamFilter`.
+ */
+export function codexJobCommand(
+  model: string,
+  promptFile: string,
+  streamPath: string,
+  opts?: AgentCommandOptions,
+): string {
+  const reasoningFlag = opts?.reasoningEffort ? ` --config reasoning_effort=${opts.reasoningEffort}` : "";
+  return `codex exec --json --model "${model}"${reasoningFlag} --dangerously-bypass-approvals-and-sandbox --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')" | tee "${streamPath}" | ${codexJobStreamFilter}`;
+}
+
+/**
+ * Adapter-aware job command for token capture. claude and codex stream
+ * JSONL into `streamPath` and project plain final text to stdout; other
+ * adapters fall back to the plain `agentCommand` (no sidecar, no tokens).
+ * Pair with `adapterStreamsTokens` to decide whether to pass the sidecar
+ * to `forge session finish --stream-json-path` / parse it after the run.
+ */
+export function agentJobCommand(
+  target: LaunchTarget,
+  model: string,
+  promptFile: string,
+  streamPath: string,
+  opts?: AgentCommandOptions,
+): string {
+  switch (target) {
+    case "claude":
+      return claudeJobCommand(model, promptFile, streamPath);
+    case "codex":
+      return codexJobCommand(model, promptFile, streamPath, opts);
+    default:
+      return agentCommand(target, model, promptFile, opts);
+  }
+}
+
+/** True for adapters whose `agentJobCommand` writes a parseable token sidecar. */
+export function adapterStreamsTokens(target: LaunchTarget): boolean {
+  return target === "claude" || target === "codex";
+}
+
+/** Metrics patch (subset of SessionMetrics) extracted from a token sidecar. */
+export interface SidecarMetricsPatch {
+  durationMs: number | null;
+  tokensIn: number | null;
+  tokensOut: number | null;
+  cacheRead: number | null;
+  cacheCreate: number | null;
+  costUsd: number | null;
+  costSource: CostSource | null;
+  modelPricedAt: string | null;
+}
+
+/**
+ * Parse a token sidecar written by `agentJobCommand` into a metrics patch.
+ * Picks the adapter-correct parser (codex → turn.completed usage, else →
+ * claude `result`), then falls back to the price table for cost when the
+ * provider didn't report one (codex always; claude never, since it omits
+ * itself from the table). Shared by the launch finish hook and the
+ * in-process review / comment-fix workers.
+ */
+export async function captureSidecarMetrics(
+  adapter: string,
+  model: string | null,
+  streamPath: string,
+): Promise<SidecarMetricsPatch> {
+  const r = adapter === "codex" ? await readCodexResultFromFile(streamPath) : await readResultFromFile(streamPath);
+  const costSource: CostSource | null = r.totalCostUsd !== null ? "provider" : null;
+  const patch: SidecarMetricsPatch = {
+    durationMs: r.durationMs,
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+    cacheRead: r.cacheRead,
+    cacheCreate: r.cacheCreate,
+    costUsd: r.totalCostUsd,
+    costSource,
+    modelPricedAt: null,
+  };
+  if (costSource === null) {
+    const est = estimateCost({ agentAdapter: adapter, model, tokensIn: r.tokensIn, tokensOut: r.tokensOut });
+    return { ...patch, ...est };
+  }
+  return patch;
 }
 
 export function mintNativeSession(agent: LaunchTarget): NativeAgentSession {

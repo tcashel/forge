@@ -25,13 +25,23 @@ export interface ModelPrice {
 type Adapter = "claude" | "codex" | "opencode" | "gemini";
 
 /**
- * Pricing is empty by design: the only adapter we currently capture cost
- * for is claude, which goes through `total_cost_usd` from stream-json.
- * Add codex / opencode / gemini entries when empirical token capture
- * lands for those adapters (one Linear ticket per adapter — see Risks
- * in the spec).
+ * claude is intentionally absent: it reports `total_cost_usd` directly via
+ * stream-json, so the provider path is the source of truth and this table
+ * is never consulted for it.
+ *
+ * codex reports tokens only (no cost) in its `turn.completed` usage event,
+ * so we estimate from this table. Keys must be the exact model ids Forge
+ * launches codex with (see `gpt-5.5`, the configured `defaultModel` /
+ * critic-b model). Prices are OpenAI's standard API rates for gpt-5.5
+ * ($5 / 1M input, $30 / 1M output) — https://developers.openai.com/api/docs/pricing
+ * and https://openai.com/index/introducing-gpt-5-5/ (verified 2026-05-31).
+ * opencode / gemini stay absent until their tokens are captured empirically.
  */
-const TABLE: Partial<Record<Adapter, Record<string, ModelPrice>>> = {};
+const TABLE: Partial<Record<Adapter, Record<string, ModelPrice>>> = {
+  codex: {
+    "gpt-5.5": { inputPer1M: 5, outputPer1M: 30, pricedAt: "2026-05-31" },
+  },
+};
 
 export interface EstimateInput {
   agentAdapter: string;
