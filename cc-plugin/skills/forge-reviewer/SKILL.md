@@ -148,3 +148,15 @@ If any of those is false, the verdict is `request-changes` or `block`. There is 
 - Quote a passing test as proof of correctness without checking what it actually asserts.
 - Skip the spec comparison when a spec is available.
 - Forget to wrap output in a ```forge-review fenced block.
+
+## Publishing findings to the PR (opt-in)
+
+When the operator enables it (repo config `publishReviewToGitHub` **and** the
+per-review "Publish to PR" toggle), Forge publishes your findings to the PR as
+**GitHub inline review comments** after parsing them — you do nothing extra;
+just emit the `forge-review` block as usual. Each published comment embeds a
+hidden `<!-- forge-finding id=… -->` marker so re-running the review never
+duplicates a comment already on the PR. Findings that don't land on a diff hunk
+are listed in the review summary body instead (GitHub rejects inline comments
+off the diff). With the toggle off, findings stay local — byte-for-byte the
+prior behavior.

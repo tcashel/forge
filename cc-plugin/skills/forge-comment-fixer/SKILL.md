@@ -124,3 +124,13 @@ move on — do not block the whole batch on one ambiguous target.
 ```
 
 That's it. Be terse.
+
+## Resolve-on-fix (handled by the worker)
+
+For findings Forge published to the PR (those carrying a `forge-finding`
+marker), the worker reconciles your verdicts against the GitHub review threads
+after it finishes: a `valid` finding that was committed and pushed gets its
+thread **resolved**; a `disputed` finding gets a **reply** with your reason and
+the thread is left open; a `failed` one is left open. You don't touch GitHub —
+just emit accurate verdicts and reasons. The worker performs no GitHub write
+for `comment:`/`review:` targets (it never resolves another author's thread).
