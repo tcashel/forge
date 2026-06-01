@@ -93,6 +93,18 @@ export const codexJobStreamFilter = `bun -e "const rl=require('readline').create
  * `codex exec --json`, tees the raw JSONL events into a sidecar (for token
  * extraction via readCodexResultFromFile) and projects the final assistant
  * message to stdout via `codexJobStreamFilter`.
+ *
+ * The pipeline is wrapped in a `{ … ; }` brace group so that when a runner
+ * embeds it as `${cmd} 2>&1 | tee log` (or `${cmd} > file 2>&1`), the outer
+ * `2>&1` redirects the WHOLE group's stderr — including `codex exec`'s — into
+ * the log/raw file. Without the group, bash binds that `2>&1` only to the
+ * final pipeline stage (the bun filter), so codex auth/model/flag failures on
+ * stderr would silently bypass the Workbench log + review SSE output and a
+ * failed row would show only a bare non-zero exit. Crucially the group does
+ * NOT redirect codex's stderr before the first pipe (that would corrupt the
+ * JSONL stream the tee/filter consume); codex stdout still flows through the
+ * pipe unchanged and only the group's combined stderr is captured by the
+ * caller's `2>&1`.
  */
 export function codexJobCommand(
   model: string,
@@ -101,7 +113,7 @@ export function codexJobCommand(
   opts?: AgentCommandOptions,
 ): string {
   const reasoningFlag = opts?.reasoningEffort ? ` --config reasoning_effort=${opts.reasoningEffort}` : "";
-  return `codex exec --json --model "${model}"${reasoningFlag} --dangerously-bypass-approvals-and-sandbox --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')" | tee "${streamPath}" | ${codexJobStreamFilter}`;
+  return `{ codex exec --json --model "${model}"${reasoningFlag} --dangerously-bypass-approvals-and-sandbox --add-dir "${path.dirname(promptFile)}" "$(cat '${promptFile}')" | tee "${streamPath}" | ${codexJobStreamFilter} ; }`;
 }
 
 /**
