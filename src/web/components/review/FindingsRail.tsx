@@ -1,6 +1,6 @@
 import { useMemo, useState } from "preact/hooks";
 import { scrollToFinding } from "../../lib/review-scroll";
-import { targetKey } from "../../lib/review-targets";
+import { commentTargetToken, targetKey } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
 import type { ForgeFinding, ForgeFindingSeverity, PrReview } from "../../types";
 import type { InlineThread } from "./CommentThread";
@@ -178,7 +178,7 @@ function FindingRailRow({ finding, onJump, expanded, onToggle }: FindingRowProps
 
 function CommentRailRow({ thread, onJump }: { thread: InlineThread; onJump?: () => void }) {
   const c = thread.root;
-  const token = targetKey("comment", c.id);
+  const token = commentTargetToken(c);
   const state = rowStateFor(token, !!onJump);
   return (
     <li class="review-rail-comment">

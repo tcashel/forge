@@ -17,6 +17,16 @@ export function targetKey(source: FixTargetSource, id: string | number): string 
   return `${source}:${id}`;
 }
 
+/**
+ * The fix-target token for a selectable inline comment row. A comment carrying
+ * a `forgeFindingId` marker IS the published view of a Forge finding, so it
+ * must be selected as a `finding:` target — otherwise the fixer skips it as
+ * someone else's `comment:` and never resolves the GitHub thread.
+ */
+export function commentTargetToken(comment: { id: string | number; forgeFindingId?: string }): string {
+  return comment.forgeFindingId ? targetKey("finding", comment.forgeFindingId) : targetKey("comment", comment.id);
+}
+
 export function parseTargetKey(token: string): FixTarget | null {
   const idx = token.indexOf(":");
   if (idx <= 0) return null;

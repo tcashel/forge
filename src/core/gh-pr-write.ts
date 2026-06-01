@@ -243,43 +243,56 @@ export async function replyToReviewComment(
   return res.ok ? { ok: true } : { ok: false, error: res.stdout || "reply POST failed" };
 }
 
+export type PublishedFindingIdsResult = { ok: true; ids: Set<string> } | { ok: false; error: string };
+
 /**
  * Fetch the set of finding ids already published on the PR — parsed from both
  * prior inline comment bodies and prior PR review bodies (out-of-diff findings
  * carry their marker in the review body). Drives idempotent re-publishing.
+ *
+ * Reconciliation is a required precondition for posting: a fetch or parse
+ * failure returns `{ ok: false, error }` rather than an incomplete id set, so
+ * the caller can skip the review POST instead of treating the failure as
+ * "nothing published" and re-posting already-published findings.
  */
-export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts): Promise<Set<string>> {
+export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts): Promise<PublishedFindingIdsResult> {
   const target = await resolvePrApiTarget(prNum, opts);
-  const ids = new Set<string>();
-  if (!target) return ids;
+  if (!target) return { ok: false, error: "could not resolve owner/repo for gh api call" };
   const hostArgs = hostArgsFor(target.apiHost);
+  const ids = new Set<string>();
 
   const inlineRes = await ghRunner(
     ["api", `repos/${target.ownerRepo}/pulls/${prNum}/comments`, "--paginate", ...hostArgs],
     opts,
-  ).catch(() => ({ ok: false, stdout: "" }));
-  if (inlineRes.ok && inlineRes.stdout) {
+  ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
+  if (!inlineRes.ok) {
+    return { ok: false, error: `could not fetch existing inline comments: ${inlineRes.stdout || "unknown"}` };
+  }
+  if (inlineRes.stdout) {
     try {
       const arr = JSON.parse(inlineRes.stdout) as Array<{ body?: string }>;
       for (const c of arr) for (const id of extractFindingIds(c.body ?? "")) ids.add(id);
-    } catch {
-      /* ignore parse error — best-effort */
+    } catch (e) {
+      return { ok: false, error: `could not parse existing inline comments: ${(e as Error).message}` };
     }
   }
 
   const reviewsRes = await ghRunner(
     ["api", `repos/${target.ownerRepo}/pulls/${prNum}/reviews`, "--paginate", ...hostArgs],
     opts,
-  ).catch(() => ({ ok: false, stdout: "" }));
-  if (reviewsRes.ok && reviewsRes.stdout) {
+  ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
+  if (!reviewsRes.ok) {
+    return { ok: false, error: `could not fetch existing reviews: ${reviewsRes.stdout || "unknown"}` };
+  }
+  if (reviewsRes.stdout) {
     try {
       const arr = JSON.parse(reviewsRes.stdout) as Array<{ body?: string }>;
       for (const r of arr) for (const id of extractFindingIds(r.body ?? "")) ids.add(id);
-    } catch {
-      /* ignore parse error */
+    } catch (e) {
+      return { ok: false, error: `could not parse existing reviews: ${(e as Error).message}` };
     }
   }
-  return ids;
+  return { ok: true, ids };
 }
 
 function buildReviewBodySummary(outOfDiff: ForgeFinding[]): string {
@@ -313,7 +326,14 @@ export async function publishReviewFindings(
   opts: GhFetchOpts,
   log: (msg: string) => void = () => {},
 ): Promise<PublishResult> {
-  const published = await fetchPublishedFindingIds(prNum, opts);
+  const reconciled = await fetchPublishedFindingIds(prNum, opts);
+  if (!reconciled.ok) {
+    // Reconciliation is a hard precondition: without a reliable view of what's
+    // already on the PR we can't post without risking duplicates. Skip and log.
+    log(`[publish] skipping review post — could not reconcile published findings: ${reconciled.error}`);
+    return { posted: 0, outOfDiff: 0, skipped: 0, skippedPost: true };
+  }
+  const published = reconciled.ids;
   const { inDiff, outOfDiff } = partitionFindingsByDiff(args.findings, args.diff);
 
   const newInDiff = inDiff.filter((a) => !published.has(a.finding.id));

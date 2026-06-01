@@ -101,6 +101,30 @@ test("publishReviewFindings is idempotent: a re-run posts no new inline comments
   }
 });
 
+test("publishReviewFindings skips the POST when reconciliation (existing-comments fetch) fails", async () => {
+  const inDiff = makeFinding({ id: "aa11bb22cc33", file: "src/foo.ts", lineStart: 2, lineEnd: 2 });
+  const calls: RecordedCall[] = [];
+  // Existing-comments read fails; without a reliable view of what's already
+  // posted we must not post (else we'd duplicate already-published findings).
+  const runner = (args: string[], o?: { inputJson?: unknown }) => {
+    calls.push({ args, inputJson: o?.inputJson });
+    const joined = args.join(" ");
+    if (joined.includes("/pulls/") && joined.includes("/comments") && args.includes("--paginate")) {
+      return Promise.resolve({ ok: false, stdout: "403 forbidden" });
+    }
+    return Promise.resolve({ ok: true, stdout: "[]" });
+  };
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [inDiff], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.posted, 0);
+    assert.equal(res.skippedPost, true);
+    assert.equal(postReviewCalls(calls).length, 0, "no reviews POST when reconciliation fails");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
 test("publishReviewFindings skips the POST entirely when an all-out-of-diff PR is already published in a review body", async () => {
   const outDiff = makeFinding({ id: "dd44ee55ff66", file: "src/foo.ts", lineStart: 99, lineEnd: 99 });
 
