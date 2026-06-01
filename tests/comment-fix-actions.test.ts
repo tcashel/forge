@@ -70,6 +70,35 @@ test("parseCommentValidation returns [] when there's no block", () => {
   assert.deepEqual(parseCommentValidation("nothing fenced here"), []);
 });
 
+test("parseCommentValidation takes the LAST block (skips echoed prompt examples)", () => {
+  // Regression for the codex-adapter case: the agent echoes the skill's
+  // schema/example blocks (placeholder tokens) before emitting the real
+  // answer. Parsing the first block read placeholders that never matched the
+  // requested targets, so every target was wrongly backfilled as disputed.
+  const raw = [
+    "## Phase 1 — emit a validation block (mandatory, first)",
+    "```forge-comment-validation",
+    '{"targetId": "comment:12345", "verdict": "valid", "reason": "Anchor matches; one-line change."}',
+    '{"targetId": "finding:ab12cd34", "verdict": "valid", "reason": "Null deref is real."}',
+    '{"targetId": "review:99887766", "verdict": "disputed", "reason": "Outside diff scope."}',
+    "```",
+    "## Output shape recap",
+    "```forge-comment-validation",
+    '{"targetId": "<source:id>", "verdict": "valid", "reason": "<text>"}',
+    "```",
+    "...now the agent's actual answer...",
+    "```forge-comment-validation",
+    '{"targetId": "comment:3334464712", "verdict": "disputed", "reason": "comment anchor is stale"}',
+    '{"targetId": "finding:3f064ef5b46d", "verdict": "valid", "reason": "contradicts the spec; fixable locally"}',
+    "```",
+  ].join("\n");
+  const parsed = parseCommentValidation(raw);
+  assert.deepEqual(parsed, [
+    { targetId: "comment:3334464712", verdict: "disputed", reason: "comment anchor is stale" },
+    { targetId: "finding:3f064ef5b46d", verdict: "valid", reason: "contradicts the spec; fixable locally" },
+  ]);
+});
+
 test("runCommentFix rejects empty targets with NO_COMMENTS", async () => {
   const { store, tmp } = makeStore();
   try {
