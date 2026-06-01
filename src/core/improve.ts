@@ -257,8 +257,10 @@ function filterAlreadyRecordedOpenQuestions(openQuestions: string[], specDocumen
       .map(normalizeOpenQuestionForComparison)
       .filter((q) => q.length > 0),
   );
-  if (existing.size === 0) return openQuestions;
 
+  // No early return when `existing` is empty: the `seen` set must still run to
+  // drop duplicates emitted within this same synthesizer pass. When the spec
+  // has no recorded questions, `existing.has(...)` simply never matches.
   const seen = new Set<string>();
   return openQuestions.filter((question) => {
     const normalized = normalizeOpenQuestionForComparison(question);
