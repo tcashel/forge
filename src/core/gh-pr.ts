@@ -34,6 +34,24 @@ export interface GhFetchOpts {
   cwd?: string;
   timeoutMs?: number;
   ghTarget?: GhTarget;
+  /**
+   * When present, stdin is piped and `JSON.stringify(inputJson)` is written
+   * to it. Used by the write helpers (`gh-pr-write.ts`) to feed request
+   * bodies to `gh api --input -` without a second gh-spawn path. Read calls
+   * leave this undefined and stdin stays `"ignore"` (byte-for-byte unchanged).
+   */
+  inputJson?: unknown;
+  /**
+   * Already-resolved `owner/repo` for `gh api` paths (which don't template
+   * `{owner}/{repo}`). The write helpers pass this through to avoid a second
+   * `gh repo view` round-trip; resolved internally when omitted.
+   */
+  ownerRepo?: string;
+  /**
+   * Already-resolved enterprise host (the `--hostname` value). `null`/omitted
+   * means github.com (no flag added).
+   */
+  apiHost?: string | null;
 }
 
 /**
@@ -72,10 +90,11 @@ export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: str
     }
     const env = { ...process.env, ...resolved.env };
 
+    const hasInput = opts?.inputJson !== undefined;
     let child: ReturnType<typeof spawn>;
     try {
       child = spawn("gh", args, {
-        stdio: ["ignore", "pipe", "pipe"],
+        stdio: [hasInput ? "pipe" : "ignore", "pipe", "pipe"],
         signal: ac.signal,
         cwd: opts?.cwd,
         env,
@@ -83,6 +102,17 @@ export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: str
     } catch {
       settle({ stdout: "", ok: false });
       return;
+    }
+
+    if (hasInput && child.stdin) {
+      // Guard against EPIPE if gh exits before reading the body — the close
+      // handler still settles with the process exit status.
+      child.stdin.on("error", () => {});
+      try {
+        child.stdin.end(JSON.stringify(opts?.inputJson));
+      } catch {
+        /* settled by close/error below */
+      }
     }
 
     child.stdout?.on("data", (chunk: Buffer) => {
@@ -252,7 +282,7 @@ function normalizeSide(value: string | null | undefined): "RIGHT" | "LEFT" | nul
   return null;
 }
 
-function parseNameWithOwner(url: string): { owner: string; repo: string } | null {
+export function parseNameWithOwner(url: string): { owner: string; repo: string } | null {
   // gh urls look like https://github.com/owner/repo/pull/N (or enterprise host).
   const m = url.match(/https?:\/\/[^/]+\/([^/]+)\/([^/]+)\/(?:pull|pulls)\/\d+/);
   if (!m) return null;
@@ -266,7 +296,7 @@ function parseNameWithOwner(url: string): { owner: string; repo: string } | null
  * comment endpoints 404. Returns null for github.com (the default) so we
  * only add the flag when it changes behaviour.
  */
-function parseApiHost(url: string): string | null {
+export function parseApiHost(url: string): string | null {
   try {
     const host = new URL(url).hostname;
     return host && host !== "github.com" ? host : null;

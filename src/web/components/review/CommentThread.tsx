@@ -1,4 +1,4 @@
-import { targetKey } from "../../lib/review-targets";
+import { commentTargetToken } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
 import type { InlinePrComment } from "../../types";
 import { MarkdownViewer } from "../MarkdownViewer";
@@ -52,7 +52,7 @@ function statusBadgeFor(token: string): StatusBadge | null {
 export function CommentThread({ thread, anchored = true }: Props) {
   const sel = selectedTargets.value;
   const id = thread.root.id;
-  const token = targetKey("comment", id);
+  const token = commentTargetToken(thread.root);
   const checked = sel.has(token);
   const badge = statusBadgeFor(token);
   const fixing = badge?.className === "fixing";
@@ -88,6 +88,11 @@ export function CommentThread({ thread, anchored = true }: Props) {
           <div class={`review-thread-badge badge-${badge.className}`}>
             <span class="badge-label">{badge.label}</span>
             {badge.reason ? <span class="badge-reason"> — {badge.reason}</span> : null}
+          </div>
+        ) : null}
+        {thread.root.forgeFindingId ? (
+          <div class={`review-thread-badge badge-${thread.root.isResolved ? "resolved" : "published"}`}>
+            <span class="badge-label">{thread.root.isResolved ? "resolved on PR" : "Forge finding · open"}</span>
           </div>
         ) : null}
         {thread.replies.length > 0 ? (

@@ -18,7 +18,9 @@ import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.t
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import { reconcileCritiqueSessions } from "../../core/critique.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
+import { commentAnchorsToDiff } from "../../core/diff-anchoring.ts";
 import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
+import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
   fetchPrBundle as defaultFetchPrBundle,
@@ -26,7 +28,10 @@ import {
   fetchPrs,
   type GhFetchOpts,
   type GhPr,
+  parseApiHost,
+  parseNameWithOwner,
 } from "../../core/gh-pr.ts";
+import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
 import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
 import {
@@ -1100,16 +1105,78 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     const linkage = derivePrLinkage(store, target.root, prNum);
     const findings = findLatestForgeFindings(store, prNum, target.root, result.bundle.pr.headRefName ?? null);
     const commentFixState: CommentFixState = findLatestCommentFixState(store, prNum, target.root);
+
+    // De-dup: an inline comment carrying a `forge-finding id=X` marker IS the
+    // published view of local finding X — suppress the local finding so the
+    // Review UI shows one row, and enrich the comment with its resolution
+    // status (GitHub thread `isResolved` is ground truth; local `ghResolved`
+    // is the fallback). Threads are only fetched when a marker is present, so
+    // PRs without published findings pay nothing on this hot path. The fetch
+    // is uncached — one extra GraphQL call per bundle load when markers exist.
+    //
+    // Suppression is gated on the published comment STILL ANCHORING: a stale
+    // marker comment renders with a disabled checkbox (not fixable), so if we
+    // suppressed its local finding too the finding would become unselectable.
+    // Stale published findings therefore keep their local `finding:<id>` row
+    // (still selectable + fixable by id) while the comment keeps its marker
+    // metadata so resolve-on-fix still finds the thread.
+    const markerByCommentId = new Map<number, string>();
+    const publishedIds = new Set<string>();
+    for (const c of result.bundle.inlineComments) {
+      const marker = parseFindingMarker(c.body);
+      if (!marker) continue;
+      markerByCommentId.set(c.id, marker.id);
+      const anchored = commentAnchorsToDiff(result.bundle.diff, {
+        path: c.path,
+        position: c.position,
+        line: c.line,
+      });
+      if (anchored) publishedIds.add(marker.id);
+    }
+
+    let threadByCommentId = new Map<number, { threadId: string; isResolved: boolean }>();
+    if (markerByCommentId.size > 0) {
+      const url = result.bundle.pr.url;
+      const owned = url ? parseNameWithOwner(url) : null;
+      const threads = await fetchReviewThreads(prNum, {
+        cwd: target.root,
+        ghTarget: ghTargetForRepo(store, target.root),
+        ownerRepo: owned ? `${owned.owner}/${owned.repo}` : undefined,
+        apiHost: url ? parseApiHost(url) : null,
+      });
+      threadByCommentId = new Map();
+      for (const t of threads) {
+        for (const c of t.comments) {
+          threadByCommentId.set(c.databaseId, { threadId: t.threadId, isResolved: t.isResolved });
+        }
+      }
+    }
+
+    const inlineComments = result.bundle.inlineComments.map((c) => {
+      const findingId = markerByCommentId.get(c.id);
+      if (!findingId) return c;
+      const thread = threadByCommentId.get(c.id);
+      const ghResolvedFallback = commentFixState[`finding:${findingId}`]?.ghResolved === true;
+      return {
+        ...c,
+        forgeFindingId: findingId,
+        reviewThreadId: thread?.threadId ?? null,
+        isResolved: thread ? thread.isResolved : ghResolvedFallback,
+      };
+    });
+
+    const forgeFindings = findings.findings.filter((f) => !publishedIds.has(f.id));
+
     return jsonOk({
       pr: result.bundle.pr,
       diff: result.bundle.diff,
       diffStats: result.bundle.diffStats,
-      inlineComments: result.bundle.inlineComments,
+      inlineComments,
       issueComments: result.bundle.issueComments,
       prReviews: result.bundle.prReviews,
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
-      forgeFindings: findings.findings,
+      forgeFindings,
       commentFixState,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
@@ -2087,8 +2154,12 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     const repos = buildRepoViews(store, ctx.currentRepo);
     const target = resolvePrRepo(repos, repoParam);
     if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const publishToGitHub = body.publishToGitHub === true;
     try {
-      const result = await runAdHocReview({ prNum, repoRoot: target.root, repoName: target.name }, store);
+      const result = await runAdHocReview(
+        { prNum, repoRoot: target.root, repoName: target.name, publishToGitHub },
+        store,
+      );
       return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
     } catch (e) {
       if (e instanceof CliError) {

@@ -464,7 +464,7 @@ Juice's data lives at its own path; phase 4 integration reads/writes via the doc
 
 - **Plan section references in tasks.** UUID-based or section-name-based? Lean section-name with rename-tracking.
 - **Multi-repo plans.** Currently `plans.repo_path` is single. May need a join table `plan_repos` later.
-- **PR metadata.** Phase 2 stores in `artifacts`; may need a separate `pull_requests` table once PR lifecycle (state changes, GitHub comment sync) gets fleshed out.
+- **PR metadata.** Phase 2 stores in `artifacts`; may need a separate `pull_requests` table once PR lifecycle (state changes, GitHub comment sync) gets fleshed out. GitHub comment sync for review findings is now handled statelessly via an embedded marker rather than a local table — see [`adr/0027-publish-pr-review-findings-to-github.md`](adr/0027-publish-pr-review-findings-to-github.md).
 - **Session event size.** Large outputs may need blob storage. Punt until we see real volume.
 - **Synthesis JSON schema.** Define a stable shape before phase 1 ships so adjudication and critique replay can build on it reliably.
 - **Job blocker_summary structure.** Free text initially? Eventually a structured `(kind, message)` for routing in the UI? Start free text, evolve.

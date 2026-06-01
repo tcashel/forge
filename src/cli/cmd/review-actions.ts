@@ -24,6 +24,8 @@ import { CliError } from "../../cli/output.ts";
 import { adapterStreamsTokens, agentJobCommand, captureSidecarMetrics } from "../../core/agents/index.ts";
 import { finalizeSession, type SessionMetrics, upsertSession } from "../../core/db/writes.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
+import { parseApiHost, parseNameWithOwner } from "../../core/gh-pr.ts";
+import { publishReviewFindings } from "../../core/gh-pr-write.ts";
 import {
   buildReviewerPrompt,
   extractLastForgeReviewBlock,
@@ -33,13 +35,19 @@ import {
 } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
 
-const PR_VIEW_FIELDS = "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url";
+const PR_VIEW_FIELDS = "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url,headRefOid";
 const SCHEMA_VERSION = 1;
 
 export interface RunAdHocReviewInput {
   prNum: number;
   repoRoot: string;
   repoName: string;
+  /**
+   * Per-request opt-in to publish findings as GitHub review comments. Must be
+   * paired with `repoConfig.publishReviewToGitHub === true` for publishing to
+   * occur; survives the detach via the session `metrics` blob.
+   */
+  publishToGitHub?: boolean;
 }
 
 export interface RunAdHocReviewResult {
@@ -59,6 +67,18 @@ interface AdHocReviewMeta {
   completedAt: string | null;
   status: "running" | "completed" | "failed";
   exitCode: number | null;
+}
+
+/**
+ * Publishing requires BOTH the repo-level config switch and the per-request
+ * opt-in (persisted in the session metrics blob). With either off, the worker
+ * makes zero GitHub write calls.
+ */
+export function shouldPublishToGitHub(
+  repoConfig: { publishReviewToGitHub?: boolean },
+  metrics: { publishToGitHub?: unknown },
+): boolean {
+  return repoConfig.publishReviewToGitHub === true && metrics.publishToGitHub === true;
 }
 
 function reviewerSkillsDir(): string {
@@ -101,6 +121,7 @@ export function parseAdHocReviewSentinel(line: string): { exitCode: number; erro
 
 export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeStore): Promise<RunAdHocReviewResult> {
   const { prNum, repoRoot, repoName } = input;
+  const publishToGitHub = input.publishToGitHub === true;
 
   // 1) repoConfig validates first — cheap and deterministic.
   const repoConfig = store.getRepoConfig(repoRoot);
@@ -206,7 +227,9 @@ export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeSto
       // SessionMetrics is a fixed shape — these extra keys ride on the
       // metrics blob as JSON; the read side already parses leniently and
       // tolerates unknown keys.
-      ...({ logFile, runDir, prNum, repoRoot } as unknown as Partial<import("../../core/db/writes.ts").SessionMetrics>),
+      ...({ logFile, runDir, prNum, repoRoot, publishToGitHub } as unknown as Partial<
+        import("../../core/db/writes.ts").SessionMetrics
+      >),
     },
   });
 
@@ -300,6 +323,7 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
   const runDir = typeof metrics.runDir === "string" ? metrics.runDir : null;
   const prNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
   const repoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
+  const publishRequested = metrics.publishToGitHub === true;
 
   if (!runDir || prNum == null || !repoRoot) {
     const err = "session row missing runDir/prNum/repoRoot in metrics";
@@ -413,6 +437,25 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
     const findings: ForgeFinding[] = parseForgeReviewFindings(block);
     fs.writeFileSync(path.join(runDir, "findings.json"), `${JSON.stringify(findings, null, 2)}\n`, "utf-8");
     process.stdout.write(`[forge:review-worker] parsed ${findings.length} finding(s)\n`);
+
+    // Best-effort publish to GitHub. Gated on BOTH the repo-level config and
+    // the per-request opt-in; a failure logs a warning but never fails the
+    // review (findings.json stays the local source of truth).
+    if (shouldPublishToGitHub(repoConfig, metrics) && findings.length > 0) {
+      await publishFindingsToGitHub({
+        prNum,
+        prInfoJson,
+        diff,
+        findings,
+        ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+        cwd: repoRoot,
+        log: (msg) => process.stdout.write(`[forge:review-worker] ${msg}\n`),
+      });
+    } else if (publishRequested && repoConfig.publishReviewToGitHub !== true) {
+      process.stdout.write(
+        "[forge:review-worker] publish requested but repoConfig.publishReviewToGitHub is not enabled — skipping\n",
+      );
+    }
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
     exitCode = 1;
@@ -498,6 +541,47 @@ function writeMetaSafe(metaPath: string, meta: AdHocReviewMeta): void {
     fs.writeFileSync(metaPath, `${JSON.stringify(meta, null, 2)}\n`, "utf-8");
   } catch {
     /* worker logs the error elsewhere; meta is advisory */
+  }
+}
+
+/**
+ * Resolve the PR's owner/repo + host + head commit from the `gh pr view` JSON
+ * and publish the findings. Kept best-effort — any thrown error is caught and
+ * logged so it never fails the review.
+ */
+async function publishFindingsToGitHub(args: {
+  prNum: number;
+  prInfoJson: string;
+  diff: string;
+  findings: ForgeFinding[];
+  ghTarget: { user?: string; host?: string };
+  cwd: string;
+  log: (msg: string) => void;
+}): Promise<void> {
+  try {
+    let url = "";
+    let headRefOid = "";
+    try {
+      const parsed = JSON.parse(args.prInfoJson) as { url?: string; headRefOid?: string };
+      url = parsed.url ?? "";
+      headRefOid = parsed.headRefOid ?? "";
+    } catch {
+      /* fall through — resolvePrApiTarget can re-fetch the url */
+    }
+    const owned = url ? parseNameWithOwner(url) : null;
+    await publishReviewFindings(
+      args.prNum,
+      { findings: args.findings, diff: args.diff, commitId: headRefOid },
+      {
+        cwd: args.cwd,
+        ghTarget: args.ghTarget,
+        ownerRepo: owned ? `${owned.owner}/${owned.repo}` : undefined,
+        apiHost: url ? parseApiHost(url) : null,
+      },
+      args.log,
+    );
+  } catch (e) {
+    args.log(`publish to GitHub failed (best-effort): ${(e as Error).message}`);
   }
 }
 

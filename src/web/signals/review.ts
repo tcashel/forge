@@ -104,8 +104,20 @@ export interface RunReviewResponse {
   logStreamUrl: string;
 }
 
-export async function startAdHocReview(prNumber: number, repoRoot: string): Promise<RunReviewResponse> {
-  return apiPost<RunReviewResponse>(`/api/prs/${prNumber}/run-review`, { repo: repoRoot });
+// Per-request toggle for publishing findings to the PR as GitHub review
+// comments. Off by default; the server further requires
+// repoConfig.publishReviewToGitHub === true before any write occurs.
+export const publishToGitHub = signal<boolean>(false);
+
+export async function startAdHocReview(
+  prNumber: number,
+  repoRoot: string,
+  opts?: { publishToGitHub?: boolean },
+): Promise<RunReviewResponse> {
+  return apiPost<RunReviewResponse>(`/api/prs/${prNumber}/run-review`, {
+    repo: repoRoot,
+    publishToGitHub: opts?.publishToGitHub === true,
+  });
 }
 
 interface ReviewsListResponse {

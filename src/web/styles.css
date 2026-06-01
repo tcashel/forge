@@ -1813,6 +1813,19 @@ body.filtered-single .repo-chip{ display: none; }
 .badge-disputed { background: rgba(245, 165, 36, 0.15); color: var(--high); }
 .badge-failed { background: rgba(229, 72, 77, 0.15); color: var(--blocker); }
 .badge-fixing { background: var(--panel-2); color: var(--fg-dim); }
+.badge-resolved { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
+.badge-published { background: rgba(110, 118, 129, 0.18); color: var(--fg-dim); }
+
+/* "Publish to PR" toggle in the review action bar */
+.review-publish-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 0.85em;
+  color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
 
 /* Intent panel */
 .review-intent {

@@ -304,6 +304,12 @@ export interface InlinePrComment {
   updatedAt: string;
   htmlUrl: string;
   commitId: string;
+  /** Set when this comment is the published view of a Forge finding. */
+  forgeFindingId?: string;
+  /** GraphQL review-thread node id (null when no thread matched). */
+  reviewThreadId?: string | null;
+  /** Whether the finding's review thread is resolved (ground truth or fallback). */
+  isResolved?: boolean;
 }
 
 export interface IssuePrComment {
@@ -350,6 +356,7 @@ export type CommentFixStatus = "fixed" | "disputed" | "failed";
 export interface CommentFixStateEntry {
   status: CommentFixStatus;
   reason?: string;
+  ghResolved?: boolean;
 }
 
 export type CommentFixState = Record<string, CommentFixStateEntry>;

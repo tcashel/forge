@@ -570,6 +570,51 @@ No edits, one open question.
   assert.equal(result.openQuestionsRecorded, 1);
 });
 
+test("runImprover de-dupes same-pass duplicate open questions even when the spec records none", async (t) => {
+  const { store } = withTmpHome(t);
+  // Spec has no recorded open questions (the `- None` placeholder is filtered
+  // out), so the existing-set is empty. The synthesizer pass emits the same
+  // question twice — only one must survive to the improver prompt.
+  const body = "# Title\n\n## Open Questions\n\n- None\n";
+  const task = seedTask(store, "task-oq-dedupe-empty-001", body);
+
+  const recs = `\`\`\`forge-spec-recommendations
+## Summary
+
+No edits, one question repeated within the pass.
+
+## Recommended Edits
+
+(none)
+
+## Open Questions
+
+1. Which storage backend should we use? — raised by reviewer A.
+2. Which storage backend should we use? — raised by reviewer B.
+
+## Findings Triage
+\`\`\`
+`;
+
+  let promptSeen = "";
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recs),
+    runImproverAgent: async (args) => {
+      promptSeen = fs.readFileSync(args.promptFile, "utf-8");
+      const improved = "# Title\n\n## Open Questions\n\n- [ ] Which storage backend should we use?\n";
+      const out = `\`\`\`forge-spec-improved\n## Mode\n\napplied\n\n## Improved Spec\n\n${improved}\n\n## Change Summary\n\n- Recorded 1 open question(s); no spec edits.\n\`\`\`\n`;
+      fs.writeFileSync(args.outputPath, out);
+      fs.writeFileSync(args.errLogPath, "");
+      return 0;
+    },
+  });
+
+  assert.equal(result.openQuestionsRecorded, 1, "the same-pass duplicate must be dropped");
+  // The improver prompt carries the question exactly once.
+  const occurrences = promptSeen.match(/Which storage backend should we use\?/g) ?? [];
+  assert.equal(occurrences.length, 1, "the duplicate must not reach the improver prompt twice");
+});
+
 test("runImprover no-ops when an Open-Questions-only pass only repeats recorded questions", async (t) => {
   const { store } = withTmpHome(t);
   const body = "# Title\n\n## Open Questions\n\n- [ ] Which storage backend should we use?\n";
