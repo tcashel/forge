@@ -32,18 +32,31 @@ function stripPrefix(p: string): string {
   return p;
 }
 
+/** Half-open-free [start, end] inclusive RIGHT-side line span of one hunk. */
+interface HunkRange {
+  start: number;
+  end: number;
+}
+
 interface ParsedFile {
   path: string;
   oldPath: string | null;
   /** Set of RIGHT-side line numbers present as added or context rows. */
   rightLines: Set<number>;
+  /**
+   * Inclusive RIGHT-side line spans for each hunk in this file, in diff order.
+   * A multi-line review anchor is only valid when both ends fall in the same
+   * span — GitHub rejects a start_line/line pair that crosses hunks.
+   */
+  hunks: HunkRange[];
 }
 
 /**
  * Minimal unified-diff parse that records, per file, the set of RIGHT-side
- * (new-file) line numbers covered by added or context rows. Deleted rows
- * don't exist on the RIGHT side and so are excluded — a finding anchored only
- * to a deleted line routes out-of-diff.
+ * (new-file) line numbers covered by added or context rows, plus the inclusive
+ * RIGHT-side line span of each hunk. Deleted rows don't exist on the RIGHT side
+ * and so are excluded — a finding anchored only to a deleted line routes
+ * out-of-diff.
  */
 function parseRightSideLines(diff: string): ParsedFile[] {
   if (!diff) return [];
@@ -52,8 +65,20 @@ function parseRightSideLines(diff: string): ParsedFile[] {
   let current: ParsedFile | null = null;
   let newLine = 0;
   let inHunk = false;
+  let currentHunk: HunkRange | null = null;
+
+  // A hunk's RIGHT-side span only counts rows that actually exist on the RIGHT
+  // side (added/context). Close out the open hunk before starting a new one or
+  // a new file, dropping empty (deletion-only) hunks.
+  const closeHunk = () => {
+    if (current && currentHunk && currentHunk.end >= currentHunk.start) {
+      current.hunks.push(currentHunk);
+    }
+    currentHunk = null;
+  };
 
   const finalize = () => {
+    closeHunk();
     if (current) files.push(current);
   };
 
@@ -67,6 +92,7 @@ function parseRightSideLines(diff: string): ParsedFile[] {
         path: newPath ?? "",
         oldPath: oldPath && oldPath !== newPath ? oldPath : null,
         rightLines: new Set(),
+        hunks: [],
       };
       inHunk = false;
       continue;
@@ -84,54 +110,84 @@ function parseRightSideLines(diff: string): ParsedFile[] {
     }
     const header = ln.match(HUNK_HEADER);
     if (header) {
+      closeHunk();
       newLine = Number(header[1]);
       inHunk = true;
+      // Seed an empty span; the first RIGHT-side row sets its real start.
+      currentHunk = { start: Number.POSITIVE_INFINITY, end: -1 };
       continue;
     }
     if (!inHunk) continue;
     if (ln.startsWith("\\")) continue; // "\ No newline at end of file"
     const marker = ln.charAt(0);
-    if (marker === "+") {
+    if (marker === "+" || marker === " " || marker === "") {
+      // Added or context row — present on the RIGHT side.
       current.rightLines.add(newLine);
+      if (currentHunk) {
+        if (newLine < currentHunk.start) currentHunk.start = newLine;
+        if (newLine > currentHunk.end) currentHunk.end = newLine;
+      }
       newLine += 1;
     } else if (marker === "-") {
       // deletion — no RIGHT-side line
-    } else if (marker === " " || marker === "") {
-      current.rightLines.add(newLine);
-      newLine += 1;
     }
   }
   finalize();
   return files;
 }
 
+/** The hunk containing `line` on the RIGHT side, or null if none does. */
+function hunkContaining(hunks: HunkRange[], line: number): HunkRange | null {
+  for (const h of hunks) {
+    if (line >= h.start && line <= h.end) return h;
+  }
+  return null;
+}
+
 /**
  * Split findings into `inDiff` (anchorable as inline review comments) and
- * `outOfDiff` (review-body bullets). A finding anchors only when its end line
- * lands on a RIGHT-side row of the file it names; a multi-line range also
- * carries `startLine` when its start line lands on a RIGHT-side row too.
+ * `outOfDiff` (review-body bullets).
+ *
+ * A finding anchors only when its end line lands on a RIGHT-side row of the
+ * file it names; otherwise it routes out-of-diff (GitHub 422s on inline
+ * comments off the diff hunks).
+ *
+ * A multi-line range carries `startLine` only when its start and end lines fall
+ * in the SAME hunk — GitHub requires a `start_line`/`line` pair to be anchorable
+ * within one hunk, and an invalid pair fails the entire batched review POST
+ * (which would block every other inline finding from publishing). When the
+ * range spans hunks (or its start isn't on a RIGHT-side row), we fall back to a
+ * single-line anchor at `end` — still valid and less lossy than dropping the
+ * finding out-of-diff.
  */
 export function partitionFindingsByDiff(findings: ForgeFinding[], diff: string): PartitionResult {
   const files = parseRightSideLines(diff);
-  const byPath = new Map<string, Set<number>>();
+  const byPath = new Map<string, ParsedFile>();
   for (const f of files) {
-    byPath.set(f.path, f.rightLines);
-    if (f.oldPath) byPath.set(f.oldPath, f.rightLines);
+    byPath.set(f.path, f);
+    if (f.oldPath) byPath.set(f.oldPath, f);
   }
 
   const inDiff: AnchoredFinding[] = [];
   const outOfDiff: ForgeFinding[] = [];
 
   for (const finding of findings) {
-    const rightLines = finding.file ? byPath.get(finding.file) : undefined;
+    const parsed = finding.file ? byPath.get(finding.file) : undefined;
     const end = finding.lineEnd > 0 ? finding.lineEnd : finding.lineStart;
-    if (!rightLines || end <= 0 || !rightLines.has(end)) {
+    // The end line must exist on the RIGHT side to anchor an inline comment.
+    if (!parsed || end <= 0 || !parsed.rightLines.has(end)) {
       outOfDiff.push(finding);
       continue;
     }
     const anchored: AnchoredFinding = { finding, line: end, side: "RIGHT" };
-    if (finding.lineStart > 0 && finding.lineStart < end && rightLines.has(finding.lineStart)) {
-      anchored.startLine = finding.lineStart;
+    // Multi-line range: carry startLine only when start and end share a hunk.
+    if (finding.lineStart > 0 && finding.lineStart < end) {
+      const endHunk = hunkContaining(parsed.hunks, end);
+      const startHunk = hunkContaining(parsed.hunks, finding.lineStart);
+      if (startHunk && endHunk && startHunk === endHunk) {
+        anchored.startLine = finding.lineStart;
+      }
+      // else: cross-hunk or start not on a RIGHT-side row → single-line anchor.
     }
     inDiff.push(anchored);
   }
