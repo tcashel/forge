@@ -120,7 +120,11 @@ function parseRightSideLines(diff: string): ParsedFile[] {
     if (!inHunk) continue;
     if (ln.startsWith("\\")) continue; // "\ No newline at end of file"
     const marker = ln.charAt(0);
-    if (marker === "+" || marker === " " || marker === "") {
+    // A genuine context row always carries a leading space — even a blank line
+    // is `" "` in a unified diff. A truly empty string is the artifact left by
+    // `diff.split(/\r?\n/)` on the trailing newline from `gh pr diff`; counting
+    // it would invent a phantom RIGHT-side line past the last hunk, so skip it.
+    if (marker === "+" || marker === " ") {
       // Added or context row — present on the RIGHT side.
       current.rightLines.add(newLine);
       if (currentHunk) {

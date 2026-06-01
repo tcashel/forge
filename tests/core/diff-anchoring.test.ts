@@ -117,3 +117,50 @@ test("partitionFindingsByDiff routes a finding with no line anchor to outOfDiff"
   assert.equal(inDiff.length, 0);
   assert.equal(outOfDiff.length, 1);
 });
+
+test("partitionFindingsByDiff ignores the trailing-newline split artifact (no phantom line past the last hunk)", () => {
+  // `gh pr diff` output ends with a trailing newline, so split() leaves a final
+  // empty string while still "in hunk". It must NOT be counted as a RIGHT-side
+  // row — the last real RIGHT-side line in SAMPLE_DIFF is 5, so a finding on
+  // line 6 has no anchor and routes out-of-diff.
+  const withTrailingNewline = `${SAMPLE_DIFF}\n`;
+  const phantom = makeFinding({ id: "phantom", file: "src/foo.ts", lineStart: 6, lineEnd: 6 });
+  const lastReal = makeFinding({ id: "last", file: "src/foo.ts", lineStart: 5, lineEnd: 5 });
+  const { inDiff, outOfDiff } = partitionFindingsByDiff([phantom, lastReal], withTrailingNewline);
+  // The genuine last line (5) still anchors; the phantom (6) does not.
+  assert.deepEqual(
+    inDiff.map((a) => a.finding.id),
+    ["last"],
+  );
+  assert.deepEqual(
+    outOfDiff.map((f) => f.id),
+    ["phantom"],
+  );
+});
+
+test("partitionFindingsByDiff counts a genuine space-prefixed blank context line as a RIGHT-side row", () => {
+  // A blank context line in a unified diff is a single space (" "), not "". It
+  // is a real RIGHT-side row, so lines after it stay anchorable.
+  const blankCtxDiff = [
+    "diff --git a/src/foo.ts b/src/foo.ts",
+    "index 1111111..2222222 100644",
+    "--- a/src/foo.ts",
+    "+++ b/src/foo.ts",
+    "@@ -1,3 +1,4 @@",
+    " line1",
+    " ", // genuine blank context line → RIGHT line 2
+    "+added3",
+    " line4",
+    "", // trailing-newline split artifact → must be ignored
+  ].join("\n");
+  // RIGHT-side lines: 1 (ctx), 2 (blank ctx), 3 (add), 4 (ctx). Not 5.
+  const onBlank = makeFinding({ id: "blank", file: "src/foo.ts", lineStart: 2, lineEnd: 2 });
+  const afterBlank = makeFinding({ id: "after", file: "src/foo.ts", lineStart: 3, lineEnd: 3 });
+  const phantom5 = makeFinding({ id: "phantom5", file: "src/foo.ts", lineStart: 5, lineEnd: 5 });
+  const { inDiff, outOfDiff } = partitionFindingsByDiff([onBlank, afterBlank, phantom5], blankCtxDiff);
+  assert.deepEqual(new Set(inDiff.map((a) => a.finding.id)), new Set(["blank", "after"]));
+  assert.deepEqual(
+    outOfDiff.map((f) => f.id),
+    ["phantom5"],
+  );
+});
