@@ -5,7 +5,7 @@
 
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { summarizeActivity } from "../../src/web/components/activity/ActivityTable.tsx";
+import { absTime, summarizeActivity } from "../../src/web/components/activity/ActivityTable.tsx";
 import type { AgentActivityRow } from "../../src/web/types.ts";
 
 function row(overrides: Partial<AgentActivityRow> & { id: string }): AgentActivityRow {
@@ -61,4 +61,45 @@ test("summarizeActivity byModel orders desc by total tokens", () => {
   assert.equal(out.byModel[0].tokensIn, 500);
   assert.equal(out.byModel[0].tokensOut, 100);
   assert.equal(out.byModel[1].model, "sonnet-4-6");
+});
+
+test("summarizeActivity byPurpose aggregates per purpose and sums to grand totals", () => {
+  const rows = [
+    row({ id: "e1", purpose: "execution", metrics: { tokensIn: 100, tokensOut: 50, costUsd: 0.1 } }),
+    row({ id: "r1", purpose: "review", metrics: { tokensIn: 200, tokensOut: 20, costUsd: 0.2 } }),
+    row({ id: "r2", purpose: "review", metrics: { tokensIn: 300, tokensOut: 30, costUsd: 0.3 } }),
+  ];
+  const out = summarizeActivity(rows);
+  const exec = out.byPurpose.find((p) => p.purposeLabel === "execution");
+  const review = out.byPurpose.find((p) => p.purposeLabel === "review");
+  assert.ok(exec && review);
+  assert.equal(review?.runCount, 2);
+  assert.equal(review?.tokensIn, 500);
+  assert.equal(review?.tokensOut, 50);
+  assert.ok(Math.abs((review?.costUsd ?? 0) - 0.5) < 1e-9);
+  // breakdown sums to the grand totals
+  const sumIn = out.byPurpose.reduce((s, p) => s + p.tokensIn, 0);
+  const sumOut = out.byPurpose.reduce((s, p) => s + p.tokensOut, 0);
+  const sumCost = out.byPurpose.reduce((s, p) => s + p.costUsd, 0);
+  assert.equal(sumIn, out.tokensIn);
+  assert.equal(sumOut, out.tokensOut);
+  assert.ok(Math.abs(sumCost - out.costUsd) < 1e-9);
+  // sorted desc by total tokens — review (550) before execution (150)
+  assert.equal(out.byPurpose[0].purposeLabel, "review");
+});
+
+test("summarizeActivity byPurpose splits critic-a / critic-b via deriveLabel", () => {
+  const rows = [
+    row({ id: "s-critique-x-a", purpose: "critique", metrics: { tokensIn: 10, tokensOut: 1 } }),
+    row({ id: "s-critique-x-b", purpose: "critique", metrics: { tokensIn: 20, tokensOut: 2 } }),
+  ];
+  const out = summarizeActivity(rows);
+  const labels = out.byPurpose.map((p) => p.purposeLabel).sort();
+  assert.deepEqual(labels, ["critic-a", "critic-b"]);
+});
+
+test("absTime formats an ISO timestamp and falls back on garbage", () => {
+  assert.equal(absTime("not-a-date"), "—");
+  const s = absTime("2026-05-31T10:28:00.000Z");
+  assert.ok(s.length > 0 && s !== "—", `expected a formatted date, got ${s}`);
 });

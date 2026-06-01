@@ -23,8 +23,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliError } from "../../cli/output.ts";
-import { agentCommand } from "../../core/agents/index.ts";
-import { finalizeSession, upsertSession } from "../../core/db/writes.ts";
+import { adapterStreamsTokens, agentJobCommand, captureSidecarMetrics } from "../../core/agents/index.ts";
+import { finalizeSession, type SessionMetrics, upsertSession } from "../../core/db/writes.ts";
 import {
   type FixTarget,
   type FixTargetSource,
@@ -483,6 +483,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   let exitCode = 0;
   let error: string | null = null;
   let qualityResult: { ok: boolean; failedCommand: string | null } | null = null;
+  let metricsPatch: Partial<SessionMetrics> = {};
 
   try {
     // 0) Rehydrate the worktree when missing. Progress streams to the session
@@ -632,7 +633,9 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
     const promptFile = path.join(runDir, "comment-fix-prompt.txt");
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    const cmd = agentCommand(row.agent_adapter as Parameters<typeof agentCommand>[0], row.model ?? "", promptFile, {
+    const adapter = row.agent_adapter as Parameters<typeof agentJobCommand>[0];
+    const streamFile = path.join(runDir, "comment-fix.stream.jsonl");
+    const cmd = agentJobCommand(adapter, row.model ?? "", promptFile, streamFile, {
       reasoningEffort: repoConfig.reviewerReasoningEffort,
     });
 
@@ -646,8 +649,20 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
         cwd: worktreePath,
       });
     } catch (e) {
+      // Even on a non-zero exit the agent may have written a parseable
+      // sidecar before dying; capture it so the failed row still records
+      // tokens/cost, mirroring the launch bash runner's failure branch.
+      if (adapterStreamsTokens(adapter) && fs.existsSync(streamFile)) {
+        metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+      }
       const err = e as { status?: number; message?: string };
       throw new Error(`agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
+    }
+
+    // Capture tokens/cost from the sidecar before parsing validation (which
+    // may throw) so a parse miss doesn't lose the run's token count.
+    if (adapterStreamsTokens(adapter)) {
+      metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
     }
 
     // Parse validation block, keyed by fix-target token.
@@ -747,6 +762,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
     state: exitCode === 0 ? "completed" : "failed",
     exitCode,
     error,
+    metrics: metricsPatch,
   });
 
   process.stdout.write(`${commentFixSentinelLine(exitCode, error)}\n`);
