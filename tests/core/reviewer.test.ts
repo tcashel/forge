@@ -58,6 +58,19 @@ test("parseForgeReviewFindings reads a multi-line range and preserves evidence",
   assert.match(f.evidence ?? "", /for \(let i = 1;/);
 });
 
+test("parseForgeReviewFindings anchors a multi-file Where line on the first path", () => {
+  // Regression: a Where line listing several backtick-quoted files used to
+  // fail the anchor regex entirely, silently dropping the whole finding.
+  const findings = parseForgeReviewFindings(load("multi-file-where.md"));
+  assert.equal(findings.length, 1);
+  const [f] = findings;
+  assert.equal(f.severity, "HIGH");
+  assert.equal(f.file, "src/core/pricing.ts");
+  assert.equal(f.lineStart, 67);
+  assert.equal(f.lineEnd, 76);
+  assert.match(f.fix, /estimateCost/);
+});
+
 test("parseForgeReviewFindings returns [] on malformed input", () => {
   const findings = parseForgeReviewFindings(load("malformed.md"));
   assert.deepEqual(findings, []);
