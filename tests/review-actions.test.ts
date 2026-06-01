@@ -12,7 +12,12 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { listForgeReviews, loadForgeReview, parseAdHocReviewSentinel } from "../src/cli/cmd/review-actions.ts";
+import {
+  listForgeReviews,
+  loadForgeReview,
+  parseAdHocReviewSentinel,
+  shouldPublishToGitHub,
+} from "../src/cli/cmd/review-actions.ts";
 import { resolveSessionLogFile, startServer } from "../src/cli/cmd/serve.ts";
 import { finalizeSession, upsertSession } from "../src/core/db/writes.ts";
 import { ForgeStore } from "../src/core/store.ts";
@@ -35,6 +40,16 @@ test("parseAdHocReviewSentinel reads exit code and error from the worker line", 
 
   assert.equal(parseAdHocReviewSentinel("not a sentinel"), null);
   assert.equal(parseAdHocReviewSentinel(""), null);
+});
+
+test("shouldPublishToGitHub requires BOTH the repo config and the per-request opt-in", () => {
+  // Off by default — neither flag set → no GitHub writes.
+  assert.equal(shouldPublishToGitHub({}, {}), false);
+  // Config on but request off (and vice-versa) → still off.
+  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: true }, { publishToGitHub: false }), false);
+  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: false }, { publishToGitHub: true }), false);
+  // Both on → publish.
+  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: true }, { publishToGitHub: true }), true);
 });
 
 test("resolveSessionLogFile reads metrics.logFile for ad-hoc review sessions", () => {

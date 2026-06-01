@@ -119,6 +119,12 @@ export interface RepoConfig {
   reviewerAgent?: LaunchTarget;
   reviewerModel?: string;
   reviewerReasoningEffort?: ReasoningEffort;
+  /**
+   * Opt-in to publishing PR-page ad-hoc review findings as GitHub inline
+   * review comments (and resolving them on fix). Default `false`. Requires a
+   * per-request opt-in too — see RunAdHocReviewInput.publishToGitHub.
+   */
+  publishReviewToGitHub?: boolean;
   fixerAgent?: LaunchTarget;
   fixerModel?: string;
   fixerReasoningEffort?: ReasoningEffort;

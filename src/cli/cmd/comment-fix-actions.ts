@@ -32,8 +32,10 @@ import {
   parseTargetKey,
   targetKey,
 } from "../../core/fix-targets.ts";
+import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
-import { fetchPrBundle } from "../../core/gh-pr.ts";
+import { fetchPrBundle, parseApiHost, parseNameWithOwner } from "../../core/gh-pr.ts";
+import { fetchReviewThreads, replyToReviewComment, resolveReviewThread } from "../../core/gh-pr-write.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
@@ -49,6 +51,8 @@ export type CommentFixStatus = "fixed" | "disputed" | "failed";
 export interface CommentFixStateEntry {
   status: CommentFixStatus;
   reason?: string;
+  /** Mirror of ValidationFileEntry.ghResolved — surfaced to the Review UI. */
+  ghResolved?: boolean;
 }
 
 export type CommentFixState = Record<string, CommentFixStateEntry>;
@@ -60,6 +64,12 @@ export interface ValidationFileEntry extends CommentValidationEntry {
    * rows stay `disputed`.
    */
   status: CommentFixStatus;
+  /**
+   * True when this finding's published GitHub review thread was resolved by
+   * the fixer (set only for `finding:` targets Forge published). Absent for
+   * targets with no GitHub write.
+   */
+  ghResolved?: boolean;
 }
 
 /** Legacy on-disk validation entry (pre-token): keyed by numeric commentId. */
@@ -68,6 +78,7 @@ interface LegacyValidationFileEntry {
   targetId?: string;
   status?: CommentFixStatus;
   reason?: string;
+  ghResolved?: boolean;
 }
 
 /**
@@ -691,6 +702,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
 
     // Check whether the agent actually changed anything.
     const changedFiles = listChangedFiles(worktreePath, headSha);
+    let committedAndPushed = false;
     if (validCount === 0 || changedFiles.length === 0) {
       process.stdout.write(
         `[forge:comment-fix-worker] no edits to commit (${changedFiles.length} changed files, ${validCount} valid).\n`,
@@ -716,6 +728,25 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       // Stage and commit only the files the agent changed (no `git add -A`).
       const validTokens = validationEntries.filter((v) => v.status === "fixed").map((v) => v.targetId);
       commitAndPush(worktreePath, changedFiles, validTokens);
+      committedAndPushed = true;
+    }
+
+    // Resolve/reply on GitHub for findings Forge published. Gated on the repo
+    // config (resolving only makes sense when publishing is enabled) and runs
+    // on the success path for both the committed and no-commit branches.
+    // Best-effort: persists ghResolved into validation.json but never fails
+    // the worker.
+    if (repoConfig.publishReviewToGitHub === true) {
+      await resolvePublishedFindingThreads({
+        prNum,
+        prUrl: bundle.bundle.pr.url,
+        ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+        cwd: repoRoot,
+        entries: validationEntries,
+        committedAndPushed,
+        log: (msg) => process.stdout.write(`[forge:comment-fix-worker] ${msg}\n`),
+      });
+      writeValidation(runDir, validationEntries);
     }
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
@@ -1117,6 +1148,100 @@ function rollbackWorktree(worktreePath: string, headSha: string, files: string[]
   }
 }
 
+/**
+ * Reconcile fix verdicts against the PR's published GitHub review threads.
+ *
+ * For each `finding:` target whose finding Forge published (i.e. a thread
+ * carries its `forge-finding` marker):
+ *   - `fixed` (gated on a successful commit/push) → resolve the thread.
+ *   - `disputed` → reply with the dispute reason, leave the thread open.
+ *   - `failed`   → leave open, no write.
+ * `comment:`/`review:` targets reference human/CodeRabbit threads with no
+ * Forge marker — they get no GitHub write (we never resolve another author's
+ * thread on fix). Mutates `entries` in place to stamp `ghResolved`.
+ */
+export async function resolvePublishedFindingThreads(args: {
+  prNum: number;
+  prUrl: string;
+  ghTarget: { user?: string; host?: string };
+  cwd: string;
+  entries: ValidationFileEntry[];
+  committedAndPushed: boolean;
+  log: (msg: string) => void;
+}): Promise<void> {
+  const { prNum, prUrl, entries, committedAndPushed, log } = args;
+  const hasFindingTarget = entries.some((e) => parseTargetKey(e.targetId)?.source === "finding");
+  if (!hasFindingTarget) return;
+
+  const owned = prUrl ? parseNameWithOwner(prUrl) : null;
+  const opts = {
+    cwd: args.cwd,
+    ghTarget: args.ghTarget,
+    ownerRepo: owned ? `${owned.owner}/${owned.repo}` : undefined,
+    apiHost: prUrl ? parseApiHost(prUrl) : null,
+  };
+
+  let threads: Awaited<ReturnType<typeof fetchReviewThreads>>;
+  try {
+    threads = await fetchReviewThreads(prNum, opts);
+  } catch (e) {
+    log(`could not fetch review threads (best-effort): ${(e as Error).message}`);
+    return;
+  }
+
+  // findingId → { commentId, threadId } from the thread markers.
+  const published = new Map<string, { commentId: number; threadId: string }>();
+  for (const t of threads) {
+    for (const c of t.comments) {
+      const marker = parseFindingMarker(c.body);
+      if (marker && !published.has(marker.id)) {
+        published.set(marker.id, { commentId: c.databaseId, threadId: t.threadId });
+      }
+    }
+  }
+
+  for (const entry of entries) {
+    const target = parseTargetKey(entry.targetId);
+    if (!target) continue;
+    if (target.source !== "finding") {
+      log(`skipping GitHub write for ${entry.targetId} (not a Forge-published finding)`);
+      continue;
+    }
+    const hit = published.get(target.id);
+    if (!hit) {
+      log(`finding ${target.id} has no published thread on the PR — skipping`);
+      continue;
+    }
+    try {
+      if (entry.status === "fixed") {
+        if (!committedAndPushed) {
+          log(`finding ${target.id} fixed but nothing was pushed — leaving thread open`);
+          continue;
+        }
+        const res = await resolveReviewThread(hit.threadId, opts);
+        if (res.ok) {
+          entry.ghResolved = true;
+          log(`resolved review thread for finding ${target.id}`);
+        } else {
+          log(`failed to resolve thread for finding ${target.id}: ${res.error ?? "unknown"}`);
+        }
+      } else if (entry.status === "disputed") {
+        const res = await replyToReviewComment(
+          prNum,
+          hit.commentId,
+          `Forge disputed this finding: ${entry.reason}`,
+          opts,
+        );
+        if (res.ok) log(`replied with dispute reason on finding ${target.id}`);
+        else log(`failed to reply on finding ${target.id}: ${res.error ?? "unknown"}`);
+      }
+      // `failed` → leave open, no write.
+    } catch (e) {
+      log(`GitHub write for finding ${target.id} failed (best-effort): ${(e as Error).message}`);
+    }
+  }
+}
+
 function commitAndPush(worktreePath: string, files: string[], validTokens: string[]): void {
   // Stage only the files the agent changed — never `git add -A`.
   execFileSync("git", ["-C", worktreePath, "add", "--", ...files], { stdio: ["pipe", "inherit", "inherit"] });
@@ -1191,6 +1316,7 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
         let status = entry.status;
         if (sessionFailed && status === "fixed") status = "failed";
         out[token] = { status, reason: entry.reason };
+        if (entry.ghResolved !== undefined) out[token].ghResolved = entry.ghResolved;
       }
       return out;
     } catch {}
