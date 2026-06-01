@@ -570,6 +570,45 @@ No edits, one open question.
   assert.equal(result.openQuestionsRecorded, 1);
 });
 
+test("runImprover no-ops when an Open-Questions-only pass only repeats recorded questions", async (t) => {
+  const { store } = withTmpHome(t);
+  const body = "# Title\n\n## Open Questions\n\n- [ ] Which storage backend should we use?\n";
+  const task = seedTask(store, "task-oqonly-dup-001", body);
+  const before = store.getSpec(task.id) ?? "";
+
+  const recs = `\`\`\`forge-spec-recommendations
+## Summary
+
+No edits, one repeated open question.
+
+## Recommended Edits
+
+(none)
+
+## Open Questions
+
+1. Which storage backend should we use? — raised by both.
+
+## Findings Triage
+\`\`\`
+`;
+
+  let ran = false;
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recs),
+    runImproverAgent: async () => {
+      ran = true;
+      return 0;
+    },
+  });
+
+  assert.equal(ran, false, "improver must not run when every open question is already recorded");
+  assert.equal(result.mode, "no-op");
+  assert.equal(result.openQuestionsRecorded, 0);
+  assert.equal(store.getPlan(task.id)?.specVersion, 1);
+  assert.equal(store.getSpec(task.id), before, "spec untouched when open questions are duplicates");
+});
+
 test("runImprover no-ops on a deferred-only pass but records the artifact", async (t) => {
   const { store } = withTmpHome(t);
   const body = "# Title\n\nBody.\n";
