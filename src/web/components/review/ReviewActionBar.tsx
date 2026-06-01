@@ -1,6 +1,6 @@
 import { useState } from "preact/hooks";
 import { enterPrMode } from "../../lib/modes";
-import { activeReviewSession, loadReviewBundle, startAdHocReview } from "../../signals/review";
+import { activeReviewSession, loadReviewBundle, publishToGitHub, startAdHocReview } from "../../signals/review";
 
 interface Props {
   prNumber: number;
@@ -23,7 +23,7 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
     setStarting(true);
     setStartError(null);
     try {
-      const res = await startAdHocReview(prNumber, repoRoot);
+      const res = await startAdHocReview(prNumber, repoRoot, { publishToGitHub: publishToGitHub.value });
       activeReviewSession.value = { sessionId: res.sessionId, prNum: prNumber };
     } catch (e) {
       const err = e as { message?: string; hint?: string | null };
@@ -52,6 +52,20 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
       >
         {starting ? "Starting…" : reviewRunning ? "Forge review running…" : "Run Forge review"}
       </button>
+      <label
+        class="review-publish-toggle"
+        title="Publish findings to the PR as GitHub review comments (requires publishReviewToGitHub enabled for this repo)."
+      >
+        <input
+          type="checkbox"
+          checked={publishToGitHub.value}
+          disabled={starting || reviewRunning}
+          onChange={(e) => {
+            publishToGitHub.value = (e.target as HTMLInputElement).checked;
+          }}
+        />
+        Publish to PR
+      </label>
       {reviewRunning ? <span class="review-running-badge">review running…</span> : null}
       {startError ? (
         <span class="review-status error" style={{ padding: "4px 8px" }}>

@@ -90,6 +90,11 @@ export function CommentThread({ thread, anchored = true }: Props) {
             {badge.reason ? <span class="badge-reason"> — {badge.reason}</span> : null}
           </div>
         ) : null}
+        {thread.root.forgeFindingId ? (
+          <div class={`review-thread-badge badge-${thread.root.isResolved ? "resolved" : "published"}`}>
+            <span class="badge-label">{thread.root.isResolved ? "resolved on PR" : "Forge finding · open"}</span>
+          </div>
+        ) : null}
         {thread.replies.length > 0 ? (
           <div class="review-thread-replies">
             {thread.replies.map((r) => (
