@@ -171,7 +171,15 @@ export async function captureSidecarMetrics(
     modelPricedAt: null,
   };
   if (costSource === null) {
-    const est = estimateCost({ agentAdapter: adapter, model, tokensIn: r.tokensIn, tokensOut: r.tokensOut });
+    const est = estimateCost({
+      agentAdapter: adapter,
+      model,
+      tokensIn: r.tokensIn,
+      tokensOut: r.tokensOut,
+      // codex folds cached input into tokensIn; price the cached portion
+      // (cacheRead) at the discounted rate instead of the full input rate.
+      cachedTokensIn: r.cacheRead,
+    });
     return { ...patch, ...est };
   }
   return patch;

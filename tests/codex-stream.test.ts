@@ -44,11 +44,62 @@ test("readCodexResultFromFile returns null metrics when file is missing", async 
 
 test("estimateCost returns a non-null cost for codex gpt-5.5 from captured tokens", async () => {
   const r = await readCodexResultFromFile(FIXTURE);
-  const est = estimateCost({ agentAdapter: "codex", model: "gpt-5.5", tokensIn: r.tokensIn, tokensOut: r.tokensOut });
+  const est = estimateCost({
+    agentAdapter: "codex",
+    model: "gpt-5.5",
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+    cachedTokensIn: r.cacheRead,
+  });
   assert.notEqual(est.costUsd, null, "priced model must produce a non-null cost");
   assert.equal(est.costSource, "estimate");
-  // 14575 in * $5/1M + 6 out * $30/1M
-  assert.ok(Math.abs((est.costUsd ?? 0) - (14575 * 5 + 6 * 30) / 1_000_000) < 1e-12);
+  // codex folds cached input into input_tokens, so the 4480 cached tokens
+  // bill at the $0.50/1M cached rate and only the remaining 10095 at $5/1M.
+  // (14575 - 4480) in * $5/1M + 4480 cached * $0.50/1M + 6 out * $30/1M
+  const expected = ((14575 - 4480) * 5 + 4480 * 0.5 + 6 * 30) / 1_000_000;
+  assert.ok(Math.abs((est.costUsd ?? 0) - expected) < 1e-12, `expected ${expected}, got ${est.costUsd}`);
+});
+
+test("estimateCost charges cached input at the full rate when no cached count is passed", () => {
+  // Backstop: without cachedTokensIn, every input token bills at inputPer1M.
+  const est = estimateCost({ agentAdapter: "codex", model: "gpt-5.5", tokensIn: 14575, tokensOut: 6 });
+  const expected = (14575 * 5 + 6 * 30) / 1_000_000;
+  assert.ok(Math.abs((est.costUsd ?? 0) - expected) < 1e-12, `expected ${expected}, got ${est.costUsd}`);
+});
+
+test("estimateCost cached pricing is strictly cheaper than full-rate input", async () => {
+  const r = await readCodexResultFromFile(FIXTURE);
+  const cached = estimateCost({
+    agentAdapter: "codex",
+    model: "gpt-5.5",
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+    cachedTokensIn: r.cacheRead,
+  });
+  const fullRate = estimateCost({
+    agentAdapter: "codex",
+    model: "gpt-5.5",
+    tokensIn: r.tokensIn,
+    tokensOut: r.tokensOut,
+  });
+  assert.ok(
+    (cached.costUsd ?? 0) < (fullRate.costUsd ?? 0),
+    "nonzero cached input must lower the estimate vs charging it all at the full input rate",
+  );
+});
+
+test("estimateCost clamps a cached count larger than tokensIn", () => {
+  // A malformed cached count must never produce negative full-rate input.
+  const est = estimateCost({
+    agentAdapter: "codex",
+    model: "gpt-5.5",
+    tokensIn: 100,
+    tokensOut: 0,
+    cachedTokensIn: 9999,
+  });
+  // All 100 input tokens billed at the cached rate, none negative.
+  const expected = (100 * 0.5) / 1_000_000;
+  assert.ok(Math.abs((est.costUsd ?? 0) - expected) < 1e-12, `expected ${expected}, got ${est.costUsd}`);
 });
 
 test("estimateCost stays null for an unpriced codex model", () => {
