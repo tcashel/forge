@@ -1535,7 +1535,7 @@ function buildAgentActivityDetail(store: ForgeStore, sessionId: string): AgentAc
     detail = { kind: "execution", logStreamUrl };
   } else if (row.purpose === "review") {
     detail = { kind: "review", logStreamUrl };
-  } else if (row.purpose === "fix") {
+  } else if (row.purpose === "fix" || row.purpose === "comment-fix") {
     detail = { kind: "fix", logStreamUrl };
   } else if (row.purpose === "critique") {
     const { content, path: markdownPath } = readCritiqueMarkdownForSession(store, session);
