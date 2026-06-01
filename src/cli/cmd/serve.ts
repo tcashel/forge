@@ -18,6 +18,7 @@ import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.t
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import { reconcileCritiqueSessions } from "../../core/critique.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
+import { commentAnchorsToDiff } from "../../core/diff-anchoring.ts";
 import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
 import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import type { GhTarget } from "../../core/gh.ts";
@@ -1112,14 +1113,25 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     // is the fallback). Threads are only fetched when a marker is present, so
     // PRs without published findings pay nothing on this hot path. The fetch
     // is uncached — one extra GraphQL call per bundle load when markers exist.
+    //
+    // Suppression is gated on the published comment STILL ANCHORING: a stale
+    // marker comment renders with a disabled checkbox (not fixable), so if we
+    // suppressed its local finding too the finding would become unselectable.
+    // Stale published findings therefore keep their local `finding:<id>` row
+    // (still selectable + fixable by id) while the comment keeps its marker
+    // metadata so resolve-on-fix still finds the thread.
     const markerByCommentId = new Map<number, string>();
     const publishedIds = new Set<string>();
     for (const c of result.bundle.inlineComments) {
       const marker = parseFindingMarker(c.body);
-      if (marker) {
-        markerByCommentId.set(c.id, marker.id);
-        publishedIds.add(marker.id);
-      }
+      if (!marker) continue;
+      markerByCommentId.set(c.id, marker.id);
+      const anchored = commentAnchorsToDiff(result.bundle.diff, {
+        path: c.path,
+        position: c.position,
+        line: c.line,
+      });
+      if (anchored) publishedIds.add(marker.id);
     }
 
     let threadByCommentId = new Map<number, { threadId: string; isResolved: boolean }>();

@@ -1,6 +1,6 @@
 import { strict as assert } from "node:assert";
 import { test } from "node:test";
-import { partitionFindingsByDiff } from "../../src/core/diff-anchoring.ts";
+import { commentAnchorsToDiff, partitionFindingsByDiff } from "../../src/core/diff-anchoring.ts";
 import type { ForgeFinding } from "../../src/core/reviewer.ts";
 
 function makeFinding(overrides: Partial<ForgeFinding> = {}): ForgeFinding {
@@ -200,4 +200,36 @@ test("partitionFindingsByDiff anchors a finding on the OLD path of a renamed fil
   assert.equal(inDiff[0].finding.file, "src/old.ts", "the finding still carries its original (old) file");
   assert.equal(inDiff[0].path, "src/new.ts", "but the anchor path is the diff's new path");
   assert.equal(inDiff[0].line, 2);
+});
+
+test("commentAnchorsToDiff anchors by line, by position, and reports stale comments", () => {
+  // SAMPLE_DIFF: file src/foo.ts, RIGHT-side lines 1-5; positions 1.. follow
+  // the first @@. A comment whose line lands on a RIGHT-side row anchors.
+  assert.equal(commentAnchorsToDiff(SAMPLE_DIFF, { path: "src/foo.ts", position: null, line: 2 }), true);
+  // A comment whose line is off the diff but whose position resolves anchors.
+  assert.equal(commentAnchorsToDiff(SAMPLE_DIFF, { path: "src/foo.ts", position: 1, line: 999 }), true);
+  // Neither line nor position resolves → stale.
+  assert.equal(commentAnchorsToDiff(SAMPLE_DIFF, { path: "src/foo.ts", position: 999, line: 999 }), false);
+  // GitHub nulls both fields on a stale comment → stale.
+  assert.equal(commentAnchorsToDiff(SAMPLE_DIFF, { path: "src/foo.ts", position: null, line: null }), false);
+  // Unknown file → stale.
+  assert.equal(commentAnchorsToDiff(SAMPLE_DIFF, { path: "src/other.ts", position: 1, line: 1 }), false);
+});
+
+test("commentAnchorsToDiff resolves a renamed file by its old path", () => {
+  const renameDiff = [
+    "diff --git a/src/old.ts b/src/new.ts",
+    "rename from src/old.ts",
+    "rename to src/new.ts",
+    "--- a/src/old.ts",
+    "+++ b/src/new.ts",
+    "@@ -1,3 +1,4 @@",
+    " line1",
+    "+added2",
+    " line3",
+    " line4",
+  ].join("\n");
+  // A stale comment recorded against the OLD path still matches the file.
+  assert.equal(commentAnchorsToDiff(renameDiff, { path: "src/old.ts", position: null, line: 2 }), true);
+  assert.equal(commentAnchorsToDiff(renameDiff, { path: "src/new.ts", position: null, line: 2 }), true);
 });

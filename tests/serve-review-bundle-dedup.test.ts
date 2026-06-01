@@ -158,3 +158,61 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
   assert.equal(enriched?.reviewThreadId, "T_published");
   assert.equal(enriched?.isResolved, true);
 });
+
+test("review-bundle keeps a STALE published finding selectable as a local finding row", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-dedup-stale-"));
+  const store = new ForgeStore({ forgeDir: path.join(tmpHome, ".forge") });
+
+  const runDir = path.join(store.runsDir, "pr-review", "1-s-dedup-stale");
+  fs.mkdirSync(runDir, { recursive: true });
+  fs.writeFileSync(
+    path.join(runDir, "findings.json"),
+    JSON.stringify([finding(PUBLISHED_ID, 2), finding(LOCAL_ID, 5)], null, 2),
+  );
+
+  // The published comment has gone stale: the diff no longer contains its
+  // anchor. GitHub nulls `position` and `line` for a stale comment (the
+  // original_* fields retain the old values). With no current anchor the UI
+  // would render a disabled checkbox, so the bundle must NOT suppress the
+  // local finding — it stays selectable.
+  const staleBundle = (num: number): PrBundle => {
+    const b = bundle(num);
+    b.inlineComments = [{ ...inlineComment(), position: null, line: null, originalPosition: 1, originalLine: 2 }];
+    return b;
+  };
+
+  const fetcher = async (num: number): Promise<FetchPrBundleResult> => ({ ok: true, bundle: staleBundle(num) });
+  const { port, stop } = await startServer(store, { port: 0, host: "127.0.0.1", prBundleFetcher: fetcher });
+  __setGhRunner(((args: string[]) => {
+    const queryArg = args.find((a) => a.startsWith("query=")) ?? "";
+    if (queryArg.includes("reviewThreads")) return Promise.resolve({ ok: true, stdout: threadsResponse() });
+    return Promise.resolve({ ok: true, stdout: "" });
+  }) as never);
+  t.after(() => {
+    __setGhRunner(null);
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const res = await fetch(`http://127.0.0.1:${port}/api/prs/1/review-bundle`);
+  const body = (await res.json()) as {
+    ok: boolean;
+    data: {
+      forgeFindings: ForgeFinding[];
+      inlineComments: Array<
+        PrInlineComment & { forgeFindingId?: string; reviewThreadId?: string; isResolved?: boolean }
+      >;
+    };
+  };
+  assert.equal(body.ok, true);
+
+  // Stale published finding is NOT suppressed: both findings stay selectable.
+  assert.deepEqual(new Set(body.data.forgeFindings.map((f) => f.id)), new Set([PUBLISHED_ID, LOCAL_ID]));
+
+  // The stale comment still carries its marker metadata so resolve-on-fix works
+  // once the local finding is fixed.
+  const enriched = body.data.inlineComments.find((c) => c.id === COMMENT_DB_ID);
+  assert.ok(enriched);
+  assert.equal(enriched?.forgeFindingId, PUBLISHED_ID);
+  assert.equal(enriched?.reviewThreadId, "T_published");
+});

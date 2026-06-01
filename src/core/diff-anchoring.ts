@@ -51,6 +51,13 @@ interface ParsedFile {
   /** Set of RIGHT-side line numbers present as added or context rows. */
   rightLines: Set<number>;
   /**
+   * GitHub `position` values present in this file's diff. `position` is the
+   * 1-based count of lines following the file's first `@@` header (later `@@`s
+   * count too) — the same semantics `src/web/lib/diff.ts` uses to anchor review
+   * comments. Used to mirror the UI's "does this comment still anchor" check.
+   */
+  positions: Set<number>;
+  /**
    * Inclusive RIGHT-side line spans for each hunk in this file, in diff order.
    * A multi-line review anchor is only valid when both ends fall in the same
    * span — GitHub rejects a start_line/line pair that crosses hunks.
@@ -73,6 +80,11 @@ function parseRightSideLines(diff: string): ParsedFile[] {
   let newLine = 0;
   let inHunk = false;
   let currentHunk: HunkRange | null = null;
+  // GitHub `position` counter, mirroring src/web/lib/diff.ts: 0 on the first
+  // hunk header of a file, +1 on each later hunk header, +1 on each content row
+  // (additions, deletions, and context — but not `\ No newline` markers).
+  let position = 0;
+  let positionStarted = false;
 
   // A hunk's RIGHT-side span only counts rows that actually exist on the RIGHT
   // side (added/context). Close out the open hunk before starting a new one or
@@ -99,9 +111,12 @@ function parseRightSideLines(diff: string): ParsedFile[] {
         path: newPath ?? "",
         oldPath: oldPath && oldPath !== newPath ? oldPath : null,
         rightLines: new Set(),
+        positions: new Set(),
         hunks: [],
       };
       inHunk = false;
+      position = 0;
+      positionStarted = false;
       continue;
     }
     if (!current) continue;
@@ -120,11 +135,18 @@ function parseRightSideLines(diff: string): ParsedFile[] {
       closeHunk();
       newLine = Number(header[1]);
       inHunk = true;
+      // Position: 0 on the first `@@` of the file, +1 on each later one.
+      if (!positionStarted) {
+        positionStarted = true;
+        position = 0;
+      } else {
+        position += 1;
+      }
       // Seed an empty span; the first RIGHT-side row sets its real start.
       currentHunk = { start: Number.POSITIVE_INFINITY, end: -1 };
       continue;
     }
-    if (!inHunk) continue;
+    if (!inHunk || !positionStarted) continue;
     if (ln.startsWith("\\")) continue; // "\ No newline at end of file"
     const marker = ln.charAt(0);
     // A genuine context row always carries a leading space — even a blank line
@@ -132,6 +154,8 @@ function parseRightSideLines(diff: string): ParsedFile[] {
     // `diff.split(/\r?\n/)` on the trailing newline from `gh pr diff`; counting
     // it would invent a phantom RIGHT-side line past the last hunk, so skip it.
     if (marker === "+" || marker === " ") {
+      position += 1;
+      current.positions.add(position);
       // Added or context row — present on the RIGHT side.
       current.rightLines.add(newLine);
       if (currentHunk) {
@@ -140,7 +164,9 @@ function parseRightSideLines(diff: string): ParsedFile[] {
       }
       newLine += 1;
     } else if (marker === "-") {
-      // deletion — no RIGHT-side line
+      // deletion — counts for `position` but has no RIGHT-side line.
+      position += 1;
+      current.positions.add(position);
     }
   }
   finalize();
@@ -153,6 +179,34 @@ function hunkContaining(hunks: HunkRange[], line: number): HunkRange | null {
     if (line >= h.start && line <= h.end) return h;
   }
   return null;
+}
+
+/** A published inline comment's current anchor coordinates on the PR diff. */
+export interface CommentAnchor {
+  path: string;
+  position: number | null;
+  line: number | null;
+}
+
+/**
+ * Whether an existing inline review comment still anchors onto the current PR
+ * diff — the server-side mirror of the Review UI's staleness check in
+ * `src/web/components/review/DiffPane.tsx` (`anchorThreads`): a comment anchors
+ * when its `position` resolves to a row in the named file, or failing that when
+ * its `line` lands on a RIGHT-side (addition/context) row. A comment that
+ * resolves to neither is "stale" and renders with a disabled checkbox, so the
+ * bundle route must keep the underlying Forge finding selectable elsewhere.
+ *
+ * The file is matched by new OR old path so renamed files still resolve.
+ */
+export function commentAnchorsToDiff(diff: string, anchor: CommentAnchor): boolean {
+  if (!anchor.path) return false;
+  const files = parseRightSideLines(diff);
+  const file = files.find((f) => f.path === anchor.path || f.oldPath === anchor.path);
+  if (!file) return false;
+  if (anchor.position != null && file.positions.has(anchor.position)) return true;
+  if (anchor.line != null && file.rightLines.has(anchor.line)) return true;
+  return false;
 }
 
 /**
