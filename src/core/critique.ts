@@ -233,17 +233,31 @@ with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
 # marker the output must contain. Evaluates is_error / stop_reason against
 # the LAST "type":"result" line only — a mid-stream tool_result carrying
 # "is_error":true (e.g. a read-only grep that matched nothing) must not
-# count. max_tokens (truncated) and error stops are failures.
+# count. stop_reason is an allowlist (end_turn/tool_use/stop_sequence);
+# anything else — max_tokens, error, or an unknown stop — fails closed. The
+# .md must be a COMPLETE fenced block (opening marker + closing fence).
 crit_slot_valid() {
-  local stream="$1" md="$2" fence="$3" result_line
+  local stream="$1" md="$2" fence="$3" result_line stop
   [ -s "$stream" ] || return 1
   result_line=$(grep '"type":"result"' "$stream" | tail -1)
   [ -n "$result_line" ] || return 1
   printf '%s' "$result_line" | grep -q '"is_error":true' && return 1
-  printf '%s' "$result_line" | grep -q '"stop_reason":"max_tokens"' && return 1
-  printf '%s' "$result_line" | grep -q '"stop_reason":"error"' && return 1
+  # stop_reason allowlist (fail closed): if present, must be end_turn /
+  # tool_use / stop_sequence. max_tokens, error, and any unknown/future stop
+  # (refusal, pause_turn, …) fail. An absent/null stop_reason is allowed.
+  stop=$(printf '%s' "$result_line" | grep -o '"stop_reason":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//')
+  if [ -n "$stop" ]; then
+    case "$stop" in
+      end_turn|tool_use|stop_sequence) ;;
+      *) return 1 ;;
+    esac
+  fi
+  # output must be a COMPLETE fenced block: opening marker present AND a closing
+  # \`\`\` as the last non-blank line. A run killed mid-write after the opening
+  # fence lacks the close and must not be rescued (truncated output).
   [ -s "$md" ] || return 1
   grep -q "$fence" "$md" || return 1
+  [ "$(grep -v '^[[:space:]]*$' "$md" | tail -1)" = '\`\`\`' ] || return 1
   return 0
 }
 

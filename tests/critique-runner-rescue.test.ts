@@ -231,3 +231,53 @@ test("non-zero exit with a valid result but truncated .md is NOT rescued — sta
     fs.rmSync(binBase, { recursive: true, force: true });
   }
 });
+
+test("non-zero exit with an unterminated fenced block is NOT rescued — needs a closing fence", () => {
+  const { forgeDir, store, runnerPath } = setup();
+  const binBase = fs.mkdtempSync(path.join(os.tmpdir(), "forge-crit-bin-"));
+  try {
+    // Valid terminal success and the OPENING fence is present, but the block is
+    // never closed (process killed mid-write). The completeness gate must
+    // reject it — checking only the opening marker would wrongly rescue this.
+    const linesFile = path.join(binBase, "lines.jsonl");
+    const text = "```forge-spec-critique\nfindings so far but truncated";
+    fs.writeFileSync(
+      linesFile,
+      `${JSON.stringify({ type: "system", subtype: "init" })}\n${resultLine({ result: text, isError: false, stopReason: "end_turn" })}\n`,
+    );
+    const binDir = fakeClaudeBin(binBase, linesFile, 1);
+
+    const meta = runWithFakeClaude(binDir, runnerPath, store, ALL_CLAUDE.planId, ALL_CLAUDE.critiqueId);
+
+    assert.equal(meta.criticA.status, "failed", "unterminated fenced block must stay failed");
+    assert.equal(meta.status, "failed");
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+    fs.rmSync(binBase, { recursive: true, force: true });
+  }
+});
+
+test("non-zero exit with an unrecognized stop_reason is NOT rescued — allowlist, not denylist", () => {
+  const { forgeDir, store, runnerPath } = setup();
+  const binBase = fs.mkdtempSync(path.join(os.tmpdir(), "forge-crit-bin-"));
+  try {
+    // Complete fenced block and is_error false, but a stop_reason outside the
+    // allowlist (end_turn/tool_use/stop_sequence). A denylist that only rejects
+    // max_tokens/error would wrongly rescue this; the allowlist must fail closed.
+    const linesFile = path.join(binBase, "lines.jsonl");
+    const text = "```forge-spec-critique\nfindings\n```";
+    fs.writeFileSync(
+      linesFile,
+      `${JSON.stringify({ type: "system", subtype: "init" })}\n${resultLine({ result: text, isError: false, stopReason: "pause_turn" })}\n`,
+    );
+    const binDir = fakeClaudeBin(binBase, linesFile, 1);
+
+    const meta = runWithFakeClaude(binDir, runnerPath, store, ALL_CLAUDE.planId, ALL_CLAUDE.critiqueId);
+
+    assert.equal(meta.criticA.status, "failed", "unknown stop_reason must fail closed");
+    assert.equal(meta.status, "failed");
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+    fs.rmSync(binBase, { recursive: true, force: true });
+  }
+});
