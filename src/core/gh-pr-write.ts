@@ -60,6 +60,26 @@ function hostArgsFor(apiHost: string | null): string[] {
   return apiHost ? ["--hostname", apiHost] : [];
 }
 
+/**
+ * Parse the stdout of a `gh api --paginate --slurp` call into a flat array of
+ * items. `--slurp` collects each page into an outer array (array-of-pages), so
+ * a multi-page response is `[[...page1], [...page2]]` rather than a single
+ * concatenated/invalid JSON blob. We flatten one level so callers see the same
+ * flat item list whether the PR had one page or ten. A bare object (some
+ * single-page error/edge shapes) or a flat array are both tolerated.
+ */
+function flattenSlurpedPages<T>(stdout: string): T[] {
+  if (!stdout.trim()) return [];
+  const parsed = JSON.parse(stdout) as unknown;
+  if (!Array.isArray(parsed)) return [parsed as T];
+  const out: T[] = [];
+  for (const page of parsed) {
+    if (Array.isArray(page)) out.push(...(page as T[]));
+    else if (page != null) out.push(page as T);
+  }
+  return out;
+}
+
 export interface InlineCommentInput {
   path: string;
   line: number;
@@ -123,10 +143,11 @@ export interface ReviewThread {
   comments: Array<{ databaseId: number; body: string }>;
 }
 
-const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$num:Int!){
+const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$num:Int!,$after:String){
   repository(owner:$owner,name:$repo){
     pullRequest(number:$num){
-      reviewThreads(first:100){
+      reviewThreads(first:100,after:$after){
+        pageInfo{ hasNextPage endCursor }
         nodes{
           id
           isResolved
@@ -137,12 +158,27 @@ const REVIEW_THREADS_QUERY = `query($owner:String!,$repo:String!,$num:Int!){
   }
 }`;
 
+// Hard ceiling on cursor pages so a malformed `hasNextPage`/`endCursor` can't
+// spin forever. 100 threads/page × 50 pages = 5000 threads, far beyond any
+// realistic Forge-reviewed PR.
+const MAX_REVIEW_THREAD_PAGES = 50;
+
+interface ReviewThreadsPage {
+  pageInfo?: { hasNextPage?: boolean; endCursor?: string | null };
+  nodes?: Array<{
+    id: string;
+    isResolved: boolean;
+    comments?: { nodes?: Array<{ databaseId: number; body: string }> };
+  }>;
+}
+
 /**
- * Fetch the PR's review threads via GraphQL. The REST comment id
- * (`databaseId`) is carried alongside the GraphQL thread node id because
- * resolving a thread needs the node id, not the REST id. Capped at the first
- * 100 threads — sufficient for Forge-authored reviews; a deeper page would
- * need cursor pagination.
+ * Fetch the PR's review threads via GraphQL, paging through `pageInfo` until
+ * exhausted (or the page ceiling is hit). The REST comment id (`databaseId`)
+ * is carried alongside the GraphQL thread node id because resolving a thread
+ * needs the node id, not the REST id. Paging matters: published finding threads
+ * past the first 100 are otherwise invisible to resolve-on-fix and bundle
+ * enrichment, so fixed findings would never resolve on busy PRs.
  */
 export async function fetchReviewThreads(prNum: number, opts: GhFetchOpts): Promise<ReviewThread[]> {
   const target = await resolvePrApiTarget(prNum, opts);
@@ -150,8 +186,10 @@ export async function fetchReviewThreads(prNum: number, opts: GhFetchOpts): Prom
   const [owner, repo] = target.ownerRepo.split("/");
   if (!owner || !repo) return [];
 
-  const res = await ghRunner(
-    [
+  const threads: ReviewThread[] = [];
+  let after: string | null = null;
+  for (let page = 0; page < MAX_REVIEW_THREAD_PAGES; page++) {
+    const args = [
       "api",
       "graphql",
       ...hostArgsFor(target.apiHost),
@@ -163,35 +201,35 @@ export async function fetchReviewThreads(prNum: number, opts: GhFetchOpts): Prom
       `repo=${repo}`,
       "-F",
       `num=${prNum}`,
-    ],
-    opts,
-  ).catch(() => ({ ok: false, stdout: "" }));
-  if (!res.ok || !res.stdout) return [];
-  try {
-    const parsed = JSON.parse(res.stdout) as {
-      data?: {
-        repository?: {
-          pullRequest?: {
-            reviewThreads?: {
-              nodes?: Array<{
-                id: string;
-                isResolved: boolean;
-                comments?: { nodes?: Array<{ databaseId: number; body: string }> };
-              }>;
-            };
-          };
-        };
+    ];
+    // GraphQL `$after` is nullable; only send it once we have a cursor so the
+    // first request fetches from the start.
+    if (after) args.push("-f", `after=${after}`);
+
+    const res = await ghRunner(args, opts).catch(() => ({ ok: false, stdout: "" }));
+    if (!res.ok || !res.stdout) break;
+    let connection: ReviewThreadsPage | undefined;
+    try {
+      const parsed = JSON.parse(res.stdout) as {
+        data?: { repository?: { pullRequest?: { reviewThreads?: ReviewThreadsPage } } };
       };
-    };
-    const nodes = parsed.data?.repository?.pullRequest?.reviewThreads?.nodes ?? [];
-    return nodes.map((n) => ({
-      threadId: n.id,
-      isResolved: n.isResolved,
-      comments: (n.comments?.nodes ?? []).map((c) => ({ databaseId: c.databaseId, body: c.body ?? "" })),
-    }));
-  } catch {
-    return [];
+      connection = parsed.data?.repository?.pullRequest?.reviewThreads;
+    } catch {
+      break;
+    }
+    const nodes = connection?.nodes ?? [];
+    for (const n of nodes) {
+      threads.push({
+        threadId: n.id,
+        isResolved: n.isResolved,
+        comments: (n.comments?.nodes ?? []).map((c) => ({ databaseId: c.databaseId, body: c.body ?? "" })),
+      });
+    }
+    const info = connection?.pageInfo;
+    if (!info?.hasNextPage || !info.endCursor) break;
+    after = info.endCursor;
   }
+  return threads;
 }
 
 const RESOLVE_THREAD_MUTATION = `mutation($id:ID!){ resolveReviewThread(input:{threadId:$id}){ thread { id isResolved } } }`;
@@ -261,8 +299,12 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   const hostArgs = hostArgsFor(target.apiHost);
   const ids = new Set<string>();
 
+  // `--paginate --slurp`: across multiple pages gh emits one JSON array per
+  // page collected into an outer array. Without `--slurp` a >1-page response is
+  // concatenated JSON documents that `JSON.parse` rejects — which previously
+  // hit the parse-error path and skipped publishing on busy PRs.
   const inlineRes = await ghRunner(
-    ["api", `repos/${target.ownerRepo}/pulls/${prNum}/comments`, "--paginate", ...hostArgs],
+    ["api", `repos/${target.ownerRepo}/pulls/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
     opts,
   ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
   if (!inlineRes.ok) {
@@ -270,7 +312,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   }
   if (inlineRes.stdout) {
     try {
-      const arr = JSON.parse(inlineRes.stdout) as Array<{ body?: string }>;
+      const arr = flattenSlurpedPages<{ body?: string }>(inlineRes.stdout);
       for (const c of arr) for (const id of extractFindingIds(c.body ?? "")) ids.add(id);
     } catch (e) {
       return { ok: false, error: `could not parse existing inline comments: ${(e as Error).message}` };
@@ -278,7 +320,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   }
 
   const reviewsRes = await ghRunner(
-    ["api", `repos/${target.ownerRepo}/pulls/${prNum}/reviews`, "--paginate", ...hostArgs],
+    ["api", `repos/${target.ownerRepo}/pulls/${prNum}/reviews`, "--paginate", "--slurp", ...hostArgs],
     opts,
   ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
   if (!reviewsRes.ok) {
@@ -286,7 +328,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   }
   if (reviewsRes.stdout) {
     try {
-      const arr = JSON.parse(reviewsRes.stdout) as Array<{ body?: string }>;
+      const arr = flattenSlurpedPages<{ body?: string }>(reviewsRes.stdout);
       for (const r of arr) for (const id of extractFindingIds(r.body ?? "")) ids.add(id);
     } catch (e) {
       return { ok: false, error: `could not parse existing reviews: ${(e as Error).message}` };
