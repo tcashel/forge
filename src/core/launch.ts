@@ -10,7 +10,7 @@ import { execSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
-import { agentCommand, claudeJobCommand } from "./agents/index.ts";
+import { adapterStreamsTokens, agentJobCommand } from "./agents/index.ts";
 import { executionSessionId, liveJobId, recordJobStarted } from "./db/writes.ts";
 import { bashGhEnvExport } from "./gh.js";
 import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
@@ -114,7 +114,12 @@ forge_session_finish() {
 }`;
 }
 
-function generateAutoFixBlock(config: LaunchConfig, runDir: string, fixerCmd: string, reviewerCmd: string): string {
+function generateAutoFixBlock(
+  config: LaunchConfig,
+  runDir: string,
+  cmds: { fixerCmd: string; reviewerCmd: string; fixerStreamArg: string; reviewerStreamArg: string },
+): string {
+  const { fixerCmd, reviewerCmd, fixerStreamArg, reviewerStreamArg } = cmds;
   const qualityCheck = fixQualityBlock(config.qualityCommands);
   return `  # ── Auto-fix ────────────────────────────────────────────────────────────────
   CURRENT_VERDICT=$(python3 -c "
@@ -150,7 +155,7 @@ except Exception:
     FIX_SESSION_ID="s-fix-$JOB_ID-r$FIX_ROUND"
     forge_session_start --id "$FIX_SESSION_ID" --purpose fix --agent "${config.fixerTarget}" --model "${config.fixerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
     if ${fixerCmd} > "$RUN_DIR/fix-raw-$FIX_ROUND.md" 2>&1; then
-      forge_session_finish --id "$FIX_SESSION_ID" --exit-code 0
+      forge_session_finish --id "$FIX_SESSION_ID" --exit-code 0${fixerStreamArg}
       log "✓ Fixer completed"
 
       # Re-run quality gates
@@ -206,7 +211,7 @@ ${qualityCheck}
         REVIEW_SESSION_ID="s-review-$JOB_ID-r$(( FIX_ROUND + 1 ))"
         forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
         if ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1; then
-          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
+          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0${reviewerStreamArg}
           # Same last-match strategy as the first reviewer pass — see
           # rationale on the original verdict extractor above.
           NEW_VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>/dev/null)
@@ -228,7 +233,7 @@ ${qualityCheck}
           fi
         else
           RE_EXIT=$?
-          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$RE_EXIT"
+          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$RE_EXIT"${reviewerStreamArg}
           log "⚠  Re-reviewer failed (exit $RE_EXIT) — stopping auto-fix"
           set_meta_field "reviewError" '"re-reviewer process failed"'
           break
@@ -239,7 +244,7 @@ ${qualityCheck}
       fi
     else
       FIX_EXIT=$?
-      forge_session_finish --id "$FIX_SESSION_ID" --exit-code "$FIX_EXIT"
+      forge_session_finish --id "$FIX_SESSION_ID" --exit-code "$FIX_EXIT"${fixerStreamArg}
       log "⚠  Fixer agent failed (exit $FIX_EXIT) — stopping auto-fix"
       set_meta_field "reviewError" '"fixer agent failed"'
       break
@@ -303,12 +308,14 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jo
   const sessionHelper = forgeSessionHelperShell(forgeBin, runDir);
 
   // ── claude / codex bash runner ──────────────────────────────
+  // claude and codex stream JSONL into a sidecar so the session-finish hook
+  // can extract tokens (+ cost); other adapters use the plain command and
+  // record no tokens.
   const streamFile = path.join(runDir, "agent.stream.jsonl");
-  const agentCmd =
-    config.target === "claude"
-      ? claudeJobCommand(config.model, promptFile, streamFile)
-      : agentCommand(config.target, config.model, promptFile, { reasoningEffort: config.reasoningEffort });
-  const agentStreamFile = config.target === "claude" ? streamFile : "";
+  const agentCmd = agentJobCommand(config.target, config.model, promptFile, streamFile, {
+    reasoningEffort: config.reasoningEffort,
+  });
+  const agentStreamFile = adapterStreamsTokens(config.target) ? streamFile : "";
   // Shell-escaped PR title for `gh pr create --title`. Capped at 70 chars
   // because long titles render badly in GitHub's PR list.
   const safeTitle = config.specTitle.replace(/'/g, "'\\''").slice(0, 70);
@@ -328,18 +335,32 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jo
           .join("\n")
       : '  echo "No quality commands configured — skipping."';
 
-  // Build the reviewer agent command for the bash script
-  const reviewerCmd = agentCommand(config.reviewerTarget, config.reviewerModel, `${runDir}/review-prompt.txt`, {
-    reasoningEffort: config.reviewerReasoningEffort,
-  });
+  // Build the reviewer agent command for the bash script. claude/codex tee
+  // tokens into a per-purpose sidecar; the finish hook parses it. The
+  // sidecar is reused across review rounds — runs are strictly sequential
+  // (review → fix → re-review), so each finish reads it before the next run
+  // overwrites it.
+  const reviewerStreamFile = path.join(runDir, "review.stream.jsonl");
+  const reviewerCmd = agentJobCommand(
+    config.reviewerTarget,
+    config.reviewerModel,
+    `${runDir}/review-prompt.txt`,
+    reviewerStreamFile,
+    { reasoningEffort: config.reviewerReasoningEffort },
+  );
+  const reviewerStreamArg = adapterStreamsTokens(config.reviewerTarget)
+    ? ` --stream-json-path "${reviewerStreamFile}"`
+    : "";
 
   // Build the fixer agent command for the bash script
-  const fixerCmd = agentCommand(config.fixerTarget, config.fixerModel, `${runDir}/fix-prompt.txt`, {
+  const fixerStreamFile = path.join(runDir, "fix.stream.jsonl");
+  const fixerCmd = agentJobCommand(config.fixerTarget, config.fixerModel, `${runDir}/fix-prompt.txt`, fixerStreamFile, {
     reasoningEffort: config.fixerReasoningEffort,
   });
+  const fixerStreamArg = adapterStreamsTokens(config.fixerTarget) ? ` --stream-json-path "${fixerStreamFile}"` : "";
 
   const autoFixBash = config.autoFix
-    ? generateAutoFixBlock(config, runDir, fixerCmd, reviewerCmd)
+    ? generateAutoFixBlock(config, runDir, { fixerCmd, reviewerCmd, fixerStreamArg, reviewerStreamArg })
     : "  # auto-fix disabled";
 
   return `#!/usr/bin/env bash
@@ -644,7 +665,7 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
   REV_EXIT=0
   if ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1; then
     REV_EXIT=$?
-    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0
+    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0${reviewerStreamArg}
     # Extract the forge-review fenced block and verdict.
     # Take the LAST matching block, not the first: codex-as-reviewer echoes
     # the SKILL.md prompt verbatim, which contains a template forge-review
@@ -669,7 +690,7 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
     fi
   else
     REVIEWER_EXIT=$?
-    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$REVIEWER_EXIT"
+    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$REVIEWER_EXIT"${reviewerStreamArg}
     log "⚠  Reviewer process failed (exit $REVIEWER_EXIT)"
     set_meta_field "reviewVerdict" "null"
     set_meta_field "reviewError" ""reviewer process exited with code $REVIEWER_EXIT""

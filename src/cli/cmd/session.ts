@@ -12,9 +12,8 @@
  */
 
 import { parseArgs } from "node:util";
-import { readResultFromFile } from "../../core/claude-stream.ts";
+import { captureSidecarMetrics } from "../../core/agents/index.ts";
 import { finalizeSession, type SessionPurpose, type SessionState, upsertSession } from "../../core/db/writes.ts";
-import { estimateCost } from "../../core/pricing.ts";
 import type { ForgeStore } from "../../core/store.ts";
 
 export const HELP = `forge session <start|finish> [...flags]
@@ -127,34 +126,15 @@ async function runFinish(argv: string[], store: ForgeStore): Promise<void> {
   let metricsPatch: Parameters<typeof finalizeSession>[1]["metrics"] = {};
   const streamPath = typeof values["stream-json-path"] === "string" ? values["stream-json-path"] : null;
   if (streamPath) {
-    const r = await readResultFromFile(streamPath);
-    const costSource = r.totalCostUsd !== null ? "provider" : null;
-    metricsPatch = {
-      durationMs: r.durationMs,
-      tokensIn: r.tokensIn,
-      tokensOut: r.tokensOut,
-      cacheRead: r.cacheRead,
-      cacheCreate: r.cacheCreate,
-      costUsd: r.totalCostUsd,
-      costSource,
-    };
-
-    // Provider didn't report cost? Try the price table (no-op for claude
-    // until pricing.ts has claude entries — which it intentionally
-    // doesn't, because the provider path is the source of truth).
-    if (costSource === null) {
-      const row = store.db.db.prepare("SELECT agent_adapter, model FROM sessions WHERE id = ?").get(id) as
-        | { agent_adapter: string; model: string | null }
-        | undefined;
-      if (row) {
-        const est = estimateCost({
-          agentAdapter: row.agent_adapter,
-          model: row.model,
-          tokensIn: r.tokensIn,
-          tokensOut: r.tokensOut,
-        });
-        metricsPatch = { ...metricsPatch, ...est };
-      }
+    // The sidecar format is adapter-specific: claude emits stream-json
+    // `result` events, codex emits `turn.completed` usage events. Load the
+    // adapter up front so captureSidecarMetrics picks the right parser and
+    // can fall back to the price table for cost.
+    const row = store.db.db.prepare("SELECT agent_adapter, model FROM sessions WHERE id = ?").get(id) as
+      | { agent_adapter: string; model: string | null }
+      | undefined;
+    if (row) {
+      metricsPatch = await captureSidecarMetrics(row.agent_adapter, row.model, streamPath);
     }
   }
 
