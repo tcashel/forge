@@ -17,6 +17,7 @@ import { atomicWriteText } from "./atomic-write.js";
 import { readResultFromFile } from "./claude-stream.ts";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
 import { finalizeSession, improvementSessionId, recordPlanVersionAdded, upsertSession } from "./db/writes.ts";
+import { openQuestionsJson } from "./plan-document.ts";
 import type { ForgeStore } from "./store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -236,6 +237,36 @@ export function extractOpenQuestions(recommendationsMd: string): string[] {
     if (chunk) items.push(chunk);
   }
   return items;
+}
+
+function normalizeOpenQuestionForComparison(question: string): string {
+  return question
+    .replace(/\s+/g, " ")
+    .replace(/\s+[—-]\s+raised by\b.*$/i, "")
+    .replace(/\s+Context:\s+.*$/i, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[?!.]+$/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function filterAlreadyRecordedOpenQuestions(openQuestions: string[], specDocument: string): string[] {
+  const existing = new Set(
+    openQuestionsJson(specDocument)
+      .map(normalizeOpenQuestionForComparison)
+      .filter((q) => q.length > 0),
+  );
+  if (existing.size === 0) return openQuestions;
+
+  const seen = new Set<string>();
+  return openQuestions.filter((question) => {
+    const normalized = normalizeOpenQuestionForComparison(question);
+    if (!normalized) return true;
+    if (existing.has(normalized) || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
 }
 
 /** Format the deferred recommendations into a standalone artifact. */
@@ -510,7 +541,7 @@ export async function runImprover(
     return skipped(critiqueId, "IMPROVE_FAILED: could not read recommendations");
   }
   const findings = extractActionableFindings(recsMd);
-  const openQuestions = extractOpenQuestions(recsMd);
+  const openQuestions = filterAlreadyRecordedOpenQuestions(extractOpenQuestions(recsMd), liveSpec);
   const deferred = extractDeferredFindings(recsMd);
   const changeCount = findings.length;
   const deferredCount = deferred.length;
