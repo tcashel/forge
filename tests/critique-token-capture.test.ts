@@ -136,8 +136,12 @@ test("generateRunnerScript wires stream-json sidecar for claude slots only", () 
       !script.includes(slotSidecarPath(path.join(dir, "critique-b.md"))),
       "codex slot must not get a stream-json sidecar",
     );
-    // Silent-failure check uses grep for "type":"result"
-    assert.ok(script.includes('grep -q \'"type":"result"\''), "silent-failure check missing");
+    // Silent-failure / rescue check scopes to the terminal "type":"result" line.
+    assert.ok(script.includes("crit_slot_valid()"), "crit_slot_valid helper missing");
+    assert.ok(
+      script.includes('result_line=$(grep \'"type":"result"\' "$stream" | tail -1)'),
+      "terminal-result-line scoping missing",
+    );
   } finally {
     fs.rmSync(forgeDir, { recursive: true, force: true });
   }

@@ -225,6 +225,46 @@ with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
 " "$@" 2>/dev/null || true
 }
 
+# Trust the stream-json sidecar's terminal result event as the source of
+# truth for a claude slot, in both directions: it force-fails a clean (exit
+# 0) run whose sidecar never produced a valid result, and it rescues a
+# non-zero exit whose sidecar DID produce one (claude/tee/SIGPIPE hiccups
+# after a complete critique). $1 = sidecar, $2 = .md output, $3 = fence
+# marker the output must contain. Evaluates is_error / stop_reason against
+# the LAST "type":"result" line only — a mid-stream tool_result carrying
+# "is_error":true (e.g. a read-only grep that matched nothing) must not
+# count. stop_reason is an allowlist (end_turn/tool_use/stop_sequence);
+# anything else — max_tokens, error, or an unknown stop — fails closed. The
+# .md must be a COMPLETE fenced block (opening marker + closing fence).
+crit_slot_valid() {
+  local stream="$1" md="$2" fence="$3" result_line stop last
+  [ -s "$stream" ] || return 1
+  result_line=$(grep '"type":"result"' "$stream" | tail -1)
+  [ -n "$result_line" ] || return 1
+  printf '%s' "$result_line" | grep -q '"is_error":true' && return 1
+  # stop_reason allowlist (fail closed): if present, must be end_turn /
+  # tool_use / stop_sequence. max_tokens, error, and any unknown/future stop
+  # (refusal, pause_turn, …) fail. An absent/null stop_reason is allowed.
+  stop=$(printf '%s' "$result_line" | grep -o '"stop_reason":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//')
+  if [ -n "$stop" ]; then
+    case "$stop" in
+      end_turn|tool_use|stop_sequence) ;;
+      *) return 1 ;;
+    esac
+  fi
+  # output must be a COMPLETE fenced block: opening marker present AND a closing
+  # fence as the last non-blank line. A run killed mid-write after the opening
+  # fence lacks the close and must not be rescued (truncated output). The close
+  # is matched whitespace-tolerantly — CommonMark allows leading indent and
+  # trailing spaces on the closing fence, so a clean critic must not be
+  # force-failed merely for padding around its \`\`\`.
+  [ -s "$md" ] || return 1
+  grep -q "$fence" "$md" || return 1
+  last=$(grep -v '^[[:space:]]*$' "$md" | tail -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  printf '%s' "$last" | grep -Eq '^\`{3,}$' || return 1
+  return 0
+}
+
 echo "╔══════════════════════════════════════════════════════╗"
 echo "  FORGE CRITIQUE — ${config.critiqueId}"
 echo "  Spec  : ${config.specTitle}"
@@ -260,27 +300,35 @@ wait $PID_B
 EXIT_B=$?
 CRIT_B_DUR=$(( (SECONDS - CRIT_B_START) * 1000 ))
 
-# Detect silent failure of the claude stream-json pipeline: the pipeline
-# may exit 0 with an empty sidecar or one missing the terminating
-# result event (e.g. auth dropped mid-call). Force the slot to failed
-# so synthesis does not feed garbage into the synth prompt.
+# Reconcile each claude slot against its stream-json sidecar. A clean (exit
+# 0) run whose sidecar never produced a valid terminal result is force-failed
+# so synthesis does not feed garbage into the synth prompt; a non-zero exit
+# whose sidecar DID produce a valid result (plus a non-empty critique .md) is
+# rescued — the terminal result event, not the pipeline exit code, is the
+# source of truth. Codex slots stay exit-code-only (no parseable sidecar).
 ${
   criticAIsClaude
     ? `if [ "$EXIT_A" -eq 0 ]; then
-  if [ ! -s "${streamA}" ] || ! grep -q '"type":"result"' "${streamA}" || grep -q '"is_error":true' "${streamA}"; then
+  if ! crit_slot_valid "${streamA}" "${outputA}" '\`\`\`forge-spec-critique'; then
     EXIT_A=1
-    echo "  (critic A silent failure: sidecar empty, missing result, or is_error)"
+    echo "  (critic A silent failure: sidecar empty, missing/failed result, or empty/truncated output)"
   fi
+elif crit_slot_valid "${streamA}" "${outputA}" '\`\`\`forge-spec-critique'; then
+  EXIT_A=0
+  echo "  (critic A: non-zero exit but valid result — rescued)"
 fi`
     : "# critic A not claude — no stream-json sidecar check"
 }
 ${
   criticBIsClaude
     ? `if [ "$EXIT_B" -eq 0 ]; then
-  if [ ! -s "${streamB}" ] || ! grep -q '"type":"result"' "${streamB}" || grep -q '"is_error":true' "${streamB}"; then
+  if ! crit_slot_valid "${streamB}" "${outputB}" '\`\`\`forge-spec-critique'; then
     EXIT_B=1
-    echo "  (critic B silent failure: sidecar empty, missing result, or is_error)"
+    echo "  (critic B silent failure: sidecar empty, missing/failed result, or empty/truncated output)"
   fi
+elif crit_slot_valid "${streamB}" "${outputB}" '\`\`\`forge-spec-critique'; then
+  EXIT_B=0
+  echo "  (critic B: non-zero exit but valid result — rescued)"
 fi`
     : "# critic B not claude — no stream-json sidecar check"
 }
@@ -337,10 +385,13 @@ SYNTH_DUR=$(( (SECONDS - SYNTH_START) * 1000 ))
 ${
   synthIsClaude
     ? `if [ "$EXIT_SYNTH" -eq 0 ]; then
-  if [ ! -s "${streamRec}" ] || ! grep -q '"type":"result"' "${streamRec}" || grep -q '"is_error":true' "${streamRec}"; then
+  if ! crit_slot_valid "${streamRec}" "${outputRec}" '\`\`\`forge-spec-recommendations'; then
     EXIT_SYNTH=1
-    echo "  (synthesizer silent failure: sidecar empty, missing result, or is_error)"
+    echo "  (synthesizer silent failure: sidecar empty, missing/failed result, or empty/truncated output)"
   fi
+elif crit_slot_valid "${streamRec}" "${outputRec}" '\`\`\`forge-spec-recommendations'; then
+  EXIT_SYNTH=0
+  echo "  (synthesizer: non-zero exit but valid result — rescued)"
 fi`
     : "# synthesizer not claude — no stream-json sidecar check"
 }
