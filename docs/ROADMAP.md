@@ -89,9 +89,13 @@ You draft a real spec in the plan workspace, run multi-critic synthesis on it, a
 **Goal:** Close the loop end-to-end inside Forge. Locked plan → headless execution → auto-review → triage queue → merge. No session watching anywhere in the flow.
 
 ### Deliverables
-- **Decomposition**
-  - Locked plan decomposed by an agent into N tasks with dependencies
+- **Decomposition** — see [ADR-0028](adr/0028-spec-dependency-graph-and-orchestration-agent.md)
+  - Cross-spec **dependency graph** (typed edges: blocks/blocked-by, depends-on, related, epic→child), not just an intra-plan task list
+  - **Lazy spec materialization:** graph nodes start as lightweight stubs and are promoted to full specs just-in-time as work approaches — never author a whole epic up front
+  - A dedicated **orchestration agent** ("product/scrum-master") owns epic ingestion, graph maintenance, materialization timing, and sequencing — distinct from planner/critic/implementer/reviewer
+  - Within a materialized, locked spec: decomposed by an agent into N tasks with dependencies
   - Manual edit/reorder before dispatch
+  - Forge owns the data (SQLite ground truth); Linear/Jira sync is an optional additive layer, schema designed sync-aware now, sync contract deferred to a follow-up ADR
 - **Headless execution**
   - Worktree-per-task management
     - Worktree lifecycle: inventory, safe-to-delete status, remove, bulk "clean merged", "test locally" (checkout branch into main), and lazy rehydration on fix (see [ADR-0024](adr/0024-worktrees-disposable-lifecycle.md))

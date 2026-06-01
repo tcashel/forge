@@ -76,7 +76,9 @@ The module names deliberately mirror the Track B crate names (`plan` ↔ `juicer
 ### Plan Engine
 Owns plan documents, lifecycle, agent collaboration on plans.
 
-Responsibilities: plan CRUD, document structure validation, drafting agent invocation, lock gate logic (zero open questions, all disagreements adjudicated), decomposition orchestration (A2+), plan version history, plan export.
+Responsibilities: plan CRUD, document structure validation, drafting agent invocation, lock gate logic (zero open questions, all disagreements adjudicated), plan version history, plan export.
+
+> Per [ADR-0028](./adr/0028-spec-dependency-graph-and-orchestration-agent.md) (Proposed), **decomposition and epic orchestration move out of the Plan Engine** into a dedicated **Orchestration Agent** role (the "product/scrum-master") that owns epic ingestion, the cross-spec dependency graph, lazy spec materialization, and sequencing. The Plan Engine keeps single-spec CRUD, validation, and lock-gate logic; it does not own the graph.
 
 ### Critic Pool + Synthesis
 Runs adversarial review on plans (A1) and on completed task diffs (A2+).
