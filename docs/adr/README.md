@@ -41,6 +41,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0025 | [Unified agent interface; agent owns conversation context](./0025-unified-agent-interface-agent-owned-context.md) | Accepted |
 | 0026 | [Plan authoring is conversation-led; the document is the maintained artifact](./0026-conversation-led-plan-authoring.md) | Proposed |
 | 0027 | [Publish PR review findings to GitHub and resolve on fix](./0027-publish-pr-review-findings-to-github.md) | Accepted |
+| 0028 | [Cross-spec dependency graph, lazy materialization + orchestration agent](./0028-spec-dependency-graph-and-orchestration-agent.md) | Proposed |
 
 ## Foundational ADRs
 
@@ -66,6 +67,7 @@ Forward-looking decisions to capture as ADRs when they're made. Pulled from the 
 - Phase detection heuristics (Phase A2)
 - ETA model (Phase A2)
 - Hook config validation / baseline recommendations (Phase B3+)
+- Linear/Jira **sync contract** — direction, conflict policy, persist timing, field mapping (Phase A2; follow-up to [`0028`](./0028-spec-dependency-graph-and-orchestration-agent.md))
 - Juice integration contract (Phase B4)
 - Pricing model and license (Phase B5)
 - Conductor/Superset partnership integration (Phase B5)

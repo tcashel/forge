@@ -231,6 +231,8 @@ Known keys, phase 1:
 
 ## Phase 2 additions (jobs + review + triage)
 
+> **Reshape pending — see [ADR-0028](./adr/0028-spec-dependency-graph-and-orchestration-agent.md) (Proposed).** The `tasks` table below models only an *intra-plan* DAG (`dependencies` is a flat JSON array of task IDs within one plan). ADR-0028 introduces a **cross-spec dependency graph** (`work_items` nodes with a materialization lifecycle + external-ref/sync columns, and typed `work_item_edges`: blocks/blocked-by, depends-on, related, epic→child). When A2 lands, `tasks` becomes the decomposition *beneath* a single materialized spec; the graph spanning specs is the new top-level structure. Do not build this section's schema until ADR-0028 is Accepted.
+
 ### `tasks`
 
 ```sql
