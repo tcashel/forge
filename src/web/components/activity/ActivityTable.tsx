@@ -60,6 +60,13 @@ function relTime(iso: string): string {
   return `${Math.round(ms / 86_400_000)}d`;
 }
 
+/** Absolute local date+time, e.g. "May 31, 10:28 AM". */
+export function absTime(iso: string): string {
+  const d = new Date(iso);
+  if (Number.isNaN(d.getTime())) return "—";
+  return d.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" });
+}
+
 function applyFilter(rows: AgentActivityRow[], filter: ActivityFilter): AgentActivityRow[] {
   if (filter === "all") return rows;
   if (filter === "live") return rows.filter((r) => r.state === "running");
@@ -99,31 +106,44 @@ export interface ActivitySummaryByModel {
   tokensOut: number;
 }
 
+export interface ActivitySummaryByPurpose {
+  purposeLabel: string;
+  tokensIn: number;
+  tokensOut: number;
+  costUsd: number;
+  runCount: number;
+}
+
 export interface ActivitySummary {
   runCount: number;
   tokensIn: number;
   tokensOut: number;
   costUsd: number;
   byModel: ActivitySummaryByModel[];
+  byPurpose: ActivitySummaryByPurpose[];
 }
 
 /**
- * Roll up the visible activity rows into the totals strip and the
- * tokens-by-model chart. Null/undefined metric values are treated as 0
- * (a row with no token data contributes nothing) so the strip never
- * renders NaN. `costUsd` sums only non-null `metrics.costUsd`.
+ * Roll up the visible activity rows into the totals strip, the
+ * tokens-by-model chart, and the per-purpose breakdown. Null/undefined
+ * metric values are treated as 0 (a row with no token data contributes
+ * nothing) so the strip never renders NaN. `costUsd` sums only non-null
+ * `metrics.costUsd`. The per-purpose map is keyed by `deriveLabel(r)` (not
+ * `r.purpose`) so critic-a / critic-b split exactly as the table rows do.
  */
 export function summarizeActivity(rows: AgentActivityRow[]): ActivitySummary {
   let tokensIn = 0;
   let tokensOut = 0;
   let costUsd = 0;
   const byModelMap = new Map<string, { tokensIn: number; tokensOut: number }>();
+  const byPurposeMap = new Map<string, { tokensIn: number; tokensOut: number; costUsd: number; runCount: number }>();
   for (const r of rows) {
     const ti = typeof r.metrics.tokensIn === "number" ? r.metrics.tokensIn : 0;
     const to = typeof r.metrics.tokensOut === "number" ? r.metrics.tokensOut : 0;
+    const cost = typeof r.metrics.costUsd === "number" ? r.metrics.costUsd : 0;
     tokensIn += ti;
     tokensOut += to;
-    if (typeof r.metrics.costUsd === "number") costUsd += r.metrics.costUsd;
+    costUsd += cost;
     if (ti || to) {
       const key = r.model ?? "—";
       const acc = byModelMap.get(key) ?? { tokensIn: 0, tokensOut: 0 };
@@ -131,11 +151,21 @@ export function summarizeActivity(rows: AgentActivityRow[]): ActivitySummary {
       acc.tokensOut += to;
       byModelMap.set(key, acc);
     }
+    const pKey = deriveLabel(r);
+    const pAcc = byPurposeMap.get(pKey) ?? { tokensIn: 0, tokensOut: 0, costUsd: 0, runCount: 0 };
+    pAcc.tokensIn += ti;
+    pAcc.tokensOut += to;
+    pAcc.costUsd += cost;
+    pAcc.runCount += 1;
+    byPurposeMap.set(pKey, pAcc);
   }
   const byModel: ActivitySummaryByModel[] = Array.from(byModelMap.entries())
     .map(([model, v]) => ({ model, tokensIn: v.tokensIn, tokensOut: v.tokensOut }))
     .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
-  return { runCount: rows.length, tokensIn, tokensOut, costUsd, byModel };
+  const byPurpose: ActivitySummaryByPurpose[] = Array.from(byPurposeMap.entries())
+    .map(([purposeLabel, v]) => ({ purposeLabel, ...v }))
+    .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
+  return { runCount: rows.length, tokensIn, tokensOut, costUsd, byModel, byPurpose };
 }
 
 function formatTotalCost(v: number): string {
@@ -280,7 +310,7 @@ export function ActivityTable() {
                 <td>{row.agentAdapter}</td>
                 <td>{row.model ?? "—"}</td>
                 <td>{row.plan ? row.plan.title : row.metrics.scopeKind === "draft" ? row.relatedId : "—"}</td>
-                <td title={row.startedAt}>{relTime(row.startedAt)}</td>
+                <td title={relTime(row.startedAt)}>{absTime(row.startedAt)}</td>
                 <td>{formatDuration(row, now)}</td>
                 <td
                   title={`in / out — cache read ${row.metrics.cacheRead ?? "—"} / create ${row.metrics.cacheCreate ?? "—"}`}
@@ -320,7 +350,37 @@ function ActivitySummaryStrip({ summary }: { summary: ActivitySummary }) {
         </div>
       </div>
       <ActivityByModelChart byModel={summary.byModel} />
+      <ActivityByPurposeBreakdown byPurpose={summary.byPurpose} />
     </div>
+  );
+}
+
+function ActivityByPurposeBreakdown({ byPurpose }: { byPurpose: ActivitySummaryByPurpose[] }) {
+  const withTokens = byPurpose.filter((p) => p.tokensIn + p.tokensOut > 0);
+  if (withTokens.length === 0) {
+    return <div class="activity-summary-purpose-empty">No token data in the current filter.</div>;
+  }
+  return (
+    <table class="activity-summary-purpose">
+      <thead>
+        <tr>
+          <th>Purpose</th>
+          <th>Tokens in</th>
+          <th>Tokens out</th>
+          <th>Cost</th>
+        </tr>
+      </thead>
+      <tbody>
+        {withTokens.map((p) => (
+          <tr key={p.purposeLabel}>
+            <td class="activity-summary-purpose-label">{p.purposeLabel}</td>
+            <td>{p.tokensIn.toLocaleString()}</td>
+            <td>{p.tokensOut.toLocaleString()}</td>
+            <td>{formatTotalCost(p.costUsd)}</td>
+          </tr>
+        ))}
+      </tbody>
+    </table>
   );
 }
 

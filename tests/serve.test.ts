@@ -13,7 +13,7 @@ import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
-import { recordJobStarted, recordPlanCreated, syncJobState } from "../src/core/db/writes.ts";
+import { recordJobStarted, recordPlanCreated, syncJobState, upsertSession } from "../src/core/db/writes.ts";
 import type { FetchPrBundleResult, GhFetchOpts, GhPr, PrBundle } from "../src/core/gh-pr.ts";
 import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
@@ -251,6 +251,28 @@ test("GET /api/agent-activity filters by state", async (t) => {
   const failedResp = await getJson(`${h.baseUrl}/api/agent-activity?state=failed`);
   const failedRows = (failedResp.body.data as { rows: Array<unknown> }).rows;
   assert.equal(failedRows.length, 0);
+});
+
+test("GET /api/agent-activity/:id surfaces a fix log panel for comment-fix sessions", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Comment-fix sessions are ad-hoc (no joined job row) and were previously
+  // falling through to kind "unknown", which hid their log panel in the UI.
+  upsertSession(h.store.db.db, {
+    id: "s-comment-fix-test",
+    purpose: "comment-fix",
+    relatedId: null,
+    agentAdapter: "codex",
+    model: "gpt-5.5",
+    startedAt: "2026-05-01T09:00:00.000Z",
+    state: "failed",
+  });
+
+  const { body } = await getJson(`${h.baseUrl}/api/agent-activity/s-comment-fix-test`);
+  assert.equal(body.ok, true);
+  const detail = (body.data as { detail: { kind: string; logStreamUrl?: string } }).detail;
+  assert.equal(detail.kind, "fix");
+  assert.equal(detail.logStreamUrl, "/api/sessions/s-comment-fix-test/log");
 });
 
 test("legacy /api/tasks/* redirects to /api/plans/* with 308 (Phase 3.5 alias)", async (t) => {

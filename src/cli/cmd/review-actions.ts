@@ -21,8 +21,8 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { CliError } from "../../cli/output.ts";
-import { agentCommand } from "../../core/agents/index.ts";
-import { finalizeSession, upsertSession } from "../../core/db/writes.ts";
+import { adapterStreamsTokens, agentJobCommand, captureSidecarMetrics } from "../../core/agents/index.ts";
+import { finalizeSession, type SessionMetrics, upsertSession } from "../../core/db/writes.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
 import { parseApiHost, parseNameWithOwner } from "../../core/gh-pr.ts";
 import { publishReviewFindings } from "../../core/gh-pr-write.ts";
@@ -356,6 +356,7 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
 
   let exitCode = 0;
   let error: string | null = null;
+  let metricsPatch: Partial<SessionMetrics> = {};
   try {
     const prInfoJson = runGhSafe(["pr", "view", String(prNum), "--json", PR_VIEW_FIELDS], ghEnv, repoRoot);
     const ciChecks = runGhSafe(["pr", "checks", String(prNum)], ghEnv, repoRoot);
@@ -389,15 +390,17 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
     const promptFile = path.join(runDir, "review-prompt.txt");
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    const cmd = agentCommand(row.agent_adapter as Parameters<typeof agentCommand>[0], row.model ?? "", promptFile, {
+    const adapter = row.agent_adapter as Parameters<typeof agentJobCommand>[0];
+    const streamFile = path.join(runDir, "review.stream.jsonl");
+    const cmd = agentJobCommand(adapter, row.model ?? "", promptFile, streamFile, {
       reasoningEffort: repoConfig.reviewerReasoningEffort,
     });
 
     process.stdout.write(`[forge:review-worker] invoking reviewer\n`);
-    // Bash so we get the same shell semantics agentCommand was built for
-    // (`<` redirection for claude, `$(cat …)` for codex/opencode/gemini).
-    // Output is captured to review-raw.md AND echoed to the worker's
-    // stdout (which the SSE log tails).
+    // Bash so we get the same shell semantics the agent command was built
+    // for (claude/codex stream-json piped through a projection, plain text
+    // for opencode/gemini). Output is captured to review-raw.md AND echoed
+    // to the worker's stdout (which the SSE log tails).
     const rawFile = path.join(runDir, "review-raw.md");
     const bashLine = `set -o pipefail; ${cmd} 2>&1 | tee "${rawFile.replace(/"/g, '\\"')}"`;
     try {
@@ -407,8 +410,20 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
         cwd: repoRoot,
       });
     } catch (e) {
+      // Even on a non-zero exit the agent may have written a parseable
+      // sidecar before dying; capture it so the failed row still records
+      // tokens/cost, mirroring the launch bash runner's failure branch.
+      if (adapterStreamsTokens(adapter) && fs.existsSync(streamFile)) {
+        metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+      }
       const err = e as { status?: number; message?: string };
       throw new Error(`reviewer agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
+    }
+
+    // Capture tokens/cost from the sidecar before extraction (which may
+    // throw) so a verdict-parse miss doesn't lose the run's token count.
+    if (adapterStreamsTokens(adapter)) {
+      metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
     }
 
     // Extract the last forge-review block and parse findings.
@@ -469,6 +484,7 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
     state: exitCode === 0 ? "completed" : "failed",
     exitCode,
     error,
+    metrics: metricsPatch,
   });
 
   // Sentinel line — the SSE serializer translates it into a `done` event.

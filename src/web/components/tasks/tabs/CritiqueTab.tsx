@@ -80,7 +80,11 @@ function CritiqueCard({
       <div class="agent">{agentLabel}</div>
       <div class="verdict">{status}</div>
       <div class="summary">
-        {content ? content.slice(0, 1200) : <span style="color:var(--dim)">No output yet</span>}
+        {content ? (
+          <MarkdownViewer markdown={content.slice(0, 1200)} class="critique-md" />
+        ) : (
+          <span style="color:var(--dim)">No output yet</span>
+        )}
       </div>
     </div>
   );

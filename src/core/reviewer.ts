@@ -231,11 +231,20 @@ interface WhereLocation {
  * Parse a `**Where:** \`<path>[:<lineStart>[-<lineEnd>]]\`` line. The
  * backticks are optional (some agents drop them); the line range is
  * optional too. Returns null on a structurally invalid Where line.
+ *
+ * Reviewers frequently list several files on one Where line, e.g.
+ * `` **Where:** `a.ts:1-2`, `b.ts:3-4` ``. We anchor on the FIRST path —
+ * the remaining files stay in the finding body as context. A naive
+ * `` `?([^`]+?)`? `` capture failed to match these multi-file lines at all,
+ * silently dropping the entire finding from the rail.
  */
 function parseWhereLine(line: string): WhereLocation | null {
-  const m = line.match(/^\*\*Where:\*\*\s*`?([^`]+?)`?\s*$/);
+  const m = line.match(/^\*\*Where:\*\*\s*(.+?)\s*$/);
   if (!m) return null;
-  const raw = m[1].trim();
+  // Anchor on the first comma-separated segment; strip its surrounding
+  // backticks (which may be absent — some agents drop them).
+  const first = m[1].split(",")[0].trim();
+  const raw = first.replace(/^`/, "").replace(/`$/, "").trim();
   if (!raw) return null;
 
   // Range form: path:start-end
@@ -327,6 +336,13 @@ export interface CommentValidationEntry {
  * responsible for cross-checking targetIds against the requested set and
  * for filling in any omitted requests as `disputed`.
  *
+ * When several blocks are present we take the LAST one — agents (and
+ * adapters like codex that echo their prompt to stdout) routinely surface
+ * the schema example block from the skill before producing the real answer.
+ * Parsing the first block read placeholder tokens (`comment:12345`, …) that
+ * never matched the requested set, so every target was wrongly backfilled as
+ * `disputed`. This mirrors `extractLastForgeReviewBlock`.
+ *
  * Returns [] when no block exists or the block is empty.
  */
 /**
@@ -346,6 +362,7 @@ function normalizeTargetId(targetIdRaw: unknown, commentIdRaw: unknown): string 
 export function parseCommentValidation(rawMd: string): CommentValidationEntry[] {
   if (!rawMd) return [];
   const lines = rawMd.split(/\r?\n/);
+  let last: CommentValidationEntry[] | null = null;
   let i = 0;
   while (i < lines.length) {
     if (!/^\s{0,3}```forge-comment-validation\s*$/.test(lines[i])) {
@@ -355,12 +372,8 @@ export function parseCommentValidation(rawMd: string): CommentValidationEntry[] 
     i++;
     const entries: CommentValidationEntry[] = [];
     const seen = new Set<string>();
-    while (i < lines.length) {
-      const line = lines[i];
-      if (/^\s{0,3}```\s*$/.test(line)) {
-        return entries;
-      }
-      const trimmed = line.trim();
+    while (i < lines.length && !/^\s{0,3}```\s*$/.test(lines[i])) {
+      const trimmed = lines[i].trim();
       if (trimmed.length > 0) {
         try {
           const parsed = JSON.parse(trimmed) as Record<string, unknown>;
@@ -383,10 +396,12 @@ export function parseCommentValidation(rawMd: string): CommentValidationEntry[] 
       }
       i++;
     }
-    // Block never closed; return what we got.
-    return entries;
+    // Remember this block and keep scanning — the last block wins. Skip the
+    // closing fence (or fall through at EOF on an unterminated block).
+    last = entries;
+    i++;
   }
-  return [];
+  return last ?? [];
 }
 
 function parseFindingBody(body: string, severity: ForgeFindingSeverity, title: string): ForgeFinding | null {
