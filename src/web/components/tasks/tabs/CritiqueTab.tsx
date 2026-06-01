@@ -23,6 +23,15 @@ interface State {
   error: string | null;
 }
 
+// Synthesizer output is stored wrapped in a ```forge-spec-recommendations
+// envelope (a machine-readable contract). Strip it so the inner markdown
+// renders as headings/lists rather than one big code block.
+const RECS_FENCE_RE = /```forge-spec-recommendations\s*\n([\s\S]*?)\n```/;
+function unwrapRecommendations(md: string): string {
+  const m = md.match(RECS_FENCE_RE);
+  return m ? m[1] : md;
+}
+
 function relativeTime(iso: string): string {
   const t = Date.parse(iso);
   if (!Number.isFinite(t)) return iso;
@@ -71,11 +80,7 @@ function CritiqueCard({
       <div class="agent">{agentLabel}</div>
       <div class="verdict">{status}</div>
       <div class="summary">
-        {content ? (
-          <MarkdownViewer markdown={content.slice(0, 1200)} class="critique-md" />
-        ) : (
-          <span style="color:var(--dim)">No output yet</span>
-        )}
+        {content ? content.slice(0, 1200) : <span style="color:var(--dim)">No output yet</span>}
       </div>
     </div>
   );
@@ -313,7 +318,7 @@ export function CritiqueTab({ t }: { t: PlanView }) {
           {s.selected.recommendations ? (
             <>
               <h3 style="font-size:13px;color:var(--text);margin:18px 0 6px">Recommendations</h3>
-              <MarkdownViewer markdown={s.selected.recommendations} class="spec" />
+              <MarkdownViewer markdown={unwrapRecommendations(s.selected.recommendations)} class="spec" />
             </>
           ) : null}
         </>
