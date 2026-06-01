@@ -6,6 +6,8 @@ import { test } from "node:test";
 import type { CritiqueConfig, CritiqueSyncResult } from "../src/core/critique.ts";
 import {
   extractActionableFindings,
+  extractDeferredFindings,
+  extractOpenQuestions,
   type ImproveConfig,
   type ImproveOverrides,
   parseImprovedOutput,
@@ -428,4 +430,223 @@ test("runImprover treats Mode: no-op as a contract violation when findings exist
   assert.equal(result.applied, false);
   assert.equal(result.error, "IMPROVE_NOOP_DESPITE_FINDINGS");
   assert.equal(store.getSpec(task.id), before);
+});
+
+// ─── Open Questions + deferred findings ──────────────────────────────────────
+
+function recsWithOpenQuestionsAndDeferred(): string {
+  return `\`\`\`forge-spec-recommendations
+## Summary
+
+One actionable, two deferred, two open questions.
+
+## Recommended Edits
+
+### 1. Tighten the acceptance criterion
+**Classification:** corroborated
+**Severity:** BLOCKER
+**Current spec text:**
+> Acceptance: works
+**Recommended replacement:**
+> Acceptance: exit 0 on success.
+**Rationale:** specifics.
+
+### 2. Cosmetic rename
+**Classification:** single-critic-only
+**Severity:** MEDIUM
+**Rationale:** nicer name.
+
+### 3. Conflicting call
+**Classification:** conflicting
+**Severity:** HIGH
+**Rationale:** critics disagree.
+
+## Open Questions
+
+1. Should retention default to 30 days? — raised by Critic A. Context: product call.
+2. Bot identity or operator identity? — raised by both.
+
+## Findings Triage
+\`\`\`
+`;
+}
+
+test("extractOpenQuestions parses numbered items and strips the leading number", () => {
+  const oq = extractOpenQuestions(recsWithOpenQuestionsAndDeferred());
+  assert.equal(oq.length, 2);
+  assert.match(oq[0], /retention default to 30 days/);
+  assert.match(oq[1], /Bot identity or operator identity/);
+  assert.ok(!/^\d+\./.test(oq[0]), "leading list number must be stripped");
+});
+
+test("extractOpenQuestions returns empty when there is no Open Questions section", () => {
+  assert.equal(extractOpenQuestions(actionableRecs()).length, 0);
+});
+
+test("extractDeferredFindings returns MEDIUM/LOW and conflicting (even HIGH) entries", () => {
+  const deferred = extractDeferredFindings(recsWithOpenQuestionsAndDeferred());
+  assert.equal(deferred.length, 2);
+  assert.ok(!deferred.some((d) => d.number === 1), "actionable BLOCKER must not be deferred");
+  assert.ok(
+    deferred.some((d) => d.severity === "medium"),
+    "MEDIUM is deferred",
+  );
+  assert.ok(
+    deferred.some((d) => d.classification === "conflicting"),
+    "conflicting is deferred regardless of severity",
+  );
+});
+
+test("runImprover forwards Open Questions to the prompt and reports both counts", async (t) => {
+  const { store } = withTmpHome(t);
+  const body = "# Title\n\n## Open Questions\n\n- None\n";
+  const task = seedTask(store, "task-oq-001", body);
+
+  let promptSeen = "";
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recsWithOpenQuestionsAndDeferred()),
+    runImproverAgent: async (args) => {
+      promptSeen = fs.readFileSync(args.promptFile, "utf-8");
+      const improved =
+        "# Title\n\n## Open Questions\n\n- [ ] Should retention default to 30 days?\n- [ ] Bot identity or operator identity?\n";
+      const out = `\`\`\`forge-spec-improved\n## Mode\n\napplied\n\n## Improved Spec\n\n${improved}\n\n## Change Summary\n\n- Recommendation #1: tightened AC\n\`\`\`\n`;
+      fs.writeFileSync(args.outputPath, out);
+      fs.writeFileSync(args.errLogPath, "");
+      return 0;
+    },
+  });
+
+  assert.equal(result.applied, true);
+  assert.equal(result.changeCount, 1);
+  assert.equal(result.openQuestionsRecorded, 2);
+  assert.equal(result.deferredCount, 2);
+  assert.match(promptSeen, /Open Questions to Record/);
+  assert.match(promptSeen, /retention default to 30 days/);
+
+  // Deferred recommendations recorded to an artifact, not silently dropped.
+  const deferredPath = path.join(store.getCritiqueDir(task.id, result.critiqueId), "deferred-recommendations.md");
+  assert.ok(fs.existsSync(deferredPath), "deferred artifact must be written");
+  assert.match(fs.readFileSync(deferredPath, "utf-8"), /Deferred recommendations/);
+});
+
+test("runImprover runs on an Open-Questions-only pass (no actionable edits)", async (t) => {
+  const { store } = withTmpHome(t);
+  const body = "# Title\n\n## Open Questions\n\n- None\n";
+  const task = seedTask(store, "task-oqonly-001", body);
+
+  const recs = `\`\`\`forge-spec-recommendations
+## Summary
+
+No edits, one open question.
+
+## Recommended Edits
+
+(none)
+
+## Open Questions
+
+1. Which storage backend should we use? — raised by both.
+
+## Findings Triage
+\`\`\`
+`;
+
+  let ran = false;
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recs),
+    runImproverAgent: async (args) => {
+      ran = true;
+      const improved = "# Title\n\n## Open Questions\n\n- [ ] Which storage backend should we use?\n";
+      const out = `\`\`\`forge-spec-improved\n## Mode\n\napplied\n\n## Improved Spec\n\n${improved}\n\n## Change Summary\n\n- Recorded 1 open question(s); no spec edits.\n\`\`\`\n`;
+      fs.writeFileSync(args.outputPath, out);
+      fs.writeFileSync(args.errLogPath, "");
+      return 0;
+    },
+  });
+
+  assert.ok(ran, "improver must run when only open questions exist");
+  assert.equal(result.applied, true);
+  assert.equal(result.changeCount, 0);
+  assert.equal(result.openQuestionsRecorded, 1);
+});
+
+test("runImprover no-ops when an Open-Questions-only pass only repeats recorded questions", async (t) => {
+  const { store } = withTmpHome(t);
+  const body = "# Title\n\n## Open Questions\n\n- [ ] Which storage backend should we use?\n";
+  const task = seedTask(store, "task-oqonly-dup-001", body);
+  const before = store.getSpec(task.id) ?? "";
+
+  const recs = `\`\`\`forge-spec-recommendations
+## Summary
+
+No edits, one repeated open question.
+
+## Recommended Edits
+
+(none)
+
+## Open Questions
+
+1. Which storage backend should we use? — raised by both.
+
+## Findings Triage
+\`\`\`
+`;
+
+  let ran = false;
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recs),
+    runImproverAgent: async () => {
+      ran = true;
+      return 0;
+    },
+  });
+
+  assert.equal(ran, false, "improver must not run when every open question is already recorded");
+  assert.equal(result.mode, "no-op");
+  assert.equal(result.openQuestionsRecorded, 0);
+  assert.equal(store.getPlan(task.id)?.specVersion, 1);
+  assert.equal(store.getSpec(task.id), before, "spec untouched when open questions are duplicates");
+});
+
+test("runImprover no-ops on a deferred-only pass but records the artifact", async (t) => {
+  const { store } = withTmpHome(t);
+  const body = "# Title\n\nBody.\n";
+  const task = seedTask(store, "task-defonly-001", body);
+  const before = store.getSpec(task.id) ?? "";
+
+  const recs = `\`\`\`forge-spec-recommendations
+## Summary
+
+Only low-severity suggestions.
+
+## Recommended Edits
+
+### 1. Cosmetic
+**Classification:** single-critic-only
+**Severity:** LOW
+**Rationale:** nit.
+
+## Findings Triage
+\`\`\`
+`;
+
+  let ran = false;
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(recs),
+    runImproverAgent: async () => {
+      ran = true;
+      return 0;
+    },
+  });
+
+  assert.equal(ran, false, "improver must not run when there's nothing to apply or record");
+  assert.equal(result.mode, "no-op");
+  assert.equal(result.deferredCount, 1);
+  assert.equal(store.getSpec(task.id), before, "spec untouched on deferred-only no-op");
+
+  const deferredPath = path.join(store.getCritiqueDir(task.id, result.critiqueId), "deferred-recommendations.md");
+  assert.ok(fs.existsSync(deferredPath), "deferred artifact must be written even on no-op");
+  const summaryPath = path.join(store.getCritiqueDir(task.id, result.critiqueId), "change-summary.md");
+  assert.match(fs.readFileSync(summaryPath, "utf-8"), /1 deferred/);
 });

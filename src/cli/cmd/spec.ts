@@ -313,6 +313,8 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
         changeCount: 0,
         mode: "skipped",
         error: `IMPROVE_FAILED: ${msg}`,
+        openQuestionsRecorded: 0,
+        deferredCount: 0,
       };
     }
     persistImproveOutcome(task.id, improve, store);
@@ -466,6 +468,8 @@ export async function improveSpec(planId: string, store: ForgeStore): Promise<Im
       changeCount: 0,
       mode: "skipped",
       error: `IMPROVE_FAILED: ${msg}`,
+      openQuestionsRecorded: 0,
+      deferredCount: 0,
     };
   }
   persistImproveOutcome(task.id, improve, store);

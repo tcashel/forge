@@ -19,18 +19,18 @@ Loaded by `forge-planner` and run mentally before each `edit` or `write` call ag
 - [ ] Imperative reads as a description of what the merged PR did.
 - [ ] Not `feat: caching` or `fix: bug` — specific enough to be searchable later.
 
-### Is `Context` doing its job?
+### Are the `Goals` observable?
 
-- [ ] 2–4 sentences.
-- [ ] Says *why*, not *what*.
-- [ ] References the JIRA ticket if Flow B.
-- [ ] Doesn't bleed into "What We're Building" (those are different sections).
+- [ ] Bullets describe behavior/outcome visible from the caller or user perspective.
+- [ ] Enough context that a reviewer understands *why* the work exists.
+- [ ] Quotes function signatures, exported names, exact behaviors where relevant.
+- [ ] Not vague ("improve X") — each goal is concrete.
 
-### Is `What We're Building` observable?
+### Are `Constraints` and `Non-goals` doing their job?
 
-- [ ] Describes behavior change visible from the caller / user perspective.
-- [ ] Quotes function signatures, exported names, exact behaviors.
-- [ ] Doesn't dive into implementation strategy.
+- [ ] Constraints are hard requirements (compat, perf bounds, API stability, conventions) — not "use good patterns".
+- [ ] Non-goals explicitly fence off adjacent work so the agent doesn't expand scope.
+- [ ] Delete either section if it's empty — don't keep an empty heading.
 
 ### Are the Acceptance Criteria verifiable?
 
@@ -40,23 +40,19 @@ Loaded by `forge-planner` and run mentally before each `edit` or `write` call ag
 - [ ] Quality-gate criteria included if applicable (`typecheck && lint && test --run`).
 - [ ] File paths and exact strings appear when relevant.
 
-### Are Implementation Notes load-bearing?
-
-If the section is present:
+### Is the `Approach` load-bearing?
 
 - [ ] Each note tells the agent something they couldn't infer from research.
-- [ ] No restating of acceptance criteria.
-- [ ] No generic advice.
-
-If you can't fill this section with something useful, **delete the section.** Empty sections are noise.
-
-### Is `For the Executing Agent` operational?
-
-- [ ] Under 150 words.
-- [ ] Sequences the tasks if there's a meaningful order.
-- [ ] Names patterns to match (`like src/foo.ts:greet()`).
+- [ ] Names files, helpers, and sequencing where there's a real choice or landmine.
 - [ ] Names landmines (signatures to preserve, deps not to add).
-- [ ] Does not duplicate acceptance criteria.
+- [ ] No restating of acceptance criteria; no generic advice.
+- [ ] Doesn't defer a decision ("figure out the best approach").
+
+### Are `Risks` real, and is `Open Questions` honest?
+
+- [ ] Risks are concrete failure modes the agent should watch, not boilerplate.
+- [ ] Open Questions uses `- [ ]` for each unresolved item; `- None` only when there genuinely are none.
+- [ ] No decision that's actually the user's is buried as prose — it's either made in the spec or listed as an open question.
 
 ### Is the spec self-contained?
 
@@ -88,7 +84,7 @@ Don't output the spec yet. Common fixes:
 | Decision deferred | Make the call, write it in. If you can't, ask the user before output |
 | Missing exact error string | Open the test that asserts it, copy verbatim |
 | Cited a file you didn't open | Open it with `read` before the next output |
-| Implementation Notes is generic | Either fill with repo-specific guidance or delete the section |
+| Approach is generic | Either fill with repo-specific guidance (files, helpers, sequencing) or trim it |
 | Spec depends on chat context | Inline the context into the spec |
 
 ## When to ask the user instead of drafting

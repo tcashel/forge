@@ -53,6 +53,8 @@ const SKIPPED_RESULT: ImproveResult = {
   changeCount: 0,
   mode: "skipped",
   error: "IMPROVE_FAILED: critique runner failed: critics or synthesizer failed",
+  openQuestionsRecorded: 0,
+  deferredCount: 0,
 };
 
 const APPLIED_RESULT: ImproveResult = {
@@ -61,6 +63,8 @@ const APPLIED_RESULT: ImproveResult = {
   changeCount: 2,
   mode: "applied",
   error: null,
+  openQuestionsRecorded: 0,
+  deferredCount: 0,
 };
 
 const NOOP_RESULT: ImproveResult = {
@@ -69,6 +73,8 @@ const NOOP_RESULT: ImproveResult = {
   changeCount: 0,
   mode: "no-op",
   error: null,
+  openQuestionsRecorded: 0,
+  deferredCount: 0,
 };
 
 test("persistImproveOutcome stores the error string + mode + timestamp on skipped", (t) => {

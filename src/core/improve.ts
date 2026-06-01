@@ -17,6 +17,7 @@ import { atomicWriteText } from "./atomic-write.js";
 import { readResultFromFile } from "./claude-stream.ts";
 import { type CritiqueAgent, type CritiqueConfig, type CritiqueSyncResult, runCritiqueSync } from "./critique.js";
 import { finalizeSession, improvementSessionId, recordPlanVersionAdded, upsertSession } from "./db/writes.ts";
+import { openQuestionsJson } from "./plan-document.ts";
 import type { ForgeStore } from "./store.js";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
@@ -41,6 +42,25 @@ export interface ImproveResult {
   changeCount: number;
   mode: "applied" | "no-op" | "skipped";
   error: string | null;
+  /**
+   * Count of synthesizer Open Questions forwarded to the improver to record
+   * in the spec's `## Open Questions` section. These are unresolved product
+   * decisions the critics surfaced; recording them keeps the spec honest
+   * about its launch-readiness instead of silently claiming "None".
+   */
+  openQuestionsRecorded: number;
+  /**
+   * Count of recommendations that fell below the auto-apply threshold
+   * (Severity MEDIUM/LOW, or conflicting) and were written to
+   * `deferred-recommendations.md` rather than applied. Surfaced so the
+   * signal isn't lost in the critique dir.
+   */
+  deferredCount: number;
+}
+
+/** Build a skipped/failed result with the new counts defaulted. */
+function skipped(critiqueId: string, error: string | null, changeCount = 0, deferredCount = 0): ImproveResult {
+  return { critiqueId, applied: false, changeCount, mode: "skipped", error, openQuestionsRecorded: 0, deferredCount };
 }
 
 /** Optional seams for tests — production callers pass nothing. */
@@ -90,26 +110,48 @@ export interface ActionableFinding {
   text: string;
 }
 
+/** A recommendation that fell below the auto-apply threshold. */
+export interface DeferredFinding {
+  number: number;
+  /** Lowercased severity, e.g. "medium" | "low". */
+  severity: string;
+  /** Lowercased classification, e.g. "conflicting". */
+  classification: string;
+  /** The full verbatim `### N.` block. */
+  text: string;
+}
+
+interface RecommendationEntry {
+  number: number;
+  text: string;
+  severity: string;
+  classification: string;
+}
+
 /**
- * Extract the actionable findings from a synthesizer recommendations document.
- *
- * Actionable iff Severity ∈ {BLOCKER, HIGH} AND Classification ∈
- * {corroborated, single-critic-only, Synthesizer addition}.
+ * Slice the body of a named `## <section>` (up to the next `## ` heading) out
+ * of the `forge-spec-recommendations` block. Returns null if absent.
  */
-export function extractActionableFindings(recommendationsMd: string): ActionableFinding[] {
+function sectionBody(recommendationsMd: string, headingRe: RegExp): string | null {
   const blockMatch = recommendationsMd.match(RECS_BLOCK_RE);
-  if (!blockMatch) return [];
+  if (!blockMatch) return null;
   const body = blockMatch[1];
-
-  // Find the "## Recommended Edits" section, ending at the next "## " heading.
-  const editsStart = body.search(/^##\s+Recommended Edits\s*$/m);
-  if (editsStart < 0) return [];
-  const after = body.slice(editsStart);
+  const start = body.search(headingRe);
+  if (start < 0) return null;
+  const after = body.slice(start);
   const nextSection = after.slice(1).search(/^##\s+/m);
-  const editsBlock = nextSection < 0 ? after : after.slice(0, 1 + nextSection);
+  return nextSection < 0 ? after : after.slice(0, 1 + nextSection);
+}
 
-  // Split on `### N. ...` headings.
-  const entries: ActionableFinding[] = [];
+/**
+ * Parse every `### N.` entry from the "## Recommended Edits" section, tagging
+ * each with its Severity and Classification. The actionable/deferred split is
+ * applied by callers so neither set is silently dropped.
+ */
+function parseRecommendationEntries(recommendationsMd: string): RecommendationEntry[] {
+  const editsBlock = sectionBody(recommendationsMd, /^##\s+Recommended Edits\s*$/m);
+  if (editsBlock === null) return [];
+
   const headingRe = /^###\s+(\d+)\.\s+.*$/gm;
   const matches: Array<{ number: number; index: number }> = [];
   let m: RegExpExecArray | null = headingRe.exec(editsBlock);
@@ -117,47 +159,166 @@ export function extractActionableFindings(recommendationsMd: string): Actionable
     matches.push({ number: Number(m[1]), index: m.index });
     m = headingRe.exec(editsBlock);
   }
+  const entries: RecommendationEntry[] = [];
   for (let i = 0; i < matches.length; i++) {
     const start = matches[i].index;
     const end = i + 1 < matches.length ? matches[i + 1].index : editsBlock.length;
     const text = editsBlock.slice(start, end).trimEnd();
-    if (isActionable(text)) {
-      entries.push({ number: matches[i].number, text });
-    }
+    const severity =
+      text
+        .match(/\*\*Severity:\*\*\s*([^\n]+)/i)?.[1]
+        ?.trim()
+        .toLowerCase() ?? "";
+    const classification =
+      text
+        .match(/\*\*Classification:\*\*\s*([^\n]+)/i)?.[1]
+        ?.trim()
+        .toLowerCase() ?? "";
+    entries.push({ number: matches[i].number, text, severity, classification });
   }
   return entries;
 }
 
-function isActionable(entryText: string): boolean {
-  const sev =
-    entryText
-      .match(/\*\*Severity:\*\*\s*([^\n]+)/i)?.[1]
-      ?.trim()
-      .toLowerCase() ?? "";
-  const cls =
-    entryText
-      .match(/\*\*Classification:\*\*\s*([^\n]+)/i)?.[1]
-      ?.trim()
-      .toLowerCase() ?? "";
-  const sevOk = sev === "blocker" || sev === "high";
+/**
+ * Actionable iff Severity ∈ {BLOCKER, HIGH} AND Classification ∈
+ * {corroborated, single-critic-only, Synthesizer addition}.
+ */
+function isActionableEntry(e: RecommendationEntry): boolean {
+  const sevOk = e.severity === "blocker" || e.severity === "high";
   if (!sevOk) return false;
   // Match the synthesizer skill's vocabulary, with some tolerance for casing
   // and the explicit "Synthesizer addition" category.
-  if (cls === "corroborated") return true;
-  if (cls === "single-critic-only") return true;
-  if (cls.includes("synthesizer addition")) return true;
+  if (e.classification === "corroborated") return true;
+  if (e.classification === "single-critic-only") return true;
+  if (e.classification.includes("synthesizer addition")) return true;
   return false;
+}
+
+/** Extract the actionable findings the improver should apply. */
+export function extractActionableFindings(recommendationsMd: string): ActionableFinding[] {
+  return parseRecommendationEntries(recommendationsMd)
+    .filter(isActionableEntry)
+    .map((e) => ({ number: e.number, text: e.text }));
+}
+
+/**
+ * Extract the recommendations that are NOT auto-applied (Severity MEDIUM/LOW,
+ * or conflicting). Recorded to an artifact instead of silently dropped.
+ */
+export function extractDeferredFindings(recommendationsMd: string): DeferredFinding[] {
+  return parseRecommendationEntries(recommendationsMd)
+    .filter((e) => !isActionableEntry(e))
+    .map((e) => ({ number: e.number, severity: e.severity, classification: e.classification, text: e.text }));
+}
+
+/**
+ * Extract the synthesizer's `## Open Questions` as a list of question strings
+ * (leading list number stripped, multi-line items preserved). These are
+ * product decisions the critics could not resolve; the improver records them
+ * in the spec's own `## Open Questions` section.
+ */
+export function extractOpenQuestions(recommendationsMd: string): string[] {
+  const oqBlock = sectionBody(recommendationsMd, /^##\s+Open Questions\s*$/m);
+  if (oqBlock === null) return [];
+  const lines = oqBlock.split("\n");
+  const starts: number[] = [];
+  lines.forEach((l, i) => {
+    if (/^\s*\d+\.\s+/.test(l)) starts.push(i);
+  });
+  const items: string[] = [];
+  for (let i = 0; i < starts.length; i++) {
+    const from = starts[i];
+    const to = i + 1 < starts.length ? starts[i + 1] : lines.length;
+    const chunk = lines
+      .slice(from, to)
+      .join("\n")
+      .trim()
+      .replace(/^\s*\d+\.\s+/, "");
+    if (chunk) items.push(chunk);
+  }
+  return items;
+}
+
+function normalizeOpenQuestionForComparison(question: string): string {
+  return question
+    .replace(/\s+/g, " ")
+    .replace(/\s+[—-]\s+raised by\b.*$/i, "")
+    .replace(/\s+Context:\s+.*$/i, "")
+    .trim()
+    .toLowerCase()
+    .replace(/[?!.]+$/g, "")
+    .replace(/[^a-z0-9]+/g, " ")
+    .trim();
+}
+
+function filterAlreadyRecordedOpenQuestions(openQuestions: string[], specDocument: string): string[] {
+  const existing = new Set(
+    openQuestionsJson(specDocument)
+      .map(normalizeOpenQuestionForComparison)
+      .filter((q) => q.length > 0),
+  );
+  if (existing.size === 0) return openQuestions;
+
+  const seen = new Set<string>();
+  return openQuestions.filter((question) => {
+    const normalized = normalizeOpenQuestionForComparison(question);
+    if (!normalized) return true;
+    if (existing.has(normalized) || seen.has(normalized)) return false;
+    seen.add(normalized);
+    return true;
+  });
+}
+
+/** Format the deferred recommendations into a standalone artifact. */
+function buildDeferredDoc(deferred: DeferredFinding[]): string {
+  const header =
+    `# Deferred recommendations\n\n` +
+    `These ${deferred.length} synthesizer recommendation(s) were below the auto-apply ` +
+    `threshold (Severity MEDIUM/LOW, or a conflicting finding) and were NOT applied ` +
+    `automatically. Review and apply manually if warranted.\n\n`;
+  return `${header}${deferred.map((d) => d.text).join("\n\n")}\n`;
 }
 
 // ─── Improver prompt ──────────────────────────────────────────────────────────
 
-function buildImproverPrompt(config: ImproveConfig, findings: ActionableFinding[]): string {
+function buildImproverPrompt(config: ImproveConfig, findings: ActionableFinding[], openQuestions: string[]): string {
   const ctxSection = config.contextContent
     ? `## Repository Context\n\n${config.contextContent.slice(0, 4000)}\n\n`
     : "";
 
   const skill = skillBody().trim();
-  const findingsBlock = findings.map((f) => f.text).join("\n\n");
+
+  const recsSection =
+    findings.length > 0
+      ? `## Recommendations to Apply
+
+Apply ONLY these entries. Skip everything else in the synthesizer document.
+
+${findings.map((f) => f.text).join("\n\n")}
+
+---
+
+`
+      : `## Recommendations to Apply
+
+(none — there are no spec edits to apply this pass; only record the Open Questions below.)
+
+---
+
+`;
+
+  const oqSection =
+    openQuestions.length > 0
+      ? `## Open Questions to Record
+
+The critique surfaced these unresolved product decisions. Merge each one into the spec's \`## Open Questions\` section as an unchecked \`- [ ] \` bullet — replace a \`- None\` placeholder if present, and do not duplicate a question already listed. These are NOT recommendations: do not list them in your Change Summary, and do not otherwise alter the spec for them.
+
+${openQuestions.map((q) => `- [ ] ${q.replace(/\n+/g, " ").trim()}`).join("\n")}
+
+---
+
+`
+      : "";
 
   return `You are the Forge Spec Improver.
 
@@ -177,17 +338,9 @@ ${config.specBody}
 
 ---
 
-## Recommendations to Apply
+${recsSection}${oqSection}## Instructions
 
-Apply ONLY these entries. Skip everything else in the synthesizer document.
-
-${findingsBlock}
-
----
-
-## Instructions
-
-Produce a single \`\`\`forge-spec-improved fenced block per the skill instructions. Mode must be \`applied\` (the orchestrator already verified findings exist).
+Produce a single \`\`\`forge-spec-improved fenced block per the skill instructions. Mode must be \`applied\` (the orchestrator already verified there is work to do).
 `;
 }
 
@@ -342,13 +495,7 @@ export async function runImprover(
 ): Promise<ImproveResult> {
   // ── Step 0: Sanity check critics ─────────────────────────────────────────
   if (config.criticA.agent === config.criticB.agent && config.criticA.model === config.criticB.model) {
-    return {
-      critiqueId: "",
-      applied: false,
-      changeCount: 0,
-      mode: "skipped",
-      error: SAME_AGENT_ERR,
-    };
+    return skipped("", SAME_AGENT_ERR);
   }
 
   // ── Step 1: Allocate critique dir ────────────────────────────────────────
@@ -359,7 +506,7 @@ export async function runImprover(
   // ── Step 2: Snapshot the live spec (with frontmatter) ────────────────────
   const liveSpec = store.getSpec(config.planId);
   if (liveSpec === null) {
-    return { critiqueId, applied: false, changeCount: 0, mode: "skipped", error: "IMPROVE_FAILED: spec missing" };
+    return skipped(critiqueId, "IMPROVE_FAILED: spec missing");
   }
   atomicWriteText(path.join(critiqueDir, "spec-original.md"), liveSpec);
 
@@ -382,13 +529,7 @@ export async function runImprover(
     store,
   );
   if (critiqueResult.error) {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount: 0,
-      mode: "skipped",
-      error: critiqueResult.error,
-    };
+    return skipped(critiqueId, critiqueResult.error);
   }
 
   // ── Step 4: Read recommendations ────────────────────────────────────────
@@ -397,26 +538,41 @@ export async function runImprover(
   try {
     recsMd = fs.readFileSync(recsPath, "utf-8");
   } catch {
+    return skipped(critiqueId, "IMPROVE_FAILED: could not read recommendations");
+  }
+  const findings = extractActionableFindings(recsMd);
+  const openQuestions = filterAlreadyRecordedOpenQuestions(extractOpenQuestions(recsMd), liveSpec);
+  const deferred = extractDeferredFindings(recsMd);
+  const changeCount = findings.length;
+  const deferredCount = deferred.length;
+
+  // Record below-threshold recommendations so the signal isn't lost in the
+  // critique dir. Written even on the no-op path below.
+  if (deferredCount > 0) {
+    atomicWriteText(path.join(critiqueDir, "deferred-recommendations.md"), buildDeferredDoc(deferred));
+  }
+
+  // ── Step 5: No-op short-circuit ─────────────────────────────────────────
+  // There is work to do iff there are findings to apply OR open questions to
+  // record. Deferred-only rounds still no-op (nothing is applied) but the
+  // artifact above preserves them.
+  if (findings.length === 0 && openQuestions.length === 0) {
+    const summary = deferredCount > 0 ? `no-op (${deferredCount} deferred)\n` : "no-op\n";
+    atomicWriteText(path.join(critiqueDir, "change-summary.md"), summary);
+    store.markCritiqueViewed(config.planId, critiqueId);
     return {
       critiqueId,
       applied: false,
       changeCount: 0,
-      mode: "skipped",
-      error: "IMPROVE_FAILED: could not read recommendations",
+      mode: "no-op",
+      error: null,
+      openQuestionsRecorded: 0,
+      deferredCount,
     };
-  }
-  const findings = extractActionableFindings(recsMd);
-  const changeCount = findings.length;
-
-  // ── Step 5: No-op short-circuit ─────────────────────────────────────────
-  if (changeCount === 0) {
-    atomicWriteText(path.join(critiqueDir, "change-summary.md"), "no-op\n");
-    store.markCritiqueViewed(config.planId, critiqueId);
-    return { critiqueId, applied: false, changeCount: 0, mode: "no-op", error: null };
   }
 
   // ── Step 6: Build improver prompt ───────────────────────────────────────
-  const promptText = buildImproverPrompt(config, findings);
+  const promptText = buildImproverPrompt(config, findings, openQuestions);
   const promptFile = path.join(critiqueDir, "improver.txt");
   atomicWriteText(promptFile, promptText);
 
@@ -464,13 +620,7 @@ export async function runImprover(
     } catch {
       /* noop */
     }
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: `IMPROVE_FAILED: improver agent threw: ${msg}`,
-    };
+    return skipped(critiqueId, `IMPROVE_FAILED: improver agent threw: ${msg}`, changeCount, deferredCount);
   }
 
   try {
@@ -503,13 +653,7 @@ export async function runImprover(
   }
 
   if (exitCode !== 0) {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: `IMPROVE_FAILED: improver agent exited ${exitCode}`,
-    };
+    return skipped(critiqueId, `IMPROVE_FAILED: improver agent exited ${exitCode}`, changeCount, deferredCount);
   }
 
   // ── Step 8: Parse improver output ───────────────────────────────────────
@@ -517,34 +661,16 @@ export async function runImprover(
   try {
     raw = fs.readFileSync(outputPath, "utf-8");
   } catch {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: "IMPROVE_FAILED: could not read improver output",
-    };
+    return skipped(critiqueId, "IMPROVE_FAILED: could not read improver output", changeCount, deferredCount);
   }
   const parsed = parseImprovedOutput(raw);
   if (!parsed) {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: "IMPROVE_FAILED: could not parse improver output",
-    };
+    return skipped(critiqueId, "IMPROVE_FAILED: could not parse improver output", changeCount, deferredCount);
   }
 
   // ── Step 9: Defend against improper no-op ───────────────────────────────
   if (parsed.mode === "no-op") {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: "IMPROVE_NOOP_DESPITE_FINDINGS",
-    };
+    return skipped(critiqueId, "IMPROVE_NOOP_DESPITE_FINDINGS", changeCount, deferredCount);
   }
 
   // ── Step 10: Persist artifacts ──────────────────────────────────────────
@@ -554,13 +680,7 @@ export async function runImprover(
   // ── Step 11: Rewrite the live spec on disk + bump Plan ────────────
   const task = store.getPlan(config.planId);
   if (!task) {
-    return {
-      critiqueId,
-      applied: false,
-      changeCount,
-      mode: "skipped",
-      error: "IMPROVE_FAILED: task disappeared during improve",
-    };
+    return skipped(critiqueId, "IMPROVE_FAILED: task disappeared during improve", changeCount, deferredCount);
   }
   const nextSpecVersion = (task.specVersion ?? 1) + 1;
   const improvedAtIso = new Date().toISOString();
@@ -577,5 +697,13 @@ export async function runImprover(
   // ── Step 12: Mark the critique viewed ───────────────────────────────────
   store.markCritiqueViewed(config.planId, critiqueId);
 
-  return { critiqueId, applied: true, changeCount, mode: "applied", error: null };
+  return {
+    critiqueId,
+    applied: true,
+    changeCount,
+    mode: "applied",
+    error: null,
+    openQuestionsRecorded: openQuestions.length,
+    deferredCount,
+  };
 }
