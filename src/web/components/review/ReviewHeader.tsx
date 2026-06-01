@@ -1,5 +1,5 @@
-import { renderMarkdown } from "../../lib/markdown";
 import type { IssuePrComment, PrReview, PrReviewBundle } from "../../types";
+import { MarkdownViewer } from "../MarkdownViewer";
 import { ciClass, ciLabel, reviewClass, reviewLabel, timeAgo } from "../prs/pr-format";
 
 interface Props {
@@ -40,7 +40,7 @@ function ConversationItem({ entry }: { entry: ConversationEntry }) {
           </a>
         ) : null}
       </header>
-      <div class="review-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(entry.body || "") }} />
+      <MarkdownViewer markdown={entry.body || ""} class="review-md" />
     </article>
   );
 }

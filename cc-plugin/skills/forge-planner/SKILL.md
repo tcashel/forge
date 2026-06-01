@@ -26,6 +26,22 @@ There are two common paths:
 
 In either case the user expects a finished spec saved to disk and (usually) a launched run.
 
+When this skill is loaded by the Workbench planner chat for an existing plan, the prompt includes `Current Forge plan id: <id>`. In that mode the conversation is primary and the document pane is the maintained artifact:
+
+- Keep talking to the user normally, but when the spec should change, call `forge plan update <plan-id> --section <section> - --json` and pipe the new section content on stdin.
+- Use section keys: `goals`, `constraints`, `non_goals`, `approach`, `risks`, `open_questions`, `acceptance_criteria`.
+- Your `forge plan update` call stages a reviewable diff. Do not claim the document was changed until the human accepts it.
+- Track unresolved items in `open_questions` using unchecked bullets (`- [ ] question`). When resolved, call `forge plan resolve-question <plan-id> <matching text> --json` or rewrite the `open_questions` section.
+- Do not rewrite the spec file directly with shell redirection or file edit tools. The plan document changes only through `forge plan ...` verbs.
+
+When this skill is loaded by the Workbench planner chat for an existing plan, the prompt includes `Current Forge plan id: <id>`. In that mode the conversation is primary and the document pane is the maintained artifact:
+
+- Keep talking to the user normally, but when the spec should change, call `forge plan update <plan-id> --section <section> - --json` and pipe the new section content on stdin.
+- Use section keys: `goals`, `constraints`, `non_goals`, `approach`, `risks`, `open_questions`, `acceptance_criteria`.
+- Your `forge plan update` call stages a reviewable diff. Do not claim the document was changed until the human accepts it.
+- Track unresolved items in `open_questions` using unchecked bullets (`- [ ] question`). When resolved, call `forge plan resolve-question <plan-id> <matching text> --json` or rewrite the `open_questions` section.
+- Do not rewrite the spec file directly with shell redirection or file edit tools. The plan document changes only through `forge plan ...` verbs.
+
 ## Workflow
 
 You progress through three short phases. Each has a companion file you load via `read` when you reach it. Don't load them all up front — pull them in as you need them.
@@ -38,7 +54,7 @@ If the user already produced a plan-mode plan that names files and is concrete e
 
 ### Phase 2 — Draft
 
-Read `schema.md`. It defines the section structure (Title, Context, What We're Building, Acceptance Criteria, Implementation Notes, Quality Gates, For the Executing Agent) and what good vs. bad content looks like in each. Compose the spec body in your reply (no frontmatter — Forge adds that). Aim for under 200 lines unless the change is genuinely large.
+Read `schema.md`. It defines the section structure and what good vs. bad content looks like in each. Compose the spec body in your reply (no frontmatter — Forge adds that). Aim for under 200 lines unless the change is genuinely large.
 
 **Title format matters.** The H1 title is used verbatim as the PR title, so it must follow conventional-commit format: `<type>(<scope>): <imperative>`, all lowercase, ≤ 70 chars. See the Title section in `schema.md` for the full rule and examples.
 

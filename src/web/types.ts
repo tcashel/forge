@@ -46,6 +46,7 @@ export interface PlanView {
   tmuxAlive: boolean;
   hasSpec: boolean;
   hasLog: boolean;
+  openQuestionCount: number;
   critique: CritiqueRef | null;
   lastImproveError: LastImproveError | null;
   /**
@@ -427,6 +428,47 @@ export interface ChatMessage {
 
 export interface PlanHistoryResponse {
   messages: ChatMessage[];
+}
+
+export type PlanSectionKey =
+  | "goals"
+  | "constraints"
+  | "non_goals"
+  | "approach"
+  | "risks"
+  | "open_questions"
+  | "acceptance_criteria";
+
+export interface PlanSectionDoc {
+  key: PlanSectionKey;
+  title: string;
+  content: string;
+  present: boolean;
+}
+
+export interface PendingPlanEdit {
+  id: string;
+  planId: string;
+  baseVersion: number;
+  diff: string;
+  createdBy: "agent:planner" | "user";
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+  openQuestions: string[];
+}
+
+export interface PlanWorkspaceResponse {
+  planId: string;
+  specVersion: number;
+  body: string;
+  parsed: {
+    title: string | null;
+    sections: Record<PlanSectionKey, PlanSectionDoc>;
+    openQuestions: string[];
+  };
+  openQuestionCount: number;
+  pendingEdit: PendingPlanEdit | null;
 }
 
 export interface PlanDraftResponse {

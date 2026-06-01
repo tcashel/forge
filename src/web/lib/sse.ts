@@ -76,6 +76,7 @@ function attachLogStream(url: string, handlers: LogStreamHandlers): EventSource 
 //   - `event: tool_use`    data: {toolUseId, name, input}
 //   - `event: tool_result` data: {toolUseId, output, isError, truncated}
 //   - `event: rate_limit`  data: {status, resetsAt}
+//   - `event: plan_updated` data: {planId, specVersion, openQuestionCount, pendingEditId}
 //   - `event: done`        data: {messageId, fullText, durationMs?, totalCostUsd?, numTurns?}
 //   - `event: error`       data: {message, exitCode, signal, stderrTail, promptFile}
 //
@@ -113,6 +114,12 @@ export interface ChatToolResultEvent {
 export interface ChatRateLimit {
   status: string | null;
   resetsAt: number | null;
+}
+export interface PlanUpdatedEvent {
+  planId: string;
+  specVersion: number | null;
+  openQuestionCount: number | null;
+  pendingEditId: string | null;
 }
 export interface ChatDoneEvent {
   messageId: string;
@@ -156,6 +163,7 @@ export interface ChatStreamListeners {
   onToolUse?: (e: ChatToolUseEvent) => void;
   onToolResult?: (e: ChatToolResultEvent) => void;
   onRateLimit?: (e: ChatRateLimit) => void;
+  onPlanUpdated?: (e: PlanUpdatedEvent) => void;
   onDone: (final: ChatDoneEvent) => void;
   onError: (e: ChatErrorEvent) => void;
 }
@@ -367,6 +375,15 @@ export function dispatchChatEvent(evt: SseEvent, listeners: ChatStreamListeners)
     listeners.onRateLimit?.({
       status: typeof parsed.status === "string" ? parsed.status : null,
       resetsAt: typeof parsed.resetsAt === "number" ? parsed.resetsAt : null,
+    });
+  } else if (evt.event === "plan_updated") {
+    const parsed = safeParse<Partial<PlanUpdatedEvent>>(evt.data);
+    if (!parsed || typeof parsed.planId !== "string") return;
+    listeners.onPlanUpdated?.({
+      planId: parsed.planId,
+      specVersion: typeof parsed.specVersion === "number" ? parsed.specVersion : null,
+      openQuestionCount: typeof parsed.openQuestionCount === "number" ? parsed.openQuestionCount : null,
+      pendingEditId: typeof parsed.pendingEditId === "string" ? parsed.pendingEditId : null,
     });
   } else if (evt.event === "done") {
     const parsed = safeParse<Partial<ChatDoneEvent>>(evt.data);

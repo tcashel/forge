@@ -1,7 +1,7 @@
-import { renderMarkdown } from "../../lib/markdown";
 import { targetKey } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
 import type { InlinePrComment } from "../../types";
+import { MarkdownViewer } from "../MarkdownViewer";
 import { timeAgo } from "../prs/pr-format";
 
 export interface InlineThread {
@@ -27,7 +27,7 @@ function CommentBody({ comment }: { comment: InlinePrComment }) {
           </a>
         ) : null}
       </header>
-      <div class="review-md" dangerouslySetInnerHTML={{ __html: renderMarkdown(comment.body || "") }} />
+      <MarkdownViewer markdown={comment.body || ""} class="review-md" />
     </article>
   );
 }

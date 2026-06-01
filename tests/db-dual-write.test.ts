@@ -49,7 +49,7 @@ test("recordPlanCreated lands plans + plan_versions v1 + synthetic task", () => 
   try {
     const store = new ForgeStore({ forgeDir });
     const task = makeTask();
-    recordPlanCreated(store.db.db, task, "# Goal\nLand the contract.");
+    recordPlanCreated(store.db.db, task, "# Goal\n\n## Open Questions\n\n- [ ] Who signs off?\n");
 
     const plan = store.db.db.prepare("SELECT * FROM plans WHERE id = ?").get(task.id) as Record<string, unknown>;
     assert.equal(plan.title, "Dual write smoke");
@@ -61,7 +61,8 @@ test("recordPlanCreated lands plans + plan_versions v1 + synthetic task", () => 
       .get(task.id) as Record<string, unknown>;
     assert.ok(v1, "v1 row exists");
     assert.equal(v1.created_by, "user");
-    assert.ok((v1.document as string).includes("Land the contract"));
+    assert.ok((v1.document as string).includes("Who signs off"));
+    assert.deepEqual(JSON.parse(v1.open_questions as string), ["Who signs off?"]);
 
     const syntheticTask = store.db.db
       .prepare("SELECT * FROM tasks WHERE plan_id = ? AND sequence = 1")
@@ -80,7 +81,7 @@ test("recordPlanVersionAdded advances plans.current_version_id and tasks.plan_ve
     const task = makeTask();
     recordPlanCreated(store.db.db, task, "v1 body");
 
-    const v2Body = "v2 body — improved";
+    const v2Body = "v2 body - improved\n\n## Goals\n\n- Faster plans\n";
     recordPlanVersionAdded(store.db.db, task, 2, v2Body);
 
     const plan = store.db.db.prepare("SELECT current_version_id FROM plans WHERE id = ?").get(task.id) as {
@@ -93,6 +94,7 @@ test("recordPlanVersionAdded advances plans.current_version_id and tasks.plan_ve
       .get(task.id) as Record<string, unknown>;
     assert.equal(v2.created_by, "agent:improver");
     assert.equal(v2.document, v2Body);
+    assert.equal(JSON.parse(v2.sections as string).goals, "- Faster plans");
 
     const syntheticTask = store.db.db
       .prepare("SELECT plan_version_id, spec FROM tasks WHERE plan_id = ? AND sequence = 1")

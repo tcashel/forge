@@ -636,7 +636,7 @@ test("runChatTurn copies the full native transcript after spec-scoped turns", as
       return fixtureChild(stdout) as never;
     };
 
-    await drainSse(
+    const sse = await drainSse(
       runChatTurn({
         forgeDir,
         scope,
@@ -644,11 +644,24 @@ test("runChatTurn copies the full native transcript after spec-scoped turns", as
         cwd: repoRoot,
         spawnImpl,
         transcriptConfigDir: claudeConfig,
+        onPlanUpdated: () => ({
+          planId: scope.id,
+          specVersion: 2,
+          openQuestionCount: 1,
+          pendingEditId: "pe_test",
+        }),
       }).stream,
     );
 
     const snapshot = path.join(forgeDir, "specs", scope.id, "native-transcript.jsonl");
     assert.equal(fs.readFileSync(snapshot, "utf-8"), '{"native":true}\n');
+    const frames = parseSseFrames(sse);
+    assert.deepEqual(frames.find((f) => f.event === "plan_updated")?.data, {
+      planId: scope.id,
+      specVersion: 2,
+      openQuestionCount: 1,
+      pendingEditId: "pe_test",
+    });
   } finally {
     fs.rmSync(tmpHome, { recursive: true, force: true });
   }

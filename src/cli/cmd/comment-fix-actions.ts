@@ -497,8 +497,13 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
         ghEnv,
       });
       if (ensured.error || !ensured.worktreePath) {
+        // BRANCH_BUSY_PRIMARY carries an already-actionable message; surface it
+        // verbatim so the log line and drawer banner read cleanly. Other errors
+        // get the rehydrate-context prefix.
         throw new Error(
-          `could not rehydrate a worktree for PR #${prNum} on branch ${headRefName}: ${ensured.error ?? "(unknown)"}`,
+          ensured.errorCode === "BRANCH_BUSY_PRIMARY"
+            ? (ensured.error ?? "branch is checked out in your main repo")
+            : `could not rehydrate a worktree for PR #${prNum} on branch ${headRefName}: ${ensured.error ?? "(unknown)"}`,
         );
       }
       worktreePath = ensured.worktreePath;

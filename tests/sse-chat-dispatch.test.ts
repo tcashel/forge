@@ -17,6 +17,7 @@ import {
   type ChatToolResultEvent,
   type ChatToolUseEvent,
   dispatchChatEvent,
+  type PlanUpdatedEvent,
   type SseEvent,
   startChatStream,
 } from "../src/web/lib/sse.ts";
@@ -27,6 +28,7 @@ interface Captured {
   toolUse: ChatToolUseEvent[];
   toolResult: ChatToolResultEvent[];
   rate: ChatRateLimit[];
+  planUpdated: PlanUpdatedEvent[];
   done: ChatDoneEvent[];
   error: ChatErrorEvent[];
   delta: string[];
@@ -39,6 +41,7 @@ function makeListeners(): { captured: Captured; listeners: ChatStreamListeners }
     toolUse: [],
     toolResult: [],
     rate: [],
+    planUpdated: [],
     done: [],
     error: [],
     delta: [],
@@ -49,6 +52,7 @@ function makeListeners(): { captured: Captured; listeners: ChatStreamListeners }
     onToolUse: (e) => captured.toolUse.push(e),
     onToolResult: (e) => captured.toolResult.push(e),
     onRateLimit: (e) => captured.rate.push(e),
+    onPlanUpdated: (e) => captured.planUpdated.push(e),
     onDone: (e) => captured.done.push(e),
     onError: (e) => captured.error.push(e),
     onDelta: (t) => captured.delta.push(t),
@@ -65,6 +69,17 @@ test("dispatchChatEvent maps meta event to onMeta with safe defaults", () => {
   dispatchChatEvent(frame("meta", { sessionId: "s_1", model: "m", cwd: "/r", tools: ["Read", 1, "Grep"] }), listeners);
   assert.equal(captured.meta.length, 1);
   assert.deepEqual(captured.meta[0], { sessionId: "s_1", model: "m", cwd: "/r", tools: ["Read", "Grep"] });
+});
+
+test("dispatchChatEvent maps plan_updated event to onPlanUpdated", () => {
+  const { captured, listeners } = makeListeners();
+  dispatchChatEvent(
+    frame("plan_updated", { planId: "p1", specVersion: 3, openQuestionCount: 2, pendingEditId: "pe_1" }),
+    listeners,
+  );
+  assert.deepEqual(captured.planUpdated, [
+    { planId: "p1", specVersion: 3, openQuestionCount: 2, pendingEditId: "pe_1" },
+  ]);
 });
 
 test("dispatchChatEvent forwards text events to onTextDelta and onDelta", () => {
@@ -162,6 +177,7 @@ test("dispatchChatEvent ignores unknown event names", () => {
       captured.toolUse.length +
       captured.toolResult.length +
       captured.rate.length +
+      captured.planUpdated.length +
       captured.done.length +
       captured.error.length +
       captured.delta.length,

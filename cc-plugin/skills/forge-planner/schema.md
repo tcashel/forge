@@ -9,20 +9,22 @@ This is the layout you write into the **working draft file** the harness gave yo
 ```markdown
 # <Title>
 
-## Context
+## Goals
 
-## What We're Building
+## Constraints
+
+## Non-goals
+
+## Approach
+
+## Risks
+
+## Open Questions
 
 ## Acceptance Criteria
-
-## Implementation Notes
-
-## Quality Gates
-
-## For the Executing Agent
 ```
 
-That's seven sections plus the title. Some are mandatory, some optional — call below.
+That's seven structured sections plus the title. The Workbench document pane reads these headings directly and uses `Open Questions` for its counter.
 
 ## Section by section
 
@@ -49,23 +51,48 @@ Forge uses the H1 verbatim as the PR title, so it must already be in this format
 
 The title is what shows up in the Forge dashboard and (Flow A) becomes the JIRA ticket summary. Make it scannable.
 
-### Context (mandatory)
+### Goals (mandatory)
 
-2–4 sentences. Why the work exists. Mention the user-visible problem or the technical motivation. Reference the JIRA ticket if Flow B.
+Bullets describing the observable behavior and outcome. Include enough context that a human reviewer understands why the work exists, but keep this section action-oriented.
 
-This section serves the **human** reader (the engineer reviewing the spec, the JIRA reader if the spec becomes a ticket description). It does not serve the executing agent — the agent acts on goals, not motivations.
+- ✅ "Session lookup P95 stays under 50ms by consulting a 30-second cache before the auth DB."
+- ❌ "Improve auth." (too vague)
 
-- ✅ "User session lookups currently hit the auth DB on every request. P95 is 80ms and growing with traffic. Adding a 30-second cache on session ID will keep us under the 50ms SLO without changing auth semantics."
-- ❌ "Need to add caching." (no context)
+### Constraints (optional but usually present)
 
-### What We're Building (mandatory)
+Hard requirements the implementation must respect: compatibility, performance bounds, public API stability, storage shape, security constraints, or repo conventions.
 
-The observable behavior change. What's true after this PR merges that wasn't true before.
+- ✅ "Do not change the public signature of `getUserSession(userId)`."
+- ❌ "Use good patterns." (not a constraint)
 
-This section is for both the human reviewer and the agent. Be precise about what changes from the user's / caller's perspective. Don't dive into implementation here — that's `Implementation Notes`.
+### Non-goals (optional)
 
-- ✅ "A new `cacheUserSession(userId, sessionId, ttlSeconds)` is exposed from `src/auth/session.ts`. The existing `getUserSession(userId)` consults the cache first; on miss it falls back to the DB and populates the cache. Cache misses are logged at debug level."
-- ❌ "Caching for sessions." (not observable, not testable)
+Explicitly out-of-scope work. Use this to stop the executing agent from expanding the task.
+
+- ✅ "Do not migrate unrelated auth endpoints to the new cache."
+
+### Approach (mandatory)
+
+Specific guidance about how to implement when there is a meaningful choice or landmine. Mention files, helpers, and sequencing when relevant.
+
+- ✅ "Reuse `src/auth/cache.ts:getCacheClient()` and add tests beside `tests/auth/session.test.ts`."
+- ❌ "Figure out the best approach." (defers the decision)
+
+### Risks (optional)
+
+Known failure modes or review concerns the agent should watch while implementing.
+
+- ✅ "Cache stampedes are possible if multiple misses for the same session arrive simultaneously."
+
+### Open Questions (mandatory; can be empty)
+
+Unresolved questions that block confidence. Use unchecked bullets (`- [ ] ...`) for open items. The Workbench open-question counter is driven by this section. If there are no open questions, write `- None`.
+
+```markdown
+## Open Questions
+
+- [ ] Should cache entries be invalidated on explicit logout?
+```
 
 ### Acceptance Criteria (mandatory)
 
@@ -88,46 +115,6 @@ Bullets. Each one is a verifiable check. A reviewer must be able to look at the 
 ```
 
 Avoid: "X works", "tests pass", "code is clean" — these aren't checkable.
-
-### Implementation Notes (optional but usually present)
-
-Specific guidance about *how* to implement, when there's a meaningful choice or a landmine. Skip the section entirely if there's nothing useful to say.
-
-Use this when:
-
-- There's an existing helper or pattern the agent should reuse instead of inventing
-- A naive implementation would have a bug (race condition, perf problem, security issue)
-- The repo has a convention that's not obvious from a quick read
-- There's a sequencing constraint (do X before Y)
-
-Don't use this for:
-
-- Restating the acceptance criteria
-- Generic advice ("write good tests")
-- Implementation details the agent should figure out themselves (which loop type, how to name a local variable)
-
-### Quality Gates (optional)
-
-Exact commands. Pulled from the repo profile or from the repo's CI config. These are commands the agent runs before opening the PR.
-
-```bash
-pnpm typecheck
-pnpm lint
-pnpm test --run
-```
-
-If you list these, the agent will run them. If the repo has nothing meaningful to enforce (rare), skip the section.
-
-### For the Executing Agent (mandatory)
-
-A short operational brief. The agent reads this last; it's the "stage directions". Cover:
-
-- Sequencing — do TASK X before Y
-- Patterns to follow — "match the existing style of `src/foo.ts:greet()`"
-- Landmines — "do not modify the public signature of `getUserSession` — callers depend on it"
-- Doc updates if APIs/CLI change
-
-Keep it under ~150 words. It's not a duplicate of acceptance criteria; it's the cover letter.
 
 ## Forbidden in the spec body
 

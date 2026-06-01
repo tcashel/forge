@@ -10,6 +10,7 @@
  */
 
 import type { Database } from "bun:sqlite";
+import { openQuestionsJson, sectionsJson } from "../plan-document.ts";
 import type { CostSource } from "../pricing.ts";
 import type { CritiqueMeta, Plan, RunMeta } from "../store.ts";
 
@@ -330,6 +331,8 @@ function planMetadata(task: Plan): string {
 export function recordPlanCreated(db: Database, task: Plan, body: string): void {
   const planVersionId = livePlanVersionId(task.id, 1);
   const taskRowId = liveTaskId(task.id);
+  const sections = JSON.stringify(sectionsJson(body));
+  const openQuestions = openQuestionsJson(body);
 
   db.transaction(() => {
     db.prepare(
@@ -350,8 +353,15 @@ export function recordPlanCreated(db: Database, task: Plan, body: string): void 
     db.prepare(
       `INSERT OR IGNORE INTO plan_versions
        (id, plan_id, version_number, document, sections, open_questions, created_by, created_at, notes)
-       VALUES (?, ?, 1, ?, '{}', NULL, 'user', ?, NULL)`,
-    ).run(planVersionId, task.id, body, task.createdAt);
+       VALUES (?, ?, 1, ?, ?, ?, 'user', ?, NULL)`,
+    ).run(
+      planVersionId,
+      task.id,
+      body,
+      sections,
+      openQuestions.length > 0 ? JSON.stringify(openQuestions) : null,
+      task.createdAt,
+    );
 
     db.prepare("UPDATE plans SET current_version_id = ? WHERE id = ?").run(planVersionId, task.id);
 
@@ -385,9 +395,18 @@ export function recordPlanCreated(db: Database, task: Plan, body: string): void 
  * task is matched by `(plan_id, sequence=1)` so backfilled IDs (`bf-t-*`)
  * and live IDs (`t-*`) both work.
  */
-export function recordPlanVersionAdded(db: Database, task: Plan, version: number, body: string): void {
+export function recordPlanVersionAdded(
+  db: Database,
+  task: Plan,
+  version: number,
+  body: string,
+  opts: { createdBy?: string; notes?: string | null } = {},
+): void {
   const planVersionId = livePlanVersionId(task.id, version);
   const now = new Date().toISOString();
+  const sections = JSON.stringify(sectionsJson(body));
+  const openQuestions = openQuestionsJson(body);
+  const createdBy = opts.createdBy ?? "agent:improver";
 
   db.transaction(() => {
     ensurePlanAndSyntheticTask(db, task);
@@ -395,8 +414,18 @@ export function recordPlanVersionAdded(db: Database, task: Plan, version: number
     db.prepare(
       `INSERT OR IGNORE INTO plan_versions
        (id, plan_id, version_number, document, sections, open_questions, created_by, created_at, notes)
-       VALUES (?, ?, ?, ?, '{}', NULL, 'agent:improver', ?, NULL)`,
-    ).run(planVersionId, task.id, version, body, now);
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    ).run(
+      planVersionId,
+      task.id,
+      version,
+      body,
+      sections,
+      openQuestions.length > 0 ? JSON.stringify(openQuestions) : null,
+      createdBy,
+      now,
+      opts.notes ?? null,
+    );
 
     db.prepare("UPDATE plans SET current_version_id = ?, updated_at = ? WHERE id = ?").run(planVersionId, now, task.id);
 

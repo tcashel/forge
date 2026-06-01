@@ -396,10 +396,24 @@ function markConversationStarted(forgeDir: string, scope: ScopeRef): void {
   writeConversationPointer(forgeDir, scope, { ...pointer, started: true, updatedAt: new Date().toISOString() });
 }
 
-function buildInitialTurnPrompt(opts: { skill: string; newUser: ChatMessage; specBody: string | null }): string {
+function buildInitialTurnPrompt(opts: {
+  skill: string;
+  newUser: ChatMessage;
+  specBody: string | null;
+  scope: ScopeRef;
+}): string {
   const parts: string[] = [];
   parts.push("# Planner skill\n");
   parts.push(opts.skill.trimEnd());
+  parts.push("\n");
+  parts.push("# Forge conversation scope\n");
+  if (opts.scope.kind === "spec") {
+    parts.push(`Current Forge plan id: ${opts.scope.id}`);
+    parts.push("When the spec needs to change, propose reviewable edits with `forge plan update` for this plan id.");
+  } else {
+    parts.push(`Draft conversation id: ${opts.scope.id}`);
+    parts.push("This draft has no saved plan id yet; produce the spec body in conversation until the user saves it.");
+  }
   parts.push("\n");
   if (opts.specBody) {
     parts.push("# Current spec body\n");
@@ -456,6 +470,8 @@ export interface RunChatTurnOptions {
   db?: ForgeDb;
   /** Test seam for transcript lookup. Production uses Claude's default config dir. */
   transcriptConfigDir?: string;
+  /** Called after a successful spec-scoped turn so the SSE stream can announce document changes. */
+  onPlanUpdated?: () => unknown | null;
 }
 
 /**
@@ -604,6 +620,7 @@ export function summarizeToolResultContent(content: unknown): { output: string; 
  *   - `event: tool_use`    data: {toolUseId, name, input}
  *   - `event: tool_result` data: {toolUseId, output, isError, truncated}
  *   - `event: rate_limit`  data: {status, resetsAt}
+ *   - `event: plan_updated` data: {planId, specVersion, openQuestionCount, pendingEditId}
  *   - `event: done`        data: {messageId, fullText, durationMs, totalCostUsd, numTurns, stopReason}
  *   - `event: error`       data: {message, exitCode, signal, stderrTail, promptFile}
  *
@@ -664,7 +681,7 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
   const skill = loadSkillPrompt();
   const promptText = pointer.started
     ? userMsg.text
-    : buildInitialTurnPrompt({ skill, newUser: userMsg, specBody: opts.specBody ?? null });
+    : buildInitialTurnPrompt({ skill, newUser: userMsg, specBody: opts.specBody ?? null, scope });
 
   const chatDir = ensureChatDir(forgeDir, scope);
   const turnNum = nextTurnNumber(chatDir);
@@ -1057,6 +1074,10 @@ export function runChatTurn(opts: RunChatTurnOptions): RunChatTurnResult {
             const startedPointer = readConversationPointer(forgeDir, scope);
             if (startedPointer)
               copyNativeTranscriptSnapshot(forgeDir, scope, startedPointer, { configDir: opts.transcriptConfigDir });
+            if (!cancelled && scope.kind === "spec" && opts.onPlanUpdated) {
+              const planUpdate = opts.onPlanUpdated();
+              if (planUpdate) send("plan_updated", planUpdate);
+            }
             // Clean up the prompt file on success.
             try {
               fs.rmSync(promptFile, { force: true });

@@ -73,7 +73,7 @@ export function stopTaskPolling(): void {
 export function defaultTabFor(t: PlanView): TabId {
   if (t.section === "running") return "log";
   if (t.kind === "critique-ready") return "critique";
-  return "spec";
+  return "plan";
 }
 
 export function selectTask(id: string, tab?: TabId): void {
