@@ -281,3 +281,29 @@ test("non-zero exit with an unrecognized stop_reason is NOT rescued — allowlis
     fs.rmSync(binBase, { recursive: true, force: true });
   }
 });
+
+test("a closing fence with indentation / trailing spaces is still a complete block", () => {
+  const { forgeDir, store, runnerPath } = setup();
+  const binBase = fs.mkdtempSync(path.join(os.tmpdir(), "forge-crit-bin-"));
+  try {
+    // Complete blocks, but the closing fences carry CommonMark-legal whitespace
+    // (leading indent + trailing spaces). An exact "= ```" check would wrongly
+    // force-fail these; the completeness gate must tolerate the padding.
+    const linesFile = path.join(binBase, "lines.jsonl");
+    const text = "```forge-spec-critique\nfindings\n   ```   \n\n```forge-spec-recommendations\nrecs\n  ```  ";
+    fs.writeFileSync(
+      linesFile,
+      `${JSON.stringify({ type: "system", subtype: "init" })}\n${resultLine({ result: text, isError: false, stopReason: "end_turn" })}\n`,
+    );
+    const binDir = fakeClaudeBin(binBase, linesFile, 1);
+
+    const meta = runWithFakeClaude(binDir, runnerPath, store, ALL_CLAUDE.planId, ALL_CLAUDE.critiqueId);
+
+    assert.equal(meta.criticA.status, "done", "padded closing fence must still count as complete");
+    assert.equal(meta.synthesizer.status, "done");
+    assert.equal(meta.status, "done");
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+    fs.rmSync(binBase, { recursive: true, force: true });
+  }
+});

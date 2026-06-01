@@ -237,7 +237,7 @@ with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
 # anything else — max_tokens, error, or an unknown stop — fails closed. The
 # .md must be a COMPLETE fenced block (opening marker + closing fence).
 crit_slot_valid() {
-  local stream="$1" md="$2" fence="$3" result_line stop
+  local stream="$1" md="$2" fence="$3" result_line stop last
   [ -s "$stream" ] || return 1
   result_line=$(grep '"type":"result"' "$stream" | tail -1)
   [ -n "$result_line" ] || return 1
@@ -253,11 +253,15 @@ crit_slot_valid() {
     esac
   fi
   # output must be a COMPLETE fenced block: opening marker present AND a closing
-  # \`\`\` as the last non-blank line. A run killed mid-write after the opening
-  # fence lacks the close and must not be rescued (truncated output).
+  # fence as the last non-blank line. A run killed mid-write after the opening
+  # fence lacks the close and must not be rescued (truncated output). The close
+  # is matched whitespace-tolerantly — CommonMark allows leading indent and
+  # trailing spaces on the closing fence, so a clean critic must not be
+  # force-failed merely for padding around its \`\`\`.
   [ -s "$md" ] || return 1
   grep -q "$fence" "$md" || return 1
-  [ "$(grep -v '^[[:space:]]*$' "$md" | tail -1)" = '\`\`\`' ] || return 1
+  last=$(grep -v '^[[:space:]]*$' "$md" | tail -1 | sed 's/^[[:space:]]*//; s/[[:space:]]*$//')
+  printf '%s' "$last" | grep -Eq '^\`{3,}$' || return 1
   return 0
 }
 
