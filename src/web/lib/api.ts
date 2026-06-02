@@ -2,7 +2,14 @@
 // callers throw with `code` / `hint` populated on failures, and we keep
 // that contract so existing toast logic still surfaces backend hints.
 import type { UsageSummary } from "../../core/usage";
-import type { ActivityDetailResponse, AgentActivityRow, PlanView, UsageFilterState } from "../types";
+import type {
+  ActivityDetailResponse,
+  AgentActivityRow,
+  LibraryFilter,
+  PlanView,
+  SpecLibraryResponse,
+  UsageFilterState,
+} from "../types";
 
 export class ApiError extends Error {
   code: string;
@@ -56,6 +63,13 @@ export interface PlansResponse {
 export function getPlans(repo?: string): Promise<PlansResponse> {
   const q = repo ? `?repo=${encodeURIComponent(repo)}` : "";
   return apiGet<PlansResponse>(`/api/plans${q}`);
+}
+
+/** Cross-repo spec library. `q` is a server-side case-insensitive substring. */
+export function fetchSpecLibrary(filter: LibraryFilter, q?: string): Promise<SpecLibraryResponse> {
+  const params = new URLSearchParams({ filter });
+  if (q) params.set("q", q);
+  return apiGet<SpecLibraryResponse>(`/api/spec-library?${params.toString()}`);
 }
 
 export interface AgentActivityResponse {

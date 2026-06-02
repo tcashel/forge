@@ -1,5 +1,6 @@
 import { viewMode } from "../signals/ui";
 import { ActivityView } from "./activity/ActivityView";
+import { LibraryView } from "./library/LibraryView";
 import { NewSpecModal } from "./modal/NewSpecModal";
 import { PickupSection } from "./pickup/PickupSection";
 import { PrDetail } from "./prs/PrDetail";
@@ -36,6 +37,7 @@ export function App() {
   const inReview = mode === "pr-review";
   const inWorktrees = mode === "worktrees";
   const inUsage = mode === "usage";
+  const inLibrary = mode === "library";
   const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}${inActivity ? " activity-list-pane" : ""}`;
   const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}${inActivity ? " activity-detail-pane" : ""}`;
   return (
@@ -61,6 +63,10 @@ export function App() {
         ) : inUsage ? (
           <main class="usage-full-pane" id="detail-pane">
             <UsageView />
+          </main>
+        ) : inLibrary ? (
+          <main class="library-full-pane" id="detail-pane">
+            <LibraryView />
           </main>
         ) : (
           <>
