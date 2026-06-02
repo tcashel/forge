@@ -67,6 +67,7 @@ import type {
   ReasoningEffort,
   RepoConfig,
 } from "../../core/store.ts";
+import { aggregateUsage } from "../../core/usage.ts";
 import {
   isCleanMergedTarget,
   listWorktrees,
@@ -1040,6 +1041,48 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk(detail);
   }
 
+  // GET /api/usage — aggregated token + cost rollups for the Usage dashboard.
+  // Window: explicit `since`/`until` (ISO), or `window`=7d|30d|90d|all. The
+  // time window is the only SQL filter (so option lists stay complete); the
+  // cross-filters repo/spec/model/agent/purpose/state are applied in-memory by
+  // aggregateUsage over the windowed rows.
+  if (pathname === "/api/usage") {
+    try {
+      reconcileExecutionSessions(store.db.db, new Date().toISOString());
+      await reconcileCritiqueSessions(store);
+    } catch {
+      /* non-fatal — show whatever is recorded */
+    }
+    const explicitSince = url.searchParams.get("since") ?? undefined;
+    const since = explicitSince ?? sinceFromWindow(url.searchParams.get("window"));
+    // Default the upper bound to "now" so the trend spans the full window
+    // (including empty trailing days) rather than stopping at the last run.
+    const until = url.searchParams.get("until") ?? new Date().toISOString();
+    // Pull the whole window (cap high); aggregateUsage does the fine filtering.
+    const rows = queryActivityRows(store, { since, until, limit: "100000" }, 100000);
+    // Authoritative spec outcomes from the JSON plan store (status + prNumber);
+    // drives the cost-to-ship / rework classification in aggregateUsage.
+    const outcomes: Record<string, { status: string; prNumber: number | null }> = {};
+    for (const p of store.getPlans()) {
+      outcomes[p.id] = { status: p.status, prNumber: p.prNumber ?? null };
+    }
+    const summary = aggregateUsage(
+      rows,
+      {
+        repo: url.searchParams.get("repo") ?? undefined,
+        spec: url.searchParams.get("spec") ?? undefined,
+        model: url.searchParams.get("model") ?? undefined,
+        agent: url.searchParams.get("agent") ?? undefined,
+        purpose: url.searchParams.get("purpose") ?? undefined,
+        state: url.searchParams.get("state") ?? undefined,
+        since: since ?? null,
+        until: until ?? null,
+      },
+      outcomes,
+    );
+    return jsonOk(summary);
+  }
+
   // GET /api/sessions/:sessionId/log — SSE log stream for a recorded
   // session (execution / review / fix). The path resolves per purpose:
   // job/review/fix all share $RUN_DIR/agent.log today; once the runner
@@ -1401,6 +1444,7 @@ interface AgentActivityFilters {
   agent?: string;
   repo?: string;
   since?: string;
+  until?: string;
   limit?: string;
 }
 
@@ -1429,7 +1473,20 @@ function parseMetricsBlob(raw: string | null): Record<string, unknown> {
   }
 }
 
-function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentActivityRow[] {
+/** Translate a `window` shorthand (7d|30d|90d|all) into a `since` ISO bound. */
+function sinceFromWindow(window: string | null): string | undefined {
+  const days = window === "7d" ? 7 : window === "30d" ? 30 : window === "90d" ? 90 : null;
+  if (days === null) return undefined; // "all" / unset → no lower bound
+  return new Date(Date.now() - days * 24 * 60 * 60 * 1000).toISOString();
+}
+
+/**
+ * Query + project sessions into AgentActivityRow[] with resolved plan refs.
+ * SQL-level filters: state / purpose / agent / since / until (all optional);
+ * `maxLimit` caps the clamp (200-row default for the list, large for usage
+ * aggregation). Repo and other fine filters are applied by callers.
+ */
+function queryActivityRows(store: ForgeStore, f: AgentActivityFilters, maxLimit = 1000): AgentActivityRow[] {
   const wheres: string[] = [];
   const params: Array<string | number> = [];
   if (f.state) {
@@ -1448,7 +1505,11 @@ function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentAct
     wheres.push("s.started_at >= ?");
     params.push(f.since);
   }
-  const limit = Math.max(1, Math.min(1000, Number.parseInt(f.limit ?? "200", 10) || 200));
+  if (f.until) {
+    wheres.push("s.started_at <= ?");
+    params.push(f.until);
+  }
+  const limit = Math.max(1, Math.min(maxLimit, Number.parseInt(f.limit ?? String(Math.min(200, maxLimit)), 10) || 200));
   const sql = `SELECT s.id, s.purpose, s.related_id, s.agent_adapter, s.model,
                       s.started_at, s.finished_at, s.state, s.exit_code, s.metrics,
                       j.run_number, j.branch_name
@@ -1459,7 +1520,7 @@ function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentAct
                 LIMIT ?`;
   const rows = store.db.db.prepare(sql).all(...params, limit) as RawSessionRow[];
 
-  const projected = rows.map<AgentActivityRow>((r) => {
+  return rows.map<AgentActivityRow>((r) => {
     const metrics = parseMetricsBlob(r.metrics);
     return {
       id: r.id,
@@ -1477,7 +1538,10 @@ function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentAct
       plan: resolvePlanRefForRow(store, r, metrics),
     };
   });
+}
 
+function listAgentActivity(store: ForgeStore, f: AgentActivityFilters): AgentActivityRow[] {
+  const projected = queryActivityRows(store, f);
   if (f.repo) {
     return projected.filter((r) => r.plan?.repo === f.repo || r.plan?.id === f.repo);
   }
@@ -1504,6 +1568,11 @@ function resolvePlanRefForRow(
       planId = lookupPlanIdViaSynthesis(store, row.related_id);
     } else if (row.purpose === "drafting" && metrics.scopeKind === "spec") {
       planId = row.related_id;
+    } else if (row.purpose === "review" || row.purpose === "fix" || row.purpose === "comment-fix") {
+      // Auto-fix-loop review/fix sessions stash the jobId in related_id
+      // (`j-<planId>-rN`); resolve plan via the job → task. PR-review sessions
+      // (`s-review-pr-…`) have no related_id and stay unlinked (no spec).
+      planId = lookupPlanIdViaJobId(store, row.related_id);
     }
   }
   if (!planId) return null;
@@ -1522,6 +1591,19 @@ function lookupPlanIdViaJob(store: ForgeStore, sessionId: string): string | null
          WHERE j.session_id = ?`,
     )
     .get(sessionId) as { plan_id: string } | undefined;
+  return row?.plan_id ?? null;
+}
+
+/** Resolve a plan from a jobId (review/fix sessions stash it in related_id). */
+function lookupPlanIdViaJobId(store: ForgeStore, jobId: string | null): string | null {
+  if (!jobId) return null;
+  const row = store.db.db
+    .prepare(
+      `SELECT t.plan_id
+         FROM jobs j JOIN tasks t ON j.task_id = t.id
+         WHERE j.id = ?`,
+    )
+    .get(jobId) as { plan_id: string } | undefined;
   return row?.plan_id ?? null;
 }
 

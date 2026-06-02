@@ -1,7 +1,8 @@
 // Thin API wrapper. Server returns `{ ok, data, error }` envelopes; legacy
 // callers throw with `code` / `hint` populated on failures, and we keep
 // that contract so existing toast logic still surfaces backend hints.
-import type { ActivityDetailResponse, AgentActivityRow, PlanView } from "../types";
+import type { UsageSummary } from "../../core/usage";
+import type { ActivityDetailResponse, AgentActivityRow, PlanView, UsageFilterState } from "../types";
 
 export class ApiError extends Error {
   code: string;
@@ -82,4 +83,17 @@ export function fetchAgentActivity(params: FetchAgentActivityParams = {}): Promi
 
 export function fetchAgentActivityDetail(sessionId: string): Promise<ActivityDetailResponse> {
   return apiGet<ActivityDetailResponse>(`/api/agent-activity/${encodeURIComponent(sessionId)}`);
+}
+
+export type { UsageSummary } from "../../core/usage";
+
+/** Fetch aggregated usage for the dashboard. `window` maps to a server since-bound. */
+export function fetchUsage(filters: UsageFilterState): Promise<UsageSummary> {
+  const q = new URLSearchParams();
+  q.set("window", filters.window);
+  for (const k of ["repo", "spec", "model", "agent", "purpose"] as const) {
+    const v = filters[k];
+    if (v) q.set(k, v);
+  }
+  return apiGet<UsageSummary>(`/api/usage?${q.toString()}`);
 }

@@ -98,6 +98,35 @@ test("summarizeActivity byPurpose splits critic-a / critic-b via deriveLabel", (
   assert.deepEqual(labels, ["critic-a", "critic-b"]);
 });
 
+test("summarizeActivity counts cache tokens in totals and byModel", () => {
+  const rows = [
+    // claude: tiny uncached input, bulk in cache read + a little cache create
+    row({ id: "c1", model: "opus-4-7", metrics: { tokensIn: 100, cacheRead: 5000, cacheCreate: 200, tokensOut: 80 } }),
+    // codex: normalized uncached input + cache read, no cache create
+    row({
+      id: "x1",
+      model: "gpt-5.5",
+      agentAdapter: "codex",
+      metrics: { tokensIn: 300, cacheRead: 700, tokensOut: 50 },
+    }),
+  ];
+  const out = summarizeActivity(rows);
+  assert.equal(out.tokensIn, 400, "uncached input summed across both adapters");
+  assert.equal(out.cached, 5900, "cacheRead + cacheCreate across both rows (5000+200+700)");
+  assert.equal(out.tokensOut, 130);
+  // claude total = 100+5200+80 = 5380 ranks above codex total = 300+700+50 = 1050
+  assert.equal(out.byModel[0].model, "opus-4-7");
+  assert.equal(out.byModel[0].cached, 5200);
+  assert.equal(out.byModel[1].model, "gpt-5.5");
+  assert.equal(out.byModel[1].cached, 700);
+});
+
+test("summarizeActivity buckets a null model under '—'", () => {
+  const rows = [row({ id: "n1", model: null, metrics: { tokensIn: 10, tokensOut: 5 } })];
+  const out = summarizeActivity(rows);
+  assert.equal(out.byModel[0].model, "—");
+});
+
 test("absTime formats an ISO timestamp and falls back on garbage", () => {
   assert.equal(absTime("not-a-date"), "—");
   const s = absTime("2026-05-31T10:28:00.000Z");

@@ -30,7 +30,7 @@ test("ForgeDb creates forge.db under forgeDir and applies all migrations", () =>
     }>;
     assert.deepEqual(
       history.map((r) => r.filename),
-      ["0001_phase1_schema.sql", "0002_phase2_schema.sql"],
+      ["0001_phase1_schema.sql", "0002_phase2_schema.sql", "0003_normalize_codex_tokens.sql"],
     );
 
     fdb.close();
@@ -89,7 +89,7 @@ test("runMigrations is idempotent when re-run on the same database", () => {
     assert.deepEqual(applied, [], "second run should apply zero new migrations");
 
     const count = fdb.db.prepare("SELECT COUNT(*) AS n FROM _migration_history").get() as { n: number };
-    assert.equal(count.n, 2);
+    assert.equal(count.n, 3);
 
     fdb.close();
   } finally {

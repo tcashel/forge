@@ -1,5 +1,12 @@
 import { useComputed } from "@preact/signals";
-import { enterActivityMode, enterPrMode, enterSettingsMode, enterTaskMode, enterWorktreesMode } from "../lib/modes";
+import {
+  enterActivityMode,
+  enterPrMode,
+  enterSettingsMode,
+  enterTaskMode,
+  enterUsageMode,
+  enterWorktreesMode,
+} from "../lib/modes";
 import { showToast } from "../lib/toast";
 import { repos } from "../signals/repos";
 import { activityFilter, modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
@@ -97,6 +104,11 @@ export function Sidebar() {
     void refreshWorktrees();
   };
 
+  const onUsage = () => {
+    sidebarFilter.value = "usage";
+    enterUsageMode();
+  };
+
   const onActivityChip = (id: ActivityFilter) => {
     activityFilter.value = id;
     if (viewMode.value !== "activity") {
@@ -191,6 +203,12 @@ export function Sidebar() {
             ⌳
           </span>
           <span class="lbl">Worktrees</span>
+        </button>
+        <button type="button" class={`nav-item${mode === "usage" ? " active" : ""}`} id="nav-usage" onClick={onUsage}>
+          <span class="ic" style="color:var(--done)">
+            ◈
+          </span>
+          <span class="lbl">Usage &amp; Cost</span>
         </button>
         <div class="nav-section">Reference</div>
         <button
