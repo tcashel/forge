@@ -131,6 +131,56 @@ test("recordJobStarted seeds an execution session linked via jobs.session_id", (
   }
 });
 
+test("recordJobStarted seeds model from meta, not the (stale) plan row", () => {
+  // At launch the plan row isn't updated with the resolved model until after
+  // launchAgent returns, so task.model can be null here. The seed must take
+  // the resolved model from meta — otherwise it would record null and (worse)
+  // clobber the runner's correct value via the upsert.
+  const forgeDir = tmpForgeDir();
+  try {
+    const store = new ForgeStore({ forgeDir });
+    const task = { ...makeTask(), model: null, agent: null } as Plan;
+    recordPlanCreated(store.db.db, task, "# spec");
+    recordJobStarted(store.db.db, task, makeRunMeta()); // meta.model = claude-opus-4-7
+
+    const row = store.db.db
+      .prepare("SELECT agent_adapter, model FROM sessions WHERE id = ?")
+      .get(executionSessionId("j-plan-sess-1-r1")) as { agent_adapter: string; model: string | null };
+    assert.equal(row.model, "claude-opus-4-7");
+    assert.equal(row.agent_adapter, "claude");
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
+test("upsertSession never lets a null-model re-upsert blank a recorded model", () => {
+  // The launch race: the runner's `session start` records the real model, then
+  // the launch-time seed re-upserts the same id ~500ms later. The COALESCE
+  // guard must keep the real model regardless of which write lands last.
+  const forgeDir = tmpForgeDir();
+  try {
+    const store = new ForgeStore({ forgeDir });
+    const base = {
+      id: "s-execution-j-race-r1",
+      purpose: "execution" as const,
+      relatedId: "j-race-r1",
+      startedAt: "2026-04-01T00:00:00.000Z",
+      cwd: "/repo/x",
+    };
+    // Runner records the real model first.
+    upsertSession(store.db.db, { ...base, agentAdapter: "claude", model: "claude-opus-4-7" });
+    // Stale seed re-upserts with a null model second.
+    upsertSession(store.db.db, { ...base, agentAdapter: "claude", model: null });
+
+    const row = store.db.db.prepare("SELECT model FROM sessions WHERE id = ?").get("s-execution-j-race-r1") as {
+      model: string | null;
+    };
+    assert.equal(row.model, "claude-opus-4-7", "null re-upsert must not blank the recorded model");
+  } finally {
+    fs.rmSync(forgeDir, { recursive: true, force: true });
+  }
+});
+
 test("reconcileExecutionSessions flips orphan running rows once the job is terminal", () => {
   const forgeDir = tmpForgeDir();
   try {

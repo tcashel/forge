@@ -89,8 +89,22 @@ export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;
 }
 
-export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review" | "worktrees";
-export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity" | "worktrees";
+export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review" | "worktrees" | "usage";
+export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity" | "worktrees" | "usage";
+
+// ─── Usage dashboard ────────────────────────────────────────────────────────
+
+export type UsageWindow = "7d" | "30d" | "90d" | "all";
+
+/** Active Usage dashboard filters; the time window plus the cross-filters. */
+export interface UsageFilterState {
+  window: UsageWindow;
+  repo?: string;
+  spec?: string;
+  model?: string;
+  agent?: string;
+  purpose?: string;
+}
 
 // ─── Agent Activity ─────────────────────────────────────────────────────────
 

@@ -186,10 +186,10 @@ export async function captureSidecarMetrics(
     const est = estimateCost({
       agentAdapter: adapter,
       model,
+      // tokensIn is uncached/full-rate (both parsers report disjoint counts);
+      // cacheRead is the cached portion, priced at the discounted rate.
       tokensIn: r.tokensIn,
       tokensOut: r.tokensOut,
-      // codex folds cached input into tokensIn; price the cached portion
-      // (cacheRead) at the discounted rate instead of the full input rate.
       cachedTokensIn: r.cacheRead,
     });
     return { ...patch, ...est };

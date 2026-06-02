@@ -20,9 +20,9 @@ export interface ModelPrice {
   outputPer1M: number;
   /**
    * USD per 1M cached (cache-read) input tokens. Optional: when absent,
-   * cached input is charged at the full `inputPer1M` rate. Vendors that
-   * fold cached tokens into the reported `input_tokens` (codex) bill them
-   * at a discount, so pricing them separately avoids overstating cost.
+   * cached input is charged at the full `inputPer1M` rate. Cached tokens are
+   * billed at a discount, so pricing them separately (against `cacheRead`,
+   * which codex-stream splits out of the raw total) avoids overstating cost.
    */
   cachedInputPer1M?: number;
   /** ISO date the prices were last verified against vendor pricing pages. */
@@ -43,8 +43,9 @@ type Adapter = "claude" | "codex" | "opencode" | "gemini";
  * ($5 / 1M input, $0.50 / 1M cached input, $30 / 1M output) —
  * https://developers.openai.com/api/docs/pricing
  * and https://openai.com/index/introducing-gpt-5-5/ (verified 2026-05-31).
- * codex folds cached tokens into the reported `input_tokens`, so we split
- * them back out and price the cached portion at the discounted rate.
+ * codex-stream already splits cached out of the raw total, so `tokensIn` is
+ * full-rate input and `cacheRead` is the cached portion priced at the
+ * discounted rate.
  * opencode / gemini stay absent until their tokens are captured empirically.
  */
 const TABLE: Partial<Record<Adapter, Record<string, ModelPrice>>> = {
@@ -56,14 +57,14 @@ const TABLE: Partial<Record<Adapter, Record<string, ModelPrice>>> = {
 export interface EstimateInput {
   agentAdapter: string;
   model: string | null;
+  /** Uncached/full-rate input tokens (cached tokens excluded — see `cachedTokensIn`). */
   tokensIn: number | null;
   tokensOut: number | null;
   /**
-   * Cache-read input tokens already counted inside `tokensIn` (codex folds
-   * them in). When provided, this portion is billed at the model's cached
-   * rate and the remainder at the full input rate, so cached input isn't
-   * overcharged. Pass null/omit for vendors that report input and cache
-   * tokens as disjoint counts.
+   * Cached (cache-read) input tokens, billed at the model's discounted
+   * cached rate. These are NOT included in `tokensIn` — both parsers report
+   * input and cache as disjoint counts (codex-stream splits its raw total
+   * before it reaches here). Pass null/omit when there are no cached tokens.
    */
   cachedTokensIn?: number | null;
 }
@@ -90,14 +91,12 @@ export function estimateCost(input: EstimateInput): EstimateResult {
   if (input.tokensIn === null || input.tokensOut === null) {
     return { costUsd: null, costSource: null, modelPricedAt: null };
   }
-  // Split cached input out of the full-rate input when both a cached count
-  // and a cached rate are available; otherwise charge everything at the
+  // `tokensIn` is already full-rate (cached excluded). Price cached input at
+  // the discounted rate when the model defines one, else fall back to the
   // full input rate. Clamp so a malformed cached count can't go negative.
-  const cachedIn =
-    price.cachedInputPer1M !== undefined ? Math.min(Math.max(input.cachedTokensIn ?? 0, 0), input.tokensIn) : 0;
-  const fullRateIn = input.tokensIn - cachedIn;
+  const cachedIn = Math.max(input.cachedTokensIn ?? 0, 0);
   const cost =
-    (fullRateIn * price.inputPer1M +
+    (input.tokensIn * price.inputPer1M +
       cachedIn * (price.cachedInputPer1M ?? price.inputPer1M) +
       input.tokensOut * price.outputPer1M) /
     1_000_000;

@@ -129,7 +129,10 @@ export function upsertSession(db: Database, input: UpsertSessionInput): void {
        purpose = excluded.purpose,
        related_id = excluded.related_id,
        agent_adapter = excluded.agent_adapter,
-       model = excluded.model,
+       -- Never let a null re-upsert (e.g. the launch-time seed that runs
+       -- before the resolved model is persisted) blank a model the runner
+       -- already recorded. See recordJobStarted for the race this guards.
+       model = COALESCE(excluded.model, sessions.model),
        started_at = excluded.started_at,
        state = excluded.state,
        pid = excluded.pid,
@@ -469,12 +472,16 @@ export function recordJobStarted(db: Database, task: Plan, meta: RunMeta): numbe
     // Seed the session row before the jobs row so the FK from
     // jobs.session_id holds. The bash runner's `forge session start`
     // upserts the same id with richer metadata once the agent launches.
+    // Seed from `meta` (the resolved launch model/agent), NOT `task` — the
+    // plan row isn't updated with the resolved model until after launchAgent
+    // returns, so `task.model` is still null here and would otherwise race
+    // the runner's correct value to null.
     upsertSession(db, {
       id: sessionId,
       purpose: "execution",
       relatedId: jobId,
-      agentAdapter: task.agent ?? "claude",
-      model: task.model,
+      agentAdapter: meta.agent ?? task.agent ?? "claude",
+      model: meta.model ?? task.model,
       startedAt: meta.startedAt,
       state: "running",
       cwd: meta.worktree,

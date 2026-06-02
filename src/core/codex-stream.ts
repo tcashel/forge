@@ -9,6 +9,13 @@
  * `totalCostUsd` is always null here and the price table (estimateCost)
  * fills it downstream.
  *
+ * Token normalization: codex's raw `input_tokens` is the TOTAL input,
+ * including the cached portion. We split it so the stored buckets match
+ * claude's semantics — `tokensIn` = uncached/full-rate input,
+ * `cacheRead` = cached input — making per-bucket comparison and the
+ * Activity rollups adapter-agnostic. (claude already reports these as
+ * disjoint counts.)
+ *
  * Fixture: tests/fixtures/codex-stream-result.jsonl, captured from
  * `codex exec --json` (codex-cli 0.135.0). Field names below match what the
  * CLI actually emits there:
@@ -36,26 +43,34 @@ function num(v: unknown): number | null {
 /**
  * Parse a single `turn.completed` event payload. Returns null when the
  * event isn't a `turn.completed` carrying a usage object. Codex's usage
- * fields:
- *   - input_tokens          → tokensIn (includes cached input)
- *   - output_tokens         → tokensOut
- *   - cached_input_tokens   → cacheRead
- * Codex doesn't report cache-creation tokens, a per-turn duration, or cost,
- * so those map to null (cost is later estimated from the price table).
+ * fields map (after normalization) to:
+ *   - input_tokens - cached_input_tokens → tokensIn  (uncached/full-rate input)
+ *   - cached_input_tokens                → cacheRead  (cached input)
+ *   - output_tokens                      → tokensOut
+ * Codex's `input_tokens` is the TOTAL input (cached included), so we subtract
+ * the cached portion to leave only full-rate input in `tokensIn` — matching
+ * claude's disjoint-counts semantics. Codex doesn't report cache-creation
+ * tokens, a per-turn duration, or cost, so those map to null (cost is later
+ * estimated from the price table).
  */
 export function parseCodexTurnEvent(evt: Record<string, unknown>): ClaudeResultMetrics | null {
   if (evt.type !== "turn.completed") return null;
   const usage = evt.usage;
   if (!usage || typeof usage !== "object") return null;
   const u = usage as Record<string, unknown>;
+  const totalIn = num(u.input_tokens);
+  const cachedIn = num(u.cached_input_tokens);
+  // Subtract cached out of the total so tokensIn is uncached-only. Clamp at 0
+  // in case a malformed payload reports cached > total.
+  const uncachedIn = totalIn === null ? null : Math.max(totalIn - (cachedIn ?? 0), 0);
   return {
     durationMs: null,
     totalCostUsd: null,
     numTurns: null,
     stopReason: null,
-    tokensIn: num(u.input_tokens),
+    tokensIn: uncachedIn,
     tokensOut: num(u.output_tokens),
-    cacheRead: num(u.cached_input_tokens),
+    cacheRead: cachedIn,
     cacheCreate: null,
   };
 }

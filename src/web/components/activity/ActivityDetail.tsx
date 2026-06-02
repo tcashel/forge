@@ -2,8 +2,60 @@ import { useSignal } from "@preact/signals";
 import { useEffect } from "preact/hooks";
 import { fetchAgentActivityDetail } from "../../lib/api";
 import { activitySelectedId } from "../../signals/ui";
-import type { ActivityDetailResponse } from "../../types";
+import type { ActivityDetailResponse, AgentActivityRow } from "../../types";
 import { MarkdownViewer } from "../MarkdownViewer";
+import { rowTokens } from "./ActivityTable";
+
+function formatCostUsd(v: number): string {
+  if (v >= 1) return `$${v.toFixed(2)}`;
+  if (v >= 0.01) return `$${v.toFixed(3)}`;
+  return `$${v.toFixed(4)}`;
+}
+
+/**
+ * Per-bucket token + cost breakdown. Buckets are normalized across adapters
+ * (uncached input / cache read / cache create / output), so a claude run's
+ * cache reads — most of its volume — are visible here instead of hidden.
+ */
+function TokenBreakdown({ session }: { session: AgentActivityRow }) {
+  const m = session.metrics;
+  const hasTokens = m.tokensIn != null || m.tokensOut != null || m.cacheRead != null || m.cacheCreate != null;
+  if (!hasTokens && typeof m.costUsd !== "number") return null;
+  const t = rowTokens(session);
+  const cost = typeof m.costUsd === "number" ? formatCostUsd(m.costUsd) : "—";
+  const costSuffix = m.costSource ? ` (${m.costSource}${m.modelPricedAt ? `, ${m.modelPricedAt}` : ""})` : "";
+  return (
+    <dl class="activity-tokens">
+      <div>
+        <dt>Input (uncached)</dt>
+        <dd>{hasTokens ? t.input.toLocaleString() : "—"}</dd>
+      </div>
+      <div>
+        <dt>Cache read</dt>
+        <dd>{hasTokens ? t.cacheRead.toLocaleString() : "—"}</dd>
+      </div>
+      <div>
+        <dt>Cache create</dt>
+        <dd>{hasTokens ? t.cacheCreate.toLocaleString() : "—"}</dd>
+      </div>
+      <div>
+        <dt>Total input</dt>
+        <dd>{hasTokens ? t.totalInput.toLocaleString() : "—"}</dd>
+      </div>
+      <div>
+        <dt>Output</dt>
+        <dd>{hasTokens ? t.output.toLocaleString() : "—"}</dd>
+      </div>
+      <div>
+        <dt>Cost</dt>
+        <dd>
+          {cost}
+          {costSuffix}
+        </dd>
+      </div>
+    </dl>
+  );
+}
 
 export function ActivityDetail() {
   const data = useSignal<ActivityDetailResponse | null>(null);
@@ -81,6 +133,7 @@ export function ActivityDetail() {
           {d.session.exitCode != null ? <span>exit: {d.session.exitCode}</span> : null}
           {d.session.plan ? <span>spec: {d.session.plan.title}</span> : null}
         </div>
+        <TokenBreakdown session={d.session} />
       </header>
       {(d.detail.kind === "execution" || d.detail.kind === "review" || d.detail.kind === "fix") && (
         <pre class="activity-log">{logLines.value.join("\n")}</pre>

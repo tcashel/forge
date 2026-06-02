@@ -1,5 +1,6 @@
 import { useComputed, useSignal } from "@preact/signals";
 import { useEffect } from "preact/hooks";
+import { type TokenBuckets, tokenBuckets } from "../../../core/usage";
 import { fetchAgentActivity } from "../../lib/api";
 import { activityFilter, activitySelectedId } from "../../signals/ui";
 import type { ActivityFilter, AgentActivityRow } from "../../types";
@@ -36,11 +37,11 @@ function formatDuration(row: AgentActivityRow, now: number): string {
 }
 
 function formatTokens(row: AgentActivityRow): string {
-  const { tokensIn, tokensOut } = row.metrics;
-  if (tokensIn == null && tokensOut == null) return "—";
-  const a = tokensIn ?? 0;
-  const b = tokensOut ?? 0;
-  return `${a.toLocaleString()} / ${b.toLocaleString()}`;
+  if (!hasTokenData(row)) return "—";
+  // Total input (uncached + cache) / output, so claude and codex compare
+  // like-for-like — claude's bulk lives in cache, which raw tokensIn omits.
+  const { totalInput, output } = rowTokens(row);
+  return `${totalInput.toLocaleString()} / ${output.toLocaleString()}`;
 }
 
 function formatCost(row: AgentActivityRow): string {
@@ -94,21 +95,38 @@ function rowDurationMs(r: AgentActivityRow, now: number): number | null {
   return Math.max(0, end - start);
 }
 
+/** True when the row carries any token metric (input, output, or cache). */
+function hasTokenData(r: AgentActivityRow): boolean {
+  const m = r.metrics;
+  return m.tokensIn != null || m.tokensOut != null || m.cacheRead != null || m.cacheCreate != null;
+}
+
+/**
+ * Normalized token buckets for a row. Delegates to the shared `tokenBuckets`
+ * (src/core/usage.ts) so the Activity view and the Usage dashboard compute the
+ * same numbers: `input` is uncached/full-rate, `cached` is cache-read +
+ * cache-create, `output` is output; `totalInput` = input + cached.
+ */
+export function rowTokens(r: AgentActivityRow): TokenBuckets {
+  return tokenBuckets(r.metrics);
+}
+
 function rowTotalTokens(r: AgentActivityRow): number | null {
-  const { tokensIn, tokensOut } = r.metrics;
-  if (tokensIn == null && tokensOut == null) return null;
-  return (tokensIn ?? 0) + (tokensOut ?? 0);
+  if (!hasTokenData(r)) return null;
+  return rowTokens(r).total;
 }
 
 export interface ActivitySummaryByModel {
   model: string;
   tokensIn: number;
+  cached: number;
   tokensOut: number;
 }
 
 export interface ActivitySummaryByPurpose {
   purposeLabel: string;
   tokensIn: number;
+  cached: number;
   tokensOut: number;
   costUsd: number;
   runCount: number;
@@ -117,6 +135,7 @@ export interface ActivitySummaryByPurpose {
 export interface ActivitySummary {
   runCount: number;
   tokensIn: number;
+  cached: number;
   tokensOut: number;
   costUsd: number;
   byModel: ActivitySummaryByModel[];
@@ -125,47 +144,56 @@ export interface ActivitySummary {
 
 /**
  * Roll up the visible activity rows into the totals strip, the
- * tokens-by-model chart, and the per-purpose breakdown. Null/undefined
- * metric values are treated as 0 (a row with no token data contributes
- * nothing) so the strip never renders NaN. `costUsd` sums only non-null
- * `metrics.costUsd`. The per-purpose map is keyed by `deriveLabel(r)` (not
- * `r.purpose`) so critic-a / critic-b split exactly as the table rows do.
+ * tokens-by-model chart, and the per-purpose breakdown. Token buckets come
+ * from `rowTokens`, so cached input counts toward the totals and the rollup
+ * is adapter-agnostic (a claude run's millions of cache reads are no longer
+ * invisible). Rows with no token data contribute 0 (never NaN); `costUsd`
+ * sums only non-null `metrics.costUsd`. The per-purpose map is keyed by
+ * `deriveLabel(r)` (not `r.purpose`) so critic-a / critic-b split exactly as
+ * the table rows do. Ordering is by total tokens (input + cached + output).
  */
 export function summarizeActivity(rows: AgentActivityRow[]): ActivitySummary {
   let tokensIn = 0;
+  let cached = 0;
   let tokensOut = 0;
   let costUsd = 0;
-  const byModelMap = new Map<string, { tokensIn: number; tokensOut: number }>();
-  const byPurposeMap = new Map<string, { tokensIn: number; tokensOut: number; costUsd: number; runCount: number }>();
+  const byModelMap = new Map<string, { tokensIn: number; cached: number; tokensOut: number }>();
+  const byPurposeMap = new Map<
+    string,
+    { tokensIn: number; cached: number; tokensOut: number; costUsd: number; runCount: number }
+  >();
   for (const r of rows) {
-    const ti = typeof r.metrics.tokensIn === "number" ? r.metrics.tokensIn : 0;
-    const to = typeof r.metrics.tokensOut === "number" ? r.metrics.tokensOut : 0;
+    const t = rowTokens(r);
     const cost = typeof r.metrics.costUsd === "number" ? r.metrics.costUsd : 0;
-    tokensIn += ti;
-    tokensOut += to;
+    tokensIn += t.input;
+    cached += t.cached;
+    tokensOut += t.output;
     costUsd += cost;
-    if (ti || to) {
+    if (t.total > 0) {
       const key = r.model ?? "—";
-      const acc = byModelMap.get(key) ?? { tokensIn: 0, tokensOut: 0 };
-      acc.tokensIn += ti;
-      acc.tokensOut += to;
+      const acc = byModelMap.get(key) ?? { tokensIn: 0, cached: 0, tokensOut: 0 };
+      acc.tokensIn += t.input;
+      acc.cached += t.cached;
+      acc.tokensOut += t.output;
       byModelMap.set(key, acc);
     }
     const pKey = deriveLabel(r);
-    const pAcc = byPurposeMap.get(pKey) ?? { tokensIn: 0, tokensOut: 0, costUsd: 0, runCount: 0 };
-    pAcc.tokensIn += ti;
-    pAcc.tokensOut += to;
+    const pAcc = byPurposeMap.get(pKey) ?? { tokensIn: 0, cached: 0, tokensOut: 0, costUsd: 0, runCount: 0 };
+    pAcc.tokensIn += t.input;
+    pAcc.cached += t.cached;
+    pAcc.tokensOut += t.output;
     pAcc.costUsd += cost;
     pAcc.runCount += 1;
     byPurposeMap.set(pKey, pAcc);
   }
+  const total = (v: { tokensIn: number; cached: number; tokensOut: number }) => v.tokensIn + v.cached + v.tokensOut;
   const byModel: ActivitySummaryByModel[] = Array.from(byModelMap.entries())
-    .map(([model, v]) => ({ model, tokensIn: v.tokensIn, tokensOut: v.tokensOut }))
-    .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
+    .map(([model, v]) => ({ model, ...v }))
+    .sort((a, b) => total(b) - total(a));
   const byPurpose: ActivitySummaryByPurpose[] = Array.from(byPurposeMap.entries())
     .map(([purposeLabel, v]) => ({ purposeLabel, ...v }))
-    .sort((a, b) => b.tokensIn + b.tokensOut - (a.tokensIn + a.tokensOut));
-  return { runCount: rows.length, tokensIn, tokensOut, costUsd, byModel, byPurpose };
+    .sort((a, b) => total(b) - total(a));
+  return { runCount: rows.length, tokensIn, cached, tokensOut, costUsd, byModel, byPurpose };
 }
 
 function formatTotalCost(v: number): string {
@@ -313,7 +341,7 @@ export function ActivityTable() {
                 <td title={relTime(row.startedAt)}>{absTime(row.startedAt)}</td>
                 <td>{formatDuration(row, now)}</td>
                 <td
-                  title={`in / out — cache read ${row.metrics.cacheRead ?? "—"} / create ${row.metrics.cacheCreate ?? "—"}`}
+                  title={`total input / output — uncached ${row.metrics.tokensIn ?? "—"}, cache read ${row.metrics.cacheRead ?? "—"}, cache create ${row.metrics.cacheCreate ?? "—"}, output ${row.metrics.tokensOut ?? "—"}`}
                 >
                   {formatTokens(row)}
                 </td>
@@ -337,8 +365,12 @@ function ActivitySummaryStrip({ summary }: { summary: ActivitySummary }) {
           <span class="activity-summary-value">{summary.runCount.toLocaleString()}</span>
         </div>
         <div class="activity-summary-stat">
-          <span class="activity-summary-label">Tokens in</span>
+          <span class="activity-summary-label">Input (uncached)</span>
           <span class="activity-summary-value">{summary.tokensIn.toLocaleString()}</span>
+        </div>
+        <div class="activity-summary-stat">
+          <span class="activity-summary-label">Cached</span>
+          <span class="activity-summary-value">{summary.cached.toLocaleString()}</span>
         </div>
         <div class="activity-summary-stat">
           <span class="activity-summary-label">Tokens out</span>
@@ -356,7 +388,7 @@ function ActivitySummaryStrip({ summary }: { summary: ActivitySummary }) {
 }
 
 function ActivityByPurposeBreakdown({ byPurpose }: { byPurpose: ActivitySummaryByPurpose[] }) {
-  const withTokens = byPurpose.filter((p) => p.tokensIn + p.tokensOut > 0);
+  const withTokens = byPurpose.filter((p) => p.tokensIn + p.cached + p.tokensOut > 0);
   if (withTokens.length === 0) {
     return <div class="activity-summary-purpose-empty">No token data in the current filter.</div>;
   }
@@ -365,8 +397,9 @@ function ActivityByPurposeBreakdown({ byPurpose }: { byPurpose: ActivitySummaryB
       <thead>
         <tr>
           <th>Purpose</th>
-          <th>Tokens in</th>
-          <th>Tokens out</th>
+          <th>Input</th>
+          <th>Cached</th>
+          <th>Output</th>
           <th>Cost</th>
         </tr>
       </thead>
@@ -375,6 +408,7 @@ function ActivityByPurposeBreakdown({ byPurpose }: { byPurpose: ActivitySummaryB
           <tr key={p.purposeLabel}>
             <td class="activity-summary-purpose-label">{p.purposeLabel}</td>
             <td>{p.tokensIn.toLocaleString()}</td>
+            <td>{p.cached.toLocaleString()}</td>
             <td>{p.tokensOut.toLocaleString()}</td>
             <td>{formatTotalCost(p.costUsd)}</td>
           </tr>
@@ -385,17 +419,18 @@ function ActivityByPurposeBreakdown({ byPurpose }: { byPurpose: ActivitySummaryB
 }
 
 function ActivityByModelChart({ byModel }: { byModel: ActivitySummaryByModel[] }) {
-  const max = byModel.reduce((m, r) => Math.max(m, r.tokensIn + r.tokensOut), 0);
+  const max = byModel.reduce((m, r) => Math.max(m, r.tokensIn + r.cached + r.tokensOut), 0);
   if (byModel.length === 0 || max === 0) {
     return <div class="activity-summary-chart-empty">No token data in the current filter.</div>;
   }
   return (
     <div class="activity-summary-chart">
       {byModel.map((row) => {
-        const total = row.tokensIn + row.tokensOut;
+        const total = row.tokensIn + row.cached + row.tokensOut;
         const width = Math.max(2, Math.round((total / max) * 100));
+        const breakdown = `${row.model} — input ${row.tokensIn.toLocaleString()}, cached ${row.cached.toLocaleString()}, output ${row.tokensOut.toLocaleString()}`;
         return (
-          <div class="activity-summary-bar-row" key={row.model}>
+          <div class="activity-summary-bar-row" key={row.model} title={breakdown}>
             <span class="activity-summary-bar-label" title={row.model}>
               {row.model}
             </span>
