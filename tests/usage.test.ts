@@ -300,6 +300,35 @@ test("aggregateUsage cost-to-ship totals: costPerShippedSpec, wastedSpend = rewo
   assert.ok(Math.abs(s.totals.costPerShippedSpec - 120) < 1e-9);
 });
 
+test("aggregateUsage does not double-count rework on a failed spec", () => {
+  // A failed spec that also burned fix/re-review dollars: those dollars are
+  // already inside the spec total (= failedSpend), so they must NOT also land in
+  // reworkCostUsd, or wastedSpendUsd would exceed the actual spend.
+  const rows = [
+    row({
+      id: "s-exec-c-r1",
+      startedAt: "2026-06-01T09:00:00Z",
+      purpose: "execution",
+      plan: { id: "c", title: "C", repo: "/r" },
+      metrics: { costUsd: 4 },
+    }),
+    row({
+      id: "s-fix-c-r1",
+      startedAt: "2026-06-01T10:00:00Z",
+      purpose: "fix",
+      plan: { id: "c", title: "C", repo: "/r" },
+      metrics: { costUsd: 2 },
+    }),
+  ];
+  const s = aggregateUsage(rows, {}, { c: { status: "failed", prNumber: null } });
+  // Whole spec (4 + 2 = 6) is wasted; rework is folded into that, not added again.
+  assert.ok(Math.abs(s.totals.failedSpendUsd - 6) < 1e-9);
+  assert.ok(Math.abs(s.totals.reworkCostUsd - 0) < 1e-9);
+  assert.ok(Math.abs(s.totals.wastedSpendUsd - 6) < 1e-9);
+  // Sanity: wasted can never exceed total spend in the window.
+  assert.ok(s.totals.wastedSpendUsd <= s.totals.costUsd + 1e-9);
+});
+
 test("aggregateUsage cost-to-ship totals are 0-guarded with no shipped specs", () => {
   const rows = [row({ startedAt: "2026-06-01T09:00:00Z", metrics: { costUsd: 5 } })];
   const s = aggregateUsage(rows, {}, {});

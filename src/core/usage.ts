@@ -400,8 +400,14 @@ export function aggregateUsage(rows: UsageRow[], filters: UsageFilters = {}, out
   let failedSpendUsd = 0;
   for (const s of bySpecDetail) {
     if (s.outcome === "shipped") shippedSpecCount += 1;
-    reworkCostUsd += s.reworkCost;
-    if (s.outcome === "failed" || s.outcome === "abandoned") failedSpendUsd += s.total;
+    if (s.outcome === "failed" || s.outcome === "abandoned") {
+      // The whole spec is wasted spend; its rework is already inside s.total, so
+      // don't also add it to reworkCostUsd (that would double-count it in
+      // wastedSpendUsd). Rework is only tracked for specs that delivered value.
+      failedSpendUsd += s.total;
+    } else {
+      reworkCostUsd += s.reworkCost;
+    }
   }
   const wastedSpendUsd = reworkCostUsd + failedSpendUsd;
 
