@@ -63,6 +63,12 @@ export function enterUsageMode(): void {
   clearDetail();
 }
 
+export function enterLibraryMode(): void {
+  viewMode.value = "library";
+  setMobileButtonActive(false, false);
+  clearDetail();
+}
+
 export function enterReviewMode(prNumber: number, repoRoot: string): void {
   currentReviewPrNumber.value = prNumber;
   currentReviewRepo.value = repoRoot;

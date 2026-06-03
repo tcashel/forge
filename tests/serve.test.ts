@@ -863,6 +863,198 @@ test("POST is rejected on read endpoints", async (t) => {
   assert.equal(body.error!.code, "METHOD_NOT_ALLOWED");
 });
 
+// ─── spec library (COO-80) ───────────────────────────────────────────────────
+
+interface LibrarySpecRow {
+  id: string;
+  title: string;
+  repo: string;
+  repoRoot: string;
+  createdAt: string;
+  specVersion: number;
+  openQuestionCount: number;
+  status: string;
+  hasSpec: boolean;
+}
+
+function archiveDraft(store: ForgeStore, id: string) {
+  const plan = store.getPlan(id)!;
+  store.upsertPlan({ ...plan, status: "archived", archivedAt: new Date().toISOString() });
+}
+
+test("GET /api/spec-library defaults to drafts across all repos", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "lib-a", "/repo-a", "alpha", "feat(alpha): first");
+  makeDraftTask(h.store, "lib-b", "/repo-b", "beta", "feat(beta): second");
+  archiveDraft(h.store, "lib-b"); // archived → excluded from the default drafts filter
+
+  const { status, body } = await getJson(`${h.baseUrl}/api/spec-library`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const specs = body.data!.specs as LibrarySpecRow[];
+  assert.equal(specs.length, 1);
+  assert.equal(specs[0].id, "lib-a");
+  assert.equal(specs[0].repo, "alpha");
+  assert.equal(specs[0].status, "draft");
+  assert.equal(specs[0].hasSpec, true);
+});
+
+test("GET /api/spec-library?filter=archived returns only archived specs", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "lib-draft", h.tmpHome, "demo", "feat(demo): draft");
+  makeDraftTask(h.store, "lib-arc", h.tmpHome, "demo", "feat(demo): archived");
+  archiveDraft(h.store, "lib-arc");
+
+  const { body } = await getJson(`${h.baseUrl}/api/spec-library?filter=archived`);
+  const specs = body.data!.specs as LibrarySpecRow[];
+  assert.equal(specs.length, 1);
+  assert.equal(specs[0].id, "lib-arc");
+  assert.equal(specs[0].status, "archived");
+});
+
+test("GET /api/spec-library?filter=all returns drafts ∪ archived but excludes other statuses", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "all-draft", h.tmpHome, "demo", "feat(demo): a draft");
+  makeDraftTask(h.store, "all-arc", h.tmpHome, "demo", "feat(demo): an archived");
+  archiveDraft(h.store, "all-arc");
+  // A running plan must never surface in the library.
+  const now = new Date().toISOString();
+  h.store.upsertPlan({
+    id: "all-running",
+    title: "feat(demo): running",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/all-running",
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: now,
+    launchedAt: now,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: "forge-all-running",
+    logFile: null,
+    jiraTicket: null,
+    specFile: h.store.writeSpec("all-running", "# running\n"),
+    specVersion: 1,
+    lastImproveError: null,
+    archivedAt: null,
+  });
+
+  const { body } = await getJson(`${h.baseUrl}/api/spec-library?filter=all`);
+  const ids = (body.data!.specs as LibrarySpecRow[]).map((s) => s.id).sort();
+  assert.deepEqual(ids, ["all-arc", "all-draft"]);
+});
+
+test("GET /api/spec-library?q matches title and spec body (case-insensitive)", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // makeDraftTask writes a body containing "A short blurb describing the work."
+  makeDraftTask(h.store, "lib-search-1", h.tmpHome, "demo", "feat(demo): widgets");
+  makeDraftTask(h.store, "lib-search-2", h.tmpHome, "demo", "feat(demo): gadgets");
+
+  // Title match.
+  const byTitle = await getJson(`${h.baseUrl}/api/spec-library?q=WIDGETS`);
+  const titleIds = (byTitle.body.data!.specs as LibrarySpecRow[]).map((s) => s.id);
+  assert.deepEqual(titleIds, ["lib-search-1"]);
+
+  // Body match — present in both, so both come back.
+  const byBody = await getJson(`${h.baseUrl}/api/spec-library?q=blurb`);
+  assert.equal((byBody.body.data!.specs as LibrarySpecRow[]).length, 2);
+
+  // No match → empty list, not an error.
+  const none = await getJson(`${h.baseUrl}/api/spec-library?q=zzz-nope`);
+  assert.equal(none.status, 200);
+  assert.deepEqual(none.body.data!.specs, []);
+});
+
+test("GET /api/spec-library rejects an invalid filter with 400 BAD_FILTER", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/spec-library?filter=bogus`);
+  assert.equal(status, 400);
+  assert.equal(body.ok, false);
+  assert.equal(body.error!.code, "BAD_FILTER");
+});
+
+test("GET /api/spec-library marks a spec with no body on disk as hasSpec=false", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // Index entry with no markdown file written.
+  const now = new Date().toISOString();
+  h.store.upsertPlan({
+    id: "lib-nospec",
+    title: "feat(demo): bodyless",
+    repoRoot: h.tmpHome,
+    repoName: "demo",
+    branch: "forge/lib-nospec",
+    worktree: null,
+    status: "draft",
+    agent: null,
+    model: null,
+    createdAt: now,
+    launchedAt: null,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: null,
+    logFile: null,
+    jiraTicket: null,
+    specFile: `${h.store.specsDir}/lib-nospec.md`,
+    specVersion: 1,
+    lastImproveError: null,
+    archivedAt: null,
+  });
+
+  const { body } = await getJson(`${h.baseUrl}/api/spec-library`);
+  const row = (body.data!.specs as LibrarySpecRow[]).find((s) => s.id === "lib-nospec");
+  assert.ok(row, "bodyless spec still renders in the list");
+  assert.equal(row!.hasSpec, false);
+  assert.equal(row!.openQuestionCount, 0);
+});
+
+test("GET /api/spec-library sorts by createdAt descending", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const mk = (id: string, createdAt: string) => {
+    h.store.upsertPlan({
+      id,
+      title: `feat(demo): ${id}`,
+      repoRoot: h.tmpHome,
+      repoName: "demo",
+      branch: `forge/${id}`,
+      worktree: null,
+      status: "draft",
+      agent: null,
+      model: null,
+      createdAt,
+      launchedAt: null,
+      completedAt: null,
+      prUrl: null,
+      prNumber: null,
+      tmuxSession: null,
+      logFile: null,
+      jiraTicket: null,
+      specFile: h.store.writeSpec(id, `# ${id}\n`),
+      specVersion: 1,
+      lastImproveError: null,
+      archivedAt: null,
+    });
+  };
+  mk("lib-old", "2026-01-01T00:00:00.000Z");
+  mk("lib-new", "2026-05-01T00:00:00.000Z");
+  mk("lib-mid", "2026-03-01T00:00:00.000Z");
+
+  const { body } = await getJson(`${h.baseUrl}/api/spec-library`);
+  const ids = (body.data!.specs as LibrarySpecRow[]).map((s) => s.id);
+  assert.deepEqual(ids, ["lib-new", "lib-mid", "lib-old"]);
+});
+
 // ─── action endpoints ────────────────────────────────────────────────────────
 
 async function postJson(url: string, body?: unknown): Promise<{ status: number; body: Envelope }> {

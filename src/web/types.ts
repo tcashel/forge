@@ -89,8 +89,38 @@ export interface WorkbenchContext {
   currentRepo: { name: string; root: string } | null;
 }
 
-export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review" | "worktrees" | "usage";
-export type SidebarFilter = "all" | "running" | "backlog" | "prs" | "done" | "activity" | "worktrees" | "usage";
+export type ViewMode = "tasks" | "prs" | "settings" | "activity" | "pr-review" | "worktrees" | "usage" | "library";
+export type SidebarFilter =
+  | "all"
+  | "running"
+  | "backlog"
+  | "prs"
+  | "done"
+  | "activity"
+  | "worktrees"
+  | "usage"
+  | "library";
+
+// ─── Spec library (GET /api/spec-library) ───────────────────────────────────
+
+export type LibraryFilter = "drafts" | "archived" | "all";
+
+/** One row in the spec library — metadata only; the body is fetched on open. */
+export interface LibrarySpec {
+  id: string;
+  title: string;
+  repo: string;
+  repoRoot: string;
+  createdAt: string;
+  specVersion: number;
+  openQuestionCount: number;
+  status: string;
+  hasSpec: boolean;
+}
+
+export interface SpecLibraryResponse {
+  specs: LibrarySpec[];
+}
 
 // ─── Usage dashboard ────────────────────────────────────────────────────────
 

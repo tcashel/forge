@@ -18,6 +18,7 @@ const FILTER_SECTIONS: Record<SidebarFilter, Set<WorkbenchSection> | "all"> = {
   activity: "all", // unreachable here — activity flips viewMode, not just the filter
   worktrees: "all", // unreachable — worktrees flips viewMode, not just the filter
   usage: "all", // unreachable — usage flips viewMode, not just the filter
+  library: "all", // unreachable — library flips viewMode, not just the filter
 };
 
 function shouldRender(section: WorkbenchSection, filter: SidebarFilter): boolean {

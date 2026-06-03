@@ -1,6 +1,7 @@
 import { useComputed } from "@preact/signals";
 import {
   enterActivityMode,
+  enterLibraryMode,
   enterPrMode,
   enterSettingsMode,
   enterTaskMode,
@@ -8,6 +9,7 @@ import {
   enterWorktreesMode,
 } from "../lib/modes";
 import { showToast } from "../lib/toast";
+import { refreshLibrary } from "../signals/library";
 import { repos } from "../signals/repos";
 import { activityFilter, modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
 import { refreshWorktrees } from "../signals/worktrees";
@@ -109,6 +111,12 @@ export function Sidebar() {
     enterUsageMode();
   };
 
+  const onLibrary = () => {
+    sidebarFilter.value = "library";
+    enterLibraryMode();
+    void refreshLibrary();
+  };
+
   const onActivityChip = (id: ActivityFilter) => {
     activityFilter.value = id;
     if (viewMode.value !== "activity") {
@@ -167,6 +175,17 @@ export function Sidebar() {
             </button>
           );
         })}
+        <button
+          type="button"
+          class={`nav-item${mode === "library" ? " active" : ""}`}
+          id="nav-library"
+          onClick={onLibrary}
+        >
+          <span class="ic" style="color:var(--ready)">
+            ▤
+          </span>
+          <span class="lbl">Library</span>
+        </button>
         <div class="nav-section">Observability</div>
         <button
           type="button"

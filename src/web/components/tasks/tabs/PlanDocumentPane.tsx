@@ -1,8 +1,13 @@
 import { useEffect, useState } from "preact/hooks";
 import { type ApiError, apiGet, apiPost } from "../../../lib/api";
 import { refreshTasks } from "../../../signals/tasks";
-import type { PlanView, PlanWorkspaceResponse } from "../../../types";
+import type { PlanWorkspaceResponse } from "../../../types";
 import { MarkdownViewer } from "../../MarkdownViewer";
+
+// Only id + title are read here; the rest of the document is fetched by id.
+// Accepting the minimal shape lets the spec library (whose rows aren't full
+// PlanViews, and may be archived and absent from the task list) reuse the pane.
+type PlanDocumentRef = { id: string; title: string };
 
 interface State {
   loading: boolean;
@@ -13,7 +18,7 @@ interface State {
   busy: boolean;
 }
 
-export function PlanDocumentPane({ t, refreshKey = 0 }: { t: PlanView; refreshKey?: number }) {
+export function PlanDocumentPane({ t, refreshKey = 0 }: { t: PlanDocumentRef; refreshKey?: number }) {
   const [s, setS] = useState<State>({
     loading: true,
     data: null,

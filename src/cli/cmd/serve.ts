@@ -841,6 +841,61 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     return jsonOk({ plans: views });
   }
 
+  // GET /api/spec-library?filter=drafts|archived|all&q=<substring>
+  // Cross-repo discovery surface for saved specs. Reads through the same
+  // storage layer as `forge spec ls` (store.getPlans + store.getSpec) — not
+  // SQLite/FTS, which can be stale during the JSON-authoritative dual-write
+  // (ADR-0023). Status filter mirrors runLs; repo scope is intentionally
+  // cross-repo (no repo arg) regardless of cwd.
+  if (pathname === "/api/spec-library") {
+    const filterParam = url.searchParams.get("filter") || "drafts";
+    if (filterParam !== "drafts" && filterParam !== "archived" && filterParam !== "all") {
+      return jsonErr(400, "BAD_FILTER", `Unknown filter "${filterParam}". Use drafts, archived, or all.`);
+    }
+    const q = (url.searchParams.get("q") || "").trim().toLowerCase();
+    try {
+      const all = store.getPlans();
+      let plans: Plan[];
+      if (filterParam === "archived") {
+        plans = all.filter((p) => p.status === "archived");
+      } else if (filterParam === "all") {
+        plans = all.filter((p) => p.status === "draft" || p.status === "archived");
+      } else {
+        plans = all.filter((p) => p.status === "draft");
+      }
+
+      const specs = plans
+        .map((p) => {
+          const spec = store.getSpec(p.id);
+          // Case-insensitive substring search over title + spec body with YAML
+          // frontmatter stripped (matching `forge spec show --raw`). Only the
+          // current saved text is searched — not prior versions or pending edits.
+          const matches =
+            !q ||
+            p.title.toLowerCase().includes(q) ||
+            (spec !== null && stripFrontmatter(spec).toLowerCase().includes(q));
+          if (!matches) return null;
+          return {
+            id: p.id,
+            title: p.title,
+            repo: p.repoName,
+            repoRoot: p.repoRoot,
+            createdAt: p.createdAt,
+            specVersion: p.specVersion,
+            openQuestionCount: spec ? parsePlanDocument(spec).openQuestions.length : 0,
+            status: p.status,
+            hasSpec: spec !== null,
+          };
+        })
+        .filter((row): row is NonNullable<typeof row> => row !== null)
+        .sort((a, b) => b.createdAt.localeCompare(a.createdAt));
+
+      return jsonOk({ specs });
+    } catch (e) {
+      return jsonErr(500, "LIBRARY_READ_FAILED", (e as Error).message || "Failed to read spec library.");
+    }
+  }
+
   // GET /api/plans/:id
   // GET /api/plans/:id/spec
   // GET /api/plans/:id/log    (SSE)
