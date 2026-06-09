@@ -845,8 +845,9 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
   // Cross-repo discovery surface for saved specs. Reads through the same
   // storage layer as `forge spec ls` (store.getPlans + store.getSpec) — not
   // SQLite/FTS, which can be stale during the JSON-authoritative dual-write
-  // (ADR-0023). Status filter mirrors runLs; repo scope is intentionally
-  // cross-repo (no repo arg) regardless of cwd.
+  // (ADR-0023). "drafts"/"archived" mirror runLs; "all" diverges to mean every
+  // status (including launched specs) so the library is a complete discovery
+  // surface. Repo scope is intentionally cross-repo (no repo arg) regardless of cwd.
   if (pathname === "/api/spec-library") {
     const filterParam = url.searchParams.get("filter") || "drafts";
     if (filterParam !== "drafts" && filterParam !== "archived" && filterParam !== "all") {
@@ -859,7 +860,10 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       if (filterParam === "archived") {
         plans = all.filter((p) => p.status === "archived");
       } else if (filterParam === "all") {
-        plans = all.filter((p) => p.status === "draft" || p.status === "archived");
+        // True library view: every saved spec regardless of status. Unlike the
+        // "drafts"/"archived" filters, "all" includes launched specs (running,
+        // done, failed, …) so completed work stays discoverable here.
+        plans = all;
       } else {
         plans = all.filter((p) => p.status === "draft");
       }

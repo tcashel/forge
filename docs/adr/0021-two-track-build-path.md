@@ -1,6 +1,6 @@
 # ADR 0021 — Two-track build path: TypeScript prototype, Rust product
 
-**Status:** Accepted (clarifies [`0002-rust-gpui-for-juicer`](./0002-rust-gpui-for-juicer.md), [`0009-workspace-crate-structure`](./0009-workspace-crate-structure.md), [`0011-forge-retirement-timeline`](./0011-forge-retirement-timeline.md))
+**Status:** Accepted — **revisited by [`0030-strategy-reset-surfaces-commoditized`](./0030-strategy-reset-surfaces-commoditized.md): Track B paused (2026-06)** (clarifies [`0002-rust-gpui-for-juicer`](./0002-rust-gpui-for-juicer.md), [`0009-workspace-crate-structure`](./0009-workspace-crate-structure.md), [`0011-forge-retirement-timeline`](./0011-forge-retirement-timeline.md))
 **Deciders:** Tripp
 **Date:** 2026-05-11
 **Related:** [`../BUILD_PATH.md`](../BUILD_PATH.md), [`../ROADMAP.md`](../ROADMAP.md), [`../ARCHITECTURE.md`](../ARCHITECTURE.md), [`../SCHEMA.md`](../SCHEMA.md), [`../VISION.md`](../VISION.md)

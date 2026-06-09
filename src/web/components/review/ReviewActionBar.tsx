@@ -54,7 +54,7 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
       </button>
       <label
         class="review-publish-toggle"
-        title="Publish findings to the PR as GitHub review comments (requires publishReviewToGitHub enabled for this repo)."
+        title="Publish findings to the PR as GitHub review comments."
       >
         <input
           type="checkbox"

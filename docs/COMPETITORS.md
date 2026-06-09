@@ -207,10 +207,10 @@ Watch quarterly:
 ## What would force a strategic rethink
 
 - Conductor adds a plan workspace with multi-critic synthesis AND removes the session-watching premise
-- Anthropic ships native multi-plan orchestration in Claude Code
+- ~~Anthropic ships native multi-plan orchestration in Claude Code~~ — **FIRED (2026-06):** Claude Code Workflow (judge-panel = multi-critic) + Routines (morning digest, PR triage/auto-review, Monitor/In-Flight) shipped ~3 of the 5 surfaces. → [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md)
 - Windsurf adds a real cognitive-load-management surface
 - Intent improves individual-operator UX and exits enterprise-only positioning
 - A well-funded competitor announces a Juice-equivalent coaching layer
 - Any well-funded competitor adopts the explicit job-not-show framing
 
-If any happen, revisit positioning immediately.
+If any happen, revisit positioning immediately. **2026-06: one fired (above) → triggered the [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md) strategy reset (pause Track B, relocate the moat to operator-scoped integration).**

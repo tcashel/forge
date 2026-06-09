@@ -1,6 +1,6 @@
 # ADR 0028 — Cross-spec dependency graph, lazy spec materialization, and a dedicated orchestration agent
 
-**Status:** Proposed
+**Status:** Superseded by [`0030-strategy-reset-surfaces-commoditized`](./0030-strategy-reset-surfaces-commoditized.md) — adopt beads instead of building the graph (2026-06-02)
 **Deciders:** Tripp
 **Date:** 2026-06-01
 **Related:** [`0003-local-first-no-backend`](./0003-local-first-no-backend.md), [`0005-plan-as-document`](./0005-plan-as-document.md), [`0019-sessions-are-jobs`](./0019-sessions-are-jobs.md), [`0023-sqlite-cutover-track-a`](./0023-sqlite-cutover-track-a.md), [`0025-unified-agent-interface-agent-owned-context`](./0025-unified-agent-interface-agent-owned-context.md), [`0026-conversation-led-plan-authoring`](./0026-conversation-led-plan-authoring.md), [`../ROADMAP.md`](../ROADMAP.md), [`../SCHEMA.md`](../SCHEMA.md), [`../ARCHITECTURE.md`](../ARCHITECTURE.md)

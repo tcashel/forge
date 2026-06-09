@@ -75,6 +75,7 @@ function detectStack(root: string): Stack {
 }
 
 function pkgMgr(root: string): string {
+  if (fs.existsSync(path.join(root, "bun.lock")) || fs.existsSync(path.join(root, "bun.lockb"))) return "bun run";
   if (fs.existsSync(path.join(root, "pnpm-lock.yaml"))) return "pnpm";
   if (fs.existsSync(path.join(root, "yarn.lock"))) return "yarn";
   return "npm run";

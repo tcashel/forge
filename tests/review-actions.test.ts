@@ -42,14 +42,12 @@ test("parseAdHocReviewSentinel reads exit code and error from the worker line", 
   assert.equal(parseAdHocReviewSentinel(""), null);
 });
 
-test("shouldPublishToGitHub requires BOTH the repo config and the per-request opt-in", () => {
-  // Off by default — neither flag set → no GitHub writes.
-  assert.equal(shouldPublishToGitHub({}, {}), false);
-  // Config on but request off (and vice-versa) → still off.
-  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: true }, { publishToGitHub: false }), false);
-  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: false }, { publishToGitHub: true }), false);
-  // Both on → publish.
-  assert.equal(shouldPublishToGitHub({ publishReviewToGitHub: true }, { publishToGitHub: true }), true);
+test("shouldPublishToGitHub is driven solely by the per-request opt-in", () => {
+  // Off by default — no flag set → no GitHub writes.
+  assert.equal(shouldPublishToGitHub({}), false);
+  assert.equal(shouldPublishToGitHub({ publishToGitHub: false }), false);
+  // The "Publish to PR" checkbox alone enables publishing.
+  assert.equal(shouldPublishToGitHub({ publishToGitHub: true }), true);
 });
 
 test("resolveSessionLogFile reads metrics.logFile for ad-hoc review sessions", () => {

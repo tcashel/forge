@@ -43,9 +43,9 @@ export interface RunAdHocReviewInput {
   repoRoot: string;
   repoName: string;
   /**
-   * Per-request opt-in to publish findings as GitHub review comments. Must be
-   * paired with `repoConfig.publishReviewToGitHub === true` for publishing to
-   * occur; survives the detach via the session `metrics` blob.
+   * Per-request opt-in to publish findings as GitHub review comments (the
+   * "Publish to PR" checkbox). Survives the detach via the session `metrics`
+   * blob.
    */
   publishToGitHub?: boolean;
 }
@@ -70,15 +70,12 @@ interface AdHocReviewMeta {
 }
 
 /**
- * Publishing requires BOTH the repo-level config switch and the per-request
- * opt-in (persisted in the session metrics blob). With either off, the worker
+ * Publishing is driven solely by the per-request opt-in (the "Publish to PR"
+ * checkbox), persisted in the session metrics blob. With it off, the worker
  * makes zero GitHub write calls.
  */
-export function shouldPublishToGitHub(
-  repoConfig: { publishReviewToGitHub?: boolean },
-  metrics: { publishToGitHub?: unknown },
-): boolean {
-  return repoConfig.publishReviewToGitHub === true && metrics.publishToGitHub === true;
+export function shouldPublishToGitHub(metrics: { publishToGitHub?: unknown }): boolean {
+  return metrics.publishToGitHub === true;
 }
 
 function reviewerSkillsDir(): string {
@@ -323,7 +320,6 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
   const runDir = typeof metrics.runDir === "string" ? metrics.runDir : null;
   const prNum = typeof metrics.prNum === "number" ? metrics.prNum : null;
   const repoRoot = typeof metrics.repoRoot === "string" ? metrics.repoRoot : null;
-  const publishRequested = metrics.publishToGitHub === true;
 
   if (!runDir || prNum == null || !repoRoot) {
     const err = "session row missing runDir/prNum/repoRoot in metrics";
@@ -438,10 +434,10 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
     fs.writeFileSync(path.join(runDir, "findings.json"), `${JSON.stringify(findings, null, 2)}\n`, "utf-8");
     process.stdout.write(`[forge:review-worker] parsed ${findings.length} finding(s)\n`);
 
-    // Best-effort publish to GitHub. Gated on BOTH the repo-level config and
-    // the per-request opt-in; a failure logs a warning but never fails the
-    // review (findings.json stays the local source of truth).
-    if (shouldPublishToGitHub(repoConfig, metrics) && findings.length > 0) {
+    // Best-effort publish to GitHub. Gated solely on the per-request opt-in
+    // (the "Publish to PR" checkbox); a failure logs a warning but never fails
+    // the review (findings.json stays the local source of truth).
+    if (shouldPublishToGitHub(metrics) && findings.length > 0) {
       await publishFindingsToGitHub({
         prNum,
         prInfoJson,
@@ -451,10 +447,6 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
         cwd: repoRoot,
         log: (msg) => process.stdout.write(`[forge:review-worker] ${msg}\n`),
       });
-    } else if (publishRequested && repoConfig.publishReviewToGitHub !== true) {
-      process.stdout.write(
-        "[forge:review-worker] publish requested but repoConfig.publishReviewToGitHub is not enabled — skipping\n",
-      );
     }
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
