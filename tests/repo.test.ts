@@ -5,11 +5,12 @@
  */
 
 import { strict as assert } from "node:assert";
+import { execFileSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { jsInstallCmd } from "../src/core/repo.ts";
+import { detectRepo, jsInstallCmd } from "../src/core/repo.ts";
 
 function tmpDir(prefix: string): string {
   return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
@@ -56,6 +57,22 @@ test("jsInstallCmd falls back to npm for an unmarked repo", () => {
   try {
     fs.writeFileSync(path.join(root, "package.json"), "{}\n");
     assert.deepEqual(jsInstallCmd(root), ["npm", ["install"]]);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("quality commands use bun, not npm, in a bun repo", () => {
+  const root = tmpDir("forge-repo-bun-quality-");
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    fs.writeFileSync(path.join(root, "bun.lock"), "");
+    fs.writeFileSync(
+      path.join(root, "package.json"),
+      JSON.stringify({ scripts: { lint: "biome check .", typecheck: "tsc --noEmit", test: "bun test" } }),
+    );
+    const profile = detectRepo(root);
+    assert.deepEqual(profile?.qualityCommands, ["bun run lint", "bun run typecheck", "bun run test"]);
   } finally {
     fs.rmSync(root, { recursive: true, force: true });
   }

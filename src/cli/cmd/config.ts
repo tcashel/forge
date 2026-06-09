@@ -30,7 +30,6 @@ Common keys:
   defaultAgent, defaultModel             Implementer fallback for forge launch
   reviewerAgent, reviewerModel           Reviewer pair (must differ from impl)
   reviewerReasoningEffort                low|medium|high|xhigh (codex only)
-  publishReviewToGitHub (true|false)     Publish ad-hoc review findings to the PR (default false)
   fixerAgent, fixerModel, fixerReasoningEffort
   autoFix (true|false), autoFixRounds (int)
   ghUser, ghHost                         gh-cli account / host overrides
@@ -78,7 +77,7 @@ const EFFORT_KEYS = [
   "critiqueReasoningSynth",
   "improverReasoning",
 ] as const;
-const BOOLEAN_KEYS = ["autoFix", "autoImprove", "publishReviewToGitHub"] as const;
+const BOOLEAN_KEYS = ["autoFix", "autoImprove"] as const;
 const NUMBER_KEYS = ["autoFixRounds"] as const;
 
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];

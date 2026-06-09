@@ -746,23 +746,21 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       committedAndPushed = true;
     }
 
-    // Resolve/reply on GitHub for findings Forge published. Gated on the repo
-    // config (resolving only makes sense when publishing is enabled) and runs
-    // on the success path for both the committed and no-commit branches.
-    // Best-effort: persists ghResolved into validation.json but never fails
-    // the worker.
-    if (repoConfig.publishReviewToGitHub === true) {
-      await resolvePublishedFindingThreads({
-        prNum,
-        prUrl: bundle.bundle.pr.url,
-        ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
-        cwd: repoRoot,
-        entries: validationEntries,
-        committedAndPushed,
-        log: (msg) => process.stdout.write(`[forge:comment-fix-worker] ${msg}\n`),
-      });
-      writeValidation(runDir, validationEntries);
-    }
+    // Resolve/reply on GitHub for findings Forge published. Runs on the success
+    // path for both the committed and no-commit branches. Best-effort and only
+    // acts on threads Forge actually published (matched by finding id), so it is
+    // safe to always attempt: persists ghResolved into validation.json but never
+    // fails the worker.
+    await resolvePublishedFindingThreads({
+      prNum,
+      prUrl: bundle.bundle.pr.url,
+      ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+      cwd: repoRoot,
+      entries: validationEntries,
+      committedAndPushed,
+      log: (msg) => process.stdout.write(`[forge:comment-fix-worker] ${msg}\n`),
+    });
+    writeValidation(runDir, validationEntries);
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
     exitCode = 1;

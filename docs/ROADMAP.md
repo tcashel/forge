@@ -2,6 +2,8 @@
 
 Phased delivery across two tracks. Track A (Forge, TypeScript) validates surfaces. Track B (Juicer, Rust + GPUI) builds the polished product. See `BUILD_PATH.md` for the rationale and gate.
 
+> ⚠️ **Track B (B0–B5) is PAUSED as of 2026-06 — see [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md).** Surfaces commoditized (Routines/Workflow); the two-track gate is suspended pending a validation experiment. Track A is now treated as the deliverable, not a prototype to be replaced.
+
 Estimated timing assumes evenings + weekends. Treat as relative ordering, not deadlines.
 
 ---

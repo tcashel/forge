@@ -914,13 +914,14 @@ test("GET /api/spec-library?filter=archived returns only archived specs", async 
   assert.equal(specs[0].status, "archived");
 });
 
-test("GET /api/spec-library?filter=all returns drafts ∪ archived but excludes other statuses", async (t) => {
+test("GET /api/spec-library?filter=all returns every status including launched specs", async (t) => {
   const h = await bootServer();
   t.after(() => h.stop());
   makeDraftTask(h.store, "all-draft", h.tmpHome, "demo", "feat(demo): a draft");
   makeDraftTask(h.store, "all-arc", h.tmpHome, "demo", "feat(demo): an archived");
   archiveDraft(h.store, "all-arc");
-  // A running plan must never surface in the library.
+  // A launched (running/done/failed) plan must surface under "all" so completed
+  // work stays discoverable in the library.
   const now = new Date().toISOString();
   h.store.upsertPlan({
     id: "all-running",
@@ -948,7 +949,7 @@ test("GET /api/spec-library?filter=all returns drafts ∪ archived but excludes 
 
   const { body } = await getJson(`${h.baseUrl}/api/spec-library?filter=all`);
   const ids = (body.data!.specs as LibrarySpecRow[]).map((s) => s.id).sort();
-  assert.deepEqual(ids, ["all-arc", "all-draft"]);
+  assert.deepEqual(ids, ["all-arc", "all-draft", "all-running"]);
 });
 
 test("GET /api/spec-library?q matches title and spec body (case-insensitive)", async (t) => {

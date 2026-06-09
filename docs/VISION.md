@@ -3,6 +3,8 @@
 > The operator's cockpit for staff engineers running agent fleets.
 > Plan. Run. Review. Ship. Don't watch.
 
+> ⚠️ **Under strategic revision (2026-06) — see [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md).** Three of the five surfaces below commoditized (Claude Code Routines + Workflow); the work-graph is now beads; Track B (Rust) is paused. The moat relocates from "the surfaces" to **operator-scoped, zero-repo-imposition integration**. Read the rest as aspirational context, not current plan, until the validation experiment resolves.
+
 ---
 
 ## A note on naming

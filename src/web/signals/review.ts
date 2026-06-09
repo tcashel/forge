@@ -105,8 +105,7 @@ export interface RunReviewResponse {
 }
 
 // Per-request toggle for publishing findings to the PR as GitHub review
-// comments. Off by default; the server further requires
-// repoConfig.publishReviewToGitHub === true before any write occurs.
+// comments. Off by default; when on, the server publishes findings for the run.
 export const publishToGitHub = signal<boolean>(false);
 
 export async function startAdHocReview(

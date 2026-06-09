@@ -2,6 +2,8 @@
 
 How we get from the existing TypeScript codebase to the polished Rust product, why it's two tracks, and the gate that moves us from one to the other.
 
+> ⚠️ **Revised 2026-06 — see [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md).** The Track A → Track B gate is **suspended**: the surfaces that Track B would polish have commoditized (Claude Code Routines/Workflow), so the Rust build is paused. The gate no longer fires on "Track A surfaces validated" alone — it requires the validation experiment to prove a product-shaped need beyond an operator-scoped skill pack.
+
 ---
 
 ## The frame
