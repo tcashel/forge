@@ -667,6 +667,30 @@ test("GET /api/prs serves repeat requests from the SWR cache", async (t) => {
   assert.equal(calls, 1, "second request within the TTL must not re-fetch");
 });
 
+test("GET /api/prs does not cache failure-shaped (ok: false) results", async (t) => {
+  let calls = 0;
+  const h = await bootServer({
+    prFetcher: async () => {
+      calls++;
+      // First call: transient gh failure (failure-shaped empty list).
+      if (calls === 1) return { prs: [], me: "", ok: false };
+      return { prs: [fakePr(505)], me: "alice", ok: true };
+    },
+  });
+  t.after(() => h.stop());
+
+  const first = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(first.body.ok, true);
+  assert.equal(first.body.data!.prs!.length, 0, "failure degrades to an empty list");
+
+  const second = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(second.body.data!.prs![0].number, 505, "failure was not pinned by the cache");
+
+  const third = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(third.body.data!.prs![0].number, 505);
+  assert.equal(calls, 2, "the successful result IS cached");
+});
+
 test("GET /api/prs with prsCacheTtlMs: 0 fetches every request", async (t) => {
   let calls = 0;
   const h = await bootServer({

@@ -600,7 +600,13 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
   };
 }
 
-export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: string }> {
+/**
+ * `ok: false` marks a failure-shaped result (gh call failed or returned
+ * unparseable JSON) as opposed to a genuinely-empty PR list. The serve
+ * layer uses this to skip caching failures — otherwise a transient gh
+ * hiccup would pin "No open PRs" for the whole SWR window.
+ */
+export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: string; ok?: boolean }> {
   // Use gh's built-in `--jq` to project the (potentially huge) `comments`
   // and `reviews` arrays down to scalar counts on gh's side. Without this,
   // the full review/comment bodies blow past execSync's default maxBuffer
@@ -632,7 +638,7 @@ export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: st
       opts,
     ),
   ]);
-  if (!ok || !stdout) return { prs: [], me };
+  if (!ok || !stdout) return { prs: [], me, ok: false };
   try {
     const prs = JSON.parse(stdout) as Array<{
       number: number;
@@ -677,8 +683,8 @@ export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: st
         isMine: mineNumbers.has(pr.number) || (me !== "" && author === me),
       };
     });
-    return { prs: mapped, me };
+    return { prs: mapped, me, ok: true };
   } catch {
-    return { prs: [], me };
+    return { prs: [], me, ok: false };
   }
 }

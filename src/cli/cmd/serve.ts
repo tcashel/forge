@@ -161,7 +161,20 @@ interface RepoView {
   stale: boolean;
 }
 
-type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string; ok?: boolean }>;
+
+/**
+ * Sentinel for failure-shaped fetchPrs results (`ok: false`). Thrown
+ * inside the prsCache loader so the cache skips storing the result —
+ * otherwise a transient gh hiccup would pin an empty PR list for the
+ * whole SWR window. The handler catches it and serves the result
+ * uncached, preserving the pre-cache degraded behavior.
+ */
+class PrFetchFailed extends Error {
+  constructor(readonly result: Awaited<ReturnType<PrFetcher>>) {
+    super("pr fetch returned a failure-shaped result");
+  }
+}
 type PrBundleFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
 
 const CONFIG_STRING_KEYS = new Set([
@@ -1307,7 +1320,21 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     const target = resolvePrRepo(repos, repoName);
     if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
     const fetchForTarget = () => ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
-    const result = ctx.prsCache ? await ctx.prsCache.get(target.root, fetchForTarget) : await fetchForTarget();
+    let result: Awaited<ReturnType<PrFetcher>>;
+    if (ctx.prsCache) {
+      try {
+        result = await ctx.prsCache.get(target.root, async () => {
+          const r = await fetchForTarget();
+          if (r.ok === false) throw new PrFetchFailed(r);
+          return r;
+        });
+      } catch (e) {
+        if (!(e instanceof PrFetchFailed)) throw e;
+        result = e.result;
+      }
+    } else {
+      result = await fetchForTarget();
+    }
     // Attach a cheap worktree snapshot per PR (path + safety only — no
     // gh state lookup or git fetch). The dedicated /api/worktrees view
     // does the full enrichment.
