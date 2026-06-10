@@ -1925,6 +1925,12 @@ body.filtered-single .repo-chip{ display: none; }
   border-radius: 6px;
   background: var(--panel);
   overflow: hidden;
+  /* Cheap virtualization: off-screen file cards skip layout/paint.
+     Scroll anchors (review-scroll.ts) still work — browsers force-render
+     scrollIntoView targets. The intrinsic-size hint keeps the scrollbar
+     from jumping as cards enter the viewport. */
+  content-visibility: auto;
+  contain-intrinsic-size: auto 400px;
 }
 .review-file > summary {
   cursor: pointer;
