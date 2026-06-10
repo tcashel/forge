@@ -38,7 +38,7 @@ export function ReviewTabs({ bundle, repoRoot }: Props) {
         ))}
       </nav>
       <div class="review-tab-body">
-        {active === "description" ? <DescriptionTab bundle={bundle} /> : null}
+        {active === "description" ? <DescriptionTab bundle={bundle} repoRoot={repoRoot} /> : null}
         {active === "discussion" ? <DiscussionTab bundle={bundle} /> : null}
         {active === "commits" ? <CommitsTab bundle={bundle} repoRoot={repoRoot} /> : null}
       </div>

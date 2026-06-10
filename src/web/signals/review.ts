@@ -9,6 +9,7 @@ import type {
   DroppedFixTarget,
   ForgeFinding,
   PrCommit,
+  PrDigest,
   PrReviewBundle,
   PublishRecord,
   ReviewRunDetail,
@@ -82,6 +83,41 @@ export const reviewActiveTab = signal<ReviewTab | null>(null);
 export const reviewCommits = signal<PrCommit[] | null>(null);
 export const reviewCommitsLoading = signal<boolean>(false);
 export const reviewCommitsError = signal<string | null>(null);
+
+// ─── PR digest ("what does this PR do") ──────────────────────────────────────
+
+export const prDigest = signal<PrDigest | null>(null);
+export const prDigestLoading = signal<boolean>(false);
+// Non-null while a digest worker runs for the active PR (same lifecycle as
+// activeReviewSession, but the DigestCard renders its own one-line status —
+// no drawer).
+export const activeDigestSession = signal<ActiveWorkerSession | null>(null);
+export const digestError = signal<string | null>(null);
+
+export async function loadPrDigest(prNumber: number, repoRoot: string): Promise<void> {
+  prDigestLoading.value = true;
+  try {
+    const q = `?repo=${encodeURIComponent(repoRoot)}`;
+    const data = await apiGet<{ digest: PrDigest | null }>(`/api/prs/${prNumber}/digest${q}`);
+    prDigest.value = data.digest;
+  } catch {
+    // Missing digest is the common case and not an error worth surfacing.
+    prDigest.value = null;
+  } finally {
+    prDigestLoading.value = false;
+  }
+}
+
+export async function startPrDigest(prNumber: number, repoRoot: string): Promise<void> {
+  digestError.value = null;
+  try {
+    const res = await apiPost<{ sessionId: string }>(`/api/prs/${prNumber}/digest`, { repo: repoRoot });
+    activeDigestSession.value = { sessionId: res.sessionId, prNum: prNumber };
+  } catch (e) {
+    const err = e as ApiError;
+    digestError.value = err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not start digest.";
+  }
+}
 
 // ─── PR lifecycle actions (ready-for-review / approve) ──────────────────────
 
@@ -160,6 +196,9 @@ export function clearReviewState(): void {
   reviewActiveTab.value = null;
   reviewCommits.value = null;
   reviewCommitsError.value = null;
+  prDigest.value = null;
+  activeDigestSession.value = null;
+  digestError.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {

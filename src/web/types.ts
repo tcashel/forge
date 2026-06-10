@@ -296,6 +296,18 @@ export interface PrView {
   headRefOid?: string;
 }
 
+// Mirror of PrDigestView from src/cli/cmd/digest-actions.ts. Returned by
+// GET /api/prs/:num/digest as `{ digest: PrDigest | null }`. `headSha` is
+// compared against the bundle's `pr.headRefOid` to flag a stale digest.
+export interface PrDigest {
+  sessionId: string;
+  headSha: string | null;
+  generatedAt: string;
+  agent: string;
+  model: string | null;
+  markdown: string;
+}
+
 // Mirror of PrCommit from src/core/gh-pr.ts. Returned by
 // GET /api/prs/:num/commits as `{ commits: PrCommit[] }`, oldest first.
 export interface PrCommit {

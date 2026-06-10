@@ -5,6 +5,7 @@ import {
   clearSelectedReviewRun,
   clearSelection,
   displayedFindings,
+  loadPrDigest,
   loadReviewBundle,
   loadReviewRuns,
   reviewBundle,
@@ -41,6 +42,9 @@ export function ReviewPage() {
       clearSelection();
       void loadReviewBundle(num, repo);
       void loadReviewRuns(num, repo);
+      // Cheap DB/disk read — no gh calls — so the digest (if one exists)
+      // renders with the bundle instead of on first Description-tab click.
+      void loadPrDigest(num, repo);
     }
   }, [num, repo]);
 
