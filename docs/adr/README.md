@@ -40,10 +40,11 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0024 | [Worktrees are disposable: lifecycle UI + lazy rehydration](./0024-worktrees-disposable-lifecycle.md) | Accepted               |
 | 0025 | [Unified agent interface; agent owns conversation context](./0025-unified-agent-interface-agent-owned-context.md) | Accepted |
 | 0026 | [Plan authoring is conversation-led; the document is the maintained artifact](./0026-conversation-led-plan-authoring.md) | Proposed |
-| 0027 | [Publish PR review findings to GitHub and resolve on fix](./0027-publish-pr-review-findings-to-github.md) | Accepted |
+| 0027 | [Publish PR review findings to GitHub and resolve on fix](./0027-publish-pr-review-findings-to-github.md) | Accepted (clarified by 0031) |
 | 0028 | [Cross-spec dependency graph, lazy materialization + orchestration agent](./0028-spec-dependency-graph-and-orchestration-agent.md) | Superseded by 0030 |
 | 0029 | [Repo setup lifecycle + validated quality-gate contract](./0029-repo-setup-lifecycle-and-quality-gate-contract.md) | Proposed |
 | 0030 | [Strategy reset: surfaces commoditized — pause Track B, keep Track A](./0030-strategy-reset-surfaces-commoditized.md) | Proposed |
+| 0031 | [Review publishing is at-least-once with persisted per-finding state](./0031-review-publish-at-least-once-persisted-state.md) | Accepted |
 
 ## Foundational ADRs
 
