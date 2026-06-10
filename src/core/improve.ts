@@ -694,7 +694,16 @@ export async function runImprover(
   store.writeSpec(config.planId, newFullSpec);
   const updatedTask = { ...task, specVersion: nextSpecVersion };
   store.upsertPlan(updatedTask);
-  recordPlanVersionAdded(store.db.db, updatedTask, nextSpecVersion, newFullSpec);
+  // Phase 3 dual-write: DB failure is warned, not fatal — the spec file +
+  // index.json above are the live source of truth during the cutover.
+  // Throwing here would report IMPROVE_FAILED for a spec that was already
+  // applied, and the Workbench retry would mint a spurious extra version.
+  try {
+    recordPlanVersionAdded(store.db.db, updatedTask, nextSpecVersion, newFullSpec);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record plan version v${nextSpecVersion} for ${config.planId}: ${msg}\n`);
+  }
 
   // ── Step 12: Mark the critique viewed ───────────────────────────────────
   store.markCritiqueViewed(config.planId, critiqueId);

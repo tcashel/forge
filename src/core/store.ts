@@ -13,16 +13,28 @@ import { ForgeDb } from "./db/connection.ts";
 import { syncJobState } from "./db/writes.ts";
 import { withFileLock } from "./file-lock.js";
 
-export type PlanStatus =
-  | "draft"
-  | "running"
-  | "quality_check"
-  | "creating_pr"
-  | "done"
-  | "failed"
-  | "quality_failed"
-  | "fixing"
-  | "archived";
+export const PLAN_STATUSES = [
+  "draft",
+  "running",
+  "quality_check",
+  "creating_pr",
+  "done",
+  "failed",
+  "quality_failed",
+  "fixing",
+  "archived",
+] as const;
+
+export type PlanStatus = (typeof PLAN_STATUSES)[number];
+
+/**
+ * Runtime guard for status strings read from meta.json. The bash runner
+ * writes phases that are not PlanStatus members (e.g. "reviewing") —
+ * those must never be persisted into Plan.status.
+ */
+export function isPlanStatus(value: string): value is PlanStatus {
+  return (PLAN_STATUSES as readonly string[]).includes(value);
+}
 
 export type LaunchTarget = "claude" | "codex" | "opencode" | "gemini";
 
@@ -178,10 +190,12 @@ export interface CritiqueMeta {
 
 export interface ForgeStoreOptions {
   /**
-   * Override the forge state directory. Defaults to `~/.forge/`. Tests
-   * pass an explicit path because `os.homedir()` is captured at process
-   * startup — mutating `process.env.HOME` mid-run does not redirect it,
-   * so HOME-tweaks aren't a viable isolation strategy.
+   * Override the forge state directory. Defaults to `$FORGE_HOME` when
+   * set, else `~/.forge/`. Tests pass an explicit path because
+   * `os.homedir()` is captured at process startup — mutating
+   * `process.env.HOME` mid-run does not redirect it, so HOME-tweaks
+   * aren't a viable isolation strategy. Spawned subprocesses can be
+   * redirected via the FORGE_HOME env var instead.
    */
   forgeDir?: string;
 }
@@ -198,7 +212,8 @@ export class ForgeStore {
   #db: ForgeDb | null = null;
 
   constructor(opts: ForgeStoreOptions = {}) {
-    this.forgeDir = opts.forgeDir ?? path.join(os.homedir(), ".forge");
+    // Resolution order: explicit option → FORGE_HOME env var → ~/.forge.
+    this.forgeDir = opts.forgeDir ?? process.env.FORGE_HOME ?? path.join(os.homedir(), ".forge");
     this.specsDir = path.join(this.forgeDir, "specs");
     this.runsDir = path.join(this.forgeDir, "runs");
     this.critiquesDir = path.join(this.forgeDir, "critiques");
@@ -403,9 +418,18 @@ export class ForgeStore {
     const meta = this.readRunMeta(plan.id);
     if (!meta) return null;
 
-    const newStatus = meta.status as PlanStatus | undefined;
+    const rawStatus = typeof meta.status === "string" ? meta.status : undefined;
     const prUrl = meta.prUrl as string | undefined;
-    if (!newStatus || newStatus === plan.status) return null;
+    if (!rawStatus || rawStatus === plan.status) return null;
+
+    // Runner-only phases (e.g. "reviewing") are not PlanStatus members.
+    // Persisting one strands the plan: serve's sync loop only re-polls
+    // running-family statuses and its statusInfo switch has no case for
+    // them, so /api/plans 500s and the runner's final "done" is never
+    // picked up. Keep the previous (running-family) status; the raw phase
+    // stays visible via meta.json and the DB job row.
+    const newStatus = isPlanStatus(rawStatus) ? rawStatus : plan.status;
+    if (newStatus === plan.status && (prUrl ?? plan.prUrl) === plan.prUrl) return null;
 
     const updated: Plan = {
       ...plan,

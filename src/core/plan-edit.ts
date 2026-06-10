@@ -260,10 +260,20 @@ function persistDocumentVersion(opts: {
   const specPath = opts.store.writeSpec(opts.task.id, withFrontmatter);
   const updatedTask: Plan = { ...opts.task, specVersion: nextVersion, specFile: specPath };
   opts.store.upsertPlan(updatedTask);
-  recordPlanVersionAdded(opts.store.db.db, updatedTask, nextVersion, withFrontmatter, {
-    createdBy: opts.createdBy,
-    notes: opts.notes ?? null,
-  });
+  // Phase 3 dual-write: DB failure is warned, not fatal — the spec file +
+  // index.json above are the live source of truth during the cutover.
+  // Throwing here would 500 an edit that already persisted (and in the
+  // accept path skip deletePendingPlanEdit, wedging future accepts on
+  // STALE_EDIT).
+  try {
+    recordPlanVersionAdded(opts.store.db.db, updatedTask, nextVersion, withFrontmatter, {
+      createdBy: opts.createdBy,
+      notes: opts.notes ?? null,
+    });
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record plan version v${nextVersion} for ${opts.task.id}: ${msg}\n`);
+  }
   return { task: updatedTask, document: withFrontmatter };
 }
 
