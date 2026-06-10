@@ -424,3 +424,47 @@ test("publishReviewFindings posts the inline comment on the diff's new path for 
     __setGhRunner(null);
   }
 });
+
+test("publishReviewFindings dedupes a re-titled finding via the colocated anchor (live PR #68 regression)", async () => {
+  // A prior pass published a marker comment anchored at src/foo.ts:2. The
+  // re-review reports the SAME defect re-titled and line-shifted (new id).
+  const prior = makeFinding({ id: "aa11bb22cc33", title: "drops last sample", file: "src/foo.ts", lineStart: 2 });
+  const retitled = makeFinding({
+    id: "99ff88ee77dd",
+    title: "final sample skipped",
+    file: "src/foo.ts",
+    lineStart: 2,
+    lineEnd: 2,
+  });
+  const existingComments = [{ body: buildFindingCommentBody(prior), path: "src/foo.ts", line: 2 }];
+  const { calls, runner } = makeRunner({ existingComments });
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [retitled], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.posted, 0);
+    assert.equal(res.skippedPost, true);
+    assert.equal(postReviewCalls(calls).length, 0, "no reviews POST for a colocated re-titled finding");
+    const outcome = res.findings.find((f) => f.id === "99ff88ee77dd");
+    assert.equal(outcome?.status, "already-published");
+    assert.ok(outcome?.error?.includes("colocated"), "outcome carries the colocated note");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("publishReviewFindings still posts at an anchor whose marker comment is outdated (line=null)", async () => {
+  // An outdated marker comment (GitHub nulls `line`) no longer claims its
+  // anchor — a new finding at those coordinates posts normally.
+  const prior = makeFinding({ id: "aa11bb22cc33", title: "old", file: "src/foo.ts", lineStart: 2 });
+  const fresh = makeFinding({ id: "99ff88ee77dd", title: "new defect", file: "src/foo.ts", lineStart: 2, lineEnd: 2 });
+  const existingComments = [{ body: buildFindingCommentBody(prior), path: "src/foo.ts", line: null }];
+  const { calls, runner } = makeRunner({ existingComments });
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [fresh], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.posted, 1);
+    assert.equal(postReviewCalls(calls).length, 1);
+  } finally {
+    __setGhRunner(null);
+  }
+});

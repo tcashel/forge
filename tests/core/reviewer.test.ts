@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 import {
+  buildReviewerPrompt,
   extractLastForgeReviewBlock,
   parseForgeReviewFindings,
   parseForgeReviewVerdict,
@@ -335,4 +336,46 @@ test("parseForgeReviewVerdict reads the verdict line and rejects junk", () => {
   assert.equal(parseForgeReviewVerdict("## Verdict\nmaybe\n"), null);
   assert.equal(parseForgeReviewVerdict("## Summary\nno verdict heading"), null);
   assert.equal(parseForgeReviewVerdict(""), null);
+});
+
+test("buildReviewerPrompt feeds prior findings back with a reuse-titles instruction", () => {
+  const prompt = buildReviewerPrompt({
+    prNum: 7,
+    repoName: "repo",
+    skillsDir: "/nonexistent",
+    prInfoJson: "{}",
+    ciChecks: "",
+    diff: "",
+    linkedSpec: null,
+    priorFindings: [
+      {
+        id: "aa11",
+        severity: "HIGH",
+        title: "Average calculation drops the last duration",
+        file: "scripts/live-review-target.ts",
+        lineStart: 6,
+        lineEnd: 12,
+        evidence: null,
+        why: "",
+        fix: "",
+      },
+    ],
+  });
+  assert.ok(prompt.includes("## Previously reported findings"));
+  assert.ok(prompt.includes("SAME title and file:line"));
+  assert.ok(prompt.includes("[HIGH] Average calculation drops the last duration (scripts/live-review-target.ts:6)"));
+});
+
+test("buildReviewerPrompt omits the prior-findings section when there are none", () => {
+  const prompt = buildReviewerPrompt({
+    prNum: 7,
+    repoName: "repo",
+    skillsDir: "/nonexistent",
+    prInfoJson: "{}",
+    ciChecks: "",
+    diff: "",
+    linkedSpec: null,
+    priorFindings: [],
+  });
+  assert.ok(!prompt.includes("Previously reported findings"));
 });

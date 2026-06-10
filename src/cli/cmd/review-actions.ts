@@ -597,6 +597,17 @@ export async function executeReview(opts: ExecuteReviewOpts): Promise<ExecuteRev
       }
     }
 
+    // Prior findings feed forward so a re-review reuses exact titles/lines for
+    // defects it re-confirms — keeps finding ids (and so publish dedup) stable
+    // across independent LLM passes. Best-effort: a missing/empty lookup just
+    // omits the section.
+    let priorFindings: ForgeFinding[] = [];
+    try {
+      priorFindings = findLatestForgeFindings(store, prNum, repoRoot, headRefName).findings;
+    } catch {
+      /* no prior findings — fresh review */
+    }
+
     const prompt = buildReviewerPrompt({
       prNum,
       repoName,
@@ -605,6 +616,7 @@ export async function executeReview(opts: ExecuteReviewOpts): Promise<ExecuteRev
       ciChecks,
       diff,
       linkedSpec,
+      priorFindings,
     });
     const promptFile = path.join(runDir, "review-prompt.txt");
     fs.writeFileSync(promptFile, prompt, "utf-8");
@@ -738,6 +750,12 @@ export async function runReviewInProcess(
 ): Promise<RunReviewInProcessResult> {
   const prep = prepareReviewSession(input, store);
   const { sessionId, runDir, logFile, startedAt, headRefName } = prep;
+  // The reviewer runs in THIS process — record our pid so a SIGKILLed CLI run
+  // is reapable by liveness (without it, the stale 'running' row 409-blocks
+  // re-reviews of this PR until the 6h TTL). Found live in the kill test.
+  store.db.db
+    .prepare("UPDATE sessions SET pid = ?, metrics = json_set(metrics, '$.pid', ?) WHERE id = ?")
+    .run(process.pid, process.pid, sessionId);
   // Mirror log lines into agent.log so the Workbench can replay CLI runs.
   const teeLog = (msg: string) => {
     log(msg);

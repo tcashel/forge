@@ -21,6 +21,13 @@ export interface ReviewerPromptArgs {
   ciChecks: string;
   diff: string;
   linkedSpec: string | null;
+  /**
+   * Findings a prior review pass already reported on this PR. Fed back so a
+   * re-review reuses their exact titles/lines for defects it re-confirms —
+   * the finding id hashes file|line|title, so stable wording keeps publishing
+   * idempotent across passes (the colocated-anchor dedup is the backstop).
+   */
+  priorFindings?: ForgeFinding[];
 }
 
 function loadSkillBody(skillsDir: string): string {
@@ -95,6 +102,22 @@ export function buildReviewerPrompt(args: ReviewerPromptArgs): string {
     ? `## Linked Forge spec\n\n\`\`\`markdown\n${args.linkedSpec}\n\`\`\`\n`
     : "## Linked Forge spec\n\n(no forge spec linked to this branch — review against general engineering criteria)\n";
 
+  const priorSection =
+    args.priorFindings && args.priorFindings.length > 0
+      ? [
+          "## Previously reported findings",
+          "",
+          "A prior review pass already reported these. If a defect below is still present, re-report it",
+          "with the SAME title and file:line, verbatim — do not rephrase. Only mint new wording for",
+          "genuinely new findings. If a defect below is fixed, simply omit it.",
+          "",
+          ...args.priorFindings.map(
+            (f) => `- [${f.severity}] ${f.title} (${f.file}${f.lineStart > 0 ? `:${f.lineStart}` : ""})`,
+          ),
+          "",
+        ].join("\n")
+      : null;
+
   return [
     prefixWithPr,
     "## PR metadata",
@@ -111,6 +134,7 @@ export function buildReviewerPrompt(args: ReviewerPromptArgs): string {
     "",
     specSection,
     "",
+    ...(priorSection ? [priorSection, ""] : []),
     "## Diff",
     "",
     "```diff",

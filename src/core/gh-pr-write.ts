@@ -274,7 +274,14 @@ export async function replyToReviewComment(
   return res.ok ? { ok: true } : { ok: false, error: ghErrorDetail(res, "reply POST failed") };
 }
 
-export type PublishedFindingIdsResult = { ok: true; ids: Set<string> } | { ok: false; error: string };
+export type PublishedFindingIdsResult =
+  | { ok: true; ids: Set<string>; anchors: Set<string> }
+  | { ok: false; error: string };
+
+/** Key for the colocated-anchor dedup set: current anchor of a marker comment. */
+export function anchorKey(path: string, line: number): string {
+  return `${path}:${line}`;
+}
 
 /**
  * Fetch the set of finding ids already published on the PR — parsed from both
@@ -291,6 +298,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   if (!target) return { ok: false, error: "could not resolve owner/repo for gh api call" };
   const hostArgs = hostArgsFor(target.apiHost);
   const ids = new Set<string>();
+  const anchors = new Set<string>();
 
   // `--paginate --slurp`: across multiple pages gh emits one JSON array per
   // page collected into an outer array. Without `--slurp` a >1-page response is
@@ -305,8 +313,19 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   }
   if (inlineRes.stdout) {
     try {
-      const arr = flattenSlurpedPages<{ body?: string }>(inlineRes.stdout);
-      for (const c of arr) for (const id of extractFindingIds(c.body ?? "")) ids.add(id);
+      const arr = flattenSlurpedPages<{ body?: string; path?: string; line?: number | null }>(inlineRes.stdout);
+      for (const c of arr) {
+        const markerIds = extractFindingIds(c.body ?? "");
+        for (const id of markerIds) ids.add(id);
+        // Marker comments also contribute their CURRENT anchor: re-reviews are
+        // LLM passes that re-title the same defect (new id), so exact-id dedup
+        // alone re-posts it. A still-anchored marker comment at the same
+        // path:line is treated as the same finding. `line` is null once the
+        // comment is outdated — those no longer claim an anchor.
+        if (markerIds.length > 0 && c.path && typeof c.line === "number") {
+          anchors.add(anchorKey(c.path, c.line));
+        }
+      }
     } catch (e) {
       return { ok: false, error: `could not parse existing inline comments: ${(e as Error).message}` };
     }
@@ -327,7 +346,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
       return { ok: false, error: `could not parse existing reviews: ${(e as Error).message}` };
     }
   }
-  return { ok: true, ids };
+  return { ok: true, ids, anchors };
 }
 
 function buildReviewBodySummary(outOfDiff: ForgeFinding[]): string {
@@ -402,12 +421,37 @@ export async function publishReviewFindings(
   const published = reconciled.ids;
   const { inDiff, outOfDiff } = partitionFindingsByDiff(args.findings, args.diff);
 
-  const newInDiff = inDiff.filter((a) => !published.has(a.finding.id));
+  // Two dedup layers: exact marker id, then colocated anchor. The id is
+  // sha1(file|lineStart|title), but a re-review is an independent LLM pass that
+  // routinely re-titles the same defect and shifts its line — so a new-id
+  // finding that anchors exactly where a live marker comment already sits is
+  // the same finding, not a new one. Verified live on PR #68: without this,
+  // every re-review duplicated every comment.
+  const colocated = inDiff.filter(
+    (a) => !published.has(a.finding.id) && reconciled.anchors.has(anchorKey(a.path, a.line)),
+  );
+  const newInDiff = inDiff.filter(
+    (a) => !published.has(a.finding.id) && !reconciled.anchors.has(anchorKey(a.path, a.line)),
+  );
   const newOutOfDiff = outOfDiff.filter((f) => !published.has(f.id));
   const skipped = args.findings.length - newInDiff.length - newOutOfDiff.length;
-  const outcomes: FindingPublishOutcome[] = args.findings
-    .filter((f) => published.has(f.id))
-    .map((f) => ({ id: f.id, status: "already-published" as const }));
+  if (colocated.length > 0) {
+    log(
+      `[publish] ${colocated.length} finding(s) skipped — an existing Forge comment already anchors at the same line: ${colocated
+        .map((a) => anchorKey(a.path, a.line))
+        .join(", ")}`,
+    );
+  }
+  const outcomes: FindingPublishOutcome[] = [
+    ...args.findings
+      .filter((f) => published.has(f.id))
+      .map((f) => ({ id: f.id, status: "already-published" as const })),
+    ...colocated.map((a) => ({
+      id: a.finding.id,
+      status: "already-published" as const,
+      error: `colocated: existing Forge comment at ${anchorKey(a.path, a.line)}`,
+    })),
+  ];
 
   if (newInDiff.length === 0 && newOutOfDiff.length === 0) {
     log(`[publish] nothing new to post (${skipped} already published)`);
