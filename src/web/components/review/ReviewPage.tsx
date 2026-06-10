@@ -2,6 +2,7 @@ import { useEffect, useMemo } from "preact/hooks";
 import { parseUnifiedDiff } from "../../lib/diff";
 import { enterPrMode } from "../../lib/modes";
 import {
+  clearPerPrHeaderState,
   clearSelectedReviewRun,
   clearSelection,
   displayedFindings,
@@ -40,6 +41,7 @@ export function ReviewPage() {
       // triage selection so checkboxes don't leak across PRs.
       clearSelectedReviewRun();
       clearSelection();
+      clearPerPrHeaderState();
       void loadReviewBundle(num, repo);
       void loadReviewRuns(num, repo);
       // Cheap DB/disk read — no gh calls — so the digest (if one exists)

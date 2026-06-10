@@ -10,8 +10,9 @@ interface Props {
 
 export function CommitsTab({ bundle, repoRoot }: Props) {
   const commits = reviewCommits.value;
-  // Lazy: first activation fetches; PR switches clear reviewCommits via
-  // clearReviewState so a stale list never carries across PRs.
+  // Lazy: first activation fetches; ReviewPage's PR-switch effect resets
+  // reviewCommits (clearPerPrHeaderState) so a stale list never carries
+  // across PRs.
   useEffect(() => {
     if (reviewCommits.value === null && !reviewCommitsLoading.value) {
       void loadReviewCommits(bundle.pr.number, repoRoot);

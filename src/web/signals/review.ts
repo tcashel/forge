@@ -181,6 +181,19 @@ export function clearSelection(): void {
   commentStatuses.value = new Map();
 }
 
+// Reset the per-PR center-header state (active tab, commits list, digest
+// view) on PR switch — without this, PR A's commits/digest linger when the
+// operator jumps straight to PR B. activeDigestSession deliberately
+// survives: the DigestCard gates on its prNum, so a digest still running
+// for PR A resumes its live status when the operator returns to A.
+export function clearPerPrHeaderState(): void {
+  reviewActiveTab.value = null;
+  reviewCommits.value = null;
+  reviewCommitsError.value = null;
+  prDigest.value = null;
+  digestError.value = null;
+}
+
 export function clearReviewState(): void {
   reviewBundle.value = null;
   reviewError.value = null;

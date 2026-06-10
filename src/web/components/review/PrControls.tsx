@@ -42,7 +42,7 @@ export function PrControls({ pr, repoRoot }: Props) {
 
   return (
     <div class="review-pr-controls">
-      <div class="review-seg-group" role="group" aria-label="PR actions">
+      <div class="review-seg-group">
         {pr.isDraft ? (
           <button
             type="button"

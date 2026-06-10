@@ -1995,6 +1995,22 @@ body.filtered-single .repo-chip{ display: none; }
 }
 .review-md { font-size: 12px; line-height: 1.5; }
 .review-md p { margin: 4px 0; }
+/* The app-wide reset (ul,ol → list-style:none) eats markdown bullets, and
+   unscoped h2/h3 render at page scale inside cards — restore document
+   styling for agent/PR markdown (digest, description, comments). */
+.review-md ul,
+.review-md ol { margin: 4px 0 10px; padding-left: 20px; list-style: disc; }
+.review-md ol { list-style: decimal; }
+.review-md li { margin: 4px 0; }
+.review-md li::marker { color: var(--fg-dim); }
+.review-md h1,
+.review-md h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; margin: 14px 0 6px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+.review-md h3 { font-size: 12.5px; margin: 10px 0 4px; }
+.review-md h4,
+.review-md h5,
+.review-md h6 { font-size: 12px; margin: 8px 0 4px; }
+.review-md h1:first-child,
+.review-md h2:first-child { margin-top: 2px; }
 /* Theme-aware (not --bg-deep): the hardcoded near-black background read as
    redaction bars on the light theme once the Description tab started
    rendering prose full of inline code. */
