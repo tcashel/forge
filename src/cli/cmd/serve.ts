@@ -9,7 +9,7 @@
  * Localhost-only by design. There is no auth in this revision.
  */
 
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -59,6 +59,7 @@ import {
   summarizePlanForSse,
 } from "../../core/plan-edit.ts";
 import { detectRepo } from "../../core/repo.ts";
+import { repoQuickInfo } from "../../core/repo-fast.ts";
 import { killPlan, reapDeadRunnerPlans, reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type {
   CritiqueMeta,
@@ -374,26 +375,16 @@ function failureMessage(task: Plan, store: ForgeStore): string | null {
   return null;
 }
 
-function specBranchInDisk(repoRoot: string): string | null {
-  try {
-    const out = execSync("git rev-parse --abbrev-ref HEAD", {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3000,
-    }).trim();
-    return out || null;
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * Subprocess-free repo facts (existence, .git presence, on-disk branch).
+ * Runs once per task per /api/plans poll, so it must stay off the event
+ * loop's critical path — repoQuickInfo is pure fs reads behind a 2s
+ * micro-TTL. Semantic note vs. the old detectRepo-based version: hasGit
+ * now means ".git exists" rather than "git rev-parse succeeded"; a
+ * corrupt checkout reports reachable+hasGit with branch null.
+ */
 function repoDiskInfo(repoRoot: string): { reachable: boolean; hasGit: boolean; branch: string | null } {
-  if (!repoRoot || !path.isAbsolute(repoRoot) || !fs.existsSync(repoRoot)) {
-    return { reachable: false, hasGit: false, branch: null };
-  }
-  const detected = detectRepo(repoRoot);
-  return { reachable: true, hasGit: !!detected, branch: detected ? specBranchInDisk(detected.root) : null };
+  return repoQuickInfo(repoRoot);
 }
 
 function ghTargetForRepo(store: ForgeStore, repoRoot: string): GhTarget | undefined {
