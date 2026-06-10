@@ -37,10 +37,10 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
 
   return (
     <div class="review-action-bar">
-      <button type="button" class="btn btn-ghost" onClick={onBack}>
+      <button type="button" class="review-back-link" onClick={onBack}>
         ← Back to PRs
       </button>
-      <button type="button" class="btn btn-secondary" disabled={loading} onClick={onRefresh}>
+      <button type="button" class="btn btn-ghost" disabled={loading} onClick={onRefresh}>
         {loading ? "Refreshing…" : "Refresh"}
       </button>
       <button
