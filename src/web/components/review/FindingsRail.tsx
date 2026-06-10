@@ -1,4 +1,5 @@
 import { useMemo, useState } from "preact/hooks";
+import { type FixBadge, fixBadgeFor } from "../../lib/fix-badge";
 import { scrollToFinding } from "../../lib/review-scroll";
 import { commentTargetToken, targetKey } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
@@ -60,16 +61,10 @@ function snippet(text: string, max = 160): string {
 
 // ─── shared selection + status helpers ───────────────────────────────────────
 
-interface StatusBadge {
-  label: string;
-  className: string;
-  reason?: string;
-}
-
 interface RowState {
   checked: boolean;
   disabled: boolean;
-  badge: StatusBadge | null;
+  badge: FixBadge | null;
 }
 
 /**
@@ -79,15 +74,7 @@ interface RowState {
 function rowStateFor(token: string, selectable: boolean): RowState {
   const live = commentStatuses.value.get(token);
   const persisted = reviewBundle.value?.commentFixState?.[token];
-  let badge: StatusBadge | null = null;
-  if (live === "fixing") {
-    badge = { label: "fixing…", className: "fixing" };
-  } else if (persisted) {
-    if (persisted.status === "fixed") badge = { label: "fixed", className: "fixed", reason: persisted.reason };
-    else if (persisted.status === "disputed")
-      badge = { label: "disputed", className: "disputed", reason: persisted.reason };
-    else if (persisted.status === "failed") badge = { label: "failed", className: "failed", reason: persisted.reason };
-  }
+  const badge = fixBadgeFor(live, persisted);
   const fixing = badge?.className === "fixing";
   const fixed = badge?.className === "fixed";
   const disabled = !selectable || fixing || fixed;
@@ -110,12 +97,14 @@ function RailSelect({ token, state, label }: { token: string; state: RowState; l
   );
 }
 
-function RailBadge({ badge }: { badge: StatusBadge | null }) {
+function RailBadge({ badge }: { badge: FixBadge | null }) {
   if (!badge) return null;
   return (
     <div class={`review-rail-badge badge-${badge.className}`}>
       <span class="badge-label">{badge.label}</span>
       {badge.reason ? <span class="badge-reason"> — {badge.reason}</span> : null}
+      {badge.ghError ? <span class="badge-gh-error"> · {badge.ghError}</span> : null}
+      {badge.ghResolved === true ? <span class="badge-gh-resolved"> · thread resolved on PR</span> : null}
     </div>
   );
 }

@@ -1,3 +1,4 @@
+import { type FixBadge, fixBadgeFor } from "../../lib/fix-badge";
 import { commentTargetToken } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
 import type { InlinePrComment } from "../../types";
@@ -32,21 +33,10 @@ function CommentBody({ comment }: { comment: InlinePrComment }) {
   );
 }
 
-interface StatusBadge {
-  label: string;
-  className: string;
-  reason?: string;
-}
-
-function statusBadgeFor(token: string): StatusBadge | null {
+function statusBadgeFor(token: string): FixBadge | null {
   const live = commentStatuses.value.get(token);
-  if (live === "fixing") return { label: "fixing…", className: "fixing" };
   const persisted = reviewBundle.value?.commentFixState?.[token];
-  if (!persisted) return null;
-  if (persisted.status === "fixed") return { label: "fixed", className: "fixed", reason: persisted.reason };
-  if (persisted.status === "disputed") return { label: "disputed", className: "disputed", reason: persisted.reason };
-  if (persisted.status === "failed") return { label: "failed", className: "failed", reason: persisted.reason };
-  return null;
+  return fixBadgeFor(live, persisted);
 }
 
 export function CommentThread({ thread, anchored = true }: Props) {
@@ -88,6 +78,8 @@ export function CommentThread({ thread, anchored = true }: Props) {
           <div class={`review-thread-badge badge-${badge.className}`}>
             <span class="badge-label">{badge.label}</span>
             {badge.reason ? <span class="badge-reason"> — {badge.reason}</span> : null}
+            {badge.ghError ? <span class="badge-gh-error"> · {badge.ghError}</span> : null}
+            {badge.ghResolved === true ? <span class="badge-gh-resolved"> · thread resolved on PR</span> : null}
           </div>
         ) : null}
         {thread.root.forgeFindingId ? (

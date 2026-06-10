@@ -1,17 +1,15 @@
-# Vision — Forge → Juicer
+# Vision — Forge
 
 > The operator's cockpit for staff engineers running agent fleets.
 > Plan. Run. Review. Ship. Don't watch.
 
-> ⚠️ **Under strategic revision (2026-06) — see [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md).** Three of the five surfaces below commoditized (Claude Code Routines + Workflow); the work-graph is now beads; Track B (Rust) is paused. The moat relocates from "the surfaces" to **operator-scoped, zero-repo-imposition integration**. Read the rest as aspirational context, not current plan, until the validation experiment resolves.
+> ℹ️ **Status (2026-06).** Forge (TypeScript, this repo) **is the deliverable** — see [ROADMAP.md](ROADMAP.md), which is authoritative on plan and priorities. The Rust + GPUI rebuild ("Juicer", Track B) is archived at [`archive/ROADMAP-track-b-juicer.md`](archive/ROADMAP-track-b-juicer.md). The moat is **operator-scoped, zero-repo-imposition integration** plus the surfaces below; the task model / work graph is deliberately undecided (ROADMAP "Open decisions"). The job-not-show thesis in this document stands.
 
 ---
 
 ## A note on naming
 
-The repo you're reading this in is named **forge**. The current TypeScript codebase is the Juicer *prototype*: the validation vehicle for product surfaces, used as the founder's daily driver, shared with trusted friends for feedback. When the surfaces are settled, the prototype gets rebuilt in Rust + GPUI and renamed **Juicer** for public launch. See `BUILD_PATH.md` for the two-track model.
-
-Throughout this document, "Juicer" refers to the product we're building toward. "Forge" refers to the TS prototype that gets us there.
+The repo you're reading this in is named **forge**. **Juicer** was the name reserved for a planned Rust + GPUI rebuild; that plan is archived (see the status note above), and Forge itself now carries the product role. Where this document says "Juicer", read it as the operator's-cockpit product concept — the thing Forge is. Mentions of the Rust rebuild, the two-track gate, and Track B pricing/launch milestones describe the archived plan, kept here as context.
 
 ---
 
@@ -92,22 +90,15 @@ Those are exactly the three things Juicer is built around. They follow logically
 
 ---
 
-## How we build it (the two tracks)
+## How we build it
 
-This product is built in two sequential tracks, structured so that each phase does what it's good at:
-
-- **Track A — Forge (TypeScript, this repo):** validates the five differentiated surfaces. Built on top of existing Forge code. Used daily by the founder; shared with a small number of trusted friends for workflow feedback. Not for public launch. **Allowed to be ugly where it doesn't matter.**
-- **Track B — Juicer (Rust + GPUI, future repo):** the polished, paid product. Built from Track A's validated spec. The marketing artifact. **Polish is a precondition, not a finish.**
-
-Track B begins when all five surfaces have been used daily without major shape changes for ~2 weeks. See `BUILD_PATH.md` for the full gate criteria and reasoning.
-
-The product presentation point is real: staff engineers running fleets will not switch to a janky-looking app from polished free competitors. But the inverse trap — building beautifully native software around the wrong product shape — is equally real. The two-track approach dodges both: validate cheaply in TS, ship polished in Rust.
+Forge is built in this repo, in TypeScript, phase by phase — see [ROADMAP.md](ROADMAP.md) (F0 production hardening → F1 one-shot quality → F2 scale the operator). The earlier two-track plan — validate surfaces in TS, then rebuild polished in Rust + GPUI — is archived at [`archive/ROADMAP-track-b-juicer.md`](archive/ROADMAP-track-b-juicer.md), with the reasoning preserved in `BUILD_PATH.md` (historical record). Forge serves its operator; polish is invested where it pays the operator back, starting with the Workbench, which is a keeper.
 
 ---
 
 ## What Juicer is
 
-Juicer is a native macOS app — fully Rust, built on GPUI — for staff and principal engineers who already run agent fleets and have hit the cognitive ceiling.
+Juicer — the cockpit Forge implements — is a macOS tool for staff and principal engineers who already run agent fleets and have hit the cognitive ceiling.
 
 The user flow:
 
@@ -161,7 +152,7 @@ We are explicit about who we are not for. The job-not-show positioning rules out
 
 ## The five surfaces that matter
 
-These are what Juicer must execute on better than anyone. These are also what Track A (Forge) is validating.
+These are what Forge must execute on better than anyone.
 
 ### 1. The plan workspace
 Document-shaped, not chat-shaped. Structured sections accrete as the plan matures. Inline agent suggestions with accept/reject. Open questions surfaced explicitly. Versioned, searchable, exportable, forkable.
@@ -188,8 +179,8 @@ Auto-presented when the app opens after time away. Summarizes completions, block
 - **Not a chat product.** Plan iteration is document-shaped.
 - **Not a model gateway.** Users bring their own agents.
 - **Not an interactive permission system.** Hook configuration enforces policy; Juicer does not prompt mid-run.
-- **Not an enterprise compliance product.** We are not pursuing SOC 2 or ISO 42001 through Track B.
-- **Not free.** Conductor occupies free; Juicer is premium native.
+- **Not an enterprise compliance product.** We are not pursuing SOC 2 or ISO 42001.
+- **Not a launched product.** No pricing, no marketing, no polish-for-strangers — Forge serves its operator.
 - **Not cross-platform.** macOS only through the foreseeable future.
 
 ---
@@ -210,28 +201,17 @@ Sixty seconds from open to oriented. Zero sessions watched. Maximum agency.
 
 ---
 
-## Pricing thesis (provisional, post Track B launch)
+## Pricing
 
-- **No free tier.** Conductor occupies free.
-- **Personal: $30-50/mo.** Premium individual tool for staff engineers.
-- **Juice + Juicer bundle pricing.** Pair-pricing that anchors the moat.
-- **No team tier initially.** Avoid procurement complexity until the individual product is loved.
-
-Forge (the TS prototype) is never priced. It's a workshop, not a product.
+There is no pricing plan. Forge is not launched, marketed, or priced — it serves its operator ([ROADMAP.md](ROADMAP.md), "Deliberately not on the roadmap"). The Track B pricing thesis (no free tier, $30-50/mo personal, Juice bundle) lives with the rest of the archived plan in [`archive/ROADMAP-track-b-juicer.md`](archive/ROADMAP-track-b-juicer.md).
 
 ---
 
 ## Success looks like
 
-**Track A complete:** Five surfaces validated through 2+ weeks of daily founder use, plus feedback from a handful of trusted friends. Spec is settled. Plan library has real plans that the founder shipped.
+The phase exit criteria in [ROADMAP.md](ROADMAP.md) are the scoreboard: F0 — a review run posts every finding, resolves on fix, survives re-runs without duplicates, and the full loop completes headless with zero intervention; F1 — most runs merge with zero or one human touch-up commit; F2 — multiple specs run in parallel for weeks while the operator orients from the digest and never feels obligated to watch a session.
 
-**Track B month 6:** Juicer is the founder's daily driver. Native polish achieved. Plan workspace + multi-critic synthesis + triage queue all real.
-
-**Track B month 12:** 20-50 paying individual users. Testimonials specifically call out *not having to watch sessions* and the plan/critique/triage layer as the reasons they pay.
-
-**Track B month 18-24:** $20-50k MRR. Category recognition — "the cockpit, not the dashboard." Possible Conductor or Superset partnership integration.
-
-**Long-term:** The serious-operator tool. Linear-tier brand. Acquisition-attractive or sustainable indie business.
+The archived plan's revenue/launch milestones (Track B months 6/12/18-24) are preserved in [`archive/ROADMAP-track-b-juicer.md`](archive/ROADMAP-track-b-juicer.md).
 
 ---
 
@@ -252,11 +232,11 @@ The window for "yet another parallel orchestrator" is closed. The window for "th
 
 Juice is the Swift macOS app that mines coding agent conversation history (Claude Code, Codex, Cursor, Windsurf, Aider, opencode) and produces per-repo optimizations: skills, CLAUDE.md, AGENTS.md, settings, coaching. Juice ships first as a standalone product.
 
-The Forge→Juicer line and Juice are siblings. Juice optimizes individual agents. Juicer orchestrates fleets of them without watching them. The integration — Juicer reads Juice's outputs; Juicer's runs feed Juice's mining — is the structural moat. Better agents need less supervision, which makes the job-not-show premise more sustainable. The flywheel reinforces itself.
+Forge and Juice are siblings. Juice optimizes individual agents. Forge orchestrates fleets of them without watching them. The integration — Forge reads Juice's outputs; Forge's runs feed Juice's mining — is the structural moat. Better agents need less supervision, which makes the job-not-show premise more sustainable. The flywheel reinforces itself.
 
 ---
 
 ## Naming
 
-**Forge** — the prototype repo. Anvil where the shape is hammered out. Already-existing TypeScript codebase.
-**Juicer** — the polished product. Operator's cockpit. The thing that wields the juice. Playfulness is deliberate: the category trends humorless and over-serious; Juicer goes the other way.
+**Forge** — this repo, the deliverable. Anvil where the shape is hammered out, and the tool that ships.
+**Juicer** — the name reserved for the archived Rust rebuild; in this document, shorthand for the operator's-cockpit concept. The thing that wields the juice. Playfulness is deliberate: the category trends humorless and over-serious; this project goes the other way.

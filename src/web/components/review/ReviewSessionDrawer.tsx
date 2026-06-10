@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "preact/hooks";
 import { openSessionLogStream } from "../../lib/sse";
-import { activeCommentFixSession, activeReviewSession, loadReviewBundle } from "../../signals/review";
+import { showToast } from "../../lib/toast";
+import { activeCommentFixSession, activeReviewSession, loadReviewBundle, loadReviewRuns } from "../../signals/review";
 
 interface Props {
   prNumber: number;
@@ -18,10 +19,13 @@ interface ActiveSession {
 /**
  * Right-side slide-in panel that streams either the running ad-hoc
  * reviewer's log or the running comment-fix worker's log. Subscribes via
- * openSessionLogStream; closes on Escape or the X button. When the
- * worker fires `done`, the drawer refetches the PR review bundle so
- * newly-written findings / fix state show up, then clears the
- * corresponding active-session signal.
+ * openSessionLogStream; closes on Escape or the X button. When the worker
+ * fires `done`, the drawer refetches the PR review bundle + run history so
+ * newly-written findings / fix / publish state show up — but it stays
+ * mounted (the active-session signal is only stamped `done`, not cleared)
+ * so failure text remains readable. Only an explicit close clears the
+ * signal; a failed run additionally raises a toast in case the operator
+ * already navigated their eyes elsewhere.
  */
 export function ReviewSessionDrawer({ prNumber, repoRoot }: Props) {
   const reviewSession = activeReviewSession.value;
@@ -42,6 +46,18 @@ export function ReviewSessionDrawer({ prNumber, repoRoot }: Props) {
     else activeReviewSession.value = null;
   };
 
+  // Mark the session finished without unmounting the drawer: the signal
+  // keeps the session (so the drawer stays open showing the final log +
+  // error text) but downstream consumers (ReviewActionBar) stop treating
+  // it as running.
+  const markDone = (kind: Kind, sessionId: string) => {
+    const sig = kind === "comment-fix" ? activeCommentFixSession : activeReviewSession;
+    const cur = sig.value;
+    if (cur && cur.sessionId === sessionId && cur.done !== true) {
+      sig.value = { ...cur, done: true };
+    }
+  };
+
   useEffect(() => {
     if (!open || !active) return undefined;
     setLines("");
@@ -52,11 +68,16 @@ export function ReviewSessionDrawer({ prNumber, repoRoot }: Props) {
         setLines((prev) => (prev ? `${prev}\n${text}` : text));
       },
       onDone: (e) => {
-        setTerminalState(e.exitCode === 0 ? "done" : "failed");
+        const failed = e.exitCode !== 0 || e.error != null;
+        setTerminalState(failed ? "failed" : "done");
         setCloseError(e.error);
+        if (failed) {
+          const label = active.kind === "comment-fix" ? "Comment fix" : "Forge review";
+          showToast(`${label} failed: ${e.error ?? `exit code ${e.exitCode}`}`, "error");
+        }
         void loadReviewBundle(prNumber, repoRoot);
-        if (active.kind === "comment-fix") activeCommentFixSession.value = null;
-        else activeReviewSession.value = null;
+        void loadReviewRuns(prNumber, repoRoot);
+        markDone(active.kind, active.sessionId);
       },
       onError: () => {
         setCloseError("log stream interrupted");

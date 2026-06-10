@@ -1,8 +1,8 @@
-# Build Path — Forge → Juicer
+# Build Path — Forge → Juicer (archived plan)
 
-How we get from the existing TypeScript codebase to the polished Rust product, why it's two tracks, and the gate that moves us from one to the other.
+How we planned to get from the existing TypeScript codebase to a polished Rust product, why it was two tracks, and the gate that would have moved us from one to the other.
 
-> ⚠️ **Revised 2026-06 — see [ADR-0030](adr/0030-strategy-reset-surfaces-commoditized.md).** The Track A → Track B gate is **suspended**: the surfaces that Track B would polish have commoditized (Claude Code Routines/Workflow), so the Rust build is paused. The gate no longer fires on "Track A surfaces validated" alone — it requires the validation experiment to prove a product-shaped need beyond an operator-scoped skill pack.
+> 🗄️ **Archived 2026-06.** Forge (TypeScript, this repo) **is the deliverable** — there is no Track A → Track B gate anymore. The Rust/GPUI plan this document describes is archived at [`archive/ROADMAP-track-b-juicer.md`](archive/ROADMAP-track-b-juicer.md) and returns only if a product-shaped need revives it. The current plan is [`ROADMAP.md`](ROADMAP.md) (phases F0/F1/F2). **Everything below is the historical record of the two-track plan, kept for context — do not read it as current.**
 
 ---
 
@@ -106,7 +106,9 @@ The schema portability is intentional: I want the prototype to feed forward into
 
 ## What this means for the roadmap
 
-The phases on the ROADMAP map onto the tracks like this:
+> **Stale:** these phases no longer exist. The current ROADMAP is structured as F0 (production hardening) → F1 (one-shot quality) → F2 (scale the operator), with no track split.
+
+The phases on the (since-replaced) ROADMAP mapped onto the tracks like this:
 
 - **Track A — Forge (TypeScript)**
   - Phase A0: extend Forge's existing architecture into the new module structure

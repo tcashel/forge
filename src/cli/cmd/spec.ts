@@ -296,7 +296,16 @@ export async function saveSpec(opts: SaveSpecOpts, store: ForgeStore): Promise<S
   const specPath = store.writeSpec(id, fullSpec);
   task.specFile = specPath;
   store.upsertPlan(task);
-  recordPlanCreated(store.db.db, task, fullSpec);
+  // Phase 3 dual-write: DB failure is warned, not fatal — the spec file +
+  // index.json above are the live source of truth during the cutover.
+  // Failing here would report a save error for a plan that already exists,
+  // and a retry would mint a duplicate plan id.
+  try {
+    recordPlanCreated(store.db.db, task, fullSpec);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    process.stderr.write(`warn: failed to record plan ${id} in SQLite: ${msg}\n`);
+  }
 
   const repoConfig = store.getRepoConfig(opts.repoRoot);
   const skip = opts.autoImprove === false || repoConfig.autoImprove === false || hasFrontmatter;

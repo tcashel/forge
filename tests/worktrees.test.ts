@@ -45,15 +45,52 @@ function makeEntry(overrides: Partial<WorktreeEntry> = {}): WorktreeEntry {
 }
 
 function tmpDir(prefix: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  // realpath: on macOS os.tmpdir() is a /var → /private/var symlink, and
+  // listWorktrees compares realpathed repo roots against Plan.repoRoot, so a
+  // symlinked fixture path silently drops plan linkage.
+  return fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), prefix)));
 }
 
+// Isolate test git invocations from the operator's config: a global
+// commit.gpgsign=true (e.g. 1Password signing) makes every test commit fail
+// or hang on a signing prompt. Identity comes from -c so no config file is
+// consulted.
+// Built per call (not a module-level snapshot) so the overrides win over any
+// live process.env mutation — the isolation regression test depends on this.
+function gitIsolatedEnv(): NodeJS.ProcessEnv {
+  return {
+    ...process.env,
+    GIT_CONFIG_GLOBAL: "/dev/null",
+    GIT_CONFIG_SYSTEM: "/dev/null",
+    GIT_CONFIG_NOSYSTEM: "1",
+  };
+}
+
+const GIT_IDENTITY_FLAGS = [
+  "-c",
+  "user.name=Test",
+  "-c",
+  "user.email=test@example.com",
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "tag.gpgsign=false",
+];
+
 function git(repoRoot: string, args: string[]): string {
-  return execFileSync("git", ["-C", repoRoot, ...args], { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  return execFileSync("git", ["-C", repoRoot, ...GIT_IDENTITY_FLAGS, ...args], {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    env: gitIsolatedEnv(),
+  }).trim();
 }
 
 function gitRaw(args: string[]): string {
-  return execFileSync("git", args, { encoding: "utf-8", stdio: ["pipe", "pipe", "pipe"] }).trim();
+  return execFileSync("git", [...GIT_IDENTITY_FLAGS, ...args], {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    env: gitIsolatedEnv(),
+  }).trim();
 }
 
 function makePlan(overrides: Partial<Plan> = {}): Plan {
@@ -82,6 +119,38 @@ function makePlan(overrides: Partial<Plan> = {}): Plan {
     ...overrides,
   };
 }
+
+// ─── git helper isolation ────────────────────────────────────────────────────
+
+test("git helpers ignore a hostile global config (commit.gpgsign=true with a broken signer)", () => {
+  // Regression: helpers used to inherit the operator's global gitconfig, so
+  // commit.gpgsign=true (e.g. 1Password signing) failed every test commit
+  // with "gpg: signing failed: No secret key" — 8 deterministic failures on
+  // signing machines. The helpers must pin GIT_CONFIG_GLOBAL=/dev/null so a
+  // hostile config in the inherited env can never reach git.
+  const dir = tmpDir("forge-wt-gpg-isolation-");
+  const prevGlobal = process.env.GIT_CONFIG_GLOBAL;
+  try {
+    const hostileConfig = path.join(dir, "hostile-gitconfig");
+    fs.writeFileSync(
+      hostileConfig,
+      ["[commit]", "\tgpgsign = true", "[gpg]", "\tprogram = /nonexistent/forge-test-signer", ""].join("\n"),
+    );
+    process.env.GIT_CONFIG_GLOBAL = hostileConfig;
+
+    const repoDir = path.join(dir, "repo");
+    fs.mkdirSync(repoDir);
+    git(repoDir, ["init", "-b", "main"]);
+    fs.writeFileSync(path.join(repoDir, "README.md"), "hello\n");
+    git(repoDir, ["add", "README.md"]);
+    git(repoDir, ["commit", "-m", "init"]);
+    assert.equal(git(repoDir, ["log", "--format=%s", "-1"]), "init");
+  } finally {
+    if (prevGlobal !== undefined) process.env.GIT_CONFIG_GLOBAL = prevGlobal;
+    else delete process.env.GIT_CONFIG_GLOBAL;
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
+});
 
 // ─── computeSafety verdict matrix ────────────────────────────────────────────
 
@@ -631,5 +700,40 @@ test("listWorktrees derives linkage from jobs.worktree_path when Plan.worktree i
     fs.rmSync(forgeDir, { recursive: true, force: true });
     fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
     fs.rmSync(repoDir, { recursive: true, force: true });
+  }
+});
+
+test("ensureWorktreeForBranch bootstraps deps when reusing an existing worktree", async () => {
+  // A reused worktree may never have had `bun install` run (created outside
+  // Forge) — quality gates then die on missing toolchains. Live regression
+  // from the PR #68 comment-fix run ('tsc: command not found').
+  const repoDir = tmpDir("forge-wt-boot-");
+  try {
+    git(repoDir, ["init", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(
+      path.join(repoDir, "package.json"),
+      `${JSON.stringify({ name: "boot-fixture", private: true })}\n`,
+    );
+    fs.writeFileSync(path.join(repoDir, "bun.lock"), "{}\n");
+    git(repoDir, ["add", "-A"]);
+    git(repoDir, ["commit", "-m", "init"]);
+
+    const branch = "forge-boot-test";
+    const wtPath = path.join(path.dirname(repoDir), "worktrees", branch);
+    fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+    git(repoDir, ["worktree", "add", "-b", branch, wtPath]);
+    assert.ok(!fs.existsSync(path.join(wtPath, "node_modules")), "fixture starts without node_modules");
+
+    const res = await ensureWorktreeForBranch(repoDir, branch);
+    assert.equal(res.error, null);
+    assert.ok(
+      fs.existsSync(path.join(fs.realpathSync(res.worktreePath), "node_modules")),
+      "reuse path bootstrapped deps",
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
   }
 });

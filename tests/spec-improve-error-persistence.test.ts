@@ -9,14 +9,18 @@ import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 function withTmpHome(t: { after: (fn: () => void) => void }): ForgeStore {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "forge-improve-persist-"));
-  const prev = process.env.HOME;
-  process.env.HOME = home;
   t.after(() => {
     fs.rmSync(home, { recursive: true, force: true });
-    if (prev !== undefined) process.env.HOME = prev;
-    else delete process.env.HOME;
   });
-  return new ForgeStore();
+  // Pass forgeDir explicitly: under Bun, os.homedir() does not reflect
+  // mid-run process.env.HOME mutation, so an env-based redirect silently
+  // writes into the operator's real ~/.forge.
+  const store = new ForgeStore({ forgeDir: path.join(home, ".forge") });
+  assert.ok(
+    !store.forgeDir.startsWith(path.join(os.homedir(), ".forge")),
+    "test store must never resolve to the real ~/.forge",
+  );
+  return store;
 }
 
 function seedDraft(store: ForgeStore, id: string, lastImproveError: Plan["lastImproveError"] = null): Plan {
@@ -76,6 +80,18 @@ const NOOP_RESULT: ImproveResult = {
   openQuestionsRecorded: 0,
   deferredCount: 0,
 };
+
+test("withTmpHome isolates plan writes from the operator's real ~/.forge", (t) => {
+  // Regression: this file previously redirected via process.env.HOME, which
+  // os.homedir() ignores under Bun — fixture plans landed in the real store.
+  const store = withTmpHome(t);
+  assert.ok(store.forgeDir.startsWith(os.tmpdir()), "store must live under the OS tmp dir");
+  assert.ok(!store.indexFile.startsWith(path.join(os.homedir(), ".forge")));
+
+  seedDraft(store, "task-isolation-sentinel-002");
+  assert.ok(fs.existsSync(store.indexFile), "index must be written in the tmp store");
+  assert.ok(store.getPlan("task-isolation-sentinel-002"), "plan must be readable from the tmp store");
+});
 
 test("persistImproveOutcome stores the error string + mode + timestamp on skipped", (t) => {
   const store = withTmpHome(t);

@@ -21,6 +21,13 @@ export interface ReviewerPromptArgs {
   ciChecks: string;
   diff: string;
   linkedSpec: string | null;
+  /**
+   * Findings a prior review pass already reported on this PR. Fed back so a
+   * re-review reuses their exact titles/lines for defects it re-confirms —
+   * the finding id hashes file|line|title, so stable wording keeps publishing
+   * idempotent across passes (the colocated-anchor dedup is the backstop).
+   */
+  priorFindings?: ForgeFinding[];
 }
 
 function loadSkillBody(skillsDir: string): string {
@@ -95,6 +102,22 @@ export function buildReviewerPrompt(args: ReviewerPromptArgs): string {
     ? `## Linked Forge spec\n\n\`\`\`markdown\n${args.linkedSpec}\n\`\`\`\n`
     : "## Linked Forge spec\n\n(no forge spec linked to this branch — review against general engineering criteria)\n";
 
+  const priorSection =
+    args.priorFindings && args.priorFindings.length > 0
+      ? [
+          "## Previously reported findings",
+          "",
+          "A prior review pass already reported these. If a defect below is still present, re-report it",
+          "with the SAME title and file:line, verbatim — do not rephrase. Only mint new wording for",
+          "genuinely new findings. If a defect below is fixed, simply omit it.",
+          "",
+          ...args.priorFindings.map(
+            (f) => `- [${f.severity}] ${f.title} (${f.file}${f.lineStart > 0 ? `:${f.lineStart}` : ""})`,
+          ),
+          "",
+        ].join("\n")
+      : null;
+
   return [
     prefixWithPr,
     "## PR metadata",
@@ -111,6 +134,7 @@ export function buildReviewerPrompt(args: ReviewerPromptArgs): string {
     "",
     specSection,
     "",
+    ...(priorSection ? [priorSection, ""] : []),
     "## Diff",
     "",
     "```diff",
@@ -167,33 +191,78 @@ function classifyFence(line: string): { fence: boolean; opening: boolean } {
  * Fix / later finding. We instead scan line-by-line and track fence depth
  * so nested code blocks are preserved and only the matching outer fence
  * closes the review.
+ *
+ * A bare ``` is ambiguous: it closes the innermost open block, but reviewers
+ * also OPEN evidence snippets with a bare fence (no info string). Treating
+ * every bare fence at depth 1 as the outer closer truncated the review at
+ * the first bare-opened snippet, silently dropping every later finding.
+ *
+ * Resolution: only the LAST opener's block can win, so only it gets the
+ * pairing heuristic — a bare fence at its depth 1 is a nested OPENER when
+ * another bare fence follows before EOF (the snippet's close); only the
+ * final unpaired bare fence closes the review. Over-capture of trailing
+ * chatter is the accepted failure mode — the section parsers ignore it —
+ * truncation is not. Earlier (echoed-template) blocks keep the eager-close
+ * behavior so prompt-echo chatter full of fences can't cascade a misjudged
+ * fence into swallowing the real block; a forge-review opener encountered
+ * at depth 1 additionally restarts the capture (unterminated-block rescue).
  */
+const FORGE_REVIEW_OPENER = /^\s{0,3}```forge-review\s*$/;
+
+function hasBareFenceAhead(lines: string[], from: number): boolean {
+  for (let j = from; j < lines.length; j++) {
+    const f = classifyFence(lines[j]);
+    if (f.fence && !f.opening) return true;
+  }
+  return false;
+}
+
 export function extractLastForgeReviewBlock(rawMd: string): string | null {
   if (!rawMd) return null;
   const lines = rawMd.split(/\r?\n/);
+  let lastOpenerIdx = -1;
+  for (let j = 0; j < lines.length; j++) {
+    if (FORGE_REVIEW_OPENER.test(lines[j])) lastOpenerIdx = j;
+  }
+  if (lastOpenerIdx === -1) return null;
+
   let last: string | null = null;
   let i = 0;
   while (i < lines.length) {
-    if (!/^\s{0,3}```forge-review\s*$/.test(lines[i])) {
+    if (!FORGE_REVIEW_OPENER.test(lines[i])) {
       i++;
       continue;
     }
     // Opening forge-review fence — capture until the matching close,
     // tracking nested fences so an inner ```text doesn't end the block.
+    const isLastBlock = i === lastOpenerIdx;
     const buf: string[] = [];
     let depth = 1;
     i++;
     while (i < lines.length && depth > 0) {
       const line = lines[i];
+      if (depth === 1 && FORGE_REVIEW_OPENER.test(line)) {
+        // A forge-review opener directly at depth 1 means the current block
+        // was unterminated — close the capture here; the outer loop restarts
+        // on this line so it can never swallow a later (real) review block.
+        break;
+      }
       const f = classifyFence(line);
       if (f.fence && f.opening) {
         depth++;
         buf.push(line);
-      } else if (f.fence) {
+      } else if (f.fence && depth > 1) {
+        // Bare fence inside a nested block — closes it.
         depth--;
-        // A bare fence at depth>0 closes a *nested* block — keep it. At
-        // depth 0 it closes the forge-review block itself — drop it.
-        if (depth > 0) buf.push(line);
+        buf.push(line);
+      } else if (f.fence && isLastBlock && hasBareFenceAhead(lines, i + 1)) {
+        // Bare fence at depth 1 with a paired bare closer ahead — it OPENS a
+        // nested snippet (evidence without an info string). Keep it.
+        depth++;
+        buf.push(line);
+      } else if (f.fence) {
+        // Outer closer (or eager close for a non-last block). Drop it.
+        depth = 0;
       } else {
         buf.push(line);
       }

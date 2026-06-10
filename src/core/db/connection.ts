@@ -16,9 +16,9 @@ import { runMigrations } from "./migrations.ts";
 
 export interface ForgeDbOptions {
   /**
-   * Override the forge state directory. Defaults to `~/.forge/`. Tests
-   * pass an explicit path to isolate state. Matches the same pattern as
-   * `ForgeStore`.
+   * Override the forge state directory. Defaults to `$FORGE_HOME` when set,
+   * else `~/.forge/`. Tests pass an explicit path to isolate state. Matches
+   * the same pattern as `ForgeStore`.
    */
   forgeDir?: string;
   /** Override the migrations directory (tests). */
@@ -31,13 +31,17 @@ export class ForgeDb {
   readonly db: Database;
 
   constructor(opts: ForgeDbOptions = {}) {
-    this.forgeDir = opts.forgeDir ?? path.join(os.homedir(), ".forge");
+    this.forgeDir = opts.forgeDir ?? process.env.FORGE_HOME ?? path.join(os.homedir(), ".forge");
     fs.mkdirSync(this.forgeDir, { recursive: true });
     this.dbFile = path.join(this.forgeDir, "forge.db");
     this.db = new Database(this.dbFile);
     this.db.exec("PRAGMA journal_mode=WAL");
     this.db.exec("PRAGMA foreign_keys=ON");
     this.db.exec("PRAGMA synchronous=NORMAL");
+    // bun:sqlite defaults busy_timeout to 0, so overlapping writers (serve
+    // timers, CLI commands, the runner's `forge session` subprocesses) throw
+    // SQLITE_BUSY immediately instead of waiting for the write lock.
+    this.db.exec("PRAGMA busy_timeout=5000");
     runMigrations(this.db, { migrationsDir: opts.migrationsDir });
   }
 

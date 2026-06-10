@@ -106,6 +106,20 @@ function isJsonRequested(argv: string[]): boolean {
   return argv.includes("--json");
 }
 
+/**
+ * True when any token asks for help. Scans the FULL argv remainder — not
+ * just position 0 — so `forge launch <id> --help` shows help instead of
+ * actually launching an agent (cli-help-after-positional-executes-command).
+ * A bare `--` terminator ends the scan: everything after it is payload.
+ */
+export function wantsHelp(argv: string[]): boolean {
+  for (const token of argv) {
+    if (token === "--") return false;
+    if (token === "--help" || token === "-h") return true;
+  }
+  return false;
+}
+
 export async function run(argv: string[]): Promise<void> {
   if (argv.length === 0 || argv[0] === "--help" || argv[0] === "-h") {
     printUsage();
@@ -120,8 +134,10 @@ export async function run(argv: string[]): Promise<void> {
   const rest = argv.slice(1);
 
   // Per-command --help: print the cmd's HELP const and exit 0 before any
-  // store/dispatch work. First-position only; e.g. `forge launch --help`.
-  if (rest[0] === "--help" || rest[0] === "-h") {
+  // store/dispatch work. Scans the whole remainder so a trailing --help on
+  // a mutating command (`forge launch <id> --help`) can never execute it.
+  // Internal __worker verbs have no HELP entry and fall through untouched.
+  if (wantsHelp(rest)) {
     const helpText = HELP_BY_CMD[cmd];
     if (helpText) {
       process.stdout.write(helpText);
@@ -207,7 +223,10 @@ export async function run(argv: string[]): Promise<void> {
         runExtractReviewBlock(rest);
         return;
       default: {
-        const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, { exitCode: 1 });
+        const e = new CliError("UNKNOWN_CMD", `Unknown command: ${cmd}`, {
+          hint: "Run `forge --help` for the list of commands.",
+          exitCode: 1,
+        });
         emitError(e, json);
         process.exit(e.exitCode);
       }

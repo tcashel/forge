@@ -38,6 +38,7 @@ import { fetchPrBundle, parseApiHost, parseNameWithOwner } from "../../core/gh-p
 import { fetchReviewThreads, replyToReviewComment, resolveReviewThread } from "../../core/gh-pr-write.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
+import { reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { ensureWorktreeForBranch } from "../../core/worktrees.ts";
 import { findLatestForgeFindings } from "./review-actions.ts";
@@ -46,6 +47,39 @@ const SCHEMA_VERSION = 1;
 const COMMENT_VIEW_FIELDS = "headRefName";
 const DIFF_BUDGET = 60_000;
 
+// Subprocess budgets — the worker is detached and headless, so a hung
+// git/gh/agent call would otherwise leave the session 'running' forever.
+const GIT_CMD_TIMEOUT_MS = 30_000;
+const GH_CMD_TIMEOUT_MS = 60_000;
+const GIT_COMMIT_TIMEOUT_MS = 120_000;
+const GIT_PUSH_TIMEOUT_MS = 300_000;
+const QUALITY_CMD_TIMEOUT_MS = 30 * 60_000;
+const DEFAULT_FIXER_TIMEOUT_MINUTES = 60;
+
+/**
+ * Env for git/gh subprocesses in the headless worker: GIT_TERMINAL_PROMPT=0
+ * turns interactive credential/host-key prompts into fast failures instead
+ * of indefinite hangs.
+ */
+function headlessGitEnv(env?: Record<string, string | undefined>): Record<string, string> {
+  return { ...(env ?? process.env), GIT_TERMINAL_PROMPT: "0" } as Record<string, string>;
+}
+
+/** True when an execFileSync error was a kill due to the `timeout` option. */
+function isExecTimeout(e: unknown): boolean {
+  return (e as { code?: unknown } | null)?.code === "ETIMEDOUT";
+}
+
+/**
+ * Lenient read of the per-repo fixer budget. `fixerTimeoutMinutes` is not yet
+ * on the RepoConfig type (owned by another module); fall back to 60 minutes.
+ */
+export function readFixerTimeoutMinutes(repoConfig: object): number {
+  const raw = (repoConfig as { fixerTimeoutMinutes?: unknown }).fixerTimeoutMinutes;
+  const n = typeof raw === "number" ? raw : Number(raw);
+  return Number.isFinite(n) && n > 0 ? n : DEFAULT_FIXER_TIMEOUT_MINUTES;
+}
+
 export type CommentFixStatus = "fixed" | "disputed" | "failed";
 
 export interface CommentFixStateEntry {
@@ -53,6 +87,8 @@ export interface CommentFixStateEntry {
   reason?: string;
   /** Mirror of ValidationFileEntry.ghResolved — surfaced to the Review UI. */
   ghResolved?: boolean;
+  /** Mirror of ValidationFileEntry.ghError — surfaced to the Review UI. */
+  ghError?: string;
 }
 
 export type CommentFixState = Record<string, CommentFixStateEntry>;
@@ -70,6 +106,12 @@ export interface ValidationFileEntry extends CommentValidationEntry {
    * targets with no GitHub write.
    */
   ghResolved?: boolean;
+  /**
+   * First-line detail when the GitHub write for this entry failed (resolve
+   * or dispute-reply). A failed write must be visible in validation.json,
+   * not just the session log.
+   */
+  ghError?: string;
 }
 
 /** Legacy on-disk validation entry (pre-token): keyed by numeric commentId. */
@@ -79,6 +121,7 @@ interface LegacyValidationFileEntry {
   status?: CommentFixStatus;
   reason?: string;
   ghResolved?: boolean;
+  ghError?: string;
 }
 
 /**
@@ -105,10 +148,23 @@ export interface RunCommentFixInput {
   targets: FixTarget[];
 }
 
+/** An operator-selected target the parent could not match on the PR. */
+export interface DroppedTarget {
+  token: string;
+  reason: string;
+}
+
 export interface RunCommentFixResult {
   sessionId: string;
   logStreamUrl: string;
   runDir: string;
+  /**
+   * Targets filtered out before the worker spawned (stale finding id,
+   * unanchored comment, missing review). The worker stamps these `failed`
+   * in validation.json; callers should surface them too so a partial
+   * selection never silently shrinks.
+   */
+  droppedTargets: DroppedTarget[];
 }
 
 interface CommentFixMeta {
@@ -161,6 +217,56 @@ function dedupeTargets(targets: unknown[]): FixTarget[] {
     out.push({ source: o.source, id });
   }
   return out;
+}
+
+/**
+ * Split the operator's selection into targets the fix can act on and targets
+ * that no longer match anything on the PR. Dropped targets carry an explicit
+ * per-token reason so they can be stamped `failed` rather than vanish.
+ */
+export function partitionFixTargets(
+  targets: FixTarget[],
+  match: { anchoredCommentIds: Set<number>; reviewIds: Set<number>; findingIds: Set<string> },
+): { fixable: FixTarget[]; dropped: DroppedTarget[] } {
+  const fixable: FixTarget[] = [];
+  const dropped: DroppedTarget[] = [];
+  for (const t of targets) {
+    const token = targetKey(t.source, t.id);
+    if (t.source === "comment") {
+      if (match.anchoredCommentIds.has(Number(t.id))) fixable.push(t);
+      else dropped.push({ token, reason: "comment no longer anchored to the diff" });
+    } else if (t.source === "review") {
+      if (match.reviewIds.has(Number(t.id))) fixable.push(t);
+      else dropped.push({ token, reason: "review summary not found on this PR" });
+    } else if (match.findingIds.has(t.id)) {
+      fixable.push(t);
+    } else {
+      dropped.push({ token, reason: "finding not present in latest review run" });
+    }
+  }
+  return { fixable, dropped };
+}
+
+/** Parse `metrics.droppedTargets` back into a typed list (lenient). */
+function parseDroppedTargets(raw: unknown): DroppedTarget[] {
+  if (!Array.isArray(raw)) return [];
+  const out: DroppedTarget[] = [];
+  for (const item of raw) {
+    if (!item || typeof item !== "object") continue;
+    const o = item as Record<string, unknown>;
+    if (typeof o.token !== "string" || o.token.length === 0) continue;
+    out.push({ token: o.token, reason: typeof o.reason === "string" ? o.reason : "target could not be matched" });
+  }
+  return out;
+}
+
+/**
+ * Project parent-dropped targets into validation entries so they land in
+ * validation.json (and thus findLatestCommentFixState / the Review UI) as
+ * explicit failures instead of silently disappearing from the run.
+ */
+export function droppedTargetValidationEntries(dropped: DroppedTarget[]): ValidationFileEntry[] {
+  return dropped.map((d) => ({ targetId: d.token, verdict: "disputed", reason: d.reason, status: "failed" }));
 }
 
 /** Compose a fix-able body for a Forge finding from its structured fields. */
@@ -225,7 +331,8 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
       cwd: repoRoot,
-      env: ghEnv,
+      env: headlessGitEnv(ghEnv),
+      timeout: GH_CMD_TIMEOUT_MS,
     }).trim();
     try {
       const parsed = JSON.parse(out) as { headRefName?: string };
@@ -286,11 +393,10 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
       .findings.filter((f) => f.file)
       .map((f) => f.id),
   );
-  const fixableTargets = uniqueTargets.filter((t) => {
-    if (t.source === "comment") return anchoredCommentIds.has(Number(t.id));
-    if (t.source === "review") return reviewIds.has(Number(t.id));
-    if (t.source === "finding") return findingIds.has(t.id);
-    return false;
+  const { fixable: fixableTargets, dropped: droppedTargets } = partitionFixTargets(uniqueTargets, {
+    anchoredCommentIds,
+    reviewIds,
+    findingIds,
   });
   if (fixableTargets.length === 0) {
     throw new CliError(
@@ -300,7 +406,10 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     );
   }
 
-  // 8) Single-flight.
+  // 8) Single-flight. Reap first, then check: a worker that died before
+  //    finalizeSession (SIGKILL, OOM, reboot) leaves its row 'running'
+  //    forever and would otherwise 409-block this PR permanently.
+  reapStaleWorkerSessions(store);
   const inFlight = store.db.db
     .prepare(
       `SELECT id FROM sessions
@@ -368,6 +477,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
         repoRoot,
         worktreePath: seedWorktreePath,
         targets: fixableTargets,
+        droppedTargets,
         needsRehydrate,
         headRefName,
       } as unknown as Partial<import("../../core/db/writes.ts").SessionMetrics>),
@@ -394,6 +504,7 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
       env: ghEnv,
     });
     proc.unref();
+    recordWorkerPid(store, sessionId, proc.pid ?? null);
   } catch (e) {
     try {
       fs.closeSync(logFd);
@@ -420,7 +531,27 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     sessionId,
     logStreamUrl: `/api/sessions/${encodeURIComponent(sessionId)}/log`,
     runDir,
+    droppedTargets,
   };
+}
+
+/**
+ * Stamp the spawned worker's pid onto the session row (column + metrics)
+ * so a future reaper can detect a dead worker stuck at state='running'.
+ * Uses json_set so a concurrently-started worker's metrics rewrite of
+ * other keys can't be clobbered by a read-merge-write race.
+ */
+export function recordWorkerPid(store: ForgeStore, sessionId: string, pid: number | null): void {
+  if (pid == null) return;
+  try {
+    store.db.db
+      .prepare(
+        "UPDATE sessions SET pid = ?, metrics = json_set(COALESCE(metrics, '{}'), '$.workerPid', ?) WHERE id = ?",
+      )
+      .run(pid, pid, sessionId);
+  } catch {
+    /* pid is advisory until the reaper lands */
+  }
 }
 
 // ─── Child: forge __comment-fix-worker <sessionId> ───────────────────────────
@@ -459,6 +590,10 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   let worktreePath = typeof metrics.worktreePath === "string" ? metrics.worktreePath : "";
   const needsRehydrate = metrics.needsRehydrate === true;
   const targets = dedupeTargets(Array.isArray(metrics.targets) ? (metrics.targets as unknown[]) : []);
+  const droppedTargets = parseDroppedTargets(metrics.droppedTargets);
+  // Parent-dropped targets are stamped `failed` up front so they reach
+  // validation.json even if the worker dies before the agent finishes.
+  const droppedEntries = droppedTargetValidationEntries(droppedTargets);
 
   if (!runDir || prNum == null || !repoRoot || (!worktreePath && !needsRehydrate) || targets.length === 0) {
     const err = "session row missing runDir/prNum/repoRoot/worktreePath/targets in metrics";
@@ -484,6 +619,12 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
   const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
 
   process.stdout.write(`[forge:comment-fix-worker] starting fix on PR #${prNum} (${summarizeTargets(targets)})\n`);
+  if (droppedEntries.length > 0) {
+    for (const d of droppedTargets) {
+      process.stdout.write(`[forge:comment-fix-worker] dropped target ${d.token}: ${d.reason}\n`);
+    }
+    writeValidation(runDir, droppedEntries);
+  }
   if (needsRehydrate) {
     process.stdout.write(`[forge:comment-fix-worker] worktree absent — will rehydrate from ${headRefName}\n`);
   } else {
@@ -523,12 +664,18 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       // Persist the resolved path so future surfaces (forge worktree list,
       // a re-run) find it. `jobs` rows are append-only history.
       updatePlanWorktreePath(store, repoRoot, prNum, worktreePath, null);
-      // Update the session row's cwd + metrics so /api/sessions reflects reality.
-      const updatedMetrics = { ...metrics, worktreePath, needsRehydrate: false };
+      // Update the session row's cwd + metrics so /api/sessions reflects
+      // reality. json_set (not read-merge-write) so the parent's post-spawn
+      // workerPid stamp can't be lost to a stale in-memory snapshot.
       try {
         store.db.db
-          .prepare("UPDATE sessions SET cwd = ?, metrics = ? WHERE id = ?")
-          .run(worktreePath, JSON.stringify(updatedMetrics), sessionId);
+          .prepare(
+            `UPDATE sessions
+                SET cwd = ?,
+                    metrics = json_set(COALESCE(metrics, '{}'), '$.worktreePath', ?, '$.needsRehydrate', json('false'))
+              WHERE id = ?`,
+          )
+          .run(worktreePath, worktreePath, sessionId);
       } catch {
         /* annotation only */
       }
@@ -544,6 +691,8 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       headSha = execFileSync("git", ["-C", worktreePath, "rev-parse", "HEAD"], {
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
+        env: headlessGitEnv(),
+        timeout: GIT_CMD_TIMEOUT_MS,
       }).trim();
     } catch (e) {
       throw new Error(`git rev-parse HEAD failed in worktree: ${(e as Error).message}`);
@@ -650,7 +799,10 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       reasoningEffort: repoConfig.reviewerReasoningEffort,
     });
 
-    process.stdout.write("[forge:comment-fix-worker] invoking agent (validate then fix)\n");
+    const fixerTimeoutMinutes = readFixerTimeoutMinutes(repoConfig);
+    process.stdout.write(
+      `[forge:comment-fix-worker] invoking agent (validate then fix, budget ${fixerTimeoutMinutes}m)\n`,
+    );
     const rawFile = path.join(runDir, "fix-raw.md");
     const bashLine = `set -o pipefail; ${cmd} 2>&1 | tee "${rawFile.replace(/"/g, '\\"')}"`;
     try {
@@ -658,6 +810,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
         stdio: ["ignore", "inherit", "inherit"],
         env: ghEnv,
         cwd: worktreePath,
+        timeout: fixerTimeoutMinutes * 60_000,
       });
     } catch (e) {
       // Even on a non-zero exit the agent may have written a parseable
@@ -665,6 +818,9 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       // tokens/cost, mirroring the launch bash runner's failure branch.
       if (adapterStreamsTokens(adapter) && fs.existsSync(streamFile)) {
         metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+      }
+      if (isExecTimeout(e)) {
+        throw new Error(`fixer timed out after ${fixerTimeoutMinutes} minutes`);
       }
       const err = e as { status?: number; message?: string };
       throw new Error(`agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
@@ -703,16 +859,18 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
 
     // Optimistically stamp `valid` rows as `fixed` and `disputed` rows as `disputed`.
     // We'll re-stamp `valid` rows to `failed` if quality fails below.
-    const validationEntries: ValidationFileEntry[] = [];
+    // Parent-dropped targets ride along as pre-stamped `failed` entries.
+    const agentEntries: ValidationFileEntry[] = [];
     for (const token of allTokens) {
       const v = byToken.get(token);
       if (!v) continue;
-      validationEntries.push({ ...v, status: v.verdict === "valid" ? "fixed" : "disputed" });
+      agentEntries.push({ ...v, status: v.verdict === "valid" ? "fixed" : "disputed" });
     }
+    const validationEntries: ValidationFileEntry[] = [...droppedEntries, ...agentEntries];
     writeValidation(runDir, validationEntries);
-    const validCount = validationEntries.filter((v) => v.status === "fixed").length;
+    const validCount = agentEntries.filter((v) => v.status === "fixed").length;
     process.stdout.write(
-      `[forge:comment-fix-worker] validation: ${validCount} valid, ${validationEntries.length - validCount} disputed\n`,
+      `[forge:comment-fix-worker] validation: ${validCount} valid, ${agentEntries.length - validCount} disputed, ${droppedEntries.length} dropped\n`,
     );
 
     // Check whether the agent actually changed anything.
@@ -742,7 +900,7 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       }
       // Stage and commit only the files the agent changed (no `git add -A`).
       const validTokens = validationEntries.filter((v) => v.status === "fixed").map((v) => v.targetId);
-      commitAndPush(worktreePath, changedFiles, validTokens);
+      commitAndPush(worktreePath, changedFiles, validTokens, ghEnv);
       committedAndPushed = true;
     }
 
@@ -807,6 +965,8 @@ function assertWorktreeReadyForCommentFix(worktreePath: string, headRefName: str
       currentBranch = execFileSync("git", ["-C", worktreePath, "branch", "--show-current"], {
         encoding: "utf-8",
         stdio: ["pipe", "pipe", "pipe"],
+        env: headlessGitEnv(),
+        timeout: GIT_CMD_TIMEOUT_MS,
       }).trim();
     } catch (e) {
       const msg = e instanceof Error ? e.message : String(e);
@@ -826,6 +986,8 @@ function assertWorktreeReadyForCommentFix(worktreePath: string, headRefName: str
     dirty = execFileSync("git", ["-C", worktreePath, "status", "--porcelain"], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      env: headlessGitEnv(),
+      timeout: GIT_CMD_TIMEOUT_MS,
     });
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -843,6 +1005,8 @@ function isLiveWorktree(worktreePath: string): boolean {
     const root = execFileSync("git", ["-C", worktreePath, "rev-parse", "--show-toplevel"], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      env: headlessGitEnv(),
+      timeout: GIT_CMD_TIMEOUT_MS,
     }).trim();
     return root.length > 0;
   } catch {
@@ -941,7 +1105,8 @@ function runGhSafe(args: string[], env: Record<string, string>, cwd: string): st
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
       cwd,
-      env,
+      env: headlessGitEnv(env),
+      timeout: GH_CMD_TIMEOUT_MS,
     });
   } catch (e) {
     const err = e as { stderr?: string; message?: string };
@@ -1058,6 +1223,8 @@ function resolveCurrentHunk(worktreePath: string, file: string, line: number | n
     const out = execFileSync("git", ["-C", worktreePath, "diff", `--unified=5`, base, "--", file], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      env: headlessGitEnv(),
+      timeout: GIT_CMD_TIMEOUT_MS,
     });
     if (!out) return null;
     return extractHunkContaining(out, line);
@@ -1068,7 +1235,11 @@ function resolveCurrentHunk(worktreePath: string, file: string, line: number | n
 
 function isCommitReachable(worktreePath: string, sha: string): boolean {
   try {
-    execFileSync("git", ["-C", worktreePath, "cat-file", "-e", sha], { stdio: ["pipe", "pipe", "pipe"] });
+    execFileSync("git", ["-C", worktreePath, "cat-file", "-e", sha], {
+      stdio: ["pipe", "pipe", "pipe"],
+      env: headlessGitEnv(),
+      timeout: GIT_CMD_TIMEOUT_MS,
+    });
     return true;
   } catch {
     return false;
@@ -1103,6 +1274,8 @@ function listChangedFiles(worktreePath: string, headSha: string): string[] {
     const out = execFileSync("git", ["-C", worktreePath, "diff", "--name-only", headSha], {
       encoding: "utf-8",
       stdio: ["pipe", "pipe", "pipe"],
+      env: headlessGitEnv(),
+      timeout: GIT_CMD_TIMEOUT_MS,
     });
     return out
       .split(/\r?\n/)
@@ -1132,10 +1305,16 @@ function runQualityGates(
       execFileSync("bash", ["-c", cmd], {
         cwd: worktreePath,
         stdio: ["ignore", "inherit", "inherit"],
-        env: process.env,
+        env: headlessGitEnv(),
+        timeout: QUALITY_CMD_TIMEOUT_MS,
       });
-    } catch {
+    } catch (e) {
       ok = false;
+      if (isExecTimeout(e)) {
+        process.stdout.write(
+          `[forge:comment-fix-worker] quality command timed out after ${QUALITY_CMD_TIMEOUT_MS / 60_000}m: ${cmd}\n`,
+        );
+      }
     }
     const durationMs = Date.now() - start;
     try {
@@ -1154,7 +1333,7 @@ function rollbackWorktree(worktreePath: string, headSha: string, files: string[]
     execFileSync(
       "git",
       ["-C", worktreePath, "restore", `--source=${headSha}`, "--staged", "--worktree", "--", ...files],
-      { stdio: ["pipe", "inherit", "inherit"] },
+      { stdio: ["pipe", "inherit", "inherit"], env: headlessGitEnv(), timeout: GIT_CMD_TIMEOUT_MS },
     );
   } catch (e) {
     const msg = e instanceof Error ? e.message : String(e);
@@ -1237,6 +1416,7 @@ export async function resolvePublishedFindingThreads(args: {
           entry.ghResolved = true;
           log(`resolved review thread for finding ${target.id}`);
         } else {
+          entry.ghError = `resolve failed: ${res.error ?? "unknown"}`;
           log(`failed to resolve thread for finding ${target.id}: ${res.error ?? "unknown"}`);
         }
       } else if (entry.status === "disputed") {
@@ -1247,23 +1427,69 @@ export async function resolvePublishedFindingThreads(args: {
           opts,
         );
         if (res.ok) log(`replied with dispute reason on finding ${target.id}`);
-        else log(`failed to reply on finding ${target.id}: ${res.error ?? "unknown"}`);
+        else {
+          entry.ghError = `dispute reply failed: ${res.error ?? "unknown"}`;
+          log(`failed to reply on finding ${target.id}: ${res.error ?? "unknown"}`);
+        }
       }
       // `failed` → leave open, no write.
     } catch (e) {
+      entry.ghError = (e as Error).message;
       log(`GitHub write for finding ${target.id} failed (best-effort): ${(e as Error).message}`);
     }
   }
 }
 
-function commitAndPush(worktreePath: string, files: string[], validTokens: string[]): void {
+/**
+ * Commit + push the fixer's edits headlessly. `--no-gpg-sign` because a
+ * gpg/1Password signing prompt would hang the detached worker forever;
+ * GIT_TERMINAL_PROMPT=0 + timeouts for the same reason on credential/host
+ * prompts. Throws with an actionable message — the worker finalizes the
+ * session failed with it. Exported (with injectable timeouts) for tests.
+ */
+export function commitAndPush(
+  worktreePath: string,
+  files: string[],
+  validTokens: string[],
+  env: Record<string, string>,
+  timeoutsMs: { commit?: number; push?: number } = {},
+): void {
+  const gitEnv = headlessGitEnv(env);
+  const commitTimeoutMs = timeoutsMs.commit ?? GIT_COMMIT_TIMEOUT_MS;
+  const pushTimeoutMs = timeoutsMs.push ?? GIT_PUSH_TIMEOUT_MS;
   // Stage only the files the agent changed — never `git add -A`.
-  execFileSync("git", ["-C", worktreePath, "add", "--", ...files], { stdio: ["pipe", "inherit", "inherit"] });
+  execFileSync("git", ["-C", worktreePath, "add", "--", ...files], {
+    stdio: ["pipe", "inherit", "inherit"],
+    env: gitEnv,
+    timeout: GIT_CMD_TIMEOUT_MS,
+  });
   const fixed = dedupeTargets(validTokens.map((tok) => parseTargetKey(tok)).filter((t): t is FixTarget => t !== null));
   const summary = summarizeTargets(fixed);
   const msg = `fix(review): address PR feedback (${summary})`;
-  execFileSync("git", ["-C", worktreePath, "commit", "-m", msg], { stdio: ["pipe", "inherit", "inherit"] });
-  execFileSync("git", ["-C", worktreePath, "push"], { stdio: ["pipe", "inherit", "inherit"] });
+  try {
+    execFileSync("git", ["-C", worktreePath, "commit", "--no-gpg-sign", "-m", msg], {
+      stdio: ["pipe", "inherit", "inherit"],
+      env: gitEnv,
+      timeout: commitTimeoutMs,
+    });
+  } catch (e) {
+    const detail = isExecTimeout(e)
+      ? `timed out after ${Math.round(commitTimeoutMs / 1000)}s`
+      : `failed: ${(e as Error).message}`;
+    throw new Error(`git commit ${detail} — fixed edits are staged but uncommitted in ${worktreePath}`);
+  }
+  try {
+    execFileSync("git", ["-C", worktreePath, "push"], {
+      stdio: ["pipe", "inherit", "inherit"],
+      env: gitEnv,
+      timeout: pushTimeoutMs,
+    });
+  } catch (e) {
+    const detail = isExecTimeout(e)
+      ? `timed out after ${Math.round(pushTimeoutMs / 1000)}s`
+      : `failed: ${(e as Error).message}`;
+    throw new Error(`git push ${detail} — the fix commit is local; push manually from ${worktreePath}`);
+  }
 }
 
 // ─── State lookup (used by the review-bundle route) ──────────────────────────
@@ -1311,7 +1537,7 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
       const sessionFailed = meta.status === "failed";
       const out: CommentFixState = {};
       for (const entry of parsed) {
-        if (!entry || !entry.status) continue;
+        if (!entry?.status) continue;
         // Prefer the `source:id` token; fall back to a legacy numeric
         // commentId (coerced to `comment:<id>`) so pre-token runs still
         // surface their status in the UI.
@@ -1331,6 +1557,7 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
         if (sessionFailed && status === "fixed") status = "failed";
         out[token] = { status, reason: entry.reason };
         if (entry.ghResolved !== undefined) out[token].ghResolved = entry.ghResolved;
+        if (typeof entry.ghError === "string") out[token].ghError = entry.ghError;
       }
       return out;
     } catch {}

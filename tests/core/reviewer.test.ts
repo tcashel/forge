@@ -3,6 +3,7 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { test } from "node:test";
 import {
+  buildReviewerPrompt,
   extractLastForgeReviewBlock,
   parseForgeReviewFindings,
   parseForgeReviewVerdict,
@@ -185,6 +186,149 @@ test("extractLastForgeReviewBlock keeps nested ```text Evidence fences", () => {
   assert.equal(parseForgeReviewVerdict(block ?? ""), "request-changes");
 });
 
+test("extractLastForgeReviewBlock survives bare ``` evidence openers (no truncation)", () => {
+  // Regression (pub-bare-fence-truncates-findings): a bare ``` line OPENING an
+  // evidence snippet used to be classified as the outer closer, truncating the
+  // block mid-finding and silently dropping every later finding.
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "request-changes",
+    "",
+    "## Findings",
+    "",
+    "### [HIGH] first finding",
+    "**Where:** `src/a.ts:10`",
+    "**Evidence:**",
+    "```", // bare OPENER — must not close the forge-review block
+    "const x = 1;",
+    "```",
+    "**Why:** first why.",
+    "**Fix:** first fix.",
+    "",
+    "### [MEDIUM] second finding",
+    "**Where:** `src/b.ts:20`",
+    "**Why:** second why.",
+    "**Fix:** second fix.",
+    "",
+    "## What I Skipped",
+    "- nothing",
+    "```",
+    "tokens used: 99",
+  ].join("\n");
+
+  const block = extractLastForgeReviewBlock(raw);
+  assert.ok(block, "should find a block");
+  assert.match(block ?? "", /second finding/, "must not truncate at the bare evidence opener");
+  assert.match(block ?? "", /## What I Skipped/);
+  assert.ok(!(block ?? "").includes("tokens used"), "trailing chatter stays outside the block");
+
+  const findings = parseForgeReviewFindings(block ?? "");
+  assert.equal(findings.length, 2, "both findings survive the bare fence");
+  assert.match(findings[0].evidence ?? "", /const x = 1;/);
+  assert.match(findings[0].why, /first why/);
+  assert.match(findings[0].fix, /first fix/);
+  assert.match(findings[1].why, /second why/);
+});
+
+test("extractLastForgeReviewBlock handles mixed bare and info-string nested fences", () => {
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "block",
+    "",
+    "## Findings",
+    "",
+    "### [BLOCKER] mixed fences",
+    "**Where:** `src/c.ts:5`",
+    "**Evidence:**",
+    "```",
+    "bare snippet",
+    "```",
+    "**Why:** because.",
+    "**Fix:**",
+    "```diff",
+    "-old",
+    "+new",
+    "```",
+    "",
+    "## What I Verified",
+    "- [x] everything",
+    "```",
+  ].join("\n");
+  const block = extractLastForgeReviewBlock(raw);
+  assert.ok(block);
+  assert.match(block ?? "", /## What I Verified/);
+  const findings = parseForgeReviewFindings(block ?? "");
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].evidence ?? "", /bare snippet/);
+  assert.match(findings[0].fix, /\+new/);
+});
+
+test("extractLastForgeReviewBlock tolerates an unterminated inner fence", () => {
+  // The evidence fence opens with ```text and never closes — the block runs
+  // to EOF rather than returning null or dropping the captured findings.
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "request-changes",
+    "",
+    "## Findings",
+    "",
+    "### [HIGH] unterminated evidence",
+    "**Where:** `src/d.ts:1`",
+    "**Why:** matters.",
+    "**Fix:** patch it.",
+    "**Evidence:**",
+    "```text",
+    "snippet that never closes",
+  ].join("\n");
+  const block = extractLastForgeReviewBlock(raw);
+  assert.ok(block, "unterminated block still extracts");
+  const findings = parseForgeReviewFindings(block ?? "");
+  assert.equal(findings.length, 1);
+  assert.match(findings[0].why, /matters/);
+});
+
+test("extractLastForgeReviewBlock still picks the real block when echoed prompt chatter contains fences", () => {
+  // Codex echoes the whole prompt — template forge-review block followed by
+  // ```json metadata / bare CI fences / ```diff — before the real review. A
+  // misjudged bare fence in the echo must not swallow the real block.
+  const raw = [
+    "```forge-review",
+    "## Verdict",
+    "<approve | request-changes | block>",
+    "```",
+    "",
+    "## PR metadata",
+    "```json",
+    '{"number": 7}',
+    "```",
+    "## CI checks",
+    "```",
+    "all green",
+    "```",
+    "## Diff",
+    "```diff",
+    "+x",
+    "```",
+    "",
+    "codex",
+    "```forge-review",
+    "## Verdict",
+    "approve",
+    "",
+    "## Summary",
+    "The real review.",
+    "```",
+  ].join("\n");
+  const block = extractLastForgeReviewBlock(raw);
+  assert.ok(block);
+  assert.match(block ?? "", /The real review/);
+  assert.ok(!(block ?? "").includes("<approve | request-changes | block>"), "template echo must not win");
+  assert.equal(parseForgeReviewVerdict(block ?? ""), "approve");
+});
+
 test("parseForgeReviewVerdict reads the verdict line and rejects junk", () => {
   assert.equal(parseForgeReviewVerdict("## Verdict\napprove\n\n## Summary\nok"), "approve");
   assert.equal(parseForgeReviewVerdict("## Verdict\nrequest-changes\n"), "request-changes");
@@ -192,4 +336,46 @@ test("parseForgeReviewVerdict reads the verdict line and rejects junk", () => {
   assert.equal(parseForgeReviewVerdict("## Verdict\nmaybe\n"), null);
   assert.equal(parseForgeReviewVerdict("## Summary\nno verdict heading"), null);
   assert.equal(parseForgeReviewVerdict(""), null);
+});
+
+test("buildReviewerPrompt feeds prior findings back with a reuse-titles instruction", () => {
+  const prompt = buildReviewerPrompt({
+    prNum: 7,
+    repoName: "repo",
+    skillsDir: "/nonexistent",
+    prInfoJson: "{}",
+    ciChecks: "",
+    diff: "",
+    linkedSpec: null,
+    priorFindings: [
+      {
+        id: "aa11",
+        severity: "HIGH",
+        title: "Average calculation drops the last duration",
+        file: "scripts/live-review-target.ts",
+        lineStart: 6,
+        lineEnd: 12,
+        evidence: null,
+        why: "",
+        fix: "",
+      },
+    ],
+  });
+  assert.ok(prompt.includes("## Previously reported findings"));
+  assert.ok(prompt.includes("SAME title and file:line"));
+  assert.ok(prompt.includes("[HIGH] Average calculation drops the last duration (scripts/live-review-target.ts:6)"));
+});
+
+test("buildReviewerPrompt omits the prior-findings section when there are none", () => {
+  const prompt = buildReviewerPrompt({
+    prNum: 7,
+    repoName: "repo",
+    skillsDir: "/nonexistent",
+    prInfoJson: "{}",
+    ciChecks: "",
+    diff: "",
+    linkedSpec: null,
+    priorFindings: [],
+  });
+  assert.ok(!prompt.includes("Previously reported findings"));
 });

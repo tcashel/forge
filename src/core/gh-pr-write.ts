@@ -14,7 +14,8 @@
 
 import { partitionFindingsByDiff } from "./diff-anchoring.ts";
 import { buildFindingCommentBody, buildFindingMarker, extractFindingIds } from "./forge-comment-marker.ts";
-import { type GhFetchOpts, parseApiHost, parseNameWithOwner, runGh } from "./gh-pr.ts";
+import { flattenSlurpedPages, type GhFetchOpts, parseApiHost, parseNameWithOwner, runGh } from "./gh-pr.ts";
+import type { FindingPublishOutcome } from "./publish-record.ts";
 import type { ForgeFinding } from "./reviewer.ts";
 
 // Test seam: all gh invocations go through this indirection so tests can
@@ -24,6 +25,16 @@ type GhRunner = typeof runGh;
 let ghRunner: GhRunner = runGh;
 export function __setGhRunner(fn: GhRunner | null): void {
   ghRunner = fn ?? runGh;
+}
+
+/**
+ * Compose the diagnostic detail for a failed gh call. gh splits its failure
+ * story across streams (HTTP error JSON on stdout, message + status on
+ * stderr); fakes injected by tests may omit `stderr` entirely.
+ */
+function ghErrorDetail(res: { stdout?: string; stderr?: string }, fallback: string): string {
+  const parts = [res.stdout?.trim(), res.stderr?.trim()].filter((s): s is string => !!s && s.length > 0);
+  return parts.join(" — ") || fallback;
 }
 
 export interface ResolvedApiTarget {
@@ -42,11 +53,13 @@ export async function resolvePrApiTarget(prNum: number, opts: GhFetchOpts): Prom
     return { ownerRepo: opts.ownerRepo, apiHost: opts.apiHost ?? null };
   }
   const repoRes = await ghRunner(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], opts).catch(
-    () => ({ ok: false, stdout: "" }),
+    () => ({ ok: false, stdout: "", stderr: "", timedOut: false }),
   );
   const urlRes = await ghRunner(["pr", "view", String(prNum), "--json", "url", "--jq", ".url"], opts).catch(() => ({
     ok: false,
     stdout: "",
+    stderr: "",
+    timedOut: false,
   }));
   const url = urlRes.ok ? urlRes.stdout : "";
   const fallback = url ? parseNameWithOwner(url) : null;
@@ -58,26 +71,6 @@ export async function resolvePrApiTarget(prNum: number, opts: GhFetchOpts): Prom
 
 function hostArgsFor(apiHost: string | null): string[] {
   return apiHost ? ["--hostname", apiHost] : [];
-}
-
-/**
- * Parse the stdout of a `gh api --paginate --slurp` call into a flat array of
- * items. `--slurp` collects each page into an outer array (array-of-pages), so
- * a multi-page response is `[[...page1], [...page2]]` rather than a single
- * concatenated/invalid JSON blob. We flatten one level so callers see the same
- * flat item list whether the PR had one page or ten. A bare object (some
- * single-page error/edge shapes) or a flat array are both tolerated.
- */
-function flattenSlurpedPages<T>(stdout: string): T[] {
-  if (!stdout.trim()) return [];
-  const parsed = JSON.parse(stdout) as unknown;
-  if (!Array.isArray(parsed)) return [parsed as T];
-  const out: T[] = [];
-  for (const page of parsed) {
-    if (Array.isArray(page)) out.push(...(page as T[]));
-    else if (page != null) out.push(page as T);
-  }
-  return out;
 }
 
 export interface InlineCommentInput {
@@ -134,7 +127,7 @@ export async function postReviewWithInlineComments(
     ],
     { ...opts, inputJson: payload },
   );
-  return res.ok ? { ok: true } : { ok: false, error: res.stdout || "gh api reviews POST failed" };
+  return res.ok ? { ok: true } : { ok: false, error: ghErrorDetail(res, "gh api reviews POST failed") };
 }
 
 export interface ReviewThread {
@@ -206,7 +199,7 @@ export async function fetchReviewThreads(prNum: number, opts: GhFetchOpts): Prom
     // first request fetches from the start.
     if (after) args.push("-f", `after=${after}`);
 
-    const res = await ghRunner(args, opts).catch(() => ({ ok: false, stdout: "" }));
+    const res = await ghRunner(args, opts).catch(() => ({ ok: false, stdout: "", stderr: "", timedOut: false }));
     if (!res.ok || !res.stdout) break;
     let connection: ReviewThreadsPage | undefined;
     try {
@@ -251,7 +244,7 @@ export async function resolveReviewThread(threadId: string, opts: GhFetchOpts): 
     ],
     opts,
   );
-  return res.ok ? { ok: true } : { ok: false, error: res.stdout || "resolveReviewThread mutation failed" };
+  return res.ok ? { ok: true } : { ok: false, error: ghErrorDetail(res, "resolveReviewThread mutation failed") };
 }
 
 /**
@@ -278,10 +271,17 @@ export async function replyToReviewComment(
     ],
     { ...opts, inputJson: { body } },
   );
-  return res.ok ? { ok: true } : { ok: false, error: res.stdout || "reply POST failed" };
+  return res.ok ? { ok: true } : { ok: false, error: ghErrorDetail(res, "reply POST failed") };
 }
 
-export type PublishedFindingIdsResult = { ok: true; ids: Set<string> } | { ok: false; error: string };
+export type PublishedFindingIdsResult =
+  | { ok: true; ids: Set<string>; anchors: Set<string> }
+  | { ok: false; error: string };
+
+/** Key for the colocated-anchor dedup set: current anchor of a marker comment. */
+export function anchorKey(path: string, line: number): string {
+  return `${path}:${line}`;
+}
 
 /**
  * Fetch the set of finding ids already published on the PR — parsed from both
@@ -298,6 +298,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   if (!target) return { ok: false, error: "could not resolve owner/repo for gh api call" };
   const hostArgs = hostArgsFor(target.apiHost);
   const ids = new Set<string>();
+  const anchors = new Set<string>();
 
   // `--paginate --slurp`: across multiple pages gh emits one JSON array per
   // page collected into an outer array. Without `--slurp` a >1-page response is
@@ -306,14 +307,25 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   const inlineRes = await ghRunner(
     ["api", `repos/${target.ownerRepo}/pulls/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
     opts,
-  ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
+  ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
   if (!inlineRes.ok) {
-    return { ok: false, error: `could not fetch existing inline comments: ${inlineRes.stdout || "unknown"}` };
+    return { ok: false, error: `could not fetch existing inline comments: ${ghErrorDetail(inlineRes, "unknown")}` };
   }
   if (inlineRes.stdout) {
     try {
-      const arr = flattenSlurpedPages<{ body?: string }>(inlineRes.stdout);
-      for (const c of arr) for (const id of extractFindingIds(c.body ?? "")) ids.add(id);
+      const arr = flattenSlurpedPages<{ body?: string; path?: string; line?: number | null }>(inlineRes.stdout);
+      for (const c of arr) {
+        const markerIds = extractFindingIds(c.body ?? "");
+        for (const id of markerIds) ids.add(id);
+        // Marker comments also contribute their CURRENT anchor: re-reviews are
+        // LLM passes that re-title the same defect (new id), so exact-id dedup
+        // alone re-posts it. A still-anchored marker comment at the same
+        // path:line is treated as the same finding. `line` is null once the
+        // comment is outdated — those no longer claim an anchor.
+        if (markerIds.length > 0 && c.path && typeof c.line === "number") {
+          anchors.add(anchorKey(c.path, c.line));
+        }
+      }
     } catch (e) {
       return { ok: false, error: `could not parse existing inline comments: ${(e as Error).message}` };
     }
@@ -322,9 +334,9 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
   const reviewsRes = await ghRunner(
     ["api", `repos/${target.ownerRepo}/pulls/${prNum}/reviews`, "--paginate", "--slurp", ...hostArgs],
     opts,
-  ).catch((e) => ({ ok: false, stdout: String((e as Error)?.message ?? e) }));
+  ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
   if (!reviewsRes.ok) {
-    return { ok: false, error: `could not fetch existing reviews: ${reviewsRes.stdout || "unknown"}` };
+    return { ok: false, error: `could not fetch existing reviews: ${ghErrorDetail(reviewsRes, "unknown")}` };
   }
   if (reviewsRes.stdout) {
     try {
@@ -334,7 +346,7 @@ export async function fetchPublishedFindingIds(prNum: number, opts: GhFetchOpts)
       return { ok: false, error: `could not parse existing reviews: ${(e as Error).message}` };
     }
   }
-  return { ok: true, ids };
+  return { ok: true, ids, anchors };
 }
 
 function buildReviewBodySummary(outOfDiff: ForgeFinding[]): string {
@@ -349,11 +361,23 @@ function buildReviewBodySummary(outOfDiff: ForgeFinding[]): string {
   return lines.join("\n");
 }
 
+export type PublishResultState = "published" | "partial" | "failed" | "nothing-new" | "reconcile-failed";
+
 export interface PublishResult {
+  state: PublishResultState;
   posted: number;
   outOfDiff: number;
   skipped: number;
   skippedPost: boolean;
+  failed: number;
+  error: string | null;
+  /** Per-finding outcome for every finding passed in. */
+  findings: FindingPublishOutcome[];
+}
+
+/** GitHub rejects un-anchorable inline comments with HTTP 422. */
+function isAnchoring422(error: string): boolean {
+  return /\b422\b|unprocessable/i.test(error);
 }
 
 /**
@@ -361,6 +385,12 @@ export interface PublishResult {
  * ids, partitions remaining findings against the diff, posts a single review
  * with one inline comment per new in-diff finding plus a body listing new
  * out-of-diff findings. Skips the POST entirely when nothing new anchors.
+ *
+ * When the batched review POST fails with more than one inline comment, falls
+ * back to posting findings INDIVIDUALLY (one single-comment review each) so a
+ * single bad anchor can't sink the batch; a finding whose individual POST
+ * 422s on anchoring degrades to an out-of-diff body mention. Idempotency via
+ * the embedded markers makes retries of any partial outcome safe.
  */
 export async function publishReviewFindings(
   prNum: number,
@@ -373,18 +403,73 @@ export async function publishReviewFindings(
     // Reconciliation is a hard precondition: without a reliable view of what's
     // already on the PR we can't post without risking duplicates. Skip and log.
     log(`[publish] skipping review post — could not reconcile published findings: ${reconciled.error}`);
-    return { posted: 0, outOfDiff: 0, skipped: 0, skippedPost: true };
+    return {
+      state: "reconcile-failed",
+      posted: 0,
+      outOfDiff: 0,
+      skipped: 0,
+      skippedPost: true,
+      failed: args.findings.length,
+      error: reconciled.error,
+      findings: args.findings.map((f) => ({
+        id: f.id,
+        status: "failed" as const,
+        error: `reconcile failed: ${reconciled.error}`,
+      })),
+    };
   }
   const published = reconciled.ids;
   const { inDiff, outOfDiff } = partitionFindingsByDiff(args.findings, args.diff);
 
-  const newInDiff = inDiff.filter((a) => !published.has(a.finding.id));
+  // Two dedup layers: exact marker id, then colocated anchor. The id is
+  // sha1(file|lineStart|title), but a re-review is an independent LLM pass that
+  // routinely re-titles the same defect and shifts its line — so a new-id
+  // finding that anchors exactly where a live marker comment already sits is
+  // the same finding, not a new one. Verified live on PR #68: without this,
+  // every re-review duplicated every comment.
+  const colocated = inDiff.filter(
+    (a) => !published.has(a.finding.id) && reconciled.anchors.has(anchorKey(a.path, a.line)),
+  );
+  const newInDiff = inDiff.filter(
+    (a) => !published.has(a.finding.id) && !reconciled.anchors.has(anchorKey(a.path, a.line)),
+  );
   const newOutOfDiff = outOfDiff.filter((f) => !published.has(f.id));
   const skipped = args.findings.length - newInDiff.length - newOutOfDiff.length;
+  if (colocated.length > 0) {
+    log(
+      `[publish] ${colocated.length} finding(s) skipped — an existing Forge comment already anchors at the same line: ${colocated
+        .map((a) => anchorKey(a.path, a.line))
+        .join(", ")}`,
+    );
+  }
+  const outcomes: FindingPublishOutcome[] = [
+    ...args.findings
+      .filter((f) => published.has(f.id))
+      .map((f) => ({ id: f.id, status: "already-published" as const })),
+    // Colocated ≠ verified: the marker id was NOT found on the PR, we are
+    // inferring "same defect, re-titled" from the shared anchor. A distinct
+    // status keeps that inference visible in publish.json / the CLI outcome
+    // table, so a genuinely new same-line finding is auditable instead of
+    // silently passing as already-published.
+    ...colocated.map((a) => ({
+      id: a.finding.id,
+      status: "skipped-colocated" as const,
+      error: `existing Forge comment anchors at ${anchorKey(a.path, a.line)} — assumed re-titled duplicate`,
+    })),
+  ];
 
   if (newInDiff.length === 0 && newOutOfDiff.length === 0) {
     log(`[publish] nothing new to post (${skipped} already published)`);
-    return { posted: 0, outOfDiff: 0, skipped, skippedPost: true };
+    return {
+      state: "nothing-new",
+      posted: 0,
+      outOfDiff: 0,
+      skipped,
+      skippedPost: true,
+      failed: 0,
+      error: null,
+      findings: outcomes,
+    };
   }
 
   const inline: InlineCommentInput[] = newInDiff.map((a) => ({
@@ -399,12 +484,103 @@ export async function publishReviewFindings(
   const bodySummary = buildReviewBodySummary(newOutOfDiff);
 
   const res = await postReviewWithInlineComments(prNum, { commitId: args.commitId, inline, bodySummary }, opts);
-  if (!res.ok) {
-    log(`[publish] review post failed: ${res.error ?? "unknown"}`);
-    return { posted: 0, outOfDiff: 0, skipped, skippedPost: false };
+  if (res.ok) {
+    for (const a of newInDiff) outcomes.push({ id: a.finding.id, status: "posted" });
+    for (const f of newOutOfDiff) outcomes.push({ id: f.id, status: "out-of-diff-posted" });
+    log(
+      `[publish] posted ${newInDiff.length} inline, ${newOutOfDiff.length} out-of-diff, skipped ${skipped} already published`,
+    );
+    return {
+      state: "published",
+      posted: newInDiff.length,
+      outOfDiff: newOutOfDiff.length,
+      skipped,
+      skippedPost: false,
+      failed: 0,
+      error: null,
+      findings: outcomes,
+    };
   }
+
+  const batchError = res.error ?? "gh api reviews POST failed";
+  log(`[publish] batched review post failed: ${batchError}`);
+
+  // Per-finding fallback. Findings that 422 on anchoring (stale line/side on
+  // the named commit) degrade to an out-of-diff body mention instead of being
+  // dropped — at-least-once delivery with per-finding visibility.
+  let posted = 0;
+  const failures: string[] = [];
+  const demoted: ForgeFinding[] = [];
+
+  if (newInDiff.length === 1) {
+    // The batched POST WAS this finding's individual POST — don't repeat it.
+    const f = newInDiff[0].finding;
+    if (isAnchoring422(batchError)) {
+      demoted.push(f);
+    } else {
+      outcomes.push({ id: f.id, status: "failed", error: batchError });
+      failures.push(batchError);
+    }
+  } else {
+    for (let i = 0; i < newInDiff.length; i++) {
+      const finding = newInDiff[i].finding;
+      const single = await postReviewWithInlineComments(
+        prNum,
+        { commitId: args.commitId, inline: [inline[i]], bodySummary: "" },
+        opts,
+      );
+      if (single.ok) {
+        posted++;
+        outcomes.push({ id: finding.id, status: "posted" });
+        continue;
+      }
+      const err = single.error ?? "gh api reviews POST failed";
+      if (isAnchoring422(err)) {
+        demoted.push(finding);
+      } else {
+        outcomes.push({ id: finding.id, status: "failed", error: err });
+        failures.push(err);
+      }
+    }
+    if (posted > 0) log(`[publish] individual fallback posted ${posted}/${newInDiff.length} inline`);
+  }
+
+  // One body-only review carries the out-of-diff findings plus any demoted
+  // in-diff findings (their markers keep retries idempotent).
+  let outOfDiffPosted = 0;
+  const bodyFindings = [...newOutOfDiff, ...demoted];
+  if (bodyFindings.length > 0) {
+    if (demoted.length > 0) log(`[publish] ${demoted.length} finding(s) demoted to out-of-diff after anchoring 422`);
+    const bodyRes = await postReviewWithInlineComments(
+      prNum,
+      { commitId: args.commitId, inline: [], bodySummary: buildReviewBodySummary(bodyFindings) },
+      opts,
+    );
+    if (bodyRes.ok) {
+      outOfDiffPosted = bodyFindings.length;
+      for (const f of bodyFindings) outcomes.push({ id: f.id, status: "out-of-diff-posted" });
+    } else {
+      const err = bodyRes.error ?? "gh api reviews POST failed";
+      for (const f of bodyFindings) outcomes.push({ id: f.id, status: "failed", error: err });
+      failures.push(err);
+    }
+  }
+
+  const failedCount = outcomes.filter((o) => o.status === "failed").length;
+  const state: PublishResultState =
+    failedCount === 0 ? "published" : posted + outOfDiffPosted > 0 ? "partial" : "failed";
+  const error = failedCount > 0 ? failures.join("; ").slice(0, 500) || batchError : null;
   log(
-    `[publish] posted ${newInDiff.length} inline, ${newOutOfDiff.length} out-of-diff, skipped ${skipped} already published`,
+    `[publish] fallback result: ${posted} inline, ${outOfDiffPosted} out-of-diff, ${failedCount} failed, ${skipped} already published`,
   );
-  return { posted: newInDiff.length, outOfDiff: newOutOfDiff.length, skipped, skippedPost: false };
+  return {
+    state,
+    posted,
+    outOfDiff: outOfDiffPosted,
+    skipped,
+    skippedPost: false,
+    failed: failedCount,
+    error,
+    findings: outcomes,
+  };
 }

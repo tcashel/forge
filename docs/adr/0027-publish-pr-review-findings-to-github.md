@@ -1,6 +1,6 @@
 # ADR 0027 — Publish PR review findings to GitHub and resolve on fix
 
-**Status:** Accepted
+**Status:** Accepted (clarified by [`0031-review-publish-at-least-once-persisted-state`](./0031-review-publish-at-least-once-persisted-state.md) — drops the never-implemented `publishReviewToGitHub` config gate, makes delivery at-least-once with persisted state)
 **Deciders:** Tripp
 **Date:** 2026-05-31
 **Related:** [`0019-sessions-are-jobs`](./0019-sessions-are-jobs.md), [`../SCHEMA.md`](../SCHEMA.md)

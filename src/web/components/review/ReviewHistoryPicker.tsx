@@ -1,6 +1,12 @@
+import { useState } from "preact/hooks";
+import type { ApiError } from "../../lib/api";
+import { publishChip } from "../../lib/publish-chip";
+import { showToast } from "../../lib/toast";
 import {
   clearSelectedReviewRun,
   loadReviewRun,
+  loadReviewRuns,
+  retryPublish,
   reviewRuns,
   reviewRunsError,
   reviewRunsLoading,
@@ -8,7 +14,15 @@ import {
   selectedReviewRunId,
   selectedReviewRunLoading,
 } from "../../signals/review";
-import type { ReviewRunStatus, ReviewRunSummary, ReviewSeverityCounts, ReviewVerdict } from "../../types";
+import type {
+  FindingPublishOutcome,
+  PublishRecord,
+  ReviewRunDetail,
+  ReviewRunStatus,
+  ReviewRunSummary,
+  ReviewSeverityCounts,
+  ReviewVerdict,
+} from "../../types";
 import { timeAgo } from "../prs/pr-format";
 
 interface Props {
@@ -52,8 +66,62 @@ function newestCompleted(runs: ReviewRunSummary[]): ReviewRunSummary | null {
   return null;
 }
 
+function PublishChipSpan({ publish, placeholder = false }: { publish: PublishRecord | null; placeholder?: boolean }) {
+  const chip = publishChip(publish);
+  if (!chip) {
+    // Pre-publish-record runs have no publish.json; the row still renders
+    // a neutral placeholder so the history grid columns stay aligned.
+    if (!placeholder) return null;
+    return (
+      <span class="review-publish-chip pr-status none" title="No publish record for this run.">
+        —
+      </span>
+    );
+  }
+  return (
+    <span class={`review-publish-chip pr-status ${chip.className}`} title={chip.detail ?? undefined}>
+      {chip.label}
+    </span>
+  );
+}
+
+function outcomeLabel(o: FindingPublishOutcome): string {
+  if (o.status === "posted") return "posted";
+  if (o.status === "already-published") return "already published";
+  if (o.status === "out-of-diff-posted") return "posted (outside diff)";
+  return "failed";
+}
+
+/** Per-finding publish outcomes for the selected run's publish record. */
+function PublishDetail({ detail }: { detail: ReviewRunDetail }) {
+  const publish = detail.publish;
+  const chip = publishChip(publish);
+  if (!publish || !chip) return null;
+  return (
+    <div class="review-history-publish-detail">
+      <header class="review-history-publish-header">
+        <h3>Publish to PR</h3>
+        <PublishChipSpan publish={publish} />
+      </header>
+      {chip.detail ? <div class="review-status error">{chip.detail}</div> : null}
+      {publish.findings.length > 0 ? (
+        <ul class="review-history-publish-findings">
+          {publish.findings.map((o) => (
+            <li key={o.id} class={`publish-finding-outcome outcome-${o.status}`}>
+              <span class="publish-finding-id">{o.id}</span>
+              <span class={`pr-status ${o.status === "failed" ? "fail" : "pass"}`}>{outcomeLabel(o)}</span>
+              {o.error ? <span class="publish-finding-error"> — {o.error}</span> : null}
+            </li>
+          ))}
+        </ul>
+      ) : null}
+    </div>
+  );
+}
+
 export function ReviewHistoryPicker({ prNumber, repoRoot }: Props) {
   const runs = reviewRuns.value;
+  const [retryingId, setRetryingId] = useState<string | null>(null);
   if (runs.length === 0) return null;
 
   const loading = reviewRunsLoading.value;
@@ -74,6 +142,36 @@ export function ReviewHistoryPicker({ prNumber, repoRoot }: Props) {
 
   const onShowLatest = () => {
     clearSelectedReviewRun();
+  };
+
+  const onRetryPublish = async (run: ReviewRunSummary) => {
+    if (retryingId !== null) return;
+    setRetryingId(run.sessionId);
+    try {
+      const record = await retryPublish(prNumber, repoRoot, run.sessionId);
+      const chip = publishChip(record);
+      showToast(`Publish retried: ${chip?.label ?? record.state}`, record.state === "failed" ? "error" : "info");
+      await loadReviewRuns(prNumber, repoRoot);
+      // The selected detail carries its own publish record — refresh it too.
+      if (selectedId === run.sessionId) void loadReviewRun(prNumber, repoRoot, run.sessionId);
+    } catch (e) {
+      const apiErr = e as ApiError;
+      // Older servers don't expose the republish route yet — say so
+      // instead of surfacing a bare 404.
+      if (apiErr.code === "HTTP_404" || apiErr.code === "NOT_FOUND") {
+        showToast(
+          "Retry publish is not available on this server — run `forge review --publish-only` instead.",
+          "error",
+        );
+      } else {
+        showToast(
+          apiErr.hint ? `${apiErr.message} — ${apiErr.hint}` : apiErr.message || "Retry publish failed.",
+          "error",
+        );
+      }
+    } finally {
+      setRetryingId(null);
+    }
   };
 
   return (
@@ -100,6 +198,7 @@ export function ReviewHistoryPicker({ prNumber, repoRoot }: Props) {
           if (isLatestHighlight) classes.push("latest");
           if (isRunning) classes.push("running");
           const label = isRunning ? "Forge review in progress…" : countsSummary(run.findingCounts, run.findingsTotal);
+          const chip = publishChip(run.publish);
           return (
             <li key={run.sessionId}>
               <button
@@ -122,14 +221,30 @@ export function ReviewHistoryPicker({ prNumber, repoRoot }: Props) {
                     {verdictLabel(run.verdict)}
                   </span>
                 ) : null}
+                {!isRunning ? <PublishChipSpan publish={run.publish} placeholder /> : null}
                 <span class="review-history-counts">{label}</span>
                 {isLatestHighlight ? <span class="review-history-badge">latest</span> : null}
                 {isSelected && detailLoading ? <span class="review-history-status">Loading…</span> : null}
               </button>
+              {chip?.retryable ? (
+                <div class="review-history-row-actions">
+                  {chip.detail ? <span class="review-history-publish-error">{chip.detail}</span> : null}
+                  <button
+                    type="button"
+                    class="btn btn-secondary btn-retry-publish"
+                    disabled={retryingId !== null}
+                    onClick={() => void onRetryPublish(run)}
+                    title="Re-run the idempotent publish for this review's findings."
+                  >
+                    {retryingId === run.sessionId ? "Retrying…" : "Retry publish"}
+                  </button>
+                </div>
+              ) : null}
             </li>
           );
         })}
       </ul>
+      {selectedDetail && selectedId === selectedDetail.sessionId ? <PublishDetail detail={selectedDetail} /> : null}
     </section>
   );
 }

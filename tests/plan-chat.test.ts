@@ -1401,7 +1401,7 @@ test("cleanStderrTail returns null for empty / whitespace-only / null-byte stder
 });
 
 test("cleanStderrTail caps the result at the last ≤500 chars", () => {
-  const raw = "x".repeat(800) + "\nfinal-line";
+  const raw = `${"x".repeat(800)}\nfinal-line`;
   const cleaned = cleanStderrTail(raw);
   assert.ok(cleaned);
   // Final line survives at the tail.

@@ -20,14 +20,17 @@ import { ForgeStore, type Plan } from "../src/core/store.ts";
 
 function withTmpHome(t: { after: (fn: () => void) => void }): { home: string; store: ForgeStore } {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), "forge-improve-"));
-  const prev = process.env.HOME;
-  process.env.HOME = home;
   t.after(() => {
     fs.rmSync(home, { recursive: true, force: true });
-    if (prev !== undefined) process.env.HOME = prev;
-    else delete process.env.HOME;
   });
-  const store = new ForgeStore();
+  // Pass forgeDir explicitly: under Bun, os.homedir() does not reflect
+  // mid-run process.env.HOME mutation, so an env-based redirect silently
+  // writes into the operator's real ~/.forge.
+  const store = new ForgeStore({ forgeDir: path.join(home, ".forge") });
+  assert.ok(
+    !store.forgeDir.startsWith(path.join(os.homedir(), ".forge")),
+    "test store must never resolve to the real ~/.forge",
+  );
   return { home, store };
 }
 
@@ -195,6 +198,25 @@ function makeImproverMock(
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
+test("withTmpHome isolates all store writes from the operator's real ~/.forge", (t) => {
+  // Regression: this file previously redirected via process.env.HOME, which
+  // os.homedir() ignores under Bun — every test run upserted fixture plans
+  // into the operator's production index/specs/db.
+  const realForge = path.join(os.homedir(), ".forge");
+  const realSpec = path.join(realForge, "specs", "task-isolation-sentinel-001.md");
+  const { home, store } = withTmpHome(t);
+
+  assert.ok(store.forgeDir.startsWith(home), "store must live inside the mkdtemp dir");
+  assert.ok(store.indexFile.startsWith(home), "index must live inside the mkdtemp dir");
+
+  seedTask(store, "task-isolation-sentinel-001", "# Sentinel\n\nbody\n");
+  assert.ok(
+    fs.existsSync(path.join(store.forgeDir, "specs", "task-isolation-sentinel-001.md")),
+    "seed must land in the tmp store",
+  );
+  assert.ok(!fs.existsSync(realSpec), "seed must not land in the real ~/.forge");
+});
+
 test("extractActionableFindings filters by severity and classification", () => {
   const findings = extractActionableFindings(actionableRecs());
   assert.equal(findings.length, 2);
@@ -337,6 +359,40 @@ test("runImprover applied path bumps specVersion and writes frontmatter", async 
   // Body matches the improved body verbatim.
   const liveBody = live.replace(/^---[\s\S]*?---\n/, "").trimEnd();
   assert.equal(liveBody, improvedBody.trimEnd());
+});
+
+test("applied improve reports success even when the SQLite mirror write throws", async (t) => {
+  // Regression (data-unwrapped-dual-writes): recordPlanVersionAdded ran
+  // unguarded after the spec rewrite + index upsert, so a DB hiccup turned
+  // an already-applied improve into mode "skipped"/IMPROVE_FAILED — and the
+  // Workbench retry minted a spurious extra version.
+  const { store } = withTmpHome(t);
+  const body = "# Old Title\n\nOld body.\n";
+  const task = seedTask(store, "task-dbguard-001", body);
+
+  store.db.db.close(); // every subsequent DB write throws, mimicking SQLITE_BUSY
+
+  const stderrChunks: string[] = [];
+  const originalWrite = process.stderr.write.bind(process.stderr);
+  process.stderr.write = ((chunk: string | Uint8Array) => {
+    stderrChunks.push(typeof chunk === "string" ? chunk : Buffer.from(chunk).toString());
+    return true;
+  }) as typeof process.stderr.write;
+  t.after(() => {
+    process.stderr.write = originalWrite;
+  });
+
+  const improvedBody = "# New Title\n\nNew body with edits.\n";
+  const result = await runImprover(buildConfig(task, body), store, {
+    runCritiqueSync: makeCritiqueMock(actionableRecs()),
+    runImproverAgent: makeImproverMock("applied", improvedBody, "- Recommendation #1: did X"),
+  });
+
+  assert.equal(result.mode, "applied");
+  assert.equal(result.applied, true);
+  assert.equal(result.error, null);
+  assert.equal(store.getPlan(task.id)?.specVersion, 2, "spec apply persisted on the JSON side");
+  assert.match(stderrChunks.join(""), /warn: failed to record plan version v2/);
 });
 
 // ─── Critique failure ────────────────────────────────────────────────────────

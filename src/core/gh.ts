@@ -148,10 +148,11 @@ export function listGhAccounts(host: string = DEFAULT_HOST): { user: string; act
  * Used by the claude/codex bash runner so all `gh` calls in the script
  * pick up the configured account. Pure-string for testability.
  *
- * The snippet assumes `log` and `set_status` are already defined (they
- * are, at the top of the runner script). When user resolution fails it
- * marks the run as failed and exits 1 — better than running for 20
- * minutes and hitting the same gh error at PR creation time.
+ * The snippet assumes `log`, `set_meta_field`, and `set_status` are already
+ * defined (they are, at the top of the runner script). When user resolution
+ * fails it records an errorMessage, marks the run as failed, and exits 1 —
+ * better than running for 20 minutes and hitting the same gh error at PR
+ * creation time.
  *
  * Returns an empty string when no override is configured.
  */
@@ -168,6 +169,10 @@ export function bashGhEnvExport(target: GhTarget | undefined): string {
       `_FORGE_GH_TOKEN=$(gh auth token --hostname ${shellQuote(host)} --user ${shellQuote(target.user)} 2>/dev/null || true)`,
       `if [ -z "$_FORGE_GH_TOKEN" ]; then`,
       `  log "✗ Forge: gh user '${target.user}' on host '${host}' is not logged in. Run: gh auth login --hostname ${host}"`,
+      // errorMessage before set_status, mirroring the runner's other failure
+      // branches — without it the Workbench failure card shows a failed run
+      // with no reason.
+      `  set_meta_field "errorMessage" "\\"gh user '${target.user}' on host '${host}' is not logged in — run: gh auth login --hostname ${host}\\""`,
       `  set_status "failed"`,
       `  exit 1`,
       `fi`,

@@ -401,6 +401,8 @@ export interface CommentFixStateEntry {
   status: CommentFixStatus;
   reason?: string;
   ghResolved?: boolean;
+  /** First-line detail when the GitHub write (resolve/dispute-reply) failed. */
+  ghError?: string;
 }
 
 export type CommentFixState = Record<string, CommentFixStateEntry>;
@@ -424,6 +426,37 @@ export interface PrReviewBundle {
 export type ReviewRunStatus = "running" | "completed" | "failed" | "killed";
 export type ReviewVerdict = "approve" | "request-changes" | "block";
 
+// Mirror of FindingPublishOutcome / PublishRecord from src/core/publish-record.ts.
+export type FindingPublishStatus =
+  | "posted"
+  | "already-published"
+  | "skipped-colocated"
+  | "out-of-diff-posted"
+  | "failed";
+
+export interface FindingPublishOutcome {
+  id: string;
+  status: FindingPublishStatus;
+  error?: string;
+}
+
+export type PublishState = "published" | "partial" | "failed" | "nothing-new" | "not-requested" | "reconcile-failed";
+
+export interface PublishRecord {
+  schemaVersion: 1;
+  requested: boolean;
+  attemptedAt: string | null;
+  state: PublishState;
+  posted: number;
+  outOfDiff: number;
+  skipped: number;
+  failed: number;
+  error: string | null;
+  findings: FindingPublishOutcome[];
+  /** Set when the PR head moved between review start and publish. */
+  headMoved?: boolean;
+}
+
 export interface ReviewSeverityCounts {
   BLOCKER: number;
   HIGH: number;
@@ -441,6 +474,8 @@ export interface ReviewRunSummary {
   verdict: ReviewVerdict | null;
   findingsTotal: number;
   findingCounts: ReviewSeverityCounts;
+  /** Publish outcome from publish.json; null for pre-publish-record runs. */
+  publish: PublishRecord | null;
 }
 
 export interface ReviewRunDetail {
@@ -453,6 +488,14 @@ export interface ReviewRunDetail {
   verdict: ReviewVerdict | null;
   summary: string;
   findings: ForgeFinding[];
+  /** Publish outcome from publish.json; null for pre-publish-record runs. */
+  publish: PublishRecord | null;
+}
+
+/** An operator-selected fix target the server could not match on the PR. */
+export interface DroppedFixTarget {
+  token: string;
+  reason: string;
 }
 
 // ─── Plan chat ──────────────────────────────────────────────────────────────

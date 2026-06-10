@@ -60,6 +60,8 @@ function statusIcon(s: PlanStatus): string {
       return "✗";
     case "draft":
       return "○";
+    case "archived":
+      return "▪";
     default:
       return "⟳";
   }
@@ -106,7 +108,15 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     repoRoot = detected.root;
   }
 
-  let plans = store.getPlans(repoRoot).map(summarize);
+  // Reconcile each plan with its runner-owned meta.json before printing —
+  // the index status goes stale the moment the bash runner transitions, so
+  // without this `forge ls` (and its --status filter) lies about finished
+  // runs (cli-status-never-syncs-meta). Cheap: syncPlanStatus early-returns
+  // for terminal plans and is lock-safe for the rest.
+  let plans = store
+    .getPlans(repoRoot)
+    .map((p) => store.syncPlanStatus(p) ?? p)
+    .map(summarize);
   if (typeof values.status === "string") {
     const wanted = new Set(values.status.split(",").map((s) => s.trim()));
     plans = plans.filter((t) => wanted.has(t.status));

@@ -151,12 +151,15 @@ If any of those is false, the verdict is `request-changes` or `block`. There is 
 
 ## Publishing findings to the PR (opt-in)
 
-When the operator enables it (repo config `publishReviewToGitHub` **and** the
-per-review "Publish to PR" toggle), Forge publishes your findings to the PR as
-**GitHub inline review comments** after parsing them — you do nothing extra;
-just emit the `forge-review` block as usual. Each published comment embeds a
-hidden `<!-- forge-finding id=… -->` marker so re-running the review never
+When the operator opts in per request — the Workbench "Publish to PR" toggle
+or `forge review <pr> --run --publish`; that per-request opt-in is the only
+gate (ADR-0031) — Forge publishes your findings to the PR as **GitHub inline
+review comments** after parsing them — you do nothing extra; just emit the
+`forge-review` block as usual. Delivery is at-least-once with a persisted
+per-finding outcome (`publish.json` in the run dir), retryable via
+`forge review <pr> --publish-only`. Each published comment embeds a hidden
+`<!-- forge-finding id=… -->` marker so re-running the review never
 duplicates a comment already on the PR. Findings that don't land on a diff hunk
 are listed in the review summary body instead (GitHub rejects inline comments
-off the diff). With the toggle off, findings stay local — byte-for-byte the
+off the diff). Without the opt-in, findings stay local — byte-for-byte the
 prior behavior.

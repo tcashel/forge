@@ -1,11 +1,11 @@
-# Data Schema — Forge → Juicer
+# Data Schema — Forge
 
-SQLite schema. **Shared across both tracks** — Track A (Forge, TypeScript) writes it; Track B (Juicer, Rust) reads the exact same schema. This is intentional: it's the contract that carries plan content, critic configs, and run history forward from prototype to product.
+SQLite schema for `~/.forge/forge.db`. Migration files are plain SQL, deliberately runnable from any language — the contract that carries plan content, critic configs, and run history forward.
 
-Tables grouped by the roadmap phase that introduces them. Schema is migration-driven; new tables and columns can be added without disrupting earlier phases. Migration files are plain SQL, runnable from either language.
+Tables are grouped by the phase of the original (now-archived two-track) roadmap that introduced them; "Phase 1" and "Phase 2" are applied (`migrations/0001`, `migrations/0002`), while the Phase 3/4 sections are unbuilt design sketches with no migrations behind them. Schema is migration-driven; new tables and columns can be added without disrupting earlier phases.
 
 Conventions:
-- All IDs are UUIDs (text in SQLite)
+- All IDs are text. Plan ids are human-readable slugs (e.g. `add-redis-caching-mokq3x1f`); job ids are structured (`j-<plan>-r<n>`); session ids and the rest are opaque text
 - All timestamps are ISO-8601 UTC (text)
 - All JSON columns store structured data, queryable via JSON1
 - Soft deletes via `deleted_at`; hard deletes only for ephemeral tables
@@ -231,7 +231,7 @@ Known keys, phase 1:
 
 ## Phase 2 additions (jobs + review + triage)
 
-> **Reshape pending — see [ADR-0028](./adr/0028-spec-dependency-graph-and-orchestration-agent.md) (Proposed).** The `tasks` table below models only an *intra-plan* DAG (`dependencies` is a flat JSON array of task IDs within one plan). ADR-0028 introduces a **cross-spec dependency graph** (`work_items` nodes with a materialization lifecycle + external-ref/sync columns, and typed `work_item_edges`: blocks/blocked-by, depends-on, related, epic→child). When A2 lands, `tasks` becomes the decomposition *beneath* a single materialized spec; the graph spanning specs is the new top-level structure. Do not build this section's schema until ADR-0028 is Accepted.
+> **Possible reshape — see [ADR-0028](./adr/0028-spec-dependency-graph-and-orchestration-agent.md) (Proposed, contested) and the ROADMAP's "Open decisions".** The `tasks` table below models only an *intra-plan* DAG (`dependencies` is a flat JSON array of task IDs within one plan). ADR-0028 proposes a **cross-spec dependency graph** (`work_items` nodes with a materialization lifecycle + external-ref/sync columns, and typed `work_item_edges`: blocks/blocked-by, depends-on, related, epic→child) under which `tasks` would become the decomposition *beneath* a single materialized spec. The task model is deliberately undecided — do not build the graph schema until an ADR picks a candidate.
 
 ### `tasks`
 
@@ -421,16 +421,22 @@ CREATE TABLE juice_sync_state (
 
 ## Migration strategy
 
-- Migrations live in `migrations/` (Track A) and `crates/juicer-storage/migrations/` (Track B), maintained as identical SQL files
+- Migrations live in `migrations/`, applied in lexical order by `src/core/db/migrations.ts`
 - Applied at app startup, idempotent
 - Schema version tracked in `_migration_history` table
 - Forward-only; no downgrades
+
+Applied migrations:
+
+- `0001_phase1_schema.sql` — the Phase 1 tables above
+- `0002_phase2_schema.sql` — the Phase 2 tables above
+- `0003_normalize_codex_tokens.sql` — data-only: re-normalizes historical codex `sessions.metrics` so `tokensIn` excludes the cached portion (matching claude's disjoint-counts semantics); no schema change
 
 ---
 
 ## Storage location
 
-**Track A (Forge):** lives under `~/.forge/` rather than macOS Application Support so the database sits alongside the existing markdown specs, agent logs, and per-repo config that predate the SQLite cutover. See [ADR-0023](./adr/0023-sqlite-cutover-track-a.md) for the rationale; this is a deliberate Track A deviation, not a product decision.
+Everything lives under `~/.forge/` (overridable via `FORGE_HOME`) rather than macOS Application Support, so the database sits alongside the markdown specs, agent logs, and per-repo config that predate the SQLite cutover. See [ADR-0023](./adr/0023-sqlite-cutover-track-a.md) for the rationale.
 ```
 ~/.forge/
 ├── forge.db
@@ -442,23 +448,9 @@ CREATE TABLE juice_sync_state (
 └── logs/                      # Phase 5: agent.log relocates to logs/<job_id>.log
 ```
 
-**Track B (Juicer):**
-```
-~/Library/Application Support/Juicer/
-├── juicer.db
-├── juicer.db-wal
-├── juicer.db-shm
-├── worktrees/                 # phase B2+
-│   └── <repo-id>/
-│       └── <task-id>/
-├── blobs/
-└── logs/
-    └── juicer.log
-```
+The archived Track B (Juicer, Rust) plan specified its own `~/Library/Application Support/Juicer/` layout reading this same schema; see [`archive/ROADMAP-track-b-juicer.md`](./archive/ROADMAP-track-b-juicer.md).
 
-Juicer can also be pointed at a Forge database via a `--db` flag or migration tool, allowing the founder's plan library and run history to carry forward across the Track A → Track B transition.
-
-Juice's data lives at its own path; phase 4 integration reads/writes via the documented contract.
+Juice's data lives at its own path; the flywheel integration reads/writes via the documented contract.
 
 ---
 

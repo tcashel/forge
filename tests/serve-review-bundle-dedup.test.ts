@@ -13,8 +13,20 @@ import { startServer } from "../src/cli/cmd/serve.ts";
 import { buildFindingCommentBody } from "../src/core/forge-comment-marker.ts";
 import type { FetchPrBundleResult, GhPr, PrBundle, PrInlineComment } from "../src/core/gh-pr.ts";
 import { __setGhRunner } from "../src/core/gh-pr-write.ts";
+import { detectRepo } from "../src/core/repo.ts";
 import type { ForgeFinding } from "../src/core/reviewer.ts";
 import { ForgeStore } from "../src/core/store.ts";
+
+/**
+ * The review-bundle endpoint resolves its repo from the server's cwd, and
+ * findLatestForgeFindings only admits ad-hoc dirs whose meta.json names that
+ * repoRoot — so the fixture must stamp its run dir the same way the real
+ * review worker does.
+ */
+function stampRunDirRepo(runDir: string): void {
+  const repoRoot = detectRepo(process.cwd())?.root ?? process.cwd();
+  fs.writeFileSync(path.join(runDir, "meta.json"), JSON.stringify({ repoRoot }));
+}
 
 const PUBLISHED_ID = "abcabcabcabc";
 const LOCAL_ID = "ffffffffffff";
@@ -115,6 +127,7 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
   // Seed an ad-hoc findings.json: one published (marker on the PR), one not.
   const runDir = path.join(store.runsDir, "pr-review", "1-s-dedup");
   fs.mkdirSync(runDir, { recursive: true });
+  stampRunDirRepo(runDir);
   fs.writeFileSync(
     path.join(runDir, "findings.json"),
     JSON.stringify([finding(PUBLISHED_ID, 2), finding(LOCAL_ID, 5)], null, 2),
@@ -165,6 +178,7 @@ test("review-bundle keeps a STALE published finding selectable as a local findin
 
   const runDir = path.join(store.runsDir, "pr-review", "1-s-dedup-stale");
   fs.mkdirSync(runDir, { recursive: true });
+  stampRunDirRepo(runDir);
   fs.writeFileSync(
     path.join(runDir, "findings.json"),
     JSON.stringify([finding(PUBLISHED_ID, 2), finding(LOCAL_ID, 5)], null, 2),

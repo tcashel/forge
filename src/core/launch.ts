@@ -42,6 +42,12 @@ export interface LaunchConfig {
   ghUser?: string;
   /** Per-repo gh host override. Falls back to github.com. */
   ghHost?: string;
+  /** Watchdog budget for the implementing-agent stage, in minutes. Default 120. */
+  agentTimeoutMinutes?: number;
+  /** Watchdog budget for each reviewer pass, in minutes. Default 60. */
+  reviewerTimeoutMinutes?: number;
+  /** Watchdog budget for each auto-fix fixer pass, in minutes. Default 60. */
+  fixerTimeoutMinutes?: number;
 }
 
 // ─── tmux utilities ───────────────────────────────────────────────────────────
@@ -114,14 +120,69 @@ forge_session_finish() {
 }`;
 }
 
+/**
+ * Bash single-quoted token for the reviewer's expected fenced block marker.
+ * Plain backticks — no backslash escapes: the value is matched with `grep -F`
+ * (fixed string), and a `\`` inside the pattern is a literal backtick to BSD
+ * grep but a buffer anchor to GNU grep, which silently broke the gate on CI.
+ */
+const FORGE_REVIEW_FENCE_TOK = "'```forge-review'";
+
+/**
+ * Bash snippet reconciling a streaming stage's pipeline exit code against its
+ * stream-json sidecar via `stage_result_valid` (anvil lesson 2, PR #64): a
+ * non-zero exit with a valid terminal result is rescued, a zero exit without
+ * one is force-failed. A watchdog-killed stage (marker file present) is never
+ * rescued. Non-streaming adapters keep exit-code-only behavior.
+ *
+ * `streamTok` / `outTok` / `fenceTok` / `markerTok` are pre-quoted bash tokens.
+ */
+function stageReconcileShell(opts: {
+  adapter: LaunchTarget;
+  exitVar: string;
+  streamTok: string;
+  outTok: string;
+  fenceTok: string;
+  label: string;
+  markerTok: string;
+  indent: string;
+}): string {
+  const I = opts.indent;
+  if (!adapterStreamsTokens(opts.adapter)) {
+    return `${I}# ${opts.label}: ${opts.adapter} emits no parseable sidecar — exit code stays authoritative`;
+  }
+  const call = `stage_result_valid "${opts.adapter}" ${opts.streamTok} ${opts.outTok} ${opts.fenceTok}`;
+  return [
+    `${I}if [ -f ${opts.markerTok} ]; then`,
+    `${I}  : # watchdog kill — never rescue a timed-out ${opts.label}`,
+    `${I}elif [ "$${opts.exitVar}" -ne 0 ] && ${call}; then`,
+    `${I}  ${opts.exitVar}=0`,
+    `${I}  log "  (${opts.label}: non-zero exit but valid result — rescued)"`,
+    `${I}elif [ "$${opts.exitVar}" -eq 0 ] && ! ${call}; then`,
+    `${I}  ${opts.exitVar}=1`,
+    `${I}  log "  (${opts.label} silent failure: no valid terminal result in sidecar)"`,
+    `${I}fi`,
+  ].join("\n");
+}
+
 function generateAutoFixBlock(
   config: LaunchConfig,
   runDir: string,
-  cmds: { fixerCmd: string; reviewerCmd: string; fixerStreamArg: string; reviewerStreamArg: string },
+  cmds: {
+    fixerCmd: string;
+    reviewerCmd: string;
+    fixerStreamArg: string;
+    reviewerStreamArg: string;
+    fixerReconcile: string;
+    reReviewReconcile: string;
+    reviewerTimeoutMin: number;
+    fixerTimeoutMin: number;
+  },
 ): string {
-  const { fixerCmd, reviewerCmd, fixerStreamArg, reviewerStreamArg } = cmds;
+  const { fixerCmd, reviewerCmd, fixerStreamArg, reviewerStreamArg, reviewerTimeoutMin, fixerTimeoutMin } = cmds;
   const qualityCheck = fixQualityBlock(config.qualityCommands);
   return `  # ── Auto-fix ────────────────────────────────────────────────────────────────
+  RUN_PHASE="auto_fix"
   CURRENT_VERDICT=$(python3 -c "
 import json
 try:
@@ -129,7 +190,7 @@ try:
     print(d.get('reviewVerdict', '') or '')
 except Exception:
     print('')
-" 2>/dev/null || echo "")
+" 2>>"$HELPER_LOG" || echo "")
   FIX_ROUND=0
   while [ "$CURRENT_VERDICT" = "request-changes" ] && [ $FIX_ROUND -lt ${config.autoFixRounds} ]; do
     FIX_ROUND=$(( FIX_ROUND + 1 ))
@@ -154,100 +215,127 @@ except Exception:
     # Run fixer agent
     FIX_SESSION_ID="s-fix-$JOB_ID-r$FIX_ROUND"
     forge_session_start --id "$FIX_SESSION_ID" --purpose fix --agent "${config.fixerTarget}" --model "${config.fixerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
-    if ${fixerCmd} > "$RUN_DIR/fix-raw-$FIX_ROUND.md" 2>&1; then
-      forge_session_finish --id "$FIX_SESSION_ID" --exit-code 0${fixerStreamArg}
-      log "✓ Fixer completed"
-
-      # Re-run quality gates
-      FIX_QUALITY_OK=1
-${qualityCheck}
-
-      if [ "$FIX_QUALITY_OK" = "1" ]; then
-        # Commit and push fixes if there are changes
-        if git -C "$WORKTREE" diff --quiet && git -C "$WORKTREE" diff --cached --quiet; then
-          log "  (no changes to commit after fix)"
-        else
-          git -C "$WORKTREE" add -A
-          git -C "$WORKTREE" commit -m "fix(review): address reviewer feedback (round $FIX_ROUND)"
-          git -C "$WORKTREE" push 2>&1 | tee -a "$LOG_FILE"
-          log "✓ Fix committed and pushed"
-        fi
-
-        # Re-run reviewer with fresh diff
-        log ""
-        log "═══ RE-REVIEW after fix $FIX_ROUND ═══"
-        set_status "reviewing"
-
-        {
-          cat "$RUN_DIR/review-prompt-prefix.txt"
-          echo
-          echo "## PR metadata"
-          echo
-          echo '\`\`\`json'
-          gh pr view "$PR_NUMBER" --json number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url 2>/dev/null || echo '{}'
-          echo '\`\`\`'
-          echo
-          echo "## CI checks"
-          echo
-          echo '\`\`\`'
-          gh pr checks "$PR_NUMBER" 2>&1 || echo "(no check status available)"
-          echo '\`\`\`'
-          echo
-          echo "## Linked Forge spec"
-          echo
-          echo '\`\`\`markdown'
-          cat "$RUN_DIR/spec-snapshot.md"
-          echo '\`\`\`'
-          echo
-          echo "## Diff"
-          echo
-          echo '\`\`\`diff'
-          gh pr diff "$PR_NUMBER" 2>/dev/null | head -c 60000
-          echo '\`\`\`'
-          echo
-          echo 'Now produce the review in a single \`\`\`forge-review fenced block per the skill instructions.'
-        } > "$RUN_DIR/review-prompt.txt"
-
-        REVIEW_SESSION_ID="s-review-$JOB_ID-r$(( FIX_ROUND + 1 ))"
-        forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
-        if ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1; then
-          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0${reviewerStreamArg}
-          # Same last-match strategy as the first reviewer pass — see
-          # rationale on the original verdict extractor above.
-          NEW_VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>/dev/null)
-          RE_EXTRACT=$?
-
-          if [ "$RE_EXTRACT" -eq 2 ]; then
-            log "⚠  No forge-review block in re-review output"
-            set_meta_field "reviewVerdict" "null"
-            set_meta_field "reviewError" '"no forge-review block in re-review"'
-            CURRENT_VERDICT=""
-          elif [ -z "$NEW_VERDICT" ] || [ "$NEW_VERDICT" = "null" ]; then
-            log "⚠  Verdict missing from re-review"
-            set_meta_field "reviewVerdict" "null"
-            CURRENT_VERDICT=""
-          else
-            log "✓ Re-review verdict: $NEW_VERDICT"
-            set_meta_field "reviewVerdict" "$NEW_VERDICT"
-            CURRENT_VERDICT=$(echo "$NEW_VERDICT" | tr -d '"')
-          fi
-        else
-          RE_EXIT=$?
-          forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$RE_EXIT"${reviewerStreamArg}
-          log "⚠  Re-reviewer failed (exit $RE_EXIT) — stopping auto-fix"
-          set_meta_field "reviewError" '"re-reviewer process failed"'
-          break
-        fi
-      else
-        log "⚠  Quality gates failed after fix — stopping auto-fix"
-        break
-      fi
-    else
-      FIX_EXIT=$?
-      forge_session_finish --id "$FIX_SESSION_ID" --exit-code "$FIX_EXIT"${fixerStreamArg}
+    rm -f "$RUN_DIR/.stage-timeout-fixer"
+    ( ${fixerCmd} > "$RUN_DIR/fix-raw-$FIX_ROUND.md" 2>&1 ) &
+    FIXER_PID=$!
+    watch_stage "$FIXER_PID" $(( FIXER_TIMEOUT_MINUTES * 60 )) "fixer" &
+    FIXER_WATCHDOG=$!
+    wait "$FIXER_PID"
+    FIX_EXIT=$?
+    kill "$FIXER_WATCHDOG" 2>/dev/null || true
+${cmds.fixerReconcile}
+    forge_session_finish --id "$FIX_SESSION_ID" --exit-code "$FIX_EXIT"${fixerStreamArg}
+    if [ -f "$RUN_DIR/.stage-timeout-fixer" ]; then
+      log "⚠  Fixer timed out after ${fixerTimeoutMin} minutes — stopping auto-fix"
+      set_meta_field "reviewError" "\\"fixer timed out after ${fixerTimeoutMin} minutes\\""
+      break
+    fi
+    if [ "$FIX_EXIT" -ne 0 ]; then
       log "⚠  Fixer agent failed (exit $FIX_EXIT) — stopping auto-fix"
       set_meta_field "reviewError" '"fixer agent failed"'
       break
+    fi
+    log "✓ Fixer completed"
+
+    # Re-run quality gates
+    FIX_QUALITY_OK=1
+${qualityCheck}
+
+    if [ "$FIX_QUALITY_OK" != "1" ]; then
+      log "⚠  Quality gates failed after fix — stopping auto-fix"
+      break
+    fi
+
+    # Commit and push fixes if there are changes
+    if git -C "$WORKTREE" diff --quiet && git -C "$WORKTREE" diff --cached --quiet; then
+      log "  (no changes to commit after fix)"
+    else
+      git -C "$WORKTREE" add -A
+      if git -C "$WORKTREE" commit -m "fix(review): address reviewer feedback (round $FIX_ROUND)" 2>&1 | tee -a "$LOG_FILE"; then
+        git -C "$WORKTREE" push 2>&1 | tee -a "$LOG_FILE"
+        log "✓ Fix committed and pushed"
+      else
+        log "⚠  Fix commit failed — stopping auto-fix"
+        set_meta_field "reviewError" '"fix commit failed"'
+        break
+      fi
+    fi
+
+    # Re-run reviewer with fresh diff
+    log ""
+    log "═══ RE-REVIEW after fix $FIX_ROUND ═══"
+    set_status "reviewing"
+
+    {
+      cat "$RUN_DIR/review-prompt-prefix.txt"
+      echo
+      echo "## PR metadata"
+      echo
+      echo '\`\`\`json'
+      gh pr view "$PR_NUMBER" --json number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url 2>/dev/null || echo '{}'
+      echo '\`\`\`'
+      echo
+      echo "## CI checks"
+      echo
+      echo '\`\`\`'
+      gh pr checks "$PR_NUMBER" 2>&1 || echo "(no check status available)"
+      echo '\`\`\`'
+      echo
+      echo "## Linked Forge spec"
+      echo
+      echo '\`\`\`markdown'
+      cat "$RUN_DIR/spec-snapshot.md"
+      echo '\`\`\`'
+      echo
+      echo "## Diff"
+      echo
+      echo '\`\`\`diff'
+      gh pr diff "$PR_NUMBER" 2>/dev/null | head -c 60000
+      echo '\`\`\`'
+      echo
+      echo 'Now produce the review in a single \`\`\`forge-review fenced block per the skill instructions.'
+    } > "$RUN_DIR/review-prompt.txt"
+
+    REVIEW_SESSION_ID="s-review-$JOB_ID-r$(( FIX_ROUND + 1 ))"
+    forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
+    rm -f "$RUN_DIR/.stage-timeout-re-reviewer"
+    ( ${reviewerCmd} > "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" 2>&1 ) &
+    RE_PID=$!
+    watch_stage "$RE_PID" $(( REVIEWER_TIMEOUT_MINUTES * 60 )) "re-reviewer" &
+    RE_WATCHDOG=$!
+    wait "$RE_PID"
+    RE_EXIT=$?
+    kill "$RE_WATCHDOG" 2>/dev/null || true
+${cmds.reReviewReconcile}
+    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$RE_EXIT"${reviewerStreamArg}
+    if [ -f "$RUN_DIR/.stage-timeout-re-reviewer" ]; then
+      log "⚠  Re-reviewer timed out after ${reviewerTimeoutMin} minutes — stopping auto-fix"
+      set_meta_field "reviewError" "\\"re-reviewer timed out after ${reviewerTimeoutMin} minutes\\""
+      break
+    fi
+    if [ "$RE_EXIT" -ne 0 ]; then
+      log "⚠  Re-reviewer failed (exit $RE_EXIT) — stopping auto-fix"
+      set_meta_field "reviewError" '"re-reviewer process failed"'
+      break
+    fi
+    # Same last-match strategy as the first reviewer pass — see
+    # rationale on the original verdict extractor above.
+    NEW_VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw-fix-$FIX_ROUND.md" "$RUN_DIR/review.md" 2>>"$HELPER_LOG")
+    RE_EXTRACT=$?
+
+    if [ "$RE_EXTRACT" -eq 2 ]; then
+      log "⚠  No forge-review block in re-review output"
+      set_meta_field "reviewVerdict" "null"
+      set_meta_field "reviewError" '"no forge-review block in re-review"'
+      CURRENT_VERDICT=""
+    elif [ -z "$NEW_VERDICT" ] || [ "$NEW_VERDICT" = "null" ]; then
+      log "⚠  Verdict missing from re-review"
+      set_meta_field "reviewVerdict" "null"
+      CURRENT_VERDICT=""
+    else
+      log "✓ Re-review verdict: $NEW_VERDICT"
+      set_meta_field "reviewVerdict" "$NEW_VERDICT"
+      CURRENT_VERDICT=$(echo "$NEW_VERDICT" | tr -d '"')
     fi
   done
 
@@ -294,7 +382,8 @@ function nextJobRunNumber(store: ForgeStore, planId: string): number {
   }
 }
 
-function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jobRunNumber: number }): string {
+/** Exported for tests: the generated bash is the contract under test. */
+export function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jobRunNumber: number }): string {
   const runDir = store.ensureRunDir(config.planId);
   const logFile = store.getLogFile(config.planId);
   const metaFile = path.join(runDir, "meta.json");
@@ -359,8 +448,62 @@ function generateRunnerScript(config: LaunchConfig, store: ForgeStore, ids: { jo
   });
   const fixerStreamArg = adapterStreamsTokens(config.fixerTarget) ? ` --stream-json-path "${fixerStreamFile}"` : "";
 
+  const agentTimeoutMin = config.agentTimeoutMinutes ?? 120;
+  const reviewerTimeoutMin = config.reviewerTimeoutMinutes ?? 60;
+  const fixerTimeoutMin = config.fixerTimeoutMinutes ?? 60;
+
+  const agentReconcile = stageReconcileShell({
+    adapter: config.target,
+    exitVar: "AGENT_EXIT",
+    streamTok: `"${streamFile}"`,
+    outTok: `"$LOG_FILE"`,
+    fenceTok: "''",
+    label: "agent",
+    markerTok: `"$RUN_DIR/.stage-timeout-agent"`,
+    indent: "",
+  });
+  const reviewerReconcile = stageReconcileShell({
+    adapter: config.reviewerTarget,
+    exitVar: "REVIEWER_EXIT",
+    streamTok: `"${reviewerStreamFile}"`,
+    outTok: `"$RUN_DIR/review-raw.md"`,
+    fenceTok: FORGE_REVIEW_FENCE_TOK,
+    label: "reviewer",
+    markerTok: `"$RUN_DIR/.stage-timeout-reviewer"`,
+    indent: "  ",
+  });
+  const fixerReconcile = stageReconcileShell({
+    adapter: config.fixerTarget,
+    exitVar: "FIX_EXIT",
+    streamTok: `"${fixerStreamFile}"`,
+    outTok: `"$RUN_DIR/fix-raw-$FIX_ROUND.md"`,
+    fenceTok: "''",
+    label: "fixer",
+    markerTok: `"$RUN_DIR/.stage-timeout-fixer"`,
+    indent: "    ",
+  });
+  const reReviewReconcile = stageReconcileShell({
+    adapter: config.reviewerTarget,
+    exitVar: "RE_EXIT",
+    streamTok: `"${reviewerStreamFile}"`,
+    outTok: `"$RUN_DIR/review-raw-fix-$FIX_ROUND.md"`,
+    fenceTok: FORGE_REVIEW_FENCE_TOK,
+    label: "re-reviewer",
+    markerTok: `"$RUN_DIR/.stage-timeout-re-reviewer"`,
+    indent: "    ",
+  });
+
   const autoFixBash = config.autoFix
-    ? generateAutoFixBlock(config, runDir, { fixerCmd, reviewerCmd, fixerStreamArg, reviewerStreamArg })
+    ? generateAutoFixBlock(config, runDir, {
+        fixerCmd,
+        reviewerCmd,
+        fixerStreamArg,
+        reviewerStreamArg,
+        fixerReconcile,
+        reReviewReconcile,
+        reviewerTimeoutMin,
+        fixerTimeoutMin,
+      })
     : "  # auto-fix disabled";
 
   return `#!/usr/bin/env bash
@@ -378,6 +521,15 @@ set -uo pipefail
 export PYTHONUTF8=1
 export LANG="\${LANG:-en_US.UTF-8}"
 
+# Headless git: never prompt for credentials and never invoke a signer —
+# gpg/1Password signing prompts hang detached runs while the screen is
+# locked. Env-only and operator-scoped: it covers Forge's auto-fix commit
+# AND the agent's own commits without writing anything into the target repo.
+export GIT_TERMINAL_PROMPT=0
+export GIT_CONFIG_COUNT=1
+export GIT_CONFIG_KEY_0=commit.gpgsign
+export GIT_CONFIG_VALUE_0=false
+
 TASK_ID="${config.planId}"
 WORKTREE="${config.worktreePath}"
 META_FILE="${metaFile}"
@@ -388,6 +540,12 @@ DEFAULT_BRANCH="${config.defaultBranch}"
 BRANCH="${config.branch}"
 QUALITY_FAILED=0
 RUN_STARTED_EPOCH=$(date +%s)
+AGENT_TIMEOUT_MINUTES=${agentTimeoutMin}
+REVIEWER_TIMEOUT_MINUTES=${reviewerTimeoutMin}
+FIXER_TIMEOUT_MINUTES=${fixerTimeoutMin}
+HELPER_LOG="${runDir}/session-helpers.log"
+RUN_PHASE="init"
+RUNNER_FINISHED=0
 
 # ── Helpers ───────────────────────────────────────────────────────────────────
 
@@ -400,18 +558,122 @@ run_cmd() {
   return $?  # pipefail makes $? the pipeline's first nonzero exit
 }
 
+# Meta writes must never silently no-op: callers pass pre-encoded JSON
+# (set_status quotes its argument), anything that doesn't parse falls back
+# to a plain string (same as critique.ts's update_meta), and every failure
+# lands in $HELPER_LOG instead of /dev/null.
 set_meta_field() {
-  python3 -c "
+  if ! python3 -c "
 import json, sys
 with open('$META_FILE') as f: d = json.load(f)
 key = sys.argv[1]
-val_json = sys.argv[2]
-d[key] = json.loads(val_json)
+val = sys.argv[2]
+try:
+    d[key] = json.loads(val)
+except (json.JSONDecodeError, ValueError):
+    d[key] = val
 with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
-" "$1" "$2" 2>/dev/null || true
+" "$1" "$2" 2>>"$HELPER_LOG"; then
+    echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) set_meta_field failed: key=$1" >> "$HELPER_LOG"
+  fi
 }
 
-set_status() { set_meta_field "status" ""$1""; }
+set_status() { set_meta_field "status" "\\"$1\\""; }
+
+meta_status() {
+  python3 -c "import json; print(json.load(open('$META_FILE')).get('status', ''))" 2>>"$HELPER_LOG" || echo ""
+}
+
+# No silent terminal states: if the script dies (crash, signal, tmux
+# teardown) while meta still shows a non-terminal status, force-write
+# 'failed' naming the phase that was running. Terminal statuses written by
+# the normal flow are left untouched.
+on_runner_exit() {
+  local code=$?
+  [ "$RUNNER_FINISHED" = "1" ] && return 0
+  case "$(meta_status)" in
+    done|failed) ;;
+    *)
+      set_meta_field "errorMessage" "\\"runner died during phase: $RUN_PHASE (exit $code)\\""
+      set_status "failed"
+      ;;
+  esac
+  return 0
+}
+trap on_runner_exit EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
+
+# Recursively signal a stage's process tree, children first. pgrep -P is
+# portable to macOS (which ships neither GNU timeout nor setsid).
+kill_tree() {
+  local pid="$1" sig="$2" kids k
+  kids=$(pgrep -P "$pid" 2>/dev/null || true)
+  for k in $kids; do kill_tree "$k" "$sig"; done
+  kill -"$sig" "$pid" 2>/dev/null || true
+}
+
+# Per-stage watchdog, run in the background while the stage runs. On budget
+# expiry it drops a marker file (so the main flow can tell a timeout from an
+# ordinary failure), then TERM → grace → KILL the stage's whole tree. The
+# main flow kills the watchdog once the stage exits on its own.
+watch_stage() {
+  local pid="$1" secs="$2" label="$3" waited=0
+  while kill -0 "$pid" 2>/dev/null; do
+    if [ "$waited" -ge "$secs" ]; then
+      : > "$RUN_DIR/.stage-timeout-$label"
+      echo "$(date -u +%Y-%m-%dT%H:%M:%SZ) watchdog: $label exceeded $(( secs / 60 ))m — killing pid $pid tree" >> "$HELPER_LOG"
+      kill_tree "$pid" TERM
+      sleep 10
+      kill_tree "$pid" KILL
+      return 0
+    fi
+    sleep 5
+    waited=$(( waited + 5 ))
+  done
+}
+
+# Trust the stream sidecar's LAST terminal event over the pipeline exit code
+# (anvil lesson 2, PR #64; modeled on critique.ts's crit_slot_valid): a
+# tee/SIGPIPE hiccup after a complete answer must not fail a finished stage,
+# and a clean exit with no valid terminal result must not pass.
+# $1 = adapter (claude|codex), $2 = sidecar, $3 = output file (must be
+# non-empty), $4 = optional fence marker — when given, the output must
+# contain it with a closing fence after the LAST occurrence ('' skips the
+# gate; agent/fixer output is free-form).
+stage_result_valid() {
+  local adapter="$1" stream="$2" out="$3" fence="$4" result_line stop last_marker
+  [ -s "$stream" ] || return 1
+  if [ "$adapter" = "claude" ]; then
+    result_line=$(grep '"type":"result"' "$stream" | tail -1)
+    [ -n "$result_line" ] || return 1
+    printf '%s' "$result_line" | grep -q '"is_error":true' && return 1
+    # stop_reason allowlist (fail closed): if present, must be end_turn /
+    # tool_use / stop_sequence. Absent/null stop_reason is allowed.
+    stop=$(printf '%s' "$result_line" | grep -o '"stop_reason":"[^"]*"' | head -1 | sed 's/.*:"//; s/"$//')
+    if [ -n "$stop" ]; then
+      case "$stop" in
+        end_turn|tool_use|stop_sequence) ;;
+        *) return 1 ;;
+      esac
+    fi
+  elif [ "$adapter" = "codex" ]; then
+    # codex JSONL: the last turn.* event must be turn.completed — turn.failed
+    # or a stream cut mid-turn fails closed.
+    result_line=$(grep -o '"type":"turn\\.[a-z_]*"' "$stream" | tail -1)
+    [ "$result_line" = '"type":"turn.completed"' ] || return 1
+  else
+    return 1
+  fi
+  [ -s "$out" ] || return 1
+  if [ -n "$fence" ]; then
+    last_marker=$(grep -nF "$fence" "$out" | tail -1 | cut -d: -f1)
+    [ -n "$last_marker" ] || return 1
+    tail -n +"$(( last_marker + 1 ))" "$out" | grep -Eq '^[[:space:]]*\`{3,}[[:space:]]*$' || return 1
+  fi
+  return 0
+}
 
 # ── Session-recording helpers (no-op on DB failure) ──────────────────────────
 ${sessionHelper}
@@ -435,23 +697,41 @@ set_status "running"
 ${bashGhEnvExport({ user: config.ghUser, host: config.ghHost })}
 # Capture base SHA for run metadata
 BASE_SHA=$(git rev-parse "origin/$DEFAULT_BRANCH" 2>/dev/null || git rev-parse HEAD)
-set_meta_field "baseSha" ""$BASE_SHA""
+set_meta_field "baseSha" "\\"$BASE_SHA\\""
 
 # ── Run Agent ─────────────────────────────────────────────────────────────────
 
 log "═══ AGENT (${config.target}) ═══"
+RUN_PHASE="agent"
 EXEC_SESSION_ID="${executionSessionId(liveJobId(config.planId, ids.jobRunNumber))}"
 JOB_ID="${liveJobId(config.planId, ids.jobRunNumber)}"
 forge_session_start --id "$EXEC_SESSION_ID" --purpose execution --agent "${config.target}" --model "${config.model}" --related-id "$JOB_ID" --cwd "$WORKTREE"
 
-${agentCmd} 2>&1 | tee -a "$LOG_FILE"
-AGENT_EXIT=$?  # correct because pipefail is set
+rm -f "$RUN_DIR/.stage-timeout-agent"
+( ${agentCmd} 2>&1 | tee -a "$LOG_FILE" ) &
+AGENT_PID=$!
+watch_stage "$AGENT_PID" $(( AGENT_TIMEOUT_MINUTES * 60 )) "agent" &
+AGENT_WATCHDOG=$!
+wait "$AGENT_PID"
+AGENT_EXIT=$?  # the subshell inherits pipefail, so this is the pipeline's status
+kill "$AGENT_WATCHDOG" 2>/dev/null || true
+
+${agentReconcile}
 
 forge_session_finish --id "$EXEC_SESSION_ID" --exit-code "$AGENT_EXIT"${agentStreamFile ? ` --stream-json-path "${agentStreamFile}"` : ""}
+
+if [ -f "$RUN_DIR/.stage-timeout-agent" ]; then
+  log ""
+  log "✗ Agent stage timed out after ${agentTimeoutMin} minutes"
+  set_meta_field "errorMessage" "\\"agent stage timed out after ${agentTimeoutMin} minutes\\""
+  set_status "failed"
+  exit 1
+fi
 
 if [ "$AGENT_EXIT" -ne 0 ]; then
   log ""
   log "✗ Agent exited with code $AGENT_EXIT"
+  set_meta_field "errorMessage" "\\"agent exited with code $AGENT_EXIT\\""
   set_status "failed"
   exit "$AGENT_EXIT"
 fi
@@ -463,6 +743,7 @@ log "✓ Agent completed"
 
 log ""
 log "═══ QUALITY CHECKS ═══"
+RUN_PHASE="quality"
 set_status "quality_check"
 
 ${qualityBlock}
@@ -488,12 +769,13 @@ if os.path.exists(qpath):
 with open('$META_FILE') as f: d = json.load(f)
 d['qualityResults'] = results
 with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
-" 2>/dev/null || true
+" 2>>"$HELPER_LOG" || true
 
 # ── Verify commits & push ─────────────────────────────────────────────────────────────
 
 log ""
 log "═══ VERIFY COMMITS & PUSH ═══"
+RUN_PHASE="push"
 
 # Forge does NOT auto-stage or auto-commit. The agent owns its commits so
 # build artifacts, scratch files, generated lockfile noise, etc. don't get
@@ -522,6 +804,7 @@ if [ "$COMMITS_AHEAD" -eq 0 ]; then
   log "✗ No commits ahead of $BASE_REF — agent did not commit any work."
   log "  Skipping push and PR creation. Inspect the worktree, commit"
   log "  manually if appropriate, then re-run /forge-launch."
+  set_meta_field "errorMessage" '"agent did not commit any work"'
   set_status "failed"
   exit 1
 fi
@@ -531,7 +814,7 @@ git log --oneline "$BASE_REF..HEAD" 2>&1 | tee -a "$LOG_FILE" || true
 
 # Capture final SHA before pushing
 FINAL_SHA=$(git rev-parse HEAD)
-set_meta_field "finalSha" ""$FINAL_SHA""
+set_meta_field "finalSha" "\\"$FINAL_SHA\\""
 
 git push -u origin "$BRANCH" 2>&1 | tee -a "$LOG_FILE" || log "push failed — PR creation may fail"
 
@@ -539,6 +822,7 @@ git push -u origin "$BRANCH" 2>&1 | tee -a "$LOG_FILE" || log "push failed — P
 
 log ""
 log "═══ BUILD PR BODY ═══"
+RUN_PHASE="pr_body"
 
 PR_BODY_FILE="${runDir}/pr-body.md"
 PR_BODY_BUILT=0
@@ -589,6 +873,7 @@ fi
 
 log ""
 log "═══ CREATING DRAFT PR ═══"
+RUN_PHASE="create_pr"
 set_status "creating_pr"
 
 PR_URL=$(gh pr create \\
@@ -602,22 +887,18 @@ PR_NUMBER=""
 if [ -n "$PR_URL" ]; then
   log ""
   log "✓ Draft PR: $PR_URL"
-  PR_NUMBER=$(python3 -c "import sys, re; m = re.search(r'/pull/(\\d+)$', sys.argv[1]); print(m.group(1) if m else '')" "$PR_URL" 2>/dev/null || true)
-  ENDED_AT=$(date -u +%Y-%m-%dT%H:%M:%SZ)
-  DURATION_MS=$(( ($(date +%s) - RUN_STARTED_EPOCH) * 1000 ))
-  python3 -c "
-import json, sys
-with open('$META_FILE') as f: d = json.load(f)
-d['status'] = 'done'
-d['prUrl'] = sys.argv[1]
-d['endedAt'] = sys.argv[2]
-d['durationMs'] = int(sys.argv[3])
-pr_num = sys.argv[4]
-if pr_num: d['prNumber'] = int(pr_num)
-with open('$META_FILE', 'w') as f: json.dump(d, f, indent=2)
-" "$PR_URL" "$ENDED_AT" "$DURATION_MS" "$PR_NUMBER" 2>/dev/null || true
+  PR_NUMBER=$(python3 -c "import sys, re; m = re.search(r'/pull/(\\d+)$', sys.argv[1]); print(m.group(1) if m else '')" "$PR_URL" 2>>"$HELPER_LOG" || true)
+  # PR coordinates are data fields, not a terminal status. The single
+  # terminal status write happens at the end of the script, after
+  # review/auto-fix — writing 'done' here let a status poll latch the plan
+  # terminally while the fixer was still pushing commits.
+  set_meta_field "prUrl" "\\"$PR_URL\\""
+  if [ -n "$PR_NUMBER" ]; then
+    set_meta_field "prNumber" "$PR_NUMBER"
+  fi
 else
   log "✗ PR creation failed — check log above"
+  set_meta_field "errorMessage" '"PR creation failed"'
   set_status "failed"
 fi
 
@@ -626,6 +907,7 @@ fi
 if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
   log ""
   log "═══ REVIEWER ═══"
+  RUN_PHASE="review"
   set_status "reviewing"
 
   # Compose the full reviewer prompt from prefix + dynamic gh output
@@ -662,10 +944,26 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
   log "Running reviewer: ${config.reviewerTarget} / ${config.reviewerModel}"
   REVIEW_SESSION_ID="s-review-${liveJobId(config.planId, ids.jobRunNumber)}-r1"
   forge_session_start --id "$REVIEW_SESSION_ID" --purpose review --agent "${config.reviewerTarget}" --model "${config.reviewerModel}" --related-id "$JOB_ID" --cwd "$WORKTREE"
-  REV_EXIT=0
-  if ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1; then
-    REV_EXIT=$?
-    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code 0${reviewerStreamArg}
+  rm -f "$RUN_DIR/.stage-timeout-reviewer"
+  ( ${reviewerCmd} > "$RUN_DIR/review-raw.md" 2>&1 ) &
+  REVIEWER_PID=$!
+  watch_stage "$REVIEWER_PID" $(( REVIEWER_TIMEOUT_MINUTES * 60 )) "reviewer" &
+  REVIEWER_WATCHDOG=$!
+  wait "$REVIEWER_PID"
+  REVIEWER_EXIT=$?
+  kill "$REVIEWER_WATCHDOG" 2>/dev/null || true
+${reviewerReconcile}
+  forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$REVIEWER_EXIT"${reviewerStreamArg}
+
+  if [ -f "$RUN_DIR/.stage-timeout-reviewer" ]; then
+    log "⚠  Reviewer timed out after ${reviewerTimeoutMin} minutes"
+    set_meta_field "reviewVerdict" "null"
+    set_meta_field "reviewError" "\\"reviewer timed out after ${reviewerTimeoutMin} minutes\\""
+  elif [ "$REVIEWER_EXIT" -ne 0 ]; then
+    log "⚠  Reviewer process failed (exit $REVIEWER_EXIT)"
+    set_meta_field "reviewVerdict" "null"
+    set_meta_field "reviewError" "\\"reviewer process exited with code $REVIEWER_EXIT\\""
+  else
     # Extract the forge-review fenced block and verdict.
     # Take the LAST matching block, not the first: codex-as-reviewer echoes
     # the SKILL.md prompt verbatim, which contains a template forge-review
@@ -673,7 +971,7 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
     # (approve | request-changes | block in angle brackets), not a real
     # verdict. The real review is always last. Paired with the fixture in
     # tests/fixtures/reviewer/.
-    VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw.md" "$RUN_DIR/review.md" 2>/dev/null)
+    VERDICT=$(bun "$FORGE_BIN" __extract-review "$RUN_DIR/review-raw.md" "$RUN_DIR/review.md" 2>>"$HELPER_LOG")
     EXTRACT_EXIT=$?
 
     if [ "$EXTRACT_EXIT" -eq 2 ]; then
@@ -688,18 +986,28 @@ if [ -n "$PR_URL" ] && [ -n "$PR_NUMBER" ]; then
       log "✓ Review verdict: $VERDICT"
       set_meta_field "reviewVerdict" "$VERDICT"
     fi
-  else
-    REVIEWER_EXIT=$?
-    forge_session_finish --id "$REVIEW_SESSION_ID" --exit-code "$REVIEWER_EXIT"${reviewerStreamArg}
-    log "⚠  Reviewer process failed (exit $REVIEWER_EXIT)"
-    set_meta_field "reviewVerdict" "null"
-    set_meta_field "reviewError" ""reviewer process exited with code $REVIEWER_EXIT""
   fi
 
 ${autoFixBash}
-
-  set_status "done"
 fi
+
+# ── Terminal status ───────────────────────────────────────────────────────────
+
+# Single terminal write, after review/auto-fix. quality_failed survives to
+# the terminal state instead of being masked by 'done'; a failed PR creation
+# already wrote 'failed' above. RUNNER_FINISHED tells the EXIT trap this was
+# an orderly shutdown.
+RUN_PHASE="finalize"
+set_meta_field "endedAt" "\\"$(date -u +%Y-%m-%dT%H:%M:%SZ)\\""
+set_meta_field "durationMs" "$(( ($(date +%s) - RUN_STARTED_EPOCH) * 1000 ))"
+if [ -n "$PR_URL" ]; then
+  if [ "$QUALITY_FAILED" -ne 0 ]; then
+    set_status "quality_failed"
+  else
+    set_status "done"
+  fi
+fi
+RUNNER_FINISHED=1
 
 log ""
 log "═══ DONE: $(date -u +%Y-%m-%dT%H:%M:%SZ) ═══"
@@ -867,7 +1175,8 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     }
 
     return { tmuxSession, logFile, error: null };
-  } catch (e: any) {
-    return { tmuxSession, logFile, error: `Failed to start tmux: ${e.message ?? e}` };
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { tmuxSession, logFile, error: `Failed to start tmux: ${message}` };
   }
 }
