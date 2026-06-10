@@ -355,20 +355,31 @@ test("runner exports headless git env; commits succeed in a gpgsign=true repo wi
     // Exports must precede every git/agent invocation.
     assert.ok(script.indexOf("export GIT_TERMINAL_PROMPT=0") < script.indexOf("# ── Init"));
 
+    // Strip any runner-injected GIT_CONFIG_*/GIT_TERMINAL_PROMPT from the
+    // inherited env: when this suite runs inside Forge's own launch runner,
+    // those exports would make the negative control below succeed.
+    const cleanEnv = Object.fromEntries(
+      Object.entries(process.env).filter(
+        ([k]) => !/^GIT_CONFIG_(COUNT|KEY_|VALUE_)/.test(k) && k !== "GIT_TERMINAL_PROMPT",
+      ),
+    ) as NodeJS.ProcessEnv;
     execSync(
       `git init -q "${repo}" && git -C "${repo}" config user.email t@t.dev && git -C "${repo}" config user.name t ` +
         `&& git -C "${repo}" config commit.gpgsign true && git -C "${repo}" config gpg.program /nonexistent-forge-signer`,
-      { stdio: "pipe" },
+      { stdio: "pipe", env: cleanEnv },
     );
 
     // Without the overrides the signer breaks the commit (in the operator's
     // real setup it hangs on a 1Password prompt instead).
-    assert.throws(() => execSync(`git -C "${repo}" commit --allow-empty -m unsigned`, { stdio: "pipe" }));
+    assert.throws(() =>
+      execSync(`git -C "${repo}" commit --allow-empty -m unsigned`, { stdio: "pipe", env: cleanEnv }),
+    );
 
     // With the runner's exact export lines the commit must succeed unsigned.
     execSync(`${exports.join("; ")}; git -C "${repo}" commit --allow-empty -m headless-ok`, {
       stdio: "pipe",
       shell: "/bin/bash",
+      env: cleanEnv,
     });
     const subject = execSync(`git -C "${repo}" log -1 --format=%s`, { encoding: "utf-8" }).trim();
     assert.equal(subject, "headless-ok");
