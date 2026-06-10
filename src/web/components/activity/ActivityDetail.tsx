@@ -92,7 +92,13 @@ export function ActivityDetail() {
   useEffect(() => {
     const d = data.value;
     if (!d) return;
-    if (d.detail.kind !== "execution" && d.detail.kind !== "review" && d.detail.kind !== "fix") return;
+    if (
+      d.detail.kind !== "execution" &&
+      d.detail.kind !== "review" &&
+      d.detail.kind !== "fix" &&
+      d.detail.kind !== "digest"
+    )
+      return;
     const url = d.detail.logStreamUrl;
     logLines.value = [];
     const es = new EventSource(url);
@@ -135,9 +141,10 @@ export function ActivityDetail() {
         </div>
         <TokenBreakdown session={d.session} />
       </header>
-      {(d.detail.kind === "execution" || d.detail.kind === "review" || d.detail.kind === "fix") && (
-        <pre class="activity-log">{logLines.value.join("\n")}</pre>
-      )}
+      {(d.detail.kind === "execution" ||
+        d.detail.kind === "review" ||
+        d.detail.kind === "fix" ||
+        d.detail.kind === "digest") && <pre class="activity-log">{logLines.value.join("\n")}</pre>}
       {(d.detail.kind === "critique" || d.detail.kind === "synthesis" || d.detail.kind === "improvement") && (
         <MarkdownViewer
           markdown={d.detail.markdownContent ?? `(see ${d.detail.markdownPath ?? "—"})`}

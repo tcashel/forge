@@ -25,6 +25,15 @@ export interface RepoProfile {
   contextFile: string | null;
   contextContent: string | null;
   qualityCommands: string[];
+  /**
+   * Write-mode auto-formatter, when one is detectable with confidence.
+   * Headless fix workers run it over agent edits BEFORE the quality gates —
+   * agents are forbidden from running commands themselves, so without this a
+   * semantically-correct fix gets rolled back over mechanical formatter
+   * drift. Null when the repo's format story is ambiguous (never guess a
+   * write-mode command).
+   */
+  formatCommand: string | null;
   worktreeScript: string | null;
   namedAgents: NamedAgent[];
   defaultBranch: string;
@@ -135,6 +144,38 @@ function detectQualityCommands(root: string, stack: Stack): string[] {
   }
 }
 
+function detectFormatCommand(root: string, stack: Stack): string | null {
+  switch (stack) {
+    case "rust":
+      return "cargo fmt";
+
+    case "python": {
+      const pyproj = readFile(path.join(root, "pyproject.toml")) ?? "";
+      // poe `format` tasks vary between check-mode and write-mode across
+      // repos — don't guess. Bare ruff format is always write-mode.
+      if (pyproj.includes("[tool.poe.tasks]")) return null;
+      return "uv run ruff format .";
+    }
+
+    case "nuxt":
+    case "js-ts": {
+      const scripts = (readJson(path.join(root, "package.json")).scripts ?? {}) as Record<string, string>;
+      const mgr = pkgMgr(root);
+      // A `check` script that is provably write-mode (e.g. biome's
+      // `check --write`) beats plain `format`: it also applies safe lint
+      // fixes like import ordering.
+      if ((scripts.check ?? "").includes("--write")) return `${mgr} check`;
+      const fmt = scripts.format ?? "";
+      // Only trust a `format` script that is clearly write-mode.
+      if (fmt && !fmt.includes("--check")) return `${mgr} format`;
+      return null;
+    }
+
+    default:
+      return null;
+  }
+}
+
 // ─── Context, agents, branch ──────────────────────────────────────────────────
 
 function detectContextFile(root: string): { file: string | null; content: string | null } {
@@ -199,6 +240,7 @@ export function detectRepo(cwd: string): RepoProfile | null {
     contextFile,
     contextContent,
     qualityCommands: detectQualityCommands(root, stack),
+    formatCommand: detectFormatCommand(root, stack),
     worktreeScript: fs.existsSync(path.join(root, "scripts", "worktree.sh"))
       ? path.join(root, "scripts", "worktree.sh")
       : null,

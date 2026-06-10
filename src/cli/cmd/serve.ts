@@ -1953,6 +1953,7 @@ interface AgentActivityDetailPayload {
     | { kind: "execution"; logStreamUrl: string }
     | { kind: "review"; logStreamUrl: string }
     | { kind: "fix"; logStreamUrl: string }
+    | { kind: "digest"; logStreamUrl: string }
     | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
@@ -1999,6 +2000,8 @@ function buildAgentActivityDetail(store: ForgeStore, sessionId: string): AgentAc
     detail = { kind: "review", logStreamUrl };
   } else if (row.purpose === "fix" || row.purpose === "comment-fix") {
     detail = { kind: "fix", logStreamUrl };
+  } else if (row.purpose === "digest") {
+    detail = { kind: "digest", logStreamUrl };
   } else if (row.purpose === "critique") {
     const { content, path: markdownPath } = readCritiqueMarkdownForSession(store, session);
     detail = { kind: "critique", markdownContent: content, markdownPath };

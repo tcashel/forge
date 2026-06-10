@@ -190,6 +190,7 @@ export type ActivityDetailKind =
   | "drafting"
   | "review"
   | "fix"
+  | "digest"
   | "unknown";
 
 export interface ActivityDetailResponse {
@@ -198,6 +199,7 @@ export interface ActivityDetailResponse {
     | { kind: "execution"; logStreamUrl: string }
     | { kind: "review"; logStreamUrl: string }
     | { kind: "fix"; logStreamUrl: string }
+    | { kind: "digest"; logStreamUrl: string }
     | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
