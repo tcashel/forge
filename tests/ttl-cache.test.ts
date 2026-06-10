@@ -80,10 +80,7 @@ test("loader failure propagates and does not poison subsequent loads", async () 
 
 test("background refresh failure keeps serving the stale value", async () => {
   const cache = createTtlCache<string, number>({ ttlMs: 20, staleWhileRevalidateMs: 10_000 });
-  assert.equal(
-    await cache.get("k", async () => 1),
-    1,
-  );
+  assert.equal(await cache.get("k", async () => 1), 1);
   await sleep(30);
   const failing = async (): Promise<number> => {
     throw new Error("refresh failed");

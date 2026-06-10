@@ -294,8 +294,35 @@ export class ForgeStore {
     return record;
   }
 
+  /**
+   * Parsed-index cache. `/api/plans` is polled every 3s and historically
+   * re-parsed index.json several times per request; the parse dominates
+   * once subprocess calls are gone. Keyed by (ino, mtimeNs, size) from a
+   * bigint stat so atomic-rename writes (atomicWriteJSON → new inode)
+   * always invalidate, even on coarse-mtime filesystems. Callers never
+   * mutate returned Plan objects in place (audited: all writers build new
+   * objects and go through upsertPlan), so sharing the parsed graph is safe.
+   */
+  private indexCache: { ino: bigint; mtimeNs: bigint; size: bigint; index: ForgeIndex } | null = null;
+
   readIndex(): ForgeIndex {
-    if (!fs.existsSync(this.indexFile)) return { version: 1, plans: {} };
+    let stat: fs.BigIntStats;
+    try {
+      stat = fs.statSync(this.indexFile, { bigint: true });
+    } catch {
+      this.indexCache = null;
+      return { version: 1, plans: {} };
+    }
+    const cached = this.indexCache;
+    if (cached && cached.ino === stat.ino && cached.mtimeNs === stat.mtimeNs && cached.size === stat.size) {
+      return cached.index;
+    }
+    const index = this.parseIndexFile();
+    this.indexCache = { ino: stat.ino, mtimeNs: stat.mtimeNs, size: stat.size, index };
+    return index;
+  }
+
+  private parseIndexFile(): ForgeIndex {
     try {
       // Pre-rename index files used `tasks` as the top-level map key. The
       // backfill reader accepts both shapes (see backfill.ts readPlansFromIndex);
@@ -325,6 +352,10 @@ export class ForgeStore {
 
   writeIndex(index: ForgeIndex): void {
     atomicWriteJSON(this.indexFile, index);
+    // The rename gives the file a new inode, so the stat check would
+    // invalidate anyway — drop the cache eagerly to keep that invariant
+    // local rather than filesystem-dependent.
+    this.indexCache = null;
   }
 
   getPlan(id: string): Plan | null {
@@ -470,15 +501,38 @@ export class ForgeStore {
     return `${slug}-${ts}`;
   }
 
-  /** Read the last N lines of a log file */
+  /**
+   * Read the last N lines of a log file. Reads only a bounded window from
+   * the end of the file — agent logs grow to many MB and this runs on the
+   * /api/plans hot path (failureMessage) every poll.
+   */
   tailLog(planId: string, lines = 8): string[] {
     const logFile = this.getLogFile(planId);
-    if (!fs.existsSync(logFile)) return [];
+    let fd: number;
     try {
-      const content = fs.readFileSync(logFile, "utf-8");
-      return content.split("\n").filter(Boolean).slice(-lines);
+      fd = fs.openSync(logFile, "r");
     } catch {
       return [];
+    }
+    try {
+      const { size } = fs.fstatSync(fd);
+      const window = Math.max(8192, lines * 512);
+      const start = Math.max(0, size - window);
+      const buf = Buffer.alloc(size - start);
+      fs.readSync(fd, buf, 0, buf.length, start);
+      let text = buf.toString("utf-8");
+      if (start > 0) {
+        // The window almost certainly starts mid-line (and possibly mid-
+        // UTF-8 sequence); drop everything up to the first newline. A
+        // single line longer than the window is kept as its partial tail.
+        const nl = text.indexOf("\n");
+        if (nl !== -1) text = text.slice(nl + 1);
+      }
+      return text.split("\n").filter(Boolean).slice(-lines);
+    } catch {
+      return [];
+    } finally {
+      fs.closeSync(fd);
     }
   }
 
