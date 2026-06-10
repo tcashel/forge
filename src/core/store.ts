@@ -387,8 +387,12 @@ export class ForgeStore {
     );
   }
 
+  getSpecPath(planId: string): string {
+    return path.join(this.specsDir, `${planId}.md`);
+  }
+
   getSpec(planId: string): string | null {
-    const p = path.join(this.specsDir, `${planId}.md`);
+    const p = this.getSpecPath(planId);
     if (!fs.existsSync(p)) return null;
     return fs.readFileSync(p, "utf-8");
   }

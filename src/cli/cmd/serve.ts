@@ -486,13 +486,51 @@ async function buildPlanViewDeps(): Promise<PlanViewDeps> {
   return { tmuxSessions: await listTmuxSessions() };
 }
 
+interface SpecSummary {
+  hasSpec: boolean;
+  blurb: string | null;
+  openQuestionCount: number;
+}
+
+const NO_SPEC: SpecSummary = { hasSpec: false, blurb: null, openQuestionCount: 0 };
+
+/**
+ * Derived spec fields for the task list, cached by the spec file's
+ * (ino, mtimeNs, size). Specs change only on explicit edits/improves —
+ * atomic renames, so the bigint stat always invalidates — yet the 3s
+ * poll previously re-read and markdown-parsed every spec on every tick.
+ */
+const specSummaryCache = new Map<string, { ino: bigint; mtimeNs: bigint; size: bigint; summary: SpecSummary }>();
+
+function specSummary(store: ForgeStore, planId: string): SpecSummary {
+  let stat: fs.BigIntStats;
+  try {
+    stat = fs.statSync(store.getSpecPath(planId), { bigint: true });
+  } catch {
+    specSummaryCache.delete(planId);
+    return NO_SPEC;
+  }
+  const hit = specSummaryCache.get(planId);
+  if (hit && hit.ino === stat.ino && hit.mtimeNs === stat.mtimeNs && hit.size === stat.size) {
+    return hit.summary;
+  }
+  const spec = store.getSpec(planId);
+  const summary: SpecSummary = spec
+    ? {
+        hasSpec: true,
+        blurb: blurbFromSpec(spec),
+        openQuestionCount: parsePlanDocument(spec).openQuestions.length,
+      }
+    : NO_SPEC;
+  specSummaryCache.set(planId, { ino: stat.ino, mtimeNs: stat.mtimeNs, size: stat.size, summary });
+  return summary;
+}
+
 function viewTask(task: Plan, store: ForgeStore, deps: PlanViewDeps): PlanView {
   const info = statusInfo(task, store);
   const ageRef = task.launchedAt ?? task.createdAt;
   const age = timeAgo(ageRef);
-  const spec = store.getSpec(task.id);
-  const blurb = spec ? blurbFromSpec(spec) : null;
-  const openQuestionCount = spec ? parsePlanDocument(spec).openQuestions.length : 0;
+  const spec = specSummary(store, task.id);
   const repoInfo = repoDiskInfo(task.repoRoot);
   return {
     id: task.id,
@@ -510,16 +548,16 @@ function viewTask(task: Plan, store: ForgeStore, deps: PlanViewDeps): PlanView {
     repoReachable: repoInfo.reachable,
     repoHasGit: repoInfo.hasGit,
     repoStale: !repoInfo.reachable || !repoInfo.hasGit,
-    blurb,
+    blurb: spec.blurb,
     age: age.label,
     ageMs: age.ms,
     prUrl: task.prUrl,
     prNumber: task.prNumber,
     error: info.error,
     tmuxAlive: task.tmuxSession ? deps.tmuxSessions.has(task.tmuxSession) : false,
-    hasSpec: !!spec,
+    hasSpec: spec.hasSpec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
-    openQuestionCount,
+    openQuestionCount: spec.openQuestionCount,
     critique: info.critique,
     lastImproveError: task.lastImproveError,
     provenance: deps.provenanceById ? (deps.provenanceById.get(task.id) ?? null) : planProvenance(task, store),
