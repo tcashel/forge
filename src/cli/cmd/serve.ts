@@ -21,7 +21,7 @@ import { reconcileCritiqueSessions } from "../../core/critique.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions } from "../../core/db/writes.ts";
 import { commentAnchorsToDiff } from "../../core/diff-anchoring.ts";
 import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
-import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
+import { extractFindingIds, parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
   fetchPrBundle as defaultFetchPrBundle,
@@ -1463,13 +1463,19 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
 
     const forgeFindings = findings.findings.filter((f) => !publishedIds.has(f.id));
 
+    // A review summary whose body carries forge-finding markers is Forge's
+    // own publication (out-of-diff findings ride the review body). Pulling
+    // it back from GitHub would show the same review twice — once natively
+    // (history picker + findings rail) and once as a GitHub review row.
+    const prReviews = result.bundle.prReviews.filter((r) => extractFindingIds(r.body).length === 0);
+
     return jsonOk({
       pr: result.bundle.pr,
       diff: result.bundle.diff,
       diffStats: result.bundle.diffStats,
       inlineComments,
       issueComments: result.bundle.issueComments,
-      prReviews: result.bundle.prReviews,
+      prReviews,
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
       forgeFindings,

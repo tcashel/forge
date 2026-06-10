@@ -15,6 +15,7 @@ import type {
   ReviewRunDetail,
   ReviewRunSummary,
 } from "../types";
+import { currentReviewPrNumber } from "./ui";
 
 export const reviewBundle = signal<PrReviewBundle | null>(null);
 export const reviewLoading = signal<boolean>(false);
@@ -99,10 +100,13 @@ export async function loadPrDigest(prNumber: number, repoRoot: string): Promise<
   try {
     const q = `?repo=${encodeURIComponent(repoRoot)}`;
     const data = await apiGet<{ digest: PrDigest | null }>(`/api/prs/${prNumber}/digest${q}`);
+    // Guard against a PR switch racing the response — a slow reply for PR A
+    // must not overwrite PR B's (cleared) digest view.
+    if (currentReviewPrNumber.value !== prNumber) return;
     prDigest.value = data.digest;
   } catch {
     // Missing digest is the common case and not an error worth surfacing.
-    prDigest.value = null;
+    if (currentReviewPrNumber.value === prNumber) prDigest.value = null;
   } finally {
     prDigestLoading.value = false;
   }
@@ -150,8 +154,11 @@ export async function loadReviewCommits(prNumber: number, repoRoot: string): Pro
   try {
     const q = `?repo=${encodeURIComponent(repoRoot)}`;
     const data = await apiGet<{ commits: PrCommit[] }>(`/api/prs/${prNumber}/commits${q}`);
+    // Same PR-switch race guard as loadPrDigest.
+    if (currentReviewPrNumber.value !== prNumber) return;
     reviewCommits.value = data.commits ?? [];
   } catch (e) {
+    if (currentReviewPrNumber.value !== prNumber) return;
     const err = e as ApiError;
     reviewCommits.value = null;
     reviewCommitsError.value = err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not load commits.";

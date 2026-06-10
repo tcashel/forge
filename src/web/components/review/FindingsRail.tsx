@@ -56,7 +56,12 @@ function findingRange(f: ForgeFinding): string {
 }
 
 function snippet(text: string, max = 160): string {
-  const clean = (text || "").replace(/\s+/g, " ").trim();
+  // Rail snippets are plain text — drop embedded HTML tags (GitHub bodies
+  // carry <sub>/<details> wrappers) so they don't render as literal noise.
+  const clean = (text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
 }
 

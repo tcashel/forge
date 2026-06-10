@@ -18,6 +18,10 @@ a{color:inherit;text-decoration:none}
   --bg: #FAFAF7;
   --bg-2: #F2F1EC;
   --bg-glow: #E8E5DC;
+  /* Recessed code/log surface. Several blocks use var(--bg-deep, #0a0a0a);
+     leaving it undefined meant the near-black fallback applied on the LIGHT
+     theme too — dark-on-dark "redacted" code blocks. */
+  --bg-deep: #F0EEE7;
   --panel: #FFFFFF;
   --panel-2: #F6F5F0;
   --panel-3: #ECEAE3;
@@ -73,6 +77,7 @@ a{color:inherit;text-decoration:none}
   --bg: #0F1419;
   --bg-2: #131820;
   --bg-glow: #1A2230;
+  --bg-deep: #0a0a0a;
   --panel: #161D26;
   --panel-2: #1B232E;
   --panel-3: #222B37;
@@ -2011,6 +2016,10 @@ body.filtered-single .repo-chip{ display: none; }
 .review-md h6 { font-size: 12px; margin: 8px 0 4px; }
 .review-md h1:first-child,
 .review-md h2:first-child { margin-top: 2px; }
+.review-md img { max-width: 100%; vertical-align: middle; }
+.review-md details { margin: 6px 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2); }
+.review-md summary { cursor: pointer; color: var(--fg-dim); font-weight: 600; }
+.review-md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--rule-2); color: var(--fg-dim); }
 /* Theme-aware (not --bg-deep): the hardcoded near-black background read as
    redaction bars on the light theme once the Description tab started
    rendering prose full of inline code. */
