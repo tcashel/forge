@@ -32,7 +32,7 @@ function threadsResponse() {
   });
 }
 
-function makeRunner() {
+function makeRunner(fail: { resolve?: string; reply?: string } = {}) {
   const calls: RecordedCall[] = [];
   const runner = (args: string[], o?: { inputJson?: unknown }) => {
     calls.push({ args, inputJson: o?.inputJson });
@@ -41,9 +41,11 @@ function makeRunner() {
       return Promise.resolve({ ok: true, stdout: threadsResponse() });
     }
     if (queryArg.includes("resolveReviewThread")) {
+      if (fail.resolve) return Promise.resolve({ ok: false, stdout: fail.resolve });
       return Promise.resolve({ ok: true, stdout: "{}" });
     }
     if (args.join(" ").includes("/replies")) {
+      if (fail.reply) return Promise.resolve({ ok: false, stdout: fail.reply });
       return Promise.resolve({ ok: true, stdout: "{}" });
     }
     return Promise.resolve({ ok: true, stdout: "" });
@@ -116,6 +118,52 @@ test("resolvePublishedFindingThreads leaves a fixed thread open when nothing was
     });
     assert.equal(resolveCalls(calls).length, 0);
     assert.equal(entries[0].ghResolved, undefined);
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("resolvePublishedFindingThreads records ghError when the resolve mutation fails", async () => {
+  const entries: ValidationFileEntry[] = [
+    { targetId: "finding:aaaaaaaaaaaa", verdict: "valid", reason: "ok", status: "fixed" },
+  ];
+  const { runner } = makeRunner({ resolve: "GraphQL: thread is locked" });
+  __setGhRunner(runner as never);
+  try {
+    await resolvePublishedFindingThreads({
+      prNum: 7,
+      prUrl: "https://github.com/acme/repo/pull/7",
+      ghTarget: {},
+      cwd: "/tmp",
+      entries,
+      committedAndPushed: true,
+      log: () => {},
+    });
+    // The failure must land in the entry (and thus validation.json), not just the log.
+    assert.equal(entries[0].ghResolved, undefined);
+    assert.equal(entries[0].ghError, "resolve failed: GraphQL: thread is locked");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("resolvePublishedFindingThreads records ghError when the dispute reply fails", async () => {
+  const entries: ValidationFileEntry[] = [
+    { targetId: "finding:bbbbbbbbbbbb", verdict: "disputed", reason: "not a real bug", status: "disputed" },
+  ];
+  const { runner } = makeRunner({ reply: "HTTP 422: Unprocessable" });
+  __setGhRunner(runner as never);
+  try {
+    await resolvePublishedFindingThreads({
+      prNum: 7,
+      prUrl: "https://github.com/acme/repo/pull/7",
+      ghTarget: {},
+      cwd: "/tmp",
+      entries,
+      committedAndPushed: true,
+      log: () => {},
+    });
+    assert.equal(entries[0].ghError, "dispute reply failed: HTTP 422: Unprocessable");
   } finally {
     __setGhRunner(null);
   }
