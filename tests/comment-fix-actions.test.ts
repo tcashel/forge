@@ -456,8 +456,17 @@ test("readFixerTimeoutMinutes defaults to 60 and accepts a lenient override", ()
 // ─── commitAndPush: headless git ─────────────────────────────────────────────
 
 // Never read the operator's git config in these repos.
+// Strip runner-injected git overrides (GIT_CONFIG_COUNT/KEY/VALUE,
+// GIT_TERMINAL_PROMPT) so the negative controls below hold even when this
+// suite runs inside Forge's own launch runner — its env exports otherwise
+// make the "signing must fail" control commit succeed.
+const inheritedEnv = Object.fromEntries(
+  Object.entries(process.env).filter(
+    ([k]) => !/^GIT_CONFIG_(COUNT|KEY_|VALUE_)/.test(k) && k !== "GIT_TERMINAL_PROMPT",
+  ),
+);
 const GIT_TEST_ENV = {
-  ...process.env,
+  ...inheritedEnv,
   GIT_CONFIG_GLOBAL: "/dev/null",
   GIT_CONFIG_SYSTEM: "/dev/null",
 } as Record<string, string>;

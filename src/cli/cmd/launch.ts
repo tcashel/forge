@@ -30,7 +30,7 @@
 import { spawnSync } from "node:child_process";
 import { parseArgs } from "node:util";
 import { launchAgent } from "../../core/launch.ts";
-import { createWorktree, detectRepo } from "../../core/repo.ts";
+import { bootstrapWorktree, createWorktree, detectRepo } from "../../core/repo.ts";
 import type { ForgeStore, LaunchTarget, Plan, ReasoningEffort, RepoConfig } from "../../core/store.ts";
 import { CliError, emitOk } from "../output.ts";
 
@@ -400,6 +400,10 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
     worktreePath = repo.root;
   } else if (opts.worktree) {
     worktreePath = opts.worktree;
+    // An operator-supplied worktree may never have had its deps installed —
+    // quality gates then fail on missing toolchains ('tsc: command not
+    // found', found live). isBootstrapped() makes this a no-op when present.
+    await bootstrapWorktree(repo.root, worktreePath, repo.stack, { mode: "checkout-existing" });
   } else {
     const wt = await createWorktree(repo.root, branch, repo.worktreeScript, repo.stack);
     if (wt.error) throw new CliError("WORKTREE_FAIL", `Worktree creation failed: ${wt.error}`, { exitCode: 3 });

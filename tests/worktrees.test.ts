@@ -712,7 +712,10 @@ test("ensureWorktreeForBranch bootstraps deps when reusing an existing worktree"
     git(repoDir, ["init", "-b", "main"]);
     git(repoDir, ["config", "user.email", "test@example.com"]);
     git(repoDir, ["config", "user.name", "Test"]);
-    fs.writeFileSync(path.join(repoDir, "package.json"), `${JSON.stringify({ name: "boot-fixture", private: true })}\n`);
+    fs.writeFileSync(
+      path.join(repoDir, "package.json"),
+      `${JSON.stringify({ name: "boot-fixture", private: true })}\n`,
+    );
     fs.writeFileSync(path.join(repoDir, "bun.lock"), "{}\n");
     git(repoDir, ["add", "-A"]);
     git(repoDir, ["commit", "-m", "init"]);
