@@ -328,6 +328,9 @@ export interface PrsResponse {
   me: string;
   repo: string | null;
   repoRoot: string | null;
+  /** False when the server's gh fetch failed (the list is failure-shaped,
+   *  not genuinely empty). Absent on older servers — treat as true. */
+  fetchOk?: boolean;
 }
 
 // Mirror of the per-comment shape returned by GET /api/prs/:num/review-bundle.

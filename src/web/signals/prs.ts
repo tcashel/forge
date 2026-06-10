@@ -7,8 +7,9 @@
 // won't recreate any DOM nodes, so focus and scroll position survive.
 import { computed, signal } from "@preact/signals";
 import { type ApiError, apiGet } from "../lib/api";
+import { isHidden } from "../lib/visibility";
 import type { PrsResponse, PrView } from "../types";
-import { selectedRepo } from "./ui";
+import { selectedRepo, viewMode } from "./ui";
 
 export const prs = signal<PrView[]>([]);
 export const prMe = signal<string>("");
@@ -31,12 +32,43 @@ export const currentPr = computed<PrView | null>(() => {
   return list.find((p) => p.number === sel) ?? list[0] ?? null;
 });
 
+let lastFetchAt = 0;
+
+// One-shot fast retry after a failed gh fetch — 5s instead of waiting
+// out the 30s poll tick. Never stacks; skipped while the tab is hidden
+// (the visibility hook catches up on return).
+let retryHandle: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRetry(): void {
+  if (retryHandle != null) return;
+  retryHandle = setTimeout(() => {
+    retryHandle = null;
+    if (!isHidden()) void refreshPrs();
+  }, 5_000);
+}
+
 export async function refreshPrs(): Promise<void> {
+  lastFetchAt = Date.now();
   prsLoading.value = true;
   try {
     const q = selectedRepo.value ? `?repo=${encodeURIComponent(selectedRepo.value)}` : "";
     const url = `/api/prs${q}`;
     const data = await apiGet<PrsResponse>(url);
+    if (data.fetchOk === false) {
+      // The server's gh call failed — the empty list is failure-shaped,
+      // not truth. Keep the last good list when it belongs to the same
+      // repo, surface a banner, and retry shortly.
+      const sameRepo = prsRepoRoot.value !== null && prsRepoRoot.value === (data.repoRoot || null);
+      if (!sameRepo) {
+        prs.value = [];
+        prMe.value = data.me || "";
+        prsRepoName.value = data.repo || null;
+        prsRepoRoot.value = data.repoRoot || null;
+      }
+      prsError.value = "GitHub fetch failed — retrying…";
+      scheduleRetry();
+      return;
+    }
     prs.value = data.prs || [];
     prMe.value = data.me || "";
     prsRepoName.value = data.repo || null;
@@ -59,12 +91,19 @@ export async function refreshPrs(): Promise<void> {
 
 let pollHandle: ReturnType<typeof setInterval> | null = null;
 
-// Single 30s poll keeps the sidebar PR count fresh and (when on the PRs
-// view) refreshes the visible list. There's no separate count endpoint —
-// `/api/prs` returns the full list — so we just call refreshPrs always.
+// Off the PRs view the sidebar count is the only consumer, so the poll
+// degrades to this slow background cadence instead of stopping outright.
+const BACKGROUND_REFRESH_MS = 5 * 60_000;
+
+// 30s poll while the PRs view is active; a 5-min background tick keeps
+// the sidebar count bounded-fresh everywhere else. Hidden tabs skip the
+// work entirely (main.tsx refreshes on return to visible, and entering
+// the PRs view triggers an immediate refresh).
 export function startPrPolling(): void {
   if (pollHandle != null) return;
   pollHandle = setInterval(() => {
+    if (isHidden()) return;
+    if (viewMode.value !== "prs" && Date.now() - lastFetchAt < BACKGROUND_REFRESH_MS) return;
     void refreshPrs();
   }, 30_000);
 }

@@ -9,7 +9,7 @@
  * Localhost-only by design. There is no auth in this revision.
  */
 
-import { execSync, spawn } from "node:child_process";
+import { spawn } from "node:child_process";
 import * as fs from "node:fs";
 import * as net from "node:net";
 import * as path from "node:path";
@@ -34,7 +34,7 @@ import {
 } from "../../core/gh-pr.ts";
 import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
-import { isTmuxSessionAlive } from "../../core/launch.ts";
+import { listTmuxSessions } from "../../core/launch.ts";
 import {
   abortInFlight,
   BadCwdError,
@@ -59,6 +59,7 @@ import {
   summarizePlanForSse,
 } from "../../core/plan-edit.ts";
 import { detectRepo } from "../../core/repo.ts";
+import { repoQuickInfo } from "../../core/repo-fast.ts";
 import { killPlan, reapDeadRunnerPlans, reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type {
   CritiqueMeta,
@@ -69,6 +70,7 @@ import type {
   ReasoningEffort,
   RepoConfig,
 } from "../../core/store.ts";
+import { createTtlCache, type TtlCache } from "../../core/ttl-cache.ts";
 import { aggregateUsage } from "../../core/usage.ts";
 import {
   isCleanMergedTarget,
@@ -159,7 +161,20 @@ interface RepoView {
   stale: boolean;
 }
 
-type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
+type PrFetcher = (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string; ok?: boolean }>;
+
+/**
+ * Sentinel for failure-shaped fetchPrs results (`ok: false`). Thrown
+ * inside the prsCache loader so the cache skips storing the result —
+ * otherwise a transient gh hiccup would pin an empty PR list for the
+ * whole SWR window. The handler catches it and serves the result
+ * uncached, preserving the pre-cache degraded behavior.
+ */
+class PrFetchFailed extends Error {
+  constructor(readonly result: Awaited<ReturnType<PrFetcher>>) {
+    super("pr fetch returned a failure-shaped result");
+  }
+}
 type PrBundleFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
 
 const CONFIG_STRING_KEYS = new Set([
@@ -374,26 +389,16 @@ function failureMessage(task: Plan, store: ForgeStore): string | null {
   return null;
 }
 
-function specBranchInDisk(repoRoot: string): string | null {
-  try {
-    const out = execSync("git rev-parse --abbrev-ref HEAD", {
-      cwd: repoRoot,
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      timeout: 3000,
-    }).trim();
-    return out || null;
-  } catch {
-    return null;
-  }
-}
-
+/**
+ * Subprocess-free repo facts (existence, .git presence, on-disk branch).
+ * Runs once per task per /api/plans poll, so it must stay off the event
+ * loop's critical path — repoQuickInfo is pure fs reads behind a 2s
+ * micro-TTL. Semantic note vs. the old detectRepo-based version: hasGit
+ * now means ".git exists" rather than "git rev-parse succeeded"; a
+ * corrupt checkout reports reachable+hasGit with branch null.
+ */
 function repoDiskInfo(repoRoot: string): { reachable: boolean; hasGit: boolean; branch: string | null } {
-  if (!repoRoot || !path.isAbsolute(repoRoot) || !fs.existsSync(repoRoot)) {
-    return { reachable: false, hasGit: false, branch: null };
-  }
-  const detected = detectRepo(repoRoot);
-  return { reachable: true, hasGit: !!detected, branch: detected ? specBranchInDisk(detected.root) : null };
+  return repoQuickInfo(repoRoot);
 }
 
 function ghTargetForRepo(store: ForgeStore, repoRoot: string): GhTarget | undefined {
@@ -475,13 +480,71 @@ function validateConfigPatch(
   return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
-function viewTask(task: Plan, store: ForgeStore): PlanView {
+/**
+ * Per-request inputs shared by every viewTask call in a list response,
+ * gathered once so the per-task work stays free of subprocesses and
+ * per-task DB round-trips.
+ */
+interface PlanViewDeps {
+  /** Live tmux session names from one batched `tmux list-sessions`. */
+  tmuxSessions: Set<string>;
+  /**
+   * Fully-resolved provenance per plan id (missing key → no DB row →
+   * null). When absent, viewTask falls back to the per-plan query —
+   * single-task endpoints don't need the batch.
+   */
+  provenanceById?: Map<string, PlanView["provenance"]>;
+}
+
+async function buildPlanViewDeps(): Promise<PlanViewDeps> {
+  return { tmuxSessions: await listTmuxSessions() };
+}
+
+interface SpecSummary {
+  hasSpec: boolean;
+  blurb: string | null;
+  openQuestionCount: number;
+}
+
+const NO_SPEC: SpecSummary = { hasSpec: false, blurb: null, openQuestionCount: 0 };
+
+/**
+ * Derived spec fields for the task list, cached by the spec file's
+ * (ino, mtimeNs, size). Specs change only on explicit edits/improves —
+ * atomic renames, so the bigint stat always invalidates — yet the 3s
+ * poll previously re-read and markdown-parsed every spec on every tick.
+ */
+const specSummaryCache = new Map<string, { ino: bigint; mtimeNs: bigint; size: bigint; summary: SpecSummary }>();
+
+function specSummary(store: ForgeStore, planId: string): SpecSummary {
+  let stat: fs.BigIntStats;
+  try {
+    stat = fs.statSync(store.getSpecPath(planId), { bigint: true });
+  } catch {
+    specSummaryCache.delete(planId);
+    return NO_SPEC;
+  }
+  const hit = specSummaryCache.get(planId);
+  if (hit && hit.ino === stat.ino && hit.mtimeNs === stat.mtimeNs && hit.size === stat.size) {
+    return hit.summary;
+  }
+  const spec = store.getSpec(planId);
+  const summary: SpecSummary = spec
+    ? {
+        hasSpec: true,
+        blurb: blurbFromSpec(spec),
+        openQuestionCount: parsePlanDocument(spec).openQuestions.length,
+      }
+    : NO_SPEC;
+  specSummaryCache.set(planId, { ino: stat.ino, mtimeNs: stat.mtimeNs, size: stat.size, summary });
+  return summary;
+}
+
+function viewTask(task: Plan, store: ForgeStore, deps: PlanViewDeps): PlanView {
   const info = statusInfo(task, store);
   const ageRef = task.launchedAt ?? task.createdAt;
   const age = timeAgo(ageRef);
-  const spec = store.getSpec(task.id);
-  const blurb = spec ? blurbFromSpec(spec) : null;
-  const openQuestionCount = spec ? parsePlanDocument(spec).openQuestions.length : 0;
+  const spec = specSummary(store, task.id);
   const repoInfo = repoDiskInfo(task.repoRoot);
   return {
     id: task.id,
@@ -499,19 +562,19 @@ function viewTask(task: Plan, store: ForgeStore): PlanView {
     repoReachable: repoInfo.reachable,
     repoHasGit: repoInfo.hasGit,
     repoStale: !repoInfo.reachable || !repoInfo.hasGit,
-    blurb,
+    blurb: spec.blurb,
     age: age.label,
     ageMs: age.ms,
     prUrl: task.prUrl,
     prNumber: task.prNumber,
     error: info.error,
-    tmuxAlive: task.tmuxSession ? isTmuxSessionAlive(task.tmuxSession) : false,
-    hasSpec: !!spec,
+    tmuxAlive: task.tmuxSession ? deps.tmuxSessions.has(task.tmuxSession) : false,
+    hasSpec: spec.hasSpec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
-    openQuestionCount,
+    openQuestionCount: spec.openQuestionCount,
     critique: info.critique,
     lastImproveError: task.lastImproveError,
-    provenance: planProvenance(task, store),
+    provenance: deps.provenanceById ? (deps.provenanceById.get(task.id) ?? null) : planProvenance(task, store),
   };
 }
 
@@ -542,6 +605,48 @@ function planProvenance(task: Plan, store: ForgeStore): PlanView["provenance"] {
   } catch {
     // DB miss or transient error — fall back to JSON-only data on the row.
     return null;
+  }
+}
+
+/**
+ * One-query provenance for a whole plan list. Same shape and null-on-miss
+ * semantics as planProvenance, but a single `IN (...)` round-trip instead
+ * of three correlated subselects per plan per poll.
+ */
+function batchPlanProvenance(store: ForgeStore, tasks: Plan[]): Map<string, PlanView["provenance"]> {
+  const out = new Map<string, PlanView["provenance"]>();
+  if (tasks.length === 0) return out;
+  try {
+    const placeholders = tasks.map(() => "?").join(",");
+    const rows = store.db.db
+      .prepare(
+        `SELECT p.id AS id,
+            (SELECT MAX(version_number) FROM plan_versions WHERE plan_id = p.id) AS spec_version,
+            (SELECT COUNT(*) FROM jobs j JOIN tasks t ON j.task_id = t.id WHERE t.plan_id = p.id) AS prior_runs,
+            (SELECT j.state FROM jobs j JOIN tasks t ON j.task_id = t.id
+              WHERE t.plan_id = p.id ORDER BY j.run_number DESC LIMIT 1) AS last_run_state
+         FROM plans p WHERE p.id IN (${placeholders})`,
+      )
+      .all(...tasks.map((t) => t.id)) as Array<{
+      id: string;
+      spec_version: number | null;
+      prior_runs: number;
+      last_run_state: string | null;
+    }>;
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const task of tasks) {
+      const row = byId.get(task.id);
+      if (!row) continue; // no DB row (legacy data) → null via map miss
+      out.set(task.id, {
+        specVersion: row.spec_version ?? task.specVersion ?? 1,
+        priorRuns: row.prior_runs ?? 0,
+        lastRunState: row.last_run_state,
+      });
+    }
+    return out;
+  } catch {
+    // Mirror planProvenance's catch → null-for-everyone on DB trouble.
+    return out;
   }
 }
 
@@ -801,6 +906,15 @@ interface RouteCtx {
   currentRepo: { name: string; root: string } | null;
   prFetcher: PrFetcher;
   prBundleFetcher: PrBundleFetcher;
+  /**
+   * Per-server PR-list cache keyed by repo root: 20s fresh, then
+   * stale-while-revalidate for up to 60s more. The PR list is remote,
+   * eventually-consistent metadata, so bounded staleness is fine — but
+   * PR-mutating routes (run-review, fix-comments, publish) invalidate
+   * their repo's key so operator actions reflect immediately. Null when
+   * caching is disabled (prsCacheTtlMs: 0 in tests).
+   */
+  prsCache: TtlCache<string, Awaited<ReturnType<PrFetcher>>> | null;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -854,24 +968,27 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     let tasks = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) tasks = tasks.filter((t) => t.repoName === repo || t.repoRoot === repo);
     // Sync any running tasks so the UI sees fresh statuses on every poll.
+    // syncPlanStatus returns the updated Plan (or null if unchanged), so
+    // the result is applied in-memory rather than re-reading the index.
     // Per-plan try/catch: one corrupt meta.json must not 500 the list.
-    for (const t of tasks) {
-      if (RUNNING_PLAN_STATUSES.has(t.status)) {
-        try {
-          store.syncPlanStatus(t);
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          process.stderr.write(`warn: syncPlanStatus failed for ${t.id}: ${msg}\n`);
-        }
+    const synced = tasks.map((t) => {
+      if (!RUNNING_PLAN_STATUSES.has(t.status)) return t;
+      try {
+        return store.syncPlanStatus(t) ?? t;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`warn: syncPlanStatus failed for ${t.id}: ${msg}\n`);
+        return t;
       }
-    }
-    // Re-read after the sync to pick up any status changes.
-    let synced = store.getPlans().filter((t) => t.status !== "archived");
-    if (repo) synced = synced.filter((t) => t.repoName === repo || t.repoRoot === repo);
+    });
+    // Shared per-request inputs: one tmux subprocess (async, micro-TTL'd)
+    // and one provenance query for the whole list.
+    const deps: PlanViewDeps = await buildPlanViewDeps();
+    deps.provenanceById = batchPlanProvenance(store, synced);
     let views: PlanView[] = [];
     for (const t of synced) {
       try {
-        views.push(viewTask(t, store));
+        views.push(viewTask(t, store, deps));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         process.stderr.write(`warn: viewTask failed for ${t.id} — omitting from /api/plans: ${msg}\n`);
@@ -959,7 +1076,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
 
     if (!sub) {
       const meta = store.readRunMeta(id);
-      const view = viewTask(task, store);
+      const view = viewTask(task, store, await buildPlanViewDeps());
       return jsonOk({ task: view, meta });
     }
 
@@ -1202,7 +1319,22 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     const repos = buildRepoViews(store, ctx.currentRepo);
     const target = resolvePrRepo(repos, repoName);
     if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
-    const result = await ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    const fetchForTarget = () => ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    let result: Awaited<ReturnType<PrFetcher>>;
+    if (ctx.prsCache) {
+      try {
+        result = await ctx.prsCache.get(target.root, async () => {
+          const r = await fetchForTarget();
+          if (r.ok === false) throw new PrFetchFailed(r);
+          return r;
+        });
+      } catch (e) {
+        if (!(e instanceof PrFetchFailed)) throw e;
+        result = e.result;
+      }
+    } else {
+      result = await fetchForTarget();
+    }
     // Attach a cheap worktree snapshot per PR (path + safety only — no
     // gh state lookup or git fetch). The dedicated /api/worktrees view
     // does the full enrichment.
@@ -1210,7 +1342,16 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       ...pr,
       worktree: summarizeWorktreeForPr(store, target.root, pr.number),
     }));
-    return jsonOk({ prs: enriched, me: result.me, repo: target.name, repoRoot: target.root });
+    // fetchOk lets the client distinguish "genuinely no open PRs" from
+    // "gh call failed" — the latter renders as a retrying banner over
+    // the last good list instead of a false "No open PRs".
+    return jsonOk({
+      prs: enriched,
+      me: result.me,
+      repo: target.name,
+      repoRoot: target.root,
+      fetchOk: result.ok !== false,
+    });
   }
 
   // GET /api/worktrees?repo=<name>
@@ -2345,6 +2486,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         { prNum, repoRoot: target.root, repoName: target.name, publishToGitHub },
         store,
       );
+      ctx.prsCache?.invalidate(target.root);
       return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
     } catch (e) {
       if (e instanceof CliError) {
@@ -2401,6 +2543,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     }
     try {
       const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, targets }, store);
+      ctx.prsCache?.invalidate(target.root);
       // droppedTargets tells the UI which requested targets were silently
       // unfixable (unanchored comment, unknown finding id, …) so the
       // operator isn't left wondering why a checkbox did nothing.
@@ -2448,6 +2591,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
       const result = await republishReviewSession({ prNum, repoRoot: target.root, sessionId }, store, (msg) =>
         process.stderr.write(`[forge serve] republish ${sessionId}: ${msg}\n`),
       );
+      ctx.prsCache?.invalidate(target.root);
       return jsonOk({ sessionId, publish: result.record });
     } catch (e) {
       if (e instanceof CliError) {
@@ -2720,6 +2864,13 @@ export interface ServeOptions {
   open?: boolean;
   prFetcher?: PrFetcher;
   prBundleFetcher?: PrBundleFetcher;
+  /**
+   * Freshness window for the per-repo /api/prs cache. Defaults to 20s
+   * (with an additional 60s stale-while-revalidate window). Pass 0 to
+   * disable caching entirely — tests asserting fetcher call counts use
+   * this.
+   */
+  prsCacheTtlMs?: number;
 }
 
 /**
@@ -2905,6 +3056,10 @@ export async function startServer(
     currentRepo: detectedCurrentRepo ? { name: detectedCurrentRepo.name, root: detectedCurrentRepo.root } : null,
     prFetcher: opts.prFetcher ?? fetchPrs,
     prBundleFetcher: opts.prBundleFetcher ?? defaultFetchPrBundle,
+    prsCache:
+      (opts.prsCacheTtlMs ?? 20_000) > 0
+        ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
+        : null,
   };
 
   const server = Bun.serve({

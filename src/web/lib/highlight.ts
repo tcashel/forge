@@ -97,6 +97,11 @@ const LANG_ID: Record<Lang, string> = {
   go: "go",
 };
 
+/** True once a grammar is loaded and rows in this language can tokenize. */
+export function isLangLoaded(lang: Lang): boolean {
+  return loadedLangs.has(lang);
+}
+
 /** Trigger lazy load of a language; safe to call repeatedly. */
 export function ensureLang(lang: Lang): void {
   if (loadedLangs.has(lang)) return;
@@ -121,12 +126,28 @@ export interface HlToken {
   color?: string;
 }
 
+// Tokenization cache. Diff rows repeat heavily (blank lines, braces,
+// unchanged context re-rendered on every parent state change), and
+// Shiki's tokenizer is the most expensive thing on the review page.
+// Map-as-LRU: delete+reinsert on hit, evict oldest insertion on
+// overflow. Single theme today — clear this cache if theme switching
+// ever lands.
+const TOKEN_CACHE_MAX = 20_000;
+const tokenCache = new Map<string, HlToken[]>();
+
 /**
  * Tokenize a single row of content. Returns null if the highlighter or
  * the language grammar isn't loaded yet (caller renders plain text).
  */
 export function tokenizeRow(content: string, lang: Lang): HlToken[] | null {
   if (!highlighter || !loadedLangs.has(lang)) return null;
+  const key = `${lang}\0${content}`;
+  const cached = tokenCache.get(key);
+  if (cached) {
+    tokenCache.delete(key);
+    tokenCache.set(key, cached);
+    return cached;
+  }
   try {
     const lines = highlighter.codeToTokensBase(content, {
       lang: LANG_ID[lang],
@@ -137,6 +158,11 @@ export function tokenizeRow(content: string, lang: Lang): HlToken[] | null {
     const line = lines[0] ?? [];
     for (const t of line) {
       out.push({ text: t.content, color: t.color });
+    }
+    tokenCache.set(key, out);
+    if (tokenCache.size > TOKEN_CACHE_MAX) {
+      const oldest = tokenCache.keys().next();
+      if (!oldest.done) tokenCache.delete(oldest.value);
     }
     return out;
   } catch {

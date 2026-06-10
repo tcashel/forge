@@ -1,6 +1,7 @@
+import { memo } from "preact/compat";
 import { useEffect, useMemo, useState } from "preact/hooks";
 import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff } from "../../lib/diff";
-import { detectLang, ensureLang, onHighlighterReady, tokenizeRow } from "../../lib/highlight";
+import { detectLang, ensureLang, isLangLoaded, onHighlighterReady, tokenizeRow } from "../../lib/highlight";
 import { fileDomId, rowDomId } from "../../lib/review-scroll";
 import type { ForgeFinding, InlinePrComment, PrReviewBundle } from "../../types";
 import { CommentThread, type InlineThread } from "./CommentThread";
@@ -124,7 +125,18 @@ function rowGutter(r: DiffRow): string {
   return " ";
 }
 
-function RowContent({ row, lang }: { row: DiffRow; lang: ReturnType<typeof detectLang> }) {
+// Memoized so a parent re-render (selection changes, sibling grammar
+// loads) skips rebuilding the token spans for unchanged rows. `loaded`
+// is part of the props so rows re-render exactly once when their own
+// grammar arrives.
+const RowContent = memo(function RowContent({
+  row,
+  lang,
+}: {
+  row: DiffRow;
+  lang: ReturnType<typeof detectLang>;
+  loaded: boolean;
+}) {
   const tokens = lang ? tokenizeRow(row.content, lang) : null;
   if (!tokens) {
     return <span class="content">{row.content}</span>;
@@ -138,24 +150,27 @@ function RowContent({ row, lang }: { row: DiffRow; lang: ReturnType<typeof detec
       ))}
     </span>
   );
-}
+});
 
-function DiffFileCard({
-  file,
-  threadsByAnchor,
-  highlightTick,
-}: {
-  file: DiffFile;
-  threadsByAnchor: Map<string, InlineThread[]>;
-  highlightTick: number;
-}) {
+function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnchor: Map<string, InlineThread[]> }) {
   const lang = useMemo(() => detectLang(file.path), [file.path]);
   useEffect(() => {
     if (lang && !file.isBinary) ensureLang(lang);
   }, [lang, file.isBinary]);
-  // Re-render on highlighter readiness so freshly-loaded grammars
-  // light up in place.
-  void highlightTick;
+  // Subscribe to highlighter load events, but only re-render when THIS
+  // file's grammar transitions to loaded — a `go` grammar finishing must
+  // not re-render every TypeScript card on the page.
+  const [loaded, setLoaded] = useState(() => (lang ? isLangLoaded(lang) : false));
+  useEffect(() => {
+    if (!lang || loaded) return;
+    if (isLangLoaded(lang)) {
+      setLoaded(true);
+      return;
+    }
+    return onHighlighterReady(() => {
+      if (isLangLoaded(lang)) setLoaded(true);
+    });
+  }, [lang, loaded]);
   return (
     <details class="review-file" id={fileDomId(file.path)} open>
       <summary>
@@ -184,7 +199,7 @@ function DiffFileCard({
                       <span class="ln old">{r.oldLine ?? ""}</span>
                       <span class="ln new">{r.newLine ?? ""}</span>
                       <span class="gutter">{rowGutter(r)}</span>
-                      <RowContent row={r} lang={lang} />
+                      <RowContent row={r} lang={lang} loaded={loaded} />
                     </div>
                     {threads ? threads.map((t) => <CommentThread key={`thread-${t.root.id}`} thread={t} />) : null}
                   </div>
@@ -204,13 +219,6 @@ export function DiffPane({ bundle, findings: _findings }: Props) {
   const threads = useMemo(() => groupIntoThreads(inlineComments), [inlineComments]);
   const { anchored } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
 
-  // Tick that bumps every time a grammar finishes loading so rows
-  // re-render with their now-available tokens.
-  const [highlightTick, setHighlightTick] = useState(0);
-  useEffect(() => {
-    return onHighlighterReady(() => setHighlightTick((t) => t + 1));
-  }, []);
-
   if (parsed.length === 0) {
     return (
       <section class="review-diff">
@@ -222,7 +230,7 @@ export function DiffPane({ bundle, findings: _findings }: Props) {
   return (
     <section class="review-diff">
       {parsed.map((file) => (
-        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} highlightTick={highlightTick} />
+        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} />
       ))}
     </section>
   );

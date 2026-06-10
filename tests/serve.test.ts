@@ -28,6 +28,7 @@ async function bootServer(
   opts: {
     prFetcher?: (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
     prBundleFetcher?: (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
+    prsCacheTtlMs?: number;
   } = {},
 ): Promise<ServerHandle> {
   const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-serve-"));
@@ -41,6 +42,7 @@ async function bootServer(
       host: "127.0.0.1",
       prFetcher: opts.prFetcher,
       prBundleFetcher: opts.prBundleFetcher,
+      prsCacheTtlMs: opts.prsCacheTtlMs,
     });
     return {
       baseUrl: `http://127.0.0.1:${port}`,
@@ -645,6 +647,70 @@ test("GET /api/prs resolves registered repo by name", async (t) => {
   assert.equal(body.data!.prs![0].number, 303);
   assert.equal(body.data!.repoRoot, repo);
   assert.equal(seenCwd, repo);
+});
+
+test("GET /api/prs serves repeat requests from the SWR cache", async (t) => {
+  let calls = 0;
+  const h = await bootServer({
+    prFetcher: async () => {
+      calls++;
+      return { prs: [fakePr(404)], me: "alice" };
+    },
+  });
+  t.after(() => h.stop());
+
+  const first = await getJson(`${h.baseUrl}/api/prs`);
+  const second = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(first.body.ok, true);
+  assert.equal(second.body.ok, true);
+  assert.equal(second.body.data!.prs![0].number, 404);
+  assert.equal(calls, 1, "second request within the TTL must not re-fetch");
+});
+
+test("GET /api/prs does not cache failure-shaped (ok: false) results", async (t) => {
+  let calls = 0;
+  const h = await bootServer({
+    prFetcher: async () => {
+      calls++;
+      // First call: transient gh failure (failure-shaped empty list).
+      if (calls === 1) return { prs: [], me: "", ok: false };
+      return { prs: [fakePr(505)], me: "alice", ok: true };
+    },
+  });
+  t.after(() => h.stop());
+
+  const first = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(first.body.ok, true);
+  assert.equal(first.body.data!.prs!.length, 0, "failure degrades to an empty list");
+  assert.equal(
+    (first.body.data as { fetchOk?: boolean }).fetchOk,
+    false,
+    "failure-shaped responses are flagged so the UI can show a retry banner",
+  );
+
+  const second = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(second.body.data!.prs![0].number, 505, "failure was not pinned by the cache");
+  assert.equal((second.body.data as { fetchOk?: boolean }).fetchOk, true);
+
+  const third = await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(third.body.data!.prs![0].number, 505);
+  assert.equal(calls, 2, "the successful result IS cached");
+});
+
+test("GET /api/prs with prsCacheTtlMs: 0 fetches every request", async (t) => {
+  let calls = 0;
+  const h = await bootServer({
+    prsCacheTtlMs: 0,
+    prFetcher: async () => {
+      calls++;
+      return { prs: [], me: "alice" };
+    },
+  });
+  t.after(() => h.stop());
+
+  await getJson(`${h.baseUrl}/api/prs`);
+  await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(calls, 2, "caching disabled → one fetch per request");
 });
 
 test("GET /api/prs prefers reachable current repo over stale same-name task repo", async (t) => {

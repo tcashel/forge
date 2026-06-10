@@ -6,7 +6,7 @@
  * Status is written to ~/.forge/runs/<id>/meta.json by the bash script.
  */
 
-import { execSync, spawnSync } from "node:child_process";
+import { execSync, spawn, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
@@ -15,6 +15,7 @@ import { executionSessionId, liveJobId, recordJobStarted } from "./db/writes.ts"
 import { bashGhEnvExport } from "./gh.js";
 import { buildFixerPromptPrefix, buildReviewerPromptPrefix } from "./reviewer.js";
 import type { ForgeStore, LaunchTarget, ReasoningEffort, RunMeta } from "./store.js";
+import { createTtlCache } from "./ttl-cache.ts";
 
 export interface LaunchConfig {
   planId: string;
@@ -68,6 +69,43 @@ export function isTmuxSessionAlive(session: string): boolean {
   } catch {
     return false;
   }
+}
+
+const tmuxSessionsCache = createTtlCache<"sessions", Set<string>>({ ttlMs: 2_000 });
+
+/**
+ * All live tmux session names in one async call. The serve /api/plans
+ * handler checks liveness for every task per 3s poll; per-task
+ * `has-session` subprocesses (execSync) blocked the event loop. One
+ * `list-sessions` behind a 2s micro-TTL (with in-flight dedupe) bounds
+ * staleness below the poll period. No tmux server / no tmux binary →
+ * empty set, matching has-session failure semantics.
+ */
+export function listTmuxSessions(): Promise<Set<string>> {
+  return tmuxSessionsCache.get("sessions", async () => {
+    return await new Promise<Set<string>>((resolve) => {
+      const child = spawn("tmux", ["list-sessions", "-F", "#{session_name}"], {
+        stdio: ["ignore", "pipe", "ignore"],
+      });
+      let out = "";
+      child.stdout.on("data", (d) => {
+        out += d.toString();
+      });
+      child.on("error", () => resolve(new Set()));
+      child.on("close", (code) => {
+        if (code !== 0) {
+          resolve(new Set());
+          return;
+        }
+        resolve(new Set(out.split("\n").filter(Boolean)));
+      });
+    });
+  });
+}
+
+/** Test hook: drop the cached session set. */
+export function __resetTmuxSessionsCache(): void {
+  tmuxSessionsCache.clear();
 }
 
 export function killTmuxSession(session: string): void {
