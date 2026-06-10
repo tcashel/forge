@@ -12,7 +12,20 @@ import * as fs from "node:fs";
 import * as path from "node:path";
 import { atomicWriteJSON } from "./atomic-write.ts";
 
-export type FindingPublishStatus = "posted" | "already-published" | "out-of-diff-posted" | "failed";
+export type FindingPublishStatus =
+  | "posted"
+  | "already-published"
+  /**
+   * Not posted because an existing Forge marker comment already anchors at the
+   * same path:line. Almost always the same defect re-titled by a re-review
+   * (ids are sha1(file|line|title), so a re-title mints a new id); distinct
+   * from "already-published", which is verified by marker id, so a genuinely
+   * new same-line finding is visible in the record rather than silently
+   * conflated.
+   */
+  | "skipped-colocated"
+  | "out-of-diff-posted"
+  | "failed";
 
 export interface FindingPublishOutcome {
   id: string;

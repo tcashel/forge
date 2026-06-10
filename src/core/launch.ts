@@ -120,8 +120,13 @@ forge_session_finish() {
 }`;
 }
 
-/** Bash single-quoted token for the reviewer's expected fenced block marker. */
-const FORGE_REVIEW_FENCE_TOK = "'\\`\\`\\`forge-review'";
+/**
+ * Bash single-quoted token for the reviewer's expected fenced block marker.
+ * Plain backticks — no backslash escapes: the value is matched with `grep -F`
+ * (fixed string), and a `\`` inside the pattern is a literal backtick to BSD
+ * grep but a buffer anchor to GNU grep, which silently broke the gate on CI.
+ */
+const FORGE_REVIEW_FENCE_TOK = "'```forge-review'";
 
 /**
  * Bash snippet reconciling a streaming stage's pipeline exit code against its
@@ -663,7 +668,7 @@ stage_result_valid() {
   fi
   [ -s "$out" ] || return 1
   if [ -n "$fence" ]; then
-    last_marker=$(grep -n "$fence" "$out" | tail -1 | cut -d: -f1)
+    last_marker=$(grep -nF "$fence" "$out" | tail -1 | cut -d: -f1)
     [ -n "$last_marker" ] || return 1
     tail -n +"$(( last_marker + 1 ))" "$out" | grep -Eq '^[[:space:]]*\`{3,}[[:space:]]*$' || return 1
   fi

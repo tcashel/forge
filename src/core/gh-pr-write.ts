@@ -446,10 +446,15 @@ export async function publishReviewFindings(
     ...args.findings
       .filter((f) => published.has(f.id))
       .map((f) => ({ id: f.id, status: "already-published" as const })),
+    // Colocated ≠ verified: the marker id was NOT found on the PR, we are
+    // inferring "same defect, re-titled" from the shared anchor. A distinct
+    // status keeps that inference visible in publish.json / the CLI outcome
+    // table, so a genuinely new same-line finding is auditable instead of
+    // silently passing as already-published.
     ...colocated.map((a) => ({
       id: a.finding.id,
-      status: "already-published" as const,
-      error: `colocated: existing Forge comment at ${anchorKey(a.path, a.line)}`,
+      status: "skipped-colocated" as const,
+      error: `existing Forge comment anchors at ${anchorKey(a.path, a.line)} — assumed re-titled duplicate`,
     })),
   ];
 

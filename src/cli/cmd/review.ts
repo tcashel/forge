@@ -135,23 +135,30 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
     });
   }
 
+  // With --json, stdout carries exactly one JSON document — progress lines go
+  // to stderr so consumers can `JSON.parse` the stream.
+  const logSink = values.json === true ? process.stderr : process.stdout;
+
   if (values["publish-only"] === true) {
     const { record, findingsPath, source } = await runPublishOnly(
       { prNum, repoRoot: repo.root, repoName: repo.name },
       store,
-      (msg) => process.stdout.write(`${msg}\n`),
+      (msg) => logSink.write(`${msg}\n`),
     );
-    if (values.json === true) {
-      emitOk({ prNumber: prNum, repoName: repo.name, source, findingsPath, publish: record }, true);
-    } else {
+    const payload = { prNumber: prNum, repoName: repo.name, source, findingsPath, publish: record };
+    if (values.json !== true) {
       process.stdout.write(`${formatPublishOutcome(record)}\n`);
     }
+    // Failure check BEFORE the success envelope: with --json, a failed publish
+    // must produce exactly one JSON document on stdout (the error envelope,
+    // payload riding in detail) — not a success envelope followed by it.
     if (PUBLISH_FAILED_STATES.has(record.state)) {
       throw new CliError("PUBLISH_FAILED", `publish ${record.state}: ${record.error ?? "see per-finding outcomes"}`, {
-        detail: record,
+        detail: payload,
         exitCode: 4,
       });
     }
+    if (values.json === true) emitOk(payload, true);
     return;
   }
 
@@ -164,34 +171,33 @@ export async function run(argv: string[], store: ForgeStore): Promise<void> {
         publishToGitHub: values.publish === true,
       },
       store,
-      (msg) => process.stdout.write(`${msg}\n`),
+      (msg) => logSink.write(`${msg}\n`),
     );
-    if (values.json === true) {
-      emitOk(
-        {
-          prNumber: prNum,
-          repoName: repo.name,
-          sessionId,
-          runDir,
-          verdict: result.verdict,
-          findings: result.findings,
-          publish: result.publish,
-          error: result.error,
-        },
-        true,
-      );
-    } else {
+    const payload = {
+      prNumber: prNum,
+      repoName: repo.name,
+      sessionId,
+      runDir,
+      verdict: result.verdict,
+      findings: result.findings,
+      publish: result.publish,
+      error: result.error,
+    };
+    if (values.json !== true) {
       process.stdout.write(`\nReview of PR #${prNum} in ${repo.name} — verdict: ${result.verdict ?? "(none)"}\n`);
       process.stdout.write(`${formatFindingsTable(result.findings)}\n`);
       process.stdout.write(`${formatPublishOutcome(result.publish)}\n`);
       process.stdout.write(`artifacts: ${runDir}\n`);
     }
+    // Failure checks BEFORE the success envelope — see the --publish-only
+    // branch above for why (one JSON document per invocation).
     if (result.exitCode !== 0) {
-      throw new CliError("REVIEW_FAILED", result.error ?? "review failed", { exitCode: 1 });
+      throw new CliError("REVIEW_FAILED", result.error ?? "review failed", { detail: payload, exitCode: 1 });
     }
     if (result.publishError) {
-      throw new CliError("PUBLISH_FAILED", result.publishError, { detail: result.publish, exitCode: 4 });
+      throw new CliError("PUBLISH_FAILED", result.publishError, { detail: payload, exitCode: 4 });
     }
+    if (values.json === true) emitOk(payload, true);
     return;
   }
 

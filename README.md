@@ -155,8 +155,8 @@ forge review 123 --publish-only   # skip the reviewer; re-run the idempotent pub
 
 Publishing is **at-least-once with persisted per-finding state** (ADR-0031):
 
-- Every review run writes `publish.json` to its run dir (`~/.forge/runs/pr-review/<pr>-<sessionId>/`): an overall state (`published | partial | failed | nothing-new | not-requested | reconcile-failed`) plus a per-finding outcome (`posted | already-published | out-of-diff-posted | failed`, with error text).
-- Posting is **idempotent**: each comment embeds a hidden `<!-- forge-finding id=… -->` marker, so re-runs update/skip instead of duplicating.
+- Every review run writes `publish.json` to its run dir (`~/.forge/runs/pr-review/<pr>-<sessionId>/`): an overall state (`published | partial | failed | nothing-new | not-requested | reconcile-failed`) plus a per-finding outcome (`posted | already-published | skipped-colocated | out-of-diff-posted | failed`, with error text).
+- Posting is **idempotent**: each comment embeds a hidden `<!-- forge-finding id=… -->` marker, so re-runs update/skip instead of duplicating. A new-id finding that anchors exactly where a live Forge comment already sits is skipped as a re-titled duplicate — recorded as `skipped-colocated` (an inference, distinct from the marker-verified `already-published`) so it stays auditable.
 - Findings that don't anchor on the diff fall back to the review summary body (`out-of-diff-posted`); one bad anchor no longer sinks the batch.
 - A requested-but-failed publish sets the session's error field, so `forge status`, the review history, and the Workbench all surface it loudly.
 - **Retry path:** `forge review <pr> --publish-only` (or the Workbench retry action) re-runs the publish at any time from the saved `findings.json`.

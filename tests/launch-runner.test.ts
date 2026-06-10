@@ -288,7 +288,7 @@ test("stage_result_valid: fence gate requires a complete forge-review block (exe
   try {
     fs.writeFileSync(metaFile, JSON.stringify({ status: "running" }));
     // The exact pre-quoted fence token the generated runner passes.
-    const fenceTok = "'\\`\\`\\`forge-review'";
+    const fenceTok = "'```forge-review'";
     const body = [
       "RUNNER_FINISHED=1",
       'S="$RUN_DIR/t.stream.jsonl"; O="$RUN_DIR/t-out.md"',

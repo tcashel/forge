@@ -582,6 +582,36 @@ test("runExtractReviewBlock writes findings.json beside the out file (launch buc
   }
 });
 
+test("findLatestForgeFindings skips ad-hoc dirs from other repos (same PR number)", () => {
+  const fx = setupFixture();
+  try {
+    const mkAdhoc = (name: string, repoRoot: string | null, id: string) => {
+      const dir = path.join(fx.store.runsDir, "pr-review", name);
+      fs.mkdirSync(dir, { recursive: true });
+      if (repoRoot !== null) {
+        fs.writeFileSync(path.join(dir, "meta.json"), JSON.stringify({ repoRoot }));
+      }
+      fs.writeFileSync(
+        path.join(dir, "findings.json"),
+        JSON.stringify([{ id, severity: "HIGH", title: "t", file: "f.ts", lineStart: 1, lineEnd: 1 }]),
+      );
+    };
+    // PR numbers collide across repos sharing one FORGE_HOME: a newer run for
+    // PR 7 in a DIFFERENT repo (and a legacy dir with no meta at all) must
+    // never shadow this repo's findings.
+    mkAdhoc("7-s-ours", fx.repoRoot, "ours00000001");
+    mkAdhoc("7-s-other-repo", "/somewhere/else", "other0000001");
+    mkAdhoc("7-s-no-meta", null, "nometa000001");
+
+    const lookup = findLatestForgeFindings(fx.store, 7, fx.repoRoot, null);
+    assert.equal(lookup.source, "adhoc");
+    assert.equal(lookup.findings.length, 1);
+    assert.equal(lookup.findings[0].id, "ours00000001");
+  } finally {
+    teardown(fx);
+  }
+});
+
 // ─── runPublishOnly ──────────────────────────────────────────────────────────
 
 test("runPublishOnly republishes the latest saved findings and writes the record beside them", async () => {
@@ -589,6 +619,7 @@ test("runPublishOnly republishes the latest saved findings and writes the record
   try {
     const runDir = path.join(fx.store.runsDir, "pr-review", "7-s-prior");
     fs.mkdirSync(runDir, { recursive: true });
+    fs.writeFileSync(path.join(runDir, "meta.json"), JSON.stringify({ repoRoot: fx.repoRoot }));
     const findings = [
       {
         id: "aa11bb22cc33",

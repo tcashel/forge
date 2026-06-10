@@ -445,8 +445,10 @@ test("publishReviewFindings dedupes a re-titled finding via the colocated anchor
     assert.equal(res.skippedPost, true);
     assert.equal(postReviewCalls(calls).length, 0, "no reviews POST for a colocated re-titled finding");
     const outcome = res.findings.find((f) => f.id === "99ff88ee77dd");
-    assert.equal(outcome?.status, "already-published");
-    assert.ok(outcome?.error?.includes("colocated"), "outcome carries the colocated note");
+    // Distinct from "already-published": the skip is an anchor-based inference
+    // (marker id NOT verified on the PR), and the record must say so.
+    assert.equal(outcome?.status, "skipped-colocated");
+    assert.ok(outcome?.error?.includes("anchors at"), "outcome carries the colocated note");
   } finally {
     __setGhRunner(null);
   }

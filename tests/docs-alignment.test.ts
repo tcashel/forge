@@ -63,7 +63,7 @@ test("README documents the review pipeline contract", () => {
   }
   // Exit codes for --run / --publish-only (0/1/4) and per-finding outcomes.
   assert.match(readme, /`0` success, `1` review failed[\s\S]*`4` publish failed/);
-  for (const outcome of ["posted", "already-published", "out-of-diff-posted", "failed"]) {
+  for (const outcome of ["posted", "already-published", "skipped-colocated", "out-of-diff-posted", "failed"]) {
     assert.ok(readme.includes(outcome), `README is missing per-finding outcome: ${outcome}`);
   }
 });

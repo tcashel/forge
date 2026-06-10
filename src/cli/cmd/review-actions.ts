@@ -1375,7 +1375,11 @@ export function findLatestForgeFindings(
 ): FindingsLookupResult {
   const candidates: Array<{ path: string; mtime: number; source: "adhoc" | "launch" }> = [];
 
-  // 1) ad-hoc
+  // 1) ad-hoc — run dirs are keyed by PR number only, and PR numbers collide
+  // across repos sharing one FORGE_HOME, so each candidate must prove via its
+  // meta.json that it belongs to THIS repo (fail closed: prepareReviewSession
+  // seeds repoRoot before the reviewer runs, so a dir that produced a
+  // findings.json always has it).
   const prReviewDir = path.join(store.runsDir, "pr-review");
   try {
     if (fs.existsSync(prReviewDir)) {
@@ -1383,6 +1387,8 @@ export function findLatestForgeFindings(
       const prefix = `${prNum}-`;
       for (const ent of entries) {
         if (!ent.isDirectory() || !ent.name.startsWith(prefix)) continue;
+        const meta = readMetaSafe(path.join(prReviewDir, ent.name, "meta.json"));
+        if (meta?.repoRoot !== repoRoot) continue;
         const fp = path.join(prReviewDir, ent.name, "findings.json");
         try {
           const stat = fs.statSync(fp);

@@ -284,6 +284,35 @@ test("forge review --run --publish exits 4 (PUBLISH_FAILED) when the POST fails"
   }
 });
 
+test("forge review --run --publish --json writes nothing to stdout on failure (single envelope)", async () => {
+  const fx = setupCliFixture();
+  const realWrite = process.stdout.write.bind(process.stdout);
+  const stdoutWrites: string[] = [];
+  // A failed publish with --json must leave stdout to main.ts's single error
+  // envelope: no success payload, no progress lines (those go to stderr).
+  process.stdout.write = ((chunk: string) => {
+    stdoutWrites.push(String(chunk));
+    return true;
+  }) as typeof process.stdout.write;
+  try {
+    __setReviewExecHooks({
+      ghExec: fx.ghExec,
+      agentExec: (a) => fs.writeFileSync(a.rawFile, CLI_RAW_REVIEW, "utf-8"),
+    });
+    __setGhRunner(makeCliPublishRunner(true) as never);
+    await assert.rejects(
+      () => runReviewCmd(["7", "--run", "--publish", "--repo", fx.repoDir, "--json"], fx.store),
+      (e: unknown) => e instanceof CliError && e.code === "PUBLISH_FAILED",
+    );
+    assert.deepEqual(stdoutWrites, [], "stdout must stay empty until main.ts emits the error envelope");
+  } finally {
+    process.stdout.write = realWrite;
+    __setReviewExecHooks(null);
+    __setGhRunner(null);
+    fs.rmSync(fx.tmpHome, { recursive: true, force: true });
+  }
+});
+
 test("forge review --run exits 1 (REVIEW_FAILED) when the reviewer produces no block", async () => {
   const fx = setupCliFixture();
   try {

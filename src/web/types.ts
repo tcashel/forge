@@ -427,7 +427,12 @@ export type ReviewRunStatus = "running" | "completed" | "failed" | "killed";
 export type ReviewVerdict = "approve" | "request-changes" | "block";
 
 // Mirror of FindingPublishOutcome / PublishRecord from src/core/publish-record.ts.
-export type FindingPublishStatus = "posted" | "already-published" | "out-of-diff-posted" | "failed";
+export type FindingPublishStatus =
+  | "posted"
+  | "already-published"
+  | "skipped-colocated"
+  | "out-of-diff-posted"
+  | "failed";
 
 export interface FindingPublishOutcome {
   id: string;
