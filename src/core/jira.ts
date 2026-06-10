@@ -50,9 +50,10 @@ function runAcli(
       input: opts.input,
     });
     return { ok: true, stdout: stdout.trim() };
-  } catch (e: any) {
-    const stderr = (e.stderr ?? "").toString().trim();
-    const message = stderr || e.message || String(e);
+  } catch (e: unknown) {
+    const err = e as { stderr?: unknown; message?: unknown };
+    const stderr = (err.stderr ?? "").toString().trim();
+    const message = stderr || (e instanceof Error ? e.message : String(e));
     return { ok: false, error: message };
   }
 }
@@ -80,7 +81,7 @@ export function fetchTicket(key: string): JiraTicket | null {
     try {
       const parsed = JSON.parse(jsonResult.stdout) as {
         key?: string;
-        fields?: { summary?: string; description?: string | { content?: any[] }; url?: string };
+        fields?: { summary?: string; description?: string | { content?: unknown[] }; url?: string };
         url?: string;
         self?: string;
         _links?: { web?: string };
