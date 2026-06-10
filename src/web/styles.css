@@ -1949,7 +1949,10 @@ body.filtered-single .repo-chip{ display: none; }
 }
 .review-md { font-size: 12px; line-height: 1.5; }
 .review-md p { margin: 4px 0; }
-.review-md code { background: var(--bg-deep, #0a0a0a); padding: 1px 4px; border-radius: 3px; }
+/* Theme-aware (not --bg-deep): the hardcoded near-black background read as
+   redaction bars on the light theme once the Description tab started
+   rendering prose full of inline code. */
+.review-md code { background: var(--panel-2); border: 1px solid var(--border); padding: 1px 4px; border-radius: 3px; }
 
 .review-diff { display: flex; flex-direction: column; gap: 12px; }
 .review-file {
