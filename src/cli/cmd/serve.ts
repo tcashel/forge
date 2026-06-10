@@ -34,7 +34,7 @@ import {
 } from "../../core/gh-pr.ts";
 import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
-import { isTmuxSessionAlive } from "../../core/launch.ts";
+import { listTmuxSessions } from "../../core/launch.ts";
 import {
   abortInFlight,
   BadCwdError,
@@ -466,7 +466,27 @@ function validateConfigPatch(
   return { ok: true, patch: patch as Partial<RepoConfig> };
 }
 
-function viewTask(task: Plan, store: ForgeStore): PlanView {
+/**
+ * Per-request inputs shared by every viewTask call in a list response,
+ * gathered once so the per-task work stays free of subprocesses and
+ * per-task DB round-trips.
+ */
+interface PlanViewDeps {
+  /** Live tmux session names from one batched `tmux list-sessions`. */
+  tmuxSessions: Set<string>;
+  /**
+   * Fully-resolved provenance per plan id (missing key → no DB row →
+   * null). When absent, viewTask falls back to the per-plan query —
+   * single-task endpoints don't need the batch.
+   */
+  provenanceById?: Map<string, PlanView["provenance"]>;
+}
+
+async function buildPlanViewDeps(): Promise<PlanViewDeps> {
+  return { tmuxSessions: await listTmuxSessions() };
+}
+
+function viewTask(task: Plan, store: ForgeStore, deps: PlanViewDeps): PlanView {
   const info = statusInfo(task, store);
   const ageRef = task.launchedAt ?? task.createdAt;
   const age = timeAgo(ageRef);
@@ -496,13 +516,13 @@ function viewTask(task: Plan, store: ForgeStore): PlanView {
     prUrl: task.prUrl,
     prNumber: task.prNumber,
     error: info.error,
-    tmuxAlive: task.tmuxSession ? isTmuxSessionAlive(task.tmuxSession) : false,
+    tmuxAlive: task.tmuxSession ? deps.tmuxSessions.has(task.tmuxSession) : false,
     hasSpec: !!spec,
     hasLog: fs.existsSync(store.getLogFile(task.id)),
     openQuestionCount,
     critique: info.critique,
     lastImproveError: task.lastImproveError,
-    provenance: planProvenance(task, store),
+    provenance: deps.provenanceById ? (deps.provenanceById.get(task.id) ?? null) : planProvenance(task, store),
   };
 }
 
@@ -533,6 +553,48 @@ function planProvenance(task: Plan, store: ForgeStore): PlanView["provenance"] {
   } catch {
     // DB miss or transient error — fall back to JSON-only data on the row.
     return null;
+  }
+}
+
+/**
+ * One-query provenance for a whole plan list. Same shape and null-on-miss
+ * semantics as planProvenance, but a single `IN (...)` round-trip instead
+ * of three correlated subselects per plan per poll.
+ */
+function batchPlanProvenance(store: ForgeStore, tasks: Plan[]): Map<string, PlanView["provenance"]> {
+  const out = new Map<string, PlanView["provenance"]>();
+  if (tasks.length === 0) return out;
+  try {
+    const placeholders = tasks.map(() => "?").join(",");
+    const rows = store.db.db
+      .prepare(
+        `SELECT p.id AS id,
+            (SELECT MAX(version_number) FROM plan_versions WHERE plan_id = p.id) AS spec_version,
+            (SELECT COUNT(*) FROM jobs j JOIN tasks t ON j.task_id = t.id WHERE t.plan_id = p.id) AS prior_runs,
+            (SELECT j.state FROM jobs j JOIN tasks t ON j.task_id = t.id
+              WHERE t.plan_id = p.id ORDER BY j.run_number DESC LIMIT 1) AS last_run_state
+         FROM plans p WHERE p.id IN (${placeholders})`,
+      )
+      .all(...tasks.map((t) => t.id)) as Array<{
+      id: string;
+      spec_version: number | null;
+      prior_runs: number;
+      last_run_state: string | null;
+    }>;
+    const byId = new Map(rows.map((r) => [r.id, r]));
+    for (const task of tasks) {
+      const row = byId.get(task.id);
+      if (!row) continue; // no DB row (legacy data) → null via map miss
+      out.set(task.id, {
+        specVersion: row.spec_version ?? task.specVersion ?? 1,
+        priorRuns: row.prior_runs ?? 0,
+        lastRunState: row.last_run_state,
+      });
+    }
+    return out;
+  } catch {
+    // Mirror planProvenance's catch → null-for-everyone on DB trouble.
+    return out;
   }
 }
 
@@ -845,24 +907,27 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     let tasks = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) tasks = tasks.filter((t) => t.repoName === repo || t.repoRoot === repo);
     // Sync any running tasks so the UI sees fresh statuses on every poll.
+    // syncPlanStatus returns the updated Plan (or null if unchanged), so
+    // the result is applied in-memory rather than re-reading the index.
     // Per-plan try/catch: one corrupt meta.json must not 500 the list.
-    for (const t of tasks) {
-      if (RUNNING_PLAN_STATUSES.has(t.status)) {
-        try {
-          store.syncPlanStatus(t);
-        } catch (e) {
-          const msg = e instanceof Error ? e.message : String(e);
-          process.stderr.write(`warn: syncPlanStatus failed for ${t.id}: ${msg}\n`);
-        }
+    const synced = tasks.map((t) => {
+      if (!RUNNING_PLAN_STATUSES.has(t.status)) return t;
+      try {
+        return store.syncPlanStatus(t) ?? t;
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`warn: syncPlanStatus failed for ${t.id}: ${msg}\n`);
+        return t;
       }
-    }
-    // Re-read after the sync to pick up any status changes.
-    let synced = store.getPlans().filter((t) => t.status !== "archived");
-    if (repo) synced = synced.filter((t) => t.repoName === repo || t.repoRoot === repo);
+    });
+    // Shared per-request inputs: one tmux subprocess (async, micro-TTL'd)
+    // and one provenance query for the whole list.
+    const deps: PlanViewDeps = await buildPlanViewDeps();
+    deps.provenanceById = batchPlanProvenance(store, synced);
     let views: PlanView[] = [];
     for (const t of synced) {
       try {
-        views.push(viewTask(t, store));
+        views.push(viewTask(t, store, deps));
       } catch (e) {
         const msg = e instanceof Error ? e.message : String(e);
         process.stderr.write(`warn: viewTask failed for ${t.id} — omitting from /api/plans: ${msg}\n`);
@@ -950,7 +1015,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
 
     if (!sub) {
       const meta = store.readRunMeta(id);
-      const view = viewTask(task, store);
+      const view = viewTask(task, store, await buildPlanViewDeps());
       return jsonOk({ task: view, meta });
     }
 
