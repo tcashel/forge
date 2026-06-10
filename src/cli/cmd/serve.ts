@@ -70,6 +70,7 @@ import type {
   ReasoningEffort,
   RepoConfig,
 } from "../../core/store.ts";
+import { createTtlCache, type TtlCache } from "../../core/ttl-cache.ts";
 import { aggregateUsage } from "../../core/usage.ts";
 import {
   isCleanMergedTarget,
@@ -892,6 +893,15 @@ interface RouteCtx {
   currentRepo: { name: string; root: string } | null;
   prFetcher: PrFetcher;
   prBundleFetcher: PrBundleFetcher;
+  /**
+   * Per-server PR-list cache keyed by repo root: 20s fresh, then
+   * stale-while-revalidate for up to 60s more. The PR list is remote,
+   * eventually-consistent metadata, so bounded staleness is fine — but
+   * PR-mutating routes (run-review, fix-comments, publish) invalidate
+   * their repo's key so operator actions reflect immediately. Null when
+   * caching is disabled (prsCacheTtlMs: 0 in tests).
+   */
+  prsCache: TtlCache<string, Awaited<ReturnType<PrFetcher>>> | null;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -1296,7 +1306,8 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     const repos = buildRepoViews(store, ctx.currentRepo);
     const target = resolvePrRepo(repos, repoName);
     if (!target) return jsonOk({ prs: [], me: "", repo: null, repoRoot: null });
-    const result = await ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    const fetchForTarget = () => ctx.prFetcher({ cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) });
+    const result = ctx.prsCache ? await ctx.prsCache.get(target.root, fetchForTarget) : await fetchForTarget();
     // Attach a cheap worktree snapshot per PR (path + safety only — no
     // gh state lookup or git fetch). The dedicated /api/worktrees view
     // does the full enrichment.
@@ -2439,6 +2450,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         { prNum, repoRoot: target.root, repoName: target.name, publishToGitHub },
         store,
       );
+      ctx.prsCache?.invalidate(target.root);
       return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
     } catch (e) {
       if (e instanceof CliError) {
@@ -2495,6 +2507,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     }
     try {
       const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, targets }, store);
+      ctx.prsCache?.invalidate(target.root);
       // droppedTargets tells the UI which requested targets were silently
       // unfixable (unanchored comment, unknown finding id, …) so the
       // operator isn't left wondering why a checkbox did nothing.
@@ -2542,6 +2555,7 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
       const result = await republishReviewSession({ prNum, repoRoot: target.root, sessionId }, store, (msg) =>
         process.stderr.write(`[forge serve] republish ${sessionId}: ${msg}\n`),
       );
+      ctx.prsCache?.invalidate(target.root);
       return jsonOk({ sessionId, publish: result.record });
     } catch (e) {
       if (e instanceof CliError) {
@@ -2814,6 +2828,13 @@ export interface ServeOptions {
   open?: boolean;
   prFetcher?: PrFetcher;
   prBundleFetcher?: PrBundleFetcher;
+  /**
+   * Freshness window for the per-repo /api/prs cache. Defaults to 20s
+   * (with an additional 60s stale-while-revalidate window). Pass 0 to
+   * disable caching entirely — tests asserting fetcher call counts use
+   * this.
+   */
+  prsCacheTtlMs?: number;
 }
 
 /**
@@ -2999,6 +3020,10 @@ export async function startServer(
     currentRepo: detectedCurrentRepo ? { name: detectedCurrentRepo.name, root: detectedCurrentRepo.root } : null,
     prFetcher: opts.prFetcher ?? fetchPrs,
     prBundleFetcher: opts.prBundleFetcher ?? defaultFetchPrBundle,
+    prsCache:
+      (opts.prsCacheTtlMs ?? 20_000) > 0
+        ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
+        : null,
   };
 
   const server = Bun.serve({
