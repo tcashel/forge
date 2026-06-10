@@ -54,6 +54,24 @@ export interface GhFetchOpts {
   apiHost?: string | null;
 }
 
+export interface GhResult {
+  stdout: string;
+  /** Trimmed and capped — diagnostic detail for callers' error strings. */
+  stderr: string;
+  ok: boolean;
+  /** True when the call was aborted by the timeout (stderr says how long). */
+  timedOut: boolean;
+}
+
+// Cap stderr so a runaway gh (e.g. dumping a whole HTTP response) can't bloat
+// error strings persisted into session rows / publish records.
+const GH_STDERR_CAP = 2048;
+
+function capStderr(stderr: string): string {
+  const trimmed = stderr.trim();
+  return trimmed.length > GH_STDERR_CAP ? `${trimmed.slice(0, GH_STDERR_CAP)}…` : trimmed;
+}
+
 /**
  * Spawn `gh` with optional per-repo account/host overrides.
  *
@@ -64,19 +82,24 @@ export interface GhFetchOpts {
  * runner scripts do: resolve a token via `gh auth token --user …` and
  * inject GH_HOST + GH_TOKEN/GH_ENTERPRISE_TOKEN into the child env.
  */
-export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: string; ok: boolean }> {
+export function runGh(args: string[], opts?: GhFetchOpts): Promise<GhResult> {
   const timeout = opts?.timeoutMs ?? 20000;
   return new Promise((resolve) => {
     const ac = new AbortController();
-    const timer = setTimeout(() => ac.abort(), timeout);
+    let timedOut = false;
+    const timer = setTimeout(() => {
+      timedOut = true;
+      ac.abort();
+    }, timeout);
     let stdout = "";
     let stderr = "";
     let settled = false;
-    const settle = (result: { stdout: string; ok: boolean }) => {
+    const settle = (result: { stdout: string; ok: boolean; stderr?: string }) => {
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve(result);
+      const detail = timedOut ? `timed out after ${timeout}ms` : capStderr(result.stderr ?? stderr);
+      resolve({ stdout: result.stdout, stderr: detail, ok: result.ok && !timedOut, timedOut });
     };
 
     // resolveGhEnv returns {} when no override is configured, so the
@@ -85,7 +108,7 @@ export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: str
     if (resolved.error) {
       // Configured account isn't logged in — fail fast rather than
       // silently falling back to the wrong account.
-      settle({ stdout: "", ok: false });
+      settle({ stdout: "", ok: false, stderr: resolved.error });
       return;
     }
     const env = { ...process.env, ...resolved.env };
@@ -99,8 +122,8 @@ export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: str
         cwd: opts?.cwd,
         env,
       });
-    } catch {
-      settle({ stdout: "", ok: false });
+    } catch (e) {
+      settle({ stdout: "", ok: false, stderr: (e as Error).message });
       return;
     }
 
@@ -121,12 +144,39 @@ export function runGh(args: string[], opts?: GhFetchOpts): Promise<{ stdout: str
     child.stderr?.on("data", (chunk: Buffer) => {
       stderr += chunk.toString();
     });
-    child.on("error", () => settle({ stdout: "", ok: false }));
+    child.on("error", (err) => settle({ stdout: "", ok: false, stderr: stderr || err.message }));
     child.on("close", (code) => {
-      void stderr; // captured for diagnostics, discarded on success
       settle({ stdout: stdout.trim(), ok: code === 0 });
     });
   });
+}
+
+// Test seam: read helpers in this module route gh invocations through this
+// indirection so tests can inject a fake runner (mirrors gh-pr-write.ts).
+type GhRunner = typeof runGh;
+let ghRunner: GhRunner = runGh;
+export function __setGhRunner(fn: GhRunner | null): void {
+  ghRunner = fn ?? runGh;
+}
+
+/**
+ * Parse the stdout of a `gh api --paginate --slurp` call into a flat array of
+ * items. `--slurp` collects each page into an outer array (array-of-pages), so
+ * a multi-page response is `[[...page1], [...page2]]` rather than a single
+ * concatenated/invalid JSON blob. We flatten one level so callers see the same
+ * flat item list whether the PR had one page or ten. A bare object (some
+ * single-page error/edge shapes) or a flat array are both tolerated.
+ */
+export function flattenSlurpedPages<T>(stdout: string): T[] {
+  if (!stdout.trim()) return [];
+  const parsed = JSON.parse(stdout) as unknown;
+  if (!Array.isArray(parsed)) return [parsed as T];
+  const out: T[] = [];
+  for (const page of parsed) {
+    if (Array.isArray(page)) out.push(...(page as T[]));
+    else if (page != null) out.push(page as T);
+  }
+  return out;
 }
 
 export async function currentLogin(opts: GhFetchOpts): Promise<string> {
@@ -316,17 +366,20 @@ export function parseApiHost(url: string): string | null {
 export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<FetchPrBundleResult> {
   const prJsonFields =
     "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles";
-  const prViewPromise = runGh(["pr", "view", String(prNum), "--json", prJsonFields], opts);
-  const diffPromise = runGh(["pr", "diff", String(prNum)], opts);
+  const prViewPromise = ghRunner(["pr", "view", String(prNum), "--json", prJsonFields], opts);
+  const diffPromise = ghRunner(["pr", "diff", String(prNum)], opts);
 
   // The two comment endpoints need {owner}/{repo} which `gh api` doesn't
   // template for us; resolve once in parallel with pr view + diff.
-  const repoPromise = runGh(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], opts);
+  const repoPromise = ghRunner(["repo", "view", "--json", "nameWithOwner", "--jq", ".nameWithOwner"], opts);
 
   const [prViewRes, diffRes, repoRes] = await Promise.all([prViewPromise, diffPromise, repoPromise]);
 
   if (!prViewRes.ok || !prViewRes.stdout) {
-    return { ok: false, error: prViewRes.stdout || `gh pr view ${prNum} failed` };
+    return {
+      ok: false,
+      error: prViewRes.stdout || `gh pr view ${prNum} failed${prViewRes.stderr ? `: ${prViewRes.stderr}` : ""}`,
+    };
   }
   let raw: RawPrView;
   try {
@@ -340,7 +393,10 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
   if (diffRes.ok) {
     diff = diffRes.stdout;
   } else {
-    warnings.push({ source: "diff", message: `gh pr diff ${prNum} failed` });
+    warnings.push({
+      source: "diff",
+      message: `gh pr diff ${prNum} failed${diffRes.stderr ? `: ${diffRes.stderr}` : ""}`,
+    });
   }
 
   let inlineComments: PrInlineComment[] = [];
@@ -362,13 +418,16 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
     warnings.push({ source: "issueComments", message: "could not resolve owner/repo for gh api calls" });
     warnings.push({ source: "prReviews", message: "could not resolve owner/repo for gh api calls" });
   } else {
-    const inlineRes = await runGh(
-      ["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate", ...hostArgs],
+    // `--paginate --slurp` everywhere below: without `--slurp` a >100-item
+    // response is back-to-back JSON arrays that JSON.parse rejects, silently
+    // dropping every comment/review on exactly the busy PRs being worked.
+    const inlineRes = await ghRunner(
+      ["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
       opts,
-    ).catch(() => ({ ok: false, stdout: "" }));
+    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
     if (inlineRes.ok && inlineRes.stdout) {
       try {
-        const parsed = JSON.parse(inlineRes.stdout) as RawInlineComment[];
+        const parsed = flattenSlurpedPages<RawInlineComment>(inlineRes.stdout);
         inlineComments = parsed.map((c) => ({
           id: c.id,
           user: c.user?.login ?? "",
@@ -391,16 +450,19 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
         warnings.push({ source: "inlineComments", message: `parse error: ${(e as Error).message}` });
       }
     } else {
-      warnings.push({ source: "inlineComments", message: `gh api pulls/${prNum}/comments failed` });
+      warnings.push({
+        source: "inlineComments",
+        message: `gh api pulls/${prNum}/comments failed${inlineRes.stderr ? `: ${inlineRes.stderr}` : ""}`,
+      });
     }
 
-    const issueRes = await runGh(
-      ["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate", ...hostArgs],
+    const issueRes = await ghRunner(
+      ["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
       opts,
-    ).catch(() => ({ ok: false, stdout: "" }));
+    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
     if (issueRes.ok && issueRes.stdout) {
       try {
-        const parsed = JSON.parse(issueRes.stdout) as RawIssueComment[];
+        const parsed = flattenSlurpedPages<RawIssueComment>(issueRes.stdout);
         issueComments = parsed.map((c) => ({
           id: c.id,
           user: c.user?.login ?? "",
@@ -413,16 +475,19 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
         warnings.push({ source: "issueComments", message: `parse error: ${(e as Error).message}` });
       }
     } else {
-      warnings.push({ source: "issueComments", message: `gh api issues/${prNum}/comments failed` });
+      warnings.push({
+        source: "issueComments",
+        message: `gh api issues/${prNum}/comments failed${issueRes.stderr ? `: ${issueRes.stderr}` : ""}`,
+      });
     }
 
-    const reviewsRes = await runGh(
-      ["api", `repos/${resolved.full}/pulls/${prNum}/reviews`, "--paginate", ...hostArgs],
+    const reviewsRes = await ghRunner(
+      ["api", `repos/${resolved.full}/pulls/${prNum}/reviews`, "--paginate", "--slurp", ...hostArgs],
       opts,
-    ).catch(() => ({ ok: false, stdout: "" }));
+    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
     if (reviewsRes.ok && reviewsRes.stdout) {
       try {
-        const parsed = JSON.parse(reviewsRes.stdout) as RawPrReview[];
+        const parsed = flattenSlurpedPages<RawPrReview>(reviewsRes.stdout);
         prReviews = parsed
           .map((r) => {
             const state = normalizeReviewState(r.state);
@@ -445,7 +510,10 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
         warnings.push({ source: "prReviews", message: `parse error: ${(e as Error).message}` });
       }
     } else {
-      warnings.push({ source: "prReviews", message: `gh api pulls/${prNum}/reviews failed` });
+      warnings.push({
+        source: "prReviews",
+        message: `gh api pulls/${prNum}/reviews failed${reviewsRes.stderr ? `: ${reviewsRes.stderr}` : ""}`,
+      });
     }
   }
 

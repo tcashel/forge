@@ -252,6 +252,146 @@ test("fetchReviewThreads pages through the GraphQL cursor until exhausted", asyn
   }
 });
 
+// ─── Per-finding outcomes + individual-post fallback ─────────────────────────
+
+const THREE_LINE_DIFF = [
+  "diff --git a/src/foo.ts b/src/foo.ts",
+  "--- a/src/foo.ts",
+  "+++ b/src/foo.ts",
+  "@@ -1,2 +1,4 @@",
+  " a",
+  "+b",
+  "+c",
+  "+d",
+].join("\n");
+// RIGHT lines: 1..4.
+
+test("publishReviewFindings reports state/per-finding outcomes on full success", async () => {
+  const inDiff = makeFinding({ id: "aa11bb22cc33", lineStart: 2, lineEnd: 2 });
+  const outDiff = makeFinding({ id: "dd44ee55ff66", lineStart: 99, lineEnd: 99 });
+  const { runner } = makeRunner({});
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [inDiff, outDiff], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.state, "published");
+    assert.equal(res.failed, 0);
+    assert.equal(res.error, null);
+    const byId = new Map(res.findings.map((f) => [f.id, f.status]));
+    assert.equal(byId.get("aa11bb22cc33"), "posted");
+    assert.equal(byId.get("dd44ee55ff66"), "out-of-diff-posted");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("publishReviewFindings marks reconcile failure as reconcile-failed with per-finding errors", async () => {
+  const inDiff = makeFinding({ id: "aa11bb22cc33", lineStart: 2, lineEnd: 2 });
+  const runner = (args: string[]) => {
+    const joined = args.join(" ");
+    if (joined.includes("/pulls/") && joined.includes("/comments") && args.includes("--paginate")) {
+      return Promise.resolve({ ok: false, stdout: "", stderr: "HTTP 403: rate limited" });
+    }
+    return Promise.resolve({ ok: true, stdout: "[[]]" });
+  };
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [inDiff], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.state, "reconcile-failed");
+    assert.equal(res.failed, 1);
+    // Regression (pub-gh-stderr-discarded): the stderr detail must survive
+    // into the error string — not "unknown".
+    assert.match(res.error ?? "", /HTTP 403: rate limited/);
+    assert.equal(res.findings[0].status, "failed");
+    assert.match(res.findings[0].error ?? "", /HTTP 403/);
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("publishReviewFindings falls back to individual posts when the batched POST fails", async () => {
+  // f1 anchors at line 2, f2 at line 3, f3 at line 4. Batch fails; f1 posts
+  // individually, f2 422s (demoted to body mention), f3 fails with a 500.
+  const f1 = makeFinding({ id: "f1aaaaaaaaaa", lineStart: 2, lineEnd: 2, title: "t1" });
+  const f2 = makeFinding({ id: "f2bbbbbbbbbb", lineStart: 3, lineEnd: 3, title: "t2" });
+  const f3 = makeFinding({ id: "f3cccccccccc", lineStart: 4, lineEnd: 4, title: "t3" });
+  const calls: RecordedCall[] = [];
+  const runner = (args: string[], o?: { inputJson?: unknown }) => {
+    calls.push({ args, inputJson: o?.inputJson });
+    const joined = args.join(" ");
+    const slurped = args.includes("--paginate") && args.includes("--slurp");
+    if (slurped) return Promise.resolve({ ok: true, stdout: "[[]]" });
+    if (args.includes("--method") && joined.includes("/reviews")) {
+      const payload = o?.inputJson as { comments: Array<{ body: string }> };
+      const comments = payload.comments ?? [];
+      if (comments.length > 1) {
+        return Promise.resolve({ ok: false, stdout: "", stderr: "HTTP 422: Unprocessable Entity (batch)" });
+      }
+      const body = comments[0]?.body ?? "";
+      if (body.includes("f2bbbbbbbbbb")) {
+        return Promise.resolve({ ok: false, stdout: "", stderr: "HTTP 422: Unprocessable Entity (line)" });
+      }
+      if (body.includes("f3cccccccccc")) {
+        return Promise.resolve({ ok: false, stdout: "", stderr: "HTTP 500: server exploded" });
+      }
+      return Promise.resolve({ ok: true, stdout: "{}" });
+    }
+    return Promise.resolve({ ok: true, stdout: "" });
+  };
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(
+      7,
+      { findings: [f1, f2, f3], diff: THREE_LINE_DIFF, commitId: "sha1" },
+      OPTS,
+    );
+    assert.equal(res.state, "partial");
+    assert.equal(res.posted, 1, "f1 posted via individual fallback");
+    assert.equal(res.outOfDiff, 1, "f2 demoted to an out-of-diff body mention");
+    assert.equal(res.failed, 1, "f3 failed outright");
+    assert.match(res.error ?? "", /HTTP 500/);
+
+    const byId = new Map(res.findings.map((f) => [f.id, f]));
+    assert.equal(byId.get("f1aaaaaaaaaa")?.status, "posted");
+    assert.equal(byId.get("f2bbbbbbbbbb")?.status, "out-of-diff-posted");
+    assert.equal(byId.get("f3cccccccccc")?.status, "failed");
+    assert.match(byId.get("f3cccccccccc")?.error ?? "", /HTTP 500/);
+
+    // The demoted finding's marker rides in a body-only review so retries
+    // stay idempotent.
+    const posts = postReviewCalls(calls);
+    const bodyOnly = posts.filter((c) => ((c.inputJson as { comments: unknown[] }).comments ?? []).length === 0);
+    assert.equal(bodyOnly.length, 1, "exactly one body-only review for demoted/out-of-diff findings");
+    assert.ok((bodyOnly[0].inputJson as { body: string }).body.includes("forge-finding id=f2bbbbbbbbbb"));
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("publishReviewFindings marks state failed when every post fails, with stderr detail", async () => {
+  const f1 = makeFinding({ id: "f1aaaaaaaaaa", lineStart: 2, lineEnd: 2 });
+  const runner = (args: string[]) => {
+    const joined = args.join(" ");
+    if (args.includes("--paginate") && args.includes("--slurp")) {
+      return Promise.resolve({ ok: true, stdout: "[[]]" });
+    }
+    if (args.includes("--method") && joined.includes("/reviews")) {
+      return Promise.resolve({ ok: false, stdout: "", stderr: "gh: Bad credentials (HTTP 401)" });
+    }
+    return Promise.resolve({ ok: true, stdout: "" });
+  };
+  __setGhRunner(runner as never);
+  try {
+    const res = await publishReviewFindings(7, { findings: [f1], diff: DIFF, commitId: "sha1" }, OPTS);
+    assert.equal(res.state, "failed");
+    assert.equal(res.failed, 1);
+    assert.equal(res.posted, 0);
+    assert.match(res.error ?? "", /Bad credentials/);
+    assert.equal(res.findings[0].status, "failed");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
 test("publishReviewFindings posts the inline comment on the diff's new path for a renamed file", async () => {
   // Rename-with-edit: src/old.ts → src/new.ts. The finding names the old path,
   // but the inline comment payload must carry the new path or GitHub 422s.

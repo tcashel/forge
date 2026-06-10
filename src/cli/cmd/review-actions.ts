@@ -25,13 +25,20 @@ import { adapterStreamsTokens, agentJobCommand, captureSidecarMetrics } from "..
 import { finalizeSession, type SessionMetrics, upsertSession } from "../../core/db/writes.ts";
 import { resolveGhEnv } from "../../core/gh.ts";
 import { parseApiHost, parseNameWithOwner } from "../../core/gh-pr.ts";
-import { publishReviewFindings } from "../../core/gh-pr-write.ts";
+import { type PublishResult, publishReviewFindings } from "../../core/gh-pr-write.ts";
+import {
+  notRequestedRecord,
+  type PublishRecord,
+  readPublishRecord,
+  writePublishRecord,
+} from "../../core/publish-record.ts";
 import {
   buildReviewerPrompt,
   extractLastForgeReviewBlock,
   type ForgeFinding,
   parseForgeReviewFindings,
   parseForgeReviewVerdict,
+  type ReviewVerdict,
 } from "../../core/reviewer.ts";
 import type { ForgeStore } from "../../core/store.ts";
 
@@ -114,9 +121,109 @@ export function parseAdHocReviewSentinel(line: string): { exitCode: number; erro
   }
 }
 
+// ─── Test seams ──────────────────────────────────────────────────────────────
+//
+// Mirrors __setGhRunner in gh-pr-write.ts: every subprocess this module
+// spawns (gh reads, the reviewer agent, the detached worker) routes through
+// this indirection so tests can drive the full pipeline without real
+// gh/claude processes.
+
+export interface ReviewExecHooks {
+  /** Synchronous `gh <args>` — throws on non-zero exit (execFileSync shape). */
+  ghExec: (args: string[], env: Record<string, string>, cwd: string) => string;
+  /** Run the reviewer agent command line; throws on failure or timeout. */
+  agentExec: (args: {
+    bashLine: string;
+    rawFile: string;
+    streamFile: string;
+    env: Record<string, string>;
+    cwd: string;
+    timeoutMs: number;
+  }) => void;
+  /** Spawn the detached review worker; returns its pid. */
+  spawnWorker: (args: { cmd: string[]; logFd: number; cwd: string; env: Record<string, string> }) => {
+    pid: number | undefined;
+    unref: () => void;
+  };
+}
+
+let execHooks: Partial<ReviewExecHooks> | null = null;
+export function __setReviewExecHooks(hooks: Partial<ReviewExecHooks> | null): void {
+  execHooks = hooks;
+}
+
+function ghExecDefault(args: string[], env: Record<string, string>, cwd: string): string {
+  return execFileSync("gh", args, {
+    encoding: "utf-8",
+    stdio: ["pipe", "pipe", "pipe"],
+    cwd,
+    env,
+  });
+}
+
+function ghExec(args: string[], env: Record<string, string>, cwd: string): string {
+  return (execHooks?.ghExec ?? ghExecDefault)(args, env, cwd);
+}
+
+function agentExecDefault(args: {
+  bashLine: string;
+  rawFile: string;
+  streamFile: string;
+  env: Record<string, string>;
+  cwd: string;
+  timeoutMs: number;
+}): void {
+  // Bash so we get the same shell semantics the agent command was built for
+  // (claude/codex stream-json piped through a projection, plain text for
+  // opencode/gemini). `timeout` SIGTERMs a hung reviewer — no GNU `timeout`
+  // binary on macOS, so the watchdog lives here.
+  execFileSync("bash", ["-c", args.bashLine], {
+    stdio: ["ignore", "inherit", "inherit"],
+    env: args.env,
+    cwd: args.cwd,
+    timeout: args.timeoutMs,
+    killSignal: "SIGTERM",
+  });
+}
+
+function spawnWorkerDefault(args: { cmd: string[]; logFd: number; cwd: string; env: Record<string, string> }): {
+  pid: number | undefined;
+  unref: () => void;
+} {
+  const proc = Bun.spawn({
+    cmd: args.cmd,
+    stdio: ["ignore", args.logFd, args.logFd],
+    cwd: args.cwd,
+    env: args.env,
+  });
+  return { pid: proc.pid, unref: () => proc.unref() };
+}
+
+function ghFailureDetail(e: unknown): string {
+  const err = e as { stderr?: string; message?: string };
+  return (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "unknown gh failure";
+}
+
 // ─── Parent: runAdHocReview ──────────────────────────────────────────────────
 
-export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeStore): Promise<RunAdHocReviewResult> {
+interface PreparedReviewSession {
+  sessionId: string;
+  runDir: string;
+  logFile: string;
+  startedAt: string;
+  headRefName: string | null;
+  reviewerAgent: string;
+  reviewerModel: string;
+  ghEnv: Record<string, string>;
+}
+
+/**
+ * Shared validation + session setup for an ad-hoc review: repoConfig, gh
+ * auth, PR existence, single-flight guard, run dir, meta seed, sessions row.
+ * Used by both the detached-worker path (runAdHocReview) and the synchronous
+ * CLI path (runReviewInProcess).
+ */
+function prepareReviewSession(input: RunAdHocReviewInput, store: ForgeStore): PreparedReviewSession {
   const { prNum, repoRoot, repoName } = input;
   const publishToGitHub = input.publishToGitHub === true;
 
@@ -137,15 +244,9 @@ export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeSto
   const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
 
   // 3) PR must exist. `gh pr view` is the canonical existence check.
-  let prInfoJson = "";
   let headRefName: string | null = null;
   try {
-    prInfoJson = execFileSync("gh", ["pr", "view", String(prNum), "--json", PR_VIEW_FIELDS], {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd: repoRoot,
-      env: ghEnv,
-    }).trim();
+    const prInfoJson = ghExec(["pr", "view", String(prNum), "--json", PR_VIEW_FIELDS], ghEnv, repoRoot).trim();
     try {
       const parsed = JSON.parse(prInfoJson) as { headRefName?: string };
       headRefName = parsed.headRefName ?? null;
@@ -153,8 +254,7 @@ export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeSto
       // PR view returned non-JSON — fall through; the worker will surface it.
     }
   } catch (e) {
-    const err = e as { stderr?: string; message?: string };
-    const detail = (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "unknown gh failure";
+    const detail = ghFailureDetail(e);
     if (/could not resolve|not found/i.test(detail)) {
       throw new CliError("PR_NOT_FOUND", `PR #${prNum} not found in ${repoName}: ${detail}`, { exitCode: 1 });
     }
@@ -230,6 +330,21 @@ export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeSto
     },
   });
 
+  return {
+    sessionId,
+    runDir,
+    logFile,
+    startedAt,
+    headRefName,
+    reviewerAgent: repoConfig.reviewerAgent,
+    reviewerModel: repoConfig.reviewerModel,
+    ghEnv,
+  };
+}
+
+export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeStore): Promise<RunAdHocReviewResult> {
+  const { sessionId, runDir, logFile, ghEnv } = prepareReviewSession(input, store);
+
   // 7) Spawn the detached worker. stdio['ignore', logFd, logFd] sends the
   //    child's stdout/stderr straight into the log file the SSE endpoint
   //    is tailing.
@@ -243,15 +358,23 @@ export async function runAdHocReview(input: RunAdHocReviewInput, store: ForgeSto
     if (!bunPath) {
       throw new CliError("INTERNAL", "Bun.which('bun') returned null — cannot locate bun on PATH");
     }
-    const proc = Bun.spawn({
+    const proc = (execHooks?.spawnWorker ?? spawnWorkerDefault)({
       cmd: [bunPath, scriptPath, "__review-worker", sessionId],
-      stdio: ["ignore", logFd, logFd],
-      cwd: repoRoot,
+      logFd,
+      cwd: input.repoRoot,
       env: ghEnv,
     });
     // Once stdio is wired into the child, the parent can release the fd —
     // dup2 happened during spawn so the child has its own copy.
     proc.unref();
+    // Record the worker pid so a liveness reaper can finalize sessions whose
+    // worker died before reaching finalizeSession (stale 'running' rows
+    // otherwise 409-block every future review of this PR).
+    if (typeof proc.pid === "number") {
+      store.db.db
+        .prepare("UPDATE sessions SET pid = ?, metrics = json_set(metrics, '$.pid', ?) WHERE id = ?")
+        .run(proc.pid, proc.pid, sessionId);
+    }
   } catch (e) {
     // Roll back: close fd, finalize the session as failed, surface the
     // error to the HTTP caller.
@@ -340,23 +463,116 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
   const repoName = (seedMeta?.repoName as string | undefined) ?? path.basename(repoRoot);
   const headRefName = (seedMeta?.headRefName as string | null | undefined) ?? null;
 
-  // Resolve gh env (it's stamped from the parent's spawn env, but we still
-  // need the repoConfig to know whether to set GH_TOKEN/GH_ENTERPRISE_TOKEN
-  // for `gh pr diff` / `gh pr checks`).
+  process.stdout.write(`[forge:review-worker] starting review of PR #${prNum} in ${repoName}\n`);
+  process.stdout.write(`[forge:review-worker] agent=${row.agent_adapter} model=${row.model ?? "(unset)"}\n`);
+
+  const result = await executeReview({
+    store,
+    runDir,
+    prNum,
+    repoRoot,
+    repoName,
+    headRefName,
+    agentAdapter: row.agent_adapter,
+    model: row.model,
+    publishToGitHub: shouldPublishToGitHub(metrics),
+    log: (msg) => process.stdout.write(`[forge:review-worker] ${msg}\n`),
+  });
+
+  // Write the meta.json with the final shape and finalize the session row.
+  const completedAt = new Date().toISOString();
+  const status = result.exitCode === 0 ? "completed" : "failed";
+  writeMetaSafe(metaPath, {
+    schemaVersion: SCHEMA_VERSION,
+    repoRoot,
+    repoName,
+    prNum,
+    headRefName,
+    sessionId,
+    startedAt: (seedMeta?.startedAt as string | undefined) ?? completedAt,
+    completedAt,
+    status,
+    exitCode: result.exitCode,
+  });
+
+  // A requested-but-failed publish must not look clean: the session stays
+  // 'completed' (the review itself succeeded) but carries the publish
+  // failure in its error field — forge status and the Workbench read it.
+  const sessionError = result.error ?? result.publishError;
+  finalizeSession(store.db.db, {
+    id: sessionId,
+    finishedAt: completedAt,
+    state: status,
+    exitCode: result.exitCode,
+    error: sessionError,
+    metrics: result.metricsPatch,
+  });
+
+  // Sentinel line — the SSE serializer translates it into a `done` event.
+  // Always last so the client sees done AFTER it sees any error text.
+  process.stdout.write(`${adHocReviewSentinelLine(result.exitCode, sessionError)}\n`);
+  process.exit(result.exitCode);
+}
+
+// ─── executeReview — the shared review pipeline ──────────────────────────────
+
+export interface ExecuteReviewOpts {
+  store: ForgeStore;
+  runDir: string;
+  prNum: number;
+  repoRoot: string;
+  repoName: string;
+  headRefName: string | null;
+  agentAdapter: string;
+  model: string | null;
+  publishToGitHub: boolean;
+  log: (msg: string) => void;
+}
+
+export interface ExecuteReviewResult {
+  exitCode: number;
+  /** Review-pipeline failure (gh pre-flight, agent, extraction). */
+  error: string | null;
+  /** Short message when the review succeeded but a requested publish didn't. */
+  publishError: string | null;
+  findings: ForgeFinding[];
+  verdict: ReviewVerdict | null;
+  publish: PublishRecord;
+  metricsPatch: Partial<SessionMetrics>;
+}
+
+const DEFAULT_REVIEWER_TIMEOUT_MINUTES = 60;
+
+/**
+ * Run one PR review end to end: gh pre-flight, prompt compose, reviewer
+ * agent, artifact extraction, optional publish. Both the detached worker
+ * (`forge __review-worker`) and the synchronous CLI (`forge review --run`)
+ * call this; neither path throws — failures come back as `exitCode`/`error`.
+ *
+ * `publish.json` is written to the run dir on EVERY run so the publish
+ * outcome is never reconstructable-only-from-logs.
+ */
+export async function executeReview(opts: ExecuteReviewOpts): Promise<ExecuteReviewResult> {
+  const { store, runDir, prNum, repoRoot, repoName, headRefName, log } = opts;
   const repoConfig = store.getRepoConfig(repoRoot);
   const ghEnvResult = resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost });
   const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
 
-  process.stdout.write(`[forge:review-worker] starting review of PR #${prNum} in ${repoName}\n`);
-  process.stdout.write(`[forge:review-worker] agent=${row.agent_adapter} model=${row.model ?? "(unset)"}\n`);
-
   let exitCode = 0;
   let error: string | null = null;
   let metricsPatch: Partial<SessionMetrics> = {};
+  let findings: ForgeFinding[] = [];
+  let verdict: ReviewVerdict | null = null;
+  let publish: PublishRecord = { ...notRequestedRecord(), requested: opts.publishToGitHub };
+
   try {
-    const prInfoJson = runGhSafe(["pr", "view", String(prNum), "--json", PR_VIEW_FIELDS], ghEnv, repoRoot);
-    const ciChecks = runGhSafe(["pr", "checks", String(prNum)], ghEnv, repoRoot);
-    const diff = runGhSafe(["pr", "diff", String(prNum)], ghEnv, repoRoot);
+    // `pr view` and `pr diff` failures are hard errors: an empty diff/PR-info
+    // would otherwise blind the reviewer AND silently demote every finding to
+    // an out-of-diff body bullet at publish time. `pr checks` stays soft — it
+    // exits non-zero for failing/pending checks, which is review input.
+    const prInfoJson = runGhHard(["pr", "view", String(prNum), "--json", PR_VIEW_FIELDS], ghEnv, repoRoot);
+    const ciChecks = runGhSoft(["pr", "checks", String(prNum)], ghEnv, repoRoot, log);
+    const diff = runGhHard(["pr", "diff", String(prNum)], ghEnv, repoRoot);
 
     // Linked Forge spec lookup by branch (best-effort — many PRs have no
     // linked plan and the reviewer prompt handles that gracefully).
@@ -370,7 +586,7 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
           if (spec) linkedSpec = spec.replace(/^---[\s\S]*?---\n*/m, "").trim();
         }
       } catch (e) {
-        process.stdout.write(`[forge:review-worker] linked spec lookup failed: ${(e as Error).message}\n`);
+        log(`linked spec lookup failed: ${(e as Error).message}`);
       }
     }
 
@@ -386,40 +602,54 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
     const promptFile = path.join(runDir, "review-prompt.txt");
     fs.writeFileSync(promptFile, prompt, "utf-8");
 
-    const adapter = row.agent_adapter as Parameters<typeof agentJobCommand>[0];
+    const adapter = opts.agentAdapter as Parameters<typeof agentJobCommand>[0];
     const streamFile = path.join(runDir, "review.stream.jsonl");
-    const cmd = agentJobCommand(adapter, row.model ?? "", promptFile, streamFile, {
+    const cmd = agentJobCommand(adapter, opts.model ?? "", promptFile, streamFile, {
       reasoningEffort: repoConfig.reviewerReasoningEffort,
     });
 
-    process.stdout.write(`[forge:review-worker] invoking reviewer\n`);
-    // Bash so we get the same shell semantics the agent command was built
-    // for (claude/codex stream-json piped through a projection, plain text
-    // for opencode/gemini). Output is captured to review-raw.md AND echoed
-    // to the worker's stdout (which the SSE log tails).
+    // reviewerTimeoutMinutes is read leniently — the optional RepoConfig key
+    // may not exist in the type yet; absent/invalid values fall back to 60.
+    const timeoutRaw = (repoConfig as { reviewerTimeoutMinutes?: unknown }).reviewerTimeoutMinutes;
+    const timeoutMinutes =
+      typeof timeoutRaw === "number" && Number.isFinite(timeoutRaw) && timeoutRaw > 0
+        ? timeoutRaw
+        : DEFAULT_REVIEWER_TIMEOUT_MINUTES;
+    const timeoutMs = timeoutMinutes * 60_000;
+
+    log("invoking reviewer");
+    // Output is captured to review-raw.md AND echoed to stdout (the SSE log
+    // tails it in worker mode; the terminal sees it in CLI mode).
     const rawFile = path.join(runDir, "review-raw.md");
     const bashLine = `set -o pipefail; ${cmd} 2>&1 | tee "${rawFile.replace(/"/g, '\\"')}"`;
+    const agentStartedMs = Date.now();
     try {
-      execFileSync("bash", ["-c", bashLine], {
-        stdio: ["ignore", "inherit", "inherit"],
+      (execHooks?.agentExec ?? agentExecDefault)({
+        bashLine,
+        rawFile,
+        streamFile,
         env: ghEnv,
         cwd: repoRoot,
+        timeoutMs,
       });
     } catch (e) {
       // Even on a non-zero exit the agent may have written a parseable
       // sidecar before dying; capture it so the failed row still records
       // tokens/cost, mirroring the launch bash runner's failure branch.
       if (adapterStreamsTokens(adapter) && fs.existsSync(streamFile)) {
-        metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+        metricsPatch = await captureSidecarMetrics(adapter, opts.model, streamFile);
       }
-      const err = e as { status?: number; message?: string };
+      const err = e as { status?: number; message?: string; code?: string };
+      if (err.code === "ETIMEDOUT" || Date.now() - agentStartedMs >= timeoutMs) {
+        throw new Error(`reviewer timed out after ${timeoutMinutes} minutes`);
+      }
       throw new Error(`reviewer agent exited non-zero (${err.status ?? "?"}): ${err.message ?? "no detail"}`);
     }
 
     // Capture tokens/cost from the sidecar before extraction (which may
     // throw) so a verdict-parse miss doesn't lose the run's token count.
     if (adapterStreamsTokens(adapter)) {
-      metricsPatch = await captureSidecarMetrics(adapter, row.model, streamFile);
+      metricsPatch = await captureSidecarMetrics(adapter, opts.model, streamFile);
     }
 
     // Extract the last forge-review block and parse findings.
@@ -429,60 +659,204 @@ export async function runReviewWorker(argv: string[], store: ForgeStore): Promis
       throw new Error("no fenced forge-review block in reviewer output");
     }
     fs.writeFileSync(path.join(runDir, "review.md"), block, "utf-8");
+    verdict = parseForgeReviewVerdict(block);
 
-    const findings: ForgeFinding[] = parseForgeReviewFindings(block);
+    findings = parseForgeReviewFindings(block);
     fs.writeFileSync(path.join(runDir, "findings.json"), `${JSON.stringify(findings, null, 2)}\n`, "utf-8");
-    process.stdout.write(`[forge:review-worker] parsed ${findings.length} finding(s)\n`);
+    log(`parsed ${findings.length} finding(s)`);
 
-    // Best-effort publish to GitHub. Gated solely on the per-request opt-in
-    // (the "Publish to PR" checkbox); a failure logs a warning but never fails
-    // the review (findings.json stays the local source of truth).
-    if (shouldPublishToGitHub(metrics) && findings.length > 0) {
-      await publishFindingsToGitHub({
+    if (opts.publishToGitHub) {
+      publish = await publishWithRecord({
         prNum,
         prInfoJson,
         diff,
         findings,
         ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+        ghEnv,
         cwd: repoRoot,
-        log: (msg) => process.stdout.write(`[forge:review-worker] ${msg}\n`),
+        log,
       });
     }
   } catch (e) {
     error = e instanceof Error ? e.message : String(e);
     exitCode = 1;
-    process.stdout.write(`[forge:review-worker] error: ${error}\n`);
+    log(`error: ${error}`);
+    if (opts.publishToGitHub) {
+      publish = { ...publish, state: "failed", error: `review failed before publish: ${error}` };
+    }
   }
 
-  // Write the meta.json with the final shape and finalize the session row.
-  const completedAt = new Date().toISOString();
-  const status = exitCode === 0 ? "completed" : "failed";
-  writeMetaSafe(metaPath, {
-    schemaVersion: SCHEMA_VERSION,
-    repoRoot,
-    repoName,
-    prNum,
+  try {
+    writePublishRecord(runDir, publish);
+  } catch (e) {
+    log(`failed to write publish.json: ${(e as Error).message}`);
+  }
+
+  const publishError =
+    exitCode === 0 &&
+    publish.requested &&
+    (publish.state === "failed" || publish.state === "partial" || publish.state === "reconcile-failed")
+      ? `publish to GitHub ${publish.state}: ${publish.posted} posted, ${publish.failed} failed${publish.error ? ` — ${publish.error}` : ""}`
+      : null;
+
+  // Compact publish summary rides on the session metrics blob (the read side
+  // parses leniently and tolerates unknown keys).
+  metricsPatch = {
+    ...metricsPatch,
+    ...({
+      publish: { state: publish.state, posted: publish.posted, failed: publish.failed, error: publish.error },
+    } as unknown as Partial<SessionMetrics>),
+  };
+
+  return { exitCode, error, publishError, findings, verdict, publish, metricsPatch };
+}
+
+// ─── runReviewInProcess — synchronous CLI path (`forge review --run`) ────────
+
+export interface RunReviewInProcessResult {
+  sessionId: string;
+  runDir: string;
+  result: ExecuteReviewResult;
+}
+
+/**
+ * Run an ad-hoc review synchronously in this process. Same validation,
+ * session row, artifacts, and finalization as the detached worker — minus
+ * the spawn. Backs `forge review <pr> --run [--publish]`.
+ */
+export async function runReviewInProcess(
+  input: RunAdHocReviewInput,
+  store: ForgeStore,
+  log: (msg: string) => void,
+): Promise<RunReviewInProcessResult> {
+  const prep = prepareReviewSession(input, store);
+  const { sessionId, runDir, logFile, startedAt, headRefName } = prep;
+  // Mirror log lines into agent.log so the Workbench can replay CLI runs.
+  const teeLog = (msg: string) => {
+    log(msg);
+    try {
+      fs.appendFileSync(logFile, `${msg}\n`);
+    } catch {
+      /* advisory */
+    }
+  };
+
+  const result = await executeReview({
+    store,
+    runDir,
+    prNum: input.prNum,
+    repoRoot: input.repoRoot,
+    repoName: input.repoName,
     headRefName,
-    sessionId,
-    startedAt: (seedMeta?.startedAt as string | undefined) ?? completedAt,
-    completedAt,
-    status,
-    exitCode,
+    agentAdapter: prep.reviewerAgent,
+    model: prep.reviewerModel,
+    publishToGitHub: input.publishToGitHub === true,
+    log: teeLog,
   });
 
+  const completedAt = new Date().toISOString();
+  const status = result.exitCode === 0 ? "completed" : "failed";
+  writeMetaSafe(path.join(runDir, "meta.json"), {
+    schemaVersion: SCHEMA_VERSION,
+    repoRoot: input.repoRoot,
+    repoName: input.repoName,
+    prNum: input.prNum,
+    headRefName,
+    sessionId,
+    startedAt,
+    completedAt,
+    status,
+    exitCode: result.exitCode,
+  });
   finalizeSession(store.db.db, {
     id: sessionId,
     finishedAt: completedAt,
-    state: exitCode === 0 ? "completed" : "failed",
-    exitCode,
-    error,
-    metrics: metricsPatch,
+    state: status,
+    exitCode: result.exitCode,
+    error: result.error ?? result.publishError,
+    metrics: result.metricsPatch,
   });
 
-  // Sentinel line — the SSE serializer translates it into a `done` event.
-  // Always last so the client sees done AFTER it sees any error text.
-  process.stdout.write(`${adHocReviewSentinelLine(exitCode, error)}\n`);
-  process.exit(exitCode);
+  return { sessionId, runDir, result };
+}
+
+// ─── runPublishOnly — re-publish saved findings (`forge review --publish-only`)
+
+export interface PublishOnlyResult {
+  source: "adhoc" | "launch";
+  findingsPath: string;
+  record: PublishRecord;
+}
+
+/**
+ * Load the latest saved findings for a PR (ad-hoc or launch bucket) and
+ * re-run the idempotent publish. The marker-based reconciliation makes this
+ * safe to repeat — already-published findings are skipped.
+ */
+export async function runPublishOnly(
+  input: { prNum: number; repoRoot: string; repoName: string },
+  store: ForgeStore,
+  log: (msg: string) => void,
+): Promise<PublishOnlyResult> {
+  const repoConfig = store.getRepoConfig(input.repoRoot);
+  const ghEnvResult = resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost });
+  if (ghEnvResult.error) {
+    throw new CliError("GH_AUTH", ghEnvResult.error, { exitCode: 2 });
+  }
+  const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
+
+  let prInfoJson = "";
+  try {
+    prInfoJson = ghExec(
+      ["pr", "view", String(input.prNum), "--json", "url,headRefName,headRefOid"],
+      ghEnv,
+      input.repoRoot,
+    ).trim();
+  } catch (e) {
+    throw new CliError("GH_FAIL", `gh pr view ${input.prNum} failed: ${ghFailureDetail(e)}`, {
+      hint: "Verify gh is authenticated for this repo's host.",
+      exitCode: 2,
+    });
+  }
+  let headRefName: string | null = null;
+  try {
+    headRefName = (JSON.parse(prInfoJson) as { headRefName?: string }).headRefName ?? null;
+  } catch {
+    /* tolerated — lookup falls back to the ad-hoc bucket only */
+  }
+
+  const lookup = findLatestForgeFindings(store, input.prNum, input.repoRoot, headRefName);
+  if (lookup.findings.length === 0 || !lookup.path) {
+    throw new CliError("NO_FINDINGS", `No saved findings for PR #${input.prNum} in ${input.repoName}.`, {
+      hint: "Run `forge review <pr> --run` (or a Workbench review) first.",
+      exitCode: 1,
+    });
+  }
+  log(`publishing ${lookup.findings.length} finding(s) from ${lookup.path} (${lookup.source})`);
+
+  let diff: string;
+  try {
+    diff = runGhHard(["pr", "diff", String(input.prNum)], ghEnv, input.repoRoot);
+  } catch (e) {
+    throw new CliError("GH_FAIL", (e as Error).message, { exitCode: 2 });
+  }
+
+  const record = await publishWithRecord({
+    prNum: input.prNum,
+    prInfoJson,
+    diff,
+    findings: lookup.findings,
+    ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+    ghEnv,
+    cwd: input.repoRoot,
+    log,
+  });
+  try {
+    writePublishRecord(path.dirname(lookup.path), record);
+  } catch {
+    /* record is advisory for publish-only — the outcome is printed */
+  }
+  return { source: lookup.source ?? "adhoc", findingsPath: lookup.path, record };
 }
 
 // ─── forge __extract-review <raw> <out> ──────────────────────────────────────
@@ -514,6 +888,20 @@ export function runExtractReviewBlock(argv: string[]): void {
   const block = extractLastForgeReviewBlock(raw);
   if (block === null) process.exit(2);
   fs.writeFileSync(outFile, block, "utf-8");
+  // Also persist structured findings beside the out file — this is what
+  // lights up the launch bucket of findLatestForgeFindings (review-bundle
+  // display, comment-fix by finding id, publish). Best-effort: a findings
+  // write failure must not break the runner's verdict contract.
+  try {
+    const findings = parseForgeReviewFindings(block);
+    fs.writeFileSync(
+      path.join(path.dirname(outFile), "findings.json"),
+      `${JSON.stringify(findings, null, 2)}\n`,
+      "utf-8",
+    );
+  } catch (e) {
+    process.stderr.write(`warning: could not write findings.json: ${(e as Error).message}\n`);
+  }
   process.stdout.write(`${JSON.stringify(parseForgeReviewVerdict(block))}\n`);
   process.exit(0);
 }
@@ -538,18 +926,30 @@ function writeMetaSafe(metaPath: string, meta: AdHocReviewMeta): void {
 
 /**
  * Resolve the PR's owner/repo + host + head commit from the `gh pr view` JSON
- * and publish the findings. Kept best-effort — any thrown error is caught and
- * logged so it never fails the review.
+ * and publish the findings, returning a persistent-shape PublishRecord. Never
+ * throws — every failure path comes back as a record the caller writes to
+ * publish.json.
+ *
+ * Stale-head guard: the reviewer typically runs for minutes, so the head may
+ * have moved since the diff was fetched. Re-fetch the head oid immediately
+ * before publishing; if it moved, re-fetch the diff so anchors are computed
+ * against the commit actually named in the POST (stale anchors 422 the review
+ * or land as immediately-outdated comments).
  */
-async function publishFindingsToGitHub(args: {
+async function publishWithRecord(args: {
   prNum: number;
   prInfoJson: string;
   diff: string;
   findings: ForgeFinding[];
   ghTarget: { user?: string; host?: string };
+  ghEnv: Record<string, string>;
   cwd: string;
   log: (msg: string) => void;
-}): Promise<void> {
+}): Promise<PublishRecord> {
+  const base: PublishRecord = { ...notRequestedRecord(), requested: true, attemptedAt: new Date().toISOString() };
+  if (args.findings.length === 0) {
+    return { ...base, state: "nothing-new" };
+  }
   try {
     let url = "";
     let headRefOid = "";
@@ -560,10 +960,35 @@ async function publishFindingsToGitHub(args: {
     } catch {
       /* fall through — resolvePrApiTarget can re-fetch the url */
     }
+
+    let diff = args.diff;
+    let headMoved = false;
+    const freshJson = runGhSoft(
+      ["pr", "view", String(args.prNum), "--json", "url,headRefOid"],
+      args.ghEnv,
+      args.cwd,
+      args.log,
+    );
+    try {
+      const fresh = JSON.parse(freshJson) as { url?: string; headRefOid?: string };
+      const freshOid = fresh.headRefOid ?? "";
+      if (freshOid && headRefOid && freshOid !== headRefOid) {
+        headMoved = true;
+        args.log(
+          `[publish] head moved ${headRefOid.slice(0, 7)} → ${freshOid.slice(0, 7)} during review — re-fetching diff`,
+        );
+        diff = runGhHard(["pr", "diff", String(args.prNum)], args.ghEnv, args.cwd);
+        headRefOid = freshOid;
+      }
+      if (!url && fresh.url) url = fresh.url;
+    } catch {
+      /* re-fetch failed — publish against the review-time head */
+    }
+
     const owned = url ? parseNameWithOwner(url) : null;
-    await publishReviewFindings(
+    const result: PublishResult = await publishReviewFindings(
       args.prNum,
-      { findings: args.findings, diff: args.diff, commitId: headRefOid },
+      { findings: args.findings, diff, commitId: headRefOid },
       {
         cwd: args.cwd,
         ghTarget: args.ghTarget,
@@ -572,24 +997,38 @@ async function publishFindingsToGitHub(args: {
       },
       args.log,
     );
+    return {
+      ...base,
+      state: result.state,
+      posted: result.posted,
+      outOfDiff: result.outOfDiff,
+      skipped: result.skipped,
+      failed: result.failed,
+      error: result.error,
+      findings: result.findings,
+      ...(headMoved ? { headMoved: true } : {}),
+    };
   } catch (e) {
-    args.log(`publish to GitHub failed (best-effort): ${(e as Error).message}`);
+    const msg = e instanceof Error ? e.message : String(e);
+    args.log(`publish to GitHub failed: ${msg}`);
+    return { ...base, state: "failed", failed: args.findings.length, error: msg };
   }
 }
 
-function runGhSafe(args: string[], env: Record<string, string>, cwd: string): string {
+function runGhSoft(args: string[], env: Record<string, string>, cwd: string, log: (msg: string) => void): string {
   try {
-    return execFileSync("gh", args, {
-      encoding: "utf-8",
-      stdio: ["pipe", "pipe", "pipe"],
-      cwd,
-      env,
-    });
+    return ghExec(args, env, cwd);
   } catch (e) {
-    const err = e as { stderr?: string; message?: string };
-    const detail = (err.stderr ?? err.message ?? "").toString().trim().split("\n")[0] || "unknown gh failure";
-    process.stdout.write(`[forge:review-worker] gh ${args.join(" ")} failed: ${detail}\n`);
+    log(`gh ${args.join(" ")} failed: ${ghFailureDetail(e)}`);
     return "";
+  }
+}
+
+function runGhHard(args: string[], env: Record<string, string>, cwd: string): string {
+  try {
+    return ghExec(args, env, cwd);
+  } catch (e) {
+    throw new Error(`gh ${args.join(" ")} failed: ${ghFailureDetail(e)} — verify gh auth/network for this repo's host`);
   }
 }
 
@@ -614,6 +1053,8 @@ export interface ReviewRunSummary {
   verdict: "approve" | "request-changes" | "block" | null;
   findingsTotal: number;
   findingCounts: ReviewSeverityCounts;
+  /** Publish outcome from publish.json; null for pre-publish-record runs. */
+  publish: PublishRecord | null;
 }
 
 export interface ReviewRunDetail {
@@ -626,6 +1067,8 @@ export interface ReviewRunDetail {
   verdict: "approve" | "request-changes" | "block" | null;
   summary: string;
   findings: ForgeFinding[];
+  /** Publish outcome from publish.json; null for pre-publish-record runs. */
+  publish: PublishRecord | null;
 }
 
 interface ReviewSessionRow {
@@ -732,6 +1175,7 @@ export function listForgeReviews(store: ForgeStore, prNum: number, repoRoot: str
       verdict,
       findingsTotal: findings.length,
       findingCounts,
+      publish: readPublishRecord(runDir),
     });
   }
   return out;
@@ -779,6 +1223,7 @@ export function loadForgeReview(
     verdict,
     summary,
     findings,
+    publish: readPublishRecord(runDir),
   };
 }
 
@@ -787,6 +1232,8 @@ export function loadForgeReview(
 export interface FindingsLookupResult {
   findings: ForgeFinding[];
   source: "adhoc" | "launch" | null;
+  /** Absolute path of the findings.json that won; null when none found. */
+  path: string | null;
 }
 
 // Find the most recent findings.json for a PR. Searches:
@@ -844,7 +1291,7 @@ export function findLatestForgeFindings(
     }
   }
 
-  if (candidates.length === 0) return { findings: [], source: null };
+  if (candidates.length === 0) return { findings: [], source: null, path: null };
 
   // Newest wins. On equal mtime, ad-hoc wins (per spec: "per-PR ad-hoc
   // review wins, more recent intent").
@@ -855,9 +1302,9 @@ export function findLatestForgeFindings(
   const pick = candidates[0];
   try {
     const findings = JSON.parse(fs.readFileSync(pick.path, "utf-8")) as ForgeFinding[];
-    if (!Array.isArray(findings)) return { findings: [], source: null };
-    return { findings, source: pick.source };
+    if (!Array.isArray(findings)) return { findings: [], source: null, path: null };
+    return { findings, source: pick.source, path: pick.path };
   } catch {
-    return { findings: [], source: null };
+    return { findings: [], source: null, path: null };
   }
 }
