@@ -1170,7 +1170,8 @@ export async function launchAgent(config: LaunchConfig, store: ForgeStore): Prom
     }
 
     return { tmuxSession, logFile, error: null };
-  } catch (e: any) {
-    return { tmuxSession, logFile, error: `Failed to start tmux: ${e.message ?? e}` };
+  } catch (e: unknown) {
+    const message = e instanceof Error ? e.message : String(e);
+    return { tmuxSession, logFile, error: `Failed to start tmux: ${message}` };
   }
 }

@@ -1537,7 +1537,7 @@ export function findLatestCommentFixState(store: ForgeStore, prNum: number, repo
       const sessionFailed = meta.status === "failed";
       const out: CommentFixState = {};
       for (const entry of parsed) {
-        if (!entry || !entry.status) continue;
+        if (!entry?.status) continue;
         // Prefer the `source:id` token; fall back to a legacy numeric
         // commentId (coerced to `comment:<id>`) so pre-token runs still
         // surface their status in the UI.

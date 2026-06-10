@@ -52,7 +52,8 @@ function parseDuration(s: string): number {
   if (!m) throw new CliError("BAD_DURATION", `Invalid duration: ${s}`, { exitCode: 1 });
   const n = Number.parseInt(m[1], 10);
   const unit = m[2] ?? "s";
-  return n * { ms: 1, s: 1000, m: 60000, h: 3600000 }[unit]!;
+  const multipliers: Record<string, number> = { ms: 1, s: 1000, m: 60000, h: 3600000 };
+  return n * (multipliers[unit] ?? 1000);
 }
 
 interface UntilSpec {
