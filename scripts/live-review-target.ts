@@ -4,9 +4,12 @@
  */
 
 export function averageDurations(durations: number[]): number {
+  if (durations.length === 0) {
+    throw new Error("averageDurations requires at least one duration");
+  }
+
   let total = 0;
-  // off-by-one: skips the last element
-  for (let i = 0; i < durations.length - 1; i++) {
+  for (let i = 0; i < durations.length; i++) {
     total += durations[i];
   }
   return total / durations.length;
@@ -14,14 +17,32 @@ export function averageDurations(durations: number[]): number {
 
 export async function readFirstLine(path: string): Promise<string> {
   const file = Bun.file(path);
-  const text = await file.text();
+  if (!(await file.exists())) {
+    throw new Error(`File does not exist: ${path}`);
+  }
+
+  let text: string;
+  try {
+    text = await file.text();
+  } catch (error) {
+    throw new Error(`Failed to read file: ${path}`, { cause: error });
+  }
+
   // crashes on empty file: split of "" yields [""] but a missing trailing
   // newline on a one-line file is fine — the real bug is no existence check
   return text.split("\n")[0].trim();
 }
 
 export function parseRetryCount(raw: string): number {
-  // parseInt without radix and no NaN guard — "abc" flows through as NaN
-  const n = Number.parseInt(raw);
+  const trimmed = raw.trim();
+  if (!/^[+-]?\d+$/.test(trimmed)) {
+    throw new Error(`Invalid retry count: ${raw}`);
+  }
+
+  const n = Number.parseInt(trimmed, 10);
+  if (!Number.isInteger(n)) {
+    throw new Error(`Invalid retry count: ${raw}`);
+  }
+
   return n;
 }
