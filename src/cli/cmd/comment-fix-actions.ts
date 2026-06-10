@@ -38,6 +38,7 @@ import { fetchPrBundle, parseApiHost, parseNameWithOwner } from "../../core/gh-p
 import { fetchReviewThreads, replyToReviewComment, resolveReviewThread } from "../../core/gh-pr-write.ts";
 import { detectRepo } from "../../core/repo.ts";
 import { type CommentValidationEntry, type ForgeFinding, parseCommentValidation } from "../../core/reviewer.ts";
+import { reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { ensureWorktreeForBranch } from "../../core/worktrees.ts";
 import { findLatestForgeFindings } from "./review-actions.ts";
@@ -405,7 +406,10 @@ export async function runCommentFix(input: RunCommentFixInput, store: ForgeStore
     );
   }
 
-  // 8) Single-flight.
+  // 8) Single-flight. Reap first, then check: a worker that died before
+  //    finalizeSession (SIGKILL, OOM, reboot) leaves its row 'running'
+  //    forever and would otherwise 409-block this PR permanently.
+  reapStaleWorkerSessions(store);
   const inFlight = store.db.db
     .prepare(
       `SELECT id FROM sessions

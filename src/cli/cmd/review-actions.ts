@@ -40,6 +40,7 @@ import {
   parseForgeReviewVerdict,
   type ReviewVerdict,
 } from "../../core/reviewer.ts";
+import { reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type { ForgeStore } from "../../core/store.ts";
 
 const PR_VIEW_FIELDS = "number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url,headRefOid";
@@ -267,6 +268,12 @@ function prepareReviewSession(input: RunAdHocReviewInput, store: ForgeStore): Pr
   // 4) No in-flight ad-hoc review for this (repoRoot, prNum). Single-flight
   //    guards stop the user from kicking off five reviews while one is
   //    already streaming into the drawer.
+  //
+  //    Reap first, then check: a worker that died before finalizeSession
+  //    (SIGKILL, OOM, reboot) leaves its row 'running' forever and would
+  //    otherwise 409-block this PR permanently. The reaper finalizes any
+  //    dead-pid / stale rows so only genuinely live reviews trip the guard.
+  reapStaleWorkerSessions(store);
   const inFlight = store.db.db
     .prepare(
       `SELECT id FROM sessions
@@ -857,6 +864,104 @@ export async function runPublishOnly(
     /* record is advisory for publish-only — the outcome is printed */
   }
   return { source: lookup.source ?? "adhoc", findingsPath: lookup.path, record };
+}
+
+// ─── republishReviewSession — retry-publish for one recorded review ──────────
+
+export interface RepublishSessionResult {
+  runDir: string;
+  record: PublishRecord;
+}
+
+/**
+ * Re-run the idempotent publish for one recorded review session, from the
+ * findings.json saved in that session's run dir. Backs the Workbench's
+ * retry-publish endpoint (POST /api/prs/:num/reviews/:sessionId/publish).
+ * Unlike runPublishOnly (which picks the newest findings across all runs),
+ * this targets exactly the session the operator clicked.
+ *
+ * Throws CliError: REVIEW_NOT_FOUND (no matching session for this pr/repo),
+ * REVIEW_RUNNING (still in flight), NO_FINDINGS, GH_AUTH, GH_FAIL.
+ */
+export async function republishReviewSession(
+  input: { prNum: number; repoRoot: string; sessionId: string },
+  store: ForgeStore,
+  log: (msg: string) => void,
+): Promise<RepublishSessionResult> {
+  const detail = loadForgeReview(store, input.prNum, input.repoRoot, input.sessionId);
+  if (!detail) {
+    throw new CliError("REVIEW_NOT_FOUND", `No review with id "${input.sessionId}" for PR #${input.prNum}.`, {
+      exitCode: 1,
+    });
+  }
+  if (detail.status === "running") {
+    throw new CliError(
+      "REVIEW_RUNNING",
+      `Review ${input.sessionId} is still running — wait for it to finish before re-publishing.`,
+      { exitCode: 1 },
+    );
+  }
+  if (detail.findings.length === 0) {
+    throw new CliError("NO_FINDINGS", `Review ${input.sessionId} has no saved findings to publish.`, { exitCode: 1 });
+  }
+  const runDir = adHocRunDir(store, input.prNum, input.sessionId);
+
+  const repoConfig = store.getRepoConfig(input.repoRoot);
+  const ghEnvResult = resolveGhEnv({ user: repoConfig.ghUser, host: repoConfig.ghHost });
+  if (ghEnvResult.error) {
+    throw new CliError("GH_AUTH", ghEnvResult.error, { exitCode: 2 });
+  }
+  const ghEnv = { ...process.env, ...ghEnvResult.env } as Record<string, string>;
+
+  let prInfoJson = "";
+  try {
+    prInfoJson = ghExec(
+      ["pr", "view", String(input.prNum), "--json", "url,headRefName,headRefOid"],
+      ghEnv,
+      input.repoRoot,
+    ).trim();
+  } catch (e) {
+    throw new CliError("GH_FAIL", `gh pr view ${input.prNum} failed: ${ghFailureDetail(e)}`, {
+      hint: "Verify gh is authenticated for this repo's host.",
+      exitCode: 2,
+    });
+  }
+  let diff: string;
+  try {
+    diff = runGhHard(["pr", "diff", String(input.prNum)], ghEnv, input.repoRoot);
+  } catch (e) {
+    throw new CliError("GH_FAIL", (e as Error).message, { exitCode: 2 });
+  }
+
+  log(`re-publishing ${detail.findings.length} finding(s) from ${runDir}`);
+  const record = await publishWithRecord({
+    prNum: input.prNum,
+    prInfoJson,
+    diff,
+    findings: detail.findings,
+    ghTarget: { user: repoConfig.ghUser, host: repoConfig.ghHost },
+    ghEnv,
+    cwd: input.repoRoot,
+    log,
+  });
+  try {
+    writePublishRecord(runDir, record);
+  } catch (e) {
+    log(`failed to write publish.json: ${(e as Error).message}`);
+  }
+  // Keep the session row's compact publish summary in step with the retry so
+  // forge status / the Workbench review list reflect the new outcome.
+  try {
+    store.db.db
+      .prepare("UPDATE sessions SET metrics = json_set(COALESCE(metrics, '{}'), '$.publish', json(?)) WHERE id = ?")
+      .run(
+        JSON.stringify({ state: record.state, posted: record.posted, failed: record.failed, error: record.error }),
+        input.sessionId,
+      );
+  } catch {
+    /* advisory — publish.json in the run dir is the authority */
+  }
+  return { runDir, record };
 }
 
 // ─── forge __extract-review <raw> <out> ──────────────────────────────────────

@@ -11,13 +11,14 @@
 
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
+import * as net from "node:net";
 import * as path from "node:path";
 import { fileURLToPath } from "node:url";
 import { parseArgs } from "node:util";
 import { AGENT_MODELS, validateAgentModelPairs } from "../../core/agent-models.ts";
 import { spawnForgeCli } from "../../core/cli-spawn.ts";
 import { reconcileCritiqueSessions } from "../../core/critique.ts";
-import { promoteDraftingSessions, reconcileExecutionSessions, syncJobState } from "../../core/db/writes.ts";
+import { promoteDraftingSessions, reconcileExecutionSessions } from "../../core/db/writes.ts";
 import { commentAnchorsToDiff } from "../../core/diff-anchoring.ts";
 import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
 import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
@@ -33,7 +34,7 @@ import {
 } from "../../core/gh-pr.ts";
 import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
-import { isTmuxSessionAlive, killTmuxSession } from "../../core/launch.ts";
+import { isTmuxSessionAlive } from "../../core/launch.ts";
 import {
   abortInFlight,
   BadCwdError,
@@ -58,6 +59,7 @@ import {
   summarizePlanForSse,
 } from "../../core/plan-edit.ts";
 import { detectRepo } from "../../core/repo.ts";
+import { killPlan, reapDeadRunnerPlans, reapStaleWorkerSessions } from "../../core/session-reaper.ts";
 import type {
   CritiqueMeta,
   ForgeStore,
@@ -88,6 +90,7 @@ import {
   listForgeReviews,
   loadForgeReview,
   parseAdHocReviewSentinel,
+  republishReviewSession,
   runAdHocReview,
 } from "./review-actions.ts";
 import { archiveSpec, saveSpec, unarchiveSpec } from "./spec.ts";
@@ -193,6 +196,19 @@ const CONFIG_BOOLEAN_KEYS = new Set(["autoFix", "autoImprove"]);
 const CONFIG_NUMBER_KEYS = new Set(["autoFixRounds"]);
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];
+
+/**
+ * Every non-terminal status the launch runner can leave a plan in. Used by
+ * the /api/plans sync loop (which statuses keep getting re-polled against
+ * meta.json) and by the kill endpoint (which statuses are killable).
+ *
+ * Note the runner-only "reviewing" phase is deliberately absent: it is not a
+ * PlanStatus — store.syncPlanStatus keeps the plan in its previous
+ * running-family status (typically creating_pr) while meta.json reads
+ * "reviewing", so re-polling these four statuses also covers plans that are
+ * mid-review and guarantees the runner's terminal status is picked up.
+ */
+const RUNNING_PLAN_STATUSES: ReadonlySet<PlanStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
 
 // ─── helpers ─────────────────────────────────────────────────────────────────
 
@@ -326,6 +342,21 @@ function statusInfo(
       }
       return { section: "drafting", statLabel: "Drafting", statClass: "drafting", error: null, critique };
     }
+
+    default:
+      // Defensive: index.json is hand-editable and older builds wrote
+      // statuses outside today's union (e.g. the runner-only "reviewing"
+      // phase). The switch above is exhaustive for PlanStatus, but a stray
+      // on-disk value must not return undefined and 500 the whole
+      // /api/plans list — surface it as needs-attention instead.
+      return {
+        section: "attention",
+        statLabel: `Unknown (${task.status})`,
+        statClass: "failed" as WorkbenchSection,
+        kind: "failed",
+        error: failureMessage(task, store),
+        critique,
+      };
   }
 }
 
@@ -823,20 +854,29 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     let tasks = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) tasks = tasks.filter((t) => t.repoName === repo || t.repoRoot === repo);
     // Sync any running tasks so the UI sees fresh statuses on every poll.
+    // Per-plan try/catch: one corrupt meta.json must not 500 the list.
     for (const t of tasks) {
-      if (
-        t.status === "running" ||
-        t.status === "quality_check" ||
-        t.status === "creating_pr" ||
-        t.status === "fixing"
-      ) {
-        store.syncPlanStatus(t);
+      if (RUNNING_PLAN_STATUSES.has(t.status)) {
+        try {
+          store.syncPlanStatus(t);
+        } catch (e) {
+          const msg = e instanceof Error ? e.message : String(e);
+          process.stderr.write(`warn: syncPlanStatus failed for ${t.id}: ${msg}\n`);
+        }
       }
     }
     // Re-read after the sync to pick up any status changes.
     let synced = store.getPlans().filter((t) => t.status !== "archived");
     if (repo) synced = synced.filter((t) => t.repoName === repo || t.repoRoot === repo);
-    let views = synced.map((t) => viewTask(t, store));
+    let views: PlanView[] = [];
+    for (const t of synced) {
+      try {
+        views.push(viewTask(t, store));
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        process.stderr.write(`warn: viewTask failed for ${t.id} — omitting from /api/plans: ${msg}\n`);
+      }
+    }
     if (section) views = views.filter((v) => v.section === section);
     return jsonOk({ plans: views });
   }
@@ -1914,6 +1954,7 @@ const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 const PLAN_EDIT_ACTION_PATH = /^\/api\/plans\/([^/]+)\/plan-edit\/(accept|reject|direct)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
+const PR_REVIEW_PUBLISH_PATH = /^\/api\/prs\/([^/]+)\/reviews\/([^/]+)\/publish$/;
 const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
 const WORKTREES_CLEAN_MERGED_PATH = "/api/worktrees/clean-merged";
 const WORKTREES_TEST_PATH = "/api/worktrees/test-locally";
@@ -1935,6 +1976,7 @@ function allowsPost(pathname: string): boolean {
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
+  if (PR_REVIEW_PUBLISH_PATH.test(pathname)) return true;
   if (
     pathname === WORKTREES_REMOVE_PATH ||
     pathname === WORKTREES_CLEAN_MERGED_PATH ||
@@ -2022,9 +2064,11 @@ function optAgent(
   return { ok: true, value: v as Plan["agent"] };
 }
 
-// Statuses where a `kill` is meaningful — only running-family tasks. Killing
-// a `done`/`failed`/`draft` task would silently rewrite the completion record.
-const KILLABLE_STATUSES: Set<PlanStatus> = new Set(["running", "quality_check", "creating_pr", "fixing"]);
+// Statuses where a `kill` is meaningful — exactly the running-family set the
+// runner can leave a plan in (quality_check / creating_pr / fixing included).
+// Killing a `done`/`failed`/`draft` task would silently rewrite the
+// completion record.
+const KILLABLE_STATUSES: ReadonlySet<PlanStatus> = RUNNING_PLAN_STATUSES;
 
 async function handleApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<Response> {
   try {
@@ -2357,7 +2401,14 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     }
     try {
       const result = await runCommentFix({ prNum, repoRoot: target.root, repoName: target.name, targets }, store);
-      return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
+      // droppedTargets tells the UI which requested targets were silently
+      // unfixable (unanchored comment, unknown finding id, …) so the
+      // operator isn't left wondering why a checkbox did nothing.
+      return jsonOk({
+        sessionId: result.sessionId,
+        logStreamUrl: result.logStreamUrl,
+        droppedTargets: result.droppedTargets,
+      });
     } catch (e) {
       if (e instanceof CliError) {
         if (e.code === "PR_NOT_FOUND") return jsonErr(404, e.code, e.message, e.hint);
@@ -2370,6 +2421,39 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
           return jsonErr(409, e.code, e.message, e.hint);
         }
         if (e.code === "NO_COMMENTS") return jsonErr(400, e.code, e.message, e.hint);
+        return fromCliError(e);
+      }
+      throw e;
+    }
+  }
+
+  // POST /api/prs/:num/reviews/:sessionId/publish — body { repo }
+  // Re-runs the idempotent publish for one recorded review session's saved
+  // findings.json (marker-based reconciliation skips already-posted
+  // findings). 409 while the review session is still running.
+  const reviewPublishMatch = pathname.match(PR_REVIEW_PUBLISH_PATH);
+  if (reviewPublishMatch) {
+    const numRaw = decodeURIComponent(reviewPublishMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const sessionId = decodeURIComponent(reviewPublishMatch[2]);
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    try {
+      const result = await republishReviewSession({ prNum, repoRoot: target.root, sessionId }, store, (msg) =>
+        process.stderr.write(`[forge serve] republish ${sessionId}: ${msg}\n`),
+      );
+      return jsonOk({ sessionId, publish: result.record });
+    } catch (e) {
+      if (e instanceof CliError) {
+        if (e.code === "REVIEW_NOT_FOUND" || e.code === "NO_FINDINGS") return jsonErr(404, e.code, e.message, e.hint);
+        if (e.code === "REVIEW_RUNNING") return jsonErr(409, e.code, e.message, e.hint);
+        if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
         return fromCliError(e);
       }
       throw e;
@@ -2545,25 +2629,10 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     if (!task.tmuxSession) {
       return jsonErr(400, "NO_TMUX_SESSION", `Task ${planId} has no tmux session — it hasn't been launched.`);
     }
-    killTmuxSession(task.tmuxSession);
-    // Locked merge: the runner's bash set_status writes meta concurrently,
-    // so a naive read-spread-write would lose either field.
-    store.mergeRunMeta(planId, { errorMessage: "Killed by user", status: "failed" });
-    const killedAt = new Date().toISOString();
-    store.upsertPlan({ ...task, status: "failed", completedAt: killedAt });
-    // Sync the SQLite jobs row too. syncPlanStatus early-returns once a plan
-    // is terminal, so without this the killed run stays `running` in DB
-    // surfaces (`forge run ls`, Runs tab, history) indefinitely.
-    try {
-      syncJobState(
-        store.db.db,
-        { ...task, status: "failed" },
-        { status: "failed", endedAt: killedAt, errorMessage: "Killed by user" },
-      );
-    } catch (e) {
-      const msg = e instanceof Error ? e.message : String(e);
-      process.stderr.write(`warn: syncJobState failed on kill for ${planId}: ${msg}\n`);
-    }
+    // Shared kill recipe (tmux kill + locked meta merge + index flip + jobs
+    // row finish) — the same helper the TUI dash uses, so every surface
+    // agrees the run is dead.
+    killPlan(store, task);
     return jsonOk({ killed: true, planId });
   }
 
@@ -2688,12 +2757,66 @@ function reapStaleCritiques(store: ForgeStore): number {
   return swept;
 }
 
+/**
+ * Run both worker/runner reapers, logging what was swept. Shared by the
+ * boot path and the periodic interval. Never throws.
+ */
+function runWorkerAndPlanReapers(store: ForgeStore): void {
+  try {
+    for (const s of reapStaleWorkerSessions(store)) {
+      process.stderr.write(`forge serve: reaped stale ${s.purpose} session ${s.id}: ${s.error}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`forge serve: worker-session reaper error: ${e instanceof Error ? e.message : e}\n`);
+  }
+  try {
+    for (const p of reapDeadRunnerPlans(store)) {
+      process.stderr.write(`forge serve: reaped dead runner for plan ${p.planId}: ${p.errorMessage}\n`);
+    }
+  } catch (e) {
+    process.stderr.write(`forge serve: dead-runner reaper error: ${e instanceof Error ? e.message : e}\n`);
+  }
+}
+
+/**
+ * True when something already accepts TCP connections on (host, port).
+ * Connect-probe rather than bind-probe: on macOS a second Bun.serve binds
+ * the same port without error (SO_REUSEPORT semantics), so a bind probe
+ * would not detect the conflict — an accepted connection always does.
+ */
+export function probeTcpListener(host: string, port: number, timeoutMs = 500): Promise<boolean> {
+  return new Promise((resolve) => {
+    const sock = net.connect({ host, port });
+    let settled = false;
+    const done = (inUse: boolean) => {
+      if (settled) return;
+      settled = true;
+      sock.destroy();
+      resolve(inUse);
+    };
+    sock.once("connect", () => done(true));
+    sock.once("error", () => done(false));
+    sock.setTimeout(timeoutMs, () => done(false));
+  });
+}
+
 export async function startServer(
   store: ForgeStore,
   opts: ServeOptions = {},
 ): Promise<{ port: number; stop: () => void }> {
   const port = opts.port ?? DEFAULT_PORT;
   const host = opts.host ?? DEFAULT_HOST;
+
+  // Refuse to double-bind. A second forge serve on the same port "works" on
+  // macOS (both processes LISTEN; newest binder captures the traffic) which
+  // silently flips the Workbench between processes with divergent in-memory
+  // state. Port 0 means "pick a free port" — nothing to probe.
+  if (port !== 0 && (await probeTcpListener(host, port))) {
+    throw new CliError("PORT_IN_USE", `Port ${port} on ${host} is already in use — is another forge serve running?`, {
+      hint: `Open http://${host}:${port} to use the existing instance, or pass --port <n> for a second one.`,
+      exitCode: 2,
+    });
+  }
 
   const webDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..", "web");
   const indexFile = path.join(webDir, "index.html");
@@ -2715,6 +2838,12 @@ export async function startServer(
     process.stderr.write(`forge serve: reaped ${sweptPlanChats} stale plan-chat artifact(s).\n`);
   }
 
+  // Boot reapers for dead detached workers (review / comment-fix sessions
+  // stuck `running`) and dead tmux runners (plans stuck in a running-family
+  // status). Without these, a worker killed mid-run 409-blocks its PR
+  // forever and a dead overnight run pulses "Running" indefinitely.
+  runWorkerAndPlanReapers(store);
+
   // Warm the SKILL prompt cache so the first /plan-chat doesn't pay a
   // disk read on the SSE-spawn path. Best-effort; failure is logged but
   // non-fatal (the chat endpoint will still try at request time).
@@ -2724,15 +2853,17 @@ export async function startServer(
     process.stderr.write(`forge serve: failed to preload planner SKILL.md: ${e instanceof Error ? e.message : e}\n`);
   }
 
-  // Periodic plan-chat reaper — every 60s. Cheap (in-memory map walk +
-  // shallow filesystem scan); guarantees stuck subprocesses are killed
-  // within ~6 minutes of becoming stale.
+  // Periodic reapers — every 60s. Cheap (in-memory map walk + shallow
+  // filesystem scan + signal-0 pid probes); guarantees stuck subprocesses,
+  // dead workers, and dead tmux runners are reconciled within ~a minute of
+  // becoming stale.
   const planChatReaper = setInterval(() => {
     try {
       reapStalePlanChats(store.forgeDir);
     } catch (e) {
       process.stderr.write(`forge serve: plan-chat reaper error: ${e instanceof Error ? e.message : e}\n`);
     }
+    runWorkerAndPlanReapers(store);
   }, 60_000);
   // Don't keep the event loop alive just for the reaper.
   if (typeof planChatReaper.unref === "function") planChatReaper.unref();
@@ -2779,6 +2910,9 @@ export async function startServer(
   const server = Bun.serve({
     port,
     hostname: host,
+    // Never opt into SO_REUSEPORT — combined with the probe above this keeps
+    // "one workbench per port" an invariant rather than a hope.
+    reusePort: false,
     development: false,
     error(err: Error) {
       process.stderr.write(`forge serve: unhandled error: ${err.message}\n`);

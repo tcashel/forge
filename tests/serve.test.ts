@@ -7,7 +7,7 @@
  */
 
 import { strict as assert } from "node:assert";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawnSync } from "node:child_process";
 import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
@@ -1538,4 +1538,187 @@ test("POST /api/plans/:id/archive returns 404 for unknown task", async (t) => {
   const { status, body } = await postJson(`${h.baseUrl}/api/plans/nope/archive`);
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_TASK");
+});
+
+// ─── Wave 2: reapers, port guard, statusInfo hardening, retry-publish ────────
+
+/** Pid of a process that has provably already exited. */
+function deadPid(): number {
+  const r = spawnSync("true", { stdio: "ignore" });
+  if (typeof r.pid !== "number") throw new Error("spawnSync returned no pid");
+  return r.pid;
+}
+
+test("startServer rejects a second bind on an occupied port with PORT_IN_USE", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const port = Number(new URL(h.baseUrl).port);
+
+  const tmpHome2 = fs.mkdtempSync(path.join(os.tmpdir(), "forge-serve-dup-"));
+  t.after(() => fs.rmSync(tmpHome2, { recursive: true, force: true }));
+  const store2 = new ForgeStore({ forgeDir: path.join(tmpHome2, ".forge") });
+
+  await assert.rejects(
+    () => startServer(store2, { port, host: "127.0.0.1" }),
+    (e: unknown) => (e as { code?: string }).code === "PORT_IN_USE",
+  );
+});
+
+test("startServer reaps a dead-worker review session on boot (no more permanent 409)", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-worker-reap-"));
+  const store = new ForgeStore({ forgeDir: path.join(tmpHome, ".forge") });
+  upsertSession(store.db.db, {
+    id: "s-review-dead",
+    purpose: "review",
+    relatedId: null,
+    agentAdapter: "claude",
+    model: "test-model",
+    startedAt: new Date(Date.now() - 60 * 60_000).toISOString(),
+    pid: deadPid(),
+    state: "running",
+    metrics: { prNum: 7, repoRoot: tmpHome } as never,
+  });
+
+  const { stop } = await startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const row = store.db.db.prepare("SELECT state, error FROM sessions WHERE id = ?").get("s-review-dead") as {
+    state: string;
+    error: string | null;
+  };
+  assert.equal(row.state, "failed");
+  assert.match(row.error ?? "", /worker died \(pid \d+ gone\)/);
+});
+
+test("startServer fails a running plan whose tmux runner is dead (boot reaper)", async (t) => {
+  const tmpHome = fs.mkdtempSync(path.join(os.tmpdir(), "forge-tmux-reap-"));
+  const store = new ForgeStore({ forgeDir: path.join(tmpHome, ".forge") });
+  const id = "dead-tmux-plan";
+  const launchedAt = new Date(Date.now() - 10 * 60_000).toISOString();
+  store.upsertPlan({
+    id,
+    title: "feat(demo): dead overnight run",
+    repoRoot: tmpHome,
+    repoName: "demo",
+    branch: `forge/${id}`,
+    worktree: null,
+    status: "running",
+    agent: "claude",
+    model: "claude-opus-4-7",
+    createdAt: launchedAt,
+    launchedAt,
+    completedAt: null,
+    prUrl: null,
+    prNumber: null,
+    tmuxSession: "forge-definitely-not-a-real-session-xyz",
+    logFile: null,
+    jiraTicket: null,
+    specFile: store.writeSpec(id, "# dead\n"),
+    specVersion: 1,
+    lastImproveError: null,
+    archivedAt: null,
+  });
+  fs.mkdirSync(path.join(store.runsDir, id), { recursive: true });
+  store.writeRunMeta(id, {
+    planId: id,
+    tmuxSession: "forge-definitely-not-a-real-session-xyz",
+    logFile: store.getLogFile(id),
+    agent: "claude",
+    model: "claude-opus-4-7",
+    worktree: "/tmp/wt",
+    status: "running",
+    startedAt: launchedAt,
+    prUrl: null,
+  } as RunMeta);
+  // Stale log: written, then mtime pushed past the grace period.
+  fs.writeFileSync(store.getLogFile(id), "working…\n");
+  const old = new Date(Date.now() - 5 * 60_000);
+  fs.utimesSync(store.getLogFile(id), old, old);
+
+  const { port, stop } = await startServer(store, { port: 0, host: "127.0.0.1" });
+  t.after(() => {
+    stop();
+    fs.rmSync(tmpHome, { recursive: true, force: true });
+  });
+
+  const plan = store.getPlan(id);
+  assert.equal(plan!.status, "failed");
+  const meta = store.readRunMeta(id);
+  assert.equal(meta!.status, "failed");
+  assert.equal(meta!.errorMessage, "runner died (tmux session gone)");
+
+  // The list reflects it too — section flips to attention with the reason.
+  const { body } = await getJson(`http://127.0.0.1:${port}/api/plans`);
+  const view = (body.data!.plans ?? []).find((p) => p.id === id);
+  assert.equal(view?.section, "attention");
+  assert.match(String(view?.error ?? ""), /runner died/);
+});
+
+test("an unknown on-disk status renders as attention instead of 500ing /api/plans", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  makeDraftTask(h.store, "weird-status", h.tmpHome, "demo", "feat(demo): hand-edited");
+  const plan = h.store.getPlan("weird-status")!;
+  // Simulate a hand-edited / legacy index.json entry outside today's union.
+  h.store.upsertPlan({ ...plan, status: "reviewing" as never });
+
+  const { status, body } = await getJson(`${h.baseUrl}/api/plans`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const view = (body.data!.plans ?? []).find((p) => p.id === "weird-status");
+  assert.ok(view, "plan with unknown status still listed");
+  assert.equal(view!.section, "attention");
+  assert.match(view!.statLabel, /Unknown/);
+});
+
+test("POST /api/prs/:num/reviews/:sessionId/publish → 404 REVIEW_NOT_FOUND for unknown session", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const repo = makeGitRepo("forge-pub-repo-");
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+  h.store.registerWorkbenchRepo({ root: repo, name: "pubrepo" });
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/prs/7/reviews/s-nope/publish`, { repo });
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "REVIEW_NOT_FOUND");
+});
+
+test("POST /api/prs/:num/reviews/:sessionId/publish → 409 while the review is still running", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const repo = makeGitRepo("forge-pub-running-");
+  t.after(() => fs.rmSync(repo, { recursive: true, force: true }));
+  h.store.registerWorkbenchRepo({ root: repo, name: "pubrunning" });
+
+  upsertSession(h.store.db.db, {
+    id: "s-pub-running",
+    purpose: "review",
+    relatedId: null,
+    agentAdapter: "claude",
+    model: "test-model",
+    startedAt: new Date().toISOString(),
+    pid: process.pid, // alive — the reapers must leave it be
+    state: "running",
+    metrics: { prNum: 7, repoRoot: repo } as never,
+  });
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/prs/7/reviews/s-pub-running/publish`, { repo });
+  assert.equal(status, 409);
+  assert.equal(body.error!.code, "REVIEW_RUNNING");
+  // The guard must not have mutated the session.
+  const row = h.store.db.db.prepare("SELECT state FROM sessions WHERE id = ?").get("s-pub-running") as {
+    state: string;
+  };
+  assert.equal(row.state, "running");
+});
+
+test("POST /api/prs/:num/reviews/:sessionId/publish requires `repo`", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await postJson(`${h.baseUrl}/api/prs/7/reviews/s-x/publish`, {});
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "BAD_REQUEST");
 });

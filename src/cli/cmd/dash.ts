@@ -14,6 +14,7 @@
 import { execSync, spawn } from "node:child_process";
 import * as fs from "node:fs";
 import { detectRepo } from "../../core/repo.ts";
+import { killPlan } from "../../core/session-reaper.ts";
 import type { ForgeStore } from "../../core/store.ts";
 import { ForgeDashboard } from "../../tui/dashboard.ts";
 import { runTui } from "../../tui/render-loop.ts";
@@ -78,16 +79,12 @@ export async function run(_argv: string[], store: ForgeStore): Promise<void> {
         }
         case "kill": {
           if (action.task.tmuxSession) {
-            try {
-              execSync(`tmux kill-session -t ${action.task.tmuxSession}`, { stdio: "ignore" });
-            } catch {
-              /* session may already be dead */
-            }
-            store.upsertPlan({
-              ...action.task,
-              status: "failed",
-              completedAt: new Date().toISOString(),
-            });
+            // Shared kill recipe (tmux kill + meta.json merge + index flip +
+            // jobs row finish) — same helper the serve kill endpoint uses.
+            // Updating only index.json here used to strand meta.json and the
+            // SQLite jobs row at "running" forever (syncPlanStatus
+            // early-returns once the plan is terminal).
+            killPlan(store, action.task);
           }
           dash.invalidate();
           handle.invalidate();
