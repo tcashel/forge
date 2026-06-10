@@ -1403,12 +1403,12 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     // Stale published findings therefore keep their local `finding:<id>` row
     // (still selectable + fixable by id) while the comment keeps its marker
     // metadata so resolve-on-fix still finds the thread.
-    const markerByCommentId = new Map<number, string>();
+    const markerByCommentId = new Map<number, { id: string; severity: string }>();
     const publishedIds = new Set<string>();
     for (const c of result.bundle.inlineComments) {
       const marker = parseFindingMarker(c.body);
       if (!marker) continue;
-      markerByCommentId.set(c.id, marker.id);
+      markerByCommentId.set(c.id, marker);
       const anchored = commentAnchorsToDiff(result.bundle.diff, {
         path: c.path,
         position: c.position,
@@ -1436,13 +1436,14 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
 
     const inlineComments = result.bundle.inlineComments.map((c) => {
-      const findingId = markerByCommentId.get(c.id);
-      if (!findingId) return c;
+      const marker = markerByCommentId.get(c.id);
+      if (!marker) return c;
       const thread = threadByCommentId.get(c.id);
-      const ghResolvedFallback = commentFixState[`finding:${findingId}`]?.ghResolved === true;
+      const ghResolvedFallback = commentFixState[`finding:${marker.id}`]?.ghResolved === true;
       return {
         ...c,
-        forgeFindingId: findingId,
+        forgeFindingId: marker.id,
+        forgeFindingSeverity: marker.severity,
         reviewThreadId: thread?.threadId ?? null,
         isResolved: thread ? thread.isResolved : ghResolvedFallback,
       };

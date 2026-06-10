@@ -152,7 +152,12 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
     data: {
       forgeFindings: ForgeFinding[];
       inlineComments: Array<
-        PrInlineComment & { forgeFindingId?: string; reviewThreadId?: string; isResolved?: boolean }
+        PrInlineComment & {
+          forgeFindingId?: string;
+          forgeFindingSeverity?: string;
+          reviewThreadId?: string;
+          isResolved?: boolean;
+        }
       >;
     };
   };
@@ -164,10 +169,12 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
     [LOCAL_ID],
   );
 
-  // The marker comment is enriched with the finding id + resolution from GitHub.
+  // The marker comment is enriched with the finding id + severity + resolution
+  // from GitHub.
   const enriched = body.data.inlineComments.find((c) => c.id === COMMENT_DB_ID);
   assert.ok(enriched);
   assert.equal(enriched?.forgeFindingId, PUBLISHED_ID);
+  assert.equal(enriched?.forgeFindingSeverity, "HIGH");
   assert.equal(enriched?.reviewThreadId, "T_published");
   assert.equal(enriched?.isResolved, true);
 });

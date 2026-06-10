@@ -353,6 +353,8 @@ export interface InlinePrComment {
   commitId: string;
   /** Set when this comment is the published view of a Forge finding. */
   forgeFindingId?: string;
+  /** Severity carried by the finding's marker (set alongside forgeFindingId). */
+  forgeFindingSeverity?: ForgeFindingSeverity;
   /** GraphQL review-thread node id (null when no thread matched). */
   reviewThreadId?: string | null;
   /** Whether the finding's review thread is resolved (ground truth or fallback). */

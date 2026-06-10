@@ -84,6 +84,11 @@ export function CommentThread({ thread, anchored = true }: Props) {
         ) : null}
         {thread.root.forgeFindingId ? (
           <div class={`review-thread-badge badge-${thread.root.isResolved ? "resolved" : "published"}`}>
+            {thread.root.forgeFindingSeverity ? (
+              <span class={`finding-severity sev-${thread.root.forgeFindingSeverity.toLowerCase()}`}>
+                {thread.root.forgeFindingSeverity}
+              </span>
+            ) : null}
             <span class="badge-label">{thread.root.isResolved ? "resolved on PR" : "Forge finding · open"}</span>
           </div>
         ) : null}
