@@ -75,9 +75,7 @@
           "severity": "LOW",
           "title": "findings.json is a frozen snapshot of the parser at run time \u2014 parser fixes never backfill, so review history permanently undercounts findings",
           "detail": "Historical ad-hoc runs on disk show review.md with 2-3 `### [` finding headers but findings.json containing 0-1 findings (e.g. 55-s-review-pr-mpt72ge6-3sdma3: 3 headers vs 1 entry; 59-s-review-pr-mpv8s2zc-jpgg4u: 1 header vs 0 entries) \u2014 written by an older parser that dropped multi-file Where lines. The current parser handles all of them (verified by re-running parseForgeReviewFindings on the same review.md), but listForgeReviews/loadForgeReview/findLatestForgeFindings serve the stale findings.json verbatim, so those findings remain invisible and unpublishable forever even though review.md has them.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/review-actions.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/review-actions.ts"],
           "evidence": "review-actions.ts:651-660 readReviewFindingsAt reads findings.json only (never re-parses review.md); disk: /Users/tcashel/.forge/runs/pr-review/55-s-review-pr-mpt72ge6-3sdma3/ review.md has 3 `### [` headers, findings.json has 1 entry; current parseForgeReviewFindings on that review.md returns 3.",
           "fix": "Either re-parse review.md on read when its header count exceeds findings.json length, or version findings.json with the parser version and lazily re-derive when outdated.",
           "test": "Fixture run dir with mismatched review.md/findings.json; assert loadForgeReview returns the re-parsed count."
@@ -109,9 +107,7 @@
           "severity": "HIGH",
           "title": "extractLastForgeReviewBlock treats a bare ``` opener as a closer \u2014 silently drops every finding after it",
           "detail": "classifyFence classifies any fence line without an info string as a closing fence. Markdown allows a bare ``` to OPEN a code block, and reviewer agents routinely omit info strings on Evidence snippets. When that happens inside the forge-review block, depth hits 0 at the bare opener and the block is truncated: the current finding loses its Why/Fix and every subsequent finding (plus Verdict-trailing sections) is silently dropped \u2014 they never reach findings.json, never display in the Workbench, never publish to GitHub. Reproduced against the current code: a 2-finding review whose first Evidence uses a bare ``` parses to 1 finding with evidence=null. Affects both the ad-hoc worker (review-actions.ts:427) and the launch pipeline's `forge __extract-review` (review-actions.ts:514), where the truncated review.md also feeds the auto-fixer. Historical artifacts confirm drops happen in practice: ~/.forge/runs/pr-review/55-s-review-pr-mpt72ge6-3sdma3 has 3 `### [` headers in review.md but only 1 finding in findings.json (older parser bug, same silent-drop class, never backfilled).",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/core/reviewer.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/core/reviewer.ts"],
           "evidence": "reviewer.ts:150-154 `function classifyFence(line) { ... return { fence: true, opening: m[2].trim().length > 0 }; }` and reviewer.ts:191-196 `} else if (f.fence) { depth--; ... }` \u2014 bare fence always decrements. Repro (bun -e against src/core/reviewer.ts): block with `**Evidence:**\\n```\\nconst x = 1;\\n``` truncates after `**Evidence:**`, parseForgeReviewFindings returns only [\"first finding\"].",
           "fix": "Track open-fence pairing instead of pure depth: remember the opening fence's marker length/char; at depth 1, only a bare fence whose marker matches the outer ```forge-review opener closes the block when the line is followed by EOF/non-block content \u2014 simpler: when at depth 1 and a bare fence is seen, look ahead \u2014 if another bare fence exists before the next ```forge-review/EOF, treat the pair as a nested block. Alternatively instruct + enforce: take the text from the forge-review opener to the LAST bare fence in the document (the reviewer emits the block last per the skill).",
           "test": "Add to tests/core/reviewer.test.ts: a forge-review block whose Evidence uses a bare ``` opener; assert both findings parse and the second finding's Why/Fix survive.",
@@ -166,9 +162,7 @@
           "severity": "HIGH",
           "title": "Generated runner's set_status and unquoted set_meta_field calls are silent no-ops \u2014 failure statuses, baseSha/finalSha, and the reviewer-crash reviewError never reach meta.json",
           "detail": "In the bash emitted by generateRunnerScript, `set_status() { set_meta_field \"status\" \"\"$1\"\"; }` \u2014 in shell, `\"\"$1\"\"` is just `$1` (empty string + value + empty string), so python receives a bare token like `reviewing` and `json.loads('reviewing')` raises; the helper's `2>/dev/null || true` swallows it. Every set_status transition (running, quality_check, quality_failed, failed\u00d73, creating_pr, reviewing, fixing, done) and the `\"\"$BASE_SHA\"\"`/`\"\"$FINAL_SHA\"\"`/`\"\"reviewer process exited with code $REVIEWER_EXIT\"\"` writes silently no-op. Confirmed empirically: every meta.json under ~/.forge/runs has baseSha/finalSha = null, and a reviewer-process crash records no reviewError. Status only changes when a separate inline python block runs (PR-created\u2192'done') or the TS kill path writes 'failed'. Consequence for the review pipeline: a reviewer agent that exits non-zero in the launch flow leaves meta.json with no reviewError and a stale status \u2014 'forge status' and the Workbench lie about the terminal state (F0 'no silent failure' violated); a failure before PR creation leaves status stuck at the last python-written value.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/core/launch.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/core/launch.ts"],
           "evidence": "launch.ts:414 `set_status() { set_meta_field \"status\" \"\"$1\"\"; }`; launch.ts:438 `set_meta_field \"baseSha\" \"\"$BASE_SHA\"\"`; launch.ts:696 `set_meta_field \"reviewError\" \"\"reviewer process exited with code $REVIEWER_EXIT\"\"`; set_meta_field (launch.ts:403-412) does `json.loads(val_json)` under `2>/dev/null || true`. Shell repro: `set_status reviewing` \u2192 python json.loads fails \u2192 no-op; `\"\\\"approve\\\"\"` parses. Disk proof: all four /Users/tcashel/.forge/runs/*/meta.json have baseSha=null, finalSha=null; generated run.sh line 49 shows the same broken quoting.",
           "fix": "Quote correctly: `set_status() { set_meta_field \"status\" \"\\\"$1\\\"\"; }` and `set_meta_field \"baseSha\" \"\\\"$BASE_SHA\\\"\"` etc. (or have set_meta_field json-encode sys.argv[2] itself with a --raw flag for pre-encoded values). Also drop the `2>/dev/null || true` swallow in favor of appending to session-helper.log.",
           "test": "Generate a runner script via generateRunnerScript, source its set_meta_field/set_status into a bash test harness with a temp meta.json, call set_status failed, assert meta.json status becomes 'failed' and baseSha gets written.",
@@ -191,9 +185,7 @@
           "severity": "MEDIUM",
           "title": "validation.json stamps targets 'fixed' before quality gates/commit run; a crash mid-gate leaves meta.status='running' and the UI reports fixed work that was never committed",
           "detail": "The worker writes validation.json with status='fixed' for all valid verdicts immediately after parsing (optimistically), then runs quality gates and only re-stamps to 'failed' on a gate failure it survives. findLatestCommentFixState demotes fixed\u2192failed only when meta.status === 'failed' \u2014 but a worker killed during the (long) quality-gate or commit phase never rewrites meta.json, which still says status='running'. Result: the Review UI permanently shows those targets as fixed (commentFixState entries 'fixed') while no commit exists and the worktree may hold uncommitted agent edits, which will then trip the WORKTREE_DIRTY assert on the next run.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"],
           "evidence": "comment-fix-actions.ts:704-712: `validationEntries.push({ ...v, status: v.verdict === \"valid\" ? \"fixed\" : \"disputed\" }); writeValidation(runDir, validationEntries);` happens before runQualityGates (729) and commitAndPush (745). findLatestCommentFixState 1311: `const sessionFailed = meta.status === \"failed\";` 1330-1331: `if (sessionFailed && status === \"fixed\") status = \"failed\";` \u2014 meta stuck at 'running' (seed meta, line 345) bypasses the demotion.",
           "fix": "Stamp valid rows as a provisional status (e.g. 'pending') until after commit+push, or treat meta.status='running' older than a TTL (or with a dead session) the same as failed when projecting commentFixState.",
           "test": "Write a run dir with validation.json entries status='fixed' and meta.json status='running' plus a finished/failed session; assert findLatestCommentFixState does not report 'fixed'."
@@ -229,9 +221,7 @@
           "severity": "LOW",
           "title": "findLatestCommentFixState surfaces only the single newest run's validation.json \u2014 fixed/disputed badges from earlier fix runs vanish after any later run",
           "detail": "The projection picks the newest validation.json by mtime and returns only its entries. A second fix run targeting different comments erases the first run's fixed/disputed/ghResolved state from the bundle (commentFixState), so rows the operator already fixed lose their badges. Thread isResolved from GitHub remains ground truth for published findings whose threads were actually resolved, but `disputed` reasons and `failed` markers for comment:/review: targets have no GitHub fallback and simply disappear.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"],
           "evidence": "comment-fix-actions.ts:1276-1339 findLatestCommentFixState: `candidates.sort((a, b) => b.mtime - a.mtime); for (const c of candidates) { ... return out; }` \u2014 returns on the FIRST (newest) matching run dir; earlier runs' entries are never merged.",
           "fix": "Merge entries across run dirs newest-wins per targetId instead of returning the newest file wholesale.",
           "test": "Two run dirs for the same PR with disjoint targets; assert findLatestCommentFixState contains both runs' entries with newest-wins on overlap."
@@ -241,9 +231,7 @@
           "severity": "LOW",
           "title": "fetchReviewThreads caps each thread at comments(first:50) with no inner pagination \u2014 markers past 50 replies become invisible",
           "detail": "Thread pagination is handled (100/page, 50-page ceiling), but the nested comments connection fetches only the first 50 comments per thread and never pages. Forge's marker is normally the thread's first comment so this rarely bites for resolve-on-fix, but the bundle's threadByCommentId mapping (serve.ts) and the published map would miss any comment beyond 50 in a long human discussion thread, e.g. a reply chain on a Forge finding.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/core/gh-pr-write.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/core/gh-pr-write.ts"],
           "evidence": "gh-pr-write.ts:146-159 REVIEW_THREADS_QUERY: `comments(first:50){ nodes{ databaseId body } }` \u2014 no pageInfo/cursor on the inner connection; fetchReviewThreads (183-233) pages only the outer reviewThreads connection.",
           "fix": "Either raise first: to 100 and accept the cap with a comment, or request pageInfo on the inner connection and fetch overflow threads individually.",
           "test": "Fake GraphQL response with a 60-comment thread whose marker comment is at index 55; assert the marker is still found (after fix)."
@@ -359,9 +347,7 @@
           "severity": "HIGH",
           "title": "commitAndPush runs bare `git commit` / `git push` in the detached worker \u2014 gpg signing (1Password) or credential prompts hang the fix headlessly",
           "detail": "The fixer's commit step inherits the repo/global git config. With commit.gpgsign=true backed by 1Password (the canonical trap in this project's own notes), `git commit` blocks on the signing prompt while the screen is locked; `git push` can similarly block on an interactive credential helper or host-key prompt. The worker has stdin 'ignore' but the gpg/askpass flow talks to the agent socket, so the process just hangs: session stays 'running', quality already passed, edits sit uncommitted in the worktree, and the single-flight guard blocks retries. No GIT_TERMINAL_PROMPT=0 / --no-gpg-sign / GCM-disable is set anywhere in src (grep for 'gpg' over src/ returns nothing).",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/comment-fix-actions.ts"],
           "evidence": "comment-fix-actions.ts:1259-1267: `execFileSync(\"git\", [\"-C\", worktreePath, \"commit\", \"-m\", msg], { stdio: [\"pipe\", \"inherit\", \"inherit\"] }); execFileSync(\"git\", [\"-C\", worktreePath, \"push\"], ...)` \u2014 no timeout, no GIT_TERMINAL_PROMPT=0, no -c commit.gpgsign handling. Memory note 'onepassword-signing-breaks-headless' documents this exact failure mode for Forge headless runs.",
           "fix": "Run git with `env: { ...env, GIT_TERMINAL_PROMPT: \"0\" }`, a timeout on execFileSync, and either `-c gpg.program=...`/`--no-gpg-sign` behind a repo-config flag or detect signing config and fail fast with an actionable error instead of hanging.",
           "test": "Configure a worktree with commit.gpgsign=true and gpg.program=/bin/false equivalent that blocks; assert commitAndPush fails within the timeout with a clear error rather than hanging.",
@@ -410,9 +396,7 @@
           "severity": "MEDIUM",
           "title": "Plan-chat reaper SIGTERMs any turn older than 5 minutes even while it is actively streaming, and the partial reply is discarded",
           "detail": "reapStalePlanChats kills in-flight plan-chat children based purely on spawn time (`now - entry.startedAt >= 5min`), with no last-activity check \u2014 yet the SSE pipeline tracks `lastWriteAt` and forwards api_retry/ping keepalives precisely because long turns are expected. A planner turn doing multi-minute repo exploration is killed mid-stream at the 5-minute mark; the close handler then sees a signal exit and deliberately does NOT persist the accumulated blocks, so the user's reply is lost and a re-send starts over. Five minutes is easily exceeded by opus-class models exploring a large repo.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/core/plan-chat.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/core/plan-chat.ts"],
           "evidence": "plan-chat.ts:1154 `const STALE_PLAN_CHAT_MS = 5 * 60_000;` and :1167-1176: `if (now - entry.startedAt < STALE_PLAN_CHAT_MS) continue; entry.child.kill(\"SIGTERM\")` \u2014 startedAt set once at spawn (:748). Non-persistence on signal exit: plan-chat.ts:1050-1057 comment 'we do NOT persist partial blocks when claude exits non-zero or via signal'.",
           "fix": "Track last stdout activity per in-flight entry (update on each data chunk) and reap on idle time, not wall-clock age; or raise the budget and emit a visible 'turn killed by reaper' SSE error naming the limit.",
           "test": "Spawn a stub child that emits a line every 30s for 7 minutes; run the reaper at 6 minutes; assert an actively-emitting child is not killed (idle-based) while a silent one is."
@@ -662,9 +646,7 @@
           "severity": "MEDIUM",
           "title": "readIndex swallows parse errors into an empty index \u2014 the next upsertPlan silently rewrites index.json with a single plan, discarding all others",
           "detail": "readIndex returns {plans:{}} on any read/parse failure. upsertPlan does read\u2192mutate\u2192write under the lock, so if index.json is ever unreadable (external corruption, manual edit, partial copy during one of the manual purge/restore operations evidenced by ~/.forge/*.bak-purge*), the very next write persists an index containing only the plan being upserted \u2014 every other plan record (status, prUrl, worktree, branch, jira links) is silently destroyed. Specs and run dirs survive on disk but become unreachable from all list surfaces. Same pattern in readRepoConfigFile/setRepoConfig for operator settings. atomicWriteJSON makes self-inflicted torn writes unlikely, but the failure mode on any corruption is silent total loss instead of a loud refusal.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/core/store.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/core/store.ts"],
           "evidence": "store.ts:299-301 `} catch { return { version: 1, plans: {} }; }` in readIndex; store.ts:312-318 upsertPlan: `const index = this.readIndex(); index.plans[plan.id] = plan; this.writeIndex(index);`. Same for repo config at store.ts:226-233 + 243-249. Manual purge/restore history: ~/.forge/index.json.bak-purge-20260602, index.json.bak-purge2-20260602 exist.",
           "fix": "Distinguish 'file absent' (empty index OK) from 'file present but unparseable' (throw / move aside to index.json.corrupt-<ts> and refuse writes until resolved). Optionally rebuild from specs/ + SQLite plans table as a recovery path.",
           "test": "Write garbage into index.json, call upsertPlan, assert it throws (or quarantines) rather than persisting a one-plan index."
@@ -887,9 +869,7 @@
           "severity": "MEDIUM",
           "title": "forge logs -f parks forever after the log file is rotated/removed \u2014 watcher closes but the process never exits",
           "detail": "The follow path parks on `await new Promise<void>(() => {})` and relies solely on SIGINT to exit. When the watched file is removed or rotated (run dir cleanup, worktree removal), the watch callback's statSync throws, the code closes the watcher ('file rotated or removed \u2014 stop') \u2014 and then nothing: the parked promise never resolves, so the process sits silently forever producing no output. In a headless script (`forge logs <id> -f` feeding a monitor), that is an indefinite hang with no error and no exit code. There is also no exit when the run reaches a terminal state, so scripted follows never terminate even on success.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/logs.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/logs.ts"],
           "evidence": "logs.ts:78-93: `const watcher = fs.watch(logFile, () => { try { stream(...) } catch { // file rotated or removed \u2014 stop\\n watcher.close(); } }); ... await new Promise<void>(() => {});` \u2014 the comment says 'stop' but only the watcher stops; the promise at line 93 never settles.",
           "fix": "Hold a resolve fn for the parked promise; call it (and process.exit cleanly with a 'log file removed' notice) in the catch branch. Optionally also poll plan/meta status each few seconds and exit 0 when the run is terminal and no new bytes arrive.",
           "test": "Start logs -f on a temp file in a child process, delete the file, assert the child exits within a bounded time with a message rather than hanging."
@@ -1017,9 +997,7 @@
           "severity": "MEDIUM",
           "title": "'Improving' pill spins forever if the detached improve worker dies while serve is running \u2014 stale-critique reaper only runs at boot",
           "detail": "POST /api/plans/:id/improve spawns a detached `forge spec improve` child; status surfaces via critique meta (running_critics/running_synth \u2192 'Improving' pulse pill). reapStaleCritiques (10-min threshold) is invoked exactly once, at startServer; the periodic 60s interval only runs reapStalePlanChats. If the improve worker crashes mid-run (or the spawn'd child is killed) while serve stays up, the meta never leaves running_critics and the plan shows a pulsing 'Improving' pill indefinitely; the operator must restart forge serve to clear it.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"],
           "evidence": "serve.ts:2707 `const swept = reapStaleCritiques(store);` \u2014 single boot-time call; serve.ts:2730-2736 the interval only calls `reapStalePlanChats(store.forgeDir)`; serve.ts:318-320 `if (critiqueMeta?.status === \"running_critics\" || ...) return { section: \"drafting\", statLabel: \"Improving\", statClass: \"running\", ... }` \u2014 pill driven purely by meta status.",
           "fix": "Call reapStaleCritiques inside the existing 60s reaper interval (it already has the 10-minute staleness threshold so in-flight improves are safe), and surface the swept state as 'failed' with lastImproveError so the row lands in Attention.",
           "test": "Write a critique meta with status running_critics and startedAt 11 minutes ago, run the periodic reaper tick, assert meta flips to failed and /api/plans shows the plan out of 'Improving'."
@@ -1070,9 +1048,7 @@
           "severity": "LOW",
           "title": "Malformed percent-encoding in API paths returns 500 INTERNAL 'URI error' instead of 400",
           "detail": "Route handlers call decodeURIComponent on path captures with no guard; an invalid sequence (e.g. /api/plans/%ff) throws URIError, escapes handleApi (which has no try/catch, unlike handleApiPost), and is caught only by Bun.serve's error hook, producing a 500 INTERNAL envelope and an 'unhandled error' stderr line. Verified live: GET /api/plans/%ff \u2192 {\"ok\":false,\"error\":{\"code\":\"INTERNAL\",\"message\":\"URI error\"}} and 'forge serve: unhandled error: URI error' on stderr. Cosmetic, but it pollutes logs and miscodes a client error as a server fault.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"],
           "evidence": "serve.ts:915 `const id = decodeURIComponent(taskMatch[1]);` (same pattern at :1009, :1021, :1044, :1097, :1151, :2523 \u2026); serve.ts:2783-2789 Bun error hook returned the observed 500. Live: `curl 'http://127.0.0.1:4399/api/plans/%ff'` \u2192 `{\"ok\":false,\"error\":{\"code\":\"INTERNAL\",\"message\":\"URI error\"}}`.",
           "fix": "Add a safeDecode(s) helper returning null on URIError and map null to jsonErr(400, 'BAD_PATH', ...); or wrap handleApi/handleApiDelete in the same try/catch shell handleApiPost has.",
           "test": "GET /api/plans/%ff and /api/sessions/%E0/log \u2192 expect 400 BAD_PATH, no stderr 'unhandled error'."
@@ -1105,9 +1081,7 @@
           "severity": "HIGH",
           "title": "ReviewSessionDrawer clears the active-session signal inside onDone, unmounting itself before the failure/error message can render",
           "detail": "The drawer's onDone handler sets terminalState ('done'/'failed') and closeError, then immediately sets activeReviewSession/activeCommentFixSession to null. The component computes `open` from those signals and returns null when they're cleared, so the drawer unmounts on the very next render \u2014 the 'failed' state badge and the worker error text (e.g. 'no fenced forge-review block in reviewer output', 'reviewer agent exited non-zero') are never visible. A failed ad-hoc review or comment-fix therefore presents as: drawer silently vanishes, no toast, findings unchanged. The run-history list isn't refetched either (only loadReviewBundle is called), so the failed run doesn't even appear in 'Past Forge reviews' until the page remounts.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/web/components/review/ReviewSessionDrawer.tsx"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/web/components/review/ReviewSessionDrawer.tsx"],
           "evidence": "ReviewSessionDrawer.tsx:54-60 `onDone: (e) => { setTerminalState(e.exitCode === 0 ? \"done\" : \"failed\"); setCloseError(e.error); void loadReviewBundle(...); if (active.kind === \"comment-fix\") activeCommentFixSession.value = null; else activeReviewSession.value = null; }`; :34 `const open = active !== null && active.prNum === prNumber;`; :90 `if (!open || !active) return null;` \u2014 nulling the signal re-renders with active=null and the drawer (including the closeError div at :107) disappears.",
           "fix": "Keep the drawer mounted after done: track the session locally (copy sessionId/kind into component state when it becomes active) and only clear the global signal when the user closes the drawer; on done also call loadReviewRuns. Alternatively fire showToast('Forge review failed: <error>', 'error') on non-zero exit before clearing the signal.",
           "test": "Component test: mount drawer with an active session, fire the SSE 'done' handler with exitCode=1/error text, assert the drawer is still in the DOM showing state 'failed' and the error string.",
@@ -1167,9 +1141,7 @@
           "severity": "HIGH",
           "title": "Second 'forge serve' on an occupied port binds successfully (SO_REUSEPORT) \u2014 two servers silently share the port with divergent state",
           "detail": "Bun.serve does not fail when the port is already taken by another forge serve. Verified live: three bun processes simultaneously LISTENing on 127.0.0.1:4399 (lsof), each 'forge serve' reporting success. Worse, on macOS the newest binder captures the traffic: after starting a second serve from /tmp, GET /api/workbench/context flipped from currentRepo=forge to currentRepo=null for the existing Workbench tab \u2014 the dashboard silently changed identity. Cross-process hazards follow: plan-chat abortInFlight is an in-process map so an abort POST can land on the wrong process; each boot also `fs.rmSync`s and rebuilds the shared src/web/dist the other process is serving. An operator who absent-mindedly runs serve twice gets a flapping, self-inconsistent Workbench with zero error anywhere.",
-          "files": [
-            "/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/src/cli/cmd/serve.ts"],
           "evidence": "serve.ts:2779-2837 `Bun.serve({ port, hostname: host, ... })` with no bind-conflict handling; serve.ts:2740-2743 `fs.rmSync(webDistDir, { recursive: true, force: true })` on every boot. Live repro: `lsof -nP -iTCP:4399 -sTCP:LISTEN` showed PIDs 87049/96906/97047 all LISTEN on 127.0.0.1:4399; `curl /api/workbench/context` returned `\"currentRepo\":null` (served by the /tmp instance) while the original instance returns the forge repo \u2014 after killing the extra instances it returned `\"currentRepo\":{\"name\":\"forge\",...}`.",
           "fix": "Before Bun.serve, probe the port with an exclusive bind (or GET /api/health) and exit with CliError PORT_IN_USE ('forge serve already running at http://127.0.0.1:7456'); ensure reusePort is not enabled. Also write a pidfile under ~/.forge to detect an existing instance.",
           "test": "startServer twice on the same port in a test; assert the second call rejects with PORT_IN_USE instead of resolving.",
@@ -1190,9 +1162,7 @@
           "severity": "MEDIUM",
           "title": "Confirmed: 'agent flag drift' tests use node:test's skip option (ignored by Bun's shim) and call real agent binaries; the gemini case asserts nothing when the binary is absent",
           "detail": "tests/agent-command.test.ts:112 gates the flag-drift tests with `{ skip: !binaryOnPath(c.binary) }` \u2014 an option Bun's node:test shim does not honor, so the test body runs even when the binary is absent. On this machine claude/codex/opencode exist and the tests spawn each binary's real `--help` (up to 10s each, env-coupled to whatever versions are installed); gemini is absent, and the test still 'passes' because every flag agentCommand emits for gemini (-y, -m, -p) is listed in helpOmittedFlags, so the loop body skips all assertions against the (undefined) help text \u2014 the drift check is vacuous for gemini whether or not the binary exists. Also note these tests were among the files silently dropped in runs 2-3 by the nested-test cascade.",
-          "files": [
-            "/Users/tcashel/repositories/forge/tests/agent-command.test.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/tests/agent-command.test.ts"],
           "evidence": "tests/agent-command.test.ts:112: `test(\\`agent flag drift: ${c.target}\\`, { skip: !binaryOnPath(c.binary) }, () => {` ; :21: `{ target: \"gemini\", ..., helpOmittedFlags: [\"-y\", \"-m\", \"-p\"] }` ; :119-120: `for (const flag of flags) { if (c.helpOmittedFlags?.includes(flag)) continue; assert.ok(help.includes(flag), ...) }` \u2014 with all three gemini flags omitted, no help assertion ever runs. `which gemini` \u2192 not found on this machine; `which claude codex opencode` \u2192 present (real binaries spawned at :30 `spawnSync(binary, args, { timeout: 10_000 })`).",
           "fix": "Move the skip decision outside the option bag (`if (!binaryOnPath(c.binary)) { test.skip?.(...); continue; }` or use bun:test's `test.skipIf`), and for gemini either drop helpOmittedFlags or assert at least one non-omitted flag exists so the test cannot pass vacuously.",
           "test": "Run the suite in a PATH-stripped env (no claude/codex/opencode/gemini) and assert the drift tests report skipped, not passed."
@@ -1351,9 +1321,7 @@
           "severity": "HIGH",
           "title": "Confirmed: worktrees.test.ts makes real git commits inheriting the user's gpg-signing config \u2014 8 deterministic failures, hang risk with an interactive signer",
           "detail": "All three runs reproduce 8 failures in tests/worktrees.test.ts: the git() helper shells out to the real git binary with the user's global config, so `git commit` attempts gpg signing and fails 'gpg: signing failed: No secret key' for the synthetic test identity. On a machine where the signer prompts (the canonical 1Password gpgsign trap in this repo's own memory), execFileSync would block indefinitely \u2014 a headless hang, not just a failure. This makes the suite red on any operator machine with commit.gpgsign=true, masking real regressions in the worktree subsystem.",
-          "files": [
-            "/Users/tcashel/repositories/forge/tests/worktrees.test.ts"
-          ],
+          "files": ["/Users/tcashel/repositories/forge/tests/worktrees.test.ts"],
           "evidence": "tests/worktrees.test.ts:51-52: `function git(repoRoot, args) { return execFileSync(\"git\", [\"-C\", repoRoot, ...args], ...) }` \u2014 no GIT_CONFIG_GLOBAL isolation, no `-c commit.gpgsign=false`. Run output: `error: gpg failed to sign the data ... gpg: skipped \"Test <test@example.com>\": No secret key ... fatal: failed to write commit object` at worktrees.test.ts:239, 268, 320, 356, 389, 431, 558, 594 (8 tests, identical across runs 1-3).",
           "fix": "In git()/gitRaw(), pass `env: { ...process.env, GIT_CONFIG_GLOBAL: \"/dev/null\", GIT_CONFIG_SYSTEM: \"/dev/null\", GIT_CONFIG_NOSYSTEM: \"1\" }` and set user.name/user.email via `-c` flags (or `git config` in the temp repo), plus `-c commit.gpgsign=false`.",
           "test": "Run the worktrees suite with a global gitconfig containing `commit.gpgsign=true` pointed at a nonexistent key and assert all tests pass.",

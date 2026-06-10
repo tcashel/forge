@@ -109,18 +109,36 @@ test("mintNativeSession assigns UUID session ids", () => {
 });
 
 for (const c of CASES) {
-  test(`agent flag drift: ${c.target}`, { skip: !binaryOnPath(c.binary) }, () => {
+  // Bun's node:test shim ignores the `{ skip }` test option, so an option-bag
+  // skip still RUNS the body (and fails) when the binary is absent. Gate
+  // registration instead.
+  if (!binaryOnPath(c.binary)) {
+    console.log(`skip: agent flag drift: ${c.target} (${c.binary} not on PATH)`);
+    continue;
+  }
+  test(`agent flag drift: ${c.target}`, () => {
     const cmd = agentCommand(c.target, "dummy-model", "/tmp/forge-test-prompt.txt", {
       reasoningEffort: "low",
     });
     const help = getHelp(c.binary, c.helpArgs);
     const flags = extractFlags(cmd);
     assert.ok(flags.length > 0, `extracted no flags from ${c.target} command: ${cmd}`);
+    let checked = 0;
     for (const flag of flags) {
       if (c.helpOmittedFlags?.includes(flag)) continue;
+      checked += 1;
       assert.ok(
         help.includes(flag),
         `${c.target}: flag ${flag} from agentCommand() is not in '${c.binary} ${c.helpArgs.join(" ")}' output. Command: ${cmd}`,
+      );
+    }
+    // When every emitted flag is help-omitted (gemini), the drift check has
+    // nothing to compare — at minimum prove the binary ran and produced help
+    // so the test cannot pass vacuously against a dead binary.
+    if (checked === 0) {
+      assert.ok(
+        help.trim().length > 0,
+        `${c.target}: all flags help-omitted and '${c.binary} ${c.helpArgs.join(" ")}' produced no output`,
       );
     }
   });
