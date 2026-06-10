@@ -142,12 +142,19 @@ async function main() {
 
   // snapshot.json
   check(fs.existsSync(snapshotFile), "snapshot.json does not exist");
-  let snapshot: any = null;
+  let snapshot: {
+    schemaVersion?: number;
+    phase?: string;
+    usage?: { turns?: number };
+    lastEventAt?: number;
+    startedAt?: number;
+    exitCode?: number;
+  } | null = null;
   if (fs.existsSync(snapshotFile)) {
     try {
       snapshot = JSON.parse(fs.readFileSync(snapshotFile, "utf-8"));
-    } catch (e: any) {
-      errors.push(`snapshot.json parse error: ${e.message}`);
+    } catch (e) {
+      errors.push(`snapshot.json parse error: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
@@ -172,7 +179,7 @@ async function main() {
         }
       })
       .filter(Boolean);
-    const types = events.map((e: any) => e.type);
+    const types = events.map((e) => e.type);
     check(types.includes("phase_change"), "progress.jsonl missing phase_change event");
     check(types.includes("usage"), "progress.jsonl missing usage event");
     check(types.includes("stopped"), "progress.jsonl missing stopped event");
@@ -184,8 +191,8 @@ async function main() {
     try {
       const meta = JSON.parse(fs.readFileSync(metaFile, "utf-8"));
       check(meta.status === "done", `meta.status: expected "done", got "${meta.status}"`);
-    } catch (e: any) {
-      errors.push(`meta.json parse error: ${e.message}`);
+    } catch (e) {
+      errors.push(`meta.json parse error: ${e instanceof Error ? e.message : String(e)}`);
     }
   }
 
