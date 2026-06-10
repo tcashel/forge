@@ -883,6 +883,11 @@ export async function runCommentFixWorker(argv: string[], store: ForgeStore): Pr
       // No quality run needed; we're done.
       qualityResult = { ok: true, failedCommand: null };
     } else {
+      // Auto-format the agent's edits BEFORE gating. The agent is forbidden
+      // from running commands, so it can't satisfy a `--check`-mode formatter
+      // gate itself — without this pass a semantically-correct fix gets
+      // rolled back over mechanical formatter drift.
+      autoFormatChangedFiles(repoRoot, worktreePath, headSha, changedFiles);
       process.stdout.write(`[forge:comment-fix-worker] running quality gates over ${changedFiles.length} file(s)\n`);
       qualityResult = runQualityGates(repoRoot, worktreePath, runDir);
       if (!qualityResult.ok) {
@@ -1283,6 +1288,38 @@ function listChangedFiles(worktreePath: string, headSha: string): string[] {
       .filter((s) => s.length > 0);
   } catch {
     return [];
+  }
+}
+
+/**
+ * Best-effort write-mode format pass over the agent's edits. Formatters are
+ * typically repo-wide, so any drift they fix in files the agent did NOT
+ * touch is restored afterwards — the eventual commit must carry only the
+ * agent's change. Failures never block: the quality gates remain the
+ * authority.
+ */
+function autoFormatChangedFiles(repoRoot: string, worktreePath: string, headSha: string, changedFiles: string[]): void {
+  const formatCommand = detectRepo(repoRoot)?.formatCommand ?? null;
+  if (!formatCommand) return;
+  process.stdout.write(`[forge:comment-fix-worker] auto-format: ${formatCommand}\n`);
+  try {
+    execFileSync("bash", ["-c", formatCommand], {
+      cwd: worktreePath,
+      stdio: ["ignore", "inherit", "inherit"],
+      env: headlessGitEnv(),
+      timeout: QUALITY_CMD_TIMEOUT_MS,
+    });
+  } catch {
+    process.stdout.write("[forge:comment-fix-worker] auto-format failed — continuing to quality gates\n");
+    return;
+  }
+  const touched = new Set(changedFiles);
+  const collateral = listChangedFiles(worktreePath, headSha).filter((f) => !touched.has(f));
+  if (collateral.length > 0) {
+    process.stdout.write(
+      `[forge:comment-fix-worker] auto-format touched ${collateral.length} unrelated file(s) — restoring them\n`,
+    );
+    rollbackWorktree(worktreePath, headSha, collateral);
   }
 }
 

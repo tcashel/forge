@@ -95,7 +95,26 @@ function bundle(num: number): PrBundle {
     diffStats: { additions: 1, deletions: 0, changedFiles: 1 },
     inlineComments: [inlineComment()],
     issueComments: [],
-    prReviews: [],
+    prReviews: [
+      {
+        // Forge's own publication echo: out-of-diff findings ride the review
+        // body with their markers. Must be filtered from the bundle.
+        id: 900,
+        user: "forge",
+        state: "COMMENTED",
+        body: `Forge automated review. **Findings outside the diff hunks:**\n- [HIGH] x\n<!-- forge-finding id=${PUBLISHED_ID} sev=HIGH v=1 -->`,
+        submittedAt: new Date().toISOString(),
+        htmlUrl: "https://github.com/acme/repo/pull/1#pullrequestreview-900",
+      },
+      {
+        id: 901,
+        user: "human",
+        state: "APPROVED",
+        body: "LGTM, nice cleanup.",
+        submittedAt: new Date().toISOString(),
+        htmlUrl: "https://github.com/acme/repo/pull/1#pullrequestreview-901",
+      },
+    ],
     warnings: [],
   };
 }
@@ -152,7 +171,12 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
     data: {
       forgeFindings: ForgeFinding[];
       inlineComments: Array<
-        PrInlineComment & { forgeFindingId?: string; reviewThreadId?: string; isResolved?: boolean }
+        PrInlineComment & {
+          forgeFindingId?: string;
+          forgeFindingSeverity?: string;
+          reviewThreadId?: string;
+          isResolved?: boolean;
+        }
       >;
     };
   };
@@ -164,12 +188,22 @@ test("review-bundle suppresses the local finding behind a marker comment and sur
     [LOCAL_ID],
   );
 
-  // The marker comment is enriched with the finding id + resolution from GitHub.
+  // The marker comment is enriched with the finding id + severity + resolution
+  // from GitHub.
   const enriched = body.data.inlineComments.find((c) => c.id === COMMENT_DB_ID);
   assert.ok(enriched);
   assert.equal(enriched?.forgeFindingId, PUBLISHED_ID);
+  assert.equal(enriched?.forgeFindingSeverity, "HIGH");
   assert.equal(enriched?.reviewThreadId, "T_published");
   assert.equal(enriched?.isResolved, true);
+
+  // Forge's own publication echo (review body carrying markers) is filtered;
+  // human review summaries survive.
+  const reviews = (body.data as unknown as { prReviews: Array<{ id: number }> }).prReviews;
+  assert.deepEqual(
+    reviews.map((r) => r.id),
+    [901],
+  );
 });
 
 test("review-bundle keeps a STALE published finding selectable as a local finding row", async (t) => {

@@ -77,3 +77,51 @@ test("quality commands use bun, not npm, in a bun repo", () => {
     fs.rmSync(root, { recursive: true, force: true });
   }
 });
+
+test("formatCommand picks a write-mode `format` script and refuses check-mode ones", () => {
+  const writable = tmpDir("forge-repo-fmt-write-");
+  const checkOnly = tmpDir("forge-repo-fmt-check-");
+  const none = tmpDir("forge-repo-fmt-none-");
+  try {
+    for (const root of [writable, checkOnly, none]) {
+      execFileSync("git", ["init", "-q"], { cwd: root });
+      fs.writeFileSync(path.join(root, "bun.lock"), "");
+    }
+    fs.writeFileSync(
+      path.join(writable, "package.json"),
+      JSON.stringify({ scripts: { format: "biome format --write ." } }),
+    );
+    fs.writeFileSync(
+      path.join(checkOnly, "package.json"),
+      JSON.stringify({ scripts: { format: "prettier --check ." } }),
+    );
+    fs.writeFileSync(path.join(none, "package.json"), JSON.stringify({ scripts: { lint: "biome check ." } }));
+
+    assert.equal(detectRepo(writable)?.formatCommand, "bun run format");
+    assert.equal(detectRepo(checkOnly)?.formatCommand, null, "check-mode format script must not be auto-run");
+    assert.equal(detectRepo(none)?.formatCommand, null);
+
+    // A write-mode `check` script wins over `format` — it also applies safe
+    // lint fixes (import ordering), not just formatting.
+    fs.writeFileSync(
+      path.join(writable, "package.json"),
+      JSON.stringify({ scripts: { format: "biome format --write .", check: "biome check --write ." } }),
+    );
+    assert.equal(detectRepo(writable)?.formatCommand, "bun run check");
+  } finally {
+    fs.rmSync(writable, { recursive: true, force: true });
+    fs.rmSync(checkOnly, { recursive: true, force: true });
+    fs.rmSync(none, { recursive: true, force: true });
+  }
+});
+
+test("formatCommand for rust is cargo fmt", () => {
+  const root = tmpDir("forge-repo-fmt-rust-");
+  try {
+    execFileSync("git", ["init", "-q"], { cwd: root });
+    fs.writeFileSync(path.join(root, "Cargo.toml"), '[package]\nname = "x"\n');
+    assert.equal(detectRepo(root)?.formatCommand, "cargo fmt");
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});

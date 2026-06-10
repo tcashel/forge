@@ -1,5 +1,6 @@
 import { useMemo, useState } from "preact/hooks";
 import { type FixBadge, fixBadgeFor } from "../../lib/fix-badge";
+import { stripFindingMarker } from "../../lib/forge-marker";
 import { scrollToFinding } from "../../lib/review-scroll";
 import { commentTargetToken, targetKey } from "../../lib/review-targets";
 import { commentStatuses, reviewBundle, selectedTargets, toggleTargetSelection } from "../../signals/review";
@@ -55,7 +56,12 @@ function findingRange(f: ForgeFinding): string {
 }
 
 function snippet(text: string, max = 160): string {
-  const clean = (text || "").replace(/\s+/g, " ").trim();
+  // Rail snippets are plain text — drop embedded HTML tags (GitHub bodies
+  // carry <sub>/<details> wrappers) so they don't render as literal noise.
+  const clean = (text || "")
+    .replace(/<[^>]+>/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
   return clean.length > max ? `${clean.slice(0, max)}…` : clean;
 }
 
@@ -180,14 +186,22 @@ function CommentRailRow({ thread, onJump }: { thread: InlineThread; onJump?: () 
           disabled={!onJump}
           title={onJump ? "Jump to this comment in the diff" : "Stale anchor — not fixable"}
         >
+          {c.forgeFindingSeverity ? (
+            <span class={`finding-severity sev-${c.forgeFindingSeverity.toLowerCase()}`}>{c.forgeFindingSeverity}</span>
+          ) : null}
           <span class="review-rail-comment-user">@{c.user || "unknown"}</span>
           <span class="review-rail-comment-where">
             {c.path}
             {c.line != null ? `:${c.line}` : ""}
           </span>
-          <span class="review-rail-comment-snippet">{snippet(c.body)}</span>
+          <span class="review-rail-comment-snippet">{snippet(stripFindingMarker(c.body))}</span>
         </button>
       </header>
+      {c.forgeFindingId ? (
+        <div class={`review-rail-badge badge-${c.isResolved ? "resolved" : "published"}`}>
+          <span class="badge-label">{c.isResolved ? "Forge finding · resolved on PR" : "Forge finding · open"}</span>
+        </div>
+      ) : null}
       <RailBadge badge={state.badge} />
     </li>
   );
@@ -226,8 +240,16 @@ export function FindingsRail({ anchoredFindings, outsideFindings, anchoredCommen
     const c: Record<ForgeFindingSeverity, number> = { BLOCKER: 0, HIGH: 0, MEDIUM: 0, LOW: 0 };
     for (const a of anchoredFindings) c[a.finding.severity]++;
     for (const f of outsideFindings) c[f.severity]++;
+    // Anchored published findings live on only as marker comments (their local
+    // finding row is suppressed) — count them so publishing doesn't zero the
+    // severity totals. Stale marker comments keep their local finding row, so
+    // counting them here would double-count.
+    for (const a of anchoredComments) {
+      const sev = a.thread.root.forgeFindingSeverity;
+      if (sev) c[sev]++;
+    }
     return c;
-  }, [anchoredFindings, outsideFindings]);
+  }, [anchoredFindings, outsideFindings, anchoredComments]);
   const sortedAnchored = useMemo(() => [...anchoredFindings].sort(sortAnchored), [anchoredFindings]);
   const sortedOutside = useMemo(() => [...outsideFindings].sort(sortOutside), [outsideFindings]);
   const [expanded, setExpanded] = useState<Set<string>>(new Set());
@@ -250,7 +272,10 @@ export function FindingsRail({ anchoredFindings, outsideFindings, anchoredCommen
     );
   }
 
-  const findingsTotal = sortedAnchored.length + sortedOutside.length;
+  const findingsTotal =
+    sortedAnchored.length +
+    sortedOutside.length +
+    anchoredComments.filter((a) => a.thread.root.forgeFindingSeverity).length;
 
   return (
     <section class="review-rail-findings">

@@ -21,18 +21,21 @@ import { reconcileCritiqueSessions } from "../../core/critique.ts";
 import { promoteDraftingSessions, reconcileExecutionSessions } from "../../core/db/writes.ts";
 import { commentAnchorsToDiff } from "../../core/diff-anchoring.ts";
 import { type FixTarget, isFixTargetSource } from "../../core/fix-targets.ts";
-import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
+import { extractFindingIds, parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
   fetchPrBundle as defaultFetchPrBundle,
+  fetchPrCommits as defaultFetchPrCommits,
   type FetchPrBundleResult,
+  type FetchPrCommitsResult,
   fetchPrs,
   type GhFetchOpts,
   type GhPr,
+  type PrCommit,
   parseApiHost,
   parseNameWithOwner,
 } from "../../core/gh-pr.ts";
-import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
+import { approvePr, fetchReviewThreads, markPrReady } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
 import { listTmuxSessions } from "../../core/launch.ts";
 import {
@@ -86,6 +89,7 @@ import {
 import { CliError } from "../output.ts";
 import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
+import { loadLatestDigest, runPrDigest } from "./digest-actions.ts";
 import { doLaunch } from "./launch.ts";
 import {
   findLatestForgeFindings,
@@ -176,6 +180,7 @@ class PrFetchFailed extends Error {
   }
 }
 type PrBundleFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
+type PrCommitsFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrCommitsResult>;
 
 const CONFIG_STRING_KEYS = new Set([
   "ghUser",
@@ -915,6 +920,13 @@ interface RouteCtx {
    * caching is disabled (prsCacheTtlMs: 0 in tests).
    */
   prsCache: TtlCache<string, Awaited<ReturnType<PrFetcher>>> | null;
+  prCommitsFetcher: PrCommitsFetcher;
+  /**
+   * Per-PR commits cache keyed `${root}#${prNum}` — same bounded-staleness
+   * rationale as prsCache; failures are never stored. Null when caching is
+   * disabled (prsCacheTtlMs: 0 in tests).
+   */
+  prCommitsCache: TtlCache<string, PrCommit[]> | null;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -1403,12 +1415,12 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     // Stale published findings therefore keep their local `finding:<id>` row
     // (still selectable + fixable by id) while the comment keeps its marker
     // metadata so resolve-on-fix still finds the thread.
-    const markerByCommentId = new Map<number, string>();
+    const markerByCommentId = new Map<number, { id: string; severity: string }>();
     const publishedIds = new Set<string>();
     for (const c of result.bundle.inlineComments) {
       const marker = parseFindingMarker(c.body);
       if (!marker) continue;
-      markerByCommentId.set(c.id, marker.id);
+      markerByCommentId.set(c.id, marker);
       const anchored = commentAnchorsToDiff(result.bundle.diff, {
         path: c.path,
         position: c.position,
@@ -1436,13 +1448,14 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
 
     const inlineComments = result.bundle.inlineComments.map((c) => {
-      const findingId = markerByCommentId.get(c.id);
-      if (!findingId) return c;
+      const marker = markerByCommentId.get(c.id);
+      if (!marker) return c;
       const thread = threadByCommentId.get(c.id);
-      const ghResolvedFallback = commentFixState[`finding:${findingId}`]?.ghResolved === true;
+      const ghResolvedFallback = commentFixState[`finding:${marker.id}`]?.ghResolved === true;
       return {
         ...c,
-        forgeFindingId: findingId,
+        forgeFindingId: marker.id,
+        forgeFindingSeverity: marker.severity,
         reviewThreadId: thread?.threadId ?? null,
         isResolved: thread ? thread.isResolved : ghResolvedFallback,
       };
@@ -1450,19 +1463,79 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
 
     const forgeFindings = findings.findings.filter((f) => !publishedIds.has(f.id));
 
+    // A review summary whose body carries forge-finding markers is Forge's
+    // own publication (out-of-diff findings ride the review body). Pulling
+    // it back from GitHub would show the same review twice — once natively
+    // (history picker + findings rail) and once as a GitHub review row.
+    const prReviews = result.bundle.prReviews.filter((r) => extractFindingIds(r.body).length === 0);
+
     return jsonOk({
       pr: result.bundle.pr,
       diff: result.bundle.diff,
       diffStats: result.bundle.diffStats,
       inlineComments,
       issueComments: result.bundle.issueComments,
-      prReviews: result.bundle.prReviews,
+      prReviews,
       linkedPlanId: linkage.linkedPlanId,
       worktreePath: linkage.worktreePath,
       forgeFindings,
       commentFixState,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
+  }
+
+  // GET /api/prs/:num/commits?repo=<root> — lazy fetch for the review page's
+  // Commits tab; not part of the bundle so PRs whose tab is never opened pay
+  // nothing.
+  const prCommitsMatch = pathname.match(/^\/api\/prs\/([^/]+)\/commits$/);
+  if (prCommitsMatch) {
+    const numRaw = decodeURIComponent(prCommitsMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    const fetchCommits = async (): Promise<PrCommit[]> => {
+      const r = await ctx.prCommitsFetcher(prNum, {
+        cwd: target.root,
+        ghTarget: ghTargetForRepo(store, target.root),
+      });
+      // Throwing keeps the failure out of the cache (same rule as prsCache).
+      if (!r.ok) throw new Error(r.error);
+      return r.commits;
+    };
+    try {
+      const commits = ctx.prCommitsCache
+        ? await ctx.prCommitsCache.get(`${target.root}#${prNum}`, fetchCommits)
+        : await fetchCommits();
+      return jsonOk({ commits });
+    } catch (e) {
+      return jsonErr(404, "PR_NOT_FOUND", String((e as Error).message ?? e));
+    }
+  }
+
+  // GET /api/prs/:num/digest?repo=<root> — newest completed digest for this
+  // PR, or null. Pure DB/disk read; the client compares digest.headSha to the
+  // bundle's headRefOid to flag staleness.
+  const digestGetMatch = pathname.match(/^\/api\/prs\/([^/]+)\/digest$/);
+  if (digestGetMatch) {
+    const numRaw = decodeURIComponent(digestGetMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    return jsonOk({ digest: loadLatestDigest(store, prNum, target.root) });
   }
 
   // GET /api/prs/:num/reviews?repo=<root>
@@ -1880,6 +1953,7 @@ interface AgentActivityDetailPayload {
     | { kind: "execution"; logStreamUrl: string }
     | { kind: "review"; logStreamUrl: string }
     | { kind: "fix"; logStreamUrl: string }
+    | { kind: "digest"; logStreamUrl: string }
     | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
@@ -1926,6 +2000,8 @@ function buildAgentActivityDetail(store: ForgeStore, sessionId: string): AgentAc
     detail = { kind: "review", logStreamUrl };
   } else if (row.purpose === "fix" || row.purpose === "comment-fix") {
     detail = { kind: "fix", logStreamUrl };
+  } else if (row.purpose === "digest") {
+    detail = { kind: "digest", logStreamUrl };
   } else if (row.purpose === "critique") {
     const { content, path: markdownPath } = readCritiqueMarkdownForSession(store, session);
     detail = { kind: "critique", markdownContent: content, markdownPath };
@@ -2024,7 +2100,8 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
     row.purpose === "execution" ||
     row.purpose === "review" ||
     row.purpose === "fix" ||
-    row.purpose === "comment-fix"
+    row.purpose === "comment-fix" ||
+    row.purpose === "digest"
   ) {
     const job = store.db.db
       .prepare(
@@ -2034,9 +2111,9 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
       )
       .get(sessionId, row.related_id) as { plan_id: string } | undefined;
     if (job) return store.getLogFile(job.plan_id);
-    // Ad-hoc reviewer and comment-fix sessions have no joined jobs row —
-    // fall back to metrics.logFile written by the parent orchestrator.
-    if (row.purpose === "review" || row.purpose === "comment-fix") {
+    // Ad-hoc reviewer / comment-fix / digest sessions have no joined jobs
+    // row — fall back to metrics.logFile written by the parent orchestrator.
+    if (row.purpose === "review" || row.purpose === "comment-fix" || row.purpose === "digest") {
       try {
         const metrics = JSON.parse(row.metrics ?? "{}") as { logFile?: unknown };
         if (typeof metrics.logFile === "string" && metrics.logFile) return metrics.logFile;
@@ -2095,6 +2172,8 @@ const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 const PLAN_EDIT_ACTION_PATH = /^\/api\/plans\/([^/]+)\/plan-edit\/(accept|reject|direct)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
+const PR_LIFECYCLE_PATH = /^\/api\/prs\/([^/]+)\/(ready|approve)$/;
+const PR_DIGEST_PATH = /^\/api\/prs\/([^/]+)\/digest$/;
 const PR_REVIEW_PUBLISH_PATH = /^\/api\/prs\/([^/]+)\/reviews\/([^/]+)\/publish$/;
 const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
 const WORKTREES_CLEAN_MERGED_PATH = "/api/worktrees/clean-merged";
@@ -2117,6 +2196,8 @@ function allowsPost(pathname: string): boolean {
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
+  if (PR_LIFECYCLE_PATH.test(pathname)) return true;
+  if (PR_DIGEST_PATH.test(pathname)) return true;
   if (PR_REVIEW_PUBLISH_PATH.test(pathname)) return true;
   if (
     pathname === WORKTREES_REMOVE_PATH ||
@@ -2501,6 +2582,64 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
     }
   }
 
+  // POST /api/prs/:num/digest — body { repo }. Spawns the detached digest
+  // worker (clone of run-review's orchestration); the result is read back via
+  // GET /api/prs/:num/digest once the SSE log stream fires `done`.
+  const digestPostMatch = pathname.match(PR_DIGEST_PATH);
+  if (digestPostMatch) {
+    const numRaw = decodeURIComponent(digestPostMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    try {
+      const result = await runPrDigest({ prNum, repoRoot: target.root, repoName: target.name }, store);
+      return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
+    } catch (e) {
+      if (e instanceof CliError) {
+        if (e.code === "PR_NOT_FOUND") return jsonErr(404, e.code, e.message, e.hint);
+        if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
+        if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
+        if (e.code === "DIGEST_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
+        return fromCliError(e);
+      }
+      throw e;
+    }
+  }
+
+  // POST /api/prs/:num/{ready|approve} — body { repo }. Thin gh wrappers:
+  // permission/policy failures (self-approval 422, branch protection, …)
+  // surface gh's error verbatim as a 502 instead of being pre-gated here.
+  const lifecycleMatch = pathname.match(PR_LIFECYCLE_PATH);
+  if (lifecycleMatch) {
+    const numRaw = decodeURIComponent(lifecycleMatch[1]);
+    const action = lifecycleMatch[2] as "ready" | "approve";
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const ghOpts = { cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) };
+    const result =
+      action === "ready"
+        ? await markPrReady(prNum, ghOpts)
+        : await approvePr(prNum, ghOpts, reqString(body, "body") ?? undefined);
+    if (!result.ok) {
+      return jsonErr(502, "GH_FAIL", result.error ?? `gh pr ${action} failed`);
+    }
+    ctx.prsCache?.invalidate(target.root);
+    return jsonOk({ ok: true });
+  }
+
   // POST /api/prs/:num/fix-comments
   const fixCommentsMatch = pathname.match(PR_FIX_COMMENTS_PATH);
   if (fixCommentsMatch) {
@@ -2864,6 +3003,7 @@ export interface ServeOptions {
   open?: boolean;
   prFetcher?: PrFetcher;
   prBundleFetcher?: PrBundleFetcher;
+  prCommitsFetcher?: PrCommitsFetcher;
   /**
    * Freshness window for the per-repo /api/prs cache. Defaults to 20s
    * (with an additional 60s stale-while-revalidate window). Pass 0 to
@@ -3057,6 +3197,11 @@ export async function startServer(
     prFetcher: opts.prFetcher ?? fetchPrs,
     prBundleFetcher: opts.prBundleFetcher ?? defaultFetchPrBundle,
     prsCache:
+      (opts.prsCacheTtlMs ?? 20_000) > 0
+        ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
+        : null,
+    prCommitsFetcher: opts.prCommitsFetcher ?? defaultFetchPrCommits,
+    prCommitsCache:
       (opts.prsCacheTtlMs ?? 20_000) > 0
         ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
         : null,

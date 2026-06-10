@@ -190,6 +190,7 @@ export type ActivityDetailKind =
   | "drafting"
   | "review"
   | "fix"
+  | "digest"
   | "unknown";
 
 export interface ActivityDetailResponse {
@@ -198,6 +199,7 @@ export interface ActivityDetailResponse {
     | { kind: "execution"; logStreamUrl: string }
     | { kind: "review"; logStreamUrl: string }
     | { kind: "fix"; logStreamUrl: string }
+    | { kind: "digest"; logStreamUrl: string }
     | { kind: "critique"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "synthesis"; markdownContent: string | null; markdownPath: string | null }
     | { kind: "improvement"; markdownContent: string | null; markdownPath: string | null; diffPath: string | null }
@@ -290,6 +292,32 @@ export interface PrView {
    * state) lives in GET /api/worktrees.
    */
   worktree: WorktreeChipInfo | null;
+  /** Bundle-only: PR description markdown. Absent on the /api/prs list. */
+  body?: string;
+  /** Bundle-only: head commit SHA — the digest staleness key. */
+  headRefOid?: string;
+}
+
+// Mirror of PrDigestView from src/cli/cmd/digest-actions.ts. Returned by
+// GET /api/prs/:num/digest as `{ digest: PrDigest | null }`. `headSha` is
+// compared against the bundle's `pr.headRefOid` to flag a stale digest.
+export interface PrDigest {
+  sessionId: string;
+  headSha: string | null;
+  generatedAt: string;
+  agent: string;
+  model: string | null;
+  markdown: string;
+}
+
+// Mirror of PrCommit from src/core/gh-pr.ts. Returned by
+// GET /api/prs/:num/commits as `{ commits: PrCommit[] }`, oldest first.
+export interface PrCommit {
+  oid: string;
+  messageHeadline: string;
+  messageBody: string;
+  authoredDate: string;
+  authors: Array<{ login: string; name: string }>;
 }
 
 export type WorktreeSafety = "unmanaged" | "in-use" | "unsafe" | "safe" | "removable" | "unknown";
@@ -353,6 +381,8 @@ export interface InlinePrComment {
   commitId: string;
   /** Set when this comment is the published view of a Forge finding. */
   forgeFindingId?: string;
+  /** Severity carried by the finding's marker (set alongside forgeFindingId). */
+  forgeFindingSeverity?: ForgeFindingSeverity;
   /** GraphQL review-thread node id (null when no thread matched). */
   reviewThreadId?: string | null;
   /** Whether the finding's review thread is resolved (ground truth or fallback). */

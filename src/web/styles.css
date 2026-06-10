@@ -18,6 +18,10 @@ a{color:inherit;text-decoration:none}
   --bg: #FAFAF7;
   --bg-2: #F2F1EC;
   --bg-glow: #E8E5DC;
+  /* Recessed code/log surface. Several blocks use var(--bg-deep, #0a0a0a);
+     leaving it undefined meant the near-black fallback applied on the LIGHT
+     theme too — dark-on-dark "redacted" code blocks. */
+  --bg-deep: #F0EEE7;
   --panel: #FFFFFF;
   --panel-2: #F6F5F0;
   --panel-3: #ECEAE3;
@@ -73,6 +77,7 @@ a{color:inherit;text-decoration:none}
   --bg: #0F1419;
   --bg-2: #131820;
   --bg-glow: #1A2230;
+  --bg-deep: #0a0a0a;
   --panel: #161D26;
   --panel-2: #1B232E;
   --panel-3: #222B37;
@@ -1897,8 +1902,86 @@ body.filtered-single .repo-chip{ display: none; }
 .review-header h1 { margin: 4px 0; font-size: 18px; }
 .review-header .meta { display: flex; gap: 14px; color: var(--fg-dim); font-size: 12px; flex-wrap: wrap; }
 .review-warnings { font-size: 11px; color: var(--attention); list-style: disc; padding-left: 20px; margin: 4px 0; }
+/* PR-state controls: one segmented cluster (shared frame, internal
+   dividers) so the group reads as a single unit instead of competing with
+   the review workflow bar above it. Exactly one primary button per page —
+   "Run Forge review" — so these stay quiet; the draft-promote segment gets
+   accent text only. */
+.review-pr-controls { display: flex; gap: 8px; align-items: center; margin-left: auto; flex-wrap: wrap; }
+.review-seg-group {
+  display: inline-flex;
+  align-items: stretch;
+  border: 1px solid var(--rule-2);
+  border-radius: 6px;
+  overflow: hidden;
+  background: var(--panel);
+}
+.review-seg-group .seg {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  padding: 4px 10px;
+  font-size: 11.5px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--text-2);
+  background: transparent;
+  border: none;
+  border-right: 1px solid var(--rule);
+  text-decoration: none;
+  white-space: nowrap;
+  transition: background 0.12s ease, color 0.12s ease;
+}
+.review-seg-group .seg:last-child { border-right: none; }
+.review-seg-group .seg:hover { background: var(--panel-2); color: var(--text); }
+.review-seg-group .seg:disabled { opacity: 0.5; cursor: not-allowed; }
+.review-seg-group .seg.accent { color: var(--primary); }
+.review-pr-controls-error { color: var(--attention); font-size: 11px; }
+
+/* "Back to PRs" is navigation, not an action — render it as a quiet link so
+   the action bar has one obvious primary (Run Forge review). */
+.review-back-link {
+  background: none;
+  border: none;
+  padding: 7px 4px;
+  font-size: 12.5px;
+  font-weight: 600;
+  color: var(--dim);
+  white-space: nowrap;
+  transition: color 0.12s ease;
+}
+.review-back-link:hover { color: var(--text); }
+.review-title-link { color: inherit; text-decoration: none; }
+.review-title-link:hover { text-decoration: underline; }
 .review-issue-comments summary { cursor: pointer; font-weight: 500; }
 .review-issue-comments-list { display: flex; flex-direction: column; gap: 10px; padding-top: 8px; }
+
+/* Center-header tabs (Description | Discussion | Commits) — reuses the
+   global .tabs/.tab look but tightened for the review header. */
+.review-tabs .tabs { padding: 0; background: transparent; }
+.review-tabs .tab { padding: 8px 12px; font-size: 12px; }
+.review-tab-body { padding: 8px 0 0; }
+.review-tab-empty { color: var(--fg-dim); font-size: 12px; margin: 6px 0; }
+.review-tab-empty.error { color: var(--attention); }
+.review-digest {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 8px 12px 10px;
+  margin-bottom: 10px;
+}
+.review-digest-header { display: flex; gap: 10px; align-items: center; flex-wrap: wrap; margin-bottom: 4px; }
+.review-digest-header h3 { margin: 0; font-size: 12px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--fg-dim); }
+.review-digest-header .btn-sm { margin-left: auto; padding: 4px 9px; font-size: 11.5px; }
+.review-digest-meta { color: var(--fg-dim); font-size: 11px; }
+.review-digest-stale { color: var(--high); font-size: 11px; font-weight: 600; }
+.review-digest-running { margin-left: auto; color: var(--fg-dim); font-size: 11px; animation: pulse 1.4s ease-in-out infinite; }
+.review-commits { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
+.review-commit { display: flex; gap: 10px; align-items: baseline; font-size: 12px; padding: 3px 0; }
+.review-commit-oid { font-family: var(--mono, monospace); font-size: 11px; color: var(--primary); text-decoration: none; }
+.review-commit-oid:hover { text-decoration: underline; }
+.review-commit-headline { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-commit-meta { color: var(--fg-dim); font-size: 11px; white-space: nowrap; }
 .review-issue-comment,
 .review-inline-comment {
   background: var(--panel);
@@ -1917,7 +2000,30 @@ body.filtered-single .repo-chip{ display: none; }
 }
 .review-md { font-size: 12px; line-height: 1.5; }
 .review-md p { margin: 4px 0; }
-.review-md code { background: var(--bg-deep, #0a0a0a); padding: 1px 4px; border-radius: 3px; }
+/* The app-wide reset (ul,ol → list-style:none) eats markdown bullets, and
+   unscoped h2/h3 render at page scale inside cards — restore document
+   styling for agent/PR markdown (digest, description, comments). */
+.review-md ul,
+.review-md ol { margin: 4px 0 10px; padding-left: 20px; list-style: disc; }
+.review-md ol { list-style: decimal; }
+.review-md li { margin: 4px 0; }
+.review-md li::marker { color: var(--fg-dim); }
+.review-md h1,
+.review-md h2 { font-size: 13px; text-transform: uppercase; letter-spacing: 0.04em; margin: 14px 0 6px; padding-bottom: 3px; border-bottom: 1px solid var(--border); }
+.review-md h3 { font-size: 12.5px; margin: 10px 0 4px; }
+.review-md h4,
+.review-md h5,
+.review-md h6 { font-size: 12px; margin: 8px 0 4px; }
+.review-md h1:first-child,
+.review-md h2:first-child { margin-top: 2px; }
+.review-md img { max-width: 100%; vertical-align: middle; }
+.review-md details { margin: 6px 0; padding: 4px 8px; border: 1px solid var(--border); border-radius: 4px; background: var(--panel-2); }
+.review-md summary { cursor: pointer; color: var(--fg-dim); font-weight: 600; }
+.review-md blockquote { margin: 6px 0; padding: 2px 10px; border-left: 3px solid var(--rule-2); color: var(--fg-dim); }
+/* Theme-aware (not --bg-deep): the hardcoded near-black background read as
+   redaction bars on the light theme once the Description tab started
+   rendering prose full of inline code. */
+.review-md code { background: var(--panel-2); border: 1px solid var(--border); padding: 1px 4px; border-radius: 3px; }
 
 .review-diff { display: flex; flex-direction: column; gap: 12px; }
 .review-file {

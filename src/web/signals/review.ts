@@ -8,6 +8,8 @@ import type { FixTarget } from "../lib/review-targets";
 import type {
   DroppedFixTarget,
   ForgeFinding,
+  PrCommit,
+  PrDigest,
   PrReviewBundle,
   PublishRecord,
   ReviewRunDetail,
@@ -36,6 +38,10 @@ export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
 export interface ActiveWorkerSession {
   sessionId: string;
   prNum: number;
+  /** Repo root the session belongs to. PR numbers collide across repos
+   *  (repo A #7 vs repo B #7), so consumers that gate "is this session for
+   *  the PR on screen" must check both. Set for digest sessions. */
+  repoRoot?: string;
   /** Set by the drawer when the worker finished; the session stays on
    *  screen but no longer counts as "running" for the action bar. */
   done?: boolean;
@@ -68,6 +74,109 @@ export const displayedFindings = computed<ForgeFinding[]>(() => {
 // the validate-then-fix worker spawned by `Fix N selected`.
 export const activeCommentFixSession = signal<ActiveWorkerSession | null>(null);
 
+// ─── center-header tabs (Description | Discussion | Commits) ────────────────
+
+export type ReviewTab = "description" | "discussion" | "commits";
+
+// null = "auto": Description when the PR has a body, else Discussion. The
+// ReviewTabs component resolves it so the default tracks the loaded bundle.
+export const reviewActiveTab = signal<ReviewTab | null>(null);
+
+// Commits are lazy — fetched on first Commits-tab activation, not with the
+// bundle, so PRs whose tab is never opened pay nothing.
+export const reviewCommits = signal<PrCommit[] | null>(null);
+export const reviewCommitsLoading = signal<boolean>(false);
+export const reviewCommitsError = signal<string | null>(null);
+
+// ─── PR digest ("what does this PR do") ──────────────────────────────────────
+
+export const prDigest = signal<PrDigest | null>(null);
+export const prDigestLoading = signal<boolean>(false);
+
+// Monotonic request tokens for the per-PR header loads. A response only
+// applies if its token is still current — tokens advance on every new
+// request AND on PR switch (clearPerPrHeaderState), so a late reply for a
+// previous PR/repo is discarded entirely. This subsumes a PR-number guard,
+// which collides across repos (repo A #7 vs repo B #7).
+let digestReqToken = 0;
+let commitsReqToken = 0;
+// Non-null while a digest worker runs for the active PR (same lifecycle as
+// activeReviewSession, but the DigestCard renders its own one-line status —
+// no drawer).
+export const activeDigestSession = signal<ActiveWorkerSession | null>(null);
+export const digestError = signal<string | null>(null);
+
+export async function loadPrDigest(prNumber: number, repoRoot: string): Promise<void> {
+  const token = ++digestReqToken;
+  prDigestLoading.value = true;
+  try {
+    const q = `?repo=${encodeURIComponent(repoRoot)}`;
+    const data = await apiGet<{ digest: PrDigest | null }>(`/api/prs/${prNumber}/digest${q}`);
+    if (token !== digestReqToken) return; // superseded — PR switch or newer load
+    prDigest.value = data.digest;
+  } catch {
+    // Missing digest is the common case and not an error worth surfacing.
+    if (token === digestReqToken) prDigest.value = null;
+  } finally {
+    if (token === digestReqToken) prDigestLoading.value = false;
+  }
+}
+
+export async function startPrDigest(prNumber: number, repoRoot: string): Promise<void> {
+  digestError.value = null;
+  try {
+    const res = await apiPost<{ sessionId: string }>(`/api/prs/${prNumber}/digest`, { repo: repoRoot });
+    activeDigestSession.value = { sessionId: res.sessionId, prNum: prNumber, repoRoot };
+  } catch (e) {
+    const err = e as ApiError;
+    digestError.value = err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not start digest.";
+  }
+}
+
+// ─── PR lifecycle actions (ready-for-review / approve) ──────────────────────
+
+// Which lifecycle action is in flight ("ready" | "approve" | null). One at a
+// time: the whole PrControls cluster disables while a call runs.
+export const prActionPending = signal<string | null>(null);
+
+async function runPrAction(action: "ready" | "approve", prNumber: number, repoRoot: string): Promise<void> {
+  prActionPending.value = action;
+  try {
+    await apiPost<{ ok: boolean }>(`/api/prs/${prNumber}/${action}`, { repo: repoRoot });
+    // Reflect the new PR state (draft flag / review decision) immediately.
+    void loadReviewBundle(prNumber, repoRoot);
+  } finally {
+    prActionPending.value = null;
+  }
+}
+
+export function markPrReady(prNumber: number, repoRoot: string): Promise<void> {
+  return runPrAction("ready", prNumber, repoRoot);
+}
+
+export function approvePr(prNumber: number, repoRoot: string): Promise<void> {
+  return runPrAction("approve", prNumber, repoRoot);
+}
+
+export async function loadReviewCommits(prNumber: number, repoRoot: string): Promise<void> {
+  const token = ++commitsReqToken;
+  reviewCommitsLoading.value = true;
+  reviewCommitsError.value = null;
+  try {
+    const q = `?repo=${encodeURIComponent(repoRoot)}`;
+    const data = await apiGet<{ commits: PrCommit[] }>(`/api/prs/${prNumber}/commits${q}`);
+    if (token !== commitsReqToken) return; // superseded — PR switch or newer load
+    reviewCommits.value = data.commits ?? [];
+  } catch (e) {
+    if (token !== commitsReqToken) return;
+    const err = e as ApiError;
+    reviewCommits.value = null;
+    reviewCommitsError.value = err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not load commits.";
+  } finally {
+    if (token === commitsReqToken) reviewCommitsLoading.value = false;
+  }
+}
+
 export function toggleTargetSelection(token: string): void {
   const next = new Set(selectedTargets.value);
   if (next.has(token)) next.delete(token);
@@ -89,6 +198,26 @@ export function clearSelection(): void {
   commentStatuses.value = new Map();
 }
 
+// Reset the per-PR center-header state (active tab, commits list, digest
+// view) on PR switch — without this, PR A's commits/digest linger when the
+// operator jumps straight to PR B. activeDigestSession deliberately
+// survives: the DigestCard gates on its prNum+repoRoot, so a digest still
+// running for PR A resumes its live status when the operator returns to A.
+// Bumping the request tokens discards any in-flight digest/commits response
+// wholesale (PR-number guards collide across repos) and unsticks the
+// loading flags a discarded response would otherwise leave true.
+export function clearPerPrHeaderState(): void {
+  reviewActiveTab.value = null;
+  reviewCommits.value = null;
+  reviewCommitsError.value = null;
+  reviewCommitsLoading.value = false;
+  prDigest.value = null;
+  prDigestLoading.value = false;
+  digestError.value = null;
+  digestReqToken++;
+  commitsReqToken++;
+}
+
 export function clearReviewState(): void {
   reviewBundle.value = null;
   reviewError.value = null;
@@ -101,6 +230,12 @@ export function clearReviewState(): void {
   selectedReviewRun.value = null;
   selectedReviewRunError.value = null;
   activeCommentFixSession.value = null;
+  reviewActiveTab.value = null;
+  reviewCommits.value = null;
+  reviewCommitsError.value = null;
+  prDigest.value = null;
+  activeDigestSession.value = null;
+  digestError.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {
