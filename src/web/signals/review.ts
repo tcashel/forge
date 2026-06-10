@@ -83,6 +83,31 @@ export const reviewCommits = signal<PrCommit[] | null>(null);
 export const reviewCommitsLoading = signal<boolean>(false);
 export const reviewCommitsError = signal<string | null>(null);
 
+// ─── PR lifecycle actions (ready-for-review / approve) ──────────────────────
+
+// Which lifecycle action is in flight ("ready" | "approve" | null). One at a
+// time: the whole PrControls cluster disables while a call runs.
+export const prActionPending = signal<string | null>(null);
+
+async function runPrAction(action: "ready" | "approve", prNumber: number, repoRoot: string): Promise<void> {
+  prActionPending.value = action;
+  try {
+    await apiPost<{ ok: boolean }>(`/api/prs/${prNumber}/${action}`, { repo: repoRoot });
+    // Reflect the new PR state (draft flag / review decision) immediately.
+    void loadReviewBundle(prNumber, repoRoot);
+  } finally {
+    prActionPending.value = null;
+  }
+}
+
+export function markPrReady(prNumber: number, repoRoot: string): Promise<void> {
+  return runPrAction("ready", prNumber, repoRoot);
+}
+
+export function approvePr(prNumber: number, repoRoot: string): Promise<void> {
+  return runPrAction("approve", prNumber, repoRoot);
+}
+
 export async function loadReviewCommits(prNumber: number, repoRoot: string): Promise<void> {
   reviewCommitsLoading.value = true;
   reviewCommitsError.value = null;

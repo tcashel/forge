@@ -35,7 +35,7 @@ import {
   parseApiHost,
   parseNameWithOwner,
 } from "../../core/gh-pr.ts";
-import { fetchReviewThreads } from "../../core/gh-pr-write.ts";
+import { approvePr, fetchReviewThreads, markPrReady } from "../../core/gh-pr-write.ts";
 import { buildPlanHistory } from "../../core/history.ts";
 import { listTmuxSessions } from "../../core/launch.ts";
 import {
@@ -2142,6 +2142,7 @@ const DRAFT_ROOT_PATH = /^\/api\/plan-chat\/draft\/([^/]+)$/;
 const PLAN_EDIT_ACTION_PATH = /^\/api\/plans\/([^/]+)\/plan-edit\/(accept|reject|direct)$/;
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
+const PR_LIFECYCLE_PATH = /^\/api\/prs\/([^/]+)\/(ready|approve)$/;
 const PR_REVIEW_PUBLISH_PATH = /^\/api\/prs\/([^/]+)\/reviews\/([^/]+)\/publish$/;
 const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
 const WORKTREES_CLEAN_MERGED_PATH = "/api/worktrees/clean-merged";
@@ -2164,6 +2165,7 @@ function allowsPost(pathname: string): boolean {
     return true;
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
+  if (PR_LIFECYCLE_PATH.test(pathname)) return true;
   if (PR_REVIEW_PUBLISH_PATH.test(pathname)) return true;
   if (
     pathname === WORKTREES_REMOVE_PATH ||
@@ -2546,6 +2548,34 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
       }
       throw e;
     }
+  }
+
+  // POST /api/prs/:num/{ready|approve} — body { repo }. Thin gh wrappers:
+  // permission/policy failures (self-approval 422, branch protection, …)
+  // surface gh's error verbatim as a 502 instead of being pre-gated here.
+  const lifecycleMatch = pathname.match(PR_LIFECYCLE_PATH);
+  if (lifecycleMatch) {
+    const numRaw = decodeURIComponent(lifecycleMatch[1]);
+    const action = lifecycleMatch[2] as "ready" | "approve";
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    const ghOpts = { cwd: target.root, ghTarget: ghTargetForRepo(store, target.root) };
+    const result =
+      action === "ready"
+        ? await markPrReady(prNum, ghOpts)
+        : await approvePr(prNum, ghOpts, reqString(body, "body") ?? undefined);
+    if (!result.ok) {
+      return jsonErr(502, "GH_FAIL", result.error ?? `gh pr ${action} failed`);
+    }
+    ctx.prsCache?.invalidate(target.root);
+    return jsonOk({ ok: true });
   }
 
   // POST /api/prs/:num/fix-comments

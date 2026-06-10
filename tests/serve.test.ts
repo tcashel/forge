@@ -22,6 +22,7 @@ import type {
   PrBundle,
   PrCommit,
 } from "../src/core/gh-pr.ts";
+import { __setGhRunner as __setPrWriteGhRunner } from "../src/core/gh-pr-write.ts";
 import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -893,6 +894,77 @@ test("GET /api/prs/:num/commits never caches a failed fetch", async (t) => {
   const third = await getJson(`${h.baseUrl}/api/prs/7/commits`);
   assert.equal(third.status, 200);
   assert.equal(calls, 2, "the successful result IS cached");
+});
+
+test("POST /api/prs/:num/{ready,approve} run the matching gh command and invalidate the PR cache", async (t) => {
+  const ghCalls: string[][] = [];
+  __setPrWriteGhRunner(((args: string[]) => {
+    ghCalls.push(args);
+    return Promise.resolve({ ok: true, stdout: "", stderr: "", timedOut: false });
+  }) as never);
+  let prFetches = 0;
+  const h = await bootServer({
+    prFetcher: async () => {
+      prFetches++;
+      return { prs: [fakePr(7)], me: "alice" };
+    },
+  });
+  t.after(() => {
+    __setPrWriteGhRunner(null);
+    h.stop();
+  });
+
+  await getJson(`${h.baseUrl}/api/prs`); // warm the cache
+  assert.equal(prFetches, 1);
+
+  const ready = await postJson(`${h.baseUrl}/api/prs/7/ready`, { repo: process.cwd() });
+  assert.equal(ready.status, 200);
+  assert.deepEqual(ghCalls[0], ["pr", "ready", "7"]);
+
+  // The mutation invalidated the repo's cache entry — next list refetches.
+  await getJson(`${h.baseUrl}/api/prs`);
+  assert.equal(prFetches, 2, "ready invalidated the PR-list cache");
+
+  const approve = await postJson(`${h.baseUrl}/api/prs/7/approve`, { repo: process.cwd(), body: "LGTM" });
+  assert.equal(approve.status, 200);
+  assert.deepEqual(ghCalls[1], ["pr", "review", "7", "--approve", "--body", "LGTM"]);
+});
+
+test("POST /api/prs/:num/approve surfaces gh failures as 502 with stderr detail", async (t) => {
+  __setPrWriteGhRunner((() =>
+    Promise.resolve({
+      ok: false,
+      stdout: "",
+      stderr: "Can not approve your own pull request (HTTP 422)",
+      timedOut: false,
+    })) as never);
+  const h = await bootServer();
+  t.after(() => {
+    __setPrWriteGhRunner(null);
+    h.stop();
+  });
+
+  const { status, body } = await postJson(`${h.baseUrl}/api/prs/7/approve`, { repo: process.cwd() });
+  assert.equal(status, 502);
+  assert.equal(body.error!.code, "GH_FAIL");
+  assert.match(body.error!.message, /approve your own pull request/);
+});
+
+test("POST /api/prs/:num/ready validates the PR number and repo", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+
+  const bad = await postJson(`${h.baseUrl}/api/prs/abc/ready`, { repo: process.cwd() });
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error!.code, "INVALID_PR_NUMBER");
+
+  const noRepo = await postJson(`${h.baseUrl}/api/prs/7/ready`, {});
+  assert.equal(noRepo.status, 400);
+  assert.equal(noRepo.body.error!.code, "BAD_REQUEST");
+
+  const unknownRepo = await postJson(`${h.baseUrl}/api/prs/7/ready`, { repo: "/tmp/no-such-repo" });
+  assert.equal(unknownRepo.status, 404);
+  assert.equal(unknownRepo.body.error!.code, "UNKNOWN_REPO");
 });
 
 test("GET /api/prs/:num/review-bundle links to a matching plan by repoRoot+prNumber", async (t) => {

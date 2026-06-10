@@ -1,5 +1,6 @@
 import type { PrReviewBundle } from "../../types";
 import { ciClass, ciLabel, reviewClass, reviewLabel, timeAgo } from "../prs/pr-format";
+import { PrControls } from "./PrControls";
 import { ReviewTabs } from "./ReviewTabs";
 
 interface Props {
@@ -16,6 +17,7 @@ export function ReviewHeader({ bundle, repoRoot }: Props) {
         {pr.isDraft ? <span class="pr-tag">draft</span> : null}
         <span class={`pr-status ${ciClass(pr.statusCheckRollup)}`}>{ciLabel(pr.statusCheckRollup)}</span>
         <span class={`pr-status ${reviewClass(pr.reviewDecision)}`}>{reviewLabel(pr.reviewDecision)}</span>
+        <PrControls pr={pr} repoRoot={repoRoot} />
       </div>
       <h1>
         {pr.url ? (

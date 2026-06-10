@@ -73,6 +73,26 @@ function hostArgsFor(apiHost: string | null): string[] {
   return apiHost ? ["--hostname", apiHost] : [];
 }
 
+/** `gh pr ready` — flip a draft PR to ready-for-review. */
+export async function markPrReady(prNum: number, opts: GhFetchOpts): Promise<GhWriteResult> {
+  const res = await ghRunner(["pr", "ready", String(prNum)], opts);
+  if (!res.ok) return { ok: false, error: ghErrorDetail(res, `gh pr ready ${prNum} failed`) };
+  return { ok: true };
+}
+
+/**
+ * `gh pr review --approve` — submit an approving review. GitHub rejects
+ * self-approval (422); the caller surfaces gh's error verbatim rather than
+ * pre-gating, so enterprise policy differences stay GitHub's call.
+ */
+export async function approvePr(prNum: number, opts: GhFetchOpts, body?: string): Promise<GhWriteResult> {
+  const args = ["pr", "review", String(prNum), "--approve"];
+  if (body?.trim()) args.push("--body", body.trim());
+  const res = await ghRunner(args, opts);
+  if (!res.ok) return { ok: false, error: ghErrorDetail(res, `gh pr review ${prNum} --approve failed`) };
+  return { ok: true };
+}
+
 export interface InlineCommentInput {
   path: string;
   line: number;
