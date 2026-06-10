@@ -224,11 +224,22 @@ export async function ensureWorktreeForBranch(
   const rawWorktrees = readWorktreesPorcelain(repoRoot);
   const mainRepoRoot = resolveMainWorktreeRoot(repoRoot, rawWorktrees);
 
-  // 1) If we already have a live worktree on this branch, reuse it.
+  // 1) If we already have a live worktree on this branch, reuse it. A reused
+  // worktree may never have had its deps installed (e.g. created outside
+  // Forge), and quality gates die on missing toolchains ('tsc: command not
+  // found' — found live in the PR #68 comment-fix run), so bootstrap here
+  // too; isBootstrapped() makes this a no-op when deps are present.
   const existing = rawWorktrees.find(
     (wt) => !samePath(wt.path, mainRepoRoot) && wt.branch === branch && fs.existsSync(wt.path),
   );
   if (existing) {
+    const repoForBootstrap = detectRepo(mainRepoRoot);
+    if (repoForBootstrap) {
+      await bootstrapWorktree(mainRepoRoot, existing.path, repoForBootstrap.stack, {
+        onProgress,
+        mode: "checkout-existing",
+      });
+    }
     return { worktreePath: existing.path, rehydrated: false, error: null };
   }
 

@@ -702,3 +702,35 @@ test("listWorktrees derives linkage from jobs.worktree_path when Plan.worktree i
     fs.rmSync(repoDir, { recursive: true, force: true });
   }
 });
+
+test("ensureWorktreeForBranch bootstraps deps when reusing an existing worktree", async () => {
+  // A reused worktree may never have had `bun install` run (created outside
+  // Forge) — quality gates then die on missing toolchains. Live regression
+  // from the PR #68 comment-fix run ('tsc: command not found').
+  const repoDir = tmpDir("forge-wt-boot-");
+  try {
+    git(repoDir, ["init", "-b", "main"]);
+    git(repoDir, ["config", "user.email", "test@example.com"]);
+    git(repoDir, ["config", "user.name", "Test"]);
+    fs.writeFileSync(path.join(repoDir, "package.json"), `${JSON.stringify({ name: "boot-fixture", private: true })}\n`);
+    fs.writeFileSync(path.join(repoDir, "bun.lock"), "{}\n");
+    git(repoDir, ["add", "-A"]);
+    git(repoDir, ["commit", "-m", "init"]);
+
+    const branch = "forge-boot-test";
+    const wtPath = path.join(path.dirname(repoDir), "worktrees", branch);
+    fs.mkdirSync(path.dirname(wtPath), { recursive: true });
+    git(repoDir, ["worktree", "add", "-b", branch, wtPath]);
+    assert.ok(!fs.existsSync(path.join(wtPath, "node_modules")), "fixture starts without node_modules");
+
+    const res = await ensureWorktreeForBranch(repoDir, branch);
+    assert.equal(res.error, null);
+    assert.ok(
+      fs.existsSync(path.join(fs.realpathSync(res.worktreePath), "node_modules")),
+      "reuse path bootstrapped deps",
+    );
+  } finally {
+    fs.rmSync(repoDir, { recursive: true, force: true });
+    fs.rmSync(path.join(path.dirname(repoDir), "worktrees"), { recursive: true, force: true });
+  }
+});
