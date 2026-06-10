@@ -5,6 +5,7 @@ import { derivePickups } from "./components/pickup/PickupRow";
 import { boot } from "./lib/boot";
 import type { ForgeBridge } from "./lib/forge-bridge";
 import { startGlobalShortcuts } from "./lib/shortcuts";
+import { onVisible } from "./lib/visibility";
 import { prs, refreshPrs, startPrPolling } from "./signals/prs";
 import { repos, startReposPolling } from "./signals/repos";
 import { refreshSettings, settingsConfig, startSettingsPolling } from "./signals/settings";
@@ -63,6 +64,20 @@ effect(() => {
   // Subscribe to the repo signal; ignore the value otherwise.
   void selectedRepo.value;
   void refreshPrs();
+});
+
+// Entering the PRs view refreshes immediately — the background poll only
+// runs every 5 min off-view, so the list could otherwise be minutes old.
+effect(() => {
+  if (viewMode.value !== "prs") return;
+  void refreshPrs();
+});
+
+// Hidden tabs skip their poll ticks; catch up the moment the operator
+// comes back instead of waiting out the next interval.
+onVisible(() => {
+  void refreshTasks();
+  if (viewMode.value === "prs") void refreshPrs();
 });
 
 // When the user enters settings mode (or switches repos while in

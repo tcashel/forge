@@ -9,6 +9,7 @@ import { computed, signal } from "@preact/signals";
 import { type ApiError, getPlans } from "../lib/api";
 import { taskRepoKey } from "../lib/format";
 import { showToast } from "../lib/toast";
+import { isHidden } from "../lib/visibility";
 import type { PlanView, TabId } from "../types";
 import { searchQuery, selectedRepo } from "./ui";
 
@@ -41,10 +42,23 @@ export const currentTask = computed<PlanView | null>(() => {
 
 let pollHandle: ReturnType<typeof setInterval> | null = null;
 
+// Serialized snapshot of the last applied plan list. The 3s poll usually
+// returns an identical payload; skipping the signal write keeps every
+// computed/effect downstream of `tasks` from re-running for nothing.
+let lastPlansJson: string | null = null;
+
 export async function refreshTasks(): Promise<void> {
   try {
     const data = await getPlans();
-    tasks.value = data.plans || [];
+    const plans = data.plans || [];
+    // ageMs is wall-clock derived and changes on every response; nothing
+    // in the client reads it (only the coarse `age` label, which IS
+    // compared), so it's excluded to let identical payloads match.
+    const json = JSON.stringify(plans, (key, value) => (key === "ageMs" ? 0 : value));
+    if (json !== lastPlansJson) {
+      lastPlansJson = json;
+      tasks.value = plans;
+    }
     lastRefreshOk.value = true;
     lastRefreshAt.value = new Date();
   } catch (e) {
@@ -57,6 +71,9 @@ export async function refreshTasks(): Promise<void> {
 export function startTaskPolling(): void {
   if (pollHandle != null) return;
   pollHandle = setInterval(() => {
+    // A hidden tab keeps its interval but skips the work; the
+    // visibilitychange hook in main.tsx refreshes immediately on return.
+    if (isHidden()) return;
     void refreshTasks();
   }, 3000);
 }
