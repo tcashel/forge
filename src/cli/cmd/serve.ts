@@ -25,10 +25,13 @@ import { parseFindingMarker } from "../../core/forge-comment-marker.ts";
 import type { GhTarget } from "../../core/gh.ts";
 import {
   fetchPrBundle as defaultFetchPrBundle,
+  fetchPrCommits as defaultFetchPrCommits,
   type FetchPrBundleResult,
+  type FetchPrCommitsResult,
   fetchPrs,
   type GhFetchOpts,
   type GhPr,
+  type PrCommit,
   parseApiHost,
   parseNameWithOwner,
 } from "../../core/gh-pr.ts";
@@ -176,6 +179,7 @@ class PrFetchFailed extends Error {
   }
 }
 type PrBundleFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
+type PrCommitsFetcher = (prNum: number, opts: GhFetchOpts) => Promise<FetchPrCommitsResult>;
 
 const CONFIG_STRING_KEYS = new Set([
   "ghUser",
@@ -915,6 +919,13 @@ interface RouteCtx {
    * caching is disabled (prsCacheTtlMs: 0 in tests).
    */
   prsCache: TtlCache<string, Awaited<ReturnType<PrFetcher>>> | null;
+  prCommitsFetcher: PrCommitsFetcher;
+  /**
+   * Per-PR commits cache keyed `${root}#${prNum}` — same bounded-staleness
+   * rationale as prsCache; failures are never stored. Null when caching is
+   * disabled (prsCacheTtlMs: 0 in tests).
+   */
+  prCommitsCache: TtlCache<string, PrCommit[]> | null;
 }
 
 function staticFile(filePath: string, contentType: string): Response {
@@ -1464,6 +1475,41 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       commentFixState,
       warnings: [...result.bundle.warnings, ...linkage.warnings],
     });
+  }
+
+  // GET /api/prs/:num/commits?repo=<root> — lazy fetch for the review page's
+  // Commits tab; not part of the bundle so PRs whose tab is never opened pay
+  // nothing.
+  const prCommitsMatch = pathname.match(/^\/api\/prs\/([^/]+)\/commits$/);
+  if (prCommitsMatch) {
+    const numRaw = decodeURIComponent(prCommitsMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    const fetchCommits = async (): Promise<PrCommit[]> => {
+      const r = await ctx.prCommitsFetcher(prNum, {
+        cwd: target.root,
+        ghTarget: ghTargetForRepo(store, target.root),
+      });
+      // Throwing keeps the failure out of the cache (same rule as prsCache).
+      if (!r.ok) throw new Error(r.error);
+      return r.commits;
+    };
+    try {
+      const commits = ctx.prCommitsCache
+        ? await ctx.prCommitsCache.get(`${target.root}#${prNum}`, fetchCommits)
+        : await fetchCommits();
+      return jsonOk({ commits });
+    } catch (e) {
+      return jsonErr(404, "PR_NOT_FOUND", String((e as Error).message ?? e));
+    }
   }
 
   // GET /api/prs/:num/reviews?repo=<root>
@@ -2865,6 +2911,7 @@ export interface ServeOptions {
   open?: boolean;
   prFetcher?: PrFetcher;
   prBundleFetcher?: PrBundleFetcher;
+  prCommitsFetcher?: PrCommitsFetcher;
   /**
    * Freshness window for the per-repo /api/prs cache. Defaults to 20s
    * (with an additional 60s stale-while-revalidate window). Pass 0 to
@@ -3058,6 +3105,11 @@ export async function startServer(
     prFetcher: opts.prFetcher ?? fetchPrs,
     prBundleFetcher: opts.prBundleFetcher ?? defaultFetchPrBundle,
     prsCache:
+      (opts.prsCacheTtlMs ?? 20_000) > 0
+        ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
+        : null,
+    prCommitsFetcher: opts.prCommitsFetcher ?? defaultFetchPrCommits,
+    prCommitsCache:
       (opts.prsCacheTtlMs ?? 20_000) > 0
         ? createTtlCache({ ttlMs: opts.prsCacheTtlMs ?? 20_000, staleWhileRevalidateMs: 60_000 })
         : null,

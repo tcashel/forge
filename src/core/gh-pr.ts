@@ -28,6 +28,12 @@ export interface GhPr {
   commentsCount: number;
   reviewsCount: number;
   isMine: boolean;
+  /**
+   * Bundle-only fields: populated by fetchPrBundle (the review page needs
+   * them), never by fetchPrs — the list projection stays lean.
+   */
+  body?: string;
+  headRefOid?: string;
 }
 
 export interface GhFetchOpts {
@@ -311,6 +317,8 @@ interface RawPrView {
   additions: number;
   deletions: number;
   changedFiles: number;
+  body?: string | null;
+  headRefOid?: string;
 }
 
 interface RawInlineComment {
@@ -401,7 +409,7 @@ export function parseApiHost(url: string): string | null {
  */
 export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<FetchPrBundleResult> {
   const prJsonFields =
-    "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles";
+    "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,body,headRefOid";
   const prViewPromise = ghRunner(["pr", "view", String(prNum), "--json", prJsonFields], opts);
   const diffPromise = ghRunner(["pr", "diff", String(prNum)], opts);
 
@@ -584,6 +592,8 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
     commentsCount: inlineComments.length + issueComments.length,
     reviewsCount: 0,
     isMine: false,
+    body: raw.body ?? "",
+    headRefOid: raw.headRefOid ?? "",
   };
 
   return {
@@ -598,6 +608,48 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
       warnings,
     },
   };
+}
+
+export interface PrCommit {
+  oid: string;
+  messageHeadline: string;
+  messageBody: string;
+  authoredDate: string;
+  authors: Array<{ login: string; name: string }>;
+}
+
+export type FetchPrCommitsResult = { ok: true; commits: PrCommit[] } | { ok: false; error: string };
+
+interface RawPrCommits {
+  commits?: Array<{
+    oid?: string;
+    messageHeadline?: string;
+    messageBody?: string;
+    authoredDate?: string;
+    authors?: Array<{ login?: string; name?: string }> | null;
+  }> | null;
+}
+
+/** Commits on a PR, oldest first (gh's order). Lazy — only the Commits tab needs it. */
+export async function fetchPrCommits(prNum: number, opts: GhFetchOpts): Promise<FetchPrCommitsResult> {
+  const res = await ghRunner(["pr", "view", String(prNum), "--json", "commits"], opts);
+  if (!res.ok || !res.stdout) {
+    return { ok: false, error: `gh pr view ${prNum} --json commits failed${res.stderr ? `: ${res.stderr}` : ""}` };
+  }
+  let raw: RawPrCommits;
+  try {
+    raw = JSON.parse(res.stdout) as RawPrCommits;
+  } catch (e) {
+    return { ok: false, error: `gh pr view returned invalid JSON: ${(e as Error).message}` };
+  }
+  const commits = (raw.commits ?? []).map((c) => ({
+    oid: c.oid ?? "",
+    messageHeadline: c.messageHeadline ?? "",
+    messageBody: c.messageBody ?? "",
+    authoredDate: c.authoredDate ?? "",
+    authors: (c.authors ?? []).map((a) => ({ login: a.login ?? "", name: a.name ?? "" })),
+  }));
+  return { ok: true, commits };
 }
 
 /**

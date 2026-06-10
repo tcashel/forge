@@ -290,6 +290,20 @@ export interface PrView {
    * state) lives in GET /api/worktrees.
    */
   worktree: WorktreeChipInfo | null;
+  /** Bundle-only: PR description markdown. Absent on the /api/prs list. */
+  body?: string;
+  /** Bundle-only: head commit SHA — the digest staleness key. */
+  headRefOid?: string;
+}
+
+// Mirror of PrCommit from src/core/gh-pr.ts. Returned by
+// GET /api/prs/:num/commits as `{ commits: PrCommit[] }`, oldest first.
+export interface PrCommit {
+  oid: string;
+  messageHeadline: string;
+  messageBody: string;
+  authoredDate: string;
+  authors: Array<{ login: string; name: string }>;
 }
 
 export type WorktreeSafety = "unmanaged" | "in-use" | "unsafe" | "safe" | "removable" | "unknown";

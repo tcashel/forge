@@ -8,6 +8,7 @@ import {
   currentLogin,
   fetchMinePrNumbers,
   fetchPrBundle,
+  fetchPrCommits,
   fetchPrs,
   runGh,
 } from "../../src/core/gh-pr.ts";
@@ -133,6 +134,44 @@ test("fetchPrBundle parses multi-page slurped comment/review responses", async (
     for (const call of apiCalls) {
       assert.ok(call.includes("--slurp"), `expected --slurp on: ${call.join(" ")}`);
     }
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("fetchPrCommits parses gh's commits projection and fails loud on gh errors", async () => {
+  const commitsJson = {
+    commits: [
+      {
+        oid: "aaa111",
+        messageHeadline: "feat: one",
+        messageBody: "body",
+        authoredDate: "2026-06-10T00:00:00Z",
+        authors: [{ login: "alice", name: "Alice" }],
+      },
+      { oid: "bbb222", messageHeadline: "fix: two" },
+    ],
+  };
+  let fail = false;
+  __setGhRunner(((args: string[]) => {
+    assert.deepEqual(args, ["pr", "view", "7", "--json", "commits"]);
+    if (fail) return Promise.resolve({ ok: false, stdout: "", stderr: "no pull requests found", timedOut: false });
+    return Promise.resolve({ ok: true, stdout: JSON.stringify(commitsJson), stderr: "", timedOut: false });
+  }) as never);
+  try {
+    const res = await fetchPrCommits(7, { cwd: "/tmp" });
+    assert.ok(res.ok);
+    if (!res.ok) return;
+    assert.equal(res.commits.length, 2);
+    assert.equal(res.commits[0].oid, "aaa111");
+    assert.equal(res.commits[0].authors[0].login, "alice");
+    assert.equal(res.commits[1].messageBody, "", "missing fields normalize to empty");
+
+    fail = true;
+    const bad = await fetchPrCommits(7, { cwd: "/tmp" });
+    assert.equal(bad.ok, false);
+    if (bad.ok) return;
+    assert.match(bad.error, /no pull requests found/);
   } finally {
     __setGhRunner(null);
   }

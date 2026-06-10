@@ -14,7 +14,14 @@ import * as path from "node:path";
 import { test } from "node:test";
 import { startServer } from "../src/cli/cmd/serve.ts";
 import { recordJobStarted, recordPlanCreated, syncJobState, upsertSession } from "../src/core/db/writes.ts";
-import type { FetchPrBundleResult, GhFetchOpts, GhPr, PrBundle } from "../src/core/gh-pr.ts";
+import type {
+  FetchPrBundleResult,
+  FetchPrCommitsResult,
+  GhFetchOpts,
+  GhPr,
+  PrBundle,
+  PrCommit,
+} from "../src/core/gh-pr.ts";
 import { ForgeStore, type Plan, type RunMeta } from "../src/core/store.ts";
 
 interface ServerHandle {
@@ -28,6 +35,7 @@ async function bootServer(
   opts: {
     prFetcher?: (opts: GhFetchOpts) => Promise<{ prs: GhPr[]; me: string }>;
     prBundleFetcher?: (prNum: number, opts: GhFetchOpts) => Promise<FetchPrBundleResult>;
+    prCommitsFetcher?: (prNum: number, opts: GhFetchOpts) => Promise<FetchPrCommitsResult>;
     prsCacheTtlMs?: number;
   } = {},
 ): Promise<ServerHandle> {
@@ -42,6 +50,7 @@ async function bootServer(
       host: "127.0.0.1",
       prFetcher: opts.prFetcher,
       prBundleFetcher: opts.prBundleFetcher,
+      prCommitsFetcher: opts.prCommitsFetcher,
       prsCacheTtlMs: opts.prsCacheTtlMs,
     });
     return {
@@ -739,7 +748,14 @@ test("GET /api/prs prefers reachable current repo over stale same-name task repo
 
 function fakeBundle(prNum: number): PrBundle {
   return {
-    pr: { ...fakePr(prNum), isMine: false, reviewsCount: 0, commentsCount: 0 },
+    pr: {
+      ...fakePr(prNum),
+      isMine: false,
+      reviewsCount: 0,
+      commentsCount: 0,
+      body: "Why\n\nBecause.",
+      headRefOid: "abc123def456",
+    },
     diff: "diff --git a/x b/x\nindex 1..2 100644\n--- a/x\n+++ b/x\n@@ -1 +1 @@\n-a\n+b\n",
     diffStats: { additions: 1, deletions: 1, changedFiles: 1 },
     inlineComments: [],
@@ -758,7 +774,7 @@ test("GET /api/prs/:num/review-bundle returns merged bundle for a known PR", asy
   assert.equal(status, 200);
   assert.equal(body.ok, true);
   const data = body.data as {
-    pr: { number: number };
+    pr: { number: number; body?: string; headRefOid?: string };
     diff: string;
     inlineComments: unknown[];
     issueComments: unknown[];
@@ -767,6 +783,10 @@ test("GET /api/prs/:num/review-bundle returns merged bundle for a known PR", asy
     warnings: unknown[];
   };
   assert.equal(data.pr.number, 42);
+  // Bundle-only PR fields the review page needs (description tab + digest
+  // staleness key) survive the route untouched.
+  assert.equal(data.pr.body, "Why\n\nBecause.");
+  assert.equal(data.pr.headRefOid, "abc123def456");
   assert.match(data.diff, /diff --git/);
   assert.deepEqual(data.inlineComments, []);
   assert.deepEqual(data.issueComments, []);
@@ -802,6 +822,77 @@ test("GET /api/prs/:num/review-bundle 404s when the repo is unknown", async (t) 
   const { status, body } = await getJson(`${h.baseUrl}/api/prs/1/review-bundle?repo=/tmp/no-such-repo`);
   assert.equal(status, 404);
   assert.equal(body.error!.code, "UNKNOWN_REPO");
+});
+
+function fakeCommit(oid: string): PrCommit {
+  return {
+    oid,
+    messageHeadline: `feat: ${oid}`,
+    messageBody: "",
+    authoredDate: "2026-06-10T00:00:00Z",
+    authors: [{ login: "alice", name: "Alice" }],
+  };
+}
+
+test("GET /api/prs/:num/commits returns the commit list", async (t) => {
+  const h = await bootServer({
+    prCommitsFetcher: async () => ({ ok: true, commits: [fakeCommit("aaa111"), fakeCommit("bbb222")] }),
+  });
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/7/commits`);
+  assert.equal(status, 200);
+  assert.equal(body.ok, true);
+  const commits = (body.data as { commits: Array<{ oid: string; messageHeadline: string }> }).commits;
+  assert.deepEqual(
+    commits.map((c) => c.oid),
+    ["aaa111", "bbb222"],
+  );
+  assert.equal(commits[0].messageHeadline, "feat: aaa111");
+});
+
+test("GET /api/prs/:num/commits rejects non-numeric PR numbers", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/abc/commits`);
+  assert.equal(status, 400);
+  assert.equal(body.error!.code, "INVALID_PR_NUMBER");
+});
+
+test("GET /api/prs/:num/commits 404s when the repo is unknown", async (t) => {
+  const h = await bootServer({
+    prCommitsFetcher: async () => ({ ok: true, commits: [] }),
+  });
+  t.after(() => h.stop());
+  const { status, body } = await getJson(`${h.baseUrl}/api/prs/7/commits?repo=/tmp/no-such-repo`);
+  assert.equal(status, 404);
+  assert.equal(body.error!.code, "UNKNOWN_REPO");
+});
+
+test("GET /api/prs/:num/commits never caches a failed fetch", async (t) => {
+  let calls = 0;
+  const h = await bootServer({
+    prCommitsFetcher: async () => {
+      calls++;
+      if (calls === 1) return { ok: false, error: "gh exploded" };
+      return { ok: true, commits: [fakeCommit("ccc333")] };
+    },
+  });
+  t.after(() => h.stop());
+
+  const first = await getJson(`${h.baseUrl}/api/prs/7/commits`);
+  assert.equal(first.status, 404, "failure surfaces as PR_NOT_FOUND");
+
+  const second = await getJson(`${h.baseUrl}/api/prs/7/commits`);
+  assert.equal(second.status, 200, "failure was not pinned by the cache");
+  const commits = (second.body.data as { commits: Array<{ oid: string }> }).commits;
+  assert.deepEqual(
+    commits.map((c) => c.oid),
+    ["ccc333"],
+  );
+
+  const third = await getJson(`${h.baseUrl}/api/prs/7/commits`);
+  assert.equal(third.status, 200);
+  assert.equal(calls, 2, "the successful result IS cached");
 });
 
 test("GET /api/prs/:num/review-bundle links to a matching plan by repoRoot+prNumber", async (t) => {
