@@ -3,7 +3,14 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 import { test } from "node:test";
-import { __setGhRunner, fetchPrBundle, runGh } from "../../src/core/gh-pr.ts";
+import {
+  __setGhRunner,
+  currentLogin,
+  fetchMinePrNumbers,
+  fetchPrBundle,
+  fetchPrs,
+  runGh,
+} from "../../src/core/gh-pr.ts";
 
 // ─── runGh: stderr capture + timeout flag ────────────────────────────────────
 //
@@ -153,6 +160,119 @@ test("fetchPrBundle surfaces gh stderr in bundle warnings", async () => {
     const inlineWarning = res.bundle.warnings.find((w) => w.source === "inlineComments");
     assert.ok(inlineWarning);
     assert.match(inlineWarning?.message ?? "", /timed out after 20000ms/);
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+// ─── Read-path caches + call concurrency ─────────────────────────────────────
+//
+// /api/prs previously paid three gh network round-trips per poll. The
+// login is cached for the process lifetime, @me PR numbers for 5 min,
+// and the remaining list call runs concurrently with cache misses. The
+// bundle's three comment/review calls must start as one wave.
+
+test("currentLogin caches successful lookups but not failures", async () => {
+  let calls = 0;
+  __setGhRunner(((args: string[]) => {
+    if (args[0] === "api" && args[1] === "user") {
+      calls++;
+      return Promise.resolve(
+        calls === 1
+          ? { ok: false, stdout: "", stderr: "no auth", timedOut: false }
+          : { ok: true, stdout: "octocat", stderr: "", timedOut: false },
+      );
+    }
+    return Promise.resolve({ ok: true, stdout: "", stderr: "", timedOut: false });
+  }) as never);
+  try {
+    assert.equal(await currentLogin({ cwd: "/tmp" }), "", "failure passes through");
+    assert.equal(await currentLogin({ cwd: "/tmp" }), "octocat", "failure was not cached");
+    assert.equal(await currentLogin({ cwd: "/tmp" }), "octocat");
+    assert.equal(calls, 2, "success is cached for the process lifetime");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("fetchMinePrNumbers caches per cwd and skips caching failures", async () => {
+  let calls = 0;
+  __setGhRunner(((args: string[]) => {
+    if (args[0] === "pr" && args.includes("@me")) {
+      calls++;
+      return Promise.resolve({ ok: true, stdout: JSON.stringify([{ number: 42 }]), stderr: "", timedOut: false });
+    }
+    return Promise.resolve({ ok: true, stdout: "", stderr: "", timedOut: false });
+  }) as never);
+  try {
+    assert.deepEqual([...(await fetchMinePrNumbers({ cwd: "/repo-a" }))], [42]);
+    assert.deepEqual([...(await fetchMinePrNumbers({ cwd: "/repo-a" }))], [42]);
+    assert.equal(calls, 1, "second lookup served from cache");
+    await fetchMinePrNumbers({ cwd: "/repo-b" });
+    assert.equal(calls, 2, "different cwd is a different cache key");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("fetchPrs runs login/@me/list as one concurrent wave", async () => {
+  let inFlight = 0;
+  let maxInFlight = 0;
+  const track = async <T>(value: T): Promise<T> => {
+    inFlight++;
+    maxInFlight = Math.max(maxInFlight, inFlight);
+    await new Promise((r) => setTimeout(r, 10));
+    inFlight--;
+    return value;
+  };
+  __setGhRunner(((args: string[]) => {
+    if (args[0] === "api" && args[1] === "user") {
+      return track({ ok: true, stdout: "octocat", stderr: "", timedOut: false });
+    }
+    if (args.includes("@me")) {
+      return track({ ok: true, stdout: "[]", stderr: "", timedOut: false });
+    }
+    if (args[0] === "pr" && args[1] === "list") {
+      return track({ ok: true, stdout: "[]", stderr: "", timedOut: false });
+    }
+    return Promise.resolve({ ok: true, stdout: "", stderr: "", timedOut: false });
+  }) as never);
+  try {
+    const res = await fetchPrs({ cwd: "/tmp" });
+    assert.equal(res.me, "octocat");
+    assert.equal(maxInFlight, 3, "all three gh calls overlapped");
+  } finally {
+    __setGhRunner(null);
+  }
+});
+
+test("fetchPrBundle starts the comment/review calls as one wave", async () => {
+  let apiInFlight = 0;
+  let maxApiInFlight = 0;
+  __setGhRunner((async (args: string[]) => {
+    const joined = args.join(" ");
+    if (joined.startsWith("pr view")) {
+      return { ok: true, stdout: JSON.stringify(PR_VIEW), stderr: "", timedOut: false };
+    }
+    if (joined.startsWith("pr diff")) {
+      return { ok: true, stdout: "", stderr: "", timedOut: false };
+    }
+    if (joined.startsWith("repo view")) {
+      return { ok: true, stdout: "acme/repo", stderr: "", timedOut: false };
+    }
+    if (args[0] === "api") {
+      apiInFlight++;
+      maxApiInFlight = Math.max(maxApiInFlight, apiInFlight);
+      await new Promise((r) => setTimeout(r, 10));
+      apiInFlight--;
+      return { ok: true, stdout: "[[]]", stderr: "", timedOut: false };
+    }
+    return { ok: true, stdout: "", stderr: "", timedOut: false };
+  }) as never);
+  try {
+    const res = await fetchPrBundle(7, { cwd: "/tmp" });
+    assert.ok(res.ok);
+    assert.equal(maxApiInFlight, 3, "inline/issue/review calls overlapped");
   } finally {
     __setGhRunner(null);
   }

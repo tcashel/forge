@@ -157,6 +157,10 @@ type GhRunner = typeof runGh;
 let ghRunner: GhRunner = runGh;
 export function __setGhRunner(fn: GhRunner | null): void {
   ghRunner = fn ?? runGh;
+  // A new (or restored) runner means a new fake world — drop the
+  // login/@me caches so values from the previous runner can't leak
+  // across tests.
+  __resetGhCaches();
 }
 
 /**
@@ -179,21 +183,53 @@ export function flattenSlurpedPages<T>(stdout: string): T[] {
   return out;
 }
 
+// ─── Read-path caches ─────────────────────────────────────────────────────────
+// The Workbench polls /api/prs; without caching every poll paid three gh
+// network round-trips. The login can't change under a running process
+// without re-auth (cache for the process lifetime; failures are NOT
+// cached so an unauthenticated boot recovers). The @me PR-number set
+// changes rarely (cache 5 min; only successful fetches are cached, so a
+// transient gh failure doesn't hide "mine" badges for the window).
+
+function ghCacheKey(opts: GhFetchOpts): string {
+  return `${opts.ghTarget?.host ?? ""}\0${opts.ghTarget?.user ?? ""}`;
+}
+
+const loginCache = new Map<string, string>();
+const MINE_TTL_MS = 5 * 60_000;
+const mineCache = new Map<string, { at: number; numbers: Set<number> }>();
+
+/** Test hook: drop the login/@me caches (pairs with __setGhRunner). */
+export function __resetGhCaches(): void {
+  loginCache.clear();
+  mineCache.clear();
+}
+
 export async function currentLogin(opts: GhFetchOpts): Promise<string> {
-  const { stdout, ok } = await runGh(["api", "user", "--jq", ".login"], opts);
-  return ok ? stdout : "";
+  const key = ghCacheKey(opts);
+  const cached = loginCache.get(key);
+  if (cached !== undefined) return cached;
+  const { stdout, ok } = await ghRunner(["api", "user", "--jq", ".login"], opts);
+  if (!ok) return "";
+  if (stdout) loginCache.set(key, stdout);
+  return stdout;
 }
 
 export async function fetchMinePrNumbers(opts: GhFetchOpts): Promise<Set<number>> {
+  const key = `${ghCacheKey(opts)}\0${opts.cwd ?? ""}`;
+  const cached = mineCache.get(key);
+  if (cached && Date.now() - cached.at < MINE_TTL_MS) return cached.numbers;
   // Use gh's own "@me" resolution so this works even when the local gh login
   // (e.g. an org-aliased account like "foo-org") differs from the PR author
   // login on the host (e.g. "foo"). Strict string equality on logins is
   // unreliable across SAML/enterprise account mappings.
-  const { stdout, ok } = await runGh(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"], opts);
+  const { stdout, ok } = await ghRunner(["pr", "list", "--author", "@me", "--json", "number", "--limit", "100"], opts);
   if (!ok || !stdout) return new Set();
   try {
     const arr = JSON.parse(stdout) as Array<{ number: number }>;
-    return new Set(arr.map((p) => p.number));
+    const numbers = new Set(arr.map((p) => p.number));
+    mineCache.set(key, { at: Date.now(), numbers });
+    return numbers;
   } catch {
     return new Set();
   }
@@ -421,10 +457,30 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
     // `--paginate --slurp` everywhere below: without `--slurp` a >100-item
     // response is back-to-back JSON arrays that JSON.parse rejects, silently
     // dropping every comment/review on exactly the busy PRs being worked.
-    const inlineRes = await ghRunner(
+    //
+    // The three endpoints are independent, so the calls are started
+    // together and only awaited in parsing order — one round-trip wave
+    // instead of three for the review page's bundle load.
+    const ghFallback = (e: unknown) => ({
+      ok: false,
+      stdout: "",
+      stderr: String((e as Error)?.message ?? e),
+      timedOut: false,
+    });
+    const inlinePromise = ghRunner(
       ["api", `repos/${resolved.full}/pulls/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
       opts,
-    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
+    ).catch(ghFallback);
+    const issuePromise = ghRunner(
+      ["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
+      opts,
+    ).catch(ghFallback);
+    const reviewsPromise = ghRunner(
+      ["api", `repos/${resolved.full}/pulls/${prNum}/reviews`, "--paginate", "--slurp", ...hostArgs],
+      opts,
+    ).catch(ghFallback);
+
+    const inlineRes = await inlinePromise;
     if (inlineRes.ok && inlineRes.stdout) {
       try {
         const parsed = flattenSlurpedPages<RawInlineComment>(inlineRes.stdout);
@@ -456,10 +512,7 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
       });
     }
 
-    const issueRes = await ghRunner(
-      ["api", `repos/${resolved.full}/issues/${prNum}/comments`, "--paginate", "--slurp", ...hostArgs],
-      opts,
-    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
+    const issueRes = await issuePromise;
     if (issueRes.ok && issueRes.stdout) {
       try {
         const parsed = flattenSlurpedPages<RawIssueComment>(issueRes.stdout);
@@ -481,10 +534,7 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
       });
     }
 
-    const reviewsRes = await ghRunner(
-      ["api", `repos/${resolved.full}/pulls/${prNum}/reviews`, "--paginate", "--slurp", ...hostArgs],
-      opts,
-    ).catch((e) => ({ ok: false, stdout: "", stderr: String((e as Error)?.message ?? e), timedOut: false }));
+    const reviewsRes = await reviewsPromise;
     if (reviewsRes.ok && reviewsRes.stdout) {
       try {
         const parsed = flattenSlurpedPages<RawPrReview>(reviewsRes.stdout);
@@ -551,7 +601,6 @@ export async function fetchPrBundle(prNum: number, opts: GhFetchOpts): Promise<F
 }
 
 export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: string }> {
-  const [me, mineNumbers] = await Promise.all([currentLogin(opts), fetchMinePrNumbers(opts)]);
   // Use gh's built-in `--jq` to project the (potentially huge) `comments`
   // and `reviews` arrays down to scalar counts on gh's side. Without this,
   // the full review/comment bodies blow past execSync's default maxBuffer
@@ -563,19 +612,26 @@ export async function fetchPrs(opts: GhFetchOpts): Promise<{ prs: GhPr[]; me: st
     "additions,deletions,changedFiles," +
     "commentsCount:(.comments|length),reviewsCount:(.reviews|length)" +
     "}]";
-  const { stdout, ok } = await runGh(
-    [
-      "pr",
-      "list",
-      "--json",
-      "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
-      "--jq",
-      jq,
-      "--limit",
-      "30",
-    ],
-    opts,
-  );
+  // The list has no data dependency on login/@me (isMine is computed after
+  // the fact), so all three round-trips run concurrently. With the
+  // login/@me caches warm this is a single gh call.
+  const [me, mineNumbers, { stdout, ok }] = await Promise.all([
+    currentLogin(opts),
+    fetchMinePrNumbers(opts),
+    ghRunner(
+      [
+        "pr",
+        "list",
+        "--json",
+        "number,title,headRefName,baseRefName,url,isDraft,statusCheckRollup,reviewDecision,author,updatedAt,additions,deletions,changedFiles,comments,reviews",
+        "--jq",
+        jq,
+        "--limit",
+        "30",
+      ],
+      opts,
+    ),
+  ]);
   if (!ok || !stdout) return { prs: [], me };
   try {
     const prs = JSON.parse(stdout) as Array<{
