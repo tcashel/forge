@@ -90,7 +90,7 @@ export function ReviewPage() {
         {err ? <div class="review-status error">{err}</div> : null}
         {bundle ? (
           <>
-            <ReviewHeader bundle={bundle} />
+            <ReviewHeader bundle={bundle} repoRoot={repo} />
             <DiffPane bundle={bundle} findings={findings} />
             <UnanchoredComments bundle={bundle} />
           </>

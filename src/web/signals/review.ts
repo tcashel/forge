@@ -8,6 +8,7 @@ import type { FixTarget } from "../lib/review-targets";
 import type {
   DroppedFixTarget,
   ForgeFinding,
+  PrCommit,
   PrReviewBundle,
   PublishRecord,
   ReviewRunDetail,
@@ -68,6 +69,36 @@ export const displayedFindings = computed<ForgeFinding[]>(() => {
 // the validate-then-fix worker spawned by `Fix N selected`.
 export const activeCommentFixSession = signal<ActiveWorkerSession | null>(null);
 
+// ─── center-header tabs (Description | Discussion | Commits) ────────────────
+
+export type ReviewTab = "description" | "discussion" | "commits";
+
+// null = "auto": Description when the PR has a body, else Discussion. The
+// ReviewTabs component resolves it so the default tracks the loaded bundle.
+export const reviewActiveTab = signal<ReviewTab | null>(null);
+
+// Commits are lazy — fetched on first Commits-tab activation, not with the
+// bundle, so PRs whose tab is never opened pay nothing.
+export const reviewCommits = signal<PrCommit[] | null>(null);
+export const reviewCommitsLoading = signal<boolean>(false);
+export const reviewCommitsError = signal<string | null>(null);
+
+export async function loadReviewCommits(prNumber: number, repoRoot: string): Promise<void> {
+  reviewCommitsLoading.value = true;
+  reviewCommitsError.value = null;
+  try {
+    const q = `?repo=${encodeURIComponent(repoRoot)}`;
+    const data = await apiGet<{ commits: PrCommit[] }>(`/api/prs/${prNumber}/commits${q}`);
+    reviewCommits.value = data.commits ?? [];
+  } catch (e) {
+    const err = e as ApiError;
+    reviewCommits.value = null;
+    reviewCommitsError.value = err.hint ? `${err.message} — ${err.hint}` : err.message || "Could not load commits.";
+  } finally {
+    reviewCommitsLoading.value = false;
+  }
+}
+
 export function toggleTargetSelection(token: string): void {
   const next = new Set(selectedTargets.value);
   if (next.has(token)) next.delete(token);
@@ -101,6 +132,9 @@ export function clearReviewState(): void {
   selectedReviewRun.value = null;
   selectedReviewRunError.value = null;
   activeCommentFixSession.value = null;
+  reviewActiveTab.value = null;
+  reviewCommits.value = null;
+  reviewCommitsError.value = null;
 }
 
 export async function loadReviewBundle(prNumber: number, repoRoot: string): Promise<void> {
