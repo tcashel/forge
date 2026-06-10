@@ -38,6 +38,15 @@ export function createTtlCache<K, V>(opts: TtlCacheOptions): TtlCache<K, V> {
   const { ttlMs, staleWhileRevalidateMs = 0, maxEntries = 1000 } = opts;
   const entries = new Map<K, Entry<V>>();
   const inFlight = new Map<K, Promise<V>>();
+  const generations = new Map<K, number>();
+
+  function generationFor(key: K): number {
+    return generations.get(key) ?? 0;
+  }
+
+  function bumpGeneration(key: K): void {
+    generations.set(key, generationFor(key) + 1);
+  }
 
   function store(key: K, value: V): void {
     // Map preserves insertion order; delete+set keeps eviction roughly LRU
@@ -53,13 +62,15 @@ export function createTtlCache<K, V>(opts: TtlCacheOptions): TtlCache<K, V> {
   function load(key: K, loader: () => Promise<V>): Promise<V> {
     const existing = inFlight.get(key);
     if (existing) return existing;
-    const p = (async () => {
+    const generation = generationFor(key);
+    let p!: Promise<V>;
+    p = (async () => {
       try {
         const value = await loader();
-        store(key, value);
+        if (generationFor(key) === generation) store(key, value);
         return value;
       } finally {
-        inFlight.delete(key);
+        if (inFlight.get(key) === p) inFlight.delete(key);
       }
     })();
     inFlight.set(key, p);
@@ -86,11 +97,19 @@ export function createTtlCache<K, V>(opts: TtlCacheOptions): TtlCache<K, V> {
       return age < ttlMs + staleWhileRevalidateMs ? entry.value : undefined;
     },
     invalidate(key?: K): void {
-      if (key === undefined) entries.clear();
-      else entries.delete(key);
+      if (key === undefined) {
+        entries.clear();
+        for (const k of inFlight.keys()) bumpGeneration(k);
+        inFlight.clear();
+      } else {
+        entries.delete(key);
+        bumpGeneration(key);
+        inFlight.delete(key);
+      }
     },
     clear(): void {
       entries.clear();
+      for (const k of inFlight.keys()) bumpGeneration(k);
       inFlight.clear();
     },
   };

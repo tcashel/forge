@@ -104,3 +104,36 @@ test("invalidate forces a reload; maxEntries evicts oldest", async () => {
   assert.equal(cache.peek("b"), 3);
   assert.equal(cache.peek("c"), 4);
 });
+
+test("invalidated in-flight loads cannot repopulate the cache", async () => {
+  const cache = createTtlCache<string, number>({ ttlMs: 10_000 });
+  const oldLoad = deferred<number>();
+  const newLoad = deferred<number>();
+  let calls = 0;
+
+  const first = cache.get("k", () => {
+    calls++;
+    return oldLoad.promise;
+  });
+  cache.invalidate("k");
+  const second = cache.get("k", () => {
+    calls++;
+    return newLoad.promise;
+  });
+  assert.equal(calls, 2, "post-invalidation get starts a new loader");
+
+  oldLoad.resolve(1);
+  assert.equal(await first, 1, "the original caller still receives its value");
+  newLoad.resolve(2);
+
+  assert.equal(await second, 2);
+  assert.equal(
+    await cache.get("k", async () => {
+      calls++;
+      return 3;
+    }),
+    2,
+    "the old loader cannot overwrite the replacement value",
+  );
+  assert.equal(calls, 2);
+});
