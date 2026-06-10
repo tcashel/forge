@@ -16,7 +16,9 @@ export function ReviewActionBar({ prNumber, repoRoot, loading }: Props) {
   const [starting, setStarting] = useState(false);
   const [startError, setStartError] = useState<string | null>(null);
   const activeSession = activeReviewSession.value;
-  const reviewRunning = activeSession !== null && activeSession.prNum === prNumber;
+  // A finished session stays in the signal (the drawer keeps showing its
+  // log until explicitly closed) — only an un-done session blocks a new run.
+  const reviewRunning = activeSession !== null && activeSession.prNum === prNumber && activeSession.done !== true;
 
   const onRunReview = async () => {
     if (starting || reviewRunning) return;

@@ -1819,6 +1819,10 @@ body.filtered-single .repo-chip{ display: none; }
 .review-thread-badge .badge-label { font-weight: 600; }
 .review-rail-badge .badge-reason,
 .review-thread-badge .badge-reason { color: var(--fg-dim); }
+.review-rail-badge .badge-gh-error,
+.review-thread-badge .badge-gh-error { color: var(--blocker); }
+.review-rail-badge .badge-gh-resolved,
+.review-thread-badge .badge-gh-resolved { color: #2ea043; }
 .badge-fixed { background: rgba(46, 160, 67, 0.15); color: #2ea043; }
 .badge-disputed { background: rgba(245, 165, 36, 0.15); color: var(--high); }
 .badge-failed { background: rgba(229, 72, 77, 0.15); color: var(--blocker); }
@@ -1987,6 +1991,17 @@ body.filtered-single .repo-chip{ display: none; }
 }
 .review-batch-count { color: var(--fg-dim); font-size: 12px; }
 .review-batch-error { color: var(--attention); font-size: 12px; }
+.review-batch-dropped {
+  flex-basis: 100%;
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.review-batch-dropped-item { font-size: 11px; color: var(--attention); }
+.review-batch-dropped-item code { font-family: var(--mono, monospace); }
 
 .pr-row { cursor: pointer; }
 .pr-row:focus { outline: 2px solid var(--primary); outline-offset: -2px; }
@@ -2147,7 +2162,7 @@ body.filtered-single .repo-chip{ display: none; }
 .review-history-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 4px; }
 .review-history-row {
   display: grid;
-  grid-template-columns: 80px 90px 110px 1fr auto;
+  grid-template-columns: 80px 90px 110px auto 1fr auto;
   gap: 10px;
   align-items: center;
   width: 100%;
@@ -2177,6 +2192,44 @@ body.filtered-single .repo-chip{ display: none; }
   text-transform: uppercase;
   letter-spacing: 0.04em;
 }
+.review-publish-chip { white-space: nowrap; }
+.review-history-row-actions {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 10px 0;
+}
+.review-history-publish-error {
+  font-size: 11px;
+  color: var(--attention);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.btn-retry-publish { margin-left: auto; white-space: nowrap; }
+.review-history-publish-detail {
+  background: var(--panel);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px 10px 8px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.review-history-publish-header { display: flex; align-items: center; gap: 8px; }
+.review-history-publish-header h3 { margin: 0; font-size: 12px; font-weight: 600; color: var(--fg-dim); }
+.review-history-publish-findings {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 3px;
+  font-size: 11px;
+}
+.publish-finding-outcome { display: flex; align-items: baseline; gap: 6px; flex-wrap: wrap; }
+.publish-finding-id { font-family: var(--mono, monospace); color: var(--fg-dim); }
+.publish-finding-error { color: var(--attention); }
 
 
 /* ─── Worktrees view ────────────────────────────────────────────────── */

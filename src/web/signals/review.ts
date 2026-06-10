@@ -1,10 +1,18 @@
 // Signals backing the PR review page. Phase 1 only exposes data we read
 // from `GET /api/prs/:num/review-bundle` plus the selection/status state
 // the Phase 2 fix UI will mutate; nothing here triggers any POST yet.
-import { computed, signal } from "@preact/signals";
+import { computed, effect, signal } from "@preact/signals";
 import { type ApiError, apiGet, apiPost } from "../lib/api";
+import { readPublishPref, writePublishPref } from "../lib/publish-pref";
 import type { FixTarget } from "../lib/review-targets";
-import type { ForgeFinding, PrReviewBundle, ReviewRunDetail, ReviewRunSummary } from "../types";
+import type {
+  DroppedFixTarget,
+  ForgeFinding,
+  PrReviewBundle,
+  PublishRecord,
+  ReviewRunDetail,
+  ReviewRunSummary,
+} from "../types";
 
 export const reviewBundle = signal<PrReviewBundle | null>(null);
 export const reviewLoading = signal<boolean>(false);
@@ -20,8 +28,20 @@ export const selectedTargets = signal<Set<string>>(new Set());
 export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
 
 // Ad-hoc reviewer session signal — non-null while an ad-hoc review is
-// running for the active PR. The ReviewSessionDrawer subscribes to it.
-export const activeReviewSession = signal<{ sessionId: string; prNum: number } | null>(null);
+// running (or finished but still on screen) for the active PR. The
+// ReviewSessionDrawer subscribes to it and stamps `done: true` when the
+// worker's log stream fires `done`; only an explicit drawer close (or a PR
+// switch via clearReviewState) clears the signal, so failure text stays
+// visible instead of unmounting with the drawer.
+export interface ActiveWorkerSession {
+  sessionId: string;
+  prNum: number;
+  /** Set by the drawer when the worker finished; the session stays on
+   *  screen but no longer counts as "running" for the action bar. */
+  done?: boolean;
+}
+
+export const activeReviewSession = signal<ActiveWorkerSession | null>(null);
 
 // Review history (past Forge reviews recorded for the active PR).
 export const reviewRuns = signal<ReviewRunSummary[]>([]);
@@ -46,7 +66,7 @@ export const displayedFindings = computed<ForgeFinding[]>(() => {
 });
 // Active comment-fix session — analogous to activeReviewSession but for
 // the validate-then-fix worker spawned by `Fix N selected`.
-export const activeCommentFixSession = signal<{ sessionId: string; prNum: number } | null>(null);
+export const activeCommentFixSession = signal<ActiveWorkerSession | null>(null);
 
 export function toggleTargetSelection(token: string): void {
   const next = new Set(selectedTargets.value);
@@ -105,8 +125,14 @@ export interface RunReviewResponse {
 }
 
 // Per-request toggle for publishing findings to the PR as GitHub review
-// comments. Off by default; when on, the server publishes findings for the run.
-export const publishToGitHub = signal<boolean>(false);
+// comments. The default sticks across sessions (localStorage, theme.ts
+// pattern) so the operator sets it once; the checkbox stays a per-run
+// override.
+export const publishToGitHub = signal<boolean>(readPublishPref());
+
+effect(() => {
+  writePublishPref(publishToGitHub.value);
+});
 
 export async function startAdHocReview(
   prNumber: number,
@@ -170,9 +196,28 @@ export function clearSelectedReviewRun(): void {
   selectedReviewRunError.value = null;
 }
 
+/**
+ * Retry a failed/partial publish for a recorded review run. POSTs to the
+ * republish route (`/api/prs/:num/reviews/:sessionId/publish`); the caller
+ * handles a 404 gracefully (older servers don't expose it yet) and
+ * refreshes the run list on success.
+ */
+export async function retryPublish(prNumber: number, repoRoot: string, sessionId: string): Promise<PublishRecord> {
+  return apiPost<PublishRecord>(`/api/prs/${prNumber}/reviews/${encodeURIComponent(sessionId)}/publish`, {
+    repo: repoRoot,
+  });
+}
+
 export interface RunCommentFixResponse {
   sessionId: string;
   logStreamUrl: string;
+  /**
+   * Targets the server filtered out before the worker spawned (stale
+   * finding id, unanchored comment, missing review). Optional: older
+   * servers omit it. The UI must surface these — a partial selection
+   * never silently shrinks.
+   */
+  droppedTargets?: DroppedFixTarget[];
 }
 
 export async function startCommentFix(
