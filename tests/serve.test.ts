@@ -682,9 +682,15 @@ test("GET /api/prs does not cache failure-shaped (ok: false) results", async (t)
   const first = await getJson(`${h.baseUrl}/api/prs`);
   assert.equal(first.body.ok, true);
   assert.equal(first.body.data!.prs!.length, 0, "failure degrades to an empty list");
+  assert.equal(
+    (first.body.data as { fetchOk?: boolean }).fetchOk,
+    false,
+    "failure-shaped responses are flagged so the UI can show a retry banner",
+  );
 
   const second = await getJson(`${h.baseUrl}/api/prs`);
   assert.equal(second.body.data!.prs![0].number, 505, "failure was not pinned by the cache");
+  assert.equal((second.body.data as { fetchOk?: boolean }).fetchOk, true);
 
   const third = await getJson(`${h.baseUrl}/api/prs`);
   assert.equal(third.body.data!.prs![0].number, 505);

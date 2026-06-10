@@ -34,6 +34,19 @@ export const currentPr = computed<PrView | null>(() => {
 
 let lastFetchAt = 0;
 
+// One-shot fast retry after a failed gh fetch — 5s instead of waiting
+// out the 30s poll tick. Never stacks; skipped while the tab is hidden
+// (the visibility hook catches up on return).
+let retryHandle: ReturnType<typeof setTimeout> | null = null;
+
+function scheduleRetry(): void {
+  if (retryHandle != null) return;
+  retryHandle = setTimeout(() => {
+    retryHandle = null;
+    if (!isHidden()) void refreshPrs();
+  }, 5_000);
+}
+
 export async function refreshPrs(): Promise<void> {
   lastFetchAt = Date.now();
   prsLoading.value = true;
@@ -41,6 +54,21 @@ export async function refreshPrs(): Promise<void> {
     const q = selectedRepo.value ? `?repo=${encodeURIComponent(selectedRepo.value)}` : "";
     const url = `/api/prs${q}`;
     const data = await apiGet<PrsResponse>(url);
+    if (data.fetchOk === false) {
+      // The server's gh call failed — the empty list is failure-shaped,
+      // not truth. Keep the last good list when it belongs to the same
+      // repo, surface a banner, and retry shortly.
+      const sameRepo = prsRepoRoot.value !== null && prsRepoRoot.value === (data.repoRoot || null);
+      if (!sameRepo) {
+        prs.value = [];
+        prMe.value = data.me || "";
+        prsRepoName.value = data.repo || null;
+        prsRepoRoot.value = data.repoRoot || null;
+      }
+      prsError.value = "GitHub fetch failed — retrying…";
+      scheduleRetry();
+      return;
+    }
     prs.value = data.prs || [];
     prMe.value = data.me || "";
     prsRepoName.value = data.repo || null;

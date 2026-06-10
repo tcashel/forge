@@ -1342,7 +1342,16 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
       ...pr,
       worktree: summarizeWorktreeForPr(store, target.root, pr.number),
     }));
-    return jsonOk({ prs: enriched, me: result.me, repo: target.name, repoRoot: target.root });
+    // fetchOk lets the client distinguish "genuinely no open PRs" from
+    // "gh call failed" — the latter renders as a retrying banner over
+    // the last good list instead of a false "No open PRs".
+    return jsonOk({
+      prs: enriched,
+      me: result.me,
+      repo: target.name,
+      repoRoot: target.root,
+      fetchOk: result.ok !== false,
+    });
   }
 
   // GET /api/worktrees?repo=<name>
