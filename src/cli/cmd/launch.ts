@@ -94,6 +94,10 @@ interface ResolvedLaunchConfig {
   fixerReasoning?: ReasoningEffort;
   autoFix: boolean;
   autoFixRounds: number;
+  /** Stage watchdog overrides (minutes) from repoConfig; runner defaults apply when unset. */
+  agentTimeoutMinutes?: number;
+  reviewerTimeoutMinutes?: number;
+  fixerTimeoutMinutes?: number;
 }
 
 function isAgent(v: unknown): v is LaunchTarget {
@@ -295,6 +299,9 @@ export function resolveLaunchConfig(
       fixerReasoning,
       autoFix,
       autoFixRounds,
+      agentTimeoutMinutes: repoConfig.agentTimeoutMinutes,
+      reviewerTimeoutMinutes: repoConfig.reviewerTimeoutMinutes,
+      fixerTimeoutMinutes: repoConfig.fixerTimeoutMinutes,
     },
     problems: [],
   };
@@ -428,6 +435,9 @@ export async function doLaunch(opts: DoLaunchOpts, store: ForgeStore): Promise<D
         fixerTarget: resolved.fixerAgent,
         fixerModel: resolved.fixerModel,
         fixerReasoningEffort: resolved.fixerReasoning,
+        agentTimeoutMinutes: resolved.agentTimeoutMinutes,
+        reviewerTimeoutMinutes: resolved.reviewerTimeoutMinutes,
+        fixerTimeoutMinutes: resolved.fixerTimeoutMinutes,
         ghUser: repoConfig.ghUser,
         ghHost: repoConfig.ghHost,
       },
@@ -490,6 +500,9 @@ function dryRunHumanFormat(c: ResolvedLaunchConfig, planId: string): string {
   lines.push(`  fixer-model: ${c.fixerModel}`);
   if (c.fixerReasoning) lines.push(`  fixer-reasoning: ${c.fixerReasoning}`);
   lines.push(`  auto-fix: ${c.autoFix} (rounds: ${c.autoFixRounds})`);
+  if (c.agentTimeoutMinutes) lines.push(`  agent-timeout: ${c.agentTimeoutMinutes}m`);
+  if (c.reviewerTimeoutMinutes) lines.push(`  reviewer-timeout: ${c.reviewerTimeoutMinutes}m`);
+  if (c.fixerTimeoutMinutes) lines.push(`  fixer-timeout: ${c.fixerTimeoutMinutes}m`);
   return lines.join("\n");
 }
 

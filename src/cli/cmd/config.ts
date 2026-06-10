@@ -32,6 +32,9 @@ Common keys:
   reviewerReasoningEffort                low|medium|high|xhigh (codex only)
   fixerAgent, fixerModel, fixerReasoningEffort
   autoFix (true|false), autoFixRounds (int)
+  agentTimeoutMinutes (int)              Implementer watchdog for launch runs (default 120)
+  reviewerTimeoutMinutes (int)           Reviewer watchdog for launch runs (default 60)
+  fixerTimeoutMinutes (int)              Fixer watchdog for launch runs (default 60)
   ghUser, ghHost                         gh-cli account / host overrides
   jiraProject, jiraType
   critiqueAgentA / critiqueModelA / critiqueReasoningA  (and B / Synth)
@@ -78,7 +81,7 @@ const EFFORT_KEYS = [
   "improverReasoning",
 ] as const;
 const BOOLEAN_KEYS = ["autoFix", "autoImprove"] as const;
-const NUMBER_KEYS = ["autoFixRounds"] as const;
+const NUMBER_KEYS = ["autoFixRounds", "agentTimeoutMinutes", "reviewerTimeoutMinutes", "fixerTimeoutMinutes"] as const;
 
 const VALID_AGENTS: LaunchTarget[] = ["claude", "codex", "opencode", "gemini"];
 const VALID_EFFORTS: ReasoningEffort[] = ["low", "medium", "high", "xhigh"];

@@ -136,6 +136,13 @@ export interface RepoConfig {
   fixerReasoningEffort?: ReasoningEffort;
   autoFix?: boolean;
   autoFixRounds?: number;
+  // ── Stage watchdog timeouts (minutes) ───────────────────────────────────
+  /** Implementer-stage watchdog for launch runs, in minutes (runner default: 120). */
+  agentTimeoutMinutes?: number;
+  /** Reviewer-stage watchdog for launch runs, in minutes (runner default: 60). */
+  reviewerTimeoutMinutes?: number;
+  /** Fixer-stage watchdog for launch runs, in minutes (runner default: 60). */
+  fixerTimeoutMinutes?: number;
   // ── Auto-improve (forge spec save) ──────────────────────────────────────
   /** Run the auto-improve loop after `forge spec save`. Treated as `true` when undefined. */
   autoImprove?: boolean;
