@@ -27,7 +27,9 @@ export function DigestCard({ bundle, repoRoot }: Props) {
   const prNum = bundle.pr.number;
   const digest = prDigest.value;
   const session = activeDigestSession.value;
-  const running = session !== null && session.prNum === prNum && session.done !== true;
+  // PR numbers collide across repos — a digest running for repo A's #7 must
+  // not read as "digesting…" on repo B's #7.
+  const running = session !== null && session.prNum === prNum && session.repoRoot === repoRoot && session.done !== true;
   const err = digestError.value;
 
   // While a digest worker runs, subscribe to its log stream just for the
