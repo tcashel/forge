@@ -110,9 +110,9 @@ export interface ReapStaleWorkerSessionsOpts {
 }
 
 /**
- * Finalize `running` review / comment-fix sessions whose worker is provably
- * gone (recorded pid is dead) or stale (no pid recorded and started_at older
- * than the TTL). Returns the reaped rows so callers can log.
+ * Finalize `running` review / comment-fix / digest sessions whose worker is
+ * provably gone (recorded pid is dead) or stale (no pid recorded and
+ * started_at older than the TTL). Returns the reaped rows so callers can log.
  *
  * Never throws — a reaper that crashes its caller would be worse than the
  * stale rows it sweeps.
@@ -130,7 +130,7 @@ export function reapStaleWorkerSessions(
       .prepare(
         `SELECT id, purpose, pid, started_at, metrics
            FROM sessions
-          WHERE purpose IN ('review', 'comment-fix') AND state = 'running'`,
+          WHERE purpose IN ('review', 'comment-fix', 'digest') AND state = 'running'`,
       )
       .all() as StaleSessionRow[];
   } catch {

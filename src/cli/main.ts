@@ -12,6 +12,7 @@ import { runCommentFixWorker } from "./cmd/comment-fix-actions.ts";
 import * as config from "./cmd/config.ts";
 import * as critique from "./cmd/critique.ts";
 import * as dash from "./cmd/dash.ts";
+import { runDigestWorker } from "./cmd/digest-actions.ts";
 import * as history from "./cmd/history.ts";
 import * as launch from "./cmd/launch.ts";
 import * as logs from "./cmd/logs.ts";
@@ -216,6 +217,10 @@ export async function run(argv: string[]): Promise<void> {
       case "__comment-fix-worker":
         // Internal worker spawned by runCommentFix.
         await runCommentFixWorker(rest, store);
+        return;
+      case "__digest-worker":
+        // Internal worker spawned by runPrDigest.
+        await runDigestWorker(rest, store);
         return;
       case "__extract-review":
         // Internal helper the tmux launch runner calls to extract the

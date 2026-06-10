@@ -89,6 +89,7 @@ import {
 import { CliError } from "../output.ts";
 import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
+import { loadLatestDigest, runPrDigest } from "./digest-actions.ts";
 import { doLaunch } from "./launch.ts";
 import {
   findLatestForgeFindings,
@@ -1512,6 +1513,25 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
     }
   }
 
+  // GET /api/prs/:num/digest?repo=<root> — newest completed digest for this
+  // PR, or null. Pure DB/disk read; the client compares digest.headSha to the
+  // bundle's headRefOid to flag staleness.
+  const digestGetMatch = pathname.match(/^\/api\/prs\/([^/]+)\/digest$/);
+  if (digestGetMatch) {
+    const numRaw = decodeURIComponent(digestGetMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = url.searchParams.get("repo") || undefined;
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) {
+      return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam ?? "<unset>"}".`);
+    }
+    return jsonOk({ digest: loadLatestDigest(store, prNum, target.root) });
+  }
+
   // GET /api/prs/:num/reviews?repo=<root>
   const reviewListMatch = pathname.match(/^\/api\/prs\/([^/]+)\/reviews$/);
   if (reviewListMatch) {
@@ -2071,7 +2091,8 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
     row.purpose === "execution" ||
     row.purpose === "review" ||
     row.purpose === "fix" ||
-    row.purpose === "comment-fix"
+    row.purpose === "comment-fix" ||
+    row.purpose === "digest"
   ) {
     const job = store.db.db
       .prepare(
@@ -2081,9 +2102,9 @@ export function resolveSessionLogFile(store: ForgeStore, sessionId: string): str
       )
       .get(sessionId, row.related_id) as { plan_id: string } | undefined;
     if (job) return store.getLogFile(job.plan_id);
-    // Ad-hoc reviewer and comment-fix sessions have no joined jobs row —
-    // fall back to metrics.logFile written by the parent orchestrator.
-    if (row.purpose === "review" || row.purpose === "comment-fix") {
+    // Ad-hoc reviewer / comment-fix / digest sessions have no joined jobs
+    // row — fall back to metrics.logFile written by the parent orchestrator.
+    if (row.purpose === "review" || row.purpose === "comment-fix" || row.purpose === "digest") {
       try {
         const metrics = JSON.parse(row.metrics ?? "{}") as { logFile?: unknown };
         if (typeof metrics.logFile === "string" && metrics.logFile) return metrics.logFile;
@@ -2143,6 +2164,7 @@ const PLAN_EDIT_ACTION_PATH = /^\/api\/plans\/([^/]+)\/plan-edit\/(accept|reject
 const PR_RUN_REVIEW_PATH = /^\/api\/prs\/([^/]+)\/run-review$/;
 const PR_FIX_COMMENTS_PATH = /^\/api\/prs\/([^/]+)\/fix-comments$/;
 const PR_LIFECYCLE_PATH = /^\/api\/prs\/([^/]+)\/(ready|approve)$/;
+const PR_DIGEST_PATH = /^\/api\/prs\/([^/]+)\/digest$/;
 const PR_REVIEW_PUBLISH_PATH = /^\/api\/prs\/([^/]+)\/reviews\/([^/]+)\/publish$/;
 const WORKTREES_REMOVE_PATH = "/api/worktrees/remove";
 const WORKTREES_CLEAN_MERGED_PATH = "/api/worktrees/clean-merged";
@@ -2166,6 +2188,7 @@ function allowsPost(pathname: string): boolean {
   if (PR_RUN_REVIEW_PATH.test(pathname)) return true;
   if (PR_FIX_COMMENTS_PATH.test(pathname)) return true;
   if (PR_LIFECYCLE_PATH.test(pathname)) return true;
+  if (PR_DIGEST_PATH.test(pathname)) return true;
   if (PR_REVIEW_PUBLISH_PATH.test(pathname)) return true;
   if (
     pathname === WORKTREES_REMOVE_PATH ||
@@ -2544,6 +2567,36 @@ async function dispatchApiPost(req: Request, url: URL, ctx: RouteCtx): Promise<R
         if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
         if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
         if (e.code === "REVIEW_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
+        return fromCliError(e);
+      }
+      throw e;
+    }
+  }
+
+  // POST /api/prs/:num/digest — body { repo }. Spawns the detached digest
+  // worker (clone of run-review's orchestration); the result is read back via
+  // GET /api/prs/:num/digest once the SSE log stream fires `done`.
+  const digestPostMatch = pathname.match(PR_DIGEST_PATH);
+  if (digestPostMatch) {
+    const numRaw = decodeURIComponent(digestPostMatch[1]);
+    const prNum = Number.parseInt(numRaw, 10);
+    if (!Number.isFinite(prNum) || prNum <= 0 || String(prNum) !== numRaw) {
+      return jsonErr(400, "INVALID_PR_NUMBER", `PR number must be a positive integer (got "${numRaw}").`);
+    }
+    const repoParam = reqString(body, "repo");
+    if (!repoParam) return jsonErr(400, "BAD_REQUEST", "`repo` is required.");
+    const repos = buildRepoViews(store, ctx.currentRepo);
+    const target = resolvePrRepo(repos, repoParam);
+    if (!target) return jsonErr(404, "UNKNOWN_REPO", `No registered repo matches "${repoParam}".`);
+    try {
+      const result = await runPrDigest({ prNum, repoRoot: target.root, repoName: target.name }, store);
+      return jsonOk({ sessionId: result.sessionId, logStreamUrl: result.logStreamUrl });
+    } catch (e) {
+      if (e instanceof CliError) {
+        if (e.code === "PR_NOT_FOUND") return jsonErr(404, e.code, e.message, e.hint);
+        if (e.code === "GH_AUTH" || e.code === "GH_FAIL") return jsonErr(502, e.code, e.message, e.hint);
+        if (e.code === "REVIEWER_NOT_CONFIGURED") return jsonErr(500, e.code, e.message, e.hint);
+        if (e.code === "DIGEST_IN_FLIGHT") return jsonErr(409, e.code, e.message, e.hint);
         return fromCliError(e);
       }
       throw e;

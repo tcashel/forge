@@ -45,6 +45,7 @@ export type SessionPurpose =
   | "review"
   | "fix"
   | "comment-fix"
+  | "digest"
   | "improvement";
 
 export type SessionState = "running" | "completed" | "failed" | "killed";

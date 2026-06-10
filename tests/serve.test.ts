@@ -896,6 +896,33 @@ test("GET /api/prs/:num/commits never caches a failed fetch", async (t) => {
   assert.equal(calls, 2, "the successful result IS cached");
 });
 
+test("GET /api/prs/:num/digest returns null before any digest run and validates input", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+
+  const none = await getJson(`${h.baseUrl}/api/prs/7/digest`);
+  assert.equal(none.status, 200);
+  assert.equal((none.body.data as { digest: unknown }).digest, null);
+
+  const bad = await getJson(`${h.baseUrl}/api/prs/abc/digest`);
+  assert.equal(bad.status, 400);
+  assert.equal(bad.body.error!.code, "INVALID_PR_NUMBER");
+
+  const unknownRepo = await getJson(`${h.baseUrl}/api/prs/7/digest?repo=/tmp/no-such-repo`);
+  assert.equal(unknownRepo.status, 404);
+  assert.equal(unknownRepo.body.error!.code, "UNKNOWN_REPO");
+});
+
+test("POST /api/prs/:num/digest maps REVIEWER_NOT_CONFIGURED to 500", async (t) => {
+  const h = await bootServer();
+  t.after(() => h.stop());
+  // The test repo (process.cwd()) has no reviewerAgent configured in the tmp
+  // store, so the orchestrator rejects before any gh/spawn happens.
+  const { status, body } = await postJson(`${h.baseUrl}/api/prs/7/digest`, { repo: process.cwd() });
+  assert.equal(status, 500);
+  assert.equal(body.error!.code, "REVIEWER_NOT_CONFIGURED");
+});
+
 test("POST /api/prs/:num/{ready,approve} run the matching gh command and invalidate the PR cache", async (t) => {
   const ghCalls: string[][] = [];
   __setPrWriteGhRunner(((args: string[]) => {

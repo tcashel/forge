@@ -207,7 +207,9 @@ function classifyFence(line: string): { fence: boolean; opening: boolean } {
  * fence into swallowing the real block; a forge-review opener encountered
  * at depth 1 additionally restarts the capture (unterminated-block rescue).
  */
-const FORGE_REVIEW_OPENER = /^\s{0,3}```forge-review\s*$/;
+function taggedOpener(tag: string): RegExp {
+  return new RegExp(`^\\s{0,3}\`\`\`${tag}\\s*$`);
+}
 
 function hasBareFenceAhead(lines: string[], from: number): boolean {
   for (let j = from; j < lines.length; j++) {
@@ -218,22 +220,32 @@ function hasBareFenceAhead(lines: string[], from: number): boolean {
 }
 
 export function extractLastForgeReviewBlock(rawMd: string): string | null {
+  return extractLastTaggedBlock(rawMd, "forge-review");
+}
+
+/**
+ * Generalized form of the forge-review extractor: pull the LAST ```<tag>
+ * fenced block out of raw agent output, with the same nested-fence handling.
+ * forge-review and forge-digest both ride this.
+ */
+export function extractLastTaggedBlock(rawMd: string, tag: string): string | null {
   if (!rawMd) return null;
+  const opener = taggedOpener(tag);
   const lines = rawMd.split(/\r?\n/);
   let lastOpenerIdx = -1;
   for (let j = 0; j < lines.length; j++) {
-    if (FORGE_REVIEW_OPENER.test(lines[j])) lastOpenerIdx = j;
+    if (opener.test(lines[j])) lastOpenerIdx = j;
   }
   if (lastOpenerIdx === -1) return null;
 
   let last: string | null = null;
   let i = 0;
   while (i < lines.length) {
-    if (!FORGE_REVIEW_OPENER.test(lines[i])) {
+    if (!opener.test(lines[i])) {
       i++;
       continue;
     }
-    // Opening forge-review fence — capture until the matching close,
+    // Opening tagged fence — capture until the matching close,
     // tracking nested fences so an inner ```text doesn't end the block.
     const isLastBlock = i === lastOpenerIdx;
     const buf: string[] = [];
@@ -241,7 +253,7 @@ export function extractLastForgeReviewBlock(rawMd: string): string | null {
     i++;
     while (i < lines.length && depth > 0) {
       const line = lines[i];
-      if (depth === 1 && FORGE_REVIEW_OPENER.test(line)) {
+      if (depth === 1 && opener.test(line)) {
         // A forge-review opener directly at depth 1 means the current block
         // was unterminated — close the capture here; the outer loop restarts
         // on this line so it can never swallow a later (real) review block.
