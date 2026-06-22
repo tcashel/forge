@@ -231,6 +231,53 @@ test("the unified/split toggle renders both modes", async () => {
   assert.ok(document.getElementById("diff-row-src/app.ts-4"), "comment anchor lost in unified mode");
 });
 
+test("a LEFT-side comment on a context line renders in the old (left) split column", async () => {
+  // Context line "export const y = 4;" is diffPosition 5 (oldLine 3). A
+  // review comment left on its OLD side must surface in the left column in
+  // split mode, not under the right-hand line.
+  const leftComment: PrReviewBundle = {
+    ...bundle(),
+    inlineComments: [
+      {
+        id: 202,
+        user: "octocat",
+        body: "old-side note",
+        path: "src/app.ts",
+        position: 5,
+        originalPosition: null,
+        line: 3,
+        originalLine: null,
+        side: "LEFT",
+        startLine: null,
+        startSide: null,
+        inReplyToId: null,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        htmlUrl: "",
+        commitId: "",
+      },
+    ],
+  };
+  entry.mount(root, leftComment, []);
+  await tick();
+  const splitBtn = [...document.querySelectorAll(".review-diff-mode-btn")].find(
+    (b) => b.textContent?.trim() === "Split",
+  ) as HTMLButtonElement | undefined;
+  assert.ok(splitBtn, "split toggle missing");
+  splitBtn.click();
+  await tick();
+
+  const widget = document.getElementById("diff-row-src/app.ts-5");
+  assert.ok(widget, "left-side context comment widget missing in split mode");
+  assert.ok(widget.textContent?.includes("old-side note"), "comment body missing");
+  const cell = widget.closest("td");
+  assert.ok(cell, "widget not inside a table cell");
+  assert.ok(
+    cell.className.includes("diff-line-extend-old-content"),
+    `left-side comment should be in the old column, got: ${cell.className}`,
+  );
+});
+
 test("marking a file viewed collapses its diff body", async () => {
   entry.mount(root, bundle(), findings());
   await tick();

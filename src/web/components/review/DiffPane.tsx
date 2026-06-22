@@ -1,7 +1,7 @@
 import { DiffModeEnum, DiffView } from "@git-diff-view/react";
 import type { FunctionComponent } from "preact";
 import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
-import { type DiffFile, findRow, parseUnifiedDiff, splitDiffSegments } from "../../lib/diff";
+import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff, splitDiffSegments } from "../../lib/diff";
 import {
   detectLang,
   ensureLang,
@@ -150,11 +150,33 @@ interface DiffViewProps {
 const DiffViewTyped = DiffView as unknown as FunctionComponent<DiffViewProps>;
 
 /**
+ * Which split-mode column a row's widget belongs in. In split mode the
+ * library renders the extend line into a side-specific cell (old → left,
+ * new → right), so the side here decides where the comment/finding shows.
+ *
+ * Deletions live on the old (left) side, additions on the new (right). A
+ * context line exists on both sides: findings annotate the new-side code, so
+ * they stay right, but a comment left explicitly on the OLD side belongs in
+ * the left column — otherwise a left-side thread renders under the
+ * right-hand line. A context row that mixes a finding (or a right-side
+ * comment) with a left-side comment stays on the new side so the row keeps a
+ * single widget — and therefore a single `rowDomId` (the rail/nav jump
+ * anchor); splitting it would mint a duplicate id for one diffPosition.
+ */
+function extendSide(r: DiffRow, threads: InlineThread[], findings: ForgeFinding[]): "old" | "new" {
+  if (r.kind === "deletion") return "old";
+  if (r.kind === "addition") return "new";
+  if (findings.length === 0 && threads.length > 0 && threads.every((t) => t.root.side === "LEFT")) {
+    return "old";
+  }
+  return "new";
+}
+
+/**
  * Build the library's per-line `extendData` for a file from the anchored
- * comment/finding maps. Findings and additions/context anchor on the new
- * (RIGHT) side by line number; deletions anchor on the old (LEFT) side. The
- * payload carries `diffPosition` so the widget can stamp the row DOM id that
- * the rail/nav jump to.
+ * comment/finding maps. The payload carries `diffPosition` so the widget can
+ * stamp the row DOM id that the rail/nav jump to; `extendSide` picks the
+ * split-mode column (see its doc).
  */
 function buildExtendData(
   file: DiffFile,
@@ -170,11 +192,11 @@ function buildExtendData(
       const threads = threadsByAnchor.get(key) ?? [];
       const findings = findingsByAnchor.get(key) ?? [];
       if (threads.length === 0 && findings.length === 0) continue;
-      const isOld = r.kind === "deletion";
-      const lineNumber = isOld ? r.oldLine : r.newLine;
+      const side = extendSide(r, threads, findings);
+      const lineNumber = side === "old" ? r.oldLine : r.newLine;
       if (lineNumber == null) continue;
       const payload: ExtendPayload = { file: file.path, diffPosition: r.diffPosition, threads, findings };
-      (isOld ? oldFile : newFile)[lineNumber] = { data: payload };
+      (side === "old" ? oldFile : newFile)[lineNumber] = { data: payload };
       any = true;
     }
   }
