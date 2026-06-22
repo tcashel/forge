@@ -278,6 +278,36 @@ test("a LEFT-side comment on a context line renders in the old (left) split colu
   );
 });
 
+test("a file that loses all findings clears its stale widgets without remounting", async () => {
+  // config.yaml has no inline comments; put a finding on its changed line
+  // (newLine 2 → diffPosition 3), then switch to a findings set with none.
+  const cfgFinding: ForgeFinding = {
+    id: "C1",
+    severity: "HIGH",
+    title: "bump version",
+    file: "config.yaml",
+    lineStart: 2,
+    lineEnd: 2,
+    evidence: null,
+    why: "x",
+    fix: "y",
+  };
+  entry.mount(root, bundle(), [cfgFinding]);
+  await tick();
+  assert.ok(document.getElementById("diff-row-config.yaml-3"), "finding widget should render on config.yaml initially");
+
+  // The DiffView stays mounted across a findings switch (run selection), and
+  // the library keeps its prior extendData when the prop is omitted — so the
+  // now-empty file must pass an empty map to clear the stale widget.
+  entry.mount(root, bundle(), []);
+  await tick();
+  assert.equal(
+    document.getElementById("diff-row-config.yaml-3"),
+    null,
+    "stale finding widget must clear when the file drops to zero entries",
+  );
+});
+
 test("marking a file viewed collapses its diff body", async () => {
   entry.mount(root, bundle(), findings());
   await tick();

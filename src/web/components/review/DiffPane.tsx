@@ -177,15 +177,21 @@ function extendSide(r: DiffRow, threads: InlineThread[], findings: ForgeFinding[
  * comment/finding maps. The payload carries `diffPosition` so the widget can
  * stamp the row DOM id that the rail/nav jump to; `extendSide` picks the
  * split-mode column (see its doc).
+ *
+ * Always returns the maps (even empty) — never `undefined`. The library's
+ * prop-sync only calls `setExtendData` when the prop is truthy, so omitting
+ * it leaves the previous widgets in the store. Switching the displayed
+ * findings (run selection) on a still-mounted DiffView can drop a file to
+ * zero entries; an empty map clears the stale keys, an `undefined` would
+ * strand them on screen.
  */
 function buildExtendData(
   file: DiffFile,
   threadsByAnchor: Map<string, InlineThread[]>,
   findingsByAnchor: Map<string, ForgeFinding[]>,
-): DiffViewProps["extendData"] | undefined {
+): DiffViewProps["extendData"] {
   const oldFile: Record<number, { data: ExtendPayload }> = {};
   const newFile: Record<number, { data: ExtendPayload }> = {};
-  let any = false;
   for (const h of file.hunks) {
     for (const r of h.rows) {
       const key = `${file.path}@${r.diffPosition}`;
@@ -197,10 +203,9 @@ function buildExtendData(
       if (lineNumber == null) continue;
       const payload: ExtendPayload = { file: file.path, diffPosition: r.diffPosition, threads, findings };
       (side === "old" ? oldFile : newFile)[lineNumber] = { data: payload };
-      any = true;
     }
   }
-  return any ? { oldFile, newFile } : undefined;
+  return { oldFile, newFile };
 }
 
 function ExtendWidget({ payload }: { payload: ExtendPayload }) {
