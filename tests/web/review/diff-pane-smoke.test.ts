@@ -205,6 +205,30 @@ test("the unified/split toggle renders both modes", async () => {
   splitBtn.click();
   await tick();
   assert.ok(document.querySelector(".split-diff-view"), "split view did not render after toggle");
+
+  // Scroll targets must still resolve in split mode — the finding/comment
+  // jump (scrollToFinding) looks up `diff-row-<file>-<pos>` by id, and split
+  // renders two columns, so a regression here is a duplicate-id or a dropped
+  // widget. Assert each anchor resolves to exactly one element.
+  assert.equal(
+    document.querySelectorAll("#diff-row-src\\/app\\.ts-3").length,
+    1,
+    "finding anchor must resolve to exactly one row in split mode",
+  );
+  assert.equal(
+    document.querySelectorAll("#diff-row-src\\/app\\.ts-4").length,
+    1,
+    "comment anchor must resolve to exactly one row in split mode",
+  );
+
+  // Flip back to unified and confirm the same anchors resolve there too.
+  const unifiedBtn = buttons.find((b) => b.textContent?.trim() === "Unified");
+  assert.ok(unifiedBtn, "unified toggle missing");
+  unifiedBtn.click();
+  await tick();
+  assert.ok(document.querySelector(".unified-diff-view"), "unified view did not render after toggle back");
+  assert.ok(document.getElementById("diff-row-src/app.ts-3"), "finding anchor lost in unified mode");
+  assert.ok(document.getElementById("diff-row-src/app.ts-4"), "comment anchor lost in unified mode");
 });
 
 test("marking a file viewed collapses its diff body", async () => {

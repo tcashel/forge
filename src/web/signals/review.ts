@@ -72,8 +72,13 @@ effect(() => {
   writeViewedFiles(viewedFilesScope.repoRoot, viewedFilesScope.prNumber, viewedFilesScope.headSha, files);
 });
 
-/** Hydrate viewed-state for a freshly-loaded bundle. Called by loadReviewBundle. */
-function hydrateViewedFiles(repoRoot: string, prNumber: number, headSha: string, reviewable: string[]): void {
+/**
+ * Hydrate viewed-state for a freshly-loaded bundle. Called by
+ * loadReviewBundle (the only production caller); exported so the
+ * signal-level integration test can drive the same scope/persistence wiring
+ * a PR switch or reload exercises without standing up the network.
+ */
+export function hydrateViewedFiles(repoRoot: string, prNumber: number, headSha: string, reviewable: string[]): void {
   hydratingViewedFiles = true;
   try {
     viewedFilesScope = { repoRoot, prNumber, headSha };
