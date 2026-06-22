@@ -143,10 +143,11 @@ body{
 .app{
   position:fixed; inset:0;
   display:grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: var(--side-w, 240px) 1fr;
   grid-template-rows: 56px 1fr;
   grid-template-areas: "side topbar" "side body";
 }
+.app.side-collapsed{ --side-w: 60px; }
 
 .side{
   grid-area:side;
@@ -233,6 +234,33 @@ body{
   background: var(--panel); color: var(--text-2);
   border: 1px solid var(--rule-2);
 }
+
+/* Collapse-to-icons toggle + collapsed sidebar state */
+.side-collapse-btn{
+  margin-left: 6px; flex: none;
+  width: 22px; height: 22px; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent;
+  color: var(--dim); font-size: 13px; line-height: 1; cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.side-collapse-btn:hover{ background: var(--hover); color: var(--text); }
+.brand .v{ margin-left: auto; }
+
+.side.collapsed .brand{ justify-content: center; gap: 4px; padding: 18px 8px 14px; }
+.side.collapsed .brand-name,
+.side.collapsed .brand .v,
+.side.collapsed .nav-item .lbl,
+.side.collapsed .nav-item .count,
+.side.collapsed .nav-section,
+.side.collapsed .nav-chips,
+.side.collapsed .new-plan .lbl,
+.side.collapsed .side-foot{ display: none; }
+.side.collapsed .side-collapse-btn{ margin-left: 0; }
+.side.collapsed .nav{ padding: 0 8px; }
+.side.collapsed .nav-item{ justify-content: center; gap: 0; padding: 9px 0; }
+.side.collapsed .nav-item .ic{ width: auto; }
+.side.collapsed .new-plan{ margin: 8px 10px 18px; padding: 11px 0; }
 
 .topbar{
   grid-area: topbar;
@@ -1565,7 +1593,9 @@ body.filtered-single .repo-chip{ display: none; }
 .review-page.review-three-pane {
   flex: 1;
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 380px;
+  /* Pane widths come from signals (lib/ui-layout.ts) via inline --review-*-w
+     custom properties; the 6px tracks are the drag handles. */
+  grid-template-columns: var(--review-nav-w, 240px) 6px minmax(0, 1fr) 6px var(--review-rail-w, 380px);
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   min-height: 0;
@@ -1573,12 +1603,102 @@ body.filtered-single .repo-chip{ display: none; }
   gap: 0;
 }
 .review-page.review-three-pane > .review-nav,
-.review-page.review-three-pane > .review-rail {
+.review-page.review-three-pane > .review-rail,
+.review-page.review-three-pane > .review-pane-strip {
   background: var(--bg-2);
   overflow-y: auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* Drag handles between panes */
+.review-splitter {
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+  z-index: 2;
+  touch-action: none;
+}
+.review-splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 1px;
+  margin: 0 auto;
+  background: var(--border);
+  transition: background 0.12s ease, width 0.12s ease;
+}
+.review-splitter:hover::before,
+.review-splitter:active::before,
+.review-splitter:focus-visible::before {
+  width: 3px;
+  background: var(--primary);
+}
+.review-splitter:focus-visible {
+  outline: none;
+}
+.review-splitter.inert {
+  cursor: default;
+}
+.review-splitter.inert::before {
+  width: 1px;
+  background: var(--border);
+}
+
+/* Pane-header collapse chevron + collapsed-strip expand control */
+.pane-collapse-btn,
+.pane-expand-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  flex: none;
+}
+.pane-collapse-btn:hover,
+.pane-expand-btn:hover {
+  background: var(--panel-2);
+  color: var(--fg);
+}
+.review-nav-header-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.review-rail-tools {
+  display: flex;
+  justify-content: flex-end;
+  padding: 2px 2px 0;
+}
+
+/* Collapsed pane: a 40px strip whose only job is to expand again */
+.review-pane-strip {
+  align-items: center;
+  padding: 10px 0;
+}
+.review-pane-strip .pane-expand-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 0;
+}
+.review-pane-strip .pane-expand-ic {
+  font-size: 14px;
+}
+.review-pane-strip .pane-strip-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
 }
 .review-page.review-three-pane .review-center {
   display: flex;
@@ -1881,6 +2001,11 @@ body.filtered-single .repo-chip{ display: none; }
     flex-direction: column;
     grid-template-columns: none;
   }
+  /* The drag handles only make sense in the side-by-side grid. */
+  .review-page.review-three-pane > .review-splitter { display: none; }
+  .review-page.review-three-pane > .review-pane-strip { flex-direction: row; padding: 8px 12px; }
+  .review-page.review-three-pane > .review-pane-strip .pane-expand-btn { flex-direction: row; }
+  .review-page.review-three-pane > .review-pane-strip .pane-strip-label { writing-mode: horizontal-tb; }
   .review-page.review-three-pane > .review-nav,
   .review-page.review-three-pane > .review-rail,
   .review-page.review-three-pane .review-center {

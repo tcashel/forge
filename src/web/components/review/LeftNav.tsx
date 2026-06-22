@@ -1,5 +1,6 @@
 import type { DiffFile } from "../../lib/diff";
 import { scrollToFile } from "../../lib/review-scroll";
+import { reviewNavCollapsed } from "../../signals/layout";
 import { viewedFiles, viewedProgress } from "../../signals/review";
 import type { ForgeFindingSeverity } from "../../types";
 
@@ -14,8 +15,21 @@ export function LeftNav({ files, findingsByFile }: Props) {
   return (
     <nav class="review-nav" aria-label="Files in this PR">
       <header class="review-nav-header">
-        <h2>Files</h2>
-        <span class="review-nav-count">{files.length}</span>
+        <div class="review-nav-header-main">
+          <h2>Files</h2>
+          <span class="review-nav-count">{files.length}</span>
+        </div>
+        <button
+          type="button"
+          class="pane-collapse-btn"
+          title="Collapse files panel"
+          aria-label="Collapse files panel"
+          onClick={() => {
+            reviewNavCollapsed.value = true;
+          }}
+        >
+          «
+        </button>
       </header>
       {progress.total > 0 ? (
         <p class="review-nav-progress">

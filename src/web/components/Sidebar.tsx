@@ -9,6 +9,7 @@ import {
   enterWorktreesMode,
 } from "../lib/modes";
 import { showToast } from "../lib/toast";
+import { sidebarCollapsed, toggleSidebar } from "../signals/layout";
 import { refreshLibrary } from "../signals/library";
 import { repos } from "../signals/repos";
 import { activityFilter, modalOpen, selectedRepo, sidebarFilter, viewMode } from "../signals/ui";
@@ -135,13 +136,24 @@ export function Sidebar() {
 
   const filter = sidebarFilter.value;
   const mode = viewMode.value;
+  const collapsed = sidebarCollapsed.value;
 
   return (
-    <aside class="side">
+    <aside class={`side${collapsed ? " collapsed" : ""}`}>
       <div class="brand">
         <span class="glyph" />
-        <span>FORGE</span>
+        <span class="brand-name">FORGE</span>
         <span class="v">workbench</span>
+        <button
+          type="button"
+          class="side-collapse-btn"
+          title={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-label={collapsed ? "Expand sidebar" : "Collapse sidebar"}
+          aria-pressed={collapsed}
+          onClick={toggleSidebar}
+        >
+          {collapsed ? "»" : "«"}
+        </button>
       </div>
       <button
         type="button"
@@ -150,7 +162,7 @@ export function Sidebar() {
         title="Create a new spec from the Workbench"
         onClick={onNewSpec}
       >
-        <span class="plus">+</span> New spec
+        <span class="plus">+</span> <span class="lbl">New spec</span>
       </button>
       <nav class="nav" id="nav">
         <div class="nav-section">Workspace</div>
@@ -162,6 +174,7 @@ export function Sidebar() {
               type="button"
               class={`nav-item${n.alert ? " alert" : ""}${isActive ? " active" : ""}`}
               data-target={n.id}
+              title={n.label}
               onClick={() => onNav(n.id)}
             >
               <span class="ic" style={n.color ? `color:${n.color}` : undefined}>
@@ -179,6 +192,7 @@ export function Sidebar() {
           type="button"
           class={`nav-item${mode === "library" ? " active" : ""}`}
           id="nav-library"
+          title="Library"
           onClick={onLibrary}
         >
           <span class="ic" style="color:var(--ready)">
@@ -191,6 +205,7 @@ export function Sidebar() {
           type="button"
           class={`nav-item${mode === "activity" ? " active" : ""}`}
           id="nav-activity"
+          title="Agent Activity"
           onClick={onActivity}
         >
           <span class="ic" style="color:var(--primary)">
@@ -216,6 +231,7 @@ export function Sidebar() {
           type="button"
           class={`nav-item${mode === "worktrees" ? " active" : ""}`}
           id="nav-worktrees"
+          title="Worktrees"
           onClick={onWorktrees}
         >
           <span class="ic" style="color:var(--ready)">
@@ -223,7 +239,13 @@ export function Sidebar() {
           </span>
           <span class="lbl">Worktrees</span>
         </button>
-        <button type="button" class={`nav-item${mode === "usage" ? " active" : ""}`} id="nav-usage" onClick={onUsage}>
+        <button
+          type="button"
+          class={`nav-item${mode === "usage" ? " active" : ""}`}
+          id="nav-usage"
+          title="Usage & Cost"
+          onClick={onUsage}
+        >
           <span class="ic" style="color:var(--done)">
             ◈
           </span>
@@ -234,12 +256,13 @@ export function Sidebar() {
           type="button"
           class={`nav-item${mode === "settings" ? " active" : ""}`}
           id="nav-settings"
+          title="Settings"
           onClick={onSettings}
         >
           <span class="ic">⚙</span>
           <span class="lbl">Settings</span>
         </button>
-        <button type="button" class="nav-item" id="nav-help" onClick={onHelp}>
+        <button type="button" class="nav-item" id="nav-help" title="Help & shortcuts" onClick={onHelp}>
           <span class="ic">?</span>
           <span class="lbl">Help &amp; shortcuts</span>
         </button>
