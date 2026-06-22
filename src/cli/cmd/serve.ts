@@ -86,6 +86,7 @@ import {
   TestLocallyError,
   type WorktreeEntry,
 } from "../../core/worktrees.ts";
+import { diffViewAliasPlugin } from "../../web/build-aliases.ts";
 import { CliError } from "../output.ts";
 import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
@@ -3160,6 +3161,8 @@ export async function startServer(
   if (typeof planChatReaper.unref === "function") planChatReaper.unref();
 
   const webDistDir = path.join(webDir, "dist");
+  // Project root (where node_modules lives) for the bundle's module aliasing.
+  const repoRootForBuild = path.resolve(webDir, "..", "..");
   try {
     fs.rmSync(webDistDir, { recursive: true, force: true });
     fs.mkdirSync(webDistDir, { recursive: true });
@@ -3174,6 +3177,11 @@ export async function startServer(
       // the review page) out of the main bundle so the workbench shell
       // loads fast and only review users pay for the highlighter.
       splitting: true,
+      // @git-diff-view/react is React-targeted; alias its react imports to
+      // preact/compat and swap @git-diff-view/lowlight for a no-op stub so
+      // highlight.js stays out of the bundle (review highlighting runs
+      // through the single Shiki instance in web/lib/highlight.ts).
+      plugins: [diffViewAliasPlugin(repoRootForBuild)],
       naming: {
         entry: "[name].js",
         chunk: "chunk-[name]-[hash].js",
@@ -3256,6 +3264,18 @@ export async function startServer(
           return jsonErr(405, "METHOD_NOT_ALLOWED", `${req.method} not allowed for ${pathname}.`);
         }
         return handleApi(url, ctx);
+      }
+
+      // Vendored diff-view stylesheet (scoped under .diff-tailwindcss-wrapper,
+      // no global resets). Resolved from node_modules so it tracks the
+      // installed @git-diff-view/react version.
+      if (pathname === "/vendor/git-diff-view.css") {
+        try {
+          const cssPath = path.join(repoRootForBuild, "node_modules/@git-diff-view/react/dist/css/diff-view.css");
+          return staticFile(cssPath, "text/css; charset=utf-8");
+        } catch {
+          return jsonErr(404, "NOT_FOUND", "diff-view.css not found.");
+        }
       }
 
       // Static UI. Serve src/web/<path>; default `/` → index.html.

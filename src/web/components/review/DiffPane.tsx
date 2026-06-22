@@ -1,18 +1,25 @@
-import { memo } from "preact/compat";
-import { useEffect, useMemo, useState } from "preact/hooks";
-import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff } from "../../lib/diff";
-import { detectLang, ensureLang, isLangLoaded, onHighlighterReady, tokenizeRow } from "../../lib/highlight";
+import { DiffModeEnum, DiffView } from "@git-diff-view/react";
+import type { FunctionComponent } from "preact";
+import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
+import { type DiffFile, findRow, parseUnifiedDiff, splitDiffSegments } from "../../lib/diff";
+import {
+  detectLang,
+  ensureLang,
+  getDiffHighlighter,
+  isLangLoaded,
+  onHighlighterReady,
+  shikiLangId,
+} from "../../lib/highlight";
 import { fileDomId, rowDomId } from "../../lib/review-scroll";
+import { expandedFiles, setFileExpanded, toggleViewedFile, viewedFiles } from "../../signals/review";
+import { theme } from "../../signals/theme";
 import type { ForgeFinding, InlinePrComment, PrReviewBundle } from "../../types";
 import { CommentThread, type InlineThread } from "./CommentThread";
+import { FindingCard } from "./FindingCard";
 
 interface Props {
   bundle: PrReviewBundle;
-  /**
-   * Kept for source-compat with prior call sites; the three-pane review
-   * surface routes findings to the right-rail FindingsRail and the
-   * DiffPane only renders rows + inline reviewer comments.
-   */
+  /** Findings to render inline as per-line widgets (also shown in FindingsRail). */
   findings?: ForgeFinding[];
 }
 
@@ -119,47 +126,98 @@ function anchorFindings(
   return { anchored, anchoredFlat, outside };
 }
 
-function rowGutter(r: DiffRow): string {
-  if (r.kind === "addition") return "+";
-  if (r.kind === "deletion") return "−";
-  return " ";
+// ─── @git-diff-view glue ─────────────────────────────────────────────────────
+
+// The library is React-typed; we run it under preact/compat. Narrow the
+// props we actually use to keep the call site type-safe without dragging in
+// the library's React-flavoured generics.
+type ExtendPayload = {
+  file: string;
+  diffPosition: number;
+  threads: InlineThread[];
+  findings: ForgeFinding[];
+};
+interface DiffViewProps {
+  data: { oldFile?: object; newFile?: object; hunks: string[] };
+  diffViewMode: number;
+  diffViewTheme: "light" | "dark";
+  diffViewHighlight: boolean;
+  diffViewWrap: boolean;
+  registerHighlighter: unknown;
+  extendData?: { oldFile?: Record<number, { data: ExtendPayload }>; newFile?: Record<number, { data: ExtendPayload }> };
+  renderExtendLine?: (args: { data?: ExtendPayload }) => preact.ComponentChildren;
+}
+const DiffViewTyped = DiffView as unknown as FunctionComponent<DiffViewProps>;
+
+/**
+ * Build the library's per-line `extendData` for a file from the anchored
+ * comment/finding maps. Findings and additions/context anchor on the new
+ * (RIGHT) side by line number; deletions anchor on the old (LEFT) side. The
+ * payload carries `diffPosition` so the widget can stamp the row DOM id that
+ * the rail/nav jump to.
+ */
+function buildExtendData(
+  file: DiffFile,
+  threadsByAnchor: Map<string, InlineThread[]>,
+  findingsByAnchor: Map<string, ForgeFinding[]>,
+): DiffViewProps["extendData"] | undefined {
+  const oldFile: Record<number, { data: ExtendPayload }> = {};
+  const newFile: Record<number, { data: ExtendPayload }> = {};
+  let any = false;
+  for (const h of file.hunks) {
+    for (const r of h.rows) {
+      const key = `${file.path}@${r.diffPosition}`;
+      const threads = threadsByAnchor.get(key) ?? [];
+      const findings = findingsByAnchor.get(key) ?? [];
+      if (threads.length === 0 && findings.length === 0) continue;
+      const isOld = r.kind === "deletion";
+      const lineNumber = isOld ? r.oldLine : r.newLine;
+      if (lineNumber == null) continue;
+      const payload: ExtendPayload = { file: file.path, diffPosition: r.diffPosition, threads, findings };
+      (isOld ? oldFile : newFile)[lineNumber] = { data: payload };
+      any = true;
+    }
+  }
+  return any ? { oldFile, newFile } : undefined;
 }
 
-// Memoized so a parent re-render (selection changes, sibling grammar
-// loads) skips rebuilding the token spans for unchanged rows. `loaded`
-// is part of the props so rows re-render exactly once when their own
-// grammar arrives.
-const RowContent = memo(function RowContent({
-  row,
-  lang,
-}: {
-  row: DiffRow;
-  lang: ReturnType<typeof detectLang>;
-  loaded: boolean;
-}) {
-  const tokens = lang ? tokenizeRow(row.content, lang) : null;
-  if (!tokens) {
-    return <span class="content">{row.content}</span>;
-  }
+function ExtendWidget({ payload }: { payload: ExtendPayload }) {
   return (
-    <span class="content">
-      {tokens.map((t, i) => (
-        <span key={i} style={t.color ? { color: t.color } : undefined}>
-          {t.text}
-        </span>
+    <div class="review-extend" id={rowDomId(payload.file, payload.diffPosition)}>
+      {payload.findings.map((f) => (
+        <FindingCard key={`f-${f.id}`} finding={f} />
       ))}
-    </span>
+      {payload.threads.map((t) => (
+        <CommentThread key={`t-${t.root.id}`} thread={t} />
+      ))}
+    </div>
   );
-});
+}
 
-function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnchor: Map<string, InlineThread[]> }) {
+function filePathLabel(file: DiffFile): string {
+  return file.isRename && file.oldPath ? `${file.oldPath} → ${file.path}` : file.path;
+}
+
+function DiffFileCard({
+  file,
+  rawSegment,
+  mode,
+  threadsByAnchor,
+  findingsByAnchor,
+}: {
+  file: DiffFile;
+  rawSegment: string;
+  mode: "unified" | "split";
+  threadsByAnchor: Map<string, InlineThread[]>;
+  findingsByAnchor: Map<string, ForgeFinding[]>;
+}) {
   const lang = useMemo(() => detectLang(file.path), [file.path]);
+  const langId = lang ? shikiLangId(lang) : undefined;
   useEffect(() => {
     if (lang && !file.isBinary) ensureLang(lang);
   }, [lang, file.isBinary]);
-  // Subscribe to highlighter load events, but only re-render when THIS
-  // file's grammar transitions to loaded — a `go` grammar finishing must
-  // not re-render every TypeScript card on the page.
+  // Re-mount the DiffView once this file's grammar arrives so the library
+  // re-runs syntax with the now-loaded grammar (see `key` below).
   const [loaded, setLoaded] = useState(() => (lang ? isLangLoaded(lang) : false));
   useEffect(() => {
     if (!lang || loaded) return;
@@ -171,53 +229,84 @@ function DiffFileCard({ file, threadsByAnchor }: { file: DiffFile; threadsByAnch
       if (isLangLoaded(lang)) setLoaded(true);
     });
   }, [lang, loaded]);
+
+  const themeMode: "light" | "dark" = theme.value === "dark" ? "dark" : "light";
+  const viewed = viewedFiles.value.has(file.path);
+  const collapsed = viewed && !expandedFiles.value.has(file.path);
+
+  const extendData = useMemo(
+    () => (file.isBinary ? undefined : buildExtendData(file, threadsByAnchor, findingsByAnchor)),
+    [file, threadsByAnchor, findingsByAnchor],
+  );
+
+  const data = useMemo(
+    () => ({
+      oldFile: { fileName: file.oldPath ?? file.path, fileLang: langId },
+      newFile: { fileName: file.path, fileLang: langId },
+      hunks: [rawSegment],
+    }),
+    [file.oldPath, file.path, langId, rawSegment],
+  );
+
+  const renderExtendLine = useCallback(
+    ({ data: payload }: { data?: ExtendPayload }) => (payload ? <ExtendWidget payload={payload} /> : null),
+    [],
+  );
+
   return (
-    <details class="review-file" id={fileDomId(file.path)} open>
-      <summary>
-        <span class="path">{file.isRename && file.oldPath ? `${file.oldPath} → ${file.path}` : file.path}</span>
+    <section class="review-file" id={fileDomId(file.path)} data-viewed={viewed ? "1" : undefined}>
+      <header class="review-file-header">
+        <button
+          type="button"
+          class="review-file-toggle"
+          onClick={() => setFileExpanded(file.path, collapsed)}
+          aria-expanded={!collapsed}
+          title={collapsed ? "Expand file" : "Collapse file"}
+        >
+          <span class={`review-file-caret ${collapsed ? "collapsed" : ""}`} aria-hidden="true">
+            ▾
+          </span>
+          <span class="path">{filePathLabel(file)}</span>
+        </button>
         <span class="counts">
           <span class="plus">+{file.additions}</span> <span class="minus">−{file.deletions}</span>
         </span>
-      </summary>
+        {file.isBinary ? null : (
+          <label class="review-file-viewed" title="Mark this file viewed">
+            <input type="checkbox" checked={viewed} onChange={() => toggleViewedFile(file.path)} />
+            <span>Viewed</span>
+          </label>
+        )}
+      </header>
       {file.isBinary ? (
         <p class="review-binary">Binary diff omitted.</p>
-      ) : (
-        <div class="review-hunks">
-          {file.hunks.map((h, hi) => (
-            <div class="review-hunk" key={`${file.path}-${hi}`}>
-              <div class="review-hunk-header">{h.header}</div>
-              {h.rows.map((r, ri) => {
-                const key = `${file.path}@${r.diffPosition}`;
-                const threads = threadsByAnchor.get(key);
-                return (
-                  <div key={`${hi}-${ri}`}>
-                    <div
-                      class={`review-row row-${r.kind}`}
-                      data-position={r.diffPosition}
-                      id={rowDomId(file.path, r.diffPosition)}
-                    >
-                      <span class="ln old">{r.oldLine ?? ""}</span>
-                      <span class="ln new">{r.newLine ?? ""}</span>
-                      <span class="gutter">{rowGutter(r)}</span>
-                      <RowContent row={r} lang={lang} loaded={loaded} />
-                    </div>
-                    {threads ? threads.map((t) => <CommentThread key={`thread-${t.root.id}`} thread={t} />) : null}
-                  </div>
-                );
-              })}
-            </div>
-          ))}
+      ) : collapsed ? null : (
+        <div class="review-file-diff">
+          <DiffViewTyped
+            key={`${file.path}::${mode}::${themeMode}::${loaded}`}
+            data={data}
+            diffViewMode={mode === "split" ? DiffModeEnum.Split : DiffModeEnum.Unified}
+            diffViewTheme={themeMode}
+            diffViewHighlight
+            diffViewWrap={false}
+            registerHighlighter={getDiffHighlighter()}
+            extendData={extendData}
+            renderExtendLine={renderExtendLine}
+          />
         </div>
       )}
-    </details>
+    </section>
   );
 }
 
-export function DiffPane({ bundle, findings: _findings }: Props) {
+export function DiffPane({ bundle, findings }: Props) {
   const { diff, inlineComments } = bundle;
   const parsed = useMemo(() => parseUnifiedDiff(diff), [diff]);
+  const segments = useMemo(() => splitDiffSegments(diff), [diff]);
   const threads = useMemo(() => groupIntoThreads(inlineComments), [inlineComments]);
-  const { anchored } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
+  const { anchored: threadsByAnchor } = useMemo(() => anchorThreads(threads, parsed), [threads, parsed]);
+  const { anchored: findingsByAnchor } = useMemo(() => anchorFindings(findings ?? [], parsed), [findings, parsed]);
+  const [mode, setMode] = useState<"unified" | "split">("unified");
 
   if (parsed.length === 0) {
     return (
@@ -229,8 +318,35 @@ export function DiffPane({ bundle, findings: _findings }: Props) {
 
   return (
     <section class="review-diff">
-      {parsed.map((file) => (
-        <DiffFileCard key={file.path} file={file} threadsByAnchor={anchored} />
+      <div class="review-diff-toolbar">
+        <div class="review-diff-mode" role="toolbar" aria-label="Diff view mode">
+          <button
+            type="button"
+            class={`review-diff-mode-btn ${mode === "unified" ? "active" : ""}`}
+            aria-pressed={mode === "unified"}
+            onClick={() => setMode("unified")}
+          >
+            Unified
+          </button>
+          <button
+            type="button"
+            class={`review-diff-mode-btn ${mode === "split" ? "active" : ""}`}
+            aria-pressed={mode === "split"}
+            onClick={() => setMode("split")}
+          >
+            Split
+          </button>
+        </div>
+      </div>
+      {parsed.map((file, i) => (
+        <DiffFileCard
+          key={file.path}
+          file={file}
+          rawSegment={segments[i] ?? ""}
+          mode={mode}
+          threadsByAnchor={threadsByAnchor}
+          findingsByAnchor={findingsByAnchor}
+        />
       ))}
     </section>
   );
