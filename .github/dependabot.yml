@@ -1,12 +1,13 @@
 # Dependabot configuration.
-# https://docs.github.com/code-security/dependabot/dependabot-version-updates/configuration-options-for-the-dependabot.yml-file
+# https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
 #
-# The "npm" ecosystem covers this repo's JS/TS dependencies; Dependabot reads
-# the Bun lockfile (bun.lock) through it.
+# This is a Bun-only repo (package.json + bun.lock), so the JS/TS block uses the
+# "bun" ecosystem — Dependabot's Bun updater keeps bun.lock in sync, which the
+# "npm" updater would not.
 version: 2
 updates:
   # JavaScript / TypeScript dependencies (package.json + bun.lock)
-  - package-ecosystem: "npm"
+  - package-ecosystem: "bun"
     directory: "/"
     schedule:
       interval: "weekly"
