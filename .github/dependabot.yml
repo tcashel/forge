@@ -1,0 +1,43 @@
+# Dependabot configuration.
+# https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
+#
+# This is a Bun-only repo (package.json + bun.lock), so the JS/TS block uses the
+# "bun" ecosystem — Dependabot's Bun updater keeps bun.lock in sync, which the
+# "npm" updater would not.
+version: 2
+updates:
+  # JavaScript / TypeScript dependencies (package.json + bun.lock)
+  - package-ecosystem: "bun"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    open-pull-requests-limit: 10
+    # No `labels:` block — Dependabot then auto-creates and applies its default
+    # `dependencies` label. Custom labels that don't already exist in the repo
+    # are silently ignored, so relying on the default is the robust choice.
+    commit-message:
+      prefix: "chore"
+      include: "scope"
+    # Batch low-risk bumps into one PR; majors still open individually so they
+    # get a closer look.
+    groups:
+      minor-and-patch:
+        update-types:
+          - "minor"
+          - "patch"
+
+  # GitHub Actions used by the workflows in .github/workflows
+  - package-ecosystem: "github-actions"
+    directory: "/"
+    schedule:
+      interval: "weekly"
+      day: "monday"
+    commit-message:
+      prefix: "ci"
+      include: "scope"
+    groups:
+      actions:
+        update-types:
+          - "minor"
+          - "patch"
