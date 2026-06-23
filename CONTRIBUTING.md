@@ -1,7 +1,7 @@
 # Contributing to Forge
 
 Thanks for your interest in Forge. It's an early-stage, pre-release project
-(`0.4.0-dev`) — APIs and config keys may still change. Contributions, bug
+(`0.4.0`) — APIs and config keys may still change. Contributions, bug
 reports, and ideas are welcome.
 
 ## Development setup

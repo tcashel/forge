@@ -290,7 +290,7 @@ bun run check         # biome check --write .
 
 ## Status
 
-- Pre-release (0.4.0-dev). API and config keys may change.
+- Pre-release (0.4.0). API and config keys may change.
 - Pi (the previous host) is removed entirely. The pre-rip snapshot is tagged `pre-rip-v0.3.0`.
 - `forge resume` is not yet wired — the supervisor that backed it was pi-specific. Re-launching a failed spec from scratch is the current path.
 
