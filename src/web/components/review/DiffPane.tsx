@@ -1,7 +1,7 @@
 import { DiffModeEnum, DiffView } from "@git-diff-view/react";
 import type { FunctionComponent } from "preact";
 import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
-import { type DiffFile, type DiffRow, findRow, parseUnifiedDiff, splitDiffSegments } from "../../lib/diff";
+import { type DiffFile, findRow, parseUnifiedDiff, splitDiffSegments } from "../../lib/diff";
 import {
   detectLang,
   ensureLang,
@@ -136,6 +136,12 @@ type ExtendPayload = {
   diffPosition: number;
   threads: InlineThread[];
   findings: ForgeFinding[];
+  /**
+   * Whether this widget carries the `rowDomId` scroll anchor. A context row
+   * can render two widgets (old + new column); exactly one is the anchor so
+   * the rail/nav jump still resolves to a single element.
+   */
+  anchor: boolean;
 };
 interface DiffViewProps {
   data: { oldFile?: object; newFile?: object; hunks: string[] };
@@ -150,33 +156,21 @@ interface DiffViewProps {
 const DiffViewTyped = DiffView as unknown as FunctionComponent<DiffViewProps>;
 
 /**
- * Which split-mode column a row's widget belongs in. In split mode the
- * library renders the extend line into a side-specific cell (old → left,
- * new → right), so the side here decides where the comment/finding shows.
- *
- * Deletions live on the old (left) side, additions on the new (right). A
- * context line exists on both sides: findings annotate the new-side code, so
- * they stay right, but a comment left explicitly on the OLD side belongs in
- * the left column — otherwise a left-side thread renders under the
- * right-hand line. A context row that mixes a finding (or a right-side
- * comment) with a left-side comment stays on the new side so the row keeps a
- * single widget — and therefore a single `rowDomId` (the rail/nav jump
- * anchor); splitting it would mint a duplicate id for one diffPosition.
- */
-function extendSide(r: DiffRow, threads: InlineThread[], findings: ForgeFinding[]): "old" | "new" {
-  if (r.kind === "deletion") return "old";
-  if (r.kind === "addition") return "new";
-  if (findings.length === 0 && threads.length > 0 && threads.every((t) => t.root.side === "LEFT")) {
-    return "old";
-  }
-  return "new";
-}
-
-/**
  * Build the library's per-line `extendData` for a file from the anchored
  * comment/finding maps. The payload carries `diffPosition` so the widget can
- * stamp the row DOM id that the rail/nav jump to; `extendSide` picks the
- * split-mode column (see its doc).
+ * stamp the row DOM id that the rail/nav jump to.
+ *
+ * In split mode the library renders the extend line into a side-specific cell
+ * (old → left, new → right), so a comment must land on the side GitHub
+ * anchored it to. We partition a row's annotations: findings annotate
+ * new-side code, a thread sits on its own `side` (LEFT → old, RIGHT/null →
+ * new), and anything whose preferred side has no line falls back to the side
+ * that does (a deletion has only an old line, an addition only a new one). A
+ * context row can therefore emit two widgets — one per column — so a
+ * left-side comment and a new-side finding both show in the right place.
+ * Exactly one widget per `diffPosition` carries the `rowDomId` anchor (the
+ * new side when it has content, else the old) so the rail/nav jump still
+ * resolves to a single element.
  *
  * Always returns the maps (even empty) — never `undefined`. The library's
  * prop-sync only calls `setExtendData` when the prop is truthy, so omitting
@@ -198,11 +192,41 @@ function buildExtendData(
       const threads = threadsByAnchor.get(key) ?? [];
       const findings = findingsByAnchor.get(key) ?? [];
       if (threads.length === 0 && findings.length === 0) continue;
-      const side = extendSide(r, threads, findings);
-      const lineNumber = side === "old" ? r.oldLine : r.newLine;
-      if (lineNumber == null) continue;
-      const payload: ExtendPayload = { file: file.path, diffPosition: r.diffPosition, threads, findings };
-      (side === "old" ? oldFile : newFile)[lineNumber] = { data: payload };
+
+      // Route each thread to its anchored side, falling back to whichever
+      // side has a line when the preferred one doesn't exist on this row.
+      const oldThreads: InlineThread[] = [];
+      const newThreads: InlineThread[] = [];
+      for (const t of threads) {
+        const wantsOld = t.root.side === "LEFT";
+        if (wantsOld && r.oldLine != null) oldThreads.push(t);
+        else if (!wantsOld && r.newLine != null) newThreads.push(t);
+        else if (r.oldLine != null) oldThreads.push(t);
+        else newThreads.push(t);
+      }
+
+      // Findings only ever anchor where a new line exists (anchorFindings
+      // resolves by newLine), so they belong on the new side.
+      const newHasContent = (newThreads.length > 0 || findings.length > 0) && r.newLine != null;
+      const oldHasContent = oldThreads.length > 0 && r.oldLine != null;
+      if (newHasContent && r.newLine != null) {
+        newFile[r.newLine] = {
+          data: { file: file.path, diffPosition: r.diffPosition, threads: newThreads, findings, anchor: true },
+        };
+      }
+      if (oldHasContent && r.oldLine != null) {
+        // The new-side widget owns the anchor when present, so the row keeps
+        // a single rowDomId.
+        oldFile[r.oldLine] = {
+          data: {
+            file: file.path,
+            diffPosition: r.diffPosition,
+            threads: oldThreads,
+            findings: [],
+            anchor: !newHasContent,
+          },
+        };
+      }
     }
   }
   return { oldFile, newFile };
@@ -210,7 +234,7 @@ function buildExtendData(
 
 function ExtendWidget({ payload }: { payload: ExtendPayload }) {
   return (
-    <div class="review-extend" id={rowDomId(payload.file, payload.diffPosition)}>
+    <div class="review-extend" id={payload.anchor ? rowDomId(payload.file, payload.diffPosition) : undefined}>
       {payload.findings.map((f) => (
         <FindingCard key={`f-${f.id}`} finding={f} />
       ))}

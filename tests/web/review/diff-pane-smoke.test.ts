@@ -278,6 +278,70 @@ test("a LEFT-side comment on a context line renders in the old (left) split colu
   );
 });
 
+test("a mixed context row puts the LEFT comment and the finding on their own split columns", async () => {
+  // Context line "export const y = 4;" is diffPosition 5 (oldLine 3 / newLine
+  // 4). Put a LEFT-side comment (old side) and a finding (new side) both on
+  // it: split view must render the comment in the left column and the finding
+  // in the right, while a single element keeps the scroll anchor.
+  const mixed: PrReviewBundle = {
+    ...bundle(),
+    inlineComments: [
+      {
+        id: 303,
+        user: "octocat",
+        body: "old-side note",
+        path: "src/app.ts",
+        position: 5,
+        originalPosition: null,
+        line: 3,
+        originalLine: null,
+        side: "LEFT",
+        startLine: null,
+        startSide: null,
+        inReplyToId: null,
+        createdAt: "2026-01-01T00:00:00Z",
+        updatedAt: "2026-01-01T00:00:00Z",
+        htmlUrl: "",
+        commitId: "",
+      },
+    ],
+  };
+  const cfg: ForgeFinding = {
+    id: "M1",
+    severity: "HIGH",
+    title: "new-side finding",
+    file: "src/app.ts",
+    lineStart: 4,
+    lineEnd: 4,
+    evidence: null,
+    why: "x",
+    fix: "y",
+  };
+  entry.mount(root, mixed, [cfg]);
+  await tick();
+  const splitBtn = [...document.querySelectorAll(".review-diff-mode-btn")].find(
+    (b) => b.textContent?.trim() === "Split",
+  ) as HTMLButtonElement | undefined;
+  assert.ok(splitBtn, "split toggle missing");
+  splitBtn.click();
+  await tick();
+
+  // Exactly one element keeps the scroll anchor for this diffPosition.
+  assert.equal(
+    document.querySelectorAll("#diff-row-src\\/app\\.ts-5").length,
+    1,
+    "mixed row must keep a single scroll anchor id",
+  );
+
+  const oldCell = document.querySelector(".diff-line-extend-old-content");
+  const newCell = document.querySelector(".diff-line-extend-new-content");
+  assert.ok(oldCell?.textContent?.includes("old-side note"), "LEFT comment should be in the old column");
+  assert.ok(newCell?.textContent?.includes("new-side finding"), "finding should be in the new column");
+  // The comment must not leak into the new column, nor the finding into the old.
+  assert.ok(!newCell?.textContent?.includes("old-side note"), "LEFT comment must not appear in the new column");
+  assert.ok(!oldCell?.textContent?.includes("new-side finding"), "finding must not appear in the old column");
+});
+
 test("a file that loses all findings clears its stale widgets without remounting", async () => {
   // config.yaml has no inline comments; put a finding on its changed line
   // (newLine 2 → diffPosition 3), then switch to a findings set with none.
