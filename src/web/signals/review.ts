@@ -3,8 +3,10 @@
 // the Phase 2 fix UI will mutate; nothing here triggers any POST yet.
 import { computed, effect, signal } from "@preact/signals";
 import { type ApiError, apiGet, apiPost } from "../lib/api";
+import { parseUnifiedDiff } from "../lib/diff";
 import { readPublishPref, writePublishPref } from "../lib/publish-pref";
 import type { FixTarget } from "../lib/review-targets";
+import { readViewedFiles, writeViewedFiles } from "../lib/viewed-files";
 import type {
   DroppedFixTarget,
   ForgeFinding,
@@ -28,6 +30,103 @@ export type CommentStatus = "pending" | "disputed" | "fixing" | "fixed";
 // inline comments, and review summaries uniformly.
 export const selectedTargets = signal<Set<string>>(new Set());
 export const commentStatuses = signal<Map<string, CommentStatus>>(new Map());
+
+// ─── per-file "Viewed" tracking (client-side, GitHub-style) ─────────────────
+
+// Set of file paths the operator has marked viewed for the PR on screen.
+// Persisted to localStorage keyed by repo + PR + head SHA (see
+// lib/viewed-files.ts) so it survives reloads and resets when the head moves.
+export const viewedFiles = signal<Set<string>>(new Set());
+// Files explicitly re-expanded (via a jump or header click) despite being
+// marked viewed. A file is collapsed when viewed AND not in this override.
+export const expandedFiles = signal<Set<string>>(new Set());
+// Non-binary file paths in the current diff — the "M" denominator. Binary
+// files are excluded from viewed tracking entirely.
+export const reviewableFiles = signal<string[]>([]);
+
+// Scope the persistence is bound to. Null until a bundle hydrates; the
+// persistence effect refuses to write while null (so a PR switch never
+// stamps an empty set under the previous PR's key) or while hydrating.
+interface ViewedFilesScope {
+  repoRoot: string;
+  prNumber: number;
+  headSha: string;
+}
+let viewedFilesScope: ViewedFilesScope | null = null;
+let hydratingViewedFiles = false;
+
+// "N of M files viewed" — N counts viewed files still present (non-binary)
+// in the current diff; M is the reviewable (non-binary) file count.
+export const viewedProgress = computed<{ viewed: number; total: number }>(() => {
+  const reviewable = reviewableFiles.value;
+  const viewed = viewedFiles.value;
+  let n = 0;
+  for (const p of reviewable) if (viewed.has(p)) n++;
+  return { viewed: n, total: reviewable.length };
+});
+
+// Persist on change — but never while hydrating or before a scope exists.
+effect(() => {
+  const files = viewedFiles.value; // track
+  if (hydratingViewedFiles || !viewedFilesScope) return;
+  writeViewedFiles(viewedFilesScope.repoRoot, viewedFilesScope.prNumber, viewedFilesScope.headSha, files);
+});
+
+/**
+ * Hydrate viewed-state for a freshly-loaded bundle. Called by
+ * loadReviewBundle (the only production caller); exported so the
+ * signal-level integration test can drive the same scope/persistence wiring
+ * a PR switch or reload exercises without standing up the network.
+ */
+export function hydrateViewedFiles(repoRoot: string, prNumber: number, headSha: string, reviewable: string[]): void {
+  hydratingViewedFiles = true;
+  try {
+    viewedFilesScope = { repoRoot, prNumber, headSha };
+    reviewableFiles.value = reviewable;
+    expandedFiles.value = new Set();
+    // Only entries under the current head SHA apply; binary/removed files
+    // are pruned to the reviewable set so the count stays honest.
+    const stored = headSha ? readViewedFiles(repoRoot, prNumber, headSha) : new Set<string>();
+    const allowed = new Set(reviewable);
+    viewedFiles.value = new Set([...stored].filter((p) => allowed.has(p)));
+  } finally {
+    hydratingViewedFiles = false;
+  }
+}
+
+export function toggleViewedFile(path: string): void {
+  const next = new Set(viewedFiles.value);
+  if (next.has(path)) {
+    next.delete(path);
+  } else {
+    next.add(path);
+    // Marking viewed collapses the file — drop any expand override.
+    if (expandedFiles.value.has(path)) {
+      const exp = new Set(expandedFiles.value);
+      exp.delete(path);
+      expandedFiles.value = exp;
+    }
+  }
+  viewedFiles.value = next;
+}
+
+/** Force a (possibly collapsed) file open so a jump can scroll to it. */
+export function ensureFileExpanded(path: string): void {
+  if (expandedFiles.value.has(path)) return;
+  const exp = new Set(expandedFiles.value);
+  exp.add(path);
+  expandedFiles.value = exp;
+}
+
+/** Toggle the expand override for a viewed file (header click). */
+export function setFileExpanded(path: string, expanded: boolean): void {
+  const has = expandedFiles.value.has(path);
+  if (has === expanded) return;
+  const exp = new Set(expandedFiles.value);
+  if (expanded) exp.add(path);
+  else exp.delete(path);
+  expandedFiles.value = exp;
+}
 
 // Ad-hoc reviewer session signal — non-null while an ad-hoc review is
 // running (or finished but still on screen) for the active PR. The
@@ -219,6 +318,13 @@ export function clearPerPrHeaderState(): void {
 }
 
 export function clearReviewState(): void {
+  // Drop the scope FIRST so the persistence effect skips the writes the
+  // signal resets below would otherwise trigger. In-memory only — viewed
+  // state stays in localStorage so returning to the PR restores it.
+  viewedFilesScope = null;
+  viewedFiles.value = new Set();
+  expandedFiles.value = new Set();
+  reviewableFiles.value = [];
   reviewBundle.value = null;
   reviewError.value = null;
   selectedTargets.value = new Set();
@@ -245,6 +351,14 @@ export async function loadReviewBundle(prNumber: number, repoRoot: string): Prom
     const q = `?repo=${encodeURIComponent(repoRoot)}`;
     const data = await apiGet<PrReviewBundle>(`/api/prs/${prNumber}/review-bundle${q}`);
     reviewBundle.value = data;
+    // Hydrate per-file viewed state for this PR at its current head SHA.
+    // PR switches route through here (not clearReviewState), so this is the
+    // single place scope/viewed-state is (re)bound to the bundle on screen.
+    const headSha = data.pr.headRefOid ?? "";
+    const reviewable = parseUnifiedDiff(data.diff)
+      .filter((f) => !f.isBinary)
+      .map((f) => f.path);
+    hydrateViewedFiles(repoRoot, prNumber, headSha, reviewable);
   } catch (e) {
     const err = e as ApiError;
     reviewBundle.value = null;

@@ -201,6 +201,29 @@ export function parseUnifiedDiff(text: string): DiffFile[] {
   return files;
 }
 
+/**
+ * Split a multi-file unified diff into per-file raw segments, each starting
+ * at its `diff --git` header. The segments align 1:1 (same order) with
+ * `parseUnifiedDiff`'s output, and each is a well-formed single-file diff
+ * suitable for feeding to `@git-diff-view`'s `data.hunks`.
+ */
+export function splitDiffSegments(text: string): string[] {
+  if (!text) return [];
+  const lines = text.split(/\r?\n/);
+  const segments: string[] = [];
+  let buf: string[] | null = null;
+  for (const ln of lines) {
+    if (ln.startsWith("diff --git ")) {
+      if (buf) segments.push(buf.join("\n"));
+      buf = [ln];
+    } else if (buf) {
+      buf.push(ln);
+    }
+  }
+  if (buf) segments.push(buf.join("\n"));
+  return segments;
+}
+
 export interface FindRowOpts {
   newLine?: number | null;
   position?: number | null;

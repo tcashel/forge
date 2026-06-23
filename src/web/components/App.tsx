@@ -1,3 +1,4 @@
+import { sidebarCollapsed } from "../signals/layout";
 import { viewMode } from "../signals/ui";
 import { ActivityView } from "./activity/ActivityView";
 import { LibraryView } from "./library/LibraryView";
@@ -41,7 +42,7 @@ export function App() {
   const listPaneClass = `list-pane${inPrs ? " pr-list-pane" : ""}${inActivity ? " activity-list-pane" : ""}`;
   const detailPaneClass = `detail-pane${inPrs ? " pr-detail-pane" : ""}${inActivity ? " activity-detail-pane" : ""}`;
   return (
-    <div class="app">
+    <div class={`app${sidebarCollapsed.value ? " side-collapsed" : ""}`}>
       <Sidebar />
       <Topbar />
       <div class="workspace-body">

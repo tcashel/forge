@@ -143,10 +143,11 @@ body{
 .app{
   position:fixed; inset:0;
   display:grid;
-  grid-template-columns: 240px 1fr;
+  grid-template-columns: var(--side-w, 240px) 1fr;
   grid-template-rows: 56px 1fr;
   grid-template-areas: "side topbar" "side body";
 }
+.app.side-collapsed{ --side-w: 60px; }
 
 .side{
   grid-area:side;
@@ -233,6 +234,33 @@ body{
   background: var(--panel); color: var(--text-2);
   border: 1px solid var(--rule-2);
 }
+
+/* Collapse-to-icons toggle + collapsed sidebar state */
+.side-collapse-btn{
+  margin-left: 6px; flex: none;
+  width: 22px; height: 22px; border-radius: 5px;
+  display: flex; align-items: center; justify-content: center;
+  background: transparent; border: 1px solid transparent;
+  color: var(--dim); font-size: 13px; line-height: 1; cursor: pointer;
+  transition: background .12s ease, color .12s ease;
+}
+.side-collapse-btn:hover{ background: var(--hover); color: var(--text); }
+.brand .v{ margin-left: auto; }
+
+.side.collapsed .brand{ justify-content: center; gap: 4px; padding: 18px 8px 14px; }
+.side.collapsed .brand-name,
+.side.collapsed .brand .v,
+.side.collapsed .nav-item .lbl,
+.side.collapsed .nav-item .count,
+.side.collapsed .nav-section,
+.side.collapsed .nav-chips,
+.side.collapsed .new-plan .lbl,
+.side.collapsed .side-foot{ display: none; }
+.side.collapsed .side-collapse-btn{ margin-left: 0; }
+.side.collapsed .nav{ padding: 0 8px; }
+.side.collapsed .nav-item{ justify-content: center; gap: 0; padding: 9px 0; }
+.side.collapsed .nav-item .ic{ width: auto; }
+.side.collapsed .new-plan{ margin: 8px 10px 18px; padding: 11px 0; }
 
 .topbar{
   grid-area: topbar;
@@ -1565,7 +1593,9 @@ body.filtered-single .repo-chip{ display: none; }
 .review-page.review-three-pane {
   flex: 1;
   display: grid;
-  grid-template-columns: 240px minmax(0, 1fr) 380px;
+  /* Pane widths come from signals (lib/ui-layout.ts) via inline --review-*-w
+     custom properties; the 6px tracks are the drag handles. */
+  grid-template-columns: var(--review-nav-w, 240px) 6px minmax(0, 1fr) 6px var(--review-rail-w, 380px);
   grid-template-rows: minmax(0, 1fr);
   align-items: stretch;
   min-height: 0;
@@ -1573,12 +1603,102 @@ body.filtered-single .repo-chip{ display: none; }
   gap: 0;
 }
 .review-page.review-three-pane > .review-nav,
-.review-page.review-three-pane > .review-rail {
+.review-page.review-three-pane > .review-rail,
+.review-page.review-three-pane > .review-pane-strip {
   background: var(--bg-2);
   overflow-y: auto;
   min-height: 0;
   display: flex;
   flex-direction: column;
+}
+
+/* Drag handles between panes */
+.review-splitter {
+  background: transparent;
+  cursor: col-resize;
+  position: relative;
+  z-index: 2;
+  touch-action: none;
+}
+.review-splitter::before {
+  content: "";
+  position: absolute;
+  inset: 0;
+  width: 1px;
+  margin: 0 auto;
+  background: var(--border);
+  transition: background 0.12s ease, width 0.12s ease;
+}
+.review-splitter:hover::before,
+.review-splitter:active::before,
+.review-splitter:focus-visible::before {
+  width: 3px;
+  background: var(--primary);
+}
+.review-splitter:focus-visible {
+  outline: none;
+}
+.review-splitter.inert {
+  cursor: default;
+}
+.review-splitter.inert::before {
+  width: 1px;
+  background: var(--border);
+}
+
+/* Pane-header collapse chevron + collapsed-strip expand control */
+.pane-collapse-btn,
+.pane-expand-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: 5px;
+  color: var(--fg-dim);
+  cursor: pointer;
+  font-size: 13px;
+  line-height: 1;
+  padding: 2px 6px;
+  flex: none;
+}
+.pane-collapse-btn:hover,
+.pane-expand-btn:hover {
+  background: var(--panel-2);
+  color: var(--fg);
+}
+.review-nav-header-main {
+  display: flex;
+  align-items: baseline;
+  gap: 6px;
+  min-width: 0;
+}
+.review-rail-tools {
+  display: flex;
+  justify-content: flex-end;
+  padding: 2px 2px 0;
+}
+
+/* Collapsed pane: a 40px strip whose only job is to expand again */
+.review-pane-strip {
+  align-items: center;
+  padding: 10px 0;
+}
+.review-pane-strip .pane-expand-btn {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 10px;
+  width: 100%;
+  padding: 8px 0;
+}
+.review-pane-strip .pane-expand-ic {
+  font-size: 14px;
+}
+.review-pane-strip .pane-strip-label {
+  writing-mode: vertical-rl;
+  text-orientation: mixed;
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: var(--fg-dim);
 }
 .review-page.review-three-pane .review-center {
   display: flex;
@@ -1653,6 +1773,9 @@ body.filtered-single .repo-chip{ display: none; }
   flex-shrink: 0;
 }
 .review-nav-empty { font-size: 11px; color: var(--fg-dim); padding: 6px; }
+.review-nav-progress { font-size: 11px; color: var(--fg-dim); padding: 0 6px 6px; }
+.review-nav-viewed { color: var(--done, #2ea043); font-size: 11px; flex-shrink: 0; }
+.review-nav-row.viewed .review-nav-path { color: var(--fg-dim); }
 
 /* Right rail */
 .review-rail { padding: 8px; gap: 10px; }
@@ -1859,7 +1982,8 @@ body.filtered-single .repo-chip{ display: none; }
 .review-intent-body { max-height: 220px; overflow-y: auto; font-size: 11px; }
 
 /* Anchor flash so the operator sees what they just jumped to. */
-.review-row.review-row-flash {
+.review-row.review-row-flash,
+.review-extend.review-row-flash {
   box-shadow: inset 0 0 0 2px var(--primary);
   animation: review-row-fade 1.4s ease-out;
 }
@@ -1877,6 +2001,11 @@ body.filtered-single .repo-chip{ display: none; }
     flex-direction: column;
     grid-template-columns: none;
   }
+  /* The drag handles only make sense in the side-by-side grid. */
+  .review-page.review-three-pane > .review-splitter { display: none; }
+  .review-page.review-three-pane > .review-pane-strip { flex-direction: row; padding: 8px 12px; }
+  .review-page.review-three-pane > .review-pane-strip .pane-expand-btn { flex-direction: row; }
+  .review-page.review-three-pane > .review-pane-strip .pane-strip-label { writing-mode: horizontal-tb; }
   .review-page.review-three-pane > .review-nav,
   .review-page.review-three-pane > .review-rail,
   .review-page.review-three-pane .review-center {
@@ -2026,6 +2155,23 @@ body.filtered-single .repo-chip{ display: none; }
 .review-md code { background: var(--panel-2); border: 1px solid var(--border); padding: 1px 4px; border-radius: 3px; }
 
 .review-diff { display: flex; flex-direction: column; gap: 12px; }
+
+/* Unified/split toggle toolbar. */
+.review-diff-toolbar { display: flex; align-items: center; justify-content: flex-end; }
+.review-diff-mode { display: inline-flex; border: 1px solid var(--border); border-radius: 6px; overflow: hidden; }
+.review-diff-mode-btn {
+  font: inherit;
+  font-size: 12px;
+  padding: 4px 12px;
+  background: var(--panel);
+  color: var(--fg-dim);
+  border: 0;
+  cursor: pointer;
+}
+.review-diff-mode-btn + .review-diff-mode-btn { border-left: 1px solid var(--border); }
+.review-diff-mode-btn:hover { background: var(--panel-2); }
+.review-diff-mode-btn.active { background: var(--primary); color: var(--bg); }
+
 .review-file {
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -2038,41 +2184,79 @@ body.filtered-single .repo-chip{ display: none; }
   content-visibility: auto;
   contain-intrinsic-size: auto 400px;
 }
-.review-file > summary {
-  cursor: pointer;
-  padding: 8px 10px;
+.review-file-header {
   display: flex;
   gap: 12px;
   align-items: center;
+  padding: 6px 10px;
+  background: var(--panel-2);
   font-weight: 500;
-  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
 }
-.review-file .path { font-family: var(--mono, monospace); }
-.review-file .counts { margin-left: auto; font-size: 11px; }
-.review-binary { padding: 8px 10px; color: var(--fg-dim); font-size: 12px; }
-.review-hunks { display: flex; flex-direction: column; }
-.review-hunk { border-top: 1px solid var(--border); }
-.review-hunk-header {
-  background: var(--panel-2);
+.review-file-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+  background: none;
+  border: 0;
+  padding: 0;
+  cursor: pointer;
+  color: inherit;
+  font: inherit;
+  min-width: 0;
+}
+.review-file-caret { color: var(--fg-dim); font-size: 10px; transition: transform 0.1s ease; }
+.review-file-caret.collapsed { transform: rotate(-90deg); }
+.review-file .path { font-family: var(--mono, monospace); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.review-file .counts { margin-left: auto; font-size: 11px; white-space: nowrap; }
+.review-file .counts .plus { color: var(--done, #2ea043); }
+.review-file .counts .minus { color: var(--failed, #f85149); }
+.review-file-viewed {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  font-size: 11px;
   color: var(--fg-dim);
+  cursor: pointer;
+  user-select: none;
+}
+.review-file[data-viewed="1"] { opacity: 0.82; }
+.review-file[data-viewed="1"] .review-file-header { background: var(--done-soft, rgba(46, 160, 67, 0.12)); }
+.review-file-diff { overflow: hidden; }
+.review-binary { padding: 8px 10px; color: var(--fg-dim); font-size: 12px; }
+
+/* Per-line widget host (inline comment threads + finding cards). The diff
+   view controls the row; this is the content rendered under an anchored line. */
+.review-extend { padding: 6px 10px; background: var(--panel); border-top: 1px solid var(--border); }
+.review-inline-finding {
+  border-left: 3px solid var(--low);
+  background: var(--panel-2);
+  padding: 8px 10px;
+  margin-bottom: 6px;
+  border-radius: 4px;
+  font-size: 12px;
+}
+.review-inline-finding.severity-blocker { border-left-color: var(--blocker); }
+.review-inline-finding.severity-high { border-left-color: var(--high); }
+.review-inline-finding.severity-medium { border-left-color: var(--medium); }
+.review-inline-finding.severity-low { border-left-color: var(--low); }
+.review-inline-finding-head { display: flex; align-items: center; gap: 8px; }
+.review-inline-finding-title { font-weight: 600; }
+.review-inline-finding-body { margin-top: 6px; display: flex; flex-direction: column; gap: 4px; }
+.review-inline-finding-body .finding-evidence {
   font-family: var(--mono, monospace);
   font-size: 11px;
-  padding: 4px 10px;
+  background: var(--bg-deep);
+  padding: 6px;
+  border-radius: 4px;
+  overflow-x: auto;
+  margin: 0;
 }
-.review-row {
-  display: grid;
-  grid-template-columns: 48px 48px 16px 1fr;
-  gap: 0;
-  font-family: var(--mono, monospace);
-  font-size: 12px;
-  padding: 0 4px;
-  white-space: pre;
-}
-.review-row .ln { color: var(--fg-dim); text-align: right; padding-right: 6px; }
-.review-row .gutter { text-align: center; }
-.review-row.row-addition { background: var(--done-soft, rgba(46, 160, 67, 0.15)); }
-.review-row.row-deletion { background: var(--failed-soft, rgba(248, 81, 73, 0.15)); }
-.review-row .content { white-space: pre; overflow-x: auto; }
+.review-inline-finding-badge { font-size: 11px; margin-top: 4px; }
+.review-inline-finding-badge .badge-reason { color: var(--fg-dim); }
+.review-inline-finding-badge .badge-gh-error { color: var(--blocker); }
+/* Comment threads inline in a widget host don't need the old grid indent. */
+.review-extend .review-thread { margin: 0 0 6px 0; }
 
 .review-thread {
   margin: 6px 0 6px 64px;

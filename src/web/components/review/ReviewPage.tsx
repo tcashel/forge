@@ -2,6 +2,13 @@ import { useEffect, useMemo } from "preact/hooks";
 import { parseUnifiedDiff } from "../../lib/diff";
 import { enterPrMode } from "../../lib/modes";
 import {
+  REVIEW_STRIP_WIDTH,
+  reviewNavCollapsed,
+  reviewNavWidth,
+  reviewRailCollapsed,
+  reviewRailWidth,
+} from "../../signals/layout";
+import {
   clearPerPrHeaderState,
   clearSelectedReviewRun,
   clearSelection,
@@ -20,6 +27,7 @@ import { anchorFindings, anchorThreads, DiffPane, groupIntoThreads } from "./Dif
 import { FindingsRail } from "./FindingsRail";
 import { IntentPanel } from "./IntentPanel";
 import { LeftNav } from "./LeftNav";
+import { PaneSplitter } from "./PaneSplitter";
 import { ReviewActionBar } from "./ReviewActionBar";
 import { ReviewHeader } from "./ReviewHeader";
 import { ReviewHistoryPicker } from "./ReviewHistoryPicker";
@@ -86,9 +94,32 @@ export function ReviewPage() {
     );
   }
 
+  const navCollapsed = reviewNavCollapsed.value;
+  const railCollapsed = reviewRailCollapsed.value;
+  const navW = navCollapsed ? REVIEW_STRIP_WIDTH : reviewNavWidth.value;
+  const railW = railCollapsed ? REVIEW_STRIP_WIDTH : reviewRailWidth.value;
+  const gridStyle = `--review-nav-w:${navW}px;--review-rail-w:${railW}px`;
+
   return (
-    <div class="review-page review-three-pane">
-      {bundle ? <LeftNav files={parsedDiff} findingsByFile={findingsByFile} /> : <aside class="review-nav empty" />}
+    <div
+      class={`review-page review-three-pane${navCollapsed ? " nav-collapsed" : ""}${railCollapsed ? " rail-collapsed" : ""}`}
+      style={gridStyle}
+    >
+      {navCollapsed ? (
+        <CollapsedPaneStrip
+          side="nav"
+          label="Files"
+          onExpand={() => {
+            reviewNavCollapsed.value = false;
+          }}
+        />
+      ) : bundle ? (
+        <LeftNav files={parsedDiff} findingsByFile={findingsByFile} />
+      ) : (
+        <aside class="review-nav empty" />
+      )}
+
+      {navCollapsed ? <div class="review-splitter inert for-nav" aria-hidden="true" /> : <PaneSplitter side="nav" />}
 
       <main class="review-center">
         <ReviewActionBar prNumber={num} repoRoot={repo} loading={loading} />
@@ -103,24 +134,71 @@ export function ReviewPage() {
         ) : null}
       </main>
 
-      <aside class="review-rail">
-        <ReviewHistoryPicker prNumber={num} repoRoot={repo} />
-        {bundle?.linkedPlanId ? <IntentPanel planId={bundle.linkedPlanId} /> : null}
-        {bundle ? (
-          <FindingsRail
-            anchoredFindings={anchoredFlat}
-            outsideFindings={outside}
-            anchoredComments={commentAnchoring.anchoredFlat}
-            staleComments={commentAnchoring.stale}
-            reviews={bundle.prReviews}
-          />
-        ) : null}
-        <div class="review-rail-batch">
-          <BatchBar prNumber={num} repoRoot={repo} />
-        </div>
-      </aside>
+      {railCollapsed ? <div class="review-splitter inert for-rail" aria-hidden="true" /> : <PaneSplitter side="rail" />}
+
+      {railCollapsed ? (
+        <CollapsedPaneStrip
+          side="rail"
+          label="Findings"
+          onExpand={() => {
+            reviewRailCollapsed.value = false;
+          }}
+        />
+      ) : (
+        <aside class="review-rail">
+          <div class="review-rail-tools">
+            <button
+              type="button"
+              class="pane-collapse-btn"
+              title="Collapse findings panel"
+              aria-label="Collapse findings panel"
+              onClick={() => {
+                reviewRailCollapsed.value = true;
+              }}
+            >
+              »
+            </button>
+          </div>
+          <ReviewHistoryPicker prNumber={num} repoRoot={repo} />
+          {bundle?.linkedPlanId ? <IntentPanel planId={bundle.linkedPlanId} /> : null}
+          {bundle ? (
+            <FindingsRail
+              anchoredFindings={anchoredFlat}
+              outsideFindings={outside}
+              anchoredComments={commentAnchoring.anchoredFlat}
+              staleComments={commentAnchoring.stale}
+              reviews={bundle.prReviews}
+            />
+          ) : null}
+          <div class="review-rail-batch">
+            <BatchBar prNumber={num} repoRoot={repo} />
+          </div>
+        </aside>
+      )}
 
       <ReviewSessionDrawer prNumber={num} repoRoot={repo} />
     </div>
+  );
+}
+
+/**
+ * Thin vertical rail shown in place of a collapsed pane: a single button that
+ * expands it again, with the panel name rotated alongside an arrow so the
+ * affordance reads at 40px wide.
+ */
+function CollapsedPaneStrip({ side, label, onExpand }: { side: "nav" | "rail"; label: string; onExpand: () => void }) {
+  return (
+    <aside class={`review-pane-strip ${side === "nav" ? "review-nav" : "review-rail"} collapsed`}>
+      <button
+        type="button"
+        class="pane-expand-btn"
+        title={`Show ${label}`}
+        aria-label={`Show ${label} panel`}
+        onClick={onExpand}
+      >
+        <span class="pane-expand-ic">{side === "nav" ? "»" : "«"}</span>
+        <span class="pane-strip-label">{label}</span>
+      </button>
+    </aside>
   );
 }
