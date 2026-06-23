@@ -7,3 +7,4 @@ src/web/dist/
 .env.local
 *.tsbuildinfo
 .claude/worktrees/
+.forge-draft-*

@@ -1,6 +1,20 @@
 # forge
 
+> The operator's cockpit for staff engineers running agent fleets.
+> **Plan. Run. Review. Ship. Don't watch.**
+
 A control plane for one-shot agentic coding runs. You hand it a spec; it spins up `claude` or `codex` (also `opencode` / `gemini`) in a fresh git worktree under tmux, runs your quality gates, opens a draft PR, and sends a different model in to review the diff.
+
+The premise: **a coding-agent session is a job, not a show.** You shouldn't have to watch tool calls scroll or approve every `lint`. Configure your agents once, then dispatch work and triage outcomes — a boss's view, not a manager's view.
+
+**What you get**
+
+- Launch agents headless into isolated git worktrees, each under its own tmux session — run several in parallel without watching any of them.
+- Quality gates + a second-model review on every run: the diff lands as a draft PR, auto-reviewed and (optionally) auto-fixed.
+- One contract for humans and agents: a `forge` CLI, a localhost **Workbench** web UI, and Claude Code / opencode plugins all drive the same cores.
+- Local-first: all state in a SQLite DB under `~/.forge/`. No accounts, no cloud, no telemetry.
+
+**Who it's for:** staff/principal engineers who already run multiple coding agents and have hit the point where *supervision*, not execution, is the bottleneck. If you want to watch an agent work, this isn't that tool. See [`docs/VISION.md`](docs/VISION.md) for the full thesis.
 
 Three artifacts ship from this repo:
 
@@ -17,10 +31,20 @@ Three artifacts ship from this repo:
 - `python3` (the launch runner's generated `run.sh` shells out to it; ships with macOS CLT)
 - `claude` and/or `codex` on PATH (only the runtimes you'll actually launch)
 
+On macOS with Homebrew:
+
+```bash
+brew install oven-sh/bun/bun tmux gh
+gh auth login        # authenticate the GitHub CLI
+# then install at least one agent CLI you'll launch (claude, codex, …)
+```
+
+> **Platform note.** Forge is developed and tested on **macOS**. It should work on Linux given the same tools on PATH (`bun`, `tmux`, `git`, `gh`, `python3`), but that path is untested. Windows is not supported (use WSL).
+
 ## Install
 
 ```bash
-git clone <repo-url> ~/code/forge
+git clone https://github.com/tcashel/forge ~/code/forge
 cd ~/code/forge
 bun install
 bun link        # puts ./bin/forge.ts on PATH as `forge`
@@ -30,7 +54,7 @@ forge --version
 For non-developer install once we publish:
 
 ```bash
-bun install -g <git-url>
+bun install -g https://github.com/tcashel/forge
 ```
 
 ### Claude Code plugin
@@ -94,6 +118,44 @@ Buttons call into the same programmatic cores the CLI uses, so agents
 and humans share one contract. Localhost binding only; no auth. Spec
 creation is exposed as `POST /api/specs` for external tooling — there is
 no in-UI form yet.
+
+## Your first run
+
+A complete end-to-end pass, from a clean checkout to a reviewed PR:
+
+```bash
+# 1. Install (see Prerequisites above for the tools)
+git clone https://github.com/tcashel/forge ~/code/forge
+cd ~/code/forge && bun install && bun link
+forge --version
+
+# 2. In the repo you actually want to work on, pick a reviewer
+#    (it must differ from the implementer agent)
+cd ~/code/your-project
+forge config set defaultAgent claude
+forge config set reviewerAgent codex
+forge config set reviewerModel gpt-5.5
+
+# 3. Save a spec and launch an agent on it
+echo "Add a /healthz endpoint that returns 200 OK with the build SHA." \
+  | forge spec save - --title "Add healthz endpoint" --json
+# → { "taskId": "add-healthz-endpoint-…", "branch": "forge/add-healthz-endpoint" }
+
+forge launch <task-id> --json     # runs headless in a worktree + tmux
+forge wait <task-id> --until done,failed,quality_failed --json
+
+# 4. Watch and review from the Workbench (or stay on the CLI)
+forge serve --open                # http://127.0.0.1:7456
+```
+
+The agent runs in a fresh git worktree under tmux, your quality gates run, a
+draft PR is opened, and a second model reviews the diff. Use `forge ls` to see
+tasks, `forge logs <task-id> -f` to follow output, and `forge review <pr>` to
+re-run or publish a review. Nothing required you to watch the session.
+
+> **First time?** `forge spec save` also runs an auto-improve loop by default
+> (two critics + a synthesizer). To skip it on your first run, pass `--no-improve`
+> or set `forge config set autoImprove false`.
 
 ## Subcommand reference
 
@@ -235,6 +297,12 @@ bun run check         # biome check --write .
 
 Forge **is the deliverable** — the operator's cockpit for staff engineers running agent fleets. See [`docs/`](docs/) for the full vision, roadmap, architecture, schema, and decision log (ADRs). Start at [`docs/README.md`](docs/README.md).
 
+## Contributing
+
+Issues and PRs are welcome — see [CONTRIBUTING.md](CONTRIBUTING.md) for dev
+setup, quality gates, and the ADR process. Security reports go through the
+private channel in [SECURITY.md](SECURITY.md), not public issues.
+
 ## License
 
-TBD.
+[MIT](LICENSE) © Tripp Cashel.

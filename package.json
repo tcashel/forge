@@ -2,7 +2,14 @@
   "name": "forge",
   "version": "0.4.0-dev",
   "description": "Agentic coding workflow control plane — CLI + Claude Code plugin",
-  "private": true,
+  "license": "MIT",
+  "author": "Tripp Cashel",
+  "homepage": "https://github.com/tcashel/forge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tcashel/forge.git"
+  },
+  "bugs": "https://github.com/tcashel/forge/issues",
   "type": "module",
   "keywords": [
     "claude-code-plugin",
