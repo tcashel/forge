@@ -133,6 +133,7 @@ forge --version
 #    (it must differ from the implementer agent)
 cd ~/code/your-project
 forge config set defaultAgent claude
+forge config set defaultModel claude-opus-4-8   # implementer needs a model
 forge config set reviewerAgent codex
 forge config set reviewerModel gpt-5.5
 

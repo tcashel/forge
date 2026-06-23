@@ -23,11 +23,13 @@ Forge orchestrates coding agents on your own machine, and it is built for an
 operator who trusts their agents. A few deliberate design choices matter for
 security:
 
-- **`forge serve` (the Workbench) binds to `127.0.0.1` only, with no
-  authentication and no TLS.** It is a local, single-operator UI. Do not expose
-  it to other hosts or proxy it to the public internet — anyone who can reach the
-  port can launch, kill, and review tasks. The Workbench can launch and kill
-  real subprocesses, so treat the port as privileged.
+- **`forge serve` (the Workbench) defaults to binding `127.0.0.1`, with no
+  authentication and no TLS.** It is a local, single-operator UI. The `--host`
+  flag lets you bind a non-loopback address (e.g. `0.0.0.0`) — **don't**, unless
+  you fully control the network. With no auth or TLS, anyone who can reach the
+  port can launch, kill, and review tasks, and the Workbench spawns real
+  subprocesses on your machine — so treat the port as privileged and never proxy
+  it to the public internet.
 - **Launched agents run headless with permission prompts disabled** (e.g.
   `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`).
   Forge assumes you enforce policy at the agent level via hooks
