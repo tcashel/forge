@@ -13,8 +13,9 @@ updates:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 10
-    labels:
-      - "dependencies"
+    # No `labels:` block — Dependabot then auto-creates and applies its default
+    # `dependencies` label. Custom labels that don't already exist in the repo
+    # are silently ignored, so relying on the default is the robust choice.
     commit-message:
       prefix: "chore"
       include: "scope"
@@ -32,8 +33,6 @@ updates:
     schedule:
       interval: "weekly"
       day: "monday"
-    labels:
-      - "dependencies"
     commit-message:
       prefix: "ci"
       include: "scope"
