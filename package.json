@@ -2,7 +2,14 @@
   "name": "forge",
   "version": "0.4.0-dev",
   "description": "Agentic coding workflow control plane — CLI + Claude Code plugin",
-  "private": true,
+  "license": "MIT",
+  "author": "Tripp Cashel",
+  "homepage": "https://github.com/tcashel/forge#readme",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/tcashel/forge.git"
+  },
+  "bugs": "https://github.com/tcashel/forge/issues",
   "type": "module",
   "keywords": [
     "claude-code-plugin",
@@ -21,7 +28,8 @@
     "typecheck": "tsc --noEmit",
     "lint": "biome check .",
     "format": "biome format --write .",
-    "check": "biome check --write ."
+    "check": "biome check --write .",
+    "prepublishOnly": "echo 'Registry publishing is not supported yet: the root skills/ symlink is not packaged into npm tarballs, so reviewer/critic/fixer/planner prompts would ship empty. Install via git (see README). See CONTRIBUTING.md > Packaging.' && exit 1"
   },
   "dependencies": {
     "@git-diff-view/file": "^0.1.6",

@@ -8,6 +8,6 @@
   },
   "homepage": "https://github.com/tcashel/forge",
   "repository": "https://github.com/tcashel/forge",
-  "license": "UNLICENSED",
+  "license": "MIT",
   "keywords": ["forge", "agents", "workflow", "coding", "tmux", "worktree", "review", "spec"]
 }
