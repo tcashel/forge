@@ -1,6 +1,6 @@
 {
   "name": "forge",
-  "version": "0.4.0-dev",
+  "version": "0.4.0",
   "description": "Agentic coding workflow control plane — drives the forge CLI from inside Claude Code.",
   "author": {
     "name": "Tripp Cashel",

@@ -88,6 +88,7 @@ import {
 } from "../../core/worktrees.ts";
 import { diffViewAliasPlugin } from "../../web/build-aliases.ts";
 import { CliError } from "../output.ts";
+import { VERSION } from "../version.ts";
 import { type CommentFixState, findLatestCommentFixState, runCommentFix } from "./comment-fix-actions.ts";
 import { doCritique } from "./critique.ts";
 import { loadLatestDigest, runPrDigest } from "./digest-actions.ts";
@@ -942,7 +943,7 @@ async function handleApi(url: URL, ctx: RouteCtx): Promise<Response> {
 
   // GET /api/health
   if (pathname === "/api/health") {
-    return jsonOk({ ok: true, version: "0.4.0-dev" });
+    return jsonOk({ ok: true, version: VERSION });
   }
 
   // GET /api/workbench/context

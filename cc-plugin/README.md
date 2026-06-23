@@ -10,7 +10,7 @@ The `forge` CLI must be on your `PATH`:
 cd <forge-repo>
 bun install
 bun link
-forge --version  # 0.4.0-dev
+forge --version  # 0.4.0
 ```
 
 `forge` itself needs `tmux`, `git`, `gh`, and a `claude` or `codex` CLI on PATH for actual launches.

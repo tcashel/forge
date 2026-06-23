@@ -2,7 +2,7 @@
 
 ## Supported versions
 
-Forge is pre-release (`0.4.0-dev`). Only the latest `main` is supported —
+Forge is pre-release (`0.4.0`). Only the latest `main` is supported —
 security fixes land there. There are no backported releases yet.
 
 ## Reporting a vulnerability

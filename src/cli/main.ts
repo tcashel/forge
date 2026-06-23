@@ -29,8 +29,7 @@ import * as status from "./cmd/status.ts";
 import * as wait from "./cmd/wait.ts";
 import * as worktree from "./cmd/worktree.ts";
 import { CliError, emitError } from "./output.ts";
-
-const VERSION = "0.4.0-dev";
+import { VERSION } from "./version.ts";
 
 const HELP_BY_CMD: Record<string, string> = {
   attach: attach.HELP,
