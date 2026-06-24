@@ -3,6 +3,13 @@
 > The operator's cockpit for staff engineers running agent fleets.
 > **Plan. Run. Review. Ship. Don't watch.**
 
+<p align="center">
+  <picture>
+    <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dark/overview.png">
+    <img alt="The Forge Workbench — operator cockpit: pick-up queue, run sections, and a task detail pane" src="docs/assets/screenshots/light/overview.png" width="900">
+  </picture>
+</p>
+
 A control plane for one-shot agentic coding runs. You hand it a spec; it spins up `claude` or `codex` (also `opencode` / `gemini`) in a fresh git worktree under tmux, runs your quality gates, opens a draft PR, and sends a different model in to review the diff.
 
 The premise: **a coding-agent session is a job, not a show.** You shouldn't have to watch tool calls scroll or approve every `lint`. Configure your agents once, then dispatch work and triage outcomes — a boss's view, not a manager's view.
@@ -115,9 +122,49 @@ forge serve --open      # default: http://127.0.0.1:7456
 
 The Workbench can launch, critique, and kill tasks directly from the UI.
 Buttons call into the same programmatic cores the CLI uses, so agents
-and humans share one contract. Localhost binding only; no auth. Spec
-creation is exposed as `POST /api/specs` for external tooling — there is
-no in-UI form yet.
+and humans share one contract. Localhost binding only; no auth. Specs can
+be created from the in-UI **New spec** modal (with a planner side-panel) or
+via `POST /api/specs` for external tooling.
+
+A coding-agent session is a job: you triage outcomes, not tool calls. The same
+surface carries each run from spec through a second-model review:
+
+<table>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dark/task-critique.png">
+        <img alt="Critique tab — two independent critics plus a synthesizer reviewing a spec before any code runs" src="docs/assets/screenshots/light/task-critique.png">
+      </picture>
+      <p align="center"><em>Two-critic + synthesizer spec critique</em></p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dark/review.png">
+        <img alt="Full-screen PR review and triage — diff, digest, and findings" src="docs/assets/screenshots/light/review.png">
+      </picture>
+      <p align="center"><em>Full-screen PR review &amp; triage</em></p>
+    </td>
+  </tr>
+  <tr>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dark/task-gates.png">
+        <img alt="Quality gates tab — each configured command with pass/fail and timing" src="docs/assets/screenshots/light/task-gates.png">
+      </picture>
+      <p align="center"><em>Quality gates, per command</em></p>
+    </td>
+    <td width="50%">
+      <picture>
+        <source media="(prefers-color-scheme: dark)" srcset="docs/assets/screenshots/dark/usage.png">
+        <img alt="Usage &amp; Cost dashboard — daily cost, cost-to-ship, and rework ratio" src="docs/assets/screenshots/light/usage.png">
+      </picture>
+      <p align="center"><em>Usage &amp; cost — what each shipped spec cost</em></p>
+    </td>
+  </tr>
+</table>
+
+More views and short walkthrough GIFs live in [`docs/assets/`](docs/assets/).
 
 ## Your first run
 
