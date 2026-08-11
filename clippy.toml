@@ -1,0 +1,2 @@
+# Intentionally empty: workspace clippy configuration lives in the root
+# Cargo.toml under [workspace.lints.clippy].
