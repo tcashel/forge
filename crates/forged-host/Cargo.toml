@@ -1,0 +1,14 @@
+[package]
+name = "forged-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+async-trait.workspace = true
+nix.workspace = true
+tokio.workspace = true
