@@ -8,3 +8,4 @@ src/web/dist/
 *.tsbuildinfo
 .claude/worktrees/
 .forge-draft-*
+target/
