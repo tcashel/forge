@@ -104,20 +104,26 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         let outcome =
             forged_beads::reclaim(&bd, &candidate.bead_id, &run_holder_id, older_than).await?;
         failpoint::hit("bd.reclaim.after");
-        let ours_already = if outcome.previous_owner.is_none() {
-            // The refusal shape, not an error: the lease is still live.
-            // When the live holder is the derived id itself the run is
-            // already ours; anyone else's live lease leaves the run alone.
-            forged_beads::lease_holder(&bd, &candidate.bead_id)
+        // On the refusal shape (`previous_owner: None`, nothing reclaimed)
+        // the lease may be genuinely live under someone else — leave the
+        // run alone — or already ours, or already released by an earlier
+        // reconcile pass (revoke-reclaim frees it). Only another worker's
+        // live lease blocks the resume.
+        let (proceed, retake) = if outcome.previous_owner.is_some() {
+            (true, true)
+        } else {
+            match forged_beads::lease_holder(&bd, &candidate.bead_id)
                 .await?
                 .as_deref()
-                == Some(run_holder_id.as_str())
-        } else {
-            false
+            {
+                Some(holder) if holder == run_holder_id => (true, false),
+                Some(_) => (false, false),
+                None => (true, true),
+            }
         };
-        if outcome.previous_owner.is_some() || ours_already {
-            if outcome.previous_owner.is_some() {
-                // Re-take the lease under the same derived holder.
+        if proceed {
+            if retake {
+                // (Re-)take the lease under the same derived holder.
                 failpoint::hit("bd.claim.before");
                 forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
                 failpoint::hit("bd.claim.after");
@@ -133,6 +139,14 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
                 })
                 .await?
             };
+            // The packet directory belongs to the new attempt now: a stale
+            // pid file from the dead attempt must not read as its session.
+            let (_, stage, seq) = crate::core::split_packet_id(&candidate.packet_id)?;
+            let _ = std::fs::remove_file(
+                ctx.config
+                    .packet_dir(&candidate.run_id, stage, seq)
+                    .join("provider.pid"),
+            );
             return Ok(json!({
                 "claimed": {
                     "run_id": candidate.run_id,

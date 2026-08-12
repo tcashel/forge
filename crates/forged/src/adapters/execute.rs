@@ -353,8 +353,11 @@ async fn run_attempt(
 
     // 3. Prefix the pid capture (no exec — the host appends the sentinel to
     // the same shell, and `$$` is that shell's pid either way) and spawn
-    // with PATH passed explicitly.
+    // with PATH passed explicitly. A stale pid file from a prior attempt is
+    // removed first: absence means "spawn never happened", and only this
+    // attempt's shell may write the file back.
     let pid_path = packet_dir.join("provider.pid");
+    let _ = std::fs::remove_file(&pid_path);
     let shell_line = format!(
         "echo $$ > {}; {}",
         pid_path.to_string_lossy(),

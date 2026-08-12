@@ -44,11 +44,16 @@ fn pause(site: &str) {
     };
     let dir = std::path::PathBuf::from(dir);
     let _ = std::fs::create_dir_all(&dir);
-    let _ = std::fs::write(dir.join(format!("{site}.reached")), b"");
+    let reached = dir.join(format!("{site}.reached"));
+    let _ = std::fs::write(&reached, b"");
     let release = dir.join(format!("{site}.release"));
     while !release.exists() {
         std::thread::sleep(std::time::Duration::from_millis(50));
     }
+    // Consume the pair so the same site can pause again on its next hit and
+    // the test can release hit-by-hit.
+    let _ = std::fs::remove_file(&release);
+    let _ = std::fs::remove_file(&reached);
 }
 
 /// Hit a failpoint site (feature off: compiled to nothing).

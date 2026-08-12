@@ -558,9 +558,11 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         };
         req.idempotency_key = derive_key("reconcile", Some(&run_id), None, Some(sweep));
     }
-    if req.run_id.is_none() {
-        req.run_id = Some(run_id.clone());
-    }
+    // The reconcile operation is deliberately run-UNSCOPED in the store: a
+    // run-scoped row would be found by the pass's own
+    // `list_inflight_operations(run)` sweep and released as SafeRetry — the
+    // reconciler must not settle the operation that wraps it.
+    req.run_id = None;
     fenced(ctx, "reconcile", EffectClass::SafeRetry, req, None, {
         move |_op| async move {
             let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
