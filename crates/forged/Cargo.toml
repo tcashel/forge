@@ -8,8 +8,34 @@ license.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Env-driven failpoints for the kill-matrix falsifier. Default OFF: a
+# release binary carries no failpoint code.
+failpoints = []
+
 [dependencies]
+forged-types = { path = "../forged-types" }
+forged-ledger = { path = "../forged-ledger" }
+forged-host = { path = "../forged-host" }
+forged-git = { path = "../forged-git" }
+forged-gate = { path = "../forged-gate" }
+forged-beads = { path = "../forged-beads" }
+forged-provider = { path = "../forged-provider" }
+forged-proto = { path = "../forged-proto" }
+
+async-trait.workspace = true
 clap.workspace = true
+jiff.workspace = true
+nix.workspace = true
 rmcp.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
