@@ -1060,7 +1060,26 @@ async fn control_event(
         Ok(value) => value.to_owned(),
         Err(error) => return err_response(&derive_key(name, Some(&epic), None, None), &error),
     };
-    default_key(req, derive_key(name, Some(&epic), None, None));
+    let control_epoch = match epic_events(ctx, &epic).await {
+        Ok(events) => {
+            let predecessor = if kind == PAUSED { RESUMED } else { PAUSED };
+            let completed = events
+                .iter()
+                .filter(|event| event.kind == predecessor)
+                .count();
+            let epoch = if kind == PAUSED {
+                completed.saturating_add(1)
+            } else {
+                completed
+            };
+            i64::try_from(epoch).unwrap_or(i64::MAX)
+        }
+        Err(error) => return err_response(&derive_key(name, Some(&epic), None, None), &error),
+    };
+    default_key(
+        req,
+        derive_key(name, Some(&epic), None, Some(control_epoch)),
+    );
     let key = req.idempotency_key.clone();
     // Pause is an out-of-band control signal specifically so a lead session
     // can stop a detached controller at its next durable boundary. Resume is

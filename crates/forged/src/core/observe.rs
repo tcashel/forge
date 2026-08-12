@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use forged_types::{OperationRequest, OperationResponse};
 use serde_json::{json, Map, Value};
 
-use crate::core::{param_opt_str, read_only, Ctx, Failure};
+use crate::core::{on_ledger, param_opt_str, read_only, Ctx, Failure};
 
 fn request(run_id: &str, params: Value) -> OperationRequest {
     OperationRequest {
@@ -87,6 +87,29 @@ fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Vec<Value> {
         .collect()
 }
 
+async fn roster_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure> {
+    let run_id = run_id.to_owned();
+    let rows = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_roster_revisions(&run_id)
+    })
+    .await?;
+    rows.into_iter()
+        .map(|row| {
+            let roster_ref: Value = serde_json::from_str(&row.roster_ref_json)
+                .map_err(|error| Failure::internal(format!("stored roster ref: {error}")))?;
+            Ok(json!({
+                "runId": row.run_id,
+                "revision": row.revision,
+                "rosterRef": roster_ref,
+                "rosterSha256": row.roster_sha256,
+                "reason": row.reason,
+                "createdAt": row.created_at,
+                "operationId": row.operation_id,
+            }))
+        })
+        .collect()
+}
+
 async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
     let status =
         result(super::ops::run_status(ctx, &request(run_id, json!({"run": run_id}))).await)?;
@@ -98,6 +121,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
     let event_page = events(ctx, run_id, after, Some(limit)).await?;
     let view = super::drive::project(ctx, run_id).await?;
     let findings = super::drive::latest_review_findings(&view);
+    let roster_revisions = roster_revisions(ctx, run_id).await?;
     Ok(json!({
         "schema": "forged.overview/1",
         "kind": "slice",
@@ -112,7 +136,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
         },
         "artifacts": packet_artifacts(ctx, &view),
         "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
-        "rosterRevisions": event_payloads(&all_events, |kind| kind == "forged.roster.revised"),
+        "rosterRevisions": roster_revisions,
         "usage": usage,
         "events": event_page,
     }))

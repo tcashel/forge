@@ -276,6 +276,28 @@ impl Ledger {
         })
     }
 
+    /// List every roster revision for a run in durable revision order.
+    pub fn list_roster_revisions(
+        &self,
+        run_id: &str,
+    ) -> Result<Vec<RosterRevisionRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            require_run(conn, &run_id)?;
+            let mut stmt = conn.prepare(
+                "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
+                 created_at, operation_id FROM roster_revisions WHERE run_id = ?1 \
+                 ORDER BY revision",
+            )?;
+            let rows = stmt.query_map([&run_id], revision_row)?;
+            let mut revisions = Vec::new();
+            for row in rows {
+                revisions.push(row?);
+            }
+            Ok(revisions)
+        })
+    }
+
     /// Append a validated roster snapshot as the next revision. The caller
     /// supplies canonical semantics; the ledger independently verifies the
     /// digest and requires a definition-backed run and non-empty reason.

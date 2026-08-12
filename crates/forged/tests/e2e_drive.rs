@@ -440,6 +440,111 @@ fn resolving_an_unclean_child_starts_a_fresh_generation() {
 }
 
 #[test]
+fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
+    let env = TestEnv::new("forged-epic-control-cycles");
+    env.seed_epic("epic-controls", &[("child-controls", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-controls",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    let mut ids = Vec::new();
+    for (command, reason) in [
+        ("pause", "first checkpoint"),
+        ("resume", "first continuation"),
+        ("pause", "second checkpoint"),
+        ("resume", "second continuation"),
+    ] {
+        let (code, response) = env.forged(&[
+            "epic",
+            command,
+            "--epic",
+            "epic-controls",
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code, 0, "{command}: {response}");
+        ids.push(response["operationId"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(ids[0], ids[2], "pause epochs differ");
+    assert_ne!(ids[1], ids[3], "resume epochs differ");
+    let (_, events) = env.forged(&["events", "--run", "epic-controls", "--limit", "1000"]);
+    let kinds = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "forged.epic.paused")
+            .count(),
+        2
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "forged.epic.resumed")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn roster_failover_cycles_get_distinct_revision_keys() {
+    let env = TestEnv::new("forged-roster-cycles");
+    env.forged(&["init"]);
+    env.add_uniform_roster("outage", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-roster-cycles",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    for (expected, roster, reason) in [
+        (2, "outage", "anthropic unavailable"),
+        (3, "default", "anthropic restored"),
+        (4, "outage", "second anthropic outage"),
+    ] {
+        let (code, revised) = env.forged(&[
+            "run",
+            "revise-roster",
+            "--run",
+            "bead-roster-cycles",
+            "--roster",
+            roster,
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code, 0, "revise to {roster}: {revised}");
+        assert_eq!(revised["result"]["revision"], json!(expected));
+    }
+}
+
+#[test]
 fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let env = TestEnv::new("forged-e2e");
     let (code, init) = env.forged(&["init"]);
@@ -778,6 +883,14 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
         status["result"]["run"]["definition"]["rosterRevision"],
         json!(2)
     );
+    let (code, overview) = switched.forged(&["overview", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "overview after revision: {overview}");
+    let revisions = overview["result"]["rosterRevisions"]
+        .as_array()
+        .expect("roster revision history");
+    assert_eq!(revisions.len(), 2, "initial plus explicit revision");
+    assert_eq!(revisions[1]["revision"], json!(2));
+    assert_eq!(revisions[1]["rosterRef"]["name"], json!("all-codex"));
     let (code, driven) = switched.forged(&["run", "drive", "--run", "bead-switch"]);
     assert_eq!(code, 0, "drive after roster revision: {driven}");
     let ledger = switched.ledger();

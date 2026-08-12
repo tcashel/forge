@@ -494,14 +494,58 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
             )
         }
     };
+    let reason = match param_str(&req.params, "reason") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(
+                &derive_key("run_revise_roster", Some(&run_id), Some(&roster_name), None),
+                &error,
+            )
+        }
+    };
+    let latest = {
+        let run_for_lookup = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_roster_revision(&run_for_lookup)
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_revise_roster", Some(&run_id), Some(&roster_name), None),
+                    &error,
+                )
+            }
+        }
+    };
+    let revision = latest
+        .as_ref()
+        .filter(|row| {
+            serde_json::from_str::<forged_types::RosterRef>(&row.roster_ref_json)
+                .is_ok_and(|reference| reference.name == roster_name)
+                && row.reason == reason
+        })
+        .map(|row| row.revision)
+        .unwrap_or_else(|| {
+            latest
+                .as_ref()
+                .map(|row| row.revision)
+                .unwrap_or(0)
+                .saturating_add(1)
+        });
     default_key(
         req,
-        derive_key("run_revise_roster", Some(&run_id), Some(&roster_name), None),
+        derive_key(
+            "run_revise_roster",
+            Some(&run_id),
+            Some(&roster_name),
+            Some(i64::from(revision)),
+        ),
     );
     if req.run_id.is_none() {
         req.run_id = Some(run_id.clone());
     }
-    let params = req.params.clone();
     fenced(
         ctx,
         "run_revise_roster",
@@ -510,7 +554,6 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
         None,
         {
             move |operation| async move {
-                let reason = param_str(&params, "reason")?.to_owned();
                 let definition = {
                     let run_id = run_id.clone();
                     on_ledger(&ctx.ledger, move |ledger| {
