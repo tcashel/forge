@@ -82,10 +82,9 @@ pub fn project_run(
 /// was released for redo, or whose `begin_operation` never ran, is simply
 /// absent here and runs again.
 ///
-/// AMENDMENT PENDING: `find_operation` is a merged ledger read, but the
-/// spec's projection bullet does not list it and the field this feeds
-/// extends the pinned `RunView` — see the note on
-/// [`RunView::settled_operations`].
+/// AMENDED (operator-adjudicated 2026-08-12): these `find_operation` probes
+/// are sanctioned additions to the spec's projection list, as is the
+/// [`RunView::settled_operations`] field they fill — see the note there.
 fn settled_machine_operations(
     ledger: &Ledger,
     run_id: &str,

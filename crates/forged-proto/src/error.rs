@@ -23,7 +23,10 @@ pub enum ProtoError {
     },
     /// A stored event payload violated the replay contract: a required key
     /// is missing, the `schemaVersion` is unknown, or a second payload for
-    /// the same logical key differs byte-wise.
+    /// the same logical key is canonically different (sorted keys, semantic
+    /// value equality). Machine-step report keys (`proto.gate`, `proto.pr`)
+    /// are last-wins and exempt from that last rule — a redone report
+    /// replaces its predecessor instead of raising this.
     #[error("malformed event {event_id}: {detail}")]
     MalformedEvent {
         /// The offending `events.event_id`.

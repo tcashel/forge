@@ -15,8 +15,8 @@ use std::collections::HashMap;
 
 use forged_ledger::{EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState};
 use forged_proto::{
-    advance, project_run, reconcile, record, widen_rfc3339, MachineStage, NextAction, PrSnapshot,
-    ProtoEvent, ReconcileConfig, SessionLiveness,
+    advance, project_run, reconcile, record, widen_rfc3339, GatePhase, MachineStage, NextAction,
+    PrSnapshot, ProtoEvent, ReconcileConfig, SessionLiveness,
 };
 use forged_types::{OperationRequest, OperationResponse, RunId, Stage};
 use support::*;
@@ -241,6 +241,86 @@ async fn a_released_safe_retry_step_still_has_to_run() {
     assert_eq!(
         advance_now(&ledger),
         NextAction::RunMachine(MachineStage::Push)
+    );
+    ledger.close().expect("close");
+}
+
+// The same released-and-redone gate, watched from the event stream: the redo
+// re-reports under the logical key its crashed predecessor already used, and
+// no rerun reproduces a wall-clock duration. AMENDED (operator-adjudicated
+// 2026-08-12): machine-step reports are LAST-WINS, so the stream replays and
+// the projection carries the redo's rows rather than the crashed pass's.
+#[tokio::test]
+async fn a_redone_gate_report_replays_last_wins() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+
+    // The gate begins and reports; the process then dies before
+    // `complete_operation`, leaving the report behind with the row in flight.
+    let key = format!("{RUN}/gate/0");
+    let operation_id = begin_inflight(&ledger, "gate", &key, EffectClass::SafeRetry, None);
+    let mut crashed = gate_row(0);
+    crashed.duration_ms = 10;
+    record(
+        &ledger,
+        RUN,
+        ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: vec![crashed],
+        },
+    )
+    .expect("record the crashed pass");
+
+    // Reconcile releases the row for redo.
+    let ports = FakePorts::new();
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("reconcile");
+    assert_eq!(report.released, vec![operation_id]);
+
+    // The redo runs the same commands, settles, and reports again.
+    settle_step(&ledger, "gate", &key, EffectClass::SafeRetry);
+    let mut redone = gate_row(0);
+    redone.duration_ms = 4200;
+    record(
+        &ledger,
+        RUN,
+        ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: vec![redone.clone()],
+        },
+    )
+    .expect("record the redone pass");
+
+    let view = project_run(
+        &ledger,
+        RUN,
+        full_roster(),
+        vec!["cargo test --workspace".to_owned()],
+        3,
+        T0,
+    )
+    .expect("a redone report must not condemn the stream");
+    let gates: Vec<&ProtoEvent> = view
+        .proto_events
+        .iter()
+        .filter(|e| matches!(e, ProtoEvent::Gate { .. }))
+        .collect();
+    assert_eq!(gates.len(), 1, "one entry per report key: {gates:?}");
+    assert_eq!(
+        *gates[0],
+        ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: vec![redone],
+        },
+        "the projection reads the redo's rows, not the crashed pass's"
     );
     ledger.close().expect("close");
 }

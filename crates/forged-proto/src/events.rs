@@ -16,6 +16,17 @@
 //! Event kinds outside the proto-owned set (the ledger's own
 //! `attempt.state`, `operation.released`, …) are skipped.
 //!
+//! The MACHINE-STEP REPORT kinds — `proto.gate` and `proto.pr` — are the one
+//! exception: they are LAST-WINS on their logical key (AMENDED,
+//! operator-adjudicated 2026-08-12). A redo of a released `SafeRetry` gate,
+//! or a re-opened PR, legitimately re-records under the same key with
+//! different bytes — durations, output previews, and PR numbers are not
+//! reproducible — so replay keeps the LATEST payload per key and never
+//! raises `MalformedEvent` for an earlier report. Reports are informational
+//! projections; the terminal operation row, not the event, remains the
+//! settlement truth. Every other kind keeps the strict rule, where a
+//! canonically different second payload is a corrupted stream.
+//!
 //! The writer holds the same invariants as the reader: [`record`] refuses a
 //! payload [`parse_proto_events`] would refuse, so no run can persist an
 //! event its own replay cannot read back.
@@ -105,13 +116,14 @@ pub enum ProtoEvent {
         request: OperationRequest,
     },
     /// `proto.quarantine` — a zombie result was refused at the fence and its
-    /// bytes taken into custody. The spec-required wire schema is
-    /// `packetId`, `attemptId`, and `reason` — the fence's refusal, verbatim.
-    /// `name` and `result` are this crate's OPTIONAL extensions (the bare
-    /// custody file name, and the refused claim preserved so
-    /// harvest-and-verify can check it); a spec-conforming payload without
-    /// them still parses, and they never join the required schema. The file
-    /// destination stays the adapter's contract.
+    /// bytes taken into custody. The pinned wire schema requires `packetId`,
+    /// `attemptId`, and `reason` — the fence's refusal, verbatim — plus the
+    /// OPTIONAL `name` (the bare custody file name) and `result` (the
+    /// refused claim, preserved so harvest-and-verify can check it), both
+    /// AMENDED into the schema, operator-adjudicated 2026-08-12: `result` is
+    /// what makes harvest-and-verify reachable. A payload carrying neither
+    /// optional key still parses. The file destination stays the adapter's
+    /// contract.
     Quarantine {
         /// The packet the refused result named.
         packet_id: String,
@@ -243,9 +255,9 @@ impl ProtoEvent {
                 name,
                 result,
             } => {
-                // The required schema first; the optional extensions are
-                // appended only when present, so a payload with neither is
-                // exactly the spec shape.
+                // The required keys first; the optional ones are appended
+                // only when present, so a payload with neither is exactly
+                // the required shape.
                 let mut payload = json!({
                     "schemaVersion": 1,
                     "packetId": packet_id,
@@ -267,6 +279,17 @@ impl ProtoEvent {
             }
         };
         Ok(value)
+    }
+
+    /// Whether this is a MACHINE-STEP REPORT — `proto.gate` or `proto.pr` —
+    /// whose logical key is last-wins on replay (AMENDED,
+    /// operator-adjudicated 2026-08-12). Both report the outcome of a
+    /// machine step that can legitimately run twice: a `SafeRetry` gate the
+    /// reconciler released for redo re-records with a fresh duration and
+    /// fresh output previews, and a re-opened PR re-records with a new
+    /// number. Neither difference means the stream is corrupt.
+    fn is_machine_step_report(&self) -> bool {
+        matches!(self, ProtoEvent::Gate { .. } | ProtoEvent::Pr { .. })
     }
 
     /// The logical key duplicates are judged under.
@@ -353,9 +376,17 @@ pub fn widen_rfc3339(s: &str) -> String {
 
 /// Replay the proto-owned events out of a run's raw event rows, in
 /// `event_id` order, applying the replay contract.
+///
+/// Each logical key appears at most once in the result. A machine-step
+/// report's entry keeps the position its first payload took in the stream
+/// and carries the latest payload recorded under that key; every other kind
+/// keeps its one and only payload.
 pub fn parse_proto_events(rows: &[EventRow]) -> Result<Vec<ProtoEvent>, ProtoError> {
-    let mut seen: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
-    let mut out = Vec::new();
+    // Logical key -> where the event standing for it sits in `out`, and the
+    // canonical payload it was parsed from.
+    let mut seen: std::collections::BTreeMap<String, (usize, String)> =
+        std::collections::BTreeMap::new();
+    let mut out: Vec<ProtoEvent> = Vec::new();
     for row in rows {
         let Some(event) = parse_one(row)? else {
             continue;
@@ -365,15 +396,26 @@ pub fn parse_proto_events(rows: &[EventRow]) -> Result<Vec<ProtoEvent>, ProtoErr
         // canonical-JSON equality, not raw bytes — key ORDER and whitespace
         // are noise, VALUE differences are not.
         let canonical = canonical_payload(row)?;
-        match seen.get(&key) {
+        let standing = seen
+            .get(&key)
+            .map(|(index, payload)| (*index, *payload == canonical));
+        match standing {
             None => {
-                seen.insert(key, canonical);
+                seen.insert(key, (out.len(), canonical));
                 out.push(event);
             }
-            Some(prior) if *prior == canonical => {
+            Some((_, true)) => {
                 // Canonically equal duplicate: ignored.
             }
-            Some(_) => {
+            // AMENDED (operator-adjudicated 2026-08-12): machine-step reports
+            // are LAST-WINS on their key — a redo's payload REPLACES the
+            // earlier report rather than condemning the stream. The
+            // settlement truth is the operation row, not this event.
+            Some((index, false)) if event.is_machine_step_report() => {
+                out[index] = event;
+                seen.insert(key, (index, canonical));
+            }
+            Some((_, false)) => {
                 return Err(ProtoError::MalformedEvent {
                     event_id: row.event_id,
                     detail: format!("second differing payload for logical key {key:?}"),
@@ -533,9 +575,10 @@ fn parse_operation_request(row: &EventRow, value: &Value) -> Result<ProtoEvent, 
 }
 
 fn parse_quarantine(row: &EventRow, value: &Value) -> Result<ProtoEvent, ProtoError> {
-    // Required schema: packetId, attemptId, reason. `name` and `result` are
-    // optional extensions — absent (or null) is a conforming payload, but a
-    // present extension that does not parse is still malformed.
+    // Required: packetId, attemptId, reason. `name` and `result` are the
+    // schema's optional keys (AMENDED, operator-adjudicated 2026-08-12) —
+    // absent or null is a conforming payload, but a present optional key
+    // that does not parse is still malformed.
     let name = match value.get("name") {
         None | Some(Value::Null) => None,
         Some(v) => Some(
@@ -646,30 +689,100 @@ mod tests {
     }
 
     #[test]
-    fn canonically_equal_duplicates_collapse_and_differing_ones_refuse() {
+    fn canonically_equal_duplicates_collapse() {
         let payload = json!({"schemaVersion": 1, "number": 7, "isDraft": true, "url": "u"});
         let rows = vec![
             row(1, "proto.pr", payload.clone()),
             row(2, "proto.pr", payload),
         ];
         assert_eq!(parse_proto_events(&rows).expect("parses").len(), 1);
+    }
+
+    // AMENDED (operator-adjudicated 2026-08-12): a machine-step report can be
+    // re-recorded under its key with different bytes — the redo of a released
+    // SafeRetry gate, a re-opened PR — and replay takes the latest payload
+    // instead of condemning the stream.
+    #[test]
+    fn machine_step_reports_are_last_wins() {
+        let gate = |duration_ms: u64| GateRow {
+            command: "cargo test --workspace".to_owned(),
+            cwd: "/work".to_owned(),
+            exit_code: Some(0),
+            duration_ms,
+            timed_out: false,
+            stdout_preview: String::new(),
+            stderr_preview: String::new(),
+            artifact_path: "gates/test.log".to_owned(),
+        };
+        let gate_event = |duration_ms: u64| ProtoEvent::Gate {
+            phase: GatePhase::Gate,
+            seq: 0,
+            passed: true,
+            rows: vec![gate(duration_ms)],
+        };
+        let payload_of = |event: &ProtoEvent| event.payload().expect("payload");
 
         let rows = vec![
-            row(
-                1,
-                "proto.pr",
-                json!({"schemaVersion": 1, "number": 7, "isDraft": true, "url": "u"}),
-            ),
+            row(1, "proto.gate", payload_of(&gate_event(10))),
             row(
                 2,
                 "proto.pr",
-                json!({"schemaVersion": 1, "number": 8, "isDraft": true, "url": "u"}),
+                json!({"schemaVersion": 1, "number": 7, "isDraft": true, "url": "u"}),
+            ),
+            // The gate is redone after release; only its duration differs.
+            row(3, "proto.gate", payload_of(&gate_event(4200))),
+            // And the draft PR is re-opened under a new number.
+            row(
+                4,
+                "proto.pr",
+                json!({"schemaVersion": 1, "number": 8, "isDraft": true, "url": "u8"}),
             ),
         ];
-        let err = parse_proto_events(&rows).expect_err("must refuse");
-        assert!(
-            matches!(err, ProtoError::MalformedEvent { event_id: 2, .. }),
-            "{err}"
+        let parsed = parse_proto_events(&rows).expect("a redone report is not a corrupt stream");
+        assert_eq!(
+            parsed,
+            vec![
+                gate_event(4200),
+                ProtoEvent::Pr {
+                    number: 8,
+                    is_draft: true,
+                    url: "u8".to_owned(),
+                },
+            ],
+            "one entry per report key, each carrying the latest payload, \
+             in the order the keys first appeared"
+        );
+    }
+
+    // Last-wins is scoped to the report key it belongs to: the redone `gate`
+    // pass leaves the `regate` pass alone.
+    #[test]
+    fn last_wins_does_not_cross_gate_phases() {
+        fn pass(phase: &str, seq: i64, passed: bool) -> Value {
+            json!({"schemaVersion": 1, "phase": phase, "seq": seq, "passed": passed, "rows": []})
+        }
+        let rows = vec![
+            row(1, "proto.gate", pass("gate", 0, false)),
+            row(2, "proto.gate", pass("regate", 1, true)),
+            row(3, "proto.gate", pass("gate", 0, true)),
+        ];
+        let parsed = parse_proto_events(&rows).expect("parses");
+        assert_eq!(
+            parsed,
+            vec![
+                ProtoEvent::Gate {
+                    phase: GatePhase::Gate,
+                    seq: 0,
+                    passed: true,
+                    rows: vec![],
+                },
+                ProtoEvent::Gate {
+                    phase: GatePhase::Regate,
+                    seq: 1,
+                    passed: true,
+                    rows: vec![],
+                },
+            ]
         );
     }
 
@@ -702,8 +815,9 @@ mod tests {
             "key order and whitespace are not differences"
         );
 
-        // A canonically different second payload under the same logical key
-        // still refuses: same packet and count, a moved deadline.
+        // `proto.retry` is not a machine-step report, so the strict rule
+        // still holds: a canonically different second payload under the same
+        // logical key refuses — same packet and count, a moved deadline.
         rows[1] = row(
             2,
             "proto.retry",
@@ -763,9 +877,11 @@ mod tests {
     }
 
     #[test]
-    fn quarantine_requires_reason_and_treats_name_and_result_as_extensions() {
-        // The spec-required shape — packetId, attemptId, reason, nothing
-        // else — is a conforming wave-4 event and must parse here.
+    fn quarantine_requires_reason_and_treats_name_and_result_as_optional() {
+        // The required keys alone — packetId, attemptId, reason, nothing
+        // else — are a conforming wave-4 event and must parse here; `name`
+        // and `result` are the schema's optional keys (AMENDED,
+        // operator-adjudicated 2026-08-12).
         let minimal = json!({
             "schemaVersion": 1, "packetId": "run-1/implement/1",
             "attemptId": 4, "reason": "stale claim token"
@@ -783,7 +899,7 @@ mod tests {
         );
 
         // A payload missing the required `reason` is malformed, whatever
-        // extensions ride along.
+        // optional keys ride along.
         let missing_reason = json!({
             "schemaVersion": 1, "packetId": "run-1/implement/1",
             "attemptId": 4, "name": "result.json"
@@ -792,7 +908,7 @@ mod tests {
             .expect_err("must refuse");
         assert!(matches!(err, ProtoError::MalformedEvent { .. }), "{err}");
 
-        // And the writer emits what the parser accepts: the extension keys
+        // And the writer emits what the parser accepts: the optional keys
         // are appended only when present.
         let bare = ProtoEvent::Quarantine {
             packet_id: "run-1/implement/1".to_owned(),
