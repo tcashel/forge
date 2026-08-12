@@ -69,7 +69,8 @@ pub struct Scratch {
 
 /// Create a fresh scratch area named for the calling test.
 pub fn scratch(name: &str) -> Scratch {
-    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
+    let root =
+        PathBuf::from(env!("CARGO_TARGET_TMPDIR")).join(format!("{name}-{}", std::process::id()));
     let _ = std::fs::remove_dir_all(&root);
     let s = Scratch {
         home: root.join("home"),
@@ -158,7 +159,9 @@ pub fn init_store(bd: &Path, s: &Scratch) {
         s.beads.display()
     );
     // Belt and braces: bd must resolve the initialized scratch store.
-    let where_out = raw_bd(bd, s, &["where"]).output().expect("spawning bd where");
+    let where_out = raw_bd(bd, s, &["where"])
+        .output()
+        .expect("spawning bd where");
     let resolved = String::from_utf8_lossy(&where_out.stdout).into_owned();
     assert!(
         resolved.contains(&s.beads.to_string_lossy().into_owned()),

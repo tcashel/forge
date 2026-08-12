@@ -297,7 +297,10 @@ pub(crate) async fn write_policy(
         attempt += 1;
         let out = match runner.run(attempt).await {
             Ok(o) => o,
-            Err(BdError::Timeout { context: c, after_s }) => {
+            Err(BdError::Timeout {
+                context: c,
+                after_s,
+            }) => {
                 if generic_retried {
                     return Err(BdError::Timeout {
                         context: c,
@@ -637,7 +640,10 @@ mod tests {
         let err = write_policy(&other_op(), &mut runner, false, "bd update")
             .await
             .unwrap_err();
-        assert!(matches!(err, BdError::Timeout { after_s: 60, .. }), "got {err:?}");
+        assert!(
+            matches!(err, BdError::Timeout { after_s: 60, .. }),
+            "got {err:?}"
+        );
         assert_eq!(runner.runs, 2);
 
         let mut runner = Canned::new(vec![t(), success()]);

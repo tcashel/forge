@@ -158,7 +158,9 @@ mod tests {
         // An object resolves to itself (bd create shape).
         let data = json!({"id": "beads-2la"});
         assert_eq!(
-            first_obj(&data).and_then(|o| o.get("id")).and_then(Value::as_str),
+            first_obj(&data)
+                .and_then(|o| o.get("id"))
+                .and_then(Value::as_str),
             Some("beads-2la")
         );
         assert!(first_obj(&json!(null)).is_none());

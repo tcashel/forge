@@ -44,11 +44,15 @@ async fn specific_claim_race_has_one_winner_and_api_maps_lease_held() {
 
     // Race two RAW `bd update <id> --claim` children concurrently.
     let spawn = |actor: &str| {
-        support::raw_bd(&bd, &s, &["update", &id, "--claim", "--actor", actor, "--json"])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .expect("spawning raw claim child")
+        support::raw_bd(
+            &bd,
+            &s,
+            &["update", &id, "--claim", "--actor", actor, "--json"],
+        )
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawning raw claim child")
     };
     let c1 = spawn("racer-1");
     let c2 = spawn("racer-2");
@@ -130,6 +134,11 @@ async fn frontier_claim_race_loser_gets_empty_result_and_api_maps_none() {
     assert!(empty, "race loser must get empty data, got: {loser_stdout}");
 
     // The API's frontier claim on the now-empty frontier: Ok(None).
-    let third = claim_ready(&cfg, "frontier-3").await.expect("frontier claim");
-    assert!(third.is_none(), "empty frontier must be Ok(None), got {third:?}");
+    let third = claim_ready(&cfg, "frontier-3")
+        .await
+        .expect("frontier claim");
+    assert!(
+        third.is_none(),
+        "empty frontier must be Ok(None), got {third:?}"
+    );
 }

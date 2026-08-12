@@ -94,14 +94,16 @@ pub async fn run_doctor(cfg: DoctorConfig) -> Vec<ProbeResult> {
 /// "schema_version": 1}`. (Without the envelope var the same fields arrive
 /// at top level; both shapes are read.)
 async fn bd_version(cfg: &DoctorConfig) -> Result<String, String> {
-    let out = invoke::run_bd(&cfg.bd, &["version", "--json"], PROBE_TIMEOUT_S, "bd version")
-        .await
-        .map_err(|e| e.to_string())?;
+    let out = invoke::run_bd(
+        &cfg.bd,
+        &["version", "--json"],
+        PROBE_TIMEOUT_S,
+        "bd version",
+    )
+    .await
+    .map_err(|e| e.to_string())?;
     if out.exit != Some(0) {
-        return Err(format!(
-            "bd version exited {:?}: {}",
-            out.exit, out.stderr
-        ));
+        return Err(format!("bd version exited {:?}: {}", out.exit, out.stderr));
     }
     let parsed: Value = serde_json::from_str(&out.stdout)
         .map_err(|e| format!("unparseable version output ({e}): {}", out.stdout))?;

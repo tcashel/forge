@@ -27,7 +27,9 @@ async fn audit_record_err_is_ignorable_and_never_delays_the_operation() {
     support::init_store(&bd, &s);
     let cfg = support::cfg_for(&bd, &s);
     let id = support::create_bead(&bd, &s, "audit bead");
-    claim_specific(&cfg, &id, "aud-holder").await.expect("claim");
+    claim_specific(&cfg, &id, "aud-holder")
+        .await
+        .expect("claim");
 
     // Explicit call at terminal-attempt time, with the sidecar DISABLED
     // (bd's default): the Err is expected and safely ignorable.
@@ -115,8 +117,14 @@ async fn doctor_returns_six_probes_and_never_panics_without_bd() {
         !results[1].ok,
         "bd-lease-liveness must fail with a missing binary"
     );
-    assert!(!results[2].ok, "beads-dir-resolves must fail with a missing binary");
-    assert!(!results[4].ok, "herdr-ping must fail on a nonexistent socket");
+    assert!(
+        !results[2].ok,
+        "beads-dir-resolves must fail with a missing binary"
+    );
+    assert!(
+        !results[4].ok,
+        "herdr-ping must fail on a nonexistent socket"
+    );
     assert!(results[5].ok, "scratch anvil home must be writable");
     let leftover: Vec<_> = std::fs::read_dir(&scratch_root)
         .expect("scratch root readable")

@@ -31,7 +31,9 @@ async fn guardian_keeps_lease_alive_past_ttl_then_lapse_is_reclaimable() {
     support::init_store(&bd, &s);
     let cfg = support::cfg_for(&bd, &s);
     let id = support::create_bead(&bd, &s, "slow guardian bead");
-    claim_specific(&cfg, &id, "slow-holder").await.expect("claim");
+    claim_specific(&cfg, &id, "slow-holder")
+        .await
+        .expect("claim");
     eprintln!("[slow] claimed {id} as slow-holder; TTL is 300s");
 
     let mut child = std::process::Command::new("/bin/sleep")

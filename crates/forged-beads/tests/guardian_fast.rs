@@ -25,7 +25,9 @@ async fn guardian_beats_then_returns_watched_pid_exited() {
     support::init_store(&bd, &s);
     let cfg = support::cfg_for(&bd, &s);
     let id = support::create_bead(&bd, &s, "guardian bead");
-    claim_specific(&cfg, &id, "guard-holder").await.expect("claim");
+    claim_specific(&cfg, &id, "guard-holder")
+        .await
+        .expect("claim");
 
     let mut child = std::process::Command::new("/bin/sleep")
         .arg("300")
@@ -83,7 +85,9 @@ async fn guardian_with_non_owner_holder_returns_lease_lost_first_round() {
     support::init_store(&bd, &s);
     let cfg = support::cfg_for(&bd, &s);
     let id = support::create_bead(&bd, &s, "non-owner guardian bead");
-    claim_specific(&cfg, &id, "real-owner").await.expect("claim");
+    claim_specific(&cfg, &id, "real-owner")
+        .await
+        .expect("claim");
 
     let mut child = std::process::Command::new("/bin/sleep")
         .arg("300")

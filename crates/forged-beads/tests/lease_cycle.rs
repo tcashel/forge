@@ -23,7 +23,9 @@ async fn lease_cycle() {
     assert_eq!(claimed.id, id);
     assert_eq!(claimed.assignee, "actor-a");
 
-    heartbeat(&cfg, &id, "actor-a").await.expect("owner heartbeat");
+    heartbeat(&cfg, &id, "actor-a")
+        .await
+        .expect("owner heartbeat");
 
     match heartbeat(&cfg, &id, "actor-b").await {
         Err(BdError::HeartbeatRefused { bead, stderr }) => {
@@ -48,7 +50,9 @@ async fn lease_cycle() {
     );
 
     // The bead keeps its original assignee.
-    let show = invoke::read(&cfg, &["show", &id, "--json"]).await.expect("show");
+    let show = invoke::read(&cfg, &["show", &id, "--json"])
+        .await
+        .expect("show");
     let obj = forged_beads::envelope::first_obj(&show).expect("show data");
     assert_eq!(
         obj.get("assignee").and_then(Value::as_str),

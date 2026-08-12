@@ -396,7 +396,10 @@ mod tests {
         let b = lock_file_name(Path::new("/tmp/store-b"));
         assert_eq!(a, a2, "deterministic");
         assert_ne!(a, b, "distinct canonical paths get distinct lock files");
-        assert_eq!(a, format!("beads-_tmp_store-a-{:016x}.lock", fnv1a64(b"/tmp/store-a")));
+        assert_eq!(
+            a,
+            format!("beads-_tmp_store-a-{:016x}.lock", fnv1a64(b"/tmp/store-a"))
+        );
         // Every byte outside [A-Za-z0-9._-] is replaced by '_'.
         let odd = lock_file_name(Path::new("/tmp/we ird/sto:re"));
         let name_part = odd.strip_prefix("beads-").unwrap();

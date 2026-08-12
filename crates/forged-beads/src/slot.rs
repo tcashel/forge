@@ -134,7 +134,9 @@ async fn slot_write(bd: &BdConfig, args: &[&str], context: &str) -> Result<Value
             &'s mut self,
             _attempt: u32,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<classify::RawOutcome, BdError>> + Send + 's>,
+            Box<
+                dyn std::future::Future<Output = Result<classify::RawOutcome, BdError>> + Send + 's,
+            >,
         > {
             Box::pin(async move { invoke::run_locked_once(self.bd, self.args, self.context).await })
         }
@@ -160,9 +162,13 @@ async fn slot_write(bd: &BdConfig, args: &[&str], context: &str) -> Result<Value
 /// "open"}`, exit 0 — and the command is idempotent (a second create returns
 /// the same shape, exit 0).
 pub async fn slot_create(bd: &BdConfig) -> Result<(), BdError> {
-    slot_write(bd, &["merge-slot", "create", "--json"], "bd merge-slot create")
-        .await
-        .map(|_| ())
+    slot_write(
+        bd,
+        &["merge-slot", "create", "--json"],
+        "bd merge-slot create",
+    )
+    .await
+    .map(|_| ())
 }
 
 /// Release the merge slot with an explicit holder:
@@ -171,7 +177,9 @@ pub async fn slot_create(bd: &BdConfig) -> Result<(), BdError> {
 pub async fn slot_release(bd: &BdConfig, holder: &str) -> Result<(), BdError> {
     validate_holder(holder)?;
     let args = ["merge-slot", "release", "--holder", holder, "--json"];
-    slot_write(bd, &args, "bd merge-slot release").await.map(|_| ())
+    slot_write(bd, &args, "bd merge-slot release")
+        .await
+        .map(|_| ())
 }
 
 /// Check the merge slot: `bd merge-slot check --json` (a READ: no lock).
@@ -290,8 +298,10 @@ pub async fn slot_acquire(
                     stderr: out.stderr,
                 });
             }
-            tokio::time::sleep(Duration::from_millis(classify::jitter_ms(contention_attempts)))
-                .await;
+            tokio::time::sleep(Duration::from_millis(classify::jitter_ms(
+                contention_attempts,
+            )))
+            .await;
             continue;
         }
         if out.exit == Some(0) {

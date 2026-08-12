@@ -37,12 +37,18 @@ async fn merge_slot_discipline_and_reaper() {
     // never Contention, LeaseHeld, or Beads.
     match slot_acquire(&cfg, "holder-y", Duration::from_millis(400)).await {
         Err(BdError::SlotBusy { holder }) => {
-            assert_eq!(holder.as_deref(), Some("holder-x"), "holder from the final check");
+            assert_eq!(
+                holder.as_deref(),
+                Some("holder-x"),
+                "holder from the final check"
+            );
         }
         other => panic!("held acquire must end SlotBusy, got {other:?}"),
     }
 
-    slot_release(&cfg, "holder-x").await.expect("release holder-x");
+    slot_release(&cfg, "holder-x")
+        .await
+        .expect("release holder-x");
     let status = slot_check(&cfg).await.expect("check after release");
     assert!(!status.held, "slot must be free after release");
 
@@ -68,7 +74,10 @@ async fn merge_slot_discipline_and_reaper() {
     assert_eq!(report.entries[0].holder, "reap-holder");
     assert_eq!(report.entries[0].outcome, ReapOutcome::Released);
     let status = slot_check(&cfg).await.expect("check after reap");
-    assert!(!status.held, "reaper must have released the dead holder's slot");
+    assert!(
+        !status.held,
+        "reaper must have released the dead holder's slot"
+    );
 
     // Reaper run while an UNRECORDED holder owns the slot refuses to act.
     slot_acquire(&cfg, "stranger", Duration::from_millis(200))
@@ -84,7 +93,9 @@ async fn merge_slot_discipline_and_reaper() {
         Some("stranger"),
         "an unrecorded holder must be left untouched"
     );
-    slot_release(&cfg, "stranger").await.expect("release stranger");
+    slot_release(&cfg, "stranger")
+        .await
+        .expect("release stranger");
 
     // A live recorded holder is left alone.
     let mut live_child = std::process::Command::new("/bin/sleep")
@@ -107,5 +118,7 @@ async fn merge_slot_discipline_and_reaper() {
     assert!(status.held, "a live recorded holder must be left alone");
     live_child.kill().expect("killing live child");
     live_child.wait().expect("reaping live child");
-    slot_release(&cfg, "alive-holder").await.expect("release alive-holder");
+    slot_release(&cfg, "alive-holder")
+        .await
+        .expect("release alive-holder");
 }
