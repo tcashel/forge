@@ -1,0 +1,35 @@
+name: rust
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  gates:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      # Reads rust-toolchain.toml for the toolchain version; caches by default.
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+        with:
+          components: rustfmt, clippy
+
+      - name: fmt
+        run: cargo fmt --all -- --check
+
+      - name: clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: build
+        run: cargo build --workspace --locked
+
+      - name: test
+        run: cargo test --workspace
+
+      # The failpoint kill-matrix — the bd-gated cases SKIP loudly when no
+      # sandboxed bd 1.2.1 binary is present, and the genuine-expiry variant
+      # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
+      - name: failpoints
+        run: cargo test -p forged --features failpoints

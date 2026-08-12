@@ -1,6 +1,6 @@
 # ADR 0030 — Strategy reset: surfaces commoditized; pause Track B, keep Track A as the operator-scoped cockpit
 
-**Status:** Proposed — pending the operator-scope validation experiment (gate to Accept)
+**Status:** Superseded by [`0032-forged-provider-neutral-rust-orchestrator`](./0032-forged-provider-neutral-rust-orchestrator.md) — the bare-parts experiment it gated on answered YES (anvil, 2026-06 and 2026-08), and the frame then moved on
 **Deciders:** Tripp
 **Date:** 2026-06-02
 **Related:** [`0021-two-track-build-path`](./0021-two-track-build-path.md) (revisits), [`0028-spec-dependency-graph-and-orchestration-agent`](./0028-spec-dependency-graph-and-orchestration-agent.md) (supersedes), [`0014-differentiation-before-execution`](./0014-differentiation-before-execution.md), [`0016-multi-critic-synthesis`](./0016-multi-critic-synthesis.md), [`0013-operators-cockpit-positioning`](./0013-operators-cockpit-positioning.md), [`0022-skill-cli-as-agent-contract`](./0022-skill-cli-as-agent-contract.md), [`../COMPETITORS.md`](../COMPETITORS.md), [`../VISION.md`](../VISION.md), [`../BUILD_PATH.md`](../BUILD_PATH.md)
