@@ -66,6 +66,8 @@ pub enum Command {
     Usage(UsageArgs),
     /// List ledger events, paged (read-only).
     Events(EventsArgs),
+    /// Reconnect projection for one slice or epic (read-only).
+    Overview(OverviewArgs),
     /// Worktree lifecycle.
     Worktree {
         /// The worktree subcommand.
@@ -485,6 +487,27 @@ pub struct EventsArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `overview` flags. Exactly one scope is required.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false, args = ["run", "epic"])]
+pub struct OverviewArgs {
+    /// Project one slice run.
+    #[arg(long)]
+    pub run: Option<String>,
+    /// Project one epic and its child runs.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Return event rows with event_id greater than this.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Maximum event rows in the polling page (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `worktree` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorktreeCmd {
@@ -572,6 +595,7 @@ pub fn command_name(command: &Command) -> &'static str {
             None => "usage_report",
         },
         Command::Events(_) => "events_tail",
+        Command::Overview(_) => "overview",
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
@@ -854,6 +878,22 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 json!({"run": a.run, "after": a.after, "limit": a.limit}),
             ),
         ),
+        Command::Overview(a) => {
+            let scope = a.run.clone().or_else(|| a.epic.clone());
+            (
+                "overview",
+                request(
+                    a.idempotency_key,
+                    scope,
+                    json!({
+                        "run": a.run,
+                        "epic": a.epic,
+                        "after": a.after,
+                        "limit": a.limit,
+                    }),
+                ),
+            )
+        }
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (
                 "worktree_retire",

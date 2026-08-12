@@ -33,6 +33,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "reconcile",
         "usage",
         "events",
+        "overview",
         "worktree",
         "mcp",
     ] {
@@ -109,6 +110,13 @@ fn help_lists_every_command_and_subcommand_flags() {
     let events = help_text(&env, &["events", "--help"]);
     for flag in ["--run", "--after", "--limit"] {
         assert!(events.contains(flag), "events --help must document {flag}");
+    }
+    let overview = help_text(&env, &["overview", "--help"]);
+    for flag in ["--run", "--epic", "--after", "--limit"] {
+        assert!(
+            overview.contains(flag),
+            "overview --help must document {flag}"
+        );
     }
 }
 

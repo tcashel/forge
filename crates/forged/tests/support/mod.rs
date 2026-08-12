@@ -1209,6 +1209,14 @@ impl McpClient {
             .unwrap_or_else(|e| panic!("tool {name} text is not an envelope ({e}): {text}"))
     }
 
+    /// Call a tool and return its raw JSON-RPC result object.
+    pub fn call_tool_result(&mut self, name: &str, envelope: Value) -> Value {
+        self.request("tools/call", json!({"name": name, "arguments": envelope}))
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
     /// The tool names the server declares.
     pub fn list_tools(&mut self) -> Vec<String> {
         let reply = self.request("tools/list", json!({}));
@@ -1223,6 +1231,40 @@ impl McpClient {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// One declared tool, including extension metadata.
+    pub fn tool(&mut self, name: &str) -> Value {
+        let reply = self.request("tools/list", json!({}));
+        reply
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Resource URIs declared by the server.
+    pub fn list_resources(&mut self) -> Vec<String> {
+        let reply = self.request("resources/list", json!({}));
+        reply
+            .pointer("/result/resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|resource| resource.get("uri").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Read one text resource.
+    pub fn read_resource(&mut self, uri: &str) -> Value {
+        self.request("resources/read", json!({"uri": uri}))
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 }
 

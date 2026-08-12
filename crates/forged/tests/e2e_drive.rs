@@ -54,6 +54,17 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert!(status["result"]["children"][0]["merged"].is_object());
     assert!(status["result"]["inputRequired"].is_null());
 
+    let (code, overview) = env.forged(&["overview", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic overview: {overview}");
+    assert_eq!(overview["result"]["schema"], json!("forged.overview/1"));
+    assert_eq!(overview["result"]["kind"], json!("epic"));
+    assert_eq!(
+        overview["result"]["childRuns"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(!overview["result"]["gates"].as_array().unwrap().is_empty());
+    assert!(overview["result"]["cursor"].as_i64().is_some());
+
     let gh = env.gh_calls();
     assert!(gh.iter().any(|args| args.starts_with(&[
         "pr".to_owned(),

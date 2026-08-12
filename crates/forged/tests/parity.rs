@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twenty-four public core functions, the CLI path and the MCP tool path produce
+//! the twenty-five public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twenty_four_tools_match_their_cli_counterparts() {
+fn all_twenty_five_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -46,6 +46,7 @@ fn all_twenty_four_tools_match_their_cli_counterparts() {
         "doctor",
         "definition_validate",
         "events_tail",
+        "overview",
         "epic_advance",
         "epic_drive",
         "epic_pause",
@@ -68,7 +69,26 @@ fn all_twenty_four_tools_match_their_cli_counterparts() {
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-four tools, exactly");
+    assert_eq!(tools, expected, "the twenty-five tools, exactly");
+
+    let overview_tool = mcp.tool("overview");
+    assert_eq!(
+        overview_tool.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/overview.html"))
+    );
+    assert_eq!(
+        mcp.list_resources(),
+        vec!["ui://forged/overview.html".to_owned()]
+    );
+    let app = mcp.read_resource("ui://forged/overview.html");
+    assert_eq!(
+        app.pointer("/contents/0/mimeType"),
+        Some(&json!("text/html;profile=mcp-app"))
+    );
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Control Plane")));
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
@@ -102,6 +122,19 @@ fn all_twenty_four_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
+
+    let cli = env.forged(&["overview", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "overview",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "overview parity");
+    let structured = mcp.call_tool_result(
+        "overview",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert!(structured["structuredContent"].is_object());
+    assert_eq!(structured["structuredContent"]["ok"], json!(false));
 
     // run_revise_roster: a nonexistent run refuses identically.
     let cli = env
