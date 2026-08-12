@@ -44,11 +44,58 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert_eq!(code, 0, "epic start: {started}");
     assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
 
+    env.set_scenario("implement", "slow", 1);
     let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
     assert_eq!(code, 0, "epic submit: {submitted}");
     assert_eq!(submitted["result"]["submitted"], json!(true));
     assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
     assert!(submitted["result"]["controller"]["sessionId"].is_string());
+
+    let mut provider_started = false;
+    for _ in 0..100 {
+        if env
+            .provider_log()
+            .iter()
+            .any(|line| line.starts_with("child-one/implementation/0") && line.contains(" start "))
+        {
+            provider_started = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(provider_started, "detached epic reached a live provider");
+    let (code, paused) = env.forged(&[
+        "epic",
+        "pause",
+        "--epic",
+        "epic-one",
+        "--reason",
+        "operator checkpoint",
+    ]);
+    assert_eq!(
+        code, 0,
+        "out-of-band pause while controller owns slot: {paused}"
+    );
+    let held = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
+        value["result"]["paused"].is_object()
+            && value["result"]["controller"]["state"] == json!("exited")
+    });
+    assert!(
+        held["result"]["finalPr"].is_null(),
+        "pause precedes merge: {held}"
+    );
+    let (code, resumed) = env.forged(&[
+        "epic",
+        "resume",
+        "--epic",
+        "epic-one",
+        "--reason",
+        "operator approved continuation",
+    ]);
+    assert_eq!(code, 0, "resume: {resumed}");
+    let (code, resubmitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic resubmit: {resubmitted}");
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
 
     let driven = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
         value["result"]["finalPr"]["number"] == json!(8)
@@ -214,8 +261,9 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
     let (code, duplicate) = env.forged(&["run", "submit", "--run", "bead-e2e"]);
     assert_eq!(code, 0, "duplicate submit: {duplicate}");
-    assert_eq!(duplicate["result"]["submitted"], json!(false));
-    assert_eq!(duplicate["result"]["alreadyRunning"], json!(true));
+    assert_eq!(duplicate["reused"], json!(true));
+    assert_eq!(duplicate["result"]["submitted"], json!(true));
+    assert_eq!(duplicate["result"]["alreadyRunning"], json!(false));
     assert_eq!(
         duplicate["result"]["controller"]["sessionId"],
         submitted["result"]["controller"]["sessionId"]
@@ -233,6 +281,15 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         value["result"]["run"]["controller"]["state"] == json!("exited")
     });
     assert_eq!(stopped["result"]["run"]["controller"]["exitCode"], json!(0));
+    let (code, terminal_submit) = env.forged(&["run", "submit", "--run", "bead-e2e"]);
+    assert_eq!(code, 0, "terminal submit is a no-op: {terminal_submit}");
+    assert_eq!(terminal_submit["result"]["submitted"], json!(false));
+    assert!(terminal_submit["result"]["stopped"]["terminal"].is_object());
+    assert_eq!(
+        terminal_submit["result"]["controller"]["generation"],
+        json!(1),
+        "a completed run never starts a second controller"
+    );
 
     // Exactly one draft PR creation; zero merge or ready-for-review calls.
     let gh = env.gh_calls();

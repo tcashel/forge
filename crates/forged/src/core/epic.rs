@@ -174,6 +174,17 @@ pub(super) async fn epic_repo(ctx: &Ctx, epic: &str) -> Result<String, Failure> 
     Ok(project(ctx, epic).await?.config.repo)
 }
 
+pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
+    let view = project(ctx, epic).await?;
+    Ok(if let Some(pr) = view.pr {
+        Some(json!({"finalPr": pr}))
+    } else if let Some(paused) = view.paused {
+        Some(json!({"paused": paused}))
+    } else {
+        view.input.map(|input| json!({"inputRequired": input}))
+    })
+}
+
 async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), Failure> {
     let epic = epic.to_owned();
     let kind = kind.to_owned();
@@ -1003,6 +1014,7 @@ async fn control_event(
     req: &mut OperationRequest,
     name: &str,
     kind: &str,
+    require_idle_driver: bool,
 ) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
         Ok(value) => value.to_owned(),
@@ -1014,9 +1026,16 @@ async fn control_event(
     };
     default_key(req, derive_key(name, Some(&epic), None, None));
     let key = req.idempotency_key.clone();
-    let _guard = match acquire_driver(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&key, &error),
+    // Pause is an out-of-band control signal specifically so a lead session
+    // can stop a detached controller at its next durable boundary. Resume is
+    // accepted only after that controller has observed the pause and released
+    // its singular driver slot.
+    let _guard = match require_idle_driver {
+        true => match acquire_driver(ctx, &epic).await {
+            Ok(guard) => Some(guard),
+            Err(error) => return err_response(&key, &error),
+        },
+        false => None,
     };
     let event = json!({"reason": reason});
     let event_epic = epic.clone();
@@ -1041,12 +1060,12 @@ async fn control_event(
 
 /// Pause an epic.
 pub async fn epic_pause(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
-    control_event(ctx, req, "epic_pause", PAUSED).await
+    control_event(ctx, req, "epic_pause", PAUSED, false).await
 }
 
 /// Resume a paused epic (input-required remains until explicitly resolved).
 pub async fn epic_resume(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
-    control_event(ctx, req, "epic_resume", RESUMED).await
+    control_event(ctx, req, "epic_resume", RESUMED, true).await
 }
 
 /// Resolve one held child after a lead session adjudicated its input/spec.

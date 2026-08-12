@@ -1,155 +1,117 @@
-# NEXT — forged drives everything
+# CURRENT — the lead agent hands locked work to Forged
 
-v0 is merged and installed (`~/.cargo/bin/forged`, all eleven doctor probes
-green). It has **never driven a real slice.** Everything below is about closing
-that gap fast, in two sessions, and then deleting the TypeScript atom that
-currently does the job.
+The Rust binary is the execution path. There is no preliminary “first contact”
+experiment and no token-accounting-only milestone: finish planning with the
+user, lock the work, submit it, then inspect durable state.
 
-Run this top to bottom. Each step says what "done" means; if a step breaks, fix
-forged and re-run it — the runs are disposable, the ledger is append-only, and
-nothing here touches a repo that matters until the PR step.
+## Ownership
 
-## Ground rules
+- The user talks to one lead agent.
+- Smithy/Anvil owns plan, proportional critique, and adjudication.
+- Beads owns inventory, dependencies, readiness, and leases.
+- Forged owns cognitive-stage contracts, topology, provider dispatch, gates,
+  review/remediation, epic waves, and results.
+- Provider adapters perform cognition.
+- Herdr owns panes/process transport; the Forged ledger remains truth.
+- Git/GitHub own code, branches, PRs, and merge truth.
 
-- **Codex is the provider.** The fable tier is out for a week (through
-  ~2026-08-19) and the Anthropic pool is needed elsewhere. Every packet below
-  runs `codex` at `gpt-5.6-sol`/xhigh unless a step says otherwise.
-- **The OpenAI pool is shared** with whatever codex session is driving drover.
-  They compete; don't run two heavy things at once.
-- **Never touch the live beads store for experiments.** `BEADS_DIR` and
-  `ANVIL_HOME` are both env-overridable — use scratch values for anything that
-  is not real work. (`forged doctor` reads the live store; that is fine, its
-  lease probe is scratch-guarded.)
+## Configure once
 
----
-
-## Session 1 — first contact, then the falsifier
-
-### Step 1 — forged drives one real slice, start to draft PR
-
-Target: `beads-aj3` in drover (the wing-coverage probe — ready, zero open
-questions, self-contained in `ts/`).
-
-```bash
-forged run start --bead beads-aj3 \
-  --repo /Users/tcashel/repositories/drover \
-  --spec /Users/tcashel/.anvil/specs/beads-aj3.md
-forged run drive --run <run-id>          # or: forged run advance, one stage at a time
-forged run status --run <run-id>
-forged events --run <run-id> --limit 50
+```sh
+export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
+export BEADS_DIR="${BEADS_DIR:-$ANVIL_HOME/beads}"
+forged init
+forged doctor
+forged definition validate --profile standard --roster default
 ```
 
-**Done when:** a draft PR is open on drover, the gate result is recorded
-(pass or fail — a failing gate must NOT abort the run), both review legs
-produced a verdict, and the ledger holds attempt rows plus `operations` rows
-with an idempotency key per external effect.
+`$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
+`standard`, `high`) and named ordered provider/model rosters. Change a roster
+when model or provider availability changes; do not rewrite topology or skills.
+Run start freezes the resolved package and hashes. A live slice changes roster
+only at a durable boundary:
 
-**Where it will break first — check these before assuming a deep bug:**
-
-1. **The gate command shape.** aj3's gate is two lines, each `cd`-prefixed:
-   `cd ts && bun run check` and a second line running the probe script. The
-   gate runner has only ever seen single cargo commands. Fix the runner, not
-   the spec.
-2. **Provider selection.** Confirm the packet's hints actually select codex,
-   and that the sandbox is `workspace-write` for implement/fix and
-   `read-only` for reviews.
-3. **`gh pr create`.** Draft flag, correct base, and the operation must be
-   recorded before the side effect (observe-only recovery class).
-4. **Usage capture.** Under a ChatGPT plan there is no USD — `pricing_basis`
-   must be `none` with real token counts, not a crash or a zero.
-
-Do NOT hand-fix drover's code to make a stage pass. If the slice's content is
-wrong, that is a finding about the spec; if a stage is wrong, that is a bug in
-forged. Keep them separate.
-
-### Step 2 — the falsifier (S6). This is the bet.
-
-Same repo, real work. Start a slice, kill the driver mid-implement, resume from
-a **different** session:
-
-```bash
-forged run start --bead <next-ready-bead> --repo /Users/tcashel/repositories/drover --spec ~/.anvil/specs/<id>.md
-forged run drive --run <run-id> &        # let it reach Implement
-kill -9 <driver-pid>                     # mid-flight, no cleanup
-# from a second shell / a codex session:
-forged claim-next --holder codex:$(hostname):$$ --idempotency-key falsifier-1
+```sh
+forged run revise-roster --run <run-id> --roster <name> --reason '<reason>'
 ```
 
-**Asserts — all must hold:**
+Herdr defaults to `preferred`: unavailability is recorded and falls back to a
+plain detached process. Use `required` only when execution must refuse without
+an observable pane.
 
-- exactly one PR, and exactly one succeeded `pr.create` operation
-- zero duplicate review comments (count the `<!-- anvil-finding id=… -->` markers)
-- no packet with two completed attempts
-- exactly one `lease_reclaimed` in bd's events, with never two live holders
-  (cross-check bd events against the ledger)
-- replaying any completed operation returns byte-identical `reused:true`
-- a failing gate yields `ok:true` with a failing result, never an abort
-- `usage` rows exist per attempt with provider, model, and `pricing_basis`
-- zero bd writes from worker packets
+## Submit a slice
 
-**On pass: tag v0.** On fail: the architecture is wrong and the parked TS
-kernel (beads-5rz) un-parks — that is the deal, and it is why this step is not
-optional.
-
----
-
-## Session 2 — make forged the default path
-
-### Step 3 — codex drives forged natively
-
-```bash
-codex mcp add forged -- forged mcp
+```sh
+forged run start --bead <id> --repo /absolute/repo \
+  --spec "$ANVIL_HOME/specs/<id>.md" --profile standard --roster default
+forged run submit --run <id>
 ```
 
-Then drive a slice from inside a codex session using the forged tools rather
-than shell commands. The stdio server round-tripped envelopes from both hosts
-during P0, so this should be registration plus a smoke test, not development.
+Submit returns a durable controller identity immediately. Retrying while it is
+live adopts the same controller. The run ends at a reviewed draft PR; the
+human adjudicates the merge.
 
-**Done when:** a codex session starts, advances, and inspects a run without
-shelling out.
+## Submit an epic
 
-### Step 4 — retire the TypeScript atom
+```sh
+forged epic start --epic <epic-id> --repo /absolute/repo \
+  --spec "$ANVIL_HOME/specs/<epic-id>.md" --profile standard --roster default
+forged epic submit --epic <epic-id>
+```
 
-In smithy (**in a git worktree** — the Claude marketplace reads
-`~/repositories/smithy` live, so a branch checkout there swaps the pipeline
-under any running session):
+Forged freezes the Beads inventory, drives ready children in waves, and
+squash-merges only mechanically clean slices into
+`forged/epic-<epic-id>`. It never merges that branch to the default branch. A
+completed epic ends at one draft PR; ambiguity/no-ready/non-clean work becomes
+durable `inputRequired`, not a hidden cognitive replan.
 
-- Point the `dispatch` skill at `forged run start` + `run drive` instead of
-  `workflows/execute-review-fix.js`.
-- Delete `execute-review-fix.js` only after forged has driven **three** real
-  slices clean. Until then it stays as the one-line revert.
-- `run-epic.js` and `watch-epic` STAY on the TS path. Epic/v1 is a separate
-  design with its own falsifier; the atom is where the tokens and the crash
-  risk live, and it is the only piece forged v0 implements.
-- Rewrite smithy's cardinal rule: "anvil never shells out to forge" dies with
-  the experiment that needed it. Successor: *anvil reaches forged only through
-  its typed CLI/MCP contracts; no cognitive stage lives in forged.*
-- Bump the plugin version (both manifests) — installs are version-keyed on the
-  codex side and will otherwise serve stale files.
+After the lead agent or user adjudicates a held child:
 
-### Step 5 — herdr panes
+```sh
+forged epic resolve --epic <epic-id> --child <child-id> --note '<resolution>'
+forged epic submit --epic <epic-id>
+```
 
-The `SessionHost` herdr backend ships and doctor reports the socket live at
-`~/.config/herdr/herdr.sock`. Smoke it: two panes at target concurrency, kill
-one, confirm death is detected via **sentinel staleness only** (herdr never
-exposes exit codes). Then make it the default vessel so slices are watchable.
+Pause is an out-of-band signal observed at the next durable boundary:
 
----
+```sh
+forged epic pause --epic <epic-id> --reason '<reason>'
+forged epic resume --epic <epic-id> --reason '<reason>'
+forged epic submit --epic <epic-id>
+```
 
-## What we are NOT doing yet
+## Reconnect from any agent harness
 
-- run-epic / watch-epic in forged (epic/v1 — needs design + its own falsifier)
-- the MCP App dashboard (view-only, desktop-only, deferred)
-- any YAML workflow DSL (protocol-first until two genuinely different
-  topologies demand it)
+```sh
+forged overview --run <run-id>
+forged overview --epic <epic-id>
+forged session list --run <run-id>
+forged events --run <id> --limit 200
+```
 
-## Carry-over debt worth one commit each
+The overview aggregates status/topology, controller and provider sessions,
+Herdr attach state, gates, findings, artifacts, interventions, roster
+revisions, usage, and events. The MCP `overview` tool returns the identical
+structured projection and renders it through `ui://forged/overview.html`.
 
-- Historical ADRs link `../VISION.md` etc.; those moved to
-  `docs/archive/ts-era/`. Add a README there rather than editing the records.
-- The failpoints CI step takes 20+ minutes (second full compile + real process
-  choreography). cargo-nextest or a feature-keyed cache would fix it.
-- The retro that priced all of this is at `~/.anvil/runs/beads-4zp-retro.md`;
-  its smithy-side actions (resumable blocked state, deterministic readiness,
-  chunked review coverage) are mostly obsoleted by Step 4 — forged's ledger
-  already owns them. Don't build them twice.
+For a Herdr-backed attempt:
+
+```sh
+forged session read --attempt <attempt-id> --lines 120
+forged session message --run <run-id> --attempt <attempt-id> \
+  --message '<guidance>' --requested-by '<human-or-agent>'
+```
+
+Messages without live-delivery capability are ledgered for the next provider
+boundary.
+
+## Smithy cutover
+
+Anvil 0.3 removes `execute-review-fix.js`, `run-epic.js`, the critique Workflow,
+`watch-epic`, and its monitor. Its dispatch skills are typed clients of the
+commands above. Planning remains human-in-the-loop and provider-neutral;
+execution has one durable authority.
+
+The next operational action is to review/merge the Forge and Smithy branches,
+install those exact versions, and use the normal Anvil plan → adjudicate →
+submit path on real work. No alternate execution path remains to reconcile.

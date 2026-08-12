@@ -398,9 +398,11 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         .map(|value| generation(&value))
         .max()
         .unwrap_or(0);
+    let mut latest_status = Value::Null;
     if let Ok(Some(record)) = latest_record(ctx, &id).await {
         max_generation = max_generation.max(generation(&record));
         let status = status_for(&record).await;
+        latest_status = status.clone();
         if is_active(&status) {
             // Recover the ledger row if the submitting process died after
             // writing controller.json but before appending the event.
@@ -495,6 +497,49 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 json!({"submitted": false, "alreadyRunning": true, "controller": status}),
             );
         }
+    }
+
+    let stopped = match scope {
+        Scope::Run => match super::drive::project(ctx, &id).await {
+            Ok(view) => match forged_proto::advance(&view) {
+                forged_proto::NextAction::Stop(terminal) => {
+                    Some(json!({"terminal": super::drive::terminal_json(&terminal)}))
+                }
+                _ => None,
+            },
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        },
+        Scope::Epic => match super::epic::epic_submission_stop(ctx, &id).await {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        },
+    };
+    if let Some(stopped) = stopped {
+        return ok_response(
+            &derive_key(
+                scope.operation(),
+                Some(&id),
+                Some("stopped"),
+                Some(i64::from(max_generation)),
+            ),
+            false,
+            json!({
+                "submitted": false,
+                "alreadyRunning": false,
+                "stopped": stopped,
+                "controller": latest_status,
+            }),
+        );
     }
 
     let next_generation = max_generation.saturating_add(1);

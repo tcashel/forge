@@ -60,15 +60,14 @@ boundary.
 - Claude, Codex, or another harness can drive the same `forged` API. Losing one
   provider requires a roster edit for future runs or an explicit revision at a
   safe boundary, not a workflow rewrite.
-- A host agent and future MCP App are monitoring/control adapters over the same
-  ledger. Neither becomes canonical run state.
-- The current four-stage `slice/v1` engine remains as a temporary compatibility
-  projection while semantic profile execution is implemented. A profile that
-  cannot fit that executor fails closed instead of being silently reduced.
-- Smithy's existing Anvil dispatch and epic workflows remain migration input,
-  not a second orchestration authority. They are removed only after their
-  locked-plan handoff and observable behavior are represented through typed
-  `forged` contracts.
+- Host agents and the view-only MCP App are monitoring/control adapters over
+  the same ledger. Neither becomes canonical run state.
+- `slice/v1` retains legacy storage-lane compatibility, while semantic seats,
+  profiles, escalation edges, and candidate selection are frozen in the
+  execution package and projected independently of provider family.
+- Smithy Anvil 0.3 removed its dispatch/epic/critique Workflow scripts and
+  scheduled watch after detached handoff, epic control, Herdr supervision, and
+  the unified overview were represented through typed `forged` contracts.
 
 ## Non-goals locked by this ADR
 
