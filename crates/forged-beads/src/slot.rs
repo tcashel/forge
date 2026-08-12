@@ -1,0 +1,547 @@
+//! Merge-slot discipline plus the stale-holder reaper.
+//!
+//! bd's merge-slot CAS is sound (second acquire refused) but bare
+//! `bd merge-slot release` force-releases ANY holder — the hole is confirmed
+//! live in bd 1.2.1 — so `--holder` is mandatory on acquire AND release at
+//! the type level; no bare-release call is constructible from this crate's
+//! API. (With `--holder` given, bd refuses a mismatch: probe observed
+//! `slot held by holder-x, not holder-z`, exit 1.)
+//!
+//! ENVELOPE EXCEPTION (source-verified in bd 1.2.1): the merge-slot commands
+//! ignore `BD_JSON_ENVELOPE` and emit raw JSON objects with no
+//! `data`/`schema_version` wrapper — all four merge-slot commands are parsed
+//! as raw JSON, never through the envelope parser. (Merge-slot ERRORS can
+//! still arrive enveloped: the mismatch refusal above came back as
+//! `{"data":{"error":...},"schema_version":1}`; the haystack matching covers
+//! both.)
+//!
+//! Acquire-when-held is NOT an error to escalate and NOT a queue to join
+//! (never any bd waiters/wait surface): acquire retries on the module-4
+//! backoff up to a caller-supplied budget, then returns
+//! [`BdError::SlotBusy`].
+
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+use serde_json::Value;
+
+use crate::classify::{self, BdError};
+use crate::config::BdConfig;
+use crate::envelope;
+use crate::guardian::{probe_pid, PidState};
+use crate::invoke;
+
+/// A successful merge-slot acquisition.
+#[derive(Debug, Clone)]
+pub struct AcquiredSlot {
+    /// The holder the slot was acquired for.
+    pub holder: String,
+    /// The wrapper's own clock reading at acquisition (unix epoch seconds) —
+    /// bd's slot carries no timestamp field; persisting this is the caller's
+    /// job (the ledger owns the acquisition clock).
+    pub acquired_at_epoch_s: u64,
+    /// The raw parsed JSON bd returned for the acquire.
+    pub raw: Value,
+}
+
+/// The merge slot's current state as reported by `check`.
+#[derive(Debug, Clone)]
+pub struct SlotStatus {
+    /// Whether a holder currently holds the slot. (A missing slot — check
+    /// before create — reports `held: false`; observed raw output
+    /// `{"available": false, "error": "not found", "id": "beads-merge-slot"}`.)
+    pub held: bool,
+    /// The current holder, when one holds the slot.
+    pub holder: Option<String>,
+    /// The raw parsed JSON bd returned for the check.
+    pub raw: Value,
+}
+
+/// One holder forged's ledger recorded as having acquired the slot — the
+/// caller is the source of truth for what forged acquired.
+#[derive(Debug, Clone)]
+pub struct RecordedHolder {
+    /// The exact holder string used at acquire time.
+    pub holder: String,
+    /// The pid of the attempt that acquired.
+    pub attempt_pid: u32,
+    /// Optional `ps -o lstart=` hint captured at acquire time; a mismatch
+    /// counts the pid as dead (reuse protection).
+    pub pid_start_hint: Option<String>,
+}
+
+/// The reaper's typed report.
+#[derive(Debug, Clone)]
+pub struct ReapReport {
+    /// Per-holder outcomes. Fail-closed: an EMPTY report means the reaper
+    /// could not act — the `check` failed, the holder's pid could not be
+    /// probed conclusively, or a release attempt failed. It never means
+    /// "nothing needed doing" (that is [`ReapOutcome::SlotFree`]).
+    pub entries: Vec<ReapEntry>,
+}
+
+/// One reaper outcome, about the slot's current holder.
+#[derive(Debug, Clone)]
+pub struct ReapEntry {
+    /// The holder this outcome describes (empty for [`ReapOutcome::SlotFree`]
+    /// — a free slot has no holder).
+    pub holder: String,
+    /// What the reaper found or did.
+    pub outcome: ReapOutcome,
+}
+
+/// What the reaper found or did for a holder.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReapOutcome {
+    /// The slot was free: nothing to do.
+    SlotFree,
+    /// The current holder is not in the recorded list: REFUSED — the reaper
+    /// never auto-reaps a holder forged did not record.
+    UnknownHolder,
+    /// The recorded holder's attempt process is still alive: left alone.
+    HolderAlive,
+    /// The recorded holder's attempt process was dead; the slot was released
+    /// with that exact `--holder`.
+    Released,
+}
+
+fn epoch_s() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn validate_holder(holder: &str) -> Result<(), BdError> {
+    if holder.is_empty() || holder.contains('\n') {
+        return Err(BdError::Beads {
+            context: "holder validation".to_string(),
+            exit: None,
+            stdout: String::new(),
+            stderr: format!("holder must be non-empty with no newline, got {holder:?}"),
+        });
+    }
+    Ok(())
+}
+
+/// A raw-JSON merge-slot WRITE under the module-4 policy (Dolt contention
+/// retries, one generic retry, no bead re-read — slot ops name no bead).
+async fn slot_write(bd: &BdConfig, args: &[&str], context: &str) -> Result<Value, BdError> {
+    struct SlotRunner<'a> {
+        bd: &'a BdConfig,
+        args: &'a [&'a str],
+        context: &'a str,
+    }
+    impl classify::AttemptRunner for SlotRunner<'_> {
+        fn run<'s>(
+            &'s mut self,
+            _attempt: u32,
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<Output = Result<classify::RawOutcome, BdError>> + Send + 's,
+            >,
+        > {
+            Box::pin(async move { invoke::run_locked_once(self.bd, self.args, self.context).await })
+        }
+        fn reread_assignee<'s>(
+            &'s mut self,
+            _bead: &'s str,
+        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Option<String>> + Send + 's>>
+        {
+            Box::pin(async move { None })
+        }
+    }
+    let op = invoke::WriteOp::Other {
+        bead: None,
+        actor: None,
+    };
+    let mut runner = SlotRunner { bd, args, context };
+    classify::write_policy(&op, &mut runner, true, context).await
+}
+
+/// Create the merge slot: `bd merge-slot create --json`.
+///
+/// Observed raw output (bd 1.2.1): `{"id": "beads-merge-slot", "status":
+/// "open"}`, exit 0 — and the command is idempotent (a second create returns
+/// the same shape, exit 0).
+pub async fn slot_create(bd: &BdConfig) -> Result<(), BdError> {
+    slot_write(
+        bd,
+        &["merge-slot", "create", "--json"],
+        "bd merge-slot create",
+    )
+    .await
+    .map(|_| ())
+}
+
+/// Release the merge slot with an explicit holder:
+/// `bd merge-slot release --holder <h> --json`. Observed raw output:
+/// `{"id": "beads-merge-slot", "released": true}`, exit 0.
+pub async fn slot_release(bd: &BdConfig, holder: &str) -> Result<(), BdError> {
+    validate_holder(holder)?;
+    let args = ["merge-slot", "release", "--holder", holder, "--json"];
+    slot_write(bd, &args, "bd merge-slot release")
+        .await
+        .map(|_| ())
+}
+
+/// Check the merge slot: `bd merge-slot check --json` (a READ: no lock).
+///
+/// Observed raw outputs (bd 1.2.1): free slot `{"available": true, "holder":
+/// null, "id": "beads-merge-slot", "waiters": null}`; held slot
+/// `{"available": false, "holder": "holder-x", "id": "beads-merge-slot",
+/// "waiters": null}`; missing slot `{"available": false, "error": "not
+/// found", "id": "beads-merge-slot"}` — all exit 0.
+pub async fn slot_check(bd: &BdConfig) -> Result<SlotStatus, BdError> {
+    let context = "bd merge-slot check";
+    let args = ["merge-slot", "check", "--json"];
+    let out = invoke::run_bd(bd, &args, bd.read_timeout_s, context).await?;
+    if out.exit != Some(0) {
+        return Err(BdError::Beads {
+            context: context.to_string(),
+            exit: out.exit,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        });
+    }
+    let raw: Value = serde_json::from_str(&out.stdout).map_err(|e| BdError::Envelope {
+        context: context.to_string(),
+        detail: format!("unparseable raw JSON ({e}); stdout: {}", out.stdout),
+    })?;
+    let holder = raw
+        .get("holder")
+        .and_then(Value::as_str)
+        .filter(|h| !h.is_empty())
+        .map(str::to_string);
+    Ok(SlotStatus {
+        held: holder.is_some(),
+        holder,
+        raw,
+    })
+}
+
+/// Whether bd's acquire response proves that THIS holder now owns the slot.
+///
+/// Three guards, all load-bearing because [`AcquiredSlot`] is the caller's
+/// proof of ownership — the ledger persists it and later release/reap
+/// decisions trust it. The response must say `acquired: true`; the child must
+/// have exited 0 (the spec's classify rule for merge-slot commands is
+/// exit-status-and-shape driven — a held acquire exits 1 — so an
+/// `acquired: true` printed alongside a refusal exit is not an acquisition);
+/// and when the raw response names a holder (or actor) itself, it must name
+/// the one we asked for, since a response describing someone else's
+/// acquisition is not ours to record. A response naming no holder at all is
+/// carried by the zero exit alone, which is the shape bd 1.2.1 emits for
+/// `merge-slot create`-adjacent commands.
+fn acquire_confirmed(exit: Option<i32>, raw: &Value, holder: &str) -> bool {
+    if exit != Some(0) || raw.get("acquired").and_then(Value::as_bool) != Some(true) {
+        return false;
+    }
+    ["holder", "actor"]
+        .iter()
+        .filter_map(|k| raw.get(*k).and_then(Value::as_str))
+        .filter(|h| !h.is_empty())
+        .all(|h| h == holder)
+}
+
+/// The EXACT pinned slot-busy shape: exit 1 with `acquired: false` in the raw
+/// (unwrapped) JSON, and no error alongside it. bd 1.2.1 prints precisely
+/// that for a held slot, and the spec's classify rule for merge-slot commands
+/// makes only that outcome contention.
+///
+/// Everything else is a real failure wearing a similar hat and must NOT enter
+/// the busy-retry loop: an `acquired: false` carrying an `error` (bd's own
+/// failure shape — the sibling `check` command emits `{"available": false,
+/// "error": "not found", ...}` for a missing slot), an unexpected exit code,
+/// or an `acquired: true` the exit status and holder field did not confirm.
+/// Retrying those as contention would burn the caller's whole acquire budget
+/// against something that will never resolve, and then report a busy slot,
+/// hiding the `Beads`/`Envelope` error that says what actually broke.
+fn slot_busy_shape(exit: Option<i32>, raw: &Value) -> bool {
+    let acquired_false = raw.get("acquired").and_then(Value::as_bool) == Some(false);
+    let carries_error = raw
+        .get("error")
+        .is_some_and(|e| !e.is_null() && e.as_str() != Some(""));
+    exit == Some(1) && acquired_false && !carries_error
+}
+
+/// Acquire the merge slot for `holder`, retrying with the module-4 backoff
+/// while it is busy, up to the caller-supplied `budget` of cumulative sleep.
+/// When the budget would be exceeded, returns [`BdError::SlotBusy`] with the
+/// holder from a final `check` call.
+///
+/// Observed raw outputs (bd 1.2.1): success `{"acquired": true, "holder":
+/// "holder-x", "id": "beads-merge-slot"}`, exit 0; held `{"acquired": false,
+/// "holder": "holder-x", "id": "beads-merge-slot"}`, exit 1 — exactly that
+/// outcome is slot-busy, never `Contention`, `LeaseHeld`, or `Beads`.
+///
+/// An [`AcquiredSlot`] comes back only when the acquire is CONFIRMED (see
+/// `acquire_confirmed`): `acquired: true`, zero exit, and a response that
+/// either names no holder or names the requested one. The backoff, in turn,
+/// runs only for the pinned busy shape (see `slot_busy_shape`). Every other
+/// outcome — including an unconfirmed `acquired: true` and an
+/// `acquired: false` that carries an error or an unexpected exit code — falls
+/// through to the generic classification below, so a broken bd surfaces as
+/// `Beads`/`Envelope` instead of as contention that never clears.
+pub async fn slot_acquire(
+    bd: &BdConfig,
+    holder: &str,
+    budget: Duration,
+) -> Result<AcquiredSlot, BdError> {
+    validate_holder(holder)?;
+    let context = "bd merge-slot acquire";
+    let args = ["merge-slot", "acquire", "--holder", holder, "--json"];
+    let budget_ms = u64::try_from(budget.as_millis()).unwrap_or(u64::MAX);
+    let mut slept_ms: u64 = 0;
+    let mut busy_attempts: u32 = 0;
+    let mut contention_attempts: u32 = 0;
+    let mut generic_retried = false;
+    loop {
+        let out = match invoke::run_locked_once(bd, &args, context).await {
+            Ok(o) => o,
+            Err(BdError::Timeout {
+                context: c,
+                after_s,
+            }) => {
+                if generic_retried {
+                    return Err(BdError::Timeout {
+                        context: c,
+                        after_s,
+                    });
+                }
+                generic_retried = true;
+                continue;
+            }
+            Err(e) => return Err(e),
+        };
+        if let Ok(raw) = serde_json::from_str::<Value>(&out.stdout) {
+            if acquire_confirmed(out.exit, &raw, holder) {
+                return Ok(AcquiredSlot {
+                    holder: holder.to_string(),
+                    acquired_at_epoch_s: epoch_s(),
+                    raw,
+                });
+            }
+            if slot_busy_shape(out.exit, &raw) {
+                busy_attempts += 1;
+                // Floor each accounted sleep at 1 ms so a run of 0-draws
+                // cannot spin past the budget forever.
+                let drawn = classify::jitter_ms(busy_attempts).max(1);
+                if slept_ms + drawn > budget_ms {
+                    let holder_now = match slot_check(bd).await {
+                        Ok(s) => s.holder,
+                        Err(_) => None,
+                    };
+                    return Err(BdError::SlotBusy { holder: holder_now });
+                }
+                tokio::time::sleep(Duration::from_millis(drawn)).await;
+                slept_ms += drawn;
+                continue;
+            }
+        }
+        // Neither a confirmed acquire nor the pinned busy shape: classify like
+        // any other write, so a bd-side failure surfaces as itself.
+        let env_err = envelope::parse_lenient(&out.stdout)
+            .error
+            .unwrap_or_default();
+        let haystack = format!("{}\n{env_err}\n{}", out.stdout, out.stderr);
+        if haystack.contains(classify::DOLT_LOCK_REFUSAL) {
+            contention_attempts += 1;
+            if contention_attempts >= 5 {
+                return Err(BdError::Contention {
+                    attempts: contention_attempts,
+                    stderr: out.stderr,
+                });
+            }
+            tokio::time::sleep(Duration::from_millis(classify::jitter_ms(
+                contention_attempts,
+            )))
+            .await;
+            continue;
+        }
+        if out.exit == Some(0) {
+            return Err(BdError::Envelope {
+                context: context.to_string(),
+                detail: format!("stdout: {}; stderr: {}", out.stdout, out.stderr),
+            });
+        }
+        if !generic_retried {
+            generic_retried = true;
+            continue;
+        }
+        return Err(BdError::Beads {
+            context: context.to_string(),
+            exit: out.exit,
+            stdout: out.stdout,
+            stderr: out.stderr,
+        });
+    }
+}
+
+/// Reap a stale merge-slot holder, fail-closed: `check` the current holder;
+/// a free slot is nothing to do; a holder NOT in `recorded` is REFUSED
+/// ([`ReapOutcome::UnknownHolder`] — never auto-reap a holder forged did not
+/// record); a recorded holder is released with that exact `--holder` only
+/// after its attempt process is confirmed dead (pid probe as in the
+/// guardian; start-hint mismatch counts as dead). A live recorded holder is
+/// left alone.
+///
+/// The pid probe is tri-state and the reaper honours all three: it releases
+/// ONLY on [`PidState::Dead`] (a confirmed-absent pid or a start-hint
+/// mismatch). A probe that could not be completed — spawn failure, timeout,
+/// a permission refusal, an unreadable `ps` — is [`PidState::Unknown`] and
+/// the reaper REFUSES to act on it, reporting the empty "could not act"
+/// report rather than releasing a holder that may well be alive.
+pub async fn reap_stale_holders(bd: &BdConfig, recorded: &[RecordedHolder]) -> ReapReport {
+    let status = match slot_check(bd).await {
+        Ok(s) => s,
+        // Fail-closed: an unreadable slot is not acted on.
+        Err(_) => return ReapReport { entries: vec![] },
+    };
+    let Some(current) = status.holder else {
+        return ReapReport {
+            entries: vec![ReapEntry {
+                holder: String::new(),
+                outcome: ReapOutcome::SlotFree,
+            }],
+        };
+    };
+    let Some(rec) = recorded.iter().find(|r| r.holder == current) else {
+        return ReapReport {
+            entries: vec![ReapEntry {
+                holder: current,
+                outcome: ReapOutcome::UnknownHolder,
+            }],
+        };
+    };
+    match probe_pid(rec.attempt_pid, rec.pid_start_hint.as_deref()).await {
+        PidState::Alive => {
+            return ReapReport {
+                entries: vec![ReapEntry {
+                    holder: current,
+                    outcome: ReapOutcome::HolderAlive,
+                }],
+            };
+        }
+        // Fail-closed: an inconclusive probe is NOT a death certificate. The
+        // slot stays held and the empty report says the reaper could not act.
+        PidState::Unknown => return ReapReport { entries: vec![] },
+        PidState::Dead => {}
+    }
+    match slot_release(bd, &current).await {
+        Ok(()) => ReapReport {
+            entries: vec![ReapEntry {
+                holder: current,
+                outcome: ReapOutcome::Released,
+            }],
+        },
+        // Fail-closed: a failed release is reported as an empty report, not
+        // a claimed success.
+        Err(_) => ReapReport { entries: vec![] },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn acquire_is_confirmed_only_by_a_zero_exit_naming_this_holder() {
+        // The observed bd 1.2.1 success shape.
+        let ours = json!({"acquired": true, "holder": "holder-x", "id": "beads-merge-slot"});
+        assert!(acquire_confirmed(Some(0), &ours, "holder-x"));
+
+        // bd refused, or died on a signal, while still printing acquired: true.
+        assert!(!acquire_confirmed(Some(1), &ours, "holder-x"));
+        assert!(!acquire_confirmed(None, &ours, "holder-x"));
+
+        // The response describes a DIFFERENT holder's acquisition.
+        assert!(!acquire_confirmed(Some(0), &ours, "holder-y"));
+
+        // An `actor` field is held to the same rule.
+        let actor = json!({"acquired": true, "actor": "holder-z"});
+        assert!(!acquire_confirmed(Some(0), &actor, "holder-x"));
+        assert!(acquire_confirmed(Some(0), &actor, "holder-z"));
+
+        // A response that names nobody is carried by the zero exit alone; an
+        // empty or null holder field names nobody either.
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "id": "beads-merge-slot"}),
+            "holder-x"
+        ));
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "holder": "", "id": "beads-merge-slot"}),
+            "holder-x"
+        ));
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "holder": null}),
+            "holder-x"
+        ));
+
+        // The `acquired` flag itself is a guard: a zero exit naming our
+        // holder proves nothing without it.
+        assert!(!acquire_confirmed(
+            Some(0),
+            &json!({"acquired": false, "holder": "holder-x"}),
+            "holder-x"
+        ));
+        assert!(!acquire_confirmed(
+            Some(0),
+            &json!({"holder": "holder-x"}),
+            "holder-x"
+        ));
+    }
+
+    #[test]
+    fn only_the_pinned_shape_is_slot_busy() {
+        // The observed bd 1.2.1 held-slot shape, and the only one that backs
+        // off: exit 1, acquired: false, no error.
+        let held = json!({"acquired": false, "holder": "holder-x", "id": "beads-merge-slot"});
+        assert!(slot_busy_shape(Some(1), &held));
+
+        // An internal bd failure shaped like a refusal is a failure, not
+        // contention — retrying it burns the budget against something that
+        // will never clear.
+        let with_error = json!({"acquired": false, "error": "not found", "id": "beads-merge-slot"});
+        assert!(!slot_busy_shape(Some(1), &with_error));
+
+        // Unexpected exit codes are not the pinned shape either.
+        assert!(!slot_busy_shape(Some(0), &held), "a zero exit is not busy");
+        assert!(!slot_busy_shape(Some(2), &held));
+        assert!(!slot_busy_shape(None, &held), "a signal death is not busy");
+
+        // An empty or null error field names no failure, so the pinned shape
+        // still stands.
+        assert!(slot_busy_shape(
+            Some(1),
+            &json!({"acquired": false, "error": null})
+        ));
+        assert!(slot_busy_shape(
+            Some(1),
+            &json!({"acquired": false, "error": ""})
+        ));
+
+        // No `acquired` field at all: not an acquire-shaped answer.
+        assert!(!slot_busy_shape(
+            Some(1),
+            &json!({"id": "beads-merge-slot"})
+        ));
+
+        // An unconfirmed `acquired: true` is neither a confirmed acquire nor
+        // the busy shape: it must reach the generic classification.
+        let unconfirmed = json!({"acquired": true, "holder": "holder-y"});
+        assert!(!acquire_confirmed(Some(0), &unconfirmed, "holder-x"));
+        assert!(!slot_busy_shape(Some(0), &unconfirmed));
+        assert!(!slot_busy_shape(Some(1), &unconfirmed));
+    }
+
+    #[test]
+    fn a_holder_must_be_non_empty_and_newline_free() {
+        assert!(validate_holder("cc:host:4242").is_ok());
+        assert!(validate_holder("").is_err());
+        assert!(validate_holder("cc:host:4242\nrelease").is_err());
+    }
+}
