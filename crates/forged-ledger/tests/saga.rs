@@ -1,0 +1,510 @@
+//! The shim test — this epic's riskiest-assumption retirement — plus the
+//! mechanically enforced saga order, the fence, and the event stream.
+//!
+//! Pause/resume is choreographed with rendezvous channels, never timing.
+
+use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::mpsc;
+use std::sync::Arc;
+
+use forged_ledger::{
+    AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
+    RunState,
+};
+use forged_types::{
+    ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
+};
+use serde_json::json;
+
+fn make_run(ledger: &Ledger, id: &str) -> String {
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(id).expect("valid run id"),
+            bead_id: "bead-1".to_owned(),
+            repo: "example/repo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: format!("feat/{id}"),
+        })
+        .expect("create run")
+        .run_id
+}
+
+fn make_packet(ledger: &Ledger, run_id: &str) -> String {
+    ledger
+        .open_packet(NewPacket {
+            run_id: run_id.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: "specs/x.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
+        })
+        .expect("open packet")
+}
+
+fn request(key: &str, run_id: Option<&str>) -> OperationRequest {
+    OperationRequest {
+        schema_version: 1,
+        idempotency_key: key.to_owned(),
+        run_id: run_id.map(str::to_owned),
+        params: serde_json::Map::new(),
+    }
+}
+
+fn ok_response(operation_id: &str) -> OperationResponse {
+    OperationResponse {
+        ok: true,
+        operation_id: operation_id.to_owned(),
+        reused: false,
+        result: Some(json!({"done": true})),
+        error: None,
+    }
+}
+
+fn fix_result(packet_id: &str) -> PacketResult {
+    PacketResult {
+        schema: "forged.result/1".to_owned(),
+        packet_id: packet_id.to_owned(),
+        outcome: Outcome::Fix {
+            applied: true,
+            summary: "done".to_owned(),
+        },
+    }
+}
+
+fn fresh(outcome: OperationOutcome) -> String {
+    match outcome {
+        OperationOutcome::Fresh(ticket) => ticket.operation_id,
+        other => panic!("expected Fresh, got {other:?}"),
+    }
+}
+
+/// Shim variant 1: revoked mid-flight. The durable `revoking` marker lands
+/// while the executor is paused before its fence check; the fence then
+/// refuses, the effect never runs, and the operation row stays
+/// `in_progress` for the reconciler.
+#[test]
+fn shim_revoked_mid_flight_never_fires_the_effect() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-shim-1");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(&packet, "claude:sess-1:100", "cafe")
+        .expect("claim");
+    let operation_id = fresh(
+        ledger
+            .begin_operation(
+                "shim.effect",
+                &request("key-1", Some(&run)),
+                EffectClass::SafeRetry,
+                Some(&claim.claim_token),
+            )
+            .expect("begin"),
+    );
+
+    let counter = Arc::new(AtomicU32::new(0));
+    let (paused_tx, paused_rx) = mpsc::channel::<()>();
+    let (resume_tx, resume_rx) = mpsc::channel::<()>();
+    let executor = {
+        let ledger = ledger.clone();
+        let token = claim.claim_token.clone();
+        let counter = Arc::clone(&counter);
+        std::thread::spawn(move || {
+            paused_tx.send(()).expect("rendezvous: paused");
+            resume_rx.recv().expect("rendezvous: resume");
+            // The fence check guards the effect immediately before it fires.
+            let fence = ledger.assert_attempt_live(&token);
+            if fence.is_ok() {
+                counter.fetch_add(1, Ordering::SeqCst);
+            }
+            fence
+        })
+    };
+
+    paused_rx.recv().expect("executor reached the pause point");
+    // Commits durably BEFORE the executor resumes.
+    ledger
+        .revoke_attempt(claim.attempt_id, "operator revoked")
+        .expect("revoke");
+    resume_tx.send(()).expect("rendezvous: resume");
+    let fence = executor.join().expect("executor thread");
+    assert_eq!(
+        fence.expect_err("fence must refuse").code(),
+        ErrorCode::StaleClaimToken
+    );
+    assert_eq!(counter.load(Ordering::SeqCst), 0, "the effect never ran");
+
+    let err = ledger
+        .complete_operation(&operation_id, &ok_response(&operation_id))
+        .expect_err("a revoked attempt cannot land results");
+    assert_eq!(err.code(), ErrorCode::StaleClaimToken);
+
+    let row = ledger
+        .find_operation("shim.effect", "key-1")
+        .expect("find")
+        .expect("row survives");
+    assert_eq!(row.state, OperationState::InProgress);
+    ledger.close().expect("close");
+}
+
+/// Shim variant 2: crash before the effect fires. After reopen, the
+/// reconciler finds the in-flight row, releases it (safe-retry), and the
+/// retry claims fresh; the effect runs exactly once.
+#[test]
+fn shim_crash_before_send_releases_and_retries_exactly_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let counter = AtomicU32::new(0);
+
+    let ledger = Ledger::open(&path).expect("open");
+    let run = make_run(&ledger, "run-shim-2");
+    let operation_id = fresh(
+        ledger
+            .begin_operation(
+                "shim.crash",
+                &request("key-2", Some(&run)),
+                EffectClass::SafeRetry,
+                None,
+            )
+            .expect("begin"),
+    );
+    // The crash is simulated by the effect never firing; close joins the
+    // writer thread so the reopen below races nothing.
+    ledger.close().expect("close");
+
+    let ledger = Ledger::open(&path).expect("reopen");
+    let inflight = ledger.list_inflight_operations(None).expect("list");
+    assert_eq!(inflight.len(), 1);
+    assert_eq!(inflight[0].operation_id, operation_id);
+    assert_eq!(inflight[0].effect_class, EffectClass::SafeRetry);
+
+    ledger.release_operation(&operation_id).expect("release");
+    let retry_id = fresh(
+        ledger
+            .begin_operation(
+                "shim.crash",
+                &request("key-2", Some(&run)),
+                EffectClass::SafeRetry,
+                None,
+            )
+            .expect("retry begins fresh"),
+    );
+    counter.fetch_add(1, Ordering::SeqCst); // the effect fires
+    assert_eq!(counter.load(Ordering::SeqCst), 1);
+    ledger
+        .complete_operation(&retry_id, &ok_response(&retry_id))
+        .expect("complete");
+    ledger.close().expect("close");
+}
+
+/// Shim variant 3: the effect applied but the response was lost. The test
+/// plays the observing reconciler: it settles the row, and a fresh
+/// `begin_operation` replays the settled result without re-firing.
+#[test]
+fn shim_applied_then_response_lost_settles_by_observation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let counter = AtomicU32::new(0);
+
+    let ledger = Ledger::open(&path).expect("open");
+    let run = make_run(&ledger, "run-shim-3");
+    let operation_id = fresh(
+        ledger
+            .begin_operation(
+                "shim.applied",
+                &request("key-3", Some(&run)),
+                EffectClass::ObserveOnly,
+                None,
+            )
+            .expect("begin"),
+    );
+    counter.fetch_add(1, Ordering::SeqCst); // the effect executes
+    ledger.close().expect("close before complete_operation");
+
+    let ledger = Ledger::open(&path).expect("reopen");
+    let settled = ok_response(&operation_id);
+    ledger
+        .resolve_interrupted_operation(&operation_id, &settled)
+        .expect("resolve");
+
+    let outcome = ledger
+        .begin_operation(
+            "shim.applied",
+            &request("key-3", Some(&run)),
+            EffectClass::ObserveOnly,
+            None,
+        )
+        .expect("begin after settle");
+    match outcome {
+        OperationOutcome::Replayed(response) => {
+            assert!(response.reused, "replay carries reused: true");
+            assert!(response.ok);
+            assert_eq!(response.result, settled.result);
+        }
+        other => panic!("expected Replayed, got {other:?}"),
+    }
+    assert_eq!(counter.load(Ordering::SeqCst), 1, "the effect never re-ran");
+    ledger.close().expect("close");
+}
+
+/// Saga order enforced mechanically, per the acceptance criterion.
+#[test]
+fn saga_order_is_enforced_mechanically() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-saga");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(&packet, "claude:sess-2:200", "cafe")
+        .expect("claim");
+
+    // reclaimed is unreachable from running.
+    let err = ledger
+        .mark_reclaimed(claim.attempt_id)
+        .expect_err("must refuse");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    ledger
+        .revoke_attempt(claim.attempt_id, "stalled")
+        .expect("revoke");
+
+    // While revoking, the fence refuses everything under that token.
+    let err = ledger
+        .complete_packet(&packet, &claim.claim_token, &fix_result(&packet))
+        .expect_err("complete while revoking");
+    assert_eq!(err.code(), ErrorCode::StaleClaimToken);
+    let err = ledger
+        .heartbeat_attempt(&claim.claim_token)
+        .expect_err("heartbeat while revoking");
+    assert_eq!(err.code(), ErrorCode::StaleClaimToken);
+    let err = ledger
+        .assert_attempt_live(&claim.claim_token)
+        .expect_err("assert while revoking");
+    assert_eq!(err.code(), ErrorCode::StaleClaimToken);
+    let err = ledger
+        .begin_operation(
+            "saga.op",
+            &request("saga-key", Some(&run)),
+            EffectClass::SafeRetry,
+            Some(&claim.claim_token),
+        )
+        .expect_err("token-bearing begin while revoking");
+    assert_eq!(err.code(), ErrorCode::StaleClaimToken);
+    let err = ledger
+        .claim_packet(&packet, "claude:sess-3:300", "cafe")
+        .expect_err("claim while revoking");
+    assert_eq!(err.code(), ErrorCode::PacketNotClaimable);
+
+    // Re-revoking is idempotent: original reason and timestamps preserved.
+    let before = ledger.get_attempt(claim.attempt_id).expect("get");
+    ledger
+        .revoke_attempt(claim.attempt_id, "a different reason")
+        .expect("idempotent revoke");
+    let after = ledger.get_attempt(claim.attempt_id).expect("get");
+    assert_eq!(after, before);
+
+    ledger.mark_reclaimed(claim.attempt_id).expect("reclaim");
+    let reclaimed = ledger.get_attempt(claim.attempt_id).expect("get");
+    assert_eq!(reclaimed.state, AttemptState::Reclaimed);
+    assert_eq!(reclaimed.revoke_reason.as_deref(), Some("stalled"));
+    assert!(reclaimed.ended_at.is_some());
+
+    // A successor claim succeeds with a fresh token only after reclaimed.
+    let successor = ledger
+        .claim_packet(&packet, "claude:sess-4:400", "cafe")
+        .expect("successor claim");
+    assert_ne!(successor.claim_token, claim.claim_token);
+    assert_ne!(successor.attempt_id, claim.attempt_id);
+    ledger.close().expect("close");
+}
+
+/// The fail note is readable both ways: `fail_note` on the row and,
+/// verbatim, as the `attempt.state` event's reason.
+#[test]
+fn fail_packet_note_lands_in_row_and_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-fail");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(&packet, "claude:sess-5:500", "cafe")
+        .expect("claim");
+    let note = "gate exploded: linker OOM";
+    ledger
+        .fail_packet(&packet, &claim.claim_token, note)
+        .expect("fail");
+
+    let attempt = ledger.get_attempt(claim.attempt_id).expect("get");
+    assert_eq!(attempt.state, AttemptState::Failed);
+    assert_eq!(attempt.fail_note.as_deref(), Some(note));
+    assert!(attempt.ended_at.is_some());
+
+    let events = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("run-scoped events");
+    let failed = events
+        .iter()
+        .filter(|e| e.kind == "attempt.state")
+        .map(|e| serde_json::from_str::<serde_json::Value>(&e.payload_json).expect("payload"))
+        .find(|p| p["new"] == "failed")
+        .expect("failed transition event");
+    assert_eq!(failed["reason"], json!(note));
+    assert_eq!(failed["old"], json!("running"));
+    assert_eq!(failed["attemptId"], json!(claim.attempt_id));
+    assert_eq!(failed["packetId"], json!(packet));
+
+    // A failed packet is re-claimable.
+    ledger
+        .claim_packet(&packet, "claude:sess-6:600", "cafe")
+        .expect("re-claim after failed");
+    ledger.close().expect("close");
+}
+
+/// `set_run_state` semantics, including idempotence and no cascade.
+#[test]
+fn set_run_state_rules_hold() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-state");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(&packet, "claude:sess-7:700", "cafe")
+        .expect("claim");
+
+    let err = ledger
+        .set_run_state(&run, RunState::Stopped, None)
+        .expect_err("stop needs a reason");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+    let err = ledger
+        .set_run_state(&run, RunState::Active, Some("why".to_owned()))
+        .expect_err("active takes no reason");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    ledger
+        .set_run_state(&run, RunState::Stopped, Some("budget".to_owned()))
+        .expect("stop");
+    let row = ledger.get_run(&run).expect("get");
+    assert_eq!(row.state, RunState::Stopped);
+    assert_eq!(row.stop_reason.as_deref(), Some("budget"));
+
+    // No cascade: the live attempt stays running.
+    let attempt = ledger.get_attempt(claim.attempt_id).expect("get");
+    assert_eq!(attempt.state, AttemptState::Running);
+
+    // Idempotent re-stop: no write, no second event, original reason kept.
+    ledger
+        .set_run_state(&run, RunState::Stopped, Some("a new reason".to_owned()))
+        .expect("idempotent stop");
+    let row = ledger.get_run(&run).expect("get");
+    assert_eq!(row.stop_reason.as_deref(), Some("budget"));
+    let stop_events: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|e| e.kind == "run.state")
+        .collect();
+    assert_eq!(stop_events.len(), 1, "one effective transition, one event");
+    let payload: serde_json::Value =
+        serde_json::from_str(&stop_events[0].payload_json).expect("payload");
+    assert_eq!(
+        payload,
+        json!({"runId": run, "old": "active", "new": "stopped", "reason": "budget"})
+    );
+
+    // Reactivation clears stop_reason and appends a second run.state event.
+    ledger
+        .set_run_state(&run, RunState::Active, None)
+        .expect("reactivate");
+    let row = ledger.get_run(&run).expect("get");
+    assert_eq!(row.state, RunState::Active);
+    assert_eq!(row.stop_reason, None);
+    let run_events: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|e| e.kind == "run.state")
+        .collect();
+    assert_eq!(run_events.len(), 2);
+    ledger.close().expect("close");
+}
+
+/// Events are append-only with strictly increasing ids, and attempt
+/// transitions carry the owning run's id (the run-scoped listing proves it).
+#[test]
+fn events_are_append_only_and_run_attributed() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-events");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(&packet, "claude:sess-8:800", "cafe")
+        .expect("claim");
+    ledger
+        .revoke_attempt(claim.attempt_id, "shutting down")
+        .expect("revoke");
+    ledger.mark_reclaimed(claim.attempt_id).expect("reclaim");
+    ledger
+        .append_event(None, "custom.kind", json!({"free": "form"}))
+        .expect("append");
+
+    let all = ledger.list_events(None, 0, 100).expect("all events");
+    assert!(all.len() >= 4);
+    for pair in all.windows(2) {
+        assert!(pair[0].event_id < pair[1].event_id, "strictly increasing");
+    }
+    assert!(
+        all.iter().any(|e| e.run_id.is_none()),
+        "None filter includes NULL-run rows"
+    );
+
+    let scoped = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("run-scoped events");
+    let transitions: Vec<String> = scoped
+        .iter()
+        .filter(|e| e.kind == "attempt.state")
+        .map(|e| {
+            let p: serde_json::Value = serde_json::from_str(&e.payload_json).expect("payload");
+            p["new"].as_str().expect("new is a string").to_owned()
+        })
+        .collect();
+    assert_eq!(transitions, ["running", "revoking", "reclaimed"]);
+    assert!(
+        scoped
+            .iter()
+            .all(|e| e.run_id.as_deref() == Some(run.as_str())),
+        "Some filter excludes NULLs"
+    );
+
+    // The claim event has old: null; the revoking event carries the reason.
+    let claim_payload: serde_json::Value = serde_json::from_str(
+        &scoped
+            .iter()
+            .find(|e| e.kind == "attempt.state")
+            .expect("claim event")
+            .payload_json,
+    )
+    .expect("payload");
+    assert_eq!(claim_payload["old"], json!(null));
+    assert_eq!(claim_payload["reason"], json!(null));
+    let revoking = scoped
+        .iter()
+        .filter(|e| e.kind == "attempt.state")
+        .map(|e| serde_json::from_str::<serde_json::Value>(&e.payload_json).expect("payload"))
+        .find(|p| p["new"] == "revoking")
+        .expect("revoking event");
+    assert_eq!(revoking["reason"], json!("shutting down"));
+
+    // Pagination: exclusive after_event_id, ascending, limit 0 → empty.
+    let first_id = scoped[0].event_id;
+    let after = ledger
+        .list_events(Some(&run), first_id, 100)
+        .expect("after first");
+    assert_eq!(after.len(), scoped.len() - 1);
+    assert!(ledger
+        .list_events(None, 0, 0)
+        .expect("limit zero")
+        .is_empty());
+    ledger.close().expect("close");
+}
