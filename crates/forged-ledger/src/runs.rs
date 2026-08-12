@@ -1,14 +1,20 @@
 //! Run rows and the `run.state` transition rules.
 
-use forged_types::ErrorCode;
+use std::fmt::Write as _;
+
+use forged_types::{canonical_json_bytes, ErrorCode, EXECUTION_PACKAGE_SCHEMA_V1};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde::Serialize;
 use serde_json::json;
+use sha2::{Digest, Sha256};
 
 use crate::error::{refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{NewRun, RunRow, RunState};
+use crate::types::{
+    NewRun, NewRunDefinition, RosterRevisionRow, RunDefinitionRow, RunRow, RunState,
+};
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
     Ok(RunRow {
@@ -30,6 +36,90 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
 
 const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
                            stop_reason, created_at, updated_at";
+
+const DEFINITION_COLUMNS: &str = "run_id, protocol_ref_json, profile_ref_json, roster_ref_json, \
+    package_sha256, profile_sha256, roster_sha256, package_json, compatibility_roster_json, created_at";
+
+fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
+    Ok(RunDefinitionRow {
+        run_id: row.get(0)?,
+        protocol_ref_json: row.get(1)?,
+        profile_ref_json: row.get(2)?,
+        roster_ref_json: row.get(3)?,
+        package_sha256: row.get(4)?,
+        profile_sha256: row.get(5)?,
+        roster_sha256: row.get(6)?,
+        package_json: row.get(7)?,
+        compatibility_roster_json: row.get(8)?,
+        created_at: row.get(9)?,
+    })
+}
+
+fn revision_row(row: &rusqlite::Row<'_>) -> Result<RosterRevisionRow, rusqlite::Error> {
+    let revision: i64 = row.get(1)?;
+    Ok(RosterRevisionRow {
+        run_id: row.get(0)?,
+        revision: revision.try_into().map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })?,
+        roster_ref_json: row.get(2)?,
+        roster_sha256: row.get(3)?,
+        roster_json: row.get(4)?,
+        reason: row.get(5)?,
+        created_at: row.get(6)?,
+    })
+}
+
+fn canonical<T: Serialize>(value: &T) -> Result<(String, String), LedgerError> {
+    let value = serde_json::to_value(value)?;
+    let bytes = canonical_json_bytes(&value)
+        .map_err(|error| crate::error::internal(format!("canonical JSON: {error}")))?;
+    let digest = Sha256::digest(&bytes);
+    let mut hex = String::with_capacity(64);
+    for byte in digest {
+        write!(&mut hex, "{byte:02x}")
+            .map_err(|_| crate::error::internal("digest formatting failed"))?;
+    }
+    let text = String::from_utf8(bytes)
+        .map_err(|error| crate::error::internal(format!("canonical JSON is not UTF-8: {error}")))?;
+    Ok((text, hex))
+}
+
+fn insert_run(
+    tx: &rusqlite::Transaction<'_>,
+    new_run: &NewRun,
+    now: &str,
+) -> Result<RunRow, LedgerError> {
+    let run_id = new_run.run_id.as_str();
+    let exists: Option<i64> = tx
+        .query_row("SELECT 1 FROM runs WHERE run_id = ?1", [run_id], |row| {
+            row.get(0)
+        })
+        .optional()?;
+    if exists.is_some() {
+        return Err(refused(
+            ErrorCode::InvalidRequest,
+            format!("run {run_id:?} already exists"),
+        ));
+    }
+    tx.execute(
+        "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, \
+         created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
+        rusqlite::params![
+            run_id,
+            new_run.bead_id,
+            new_run.repo,
+            new_run.base_ref,
+            new_run.branch,
+            now
+        ],
+    )?;
+    get_run_tx(tx, run_id)
+}
 
 pub(crate) fn get_run_tx(conn: &Connection, run_id: &str) -> Result<RunRow, LedgerError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
@@ -61,34 +151,124 @@ impl Ledger {
     pub fn create_run(&self, new_run: NewRun) -> Result<RunRow, LedgerError> {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let run_id = new_run.run_id.as_str();
-            let exists: Option<i64> = tx
-                .query_row("SELECT 1 FROM runs WHERE run_id = ?1", [run_id], |row| {
-                    row.get(0)
-                })
-                .optional()?;
-            if exists.is_some() {
-                return Err(refused(
-                    ErrorCode::InvalidRequest,
-                    format!("run {run_id:?} already exists"),
-                ));
-            }
             let now = now_iso();
-            tx.execute(
-                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, \
-                 created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, 'active', ?6, ?6)",
-                rusqlite::params![
-                    run_id,
-                    new_run.bead_id,
-                    new_run.repo,
-                    new_run.base_ref,
-                    new_run.branch,
-                    now
-                ],
-            )?;
-            let row = get_run_tx(&tx, run_id)?;
+            let row = insert_run(&tx, &new_run, &now)?;
             tx.commit()?;
             Ok(row)
+        })
+    }
+
+    /// Create a run, its immutable execution package, and roster revision 1
+    /// in one transaction. All supplied digests are independently verified.
+    pub fn create_run_with_definition(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+    ) -> Result<RunRow, LedgerError> {
+        self.submit(move |conn| {
+            let package = &definition.package;
+            if package.schema != EXECUTION_PACKAGE_SCHEMA_V1 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("unsupported execution package schema {:?}", package.schema),
+                ));
+            }
+            if package.roster_ref != package.roster.roster_ref {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package roster ref does not match resolved roster",
+                ));
+            }
+            let (profile_json, profile_sha256) = canonical(&package.profile)?;
+            let (roster_json, roster_sha256) = canonical(&package.roster)?;
+            let (package_json, package_sha256) = canonical(package)?;
+            if profile_sha256 != package.profile_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package profile digest mismatch",
+                ));
+            }
+            if roster_sha256 != package.roster_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package roster digest mismatch",
+                ));
+            }
+            if package_sha256 != definition.package_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package digest mismatch",
+                ));
+            }
+            let (protocol_ref_json, _) = canonical(&package.protocol_ref)?;
+            let (profile_ref_json, _) = canonical(&package.profile_ref)?;
+            let (roster_ref_json, _) = canonical(&package.roster_ref)?;
+            let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = now_iso();
+            let row = insert_run(&tx, &new_run, &now)?;
+            tx.execute(
+                "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
+                 roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
+                 compatibility_roster_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    row.run_id,
+                    protocol_ref_json,
+                    profile_ref_json,
+                    roster_ref_json,
+                    package_sha256,
+                    profile_sha256,
+                    roster_sha256,
+                    package_json,
+                    compatibility_roster_json,
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO roster_revisions (run_id, revision, roster_ref_json, roster_sha256, \
+                 roster_json, reason, created_at) VALUES (?1, 1, ?2, ?3, ?4, 'run-created', ?5)",
+                rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
+            )?;
+            // Keep the canonicalized profile alive as an explicit integrity
+            // input above even though the full package stores it.
+            drop(profile_json);
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    /// Fetch the immutable execution package for a run. Legacy runs return
+    /// `None`; a nonexistent run still refuses `RunNotFound`.
+    pub fn get_run_definition(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RunDefinitionRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            require_run(conn, &run_id)?;
+            let sql = format!("SELECT {DEFINITION_COLUMNS} FROM run_definitions WHERE run_id = ?1");
+            Ok(conn.query_row(&sql, [&run_id], definition_row).optional()?)
+        })
+    }
+
+    /// Fetch the latest roster revision for a run.
+    pub fn latest_roster_revision(
+        &self,
+        run_id: &str,
+    ) -> Result<Option<RosterRevisionRow>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            require_run(conn, &run_id)?;
+            conn.query_row(
+                "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
+                 created_at FROM roster_revisions WHERE run_id = ?1 ORDER BY revision DESC LIMIT 1",
+                [&run_id],
+                revision_row,
+            )
+            .optional()
+            .map_err(Into::into)
         })
     }
 

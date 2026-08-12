@@ -4,7 +4,7 @@
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewUsage, RunState};
+use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, RunState};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
 use forged_types::{ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket};
 use serde_json::{json, Value};
@@ -149,16 +149,21 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
                 created.push("runs".to_owned());
             }
             if !ctx.config.config_path.exists() {
-                let doc = ctx.config.default_document();
-                let text = serde_json::to_string_pretty(&doc)
-                    .map_err(|e| Failure::internal(e.to_string()))?;
+                let text = ctx.config.default_document().map_err(Failure::internal)?;
                 if let Some(parent) = ctx.config.config_path.parent() {
                     std::fs::create_dir_all(parent)
                         .map_err(|e| Failure::internal(format!("creating config dir: {e}")))?;
                 }
                 std::fs::write(&ctx.config.config_path, text)
                     .map_err(|e| Failure::internal(format!("writing config: {e}")))?;
-                created.push("config.json".to_owned());
+                created.push(
+                    ctx.config
+                        .config_path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("config.yaml")
+                        .to_owned(),
+                );
             }
             // The ledger was opened (and migrated) when this process started;
             // exercise it once so init proves the store answers.
@@ -217,6 +222,19 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 Some(base) => base.to_owned(),
                 None => default_branch_of(&repo).await,
             };
+            let compiled = ctx
+                .config
+                .compile_definition(
+                    param_opt_str(&params, "profile"),
+                    param_opt_str(&params, "roster"),
+                )
+                .map_err(|errors| {
+                    Failure::invalid(format!(
+                        "execution definition is invalid: {}",
+                        serde_json::to_string(&errors)
+                            .unwrap_or_else(|_| "validation failed".to_owned())
+                    ))
+                })?;
             let branch = format!("forged/{bead}");
             let new_run = NewRun {
                 run_id: run_id.clone(),
@@ -225,7 +243,17 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 base_ref: base_ref.clone(),
                 branch: branch.clone(),
             };
-            let row = on_ledger(&ctx.ledger, move |l| l.create_run(new_run)).await?;
+            let package = compiled.package.clone();
+            let package_sha256 = compiled.package_sha256.clone();
+            let definition = NewRunDefinition {
+                package: compiled.package,
+                package_sha256: compiled.package_sha256,
+                compatibility_roster: compiled.compatibility_roster,
+            };
+            let row = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.create_run_with_definition(new_run, definition)
+            })
+            .await?;
             // Persist the spec path for packet building — the run row has
             // no spec column, and every process must resolve the same one.
             let run_for_event = row.run_id.clone();
@@ -239,6 +267,12 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 "bead_id": row.bead_id,
                 "branch": branch,
                 "base_ref": base_ref,
+                "protocol_ref": package.protocol_ref,
+                "profile_ref": package.profile_ref,
+                "roster_ref": package.roster_ref,
+                "package_sha256": package_sha256,
+                "profile_sha256": package.profile_sha256,
+                "roster_sha256": package.roster_sha256,
             }))
         }
     })
@@ -275,7 +309,30 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
     read_only("run_status", req, || async {
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
+        let run_id_owned = run_id.to_owned();
+        let (definition, revision) = on_ledger(&ctx.ledger, move |ledger| {
+            Ok((
+                ledger.get_run_definition(&run_id_owned)?,
+                ledger.latest_roster_revision(&run_id_owned)?,
+            ))
+        })
+        .await?;
         let action = forged_proto::advance(&view);
+        let definition = match definition {
+            Some(row) => json!({
+                "protocolRef": serde_json::from_str::<Value>(&row.protocol_ref_json)
+                    .map_err(|error| Failure::internal(format!("stored protocol ref: {error}")))?,
+                "profileRef": serde_json::from_str::<Value>(&row.profile_ref_json)
+                    .map_err(|error| Failure::internal(format!("stored profile ref: {error}")))?,
+                "rosterRef": serde_json::from_str::<Value>(&row.roster_ref_json)
+                    .map_err(|error| Failure::internal(format!("stored roster ref: {error}")))?,
+                "packageSha256": row.package_sha256,
+                "profileSha256": row.profile_sha256,
+                "rosterSha256": row.roster_sha256,
+                "rosterRevision": revision.as_ref().map(|value| value.revision),
+            }),
+            None => Value::Null,
+        };
         Ok(json!({
             "run": {
                 "runId": view.run.run_id,
@@ -288,6 +345,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     RunState::Stopped => "stopped",
                 },
                 "stopReason": view.run.stop_reason,
+                "definition": definition,
                 "packets": view.packets.iter().map(|p| json!({
                     "packetId": p.packet_id,
                     "stage": stage_str(p.stage),
@@ -315,6 +373,35 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 },
             }
         }))
+    })
+    .await
+}
+
+// ---------------------------------------------------- definition validate
+
+/// Resolve and validate selected definitions without creating a run.
+pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("definition_validate", req, || async {
+        let profile = param_opt_str(&req.params, "profile");
+        let roster = param_opt_str(&req.params, "roster");
+        match ctx.config.compile_definition(profile, roster) {
+            Ok(compiled) => {
+                let package = compiled.package;
+                Ok(json!({
+                    "valid": true,
+                    "errors": [],
+                    "protocolRef": package.protocol_ref,
+                    "profileRef": package.profile_ref,
+                    "rosterRef": package.roster_ref,
+                    "packageSha256": compiled.package_sha256,
+                    "profileSha256": package.profile_sha256,
+                    "rosterSha256": package.roster_sha256,
+                    "roles": package.roster.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
+                    "seats": package.profile.seats,
+                }))
+            }
+            Err(errors) => Ok(json!({"valid": false, "errors": errors})),
+        }
     })
     .await
 }

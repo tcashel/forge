@@ -5,7 +5,7 @@
 
 mod support;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use support::{assert_no_overlap, rev_parse, TestEnv};
 
 #[test]
@@ -225,6 +225,61 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert_eq!(code, 0, "worktree retire: {retired}");
     assert_eq!(retired["result"]["retired"], json!(true));
     assert!(!env.worktree("bead-e2e").exists());
+}
+
+#[test]
+fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
+    let env = TestEnv::new("forged-frozen-roster");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-frozen",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
+    assert_eq!(started["result"]["roster_ref"]["name"], json!("default"));
+    let original_digest = started["result"]["package_sha256"]
+        .as_str()
+        .expect("package digest")
+        .to_owned();
+
+    // Make the live authoring roster unusable. A projection that consulted
+    // config again would fail before the implement packet could run.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config json");
+    config["roster"]["implement"]["provider"] = json!("unavailable-provider");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("rewrite config");
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-frozen"]);
+    assert_eq!(code, 0, "drive must use the stored roster: {driven}");
+    assert!(driven["result"]["terminal"]["done"].is_object());
+
+    let (code, status) = env.forged(&["run", "status", "--run", "bead-frozen"]);
+    assert_eq!(code, 0, "status: {status}");
+    assert_eq!(
+        status["result"]["run"]["definition"]["packageSha256"],
+        json!(original_digest)
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["rosterRevision"],
+        json!(1)
+    );
 }
 
 #[test]

@@ -22,6 +22,11 @@ pub enum Command {
     Doctor(KeyOnly),
     /// Create <anvil_home>/runs, the default config, and the ledger schema.
     Init(KeyOnly),
+    /// Execution-definition operations.
+    Definition {
+        #[command(subcommand)]
+        command: DefinitionCmd,
+    },
     /// Run lifecycle.
     Run {
         /// The run subcommand.
@@ -80,6 +85,27 @@ pub enum RunCmd {
     Status(RunScoped),
 }
 
+/// `definition` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum DefinitionCmd {
+    /// Resolve and validate a profile/roster selection (read-only).
+    Validate(DefinitionValidateArgs),
+}
+
+/// `definition validate` flags.
+#[derive(Debug, Args)]
+pub struct DefinitionValidateArgs {
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `run start` flags.
 #[derive(Debug, Args)]
 pub struct RunStartArgs {
@@ -95,6 +121,12 @@ pub struct RunStartArgs {
     /// Base ref; defaults to the repo's default branch.
     #[arg(long)]
     pub base_ref: Option<String>,
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -319,6 +351,9 @@ pub fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Doctor(_) => "doctor",
         Command::Init(_) => "init",
+        Command::Definition { command } => match command {
+            DefinitionCmd::Validate(_) => "definition_validate",
+        },
         Command::Run { command } => match command {
             RunCmd::Start(_) => "run_start",
             RunCmd::Advance(_) => "run_advance",
@@ -355,6 +390,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
     Ok(match command {
         Command::Doctor(a) => ("doctor", request(a.idempotency_key, None, json!({}))),
         Command::Init(a) => ("init", request(a.idempotency_key, None, json!({}))),
+        Command::Definition { command } => match command {
+            DefinitionCmd::Validate(a) => (
+                "definition_validate",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"profile": a.profile, "roster": a.roster}),
+                ),
+            ),
+        },
         Command::Run { command } => match command {
             RunCmd::Start(a) => (
                 "run_start",
@@ -366,6 +411,8 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "repo": a.repo,
                         "spec": a.spec,
                         "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
                     }),
                 ),
             ),

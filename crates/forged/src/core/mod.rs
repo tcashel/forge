@@ -538,6 +538,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
     match name {
         "doctor" => ops::doctor(ctx, &req).await,
         "init" => ops::init(ctx, &mut req).await,
+        "definition_validate" => ops::definition_validate(ctx, &req).await,
         "run_start" => ops::run_start(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,
         "run_drive" => drive::run_drive(ctx, &req).await,

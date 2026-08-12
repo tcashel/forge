@@ -26,21 +26,30 @@ use crate::core::{
 };
 use crate::failpoint;
 
-/// Project one run into the engine's input, with the roster, gate
-/// commands, budget, and `now` threaded from the once-read config.
+/// Project one run into the engine's input. Definition-backed runs use their
+/// frozen compatibility roster; legacy runs fall back to the once-read config.
 pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
-    let roster = ctx.config.roster.clone();
+    let legacy_roster = ctx.config.roster.clone();
     let gate_commands = ctx.config.gate_commands.clone();
     let budget = ctx.config.transport_retry_budget;
     let run_id = run_id.to_owned();
     let now = now_iso();
     let ledger = ctx.ledger.clone();
     tokio::task::spawn_blocking(move || {
+        let roster = match ledger.get_run_definition(&run_id).map_err(Failure::from)? {
+            Some(definition) => serde_json::from_str(&definition.compatibility_roster_json)
+                .map_err(|error| {
+                    Failure::internal(format!(
+                        "stored compatibility roster does not parse: {error}"
+                    ))
+                })?,
+            None => legacy_roster,
+        };
         forged_proto::project_run(&ledger, &run_id, roster, gate_commands, budget, &now)
+            .map_err(Failure::from)
     })
     .await
     .map_err(|e| Failure::internal(format!("join failure: {e}")))?
-    .map_err(Failure::from)
 }
 
 /// Whether a machine step at `round` has a terminal operation row — the

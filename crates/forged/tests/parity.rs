@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the eleven core functions, the CLI path and the MCP tool path produce
+//! the twelve core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,17 +33,18 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_eleven_tools_match_their_cli_counterparts() {
+fn all_twelve_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
 
-    // The server declares exactly the eleven tools of section (b).
+    // The server declares exactly the public operation tools.
     let mut tools = mcp.list_tools();
     tools.sort();
     let mut expected = vec![
         "claim_next",
         "doctor",
+        "definition_validate",
         "events_tail",
         "packet_claim",
         "packet_complete",
@@ -55,9 +56,13 @@ fn all_eleven_tools_match_their_cli_counterparts() {
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the eleven tools, exactly");
+    assert_eq!(tools, expected, "the twelve tools, exactly");
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
+
+    let cli = env.forged(&["definition", "validate"]).1;
+    let tool = mcp.call_tool("definition_validate", envelope(json!({})));
+    assert_eq!(cli, tool, "definition_validate parity");
 
     // run_start: an invalid (relative) repo path refuses identically.
     let cli = env

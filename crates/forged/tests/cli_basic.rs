@@ -23,6 +23,7 @@ fn help_lists_every_command_and_subcommand_flags() {
     for command in [
         "doctor",
         "init",
+        "definition",
         "run",
         "packet",
         "claim-next",
@@ -45,11 +46,20 @@ fn help_lists_every_command_and_subcommand_flags() {
         "--repo",
         "--spec",
         "--base-ref",
+        "--profile",
+        "--roster",
         "--idempotency-key",
     ] {
         assert!(
             start.contains(flag),
             "run start --help must document {flag}"
+        );
+    }
+    let definition = help_text(&env, &["definition", "validate", "--help"]);
+    for flag in ["--profile", "--roster", "--idempotency-key"] {
+        assert!(
+            definition.contains(flag),
+            "definition validate --help must document {flag}"
         );
     }
     let packet = help_text(&env, &["packet", "--help"]);
@@ -106,6 +116,26 @@ fn init_derives_its_key_replays_and_is_idempotent() {
     assert_eq!(code, 0);
     assert_eq!(third["reused"], json!(false));
     assert_ne!(third["operationId"], first["operationId"]);
+}
+
+#[test]
+fn init_creates_yaml_only_when_no_config_exists() {
+    let env = TestEnv::new("forged-init-yaml");
+    std::fs::remove_file(env.anvil.join("config.json")).expect("remove legacy fixture config");
+    let (code, response) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {response}");
+    let path = env.anvil.join("config.yaml");
+    let original = std::fs::read_to_string(&path).expect("default YAML created");
+    assert!(original.starts_with("# forged authoring config"));
+    assert_eq!(response["result"]["config_path"], json!(path));
+    assert!(!env.anvil.join("config.json").exists());
+
+    let mut edited = original;
+    edited.push_str("# operator note\n");
+    std::fs::write(&path, &edited).expect("operator edit");
+    let (code, _) = env.forged(&["init", "--idempotency-key", "init-yaml-again"]);
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(path).expect("read"), edited);
 }
 
 #[test]
