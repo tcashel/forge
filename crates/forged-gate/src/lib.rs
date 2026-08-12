@@ -11,5 +11,7 @@
 //! pass `cwd` and `artifacts_dir` explicitly.
 
 mod error;
+mod runner;
 
 pub use error::GateError;
+pub use runner::{run_gates, GateOutcome, GateRequest};
