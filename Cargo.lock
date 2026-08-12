@@ -373,7 +373,12 @@ name = "forged-host"
 version = "0.1.0"
 dependencies = [
  "async-trait",
+ "forged-types",
  "nix",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
 ]
 
