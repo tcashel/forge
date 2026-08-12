@@ -10,22 +10,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use forged_ledger::{AttemptRow, AttemptState, OperationRow, PacketRow, RunRow, RunState};
+use forged_ledger::{
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RunRow, RunState,
+};
 use forged_types::{Outcome, ProviderHints, Stage, Verdict};
 
 use crate::error::ProtoError;
-use crate::events::{widen_rfc3339, ProtoEvent};
+use crate::events::{stage_str, widen_rfc3339, ProtoEvent};
 
 /// The engine's input: a projection of one run, named `RunView` (not
 /// `RunState` — `forged_ledger::RunState` already means the run's lifecycle
 /// column, which is one field of this view).
-///
-/// The spec pins `roster` and the reconciler's stage budgets as
-/// `BTreeMap<forged_types::Stage, _>`, but the merged `Stage` implements
-/// `Hash + Eq` and not `Ord`, and this slice may not touch `forged-types`;
-/// `HashMap` keeps the caller-supplied per-stage lookup contract without
-/// forking the wire type. Lookups are point reads, so iteration order never
-/// reaches a decision.
 #[derive(Debug, Clone, PartialEq)]
 pub struct RunView {
     /// The run row, verbatim.
@@ -37,12 +32,33 @@ pub struct RunView {
     pub terminal_attempts: BTreeMap<String, Vec<TerminalAttempt>>,
     /// Attempts in `running` or `revoking`.
     pub live_attempts: Vec<AttemptRow>,
-    /// Operation rows still `in_progress`.
+    /// Operation rows still `in_progress` — what the reconciler settles by
+    /// effect class. An in-flight row never means a step is done; the
+    /// engine's settlement test reads `settled_operations` alone.
     pub inflight_operations: Vec<OperationRow>,
+    /// Machine-step operation rows that reached `OperationState::Terminal`.
+    ///
+    /// A terminal row is the *only* evidence that a machine step ran to a
+    /// settlement, and it is what [`advance`] reads. Neither the
+    /// `proto.operation.request` event nor the absence of an in-flight row
+    /// proves anything: the request event is appended *before*
+    /// `begin_operation`, so a crash between the two leaves a requested step
+    /// with no row at all, and `release_operation` **deletes** the row of a
+    /// `SafeRetry` step it hands back for redo
+    /// (`forged-ledger/src/operations.rs:287`). Both of those states mean the
+    /// step still has to run.
+    pub settled_operations: Vec<OperationRow>,
     /// `proto.*` events for this run, in `event_id` order, already parsed.
     pub proto_events: Vec<ProtoEvent>,
     /// Caller-supplied per-stage provider hints. `advance` copies the
     /// stage's entry verbatim and never invents hint values.
+    ///
+    /// AMENDED (operator-adjudicated 2026-08-12): the spec's original
+    /// `BTreeMap` is impossible — the merged `forged_types::Stage` derives
+    /// `Hash + Eq` but not `Ord`, and this slice may not touch the frozen
+    /// types crate. `HashMap` is correct, and determinism is unaffected
+    /// because `advance` performs keyed lookups only and never iterates the
+    /// roster.
     pub roster: HashMap<Stage, ProviderHints>,
     /// Gate commands, in order, for `Gate` and `ReGate`.
     pub gate_commands: Vec<String>,
@@ -174,6 +190,19 @@ pub fn machine_idempotency_key(run_id: &str, step: MachineStage, round: u32) -> 
     format!("{run_id}/{}/{round}", step.as_str())
 }
 
+/// Every machine step the slice/v1 graph can record, paired with its round —
+/// `Resolve → Gate → Push → DraftPr` in round 0, `ReGate → Push` in round 1.
+/// The set is closed and fixed, which is what lets the projection probe for
+/// each step's settled operation row with `find_operation`.
+pub const MACHINE_STEPS: [(MachineStage, u32); 6] = [
+    (MachineStage::Resolve, 0),
+    (MachineStage::Gate, 0),
+    (MachineStage::Push, 0),
+    (MachineStage::DraftPr, 0),
+    (MachineStage::ReGate, 1),
+    (MachineStage::Push, 1),
+];
+
 /// How a packet failure counts against the run.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FailureKind {
@@ -244,10 +273,10 @@ enum LegState<'v> {
 
 /// The pure decision function: what should this run do next?
 ///
-/// # Panics
-///
-/// Panics if the roster lacks an entry for a stage the engine must open —
-/// hints are caller-supplied input and `advance` never invents them.
+/// Total on every `RunView` a caller can construct, including malformed
+/// ones: a roster missing the stage the engine must open resolves to
+/// `Stop(Terminal::ExternallyStopped { reason: "roster missing stage
+/// <stage>" })` — loud, inspectable, and never a panic in the orchestrator.
 pub fn advance(view: &RunView) -> NextAction {
     if view.run.state == RunState::Stopped {
         return NextAction::Stop(Terminal::ExternallyStopped {
@@ -256,7 +285,7 @@ pub fn advance(view: &RunView) -> NextAction {
     }
 
     // Round-0 machine prologue.
-    if !op_done(view, MachineStage::Resolve, 0) {
+    if !op_settled(view, MachineStage::Resolve, 0) {
         return NextAction::RunMachine(MachineStage::Resolve);
     }
 
@@ -286,13 +315,13 @@ pub fn advance(view: &RunView) -> NextAction {
         LegState::Completed { .. } => {}
     }
 
-    if !op_done(view, MachineStage::Gate, 0) {
+    if !op_settled(view, MachineStage::Gate, 0) {
         return NextAction::RunMachine(MachineStage::Gate);
     }
-    if !op_done(view, MachineStage::Push, 0) {
+    if !op_settled(view, MachineStage::Push, 0) {
         return NextAction::RunMachine(MachineStage::Push);
     }
-    if !op_done(view, MachineStage::DraftPr, 0) {
+    if !op_settled(view, MachineStage::DraftPr, 0) {
         return NextAction::RunMachine(MachineStage::DraftPr);
     }
 
@@ -342,10 +371,10 @@ pub fn advance(view: &RunView) -> NextAction {
     }
 
     // Round-1 machine steps.
-    if !op_done(view, MachineStage::ReGate, 1) {
+    if !op_settled(view, MachineStage::ReGate, 1) {
         return NextAction::RunMachine(MachineStage::ReGate);
     }
-    if !op_done(view, MachineStage::Push, 1) {
+    if !op_settled(view, MachineStage::Push, 1) {
         return NextAction::RunMachine(MachineStage::Push);
     }
 
@@ -396,19 +425,13 @@ fn eval_fanout(view: &RunView, seq: i64) -> FanoutJoin {
 
     // A missing leg in an existing fan-out is repaired by opening it at the
     // same seq.
-    if matches!(claude, LegState::Missing) {
-        return FanoutJoin::NotDone(NextAction::OpenPackets(vec![intent(
-            view,
-            Stage::ReviewClaude,
-            seq,
-        )]));
-    }
-    if matches!(codex, LegState::Missing) {
-        return FanoutJoin::NotDone(NextAction::OpenPackets(vec![intent(
-            view,
-            Stage::ReviewCodex,
-            seq,
-        )]));
+    for (stage, leg) in [(Stage::ReviewClaude, &claude), (Stage::ReviewCodex, &codex)] {
+        if matches!(leg, LegState::Missing) {
+            return FanoutJoin::NotDone(match intent(view, stage, seq) {
+                Some(intent) => NextAction::OpenPackets(vec![intent]),
+                None => roster_missing(stage),
+            });
+        }
     }
 
     for (stage, leg) in [(Stage::ReviewClaude, &claude), (Stage::ReviewCodex, &codex)] {
@@ -537,13 +560,13 @@ fn leg_state<'v>(view: &'v RunView, stage: Stage, seq: Option<i64>) -> LegState<
     match last.state {
         AttemptState::Failed => match classify_failure(last.fail_note.as_deref().unwrap_or("")) {
             FailureKind::Transport => {
-                let attempts = transport_failures(history);
+                let (attempts, not_before) = transport_retry_state(view, packet_id, history);
                 if attempts > view.transport_retry_budget {
                     LegState::Exhausted { attempts }
                 } else {
                     LegState::Pending {
                         packet_id,
-                        not_before: pending_retry(view, packet_id),
+                        not_before,
                     }
                 }
             }
@@ -557,7 +580,42 @@ fn leg_state<'v>(view: &'v RunView, stage: Stage, seq: Option<i64>) -> LegState<
     }
 }
 
-/// Transport failures observed for a packet, from its terminal history.
+/// A packet's transport-retry standing: how many transport failures it has
+/// accumulated, and the deadline before which it may not be claimed again.
+///
+/// **One source, read once.** The spec makes the packet's latest
+/// `proto.retry` event the paired carrier of both numbers — the caller
+/// appends it, carrying the count it computed, before honoring the action —
+/// so the count and the deadline are read out of that one event together and
+/// can never drift apart. Counting terminal attempts is the fallback for the
+/// one state where no such event exists yet: the very first transport
+/// failure of a packet, before its grant was recorded. That fallback yields
+/// no deadline, which is honest — none has been granted.
+fn transport_retry_state(
+    view: &RunView,
+    packet_id: &str,
+    history: &[TerminalAttempt],
+) -> (u32, Option<String>) {
+    match latest_retry(view, packet_id) {
+        Some((transport_failures, retry_after)) => (transport_failures, Some(retry_after)),
+        None => (transport_failures(history), None),
+    }
+}
+
+/// The packet's latest `proto.retry` grant: its failure count and deadline.
+fn latest_retry(view: &RunView, packet_id: &str) -> Option<(u32, String)> {
+    view.proto_events.iter().rev().find_map(|e| match e {
+        ProtoEvent::Retry {
+            packet_id: p,
+            transport_failures,
+            retry_after,
+        } if p == packet_id => Some((*transport_failures, retry_after.clone())),
+        _ => None,
+    })
+}
+
+/// Transport failures observed for a packet, from its terminal history —
+/// the fallback used only until the packet's first `proto.retry` grant.
 fn transport_failures(history: &[TerminalAttempt]) -> u32 {
     let count = history
         .iter()
@@ -569,31 +627,27 @@ fn transport_failures(history: &[TerminalAttempt]) -> u32 {
     u32::try_from(count).unwrap_or(u32::MAX)
 }
 
-/// The latest recorded retry deadline for a packet, from `proto.retry`.
-fn pending_retry(view: &RunView, packet_id: &str) -> Option<String> {
-    view.proto_events.iter().rev().find_map(|e| match e {
-        ProtoEvent::Retry {
-            packet_id: p,
-            retry_after,
-            ..
-        } if p == packet_id => Some(retry_after.clone()),
-        _ => None,
-    })
-}
-
-/// Whether the machine step at `round` has been requested and settled: its
-/// `proto.operation.request` event exists and no operation row with its
-/// idempotency key is still in flight.
-fn op_done(view: &RunView, step: MachineStage, round: u32) -> bool {
+/// Whether the machine step at `round` is settled: a **terminal operation
+/// row** exists under its name and idempotency key.
+///
+/// Nothing weaker will do. "Requested and not in flight" admits two states
+/// that are emphatically not settled, and the step must run again in both:
+///
+/// - the request event is appended immediately *before* `begin_operation`,
+///   so a crash between the two leaves the request recorded and no row
+///   anywhere;
+/// - `release_operation` deletes the `in_progress` row of a `SafeRetry` step
+///   the reconciler handed back for redo.
+///
+/// A terminal row is also what an `ObserveOnly` step's reconcile settlement
+/// leaves behind — `resolve_interrupted_operation` stores the observation as
+/// the row's terminal envelope — so port-confirmed effects settle through
+/// the same single test.
+fn op_settled(view: &RunView, step: MachineStage, round: u32) -> bool {
     let key = machine_idempotency_key(&view.run.run_id, step, round);
-    let requested = view.proto_events.iter().any(|e| {
-        matches!(e, ProtoEvent::OperationRequest { idempotency_key, .. } if *idempotency_key == key)
-    });
-    let inflight = view
-        .inflight_operations
-        .iter()
-        .any(|o| o.idempotency_key == key);
-    requested && !inflight
+    view.settled_operations.iter().any(|o| {
+        o.idempotency_key == key && o.name == step.as_str() && o.state == OperationState::Terminal
+    })
 }
 
 /// The next unused seq for a stage (1 for its first packet).
@@ -606,27 +660,46 @@ fn next_seq(view: &RunView, stage: Stage) -> i64 {
         .map_or(1, |s| s + 1)
 }
 
-fn intent(view: &RunView, stage: Stage, seq: i64) -> PacketIntent {
-    let hints = view
-        .roster
-        .get(&stage)
-        .unwrap_or_else(|| panic!("roster has no entry for stage {stage:?}"))
-        .clone();
-    PacketIntent { stage, seq, hints }
+/// The intent for one stage, or `None` when the caller's roster has no entry
+/// for it — hints are input and `advance` never invents them.
+fn intent(view: &RunView, stage: Stage, seq: i64) -> Option<PacketIntent> {
+    let hints = view.roster.get(&stage)?.clone();
+    Some(PacketIntent { stage, seq, hints })
+}
+
+/// What a roster gap resolves to. The run cannot proceed — the engine would
+/// have to invent provider hints to open the stage — but it stops loudly
+/// with the offending stage named, and `advance` stays total.
+fn roster_missing(stage: Stage) -> NextAction {
+    NextAction::Stop(Terminal::ExternallyStopped {
+        reason: format!("roster missing stage {}", stage_str(stage)),
+    })
 }
 
 fn open_stage(view: &RunView, stage: Stage) -> NextAction {
     let seq = next_seq(view, stage);
-    NextAction::OpenPackets(vec![intent(view, stage, seq)])
+    match intent(view, stage, seq) {
+        Some(intent) => NextAction::OpenPackets(vec![intent]),
+        None => roster_missing(stage),
+    }
 }
 
 /// Open both review legs atomically at the same (next unused) seq.
 fn open_review_fanout(view: &RunView) -> NextAction {
     let seq = next_seq(view, Stage::ReviewClaude).max(next_seq(view, Stage::ReviewCodex));
-    NextAction::OpenPackets(vec![
+    let (Some(claude), Some(codex)) = (
         intent(view, Stage::ReviewClaude, seq),
         intent(view, Stage::ReviewCodex, seq),
-    ])
+    ) else {
+        // Deterministic: the claude leg is reported first when both are gone.
+        let missing = if view.roster.contains_key(&Stage::ReviewClaude) {
+            Stage::ReviewCodex
+        } else {
+            Stage::ReviewClaude
+        };
+        return roster_missing(missing);
+    };
+    NextAction::OpenPackets(vec![claude, codex])
 }
 
 /// The claim-again shape for a stage whose packet is open with no live

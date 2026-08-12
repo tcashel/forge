@@ -6,7 +6,7 @@
 mod support;
 
 use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun};
-use forged_proto::{project_run, record, GatePhase, ProtoEvent};
+use forged_proto::{project_run, record, GatePhase, ProtoError, ProtoEvent};
 use forged_types::{Outcome, RunId, Stage, Verdict};
 use support::*;
 
@@ -74,6 +74,10 @@ fn projection_reconstructs_history_and_threads_inputs() {
     assert_eq!(view.packets.len(), 1);
     assert!(view.live_attempts.is_empty());
     assert!(view.inflight_operations.is_empty());
+    assert!(
+        view.settled_operations.is_empty(),
+        "no machine step ever began: nothing is settled"
+    );
     assert_eq!(view.roster, roster);
     assert_eq!(view.gate_commands, gates);
     assert_eq!(view.transport_retry_budget, 3);
@@ -169,5 +173,44 @@ fn every_proto_event_kind_round_trips_through_the_ledger() {
     }
     let view = project_run(&ledger, RUN, full_roster(), vec![], 3, T0).expect("project");
     assert_eq!(view.proto_events, events);
+    ledger.close().expect("close");
+}
+
+// The writer holds the reader's invariants: a payload `parse_review` would
+// refuse never reaches the ledger, because once it is appended there is no
+// way to withdraw the row and every later replay of that stream — including
+// the projection behind every `advance` — would fail.
+#[test]
+fn record_refuses_a_review_the_parser_would_reject() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(RUN).expect("run id"),
+            bead_id: "bead-1".to_owned(),
+            repo: "octo/demo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "feat/x".to_owned(),
+        })
+        .expect("create run");
+
+    let err = record(
+        &ledger,
+        RUN,
+        ProtoEvent::Review {
+            seq: 1,
+            stage: Stage::ReviewCodex,
+            verdict: Some(Verdict::Approve),
+            available: false,
+        },
+    )
+    .expect_err("a verdict from an unavailable leg must be refused at the writer");
+    assert!(matches!(err, ProtoError::Projection(_)), "{err}");
+
+    // Nothing was appended, and the stream still replays.
+    let events = ledger.list_events(Some(RUN), 0, 100).expect("events");
+    assert!(events.is_empty(), "{events:?}");
+    let view = project_run(&ledger, RUN, full_roster(), vec![], 3, T0).expect("project");
+    assert!(view.proto_events.is_empty());
     ledger.close().expect("close");
 }

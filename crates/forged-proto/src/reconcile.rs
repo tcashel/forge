@@ -41,8 +41,12 @@ fn reclaim_older_than(stage_budget_s: u64) -> u64 {
 pub struct ReconcileConfig {
     /// Per-stage wall-clock budget, seconds; drives the ladder's budget rung
     /// and `reclaim_older_than(stage_budget_s)`. No default — callers supply
-    /// it (tests use 1800). Pinned as a per-stage map; see
-    /// [`crate::RunView::roster`] for why the container is `HashMap`.
+    /// it (tests use 1800).
+    ///
+    /// AMENDED (operator-adjudicated 2026-08-12): `HashMap` for the same
+    /// reason as [`crate::RunView::roster`] — the merged
+    /// `forged_types::Stage` derives `Hash + Eq` and not `Ord`, and reconcile
+    /// looks budgets up by key rather than iterating them.
     pub stage_budget_s: HashMap<Stage, u64>,
     /// Gate commands, in order, for `rerun_gates` during harvest-and-verify.
     pub gate_commands: Vec<String>,
@@ -57,9 +61,11 @@ pub struct ReconcileReport {
     /// Attempts that reached `reclaimed` (including convergence with a
     /// racing reconciler).
     pub reclaimed: Vec<i64>,
-    /// `SafeRetry` operations released for redo.
+    /// Operations released for redo: every `SafeRetry` row, plus any
+    /// `ObserveOnly` row whose observation did not confirm its effect.
     pub released: Vec<String>,
-    /// `ObserveOnly` operations settled by observation.
+    /// `ObserveOnly` operations settled by an observation that confirmed the
+    /// effect.
     pub observed: Vec<String>,
     /// `HumanAmbiguous` operations quarantined (or recorded) and left in
     /// progress.
@@ -367,7 +373,25 @@ async fn settle_operations(
                 report.released.push(op.operation_id);
             }
             EffectClass::ObserveOnly => {
+                // An observation settles the row only when it CONFIRMS the
+                // effect. An interrupted push whose branch never reached the
+                // remote, a draft PR that was never opened, a worktree that
+                // is not there — those observations say the step did not
+                // happen, and storing them as the row's terminal envelope
+                // would tell `advance` the step is done and let the run walk
+                // straight past it. Unconfirmed, the row is released instead
+                // and the step runs again.
                 let observation = observe(ports, run, &op.name).await?;
+                if !confirms_effect(&op.name, &observation) {
+                    let operation_id = op.operation_id.clone();
+                    on_ledger(ledger, move |l| {
+                        l.release_operation(&operation_id)
+                            .map_err(ProtoError::Ledger)
+                    })
+                    .await?;
+                    report.released.push(op.operation_id);
+                    continue;
+                }
                 let response = OperationResponse {
                     ok: true,
                     operation_id: op.operation_id.clone(),
@@ -431,6 +455,25 @@ async fn settle_operations(
     Ok(())
 }
 
+/// Whether an [`observe`] answer confirms its step's effect actually
+/// landed: the worktree is there, the PR exists, the branch reached the
+/// remote. Each mirrors the effect-class table's "settled after a crash by"
+/// column, and anything else — including a shape this crate does not know —
+/// counts as unconfirmed, the conservative direction.
+fn confirms_effect(name: &str, observation: &Value) -> bool {
+    match name {
+        "resolve" => observation
+            .get("worktreePresent")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        "draftpr" => observation.get("pr").is_some_and(|pr| !pr.is_null()),
+        "push" => observation
+            .get("remoteSha")
+            .is_some_and(|sha| !sha.is_null()),
+        _ => false,
+    }
+}
+
 /// Query the external system for an `ObserveOnly` machine step, per the
 /// effect-class table.
 async fn observe(
@@ -480,6 +523,15 @@ async fn observe(
 /// Harvest-and-verify: a quarantined `Outcome::Implement` claim from a
 /// revoked attempt is a claim to check, never a result to trust — the
 /// recomputed `commits_ahead` and the re-run gates decide.
+///
+/// Ground truth is established **once per pass**, not once per claim. Both
+/// ports are run-scoped — `commits_ahead(run_id)` and `rerun_gates(run_id,
+/// commands)` — so their answers are the same for every claim in the pass,
+/// and the quarantine events are a growing history that every later pass
+/// replays: re-running the gates once per historical event would make
+/// reconcile cost more the longer a run has been alive. A pass with no
+/// implement claim to check touches neither port, and identical mismatch
+/// lines are reported once.
 async fn harvest_and_verify(
     ports: &dyn ReconcilePorts,
     run_id: &str,
@@ -487,49 +539,73 @@ async fn harvest_and_verify(
     proto_events: &[ProtoEvent],
     report: &mut ReconcileReport,
 ) -> Result<(), ProtoError> {
-    for event in proto_events {
-        let ProtoEvent::Quarantine {
-            packet_id,
-            attempt_id,
-            result,
-            ..
-        } = event
-        else {
-            continue;
-        };
-        let Outcome::Implement {
-            commits_ahead,
-            gate_state,
-            ..
-        } = &result.outcome
-        else {
-            continue;
-        };
-        let truth_commits = ports
-            .commits_ahead(run_id)
-            .await
-            .map_err(|source| port_failure(*attempt_id, "commits_ahead", source))?;
-        let rows = ports
-            .rerun_gates(run_id, &config.gate_commands)
-            .await
-            .map_err(|source| port_failure(*attempt_id, "rerun_gates", source))?;
-        let gates_pass = rows.iter().all(|r| r.exit_code == Some(0) && !r.timed_out);
-        if truth_commits != *commits_ahead {
-            report.harvest_mismatches.push(format!(
-                "attempt {attempt_id} ({packet_id}): claimed {commits_ahead} commits ahead, \
-                 worktree has {truth_commits}"
-            ));
+    let claims: Vec<(&i64, &String, u32, Option<&str>)> = proto_events
+        .iter()
+        .filter_map(|event| {
+            let ProtoEvent::Quarantine {
+                packet_id,
+                attempt_id,
+                result,
+                ..
+            } = event
+            else {
+                return None;
+            };
+            let Outcome::Implement {
+                commits_ahead,
+                gate_state,
+                ..
+            } = &result.outcome
+            else {
+                return None;
+            };
+            Some((attempt_id, packet_id, *commits_ahead, gate_state.as_deref()))
+        })
+        .collect();
+    let Some((first_attempt, ..)) = claims.first() else {
+        return Ok(());
+    };
+
+    let truth_commits = ports
+        .commits_ahead(run_id)
+        .await
+        .map_err(|source| port_failure(**first_attempt, "commits_ahead", source))?;
+    let rows = ports
+        .rerun_gates(run_id, &config.gate_commands)
+        .await
+        .map_err(|source| port_failure(**first_attempt, "rerun_gates", source))?;
+    let gates_pass = rows.iter().all(|r| r.exit_code == Some(0) && !r.timed_out);
+
+    for (attempt_id, packet_id, commits_ahead, gate_state) in claims {
+        if truth_commits != commits_ahead {
+            push_mismatch(
+                report,
+                format!(
+                    "attempt {attempt_id} ({packet_id}): claimed {commits_ahead} commits ahead, \
+                     worktree has {truth_commits}"
+                ),
+            );
         }
-        let claimed_pass = gate_state.as_deref() == Some("pass");
+        let claimed_pass = gate_state == Some("pass");
         if claimed_pass != gates_pass {
-            report.harvest_mismatches.push(format!(
-                "attempt {attempt_id} ({packet_id}): claimed gate state {gate_state:?}, \
-                 re-run gates {}",
-                if gates_pass { "pass" } else { "fail" }
-            ));
+            push_mismatch(
+                report,
+                format!(
+                    "attempt {attempt_id} ({packet_id}): claimed gate state {gate_state:?}, \
+                     re-run gates {}",
+                    if gates_pass { "pass" } else { "fail" }
+                ),
+            );
         }
     }
     Ok(())
+}
+
+/// Record a mismatch once; the same claim checked twice is one finding.
+fn push_mismatch(report: &mut ReconcileReport, line: String) {
+    if !report.harvest_mismatches.contains(&line) {
+        report.harvest_mismatches.push(line);
+    }
 }
 
 #[cfg(test)]

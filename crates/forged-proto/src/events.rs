@@ -6,12 +6,19 @@
 //! honoring each `NextAction`; [`parse_proto_events`] replays the stream in
 //! `event_id` order.
 //!
-//! Replay contract: unknown JSON keys are ignored; byte-identical duplicate
-//! payloads for the same logical key are ignored; a payload missing a
-//! required key, an unknown `schemaVersion`, or a second payload for the
-//! same logical key whose bytes differ is
-//! [`ProtoError::MalformedEvent`]. Event kinds outside the proto-owned set
-//! (the ledger's own `attempt.state`, `operation.released`, …) are skipped.
+//! Replay contract: unknown JSON keys are ignored; duplicate payloads for
+//! the same logical key are judged by **canonical-JSON equality** — sorted
+//! keys, semantic value equality (AMENDED, operator-adjudicated 2026-08-12,
+//! aligning with the ledger's canonical-JSON idempotency convention) — and
+//! canonically-equal duplicates are ignored; a payload missing a required
+//! key, an unknown `schemaVersion`, or a second payload for the same logical
+//! key that is canonically DIFFERENT is [`ProtoError::MalformedEvent`].
+//! Event kinds outside the proto-owned set (the ledger's own
+//! `attempt.state`, `operation.released`, …) are skipped.
+//!
+//! The writer holds the same invariants as the reader: [`record`] refuses a
+//! payload [`parse_proto_events`] would refuse, so no run can persist an
+//! event its own replay cannot read back.
 
 use forged_ledger::{EventRow, Ledger};
 use forged_types::{GateRow, OperationRequest, PacketResult, Stage, Verdict};
@@ -126,8 +133,43 @@ impl ProtoEvent {
         }
     }
 
+    /// Refuse an event the replay parser would refuse.
+    ///
+    /// The parser enforces the `proto.review` invariants — a review stage,
+    /// and a verdict that is null exactly when the leg was unavailable — and
+    /// so does this, at the writer. Persisting a payload that only fails on
+    /// the way back out would strand the run: every later `parse_proto_events`
+    /// over that stream, including the projection every `advance` reads,
+    /// would return `MalformedEvent` with no way to withdraw the row.
+    fn validate(&self) -> Result<(), ProtoError> {
+        let refuse = |detail: &str| {
+            Err(ProtoError::Projection(format!(
+                "refusing to record {}: {detail}",
+                self.kind()
+            )))
+        };
+        match self {
+            ProtoEvent::Review {
+                stage,
+                verdict,
+                available,
+                ..
+            } => {
+                if !matches!(stage, Stage::ReviewClaude | Stage::ReviewCodex) {
+                    return refuse("stage is not a review stage");
+                }
+                if *available == verdict.is_none() {
+                    return refuse("verdict must be null exactly when available is false");
+                }
+                Ok(())
+            }
+            _ => Ok(()),
+        }
+    }
+
     /// The exact versioned payload for this event.
     fn payload(&self) -> Result<Value, ProtoError> {
+        self.validate()?;
         let value = match self {
             ProtoEvent::Gate {
                 phase,
@@ -230,7 +272,7 @@ fn to_json_error(err: serde_json::Error) -> ProtoError {
     ProtoError::Projection(format!("cannot serialize proto event: {err}"))
 }
 
-fn stage_str(stage: Stage) -> &'static str {
+pub(crate) fn stage_str(stage: Stage) -> &'static str {
     match stage {
         Stage::Implement => "implement",
         Stage::ReviewClaude => "reviewclaude",
@@ -241,6 +283,9 @@ fn stage_str(stage: Stage) -> &'static str {
 
 /// Append one proto event to the run's stream. The driver calls this after
 /// honoring each `NextAction`; `advance` itself never writes.
+///
+/// Refuses, as `ProtoError::Projection`, any event the replay parser would
+/// refuse — the writer holds the reader's invariants.
 pub fn record(ledger: &Ledger, run_id: &str, event: ProtoEvent) -> Result<(), ProtoError> {
     let payload = event.payload()?;
     ledger.append_event(Some(run_id), event.kind(), payload)?;
@@ -284,8 +329,9 @@ pub fn parse_proto_events(rows: &[EventRow]) -> Result<Vec<ProtoEvent>, ProtoErr
             continue;
         };
         let key = event.logical_key();
-        // Canonicalize through Value so key ORDER differences still count as
-        // byte-identical; VALUE differences do not.
+        // AMENDED (operator-adjudicated 2026-08-12): duplicates are judged by
+        // canonical-JSON equality, not raw bytes — key ORDER and whitespace
+        // are noise, VALUE differences are not.
         let canonical = canonical_payload(row)?;
         match seen.get(&key) {
             None => {
@@ -293,7 +339,7 @@ pub fn parse_proto_events(rows: &[EventRow]) -> Result<Vec<ProtoEvent>, ProtoErr
                 out.push(event);
             }
             Some(prior) if *prior == canonical => {
-                // Byte-identical duplicate: ignored.
+                // Canonically equal duplicate: ignored.
             }
             Some(_) => {
                 return Err(ProtoError::MalformedEvent {
@@ -306,6 +352,10 @@ pub fn parse_proto_events(rows: &[EventRow]) -> Result<Vec<ProtoEvent>, ProtoErr
     Ok(out)
 }
 
+/// The row's payload in canonical form: parsed to a `Value` — whose object
+/// keys are sorted and whose numbers are normalized — and re-serialized, so
+/// two payloads compare equal iff they are semantically the same JSON. The
+/// key-order test in this module's suite locks that property down.
 fn canonical_payload(row: &EventRow) -> Result<String, ProtoError> {
     let value: Value =
         serde_json::from_str(&row.payload_json).map_err(|err| ProtoError::MalformedEvent {
@@ -466,12 +516,18 @@ mod tests {
     use super::*;
 
     fn row(event_id: i64, kind: &str, payload: Value) -> EventRow {
+        raw_row(event_id, kind, &payload.to_string())
+    }
+
+    /// A row whose payload bytes are given verbatim — `json!` sorts object
+    /// keys on the way in, so key order can only be varied by hand.
+    fn raw_row(event_id: i64, kind: &str, payload_json: &str) -> EventRow {
         EventRow {
             event_id,
             ts: "2026-08-12T00:00:00.000000000Z".to_owned(),
             run_id: Some("run-1".to_owned()),
             kind: kind.to_owned(),
-            payload_json: payload.to_string(),
+            payload_json: payload_json.to_owned(),
         }
     }
 
@@ -541,7 +597,7 @@ mod tests {
     }
 
     #[test]
-    fn byte_identical_duplicates_collapse_and_differing_ones_refuse() {
+    fn canonically_equal_duplicates_collapse_and_differing_ones_refuse() {
         let payload = json!({"schemaVersion": 1, "number": 7, "isDraft": true, "url": "u"});
         let rows = vec![
             row(1, "proto.pr", payload.clone()),
@@ -566,6 +622,95 @@ mod tests {
             matches!(err, ProtoError::MalformedEvent { event_id: 2, .. }),
             "{err}"
         );
+    }
+
+    // The amended rule is canonical-JSON equality, so a re-serialized
+    // duplicate whose keys landed in a different order is the same event —
+    // and an unknown extra key, which the parser ignores, is not.
+    #[test]
+    fn duplicates_are_judged_canonically_not_by_raw_bytes() {
+        let mut rows = vec![
+            raw_row(
+                1,
+                "proto.retry",
+                r#"{"schemaVersion":1,"packetId":"run-1/fix/1","transportFailures":1,
+                    "retryAfter":"2026-08-12T00:00:30.000000000Z"}"#,
+            ),
+            raw_row(
+                2,
+                "proto.retry",
+                r#"{ "retryAfter": "2026-08-12T00:00:30.000000000Z", "transportFailures": 1,
+                     "packetId": "run-1/fix/1", "schemaVersion": 1 }"#,
+            ),
+        ];
+        assert_ne!(
+            rows[0].payload_json, rows[1].payload_json,
+            "the fixture must differ in raw bytes for this test to mean anything"
+        );
+        assert_eq!(
+            parse_proto_events(&rows).expect("parses").len(),
+            1,
+            "key order and whitespace are not differences"
+        );
+
+        // A canonically different second payload under the same logical key
+        // still refuses: same packet and count, a moved deadline.
+        rows[1] = row(
+            2,
+            "proto.retry",
+            json!({"schemaVersion": 1, "packetId": "run-1/fix/1",
+                   "transportFailures": 1, "retryAfter": "2026-08-12T00:01:00.000000000Z"}),
+        );
+        let err = parse_proto_events(&rows).expect_err("must refuse");
+        assert!(
+            matches!(err, ProtoError::MalformedEvent { event_id: 2, .. }),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn the_writer_refuses_what_the_parser_would_refuse() {
+        // A verdict alongside `available: false` is exactly the payload
+        // `parse_review` rejects, so it never reaches the ledger.
+        let err = ProtoEvent::Review {
+            seq: 1,
+            stage: Stage::ReviewCodex,
+            verdict: Some(Verdict::Approve),
+            available: false,
+        }
+        .payload()
+        .expect_err("must refuse");
+        assert!(matches!(err, ProtoError::Projection(_)), "{err}");
+
+        let err = ProtoEvent::Review {
+            seq: 1,
+            stage: Stage::ReviewClaude,
+            verdict: None,
+            available: true,
+        }
+        .payload()
+        .expect_err("must refuse");
+        assert!(matches!(err, ProtoError::Projection(_)), "{err}");
+
+        let err = ProtoEvent::Review {
+            seq: 1,
+            stage: Stage::Implement,
+            verdict: Some(Verdict::Approve),
+            available: true,
+        }
+        .payload()
+        .expect_err("must refuse");
+        assert!(matches!(err, ProtoError::Projection(_)), "{err}");
+
+        // The honest absence still records.
+        ProtoEvent::Review {
+            seq: 1,
+            stage: Stage::ReviewCodex,
+            verdict: None,
+            available: false,
+        }
+        .payload()
+        .expect("an absent leg is recordable");
     }
 
     #[test]

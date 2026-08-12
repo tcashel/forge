@@ -120,6 +120,87 @@ fn inflight_machine_operation_is_not_done() {
     );
 }
 
+// Only a terminal operation row settles a machine step. A request event
+// with no row is what both a crash before `begin_operation` and a released
+// SafeRetry redo look like, and neither ran to a settlement.
+#[test]
+fn a_requested_machine_step_with_no_row_is_not_settled() {
+    let requested_only = ViewBuilder::new(RUN)
+        .op_requested_only(MachineStage::Resolve, 0)
+        .build();
+    assert_eq!(
+        advance(&requested_only),
+        NextAction::RunMachine(MachineStage::Resolve)
+    );
+
+    // Deeper in the graph the same shape must not let the run skip a step:
+    // implement is done and the gate was requested, never settled.
+    let gate_requested = ViewBuilder::new(RUN)
+        .op_done(MachineStage::Resolve, 0)
+        .packet(Stage::Implement, 1)
+        .completed(Stage::Implement, 1, implement_ok(2))
+        .op_requested_only(MachineStage::Gate, 0)
+        .build();
+    assert_eq!(
+        advance(&gate_requested),
+        NextAction::RunMachine(MachineStage::Gate)
+    );
+}
+
+// `advance` is total. A roster with no entry for the stage the engine must
+// open cannot yield hints, and the engine never invents them — so the run
+// stops, loudly, naming the gap, instead of panicking inside the
+// orchestrator.
+#[test]
+fn a_roster_gap_stops_the_run_instead_of_panicking() {
+    let missing_implement = ViewBuilder::new(RUN)
+        .op_done(MachineStage::Resolve, 0)
+        .without_roster_entry(Stage::Implement)
+        .build();
+    assert_eq!(
+        advance(&missing_implement),
+        NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "roster missing stage implement".to_owned()
+        })
+    );
+
+    // The review fan-out reports whichever leg it cannot open.
+    let missing_codex = through_draftpr(RUN)
+        .without_roster_entry(Stage::ReviewCodex)
+        .build();
+    assert_eq!(
+        advance(&missing_codex),
+        NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "roster missing stage reviewcodex".to_owned()
+        })
+    );
+
+    // Including when it is repairing a half-open fan-out at an existing seq.
+    let half_open = through_draftpr(RUN)
+        .packet(Stage::ReviewClaude, 1)
+        .without_roster_entry(Stage::ReviewCodex)
+        .build();
+    assert_eq!(
+        advance(&half_open),
+        NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "roster missing stage reviewcodex".to_owned()
+        })
+    );
+
+    // And the fix round.
+    let missing_fix = at_first_review(RUN)
+        .completed(Stage::ReviewClaude, 1, review(Verdict::RequestChanges))
+        .completed(Stage::ReviewCodex, 1, review(Verdict::Approve))
+        .without_roster_entry(Stage::Fix)
+        .build();
+    assert_eq!(
+        advance(&missing_fix),
+        NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "roster missing stage fix".to_owned()
+        })
+    );
+}
+
 #[test]
 fn draftpr_done_opens_the_review_fanout_atomically() {
     let view = through_draftpr(RUN).build();

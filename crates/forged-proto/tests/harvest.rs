@@ -124,6 +124,111 @@ async fn harvested_implement_claim_is_verified_not_trusted() {
     ledger.close().expect("close");
 }
 
+// Quarantine events are a growing history that every later pass replays.
+// Ground truth is run-scoped — both ports take only the run — so a pass
+// establishes it once, however many claims it is checking, and reports each
+// distinct mismatch once. Re-running the gates per historical event would
+// make reconcile cost more the longer a run has been alive.
+#[tokio::test]
+async fn a_pass_checks_the_history_against_ground_truth_established_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(RUN).expect("run id"),
+            bead_id: "bead-1".to_owned(),
+            repo: "octo/demo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "feat/x".to_owned(),
+        })
+        .expect("create run");
+
+    // Two revoked attempts on two packets, each landing a zombie claim.
+    let mut attempts = Vec::new();
+    for (stage, seq) in [(Stage::Implement, 1), (Stage::Implement, 2)] {
+        let pid = ledger
+            .open_packet(NewPacket {
+                run_id: RUN.to_owned(),
+                stage,
+                seq,
+                spec_path: "spec.md".to_owned(),
+                spec_sha256: "cafe".to_owned(),
+                body_json: "{}".to_owned(),
+            })
+            .expect("open packet");
+        let claim = ledger
+            .claim_packet(&pid, &format!("claude:sess-{seq}:1"), "cafe")
+            .expect("claim");
+        let ports = FakePorts::new();
+        reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+            .await
+            .expect("reconcile");
+        land_packet_result(
+            &ledger,
+            &ports,
+            RUN,
+            &pid,
+            claim.attempt_id,
+            &claim.claim_token,
+            &result_for(&pid, implement_ok(5)),
+        )
+        .await
+        .expect("land");
+        attempts.push(claim.attempt_id);
+    }
+
+    // A later pass replays both quarantine events against one recomputation.
+    let ports = FakePorts::new();
+    ports.commits_script.lock().expect("lock").push_back(3);
+    ports
+        .gates_script
+        .lock()
+        .expect("lock")
+        .push_back(vec![gate_row(1)]);
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("pass");
+
+    let calls = ports.recorded();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| matches!(c, PortCall::CommitsAhead(_)))
+            .count(),
+        1,
+        "ground truth is recomputed once per pass: {calls:?}"
+    );
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|c| matches!(c, PortCall::RerunGates { .. }))
+            .count(),
+        1,
+        "the gates are re-run once per pass, not once per historical claim: {calls:?}"
+    );
+
+    // One commits line and one gate line per attempt, no repeats.
+    assert_eq!(
+        report.harvest_mismatches.len(),
+        4,
+        "{:?}",
+        report.harvest_mismatches
+    );
+    for attempt_id in attempts {
+        assert_eq!(
+            report
+                .harvest_mismatches
+                .iter()
+                .filter(|m| m.contains(&format!("attempt {attempt_id} ")))
+                .count(),
+            2,
+            "{:?}",
+            report.harvest_mismatches
+        );
+    }
+    ledger.close().expect("close");
+}
+
 #[tokio::test]
 async fn matching_ground_truth_records_no_mismatch() {
     let dir = tempfile::tempdir().expect("tempdir");

@@ -125,7 +125,9 @@ pub struct ViewBuilder {
     terminal: BTreeMap<String, Vec<TerminalAttempt>>,
     live: Vec<AttemptRow>,
     inflight: Vec<OperationRow>,
+    settled: Vec<OperationRow>,
     events: Vec<ProtoEvent>,
+    roster: HashMap<Stage, ProviderHints>,
     budget: u32,
     next_attempt_id: i64,
 }
@@ -140,7 +142,9 @@ impl ViewBuilder {
             terminal: BTreeMap::new(),
             live: Vec::new(),
             inflight: Vec::new(),
+            settled: Vec::new(),
             events: Vec::new(),
+            roster: full_roster(),
             budget: 3,
             next_attempt_id: 1,
         }
@@ -152,8 +156,22 @@ impl ViewBuilder {
         self
     }
 
-    /// Record a machine step as requested and settled.
+    /// Record a machine step as settled: the request event, plus the
+    /// terminal operation row that is the engine's only settlement evidence.
     pub fn op_done(mut self, step: MachineStage, round: u32) -> Self {
+        let key = machine_idempotency_key(&self.run_id, step, round);
+        self = self.op_requested_only(step, round);
+        self.settled
+            .push(self.op_row(step, &key, OperationState::Terminal));
+        self
+    }
+
+    /// Record a machine step as requested with **no operation row at all**.
+    ///
+    /// Two real states wear this shape, and neither is settled: a crash
+    /// between the request event and `begin_operation`, and a `SafeRetry`
+    /// step whose row the reconciler released (deleted) for redo.
+    pub fn op_requested_only(mut self, step: MachineStage, round: u32) -> Self {
         let key = machine_idempotency_key(&self.run_id, step, round);
         self.events.push(ProtoEvent::OperationRequest {
             name: step.as_str().to_owned(),
@@ -172,21 +190,29 @@ impl ViewBuilder {
     /// Record a machine step as requested but still in flight.
     pub fn op_inflight(mut self, step: MachineStage, round: u32) -> Self {
         let key = machine_idempotency_key(&self.run_id, step, round);
-        self = self.op_done(step, round);
-        self.inflight.push(OperationRow {
+        self = self.op_requested_only(step, round);
+        self.inflight
+            .push(self.op_row(step, &key, OperationState::InProgress));
+        self
+    }
+
+    fn op_row(&self, step: MachineStage, key: &str, state: OperationState) -> OperationRow {
+        OperationRow {
             operation_id: format!("op-{key}"),
             name: step.as_str().to_owned(),
-            idempotency_key: key,
+            idempotency_key: key.to_owned(),
             request_sha256: "cafe".to_owned(),
             effect_class: EffectClass::ObserveOnly,
             run_id: Some(self.run_id.clone()),
             claim_token: None,
-            state: OperationState::InProgress,
-            response_json: None,
+            state,
+            response_json: match state {
+                OperationState::Terminal => Some("{\"ok\":true}".to_owned()),
+                OperationState::InProgress => None,
+            },
             created_at: T0.to_owned(),
             updated_at: T0.to_owned(),
-        });
-        self
+        }
     }
 
     /// Open a packet.
@@ -300,6 +326,12 @@ impl ViewBuilder {
         self
     }
 
+    /// Drop a stage from the roster, leaving `advance` no hints to copy.
+    pub fn without_roster_entry(mut self, stage: Stage) -> Self {
+        self.roster.remove(&stage);
+        self
+    }
+
     /// Assemble the view.
     pub fn build(self) -> RunView {
         RunView {
@@ -323,8 +355,9 @@ impl ViewBuilder {
             terminal_attempts: self.terminal,
             live_attempts: self.live,
             inflight_operations: self.inflight,
+            settled_operations: self.settled,
             proto_events: self.events,
-            roster: full_roster(),
+            roster: self.roster,
             gate_commands: vec!["cargo test --workspace".to_owned()],
             transport_retry_budget: self.budget,
             now: T0.to_owned(),

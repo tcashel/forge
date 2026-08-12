@@ -1,7 +1,8 @@
 //! Projection: assemble a [`RunView`] from the ledger's merged reads —
 //! `get_run`, `list_packets`, `list_live_attempts`,
-//! `list_inflight_operations`, `list_events` (paginated), and `get_attempt`
-//! for the completed ids the events name. No new ledger API.
+//! `list_inflight_operations`, `find_operation` per machine step,
+//! `list_events` (paginated), and `get_attempt` for the completed ids the
+//! events name. No new ledger API.
 //!
 //! The ledger exposes `list_live_attempts` but no "all attempts for a
 //! packet" query, so terminal attempt history is reconstructed from
@@ -10,11 +11,11 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use forged_ledger::{AttemptState, EventRow, Ledger};
+use forged_ledger::{AttemptState, EventRow, Ledger, OperationRow, OperationState};
 use forged_types::{PacketResult, ProviderHints, Stage};
 use serde_json::Value;
 
-use crate::engine::{RunView, TerminalAttempt};
+use crate::engine::{machine_idempotency_key, RunView, TerminalAttempt, MACHINE_STEPS};
 use crate::error::ProtoError;
 use crate::events::parse_proto_events;
 
@@ -54,6 +55,7 @@ pub fn project_run(
     let packets = ledger.list_packets(run_id)?;
     let live_attempts = ledger.list_live_attempts(Some(run_id))?;
     let inflight_operations = ledger.list_inflight_operations(Some(run_id))?;
+    let settled_operations = settled_machine_operations(ledger, run_id)?;
     let events = fetch_all_events(ledger, run_id)?;
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
@@ -63,12 +65,36 @@ pub fn project_run(
         terminal_attempts,
         live_attempts,
         inflight_operations,
+        settled_operations,
         proto_events,
         roster,
         gate_commands,
         transport_retry_budget,
         now: now.to_owned(),
     })
+}
+
+/// The terminal operation row of every machine step that has one.
+///
+/// The machine-step key set is closed (`MACHINE_STEPS`), so this is a
+/// bounded probe with `find_operation` rather than a new ledger query, and
+/// it is the engine's only evidence that a step is settled: a step whose row
+/// was released for redo, or whose `begin_operation` never ran, is simply
+/// absent here and runs again.
+fn settled_machine_operations(
+    ledger: &Ledger,
+    run_id: &str,
+) -> Result<Vec<OperationRow>, ProtoError> {
+    let mut out = Vec::new();
+    for (step, round) in MACHINE_STEPS {
+        let key = machine_idempotency_key(run_id, step, round);
+        if let Some(row) = ledger.find_operation(step.as_str(), &key)? {
+            if row.state == OperationState::Terminal {
+                out.push(row);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Rebuild each packet's terminal attempt history, oldest first, from the

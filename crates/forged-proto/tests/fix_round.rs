@@ -81,6 +81,69 @@ fn second_transport_failure_backs_off_sixty_seconds() {
     );
 }
 
+// The count and the deadline come from ONE place: the packet's latest
+// `proto.retry` event, which the caller appends carrying the count it
+// computed. Counting terminal attempts separately is a second, independent
+// source, and two sources can disagree — after a failure whose grant is
+// recorded, or a grant recorded for a failure whose attempt row never
+// landed. Whichever way they disagree, the event decides.
+#[test]
+fn the_latest_retry_event_is_the_only_source_of_count_and_deadline() {
+    // The event outruns the history: two visible terminal failures, but the
+    // grant says this packet is on its fourth. Over budget, and the run
+    // stops with the event's count rather than waiting on a stale deadline.
+    let event_ahead = at_fix()
+        .failed(Stage::Fix, 1, "transport: dropped")
+        .failed(Stage::Fix, 1, "transport: dropped")
+        .retry_event(
+            Stage::Fix,
+            1,
+            4,
+            &backoff_deadline(T0, 3).expect("computes"),
+        )
+        .build();
+    assert_eq!(
+        advance(&event_ahead),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::Fix,
+            attempts: 4
+        })
+    );
+
+    // The history outruns the event: four terminal transport failures, but
+    // the latest grant says one. The grant is what the caller honored, so
+    // the packet waits on its deadline instead of being declared exhausted
+    // by a count nobody granted.
+    let deadline = backoff_deadline(T0, 0).expect("computes");
+    let mut b = at_fix();
+    for _ in 0..4 {
+        b = b.failed(Stage::Fix, 1, "transport: dropped");
+    }
+    let history_ahead = b.retry_event(Stage::Fix, 1, 1, &deadline).build();
+    assert_eq!(
+        advance(&history_ahead),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: Some(deadline)
+        }
+    );
+}
+
+#[test]
+fn a_transport_failure_with_no_grant_yet_counts_from_history_and_waits_on_nothing() {
+    // The caller appends `proto.retry` before honoring the action, so this
+    // is the window before the first grant: the count falls back to the
+    // history and there is honestly no deadline to report.
+    let view = at_fix().failed(Stage::Fix, 1, "transport: dropped").build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: None
+        }
+    );
+}
+
 #[test]
 fn semantic_failure_consumes_the_round_and_stops_done() {
     let view = at_fix()
