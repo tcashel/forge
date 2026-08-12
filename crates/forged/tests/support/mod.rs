@@ -371,11 +371,18 @@ pkt=$(printf '%s\n' "$prompt" | sed -n 's/.*"packetId": "\([^"]*\)".*/\1/p' | he
 schema=$(printf '%s\n' "$prompt" | sed -n 's/.*"schema": "\([^"]*\)".*/\1/p' | head -1)
 stage=$(printf '%s' "$pkt" | awk -F/ '{print $(NF-1)}')
 seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
+scenario_stage=$stage
+case "$stage" in
+  implementation) scenario_stage=implement ;;
+  review-1) scenario_stage=reviewclaude ;;
+  review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
+  remediation) scenario_stage=fix ;;
+esac
 log="${FORGED_SHIM_DIR:?}/provider.log"
 echo "$pkt start $(date +%s) $$" >> "$log"
 
 mode=normal
-sf="$FORGED_SHIM_DIR/scenario.$stage"
+sf="$FORGED_SHIM_DIR/scenario.$scenario_stage"
 if [ -f "$sf" ]; then
   read -r m n < "$sf"
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
@@ -414,21 +421,23 @@ esac
 
 inner=""
 case "$stage" in
-  implement)
+  implement|implementation)
     printf 'impl by shim\n' > "impl-$seq.txt"
     git add "impl-$seq.txt"
     git commit -q -m "feat: shim implement $seq"
     commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
     inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     ;;
-  reviewclaude|reviewcodex)
-    if [ "$seq" -le 1 ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
+    if [ "$mode" = approve ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix)
+  fix|remediation)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -462,11 +471,18 @@ pkt=$(printf '%s\n' "$prompt" | sed -n 's/.*"packetId": "\([^"]*\)".*/\1/p' | he
 schema=$(printf '%s\n' "$prompt" | sed -n 's/.*"schema": "\([^"]*\)".*/\1/p' | head -1)
 stage=$(printf '%s' "$pkt" | awk -F/ '{print $(NF-1)}')
 seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
+scenario_stage=$stage
+case "$stage" in
+  implementation) scenario_stage=implement ;;
+  review-1) scenario_stage=reviewclaude ;;
+  review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
+  remediation) scenario_stage=fix ;;
+esac
 log="${FORGED_SHIM_DIR:?}/provider.log"
 echo "$pkt start $(date +%s) $$" >> "$log"
 
 mode=normal
-sf="$FORGED_SHIM_DIR/scenario.$stage"
+sf="$FORGED_SHIM_DIR/scenario.$scenario_stage"
 if [ -f "$sf" ]; then
   read -r m n < "$sf"
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
@@ -502,21 +518,23 @@ esac
 
 inner=""
 case "$stage" in
-  implement)
+  implement|implementation)
     printf 'impl by shim\n' > "impl-$seq.txt"
     git add "impl-$seq.txt"
     git commit -q -m "feat: shim implement $seq"
     commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
     inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     ;;
-  reviewclaude|reviewcodex)
-    if [ "$seq" -le 1 ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
+    if [ "$mode" = approve ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix)
+  fix|remediation)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -718,6 +736,89 @@ impl TestEnv {
             serde_json::to_string_pretty(&config).expect("config json"),
         )
         .expect("write config");
+    }
+
+    /// Add a provider-uniform semantic roster while retaining the mixed
+    /// default roster. Every role remains present so any stored profile can
+    /// escalate without consulting config again.
+    pub fn add_uniform_roster(&self, name: &str, provider: &str, model: &str) {
+        let path = self.anvil.join("config.json");
+        let mut config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("read config for roster extension"),
+        )
+        .expect("config json");
+        let candidate = |provider: &str, model: &str, write: bool| {
+            let mut capabilities = vec!["repositoryRead", "structuredOutput"];
+            if write {
+                capabilities.push("repositoryWrite");
+            }
+            json!({
+                "provider": provider,
+                "model": model,
+                "effort": (provider == "codex").then_some("xhigh"),
+                "sandbox": if write { "workspaceWrite" } else { "readOnly" },
+                "capabilities": capabilities,
+            })
+        };
+        let roster = |roster_name: &str, uniform: Option<(&str, &str)>| {
+            let for_role = |role: &str, write: bool| match uniform {
+                Some((provider, model)) => candidate(provider, model, write),
+                None => match role {
+                    "review.secondary" | "synthesis" => candidate("codex", "gpt-5.6-sol", write),
+                    _ => candidate("claude", "opus", write),
+                },
+            };
+            json!({
+                "schema": "forged.roster/1",
+                "name": roster_name,
+                "roles": {
+                    "implementation": [for_role("implementation", true)],
+                    "review.primary": [for_role("review.primary", false)],
+                    "review.secondary": [for_role("review.secondary", false)],
+                    "review.tertiary": [for_role("review.tertiary", false)],
+                    "synthesis": [for_role("synthesis", false)],
+                    "remediation": [for_role("remediation", true)],
+                }
+            })
+        };
+        let mut rosters = serde_json::Map::new();
+        rosters.insert("default".to_owned(), roster("default", None));
+        rosters.insert(name.to_owned(), roster(name, Some((provider, model))));
+        config["rosters"] = Value::Object(rosters);
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("extended config json"),
+        )
+        .expect("write extended config");
+    }
+
+    /// Add a roster whose implementation role first names an unavailable
+    /// adapter and then Claude. Other roles are Claude-only.
+    pub fn add_implementation_fallback_roster(&self, name: &str) {
+        self.add_uniform_roster(name, "claude", "opus");
+        let path = self.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read fallback config"))
+                .expect("fallback config json");
+        let candidates = config
+            .pointer_mut(&format!("/rosters/{name}/roles/implementation"))
+            .and_then(Value::as_array_mut)
+            .expect("implementation candidates");
+        candidates.insert(
+            0,
+            json!({
+                "provider": "uninstalled",
+                "model": "unavailable-model",
+                "effort": null,
+                "sandbox": "workspaceWrite",
+                "capabilities": ["repositoryRead", "repositoryWrite", "structuredOutput"],
+            }),
+        );
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("fallback config json"),
+        )
+        .expect("write fallback config");
     }
 
     /// The environment a forged child (or MCP server) runs under.

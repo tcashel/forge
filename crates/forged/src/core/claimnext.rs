@@ -28,6 +28,8 @@ struct Resumable {
     packet_id: String,
     spec_path: String,
     stage: forged_types::Stage,
+    stage_key: String,
+    logical_seq: i64,
     /// The packet's own provider hint — the `<provider>` segment of the
     /// attempt claimant this resume mints.
     provider: String,
@@ -120,22 +122,30 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
         // The stored body carries the hints the packet was opened with; the
         // roster is the same source `build_packet` read, and is the fallback
         // when a body predates them.
-        let provider = serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
-            .map(|p| p.provider_hints.provider)
-            .ok()
-            .or_else(|| {
-                ctx.config
-                    .roster
-                    .get(&packet.stage)
-                    .map(|h| h.provider.clone())
-            })
-            .unwrap_or_default();
+        let provider = if view.execution_package.is_some() {
+            crate::core::drive::stored_packet_for_attempt(&view, &packet_id)?
+                .provider_hints
+                .provider
+        } else {
+            view.roster
+                .get(&packet.stage)
+                .map(|hints| hints.provider.clone())
+                .ok_or_else(|| {
+                    Failure::invalid(format!(
+                        "legacy roster has no provider for {:?}",
+                        packet.stage
+                    ))
+                })?
+        };
+        let (_, stage_key, logical_seq) = crate::core::split_packet_key(&packet_id)?;
         resumables.push(Resumable {
             run_id: run.run_id,
             bead_id: run.bead_id,
             packet_id,
             spec_path: packet.spec_path,
             stage: packet.stage,
+            stage_key,
+            logical_seq,
             provider,
         });
     }
@@ -218,8 +228,11 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // The packet directory belongs to the new attempt now: a stale pid
         // file (and its start-time stamp) from the dead attempt must not
         // read as this session.
-        let (_, stage, seq) = crate::core::split_packet_id(&candidate.packet_id)?;
-        let dir = ctx.config.packet_dir(&candidate.run_id, stage, seq);
+        let dir = ctx.config.packet_dir_key(
+            &candidate.run_id,
+            &candidate.stage_key,
+            candidate.logical_seq,
+        );
         let _ = std::fs::remove_file(dir.join("provider.pid"));
         let _ = std::fs::remove_file(dir.join(crate::adapters::ports::PROVIDER_LSTART));
         return Ok(json!({

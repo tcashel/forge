@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Twelve tools, each taking the
+//! `forged mcp` — the rmcp stdio server. Thirteen tools, each taking the
 //! same operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -115,6 +115,15 @@ impl ForgedServer {
     #[tool(name = "run_status", description = "Project a run's current state.")]
     pub async fn run_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_status", args.0).await
+    }
+
+    /// Append an explicit roster revision.
+    #[tool(
+        name = "run_revise_roster",
+        description = "Append a validated roster revision for a run."
+    )]
+    pub async fn run_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_revise_roster", args.0).await
     }
 
     /// Claim one packet.

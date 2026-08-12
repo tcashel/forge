@@ -154,6 +154,17 @@ fn profile(name: &str, review_roles: &[&str], synthesis: bool) -> ProfileDefinit
             ],
             _ => Vec::new(),
         },
+        escalate_to: match name {
+            "lean" => Some(ProfileRef {
+                name: "standard".to_owned(),
+                version: 1,
+            }),
+            "standard" => Some(ProfileRef {
+                name: "high".to_owned(),
+                version: 1,
+            }),
+            _ => None,
+        },
     }
 }
 
@@ -353,8 +364,36 @@ impl ForgedConfig {
                 message: format!("unknown roster {roster_name:?}"),
             }]);
         };
-        let mut errors = profile.validate();
-        errors.extend(roster.validate_for(&profile));
+        let mut errors = Vec::new();
+        let mut profile_catalog = BTreeMap::new();
+        let mut cursor = Some(profile.clone());
+        let mut seen = BTreeSet::new();
+        while let Some(current) = cursor {
+            let name = current.name.clone();
+            if !seen.insert(name.clone()) {
+                errors.push(DefinitionError {
+                    path: "$.profile.escalateTo".to_owned(),
+                    message: format!("escalation cycle reaches {name:?}"),
+                });
+                break;
+            }
+            errors.extend(current.validate());
+            errors.extend(roster.validate_for(&current));
+            let next = current.escalate_to.as_ref().and_then(|target| {
+                match self.profiles.get(&target.name) {
+                    Some(value) if target.version == 1 => Some(value.clone()),
+                    _ => {
+                        errors.push(DefinitionError {
+                            path: format!("$.profiles.{name}.escalateTo"),
+                            message: format!("missing escalation target {:?}", target.name),
+                        });
+                        None
+                    }
+                }
+            });
+            profile_catalog.insert(name, current);
+            cursor = next;
+        }
         if profile.name != profile_name {
             errors.push(DefinitionError {
                 path: "$.profile.name".to_owned(),
@@ -410,6 +449,7 @@ impl ForgedConfig {
             profile_sha256,
             roster_sha256,
             profile,
+            profile_catalog,
             roster: resolved,
         };
         let package_sha256 = digest_of(&package).map_err(|message| {
@@ -423,6 +463,50 @@ impl ForgedConfig {
             package_sha256,
             compatibility_roster,
         })
+    }
+
+    /// Compile one current config roster against every profile frozen into
+    /// an existing run. This is the only authoring path for explicit roster
+    /// revisions; the run's topology never comes from current config.
+    pub fn compile_roster_revision(
+        &self,
+        package: &ExecutionPackageV1,
+        roster_name: &str,
+    ) -> Result<(forged_types::ResolvedRosterV1, String), Vec<DefinitionError>> {
+        let Some(roster) = self.rosters.get(roster_name) else {
+            return Err(vec![DefinitionError {
+                path: "$.roster".to_owned(),
+                message: format!("unknown roster {roster_name:?}"),
+            }]);
+        };
+        let mut errors = Vec::new();
+        if roster.name != roster_name {
+            errors.push(DefinitionError {
+                path: "$.roster.name".to_owned(),
+                message: format!(
+                    "definition name {:?} does not match selected key {roster_name:?}",
+                    roster.name
+                ),
+            });
+        }
+        if package.profile_catalog.is_empty() {
+            errors.extend(roster.validate_for(&package.profile));
+        } else {
+            for profile in package.profile_catalog.values() {
+                errors.extend(roster.validate_for(profile));
+            }
+        }
+        if !errors.is_empty() {
+            return Err(errors);
+        }
+        let resolved = roster.resolve();
+        let digest = digest_of(&resolved).map_err(|message| {
+            vec![DefinitionError {
+                path: "$.roster".to_owned(),
+                message,
+            }]
+        })?;
+        Ok((resolved, digest))
     }
 
     /// YAML document written by `init`; real YAML comments explain ownership.
@@ -478,10 +562,11 @@ impl ForgedConfig {
         self.run_dir(run_id).join("worktree")
     }
 
-    pub fn packet_dir(&self, run_id: &str, stage: Stage, seq: i64) -> PathBuf {
+    /// Semantic packet directory, independent of a provider/storage lane.
+    pub fn packet_dir_key(&self, run_id: &str, stage_key: &str, seq: i64) -> PathBuf {
         self.run_dir(run_id)
             .join("packets")
-            .join(stage_str(stage))
+            .join(stage_key)
             .join(seq.to_string())
     }
 }
@@ -500,10 +585,10 @@ fn compatibility_projection(
     let implement = seats(SeatPurpose::Implement);
     let reviews = seats(SeatPurpose::Review);
     let fixes = seats(SeatPurpose::Fix);
-    if implement.len() != 1 || reviews.len() != 2 || fixes.len() != 1 {
+    if implement.len() != 1 || reviews.is_empty() || fixes.len() != 1 {
         return Err(DefinitionError {
             path: "$.profile.seats".to_owned(),
-            message: "selected profile cannot fit the temporary slice/v1 four-stage executor (requires one implement, two review, and one fix seat)".to_owned(),
+            message: "profile cannot supply the temporary slice/v1 storage lanes".to_owned(),
         });
     }
     let candidate = |seat: &SeatDefinitionV1| {
@@ -525,7 +610,10 @@ fn compatibility_projection(
     Ok(HashMap::from([
         (Stage::Implement, candidate(implement[0])?),
         (Stage::ReviewClaude, candidate(reviews[0])?),
-        (Stage::ReviewCodex, candidate(reviews[1])?),
+        (
+            Stage::ReviewCodex,
+            candidate(reviews.get(1).copied().unwrap_or(reviews[0]))?,
+        ),
         (Stage::Fix, candidate(fixes[0])?),
     ]))
 }
@@ -690,12 +778,11 @@ mod tests {
     }
 
     #[test]
-    fn non_standard_topology_fails_closed_during_compatibility() {
+    fn every_default_topology_has_a_storage_projection() {
         let cfg = config();
-        let errors = cfg
-            .compile_definition(Some("lean"), None)
-            .expect_err("lean does not fit v0");
-        assert!(errors.iter().any(|error| error.path == "$.profile.seats"));
+        for profile in ["lean", "standard", "high"] {
+            assert!(cfg.compile_definition(Some(profile), None).is_ok());
+        }
     }
 
     #[test]

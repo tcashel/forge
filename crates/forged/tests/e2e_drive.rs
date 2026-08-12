@@ -80,12 +80,12 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     // overlapped.
     let plog = env.provider_log();
     for packet in [
-        "bead-e2e/implement/1",
-        "bead-e2e/reviewclaude/1",
-        "bead-e2e/reviewcodex/1",
-        "bead-e2e/fix/1",
-        "bead-e2e/reviewclaude/2",
-        "bead-e2e/reviewcodex/2",
+        "bead-e2e/implementation/0",
+        "bead-e2e/review-1/0",
+        "bead-e2e/review-2/0",
+        "bead-e2e/remediation/0",
+        "bead-e2e/review-1/1",
+        "bead-e2e/review-2/1",
     ] {
         assert!(
             plog.iter().any(|l| l.starts_with(packet)),
@@ -187,7 +187,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     );
 
     // packet show returns the stored packet body and its attempts.
-    let (code, shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/implement/1"]);
+    let (code, shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/implementation/0"]);
     assert_eq!(code, 0);
     assert_eq!(
         shown["result"]["packet"]["schema"],
@@ -204,7 +204,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         json!("claude"),
         "implement routed to the claude driver"
     );
-    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/reviewcodex/1"]);
+    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/review-2/0"]);
     assert_eq!(
         codex_shown["result"]["packet"]["providerHints"]["provider"],
         json!("codex"),
@@ -225,6 +225,329 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert_eq!(code, 0, "worktree retire: {retired}");
     assert_eq!(retired["result"]["retired"], json!(true));
     assert!(!env.worktree("bead-e2e").exists());
+}
+
+#[test]
+fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_family() {
+    // Lean proves inexpensive work uses one reviewer and no fix/synthesis.
+    let lean = TestEnv::new("forged-profile-lean");
+    lean.forged(&["init"]);
+    lean.add_uniform_roster("all-claude", "claude", "opus");
+    let repo = lean.repos.repo.to_string_lossy().into_owned();
+    let spec = lean.spec.to_string_lossy().into_owned();
+    let (code, started) = lean.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-lean",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+        "--roster",
+        "all-claude",
+    ]);
+    assert_eq!(code, 0, "lean start: {started}");
+    let (code, driven) = lean.forged(&["run", "drive", "--run", "bead-lean"]);
+    assert_eq!(code, 0, "lean drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["done"]["finalVerdict"],
+        json!("requestChanges")
+    );
+    let log = lean.provider_log();
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-lean/review-1/0")));
+    assert!(!log.iter().any(|line| line.contains("/review-2/")));
+    assert!(!log.iter().any(|line| line.contains("/remediation/")));
+    assert!(!log.iter().any(|line| line.contains("/synthesis/")));
+    let ledger = lean.ledger();
+    for attempt_id in 1..=8 {
+        let Ok(attempt) = ledger.get_attempt(attempt_id) else {
+            continue;
+        };
+        assert!(attempt.claimant.starts_with("claude:"));
+    }
+    ledger.close().expect("close lean ledger");
+
+    // A run freezes topology, then an explicit revision replaces only its
+    // provider roster. The subsequent full run is driven entirely by Codex.
+    let switched = TestEnv::new("forged-roster-switch");
+    switched.forged(&["init"]);
+    switched.add_uniform_roster("all-codex", "codex", "gpt-5.6-sol");
+    let repo = switched.repos.repo.to_string_lossy().into_owned();
+    let spec = switched.spec.to_string_lossy().into_owned();
+    let (code, started) = switched.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-switch",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "switch start: {started}");
+    let original = started["result"]["roster_sha256"].clone();
+    let (code, revised) = switched.forged(&[
+        "run",
+        "revise-roster",
+        "--run",
+        "bead-switch",
+        "--roster",
+        "all-codex",
+        "--reason",
+        "Anthropic harness unavailable",
+    ]);
+    assert_eq!(code, 0, "roster revision: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    assert_ne!(revised["result"]["roster_sha256"], original);
+    let (code, status) = switched.forged(&["run", "status", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "status after revision: {status}");
+    assert_eq!(
+        status["result"]["run"]["definition"]["activeRosterRef"]["name"],
+        json!("all-codex")
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["rosterRevision"],
+        json!(2)
+    );
+    let (code, driven) = switched.forged(&["run", "drive", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "drive after roster revision: {driven}");
+    let ledger = switched.ledger();
+    for attempt_id in 1..=32 {
+        let Ok(attempt) = ledger.get_attempt(attempt_id) else {
+            continue;
+        };
+        assert!(
+            attempt.claimant.starts_with("codex:"),
+            "all-codex roster selected for {}: {}",
+            attempt.packet_id,
+            attempt.claimant
+        );
+    }
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
+    let env = TestEnv::new("forged-roster-fallback");
+    env.forged(&["init"]);
+    env.add_implementation_fallback_roster("fallback");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-fallback",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+        "--roster",
+        "fallback",
+    ]);
+    assert_eq!(code, 0, "fallback start: {started}");
+    // Resolve, open, and execute candidate 1. Advance the durable retry
+    // clock in the test database instead of sleeping through the production
+    // 30-second backoff; the next projection still reads the real event.
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-fallback"]);
+        assert_eq!(code, 0, "fallback advance: {advanced}");
+    }
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
+            ["bead-fallback"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retry event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+    drop(connection);
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-fallback"]);
+    assert_eq!(code, 0, "fallback drive: {driven}");
+
+    let ledger = env.ledger();
+    let first = ledger.get_attempt(1).expect("first implementation attempt");
+    let second = ledger
+        .get_attempt(2)
+        .expect("fallback implementation attempt");
+    assert!(first.claimant.starts_with("uninstalled:"), "{first:?}");
+    assert!(second.claimant.starts_with("claude:"), "{second:?}");
+    assert_eq!(first.state, forged_ledger::AttemptState::Failed);
+    assert_eq!(second.state, forged_ledger::AttemptState::Completed);
+    let completed_implementation = [first, second]
+        .iter()
+        .filter(|attempt| attempt.state == forged_ledger::AttemptState::Completed)
+        .count();
+    assert_eq!(
+        completed_implementation, 1,
+        "exactly one implementation landed"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
+    let env = TestEnv::new("forged-profile-high");
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-high",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "high",
+    ]);
+    assert_eq!(code, 0, "high start: {started}");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-high"]);
+    assert_eq!(code, 0, "high drive: {driven}");
+    let log = env.provider_log();
+    for seat in ["review-1", "review-2", "review-3", "synthesis"] {
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with(&format!("bead-high/{seat}/0"))),
+            "{seat} ran: {log:?}"
+        );
+    }
+}
+
+#[test]
+fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
+    // Gate failure raises lean to its stored standard edge and survives
+    // repeated projection/drive without duplicating the transition.
+    let gate = TestEnv::new("forged-escalate-gate");
+    gate.forged(&["init"]);
+    let config_path = gate.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("gate config"))
+            .expect("gate config json");
+    config["gate_commands"] = json!(["false"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("gate config json"),
+    )
+    .expect("write failing gate");
+    let repo = gate.repos.repo.to_string_lossy().into_owned();
+    let spec = gate.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        gate.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-gate-edge",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+            "--profile",
+            "lean",
+        ])
+        .0,
+        0
+    );
+    assert_eq!(
+        gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
+        0
+    );
+    assert_eq!(
+        gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
+        0
+    );
+    let (_, events) = gate.forged(&["events", "--run", "bead-gate-edge"]);
+    let escalations: Vec<_> = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.profile.escalated"))
+        .collect();
+    assert_eq!(escalations.len(), 1, "one durable gate escalation");
+    assert_eq!(escalations[0]["payload"]["from"], json!("lean"));
+    assert_eq!(escalations[0]["payload"]["to"], json!("standard"));
+    assert_eq!(escalations[0]["payload"]["trigger"], json!("gateFailure"));
+
+    // Conflicting standard reviewers raise to high and materialize only its
+    // added review/synthesis seats.
+    let conflict = TestEnv::new("forged-escalate-conflict");
+    conflict.forged(&["init"]);
+    let repo = conflict.repos.repo.to_string_lossy().into_owned();
+    let spec = conflict.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        conflict
+            .forged(&[
+                "run",
+                "start",
+                "--bead",
+                "bead-conflict-edge",
+                "--repo",
+                &repo,
+                "--spec",
+                &spec,
+                "--base-ref",
+                "main",
+            ])
+            .0,
+        0
+    );
+    conflict.set_scenario("reviewclaude", "approve", 1);
+    assert_eq!(
+        conflict
+            .forged(&["run", "drive", "--run", "bead-conflict-edge"])
+            .0,
+        0
+    );
+    let (_, status) = conflict.forged(&["run", "status", "--run", "bead-conflict-edge"]);
+    assert_eq!(
+        status["result"]["run"]["execution"]["activeProfileRef"]["name"],
+        json!("high")
+    );
+    assert_eq!(
+        status["result"]["run"]["execution"]["profileHistory"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let log = conflict.provider_log();
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-conflict-edge/review-3/0")));
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-conflict-edge/synthesis/0")));
 }
 
 #[test]
@@ -329,10 +652,10 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
         "a semantic failure grants no transport retry"
     );
     let plog = env.provider_log();
-    assert_no_overlap(&plog, "bead-sem/implement/1");
+    assert_no_overlap(&plog, "bead-sem/implementation/0");
     let starts = plog
         .iter()
-        .filter(|l| l.starts_with("bead-sem/implement/1") && l.contains(" start "))
+        .filter(|l| l.starts_with("bead-sem/implementation/0") && l.contains(" start "))
         .count();
     assert_eq!(starts, 2, "one failed and one successful attempt: {plog:?}");
 }
@@ -413,7 +736,7 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     // Occupy the pid path with a DIRECTORY: the spawned shell's
     // `echo $$ > provider.pid` fails, the provider still runs, and the file
     // never appears — deterministically, with no race against the shim.
-    let packet_dir = env.packet_dir("bead-nopid", "implement", 1);
+    let packet_dir = env.packet_dir("bead-nopid", "implementation", 0);
     std::fs::create_dir_all(packet_dir.join("provider.pid")).expect("occupy the pid path");
     // A provider that would otherwise outlive the window, so the kill is
     // observable rather than a no-op on an already-exited shim.
@@ -454,12 +777,12 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     let plog = env.provider_log();
     let start = plog
         .iter()
-        .find(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" start "))
+        .find(|l| l.starts_with("bead-nopid/implementation/0") && l.contains(" start "))
         .expect("the provider did start");
     assert!(
         !plog
             .iter()
-            .any(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" end ")),
+            .any(|l| l.starts_with("bead-nopid/implementation/0") && l.contains(" end ")),
         "the hung provider was killed, so it never wrote its end line: {plog:?}"
     );
     let pid: i32 = start

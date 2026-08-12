@@ -361,6 +361,8 @@ impl ViewBuilder {
             gate_commands: vec!["cargo test --workspace".to_owned()],
             transport_retry_budget: self.budget,
             now: T0.to_owned(),
+            execution_package: None,
+            profile_escalations: Vec::new(),
         }
     }
 }

@@ -2,7 +2,9 @@
 
 use std::fmt::Write as _;
 
-use forged_types::{canonical_json_bytes, ErrorCode, EXECUTION_PACKAGE_SCHEMA_V1};
+use forged_types::{
+    canonical_json_bytes, ErrorCode, ResolvedRosterV1, EXECUTION_PACKAGE_SCHEMA_V1,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
 use serde_json::json;
@@ -71,6 +73,7 @@ fn revision_row(row: &rusqlite::Row<'_>) -> Result<RosterRevisionRow, rusqlite::
         roster_json: row.get(4)?,
         reason: row.get(5)?,
         created_at: row.get(6)?,
+        operation_id: row.get(7)?,
     })
 }
 
@@ -263,12 +266,116 @@ impl Ledger {
             require_run(conn, &run_id)?;
             conn.query_row(
                 "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
-                 created_at FROM roster_revisions WHERE run_id = ?1 ORDER BY revision DESC LIMIT 1",
+                 created_at, operation_id FROM roster_revisions WHERE run_id = ?1 \
+                 ORDER BY revision DESC LIMIT 1",
                 [&run_id],
                 revision_row,
             )
             .optional()
             .map_err(Into::into)
+        })
+    }
+
+    /// Append a validated roster snapshot as the next revision. The caller
+    /// supplies canonical semantics; the ledger independently verifies the
+    /// digest and requires a definition-backed run and non-empty reason.
+    pub fn append_roster_revision(
+        &self,
+        run_id: &str,
+        roster: ResolvedRosterV1,
+        roster_sha256: String,
+        reason: String,
+        operation_id: String,
+    ) -> Result<RosterRevisionRow, LedgerError> {
+        let run_id = run_id.to_owned();
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "roster revision requires a reason",
+            ));
+        }
+        let (roster_json, actual_sha256) = canonical(&roster)?;
+        if roster_sha256 != actual_sha256 {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "roster revision digest mismatch",
+            ));
+        }
+        let (roster_ref_json, _) = canonical(&roster.roster_ref)?;
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_run(&tx, &run_id)?;
+            let has_definition: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM run_definitions WHERE run_id = ?1)",
+                [&run_id],
+                |row| row.get(0),
+            )?;
+            if !has_definition {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "legacy run has no revisable roster",
+                ));
+            }
+            let existing = tx
+                .query_row(
+                    "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
+                     created_at, operation_id FROM roster_revisions WHERE operation_id = ?1",
+                    [&operation_id],
+                    revision_row,
+                )
+                .optional()?;
+            if let Some(existing) = existing {
+                if existing.run_id == run_id
+                    && existing.roster_sha256 == roster_sha256
+                    && existing.reason == reason
+                {
+                    tx.commit()?;
+                    return Ok(existing);
+                }
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "roster revision operation was reused with different content",
+                ));
+            }
+            let current: i64 = tx.query_row(
+                "SELECT COALESCE(MAX(revision), 0) FROM roster_revisions WHERE run_id = ?1",
+                [&run_id],
+                |row| row.get(0),
+            )?;
+            let revision = current
+                .checked_add(1)
+                .ok_or_else(|| crate::error::internal("roster revision counter overflow"))?;
+            let now = now_iso();
+            tx.execute(
+                "INSERT INTO roster_revisions (run_id, revision, roster_ref_json, roster_sha256, \
+                 roster_json, reason, created_at, operation_id) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                rusqlite::params![
+                    run_id,
+                    revision,
+                    roster_ref_json,
+                    roster_sha256,
+                    roster_json,
+                    reason,
+                    now,
+                    operation_id,
+                ],
+            )?;
+            let revision: u32 = revision
+                .try_into()
+                .map_err(|_| crate::error::internal("roster revision does not fit u32"))?;
+            let row = RosterRevisionRow {
+                run_id,
+                revision,
+                roster_ref_json,
+                roster_sha256,
+                roster_json,
+                reason,
+                created_at: now,
+                operation_id: Some(operation_id),
+            };
+            tx.commit()?;
+            Ok(row)
         })
     }
 

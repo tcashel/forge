@@ -114,9 +114,9 @@ impl ForgedPorts {
     }
 
     fn packet_dir_of(&self, packet_id: &str) -> Result<PathBuf, PortError> {
-        let (run_id, stage, seq) =
-            crate::core::split_packet_id(packet_id).map_err(|f| PortError::Internal(f.message))?;
-        Ok(self.config.packet_dir(&run_id, stage, seq))
+        let (run_id, stage_key, seq) =
+            crate::core::split_packet_key(packet_id).map_err(|f| PortError::Internal(f.message))?;
+        Ok(self.config.packet_dir_key(&run_id, &stage_key, seq))
     }
 
     /// Whether an attempt's process identity is past the window in which it
@@ -417,7 +417,7 @@ fn pid_alive(pid: i32) -> bool {
 /// Whether `session` is a per-attempt claimant, and if so the run it names.
 fn run_of_session(session: &str) -> Option<String> {
     let packet_id = crate::core::packet_of_session(session)?;
-    let (run_id, _, _) = crate::core::split_packet_id(packet_id).ok()?;
+    let (run_id, _, _) = crate::core::split_packet_key(packet_id).ok()?;
     Some(run_id)
 }
 
@@ -743,7 +743,7 @@ mod tests {
         // which would abort every reconcile pass of the run forever.
         let tmp = tempfile::tempdir().expect("tempdir");
         let (config, ledger, attempt) = one_running_attempt(tmp.path());
-        let dir = config.packet_dir("run-orphan", forged_types::Stage::Implement, 1);
+        let dir = config.packet_dir_key("run-orphan", "implement", 1);
         std::fs::create_dir_all(&dir).expect("packet dir");
         // A live pid (this test process) and NO `provider.lstart`: exactly
         // the crash window between the host spawn and the identity stamp.

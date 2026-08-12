@@ -148,14 +148,14 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     // and the shim logged its start (so the hang scenario is consumed by
     // THIS attempt, never left armed for the resume).
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k1", "implement", 1).is_some()
+        read_pid(&env, "bead-k1", "implementation", 0).is_some()
     });
     wait_until("implement shim start", || {
         env.provider_log()
             .iter()
-            .any(|l| l.starts_with("bead-k1/implement/1") && l.contains(" start "))
+            .any(|l| l.starts_with("bead-k1/implementation/0") && l.contains(" start "))
     });
-    let provider_pid = read_pid(&env, "bead-k1", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k1", "implementation", 0).expect("pid");
 
     // Kill the driver mid-packet, then the orphaned provider group — the
     // machine died. Disarm the scenario so the timing of the kill can
@@ -168,7 +168,7 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     // A SIGKILLed shim never writes its `end` line; its pid — verified
     // dead above, before any successor starts — is excluded from the log
     // scan (the ledger's attempt-order record covers it).
-    let killed_pids = shim_pids(&env, "bead-k1/implement/1");
+    let killed_pids = shim_pids(&env, "bead-k1/implementation/0");
 
     // Reconcile revokes the dead attempt and reclaims the scoped lease.
     let (code, reconciled) = env.forged(&["reconcile", "--run", "bead-k1"]);
@@ -192,7 +192,7 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     assert_eq!(resumed["result"]["claimed"]["resumed"], json!(true));
     assert_eq!(
         resumed["result"]["claimed"]["packet_id"],
-        json!("bead-k1/implement/1")
+        json!("bead-k1/implementation/0")
     );
 
     // Finish the run: drive adopts the resumed claim and completes.
@@ -210,10 +210,10 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     assert!(log.contains("shim fix"), "fix commit: {log}");
 
     // Process non-overlap: the ledger's attempt order and the shim log.
-    assert_attempts_serialized(&env, "bead-k1", "bead-k1/implement/1");
+    assert_attempts_serialized(&env, "bead-k1", "bead-k1/implementation/0");
     support::assert_no_overlap_after_kills(
         &env.provider_log(),
-        "bead-k1/implement/1",
+        "bead-k1/implementation/0",
         &killed_pids,
     );
 }
@@ -308,7 +308,7 @@ fn pause_after_reservation_zombie_send_is_refused_and_quarantined() {
             .any(|e| e["kind"] == json!("proto.quarantine")),
         "the quarantine event is durable"
     );
-    assert_attempts_serialized(&env, "bead-k2", "bead-k2/implement/1");
+    assert_attempts_serialized(&env, "bead-k2", "bead-k2/implementation/0");
 }
 
 fn wait_release_consumed(release: &Path) -> bool {
@@ -473,20 +473,20 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     env.set_scenario("implement", "hang", 1);
     let mut drive = spawn_drive(&env, "bead-k5", None);
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k5", "implement", 1).is_some()
+        read_pid(&env, "bead-k5", "implementation", 0).is_some()
     });
     wait_until("implement shim start", || {
         env.provider_log()
             .iter()
-            .any(|l| l.starts_with("bead-k5/implement/1") && l.contains(" start "))
+            .any(|l| l.starts_with("bead-k5/implementation/0") && l.contains(" start "))
     });
-    let provider_pid = read_pid(&env, "bead-k5", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k5", "implementation", 0).expect("pid");
     drive.kill().expect("kill driver");
     let _ = drive.wait();
     kill_group(provider_pid);
     wait_until("provider death", || !pid_alive(provider_pid));
     env.set_scenario("implement", "hang", 0);
-    let killed_pids = shim_pids(&env, "bead-k5/implement/1");
+    let killed_pids = shim_pids(&env, "bead-k5/implementation/0");
 
     // Two INDEPENDENT OS processes reconcile the same run, concurrently.
     let mut first = env
@@ -560,10 +560,10 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k5"]);
     assert_eq!(code, 0, "resumed drive: {driven}");
     assert!(driven["result"]["terminal"]["done"].is_object());
-    assert_attempts_serialized(&env, "bead-k5", "bead-k5/implement/1");
+    assert_attempts_serialized(&env, "bead-k5", "bead-k5/implementation/0");
     support::assert_no_overlap_after_kills(
         &env.provider_log(),
-        "bead-k5/implement/1",
+        "bead-k5/implementation/0",
         &killed_pids,
     );
 }
@@ -577,9 +577,9 @@ fn a_live_slow_worker_inside_its_budget_is_not_robbed() {
     env.set_scenario("implement", "slow", 1);
     let mut drive = spawn_drive(&env, "bead-k6", None);
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k6", "implement", 1).is_some()
+        read_pid(&env, "bead-k6", "implementation", 0).is_some()
     });
-    let provider_pid = read_pid(&env, "bead-k6", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k6", "implementation", 0).expect("pid");
     assert!(pid_alive(provider_pid), "the slow worker is alive");
 
     // Reconcile while the worker is alive and inside its budget.
@@ -644,7 +644,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .iter()
         .find(|e| e["kind"] == json!("proto.retry"))
         .expect("a proto.retry carries the backoff");
-    assert_eq!(retry["payload"]["packetId"], json!("bead-k7/fix/1"));
+    assert_eq!(retry["payload"]["packetId"], json!("bead-k7/remediation/0"));
     assert_eq!(retry["payload"]["transportFailures"], json!(1));
     assert!(retry["payload"]["retryAfter"].as_str().is_some());
 
@@ -655,7 +655,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .as_array()
         .expect("packets")
         .iter()
-        .filter(|p| p["stage"] == json!("fix"))
+        .filter(|p| p["storageLane"] == json!("fix"))
         .cloned()
         .collect();
     assert_eq!(fix_packets.len(), 1, "one fix packet only: {fix_packets:?}");
@@ -665,8 +665,8 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .find_map(|e| e["payload"]["reason"].as_str())
         .expect("the failed fix attempt note");
     assert_eq!(fail_note, "transport: codex turn failed: rate limit");
-    assert_attempts_serialized(&env, "bead-k7", "bead-k7/fix/1");
-    assert_no_overlap(&env.provider_log(), "bead-k7/fix/1");
+    assert_attempts_serialized(&env, "bead-k7", "bead-k7/remediation/0");
+    assert_no_overlap(&env.provider_log(), "bead-k7/remediation/0");
 }
 
 // ------------------------------------------------------------- schedule 8

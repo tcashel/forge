@@ -109,6 +109,39 @@ fn pr_number_of(view: &RunView) -> Option<u64> {
 
 /// The merged findings of the latest review fan-out.
 fn latest_review_findings(view: &RunView) -> Vec<forged_types::Finding> {
+    if view.execution_package.is_some() {
+        let semantic: Vec<_> = view
+            .packets
+            .iter()
+            .filter_map(|row| {
+                let packet =
+                    serde_json::from_str::<forged_types::WorkPacket>(&row.body_json).ok()?;
+                let execution = packet.execution?;
+                (execution.purpose == forged_types::SeatPurpose::Review)
+                    .then_some((row, execution.round))
+            })
+            .collect();
+        let latest_round = semantic.iter().map(|(_, round)| *round).max();
+        let mut findings = Vec::new();
+        for (packet, _) in semantic
+            .into_iter()
+            .filter(|(_, round)| Some(*round) == latest_round)
+        {
+            if let Some(history) = view.terminal_attempts.get(&packet.packet_id) {
+                if let Some(Outcome::Review {
+                    findings: leg_findings,
+                    ..
+                }) = history
+                    .iter()
+                    .rev()
+                    .find_map(|attempt| attempt.outcome.as_ref())
+                {
+                    findings.extend(leg_findings.iter().cloned());
+                }
+            }
+        }
+        return findings;
+    }
     let latest_seq = view
         .packets
         .iter()
@@ -140,6 +173,40 @@ fn latest_review_findings(view: &RunView) -> Vec<forged_types::Finding> {
     findings
 }
 
+/// Stable, compact evidence from the latest semantic review round for a
+/// synthesis seat. The synthesis provider receives outcomes, not transcripts.
+fn latest_review_evidence(view: &RunView) -> Vec<String> {
+    let semantic: Vec<_> = view
+        .packets
+        .iter()
+        .filter_map(|row| {
+            let packet = serde_json::from_str::<forged_types::WorkPacket>(&row.body_json).ok()?;
+            let execution = packet.execution?;
+            (execution.purpose == forged_types::SeatPurpose::Review).then_some((
+                row,
+                execution.round,
+                execution.seat_id,
+            ))
+        })
+        .collect();
+    let latest_round = semantic.iter().map(|(_, round, _)| *round).max();
+    semantic
+        .into_iter()
+        .filter(|(_, round, _)| Some(*round) == latest_round)
+        .filter_map(|(packet, _, seat)| {
+            let outcome = view
+                .terminal_attempts
+                .get(&packet.packet_id)?
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.outcome.as_ref())?;
+            serde_json::to_string(outcome)
+                .ok()
+                .map(|body| format!("seat {} outcome: {body}", seat.as_str()))
+        })
+        .collect()
+}
+
 /// The run's remote URL, for the fix prompt's `push_url`.
 async fn push_url_of(repo: &str) -> String {
     let out = tokio::process::Command::new("git")
@@ -169,6 +236,13 @@ fn action_json(action: &NextAction) -> Value {
             packet_id,
             not_before,
         } => json!({"awaitPacket": {"packetId": packet_id, "notBefore": not_before}}),
+        NextAction::EscalateProfile(escalation) => json!({
+            "escalateProfile": {
+                "from": escalation.from,
+                "to": escalation.to,
+                "trigger": escalation.trigger,
+            }
+        }),
         NextAction::Stop(terminal) => json!({"stop": terminal_json(terminal)}),
     }
 }
@@ -182,6 +256,12 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
         Terminal::ProviderUnavailable { stage, attempts } => json!({
             "providerUnavailable": {
                 "stage": crate::config::stage_str(*stage),
+                "attempts": attempts,
+            }
+        }),
+        Terminal::SemanticProviderUnavailable { stage_id, attempts } => json!({
+            "providerUnavailable": {
+                "stage": stage_id,
                 "attempts": attempts,
             }
         }),
@@ -233,6 +313,25 @@ async fn honor(
             }
             Ok(Honored::Progressed)
         }
+        NextAction::EscalateProfile(escalation) => {
+            let run_id = view.run.run_id.clone();
+            let escalation = escalation.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.append_event_once(
+                    &run_id,
+                    "forged.profile.escalated",
+                    json!({
+                        "schemaVersion": 1,
+                        "from": escalation.from,
+                        "to": escalation.to,
+                        "trigger": escalation.trigger,
+                    }),
+                )?;
+                Ok(())
+            })
+            .await?;
+            Ok(Honored::Progressed)
+        }
         NextAction::AwaitPacket {
             packet_id,
             not_before,
@@ -267,8 +366,8 @@ async fn honor_await(
         .find(|a| a.packet_id == packet_id)
         .cloned();
     if let Some(attempt) = live {
-        let (run_id, stage, seq) = crate::core::split_packet_id(packet_id)?;
-        let packet_dir = ctx.config.packet_dir(&run_id, stage, seq);
+        let (run_id, stage_key, seq) = crate::core::split_packet_key(packet_id)?;
+        let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
         let pid = std::fs::read_to_string(packet_dir.join("provider.pid"))
             .ok()
             .and_then(|t| t.trim().parse::<i32>().ok());
@@ -277,7 +376,7 @@ async fn honor_await(
                 // Claimed but never spawned — the crash window between claim
                 // and spawn. Adopt: spawn under the row's own token.
                 let exec = execution_context(ctx, view).await?;
-                let packet = stored_packet(view, packet_id)?;
+                let packet = stored_packet_for_attempt(view, packet_id)?;
                 let outcome = crate::adapters::execute::execute_adopted(
                     ctx,
                     ports,
@@ -323,7 +422,7 @@ async fn honor_await(
             }
         }
         let exec = execution_context(ctx, view).await?;
-        let packet = stored_packet(view, packet_id)?;
+        let packet = stored_packet_for_attempt(view, packet_id)?;
         let outcome = execute_packet(ctx, ports, &exec, &packet).await?;
         after_outcome(outcome);
         Ok(Honored::Progressed)
@@ -360,14 +459,59 @@ async fn sleep_until(deadline: &str) {
 }
 
 /// The stored `WorkPacket` for a packet row (`body_json` verbatim).
-fn stored_packet(view: &RunView, packet_id: &str) -> Result<forged_types::WorkPacket, Failure> {
+pub(crate) fn stored_packet_for_attempt(
+    view: &RunView,
+    packet_id: &str,
+) -> Result<forged_types::WorkPacket, Failure> {
     let row = view
         .packets
         .iter()
         .find(|p| p.packet_id == packet_id)
         .ok_or_else(|| Failure::invalid(format!("no packet {packet_id:?} in view")))?;
-    serde_json::from_str(&row.body_json)
-        .map_err(|e| Failure::internal(format!("stored packet body does not parse: {e}")))
+    let mut packet: forged_types::WorkPacket = serde_json::from_str(&row.body_json)
+        .map_err(|e| Failure::internal(format!("stored packet body does not parse: {e}")))?;
+    if let (Some(package), Some(execution)) = (&view.execution_package, &packet.execution) {
+        let candidates = package
+            .roster
+            .roles
+            .get(&execution.role_id)
+            .ok_or_else(|| {
+                Failure::invalid(format!(
+                    "active roster revision has no role {:?}",
+                    execution.role_id.as_str()
+                ))
+            })?;
+        let failures = view
+            .terminal_attempts
+            .get(packet_id)
+            .map(|history| transport_fallback_index(history))
+            .unwrap_or(0);
+        let index = failures.min(candidates.len().saturating_sub(1));
+        let candidate = candidates.get(index).ok_or_else(|| {
+            Failure::invalid(format!(
+                "active roster role {:?} has no candidates",
+                execution.role_id.as_str()
+            ))
+        })?;
+        packet.provider_hints = forged_types::ProviderHints {
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+            effort: candidate.effort.clone(),
+            sandbox: candidate.sandbox,
+        };
+    }
+    Ok(packet)
+}
+
+fn transport_fallback_index(history: &[forged_proto::TerminalAttempt]) -> usize {
+    history
+        .iter()
+        .filter(|attempt| {
+            attempt.state == forged_ledger::AttemptState::Failed
+                && forged_proto::classify_failure(attempt.fail_note.as_deref().unwrap_or(""))
+                    == forged_proto::FailureKind::Transport
+        })
+        .count()
 }
 
 /// Assemble the execution context for provider packets.
@@ -375,6 +519,7 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
     Ok(ExecutionContext {
         pr_number: pr_number_of(view),
         findings: latest_review_findings(view),
+        review_evidence: latest_review_evidence(view),
         push_url: push_url_of(&view.run.repo).await,
     })
 }
@@ -707,6 +852,45 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 pub fn intents_json(intents: &[PacketIntent]) -> Value {
     json!(intents
         .iter()
-        .map(|i| json!({"stage": crate::config::stage_str(i.stage), "seq": i.seq}))
+        .map(|intent| json!({
+            "stage": intent.execution.as_ref().map(|value| value.stage_id.as_str())
+                .unwrap_or_else(|| crate::config::stage_str(intent.stage)),
+            "seq": intent.seq,
+            "seat": intent.execution.as_ref().map(|value| value.seat_id.as_str()),
+        }))
         .collect::<Vec<_>>())
+}
+
+#[cfg(test)]
+mod adaptive_tests {
+    use forged_ledger::AttemptState;
+    use forged_proto::TerminalAttempt;
+
+    use super::transport_fallback_index;
+
+    fn failed(note: &str) -> TerminalAttempt {
+        TerminalAttempt {
+            attempt_id: 1,
+            state: AttemptState::Failed,
+            outcome: None,
+            fail_note: Some(note.to_owned()),
+        }
+    }
+
+    #[test]
+    fn only_transport_failures_advance_the_ordered_provider_fallback() {
+        assert_eq!(transport_fallback_index(&[]), 0);
+        assert_eq!(
+            transport_fallback_index(&[failed("no forged-result block")]),
+            0
+        );
+        assert_eq!(
+            transport_fallback_index(&[
+                failed("transport: provider unavailable"),
+                failed("malformed result"),
+                failed("transport: rate limit"),
+            ]),
+            2
+        );
+    }
 }

@@ -238,6 +238,7 @@ pub struct RosterRevisionRow {
     pub roster_json: String,
     pub reason: String,
     pub created_at: String,
+    pub operation_id: Option<String>,
 }
 
 /// One row of `packets`, in DDL column order.

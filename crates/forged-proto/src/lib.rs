@@ -24,8 +24,8 @@ pub mod reconcile;
 
 pub use engine::{
     advance, backoff_deadline, classify_failure, machine_idempotency_key, transport_backoff_s,
-    FailureKind, MachineStage, NextAction, PacketIntent, RunView, Terminal, TerminalAttempt,
-    MACHINE_STEPS,
+    FailureKind, MachineStage, NextAction, PacketIntent, ProfileEscalation, RunView, Terminal,
+    TerminalAttempt, MACHINE_STEPS,
 };
 pub use error::{PortError, ProtoError};
 pub use events::{parse_proto_events, record, widen_rfc3339, GatePhase, ProtoEvent};

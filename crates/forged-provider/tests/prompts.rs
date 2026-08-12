@@ -28,6 +28,7 @@ fn review_context() -> Value {
         "pr_number": 41,
         "spec_path": "specs/bead-1.md",
         "worktree": "/tmp/worktrees/run-1",
+        "field_notes": [],
         "packet_id": PACKET_ID,
         "result_schema": PromptStage::Review.result_schema(),
     })
@@ -235,6 +236,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "pr_number",
             "spec_path",
             "worktree",
+            "field_notes",
             "packet_id",
             "result_schema"
         ]

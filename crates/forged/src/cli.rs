@@ -83,6 +83,25 @@ pub enum RunCmd {
     Drive(RunScoped),
     /// Project the run's current state (read-only).
     Status(RunScoped),
+    /// Append an explicit roster revision at a durable boundary.
+    ReviseRoster(RunReviseRosterArgs),
+}
+
+/// `run revise-roster` flags.
+#[derive(Debug, Args)]
+pub struct RunReviseRosterArgs {
+    /// Run id.
+    #[arg(long)]
+    pub run: String,
+    /// Named roster from the once-read config.
+    #[arg(long)]
+    pub roster: String,
+    /// Human-readable reason recorded with the revision.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `definition` subcommands.
@@ -359,6 +378,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Advance(_) => "run_advance",
             RunCmd::Drive(_) => "run_drive",
             RunCmd::Status(_) => "run_status",
+            RunCmd::ReviseRoster(_) => "run_revise_roster",
         },
         Command::Packet { command } => match command {
             PacketCmd::Show(_) => "packet_show",
@@ -438,6 +458,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.run.clone()),
                     json!({"run": a.run}),
+                ),
+            ),
+            RunCmd::ReviseRoster(a) => (
+                "run_revise_roster",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run, "roster": a.roster, "reason": a.reason}),
                 ),
             ),
         },

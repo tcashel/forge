@@ -52,15 +52,49 @@ impl Ledger {
     /// the existing id and adds no row; any difference refuses with
     /// `InvalidRequest`. An unknown run refuses with `RunNotFound`.
     pub fn open_packet(&self, new_packet: NewPacket) -> Result<String, LedgerError> {
+        let packet_id = format!(
+            "{}/{}/{}",
+            new_packet.run_id,
+            stage_as_str(new_packet.stage),
+            new_packet.seq
+        );
+        self.open_packet_with_id(new_packet, packet_id)
+    }
+
+    /// Open a definition-backed packet under a caller-supplied semantic id.
+    /// The id must be `<run>/<safe-stage-id>/<positive-round>` and is checked
+    /// against `new_packet.run_id`; storage still carries a temporary v0 lane.
+    pub fn open_packet_with_id(
+        &self,
+        new_packet: NewPacket,
+        packet_id: String,
+    ) -> Result<String, LedgerError> {
+        let expected_prefix = format!("{}/", new_packet.run_id);
+        let suffix = packet_id.strip_prefix(&expected_prefix).ok_or_else(|| {
+            refused(
+                ErrorCode::InvalidRequest,
+                "semantic packet id does not belong to its run",
+            )
+        })?;
+        let (stage_id, round) = suffix
+            .rsplit_once('/')
+            .ok_or_else(|| refused(ErrorCode::InvalidRequest, "semantic packet id has no round"))?;
+        let valid_stage = !stage_id.is_empty()
+            && stage_id.len() <= 64
+            && stage_id.chars().all(|character| {
+                character.is_ascii_lowercase()
+                    || character.is_ascii_digit()
+                    || matches!(character, '.' | '_' | '-')
+            });
+        if !valid_stage || round.parse::<u8>().is_err() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "semantic packet id has an invalid stage or round",
+            ));
+        }
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             require_run(&tx, &new_packet.run_id)?;
-            let packet_id = format!(
-                "{}/{}/{}",
-                new_packet.run_id,
-                stage_as_str(new_packet.stage),
-                new_packet.seq
-            );
             let existing: Option<(String, String, String)> = tx
                 .query_row(
                     "SELECT spec_path, spec_sha256, body_json FROM packets \

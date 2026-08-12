@@ -187,6 +187,18 @@ pub fn param_opt_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'
 /// Split a deterministic packet id (`<run_id>/<stage>/<seq>`) into its
 /// parts.
 pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, i64), Failure> {
+    let (run_id, stage_key, seq) = split_packet_key(packet_id)?;
+    let stage = crate::config::stage_from_str(&stage_key).ok_or_else(|| {
+        Failure::invalid(format!(
+            "packet id {packet_id:?} has no legacy stage segment"
+        ))
+    })?;
+    Ok((run_id, stage, seq))
+}
+
+/// Split either a legacy or semantic packet id into run, stage key, and
+/// logical round/sequence. The stage key remains an opaque semantic string.
+pub fn split_packet_key(packet_id: &str) -> Result<(String, String, i64), Failure> {
     let mut parts = packet_id.rsplitn(3, '/');
     let seq = parts
         .next()
@@ -194,13 +206,13 @@ pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, 
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no seq segment")))?;
     let stage = parts
         .next()
-        .and_then(crate::config::stage_from_str)
+        .filter(|stage| !stage.is_empty())
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no stage segment")))?;
     let run_id = parts
         .next()
         .filter(|r| !r.is_empty())
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no run segment")))?;
-    Ok((run_id.to_owned(), stage, seq))
+    Ok((run_id.to_owned(), stage.to_owned(), seq))
 }
 
 /// The pre-run bd lease identity: the actor a FRESH frontier claim in
@@ -543,6 +555,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_advance" => drive::run_advance(ctx, &req).await,
         "run_drive" => drive::run_drive(ctx, &req).await,
         "run_status" => ops::run_status(ctx, &req).await,
+        "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,

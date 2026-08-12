@@ -21,6 +21,8 @@ pub fn sample_packet() -> WorkPacket {
         run_id: "run-1".to_owned(),
         bead_id: "bead-1".to_owned(),
         stage: Stage::Implement,
+        execution: None,
+        lane_seq: None,
         spec: SpecRef {
             path: "specs/bead-1.md".to_owned(),
             sha256: "cafe".to_owned(),

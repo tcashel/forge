@@ -136,8 +136,15 @@ CREATE TABLE roster_revisions (
 );
 ";
 
+/// Migration 003: fence explicit roster revisions by operation identity.
+const MIGRATION_003: &str = "
+ALTER TABLE roster_revisions ADD COLUMN operation_id TEXT;
+CREATE UNIQUE INDEX roster_revision_operation
+  ON roster_revisions(operation_id) WHERE operation_id IS NOT NULL;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
 pub(crate) fn configure_connection(conn: &mut Connection) -> Result<(), LedgerError> {
@@ -227,7 +234,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 2);
+        assert_eq!(pragmas.user_version, 3);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -272,7 +279,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 2);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
         ledger.close().expect("close");
     }
 
@@ -293,7 +300,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 2);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"

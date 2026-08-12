@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twelve core functions, the CLI path and the MCP tool path produce
+//! the thirteen core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twelve_tools_match_their_cli_counterparts() {
+fn all_thirteen_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -51,12 +51,13 @@ fn all_twelve_tools_match_their_cli_counterparts() {
         "packet_fail",
         "reconcile",
         "run_advance",
+        "run_revise_roster",
         "run_start",
         "run_status",
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twelve tools, exactly");
+    assert_eq!(tools, expected, "the thirteen tools, exactly");
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
@@ -90,6 +91,37 @@ fn all_twelve_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
+
+    // run_revise_roster: a nonexistent run refuses identically.
+    let cli = env
+        .forged(&[
+            "run",
+            "revise-roster",
+            "--run",
+            "absent",
+            "--roster",
+            "default",
+            "--reason",
+            "provider access changed",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "run_revise_roster",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {
+                "run": "absent",
+                "roster": "default",
+                "reason": "provider access changed"
+            }
+        }),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "run_revise_roster parity"
+    );
 
     // packet_claim: an absent packet refuses identically.
     let cli = env

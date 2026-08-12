@@ -156,6 +156,9 @@ pub struct ProfileDefinitionV1 {
     pub fix_round_budget: u8,
     #[serde(default)]
     pub escalate_on: Vec<EscalationTrigger>,
+    /// The stored profile selected when one of `escalate_on` fires.
+    #[serde(default)]
+    pub escalate_to: Option<ProfileRef>,
 }
 
 /// A capability a provider candidate declares to the dispatcher.
@@ -198,6 +201,18 @@ pub struct ResolvedRosterV1 {
     pub roles: BTreeMap<RoleId, Vec<ProviderCandidateV1>>,
 }
 
+/// Semantic identity carried by a runtime packet. Its legacy storage/result
+/// lane is intentionally outside the provider-neutral contract.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SeatExecutionV1 {
+    pub stage_id: String,
+    pub seat_id: SeatId,
+    pub role_id: RoleId,
+    pub purpose: SeatPurpose,
+    pub round: u8,
+}
+
 /// Durable runtime truth for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -209,6 +224,9 @@ pub struct ExecutionPackageV1 {
     pub profile_sha256: String,
     pub roster_sha256: String,
     pub profile: ProfileDefinitionV1,
+    /// Selected plus reachable escalation profiles, keyed by name.
+    #[serde(default)]
+    pub profile_catalog: BTreeMap<String, ProfileDefinitionV1>,
     pub roster: ResolvedRosterV1,
 }
 
@@ -251,11 +269,27 @@ impl ProfileDefinitionV1 {
                 "seat count must be between 1 and 8",
             ));
         }
-        if self.fix_round_budget > 3 {
+        if self.fix_round_budget > 1 {
             errors.push(DefinitionError::at(
                 "$.profile.fixRoundBudget",
-                "fix round budget must be between 0 and 3",
+                "fix round budget must be between 0 and 1",
             ));
+        }
+        match (&self.escalate_to, self.escalate_on.is_empty()) {
+            (Some(target), false) if valid_identifier(&target.name) && target.version == 1 => {}
+            (None, true) => {}
+            (Some(_), true) => errors.push(DefinitionError::at(
+                "$.profile.escalateTo",
+                "escalation target requires at least one trigger",
+            )),
+            (None, false) => errors.push(DefinitionError::at(
+                "$.profile.escalateTo",
+                "escalation triggers require a target",
+            )),
+            (Some(_), false) => errors.push(DefinitionError::at(
+                "$.profile.escalateTo",
+                "invalid escalation profile ref",
+            )),
         }
         let mut ids = BTreeSet::new();
         for (index, seat) in self.seats.iter().enumerate() {
@@ -425,6 +459,10 @@ mod tests {
             ],
             fix_round_budget: 1,
             escalate_on: vec![EscalationTrigger::GateFailure],
+            escalate_to: Some(ProfileRef {
+                name: "high".to_owned(),
+                version: 1,
+            }),
         }
     }
 
