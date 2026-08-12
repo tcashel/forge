@@ -103,12 +103,30 @@ pub(crate) fn bd_env(cfg: &BdConfig) -> Vec<(String, String)> {
 /// Spawn one bd child and collect its outcome under `timeout_s`. On elapse
 /// the child future is dropped (`kill_on_drop` reaps it) and
 /// [`BdError::Timeout`] is returned.
+///
+/// This is the crate's ONLY bd spawn point, so it is where the
+/// explicit-resolution rule is enforced: a `bd_path` that is not absolute is
+/// refused BEFORE spawning. `Command::new` searches `PATH` for any relative
+/// program name, and `BdConfig`'s fields are public — a caller writing
+/// `bd_path: PathBuf::from("bd")` would otherwise silently get whatever bd
+/// the machine happens to have installed, which is the one thing this crate
+/// promises never to do.
 pub(crate) async fn run_bd(
     cfg: &BdConfig,
     args: &[&str],
     timeout_s: u64,
     context: &str,
 ) -> Result<RawOutcome, BdError> {
+    if !cfg.bd_path.is_absolute() {
+        return Err(BdError::SpawnFailed {
+            context: context.to_string(),
+            detail: format!(
+                "bd_path {:?} is not absolute: bd is resolved from explicit config only, never \
+                 from PATH or any other machine state",
+                cfg.bd_path
+            ),
+        });
+    }
     let mut cmd = tokio::process::Command::new(&cfg.bd_path);
     cmd.args(args)
         .env_clear()
@@ -278,13 +296,31 @@ pub async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError> {
 /// Run a bd WRITE behind the inter-process write lock, with the module-4
 /// retry/classification policy applied around every attempt. Returns the
 /// envelope `data` on success.
+///
+/// EVERY `Timeout` gets that policy, flock acquisition included: the lock is
+/// taken before any child runs, so a timeout there would otherwise escape the
+/// policy entirely. It is retried once and then classified terminally like
+/// any other unknown failure (best-effort re-read first, so a write blocked
+/// by another holder surfaces as `LeaseHeld`).
 pub async fn write(cfg: &BdConfig, op: WriteOp, args: &[&str]) -> Result<Value, BdError> {
     let context = context_of(args);
-    let _lock = acquire_write_lock(cfg).await?;
     let mut runner = LiveRunner {
         cfg,
         args,
         context: context.clone(),
+    };
+    let _lock = match acquire_write_lock(cfg).await {
+        Ok(lock) => lock,
+        Err(BdError::Timeout {
+            context: lock_ctx, ..
+        }) => match acquire_write_lock(cfg).await {
+            Ok(lock) => lock,
+            Err(BdError::Timeout { after_s, .. }) => {
+                return Err(classify::timeout_terminal(&op, &mut runner, lock_ctx, after_s).await);
+            }
+            Err(other) => return Err(other),
+        },
+        Err(other) => return Err(other),
     };
     classify::write_policy(&op, &mut runner, false, &context).await
 }
@@ -380,6 +416,33 @@ mod tests {
         assert_eq!(get("BEADS_DIR"), Some("/tmp/store"));
         assert_eq!(get("HOME"), Some("/tmp/scratch-home"));
         assert_eq!(get("BD_JSON_ENVELOPE"), Some("1"));
+    }
+
+    #[tokio::test]
+    async fn a_relative_bd_path_is_refused_before_spawning() {
+        // The source-hygiene grep for a literal PATH-resolved bd cannot see
+        // this case: the lookup would come from the CONFIG at runtime, not
+        // from any literal in this crate's source.
+        for relative in ["bd", "./bd", "bin/bd", "../tools/bd"] {
+            let mut cfg = cfg();
+            cfg.bd_path = PathBuf::from(relative);
+            match run_bd(&cfg, &["version", "--json"], 5, "bd version").await {
+                Err(BdError::SpawnFailed { detail, .. }) => assert!(
+                    detail.contains("not absolute"),
+                    "{relative}: unexpected detail {detail}"
+                ),
+                other => panic!("{relative} must be refused, got {:?}", other.map(|_| ())),
+            }
+            // The refusal is on the spawn path, so both spines inherit it —
+            // and nothing is written to disk on the way there.
+            assert!(
+                matches!(
+                    read(&cfg, &["list", "--json"]).await,
+                    Err(BdError::SpawnFailed { .. })
+                ),
+                "read must refuse {relative} too"
+            );
+        }
     }
 
     #[test]

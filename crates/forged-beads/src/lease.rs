@@ -157,6 +157,11 @@ pub async fn claim_specific(
 /// loser gets an empty result (`data: []`, exit 0), no error, no double
 /// claim. Observed winner envelope: `data` is an array whose first element
 /// carries the claimed issue with `"assignee"` set to the actor.
+///
+/// Non-empty data that names a bead without confirming the assignee is
+/// settled by a re-read of `bd show <id> --json`, exactly as
+/// [`claim_specific`] does: only the requested holder counts as a claim, and
+/// an unconfirmable one is [`BdError::LeaseHeld`].
 pub async fn claim_ready(bd: &BdConfig, holder: &str) -> Result<Option<ClaimedBead>, BdError> {
     validate_holder(holder)?;
     let op = WriteOp::Claim {
@@ -180,12 +185,40 @@ pub async fn claim_ready(bd: &BdConfig, holder: &str) -> Result<Option<ClaimedBe
                 .to_string(),
             holder: observed,
         }),
-        ClaimCheck::Inconclusive => Err(BdError::Beads {
-            context: "bd ready --claim (claim verification)".to_string(),
-            exit: None,
-            stdout: data.to_string(),
-            stderr: "frontier claim returned data with no confirmable assignee".to_string(),
-        }),
+        // Non-empty data that names a bead but confirms no assignee: the
+        // claim contract says re-read that id and decide from bd, never from
+        // the ambiguous response. Only the requested holder counts as a
+        // claim; anything else is LeaseHeld with whatever holder was
+        // observed — an unverified claim must never surface as a generic
+        // failure the caller could mistake for a transient one.
+        ClaimCheck::Inconclusive => match envelope::first_obj(&data)
+            .and_then(|o| o.get("id"))
+            .and_then(Value::as_str)
+        {
+            Some(id) => {
+                let show = invoke::read(bd, &["show", id, "--json"]).await;
+                match show.as_ref().map(|d| verify_claim(id, holder, d)) {
+                    Ok(ClaimCheck::Claimed(cb)) => Ok(Some(cb)),
+                    Ok(ClaimCheck::HeldBy(observed)) => Err(BdError::LeaseHeld {
+                        bead: id.to_string(),
+                        holder: observed,
+                    }),
+                    _ => Err(BdError::LeaseHeld {
+                        bead: id.to_string(),
+                        holder: None,
+                    }),
+                }
+            }
+            // No id at all: there is nothing to re-read, so this is a genuine
+            // protocol failure rather than a contested lease.
+            None => Err(BdError::Beads {
+                context: "bd ready --claim (claim verification)".to_string(),
+                exit: None,
+                stdout: data.to_string(),
+                stderr: "frontier claim returned data with no bead id and no confirmable assignee"
+                    .to_string(),
+            }),
+        },
     }
 }
 

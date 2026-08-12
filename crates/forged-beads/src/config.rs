@@ -11,7 +11,11 @@ use std::path::PathBuf;
 #[derive(Debug, Clone)]
 pub struct BdConfig {
     /// Absolute path to the bd binary. `Command::new` is always given this
-    /// path, never the literal `"bd"` — no PATH lookup ever.
+    /// path, never the literal `"bd"` — no PATH lookup ever. Enforced at
+    /// runtime, not just by convention: the crate's single spawn point
+    /// (`invoke::run_bd`) refuses a non-absolute `bd_path` before spawning,
+    /// because these fields are public and a relative name would make
+    /// `Command` search `PATH`.
     pub bd_path: PathBuf,
     /// Exported as `BEADS_DIR` to every bd child.
     pub beads_dir: PathBuf,

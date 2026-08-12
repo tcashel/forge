@@ -118,47 +118,87 @@ pub fn raw_bd(bd: &Path, s: &Scratch, args: &[&str]) -> Command {
     c
 }
 
-/// Initialize the scratch store. The sandboxed bd 1.2.1 build does not
-/// auto-init on first create ("no beads database found"), so tests init
-/// explicitly.
+/// Bring the scratch store into existence.
+///
+/// The spec's protocol is tried FIRST and unmodified: a fresh store is
+/// initialized by its first `bd create`, and `bd init` is forbidden because
+/// the P0 probe recorded it refusing temp paths as an "unsafe location". The
+/// pinned sandboxed bd 1.2.1 contradicts both halves — `bd create` on an
+/// empty `$BEADS_DIR` exits 1 with "no beads database found", and `bd init`
+/// accepts a temp path — so the fallback fires ONLY on that exact refusal and
+/// says so on stderr. That mismatch is a reported environment fact, not a
+/// silent protocol change: the day a bd auto-initializes again, the fallback
+/// stops running on its own.
 ///
 /// CRITICAL, dogfood-proven: bd's workspace discovery lets a CWD-ancestor
 /// `.beads` preempt an UNINITIALIZED `$BEADS_DIR` — and the operator's
 /// machine-global `~/.beads` is an initialized ancestor of everything under
-/// this repo's `CARGO_TARGET_TMPDIR`. Running `bd init` with cwd inside the
-/// worktree once initialized-and-wrote-into the REAL `~/.beads` despite the
-/// scratch `HOME` and `BEADS_DIR`. So: init runs from an ancestor-clean cwd
-/// under the system temp dir, and the store is verified to have actually
-/// landed in the scratch `BEADS_DIR` before any test writes a bead. Once a
-/// store is INITIALIZED, `$BEADS_DIR` wins over ancestor discovery
-/// (probe-verified), so every later bd child may safely use the scratch
-/// store as its cwd.
+/// this repo's `CARGO_TARGET_TMPDIR`. Running an uninitialized-store command
+/// with cwd inside the worktree once wrote into the REAL `~/.beads` despite
+/// the scratch `HOME` and `BEADS_DIR`. So: every pre-store call runs from an
+/// ancestor-clean cwd under the system temp dir, and the store is verified to
+/// have actually landed in the scratch `BEADS_DIR` before any test writes a
+/// bead. Once a store is INITIALIZED, `$BEADS_DIR` wins over ancestor
+/// discovery (probe-verified), so every later bd child may safely use the
+/// scratch store as its cwd.
 pub fn init_store(bd: &Path, s: &Scratch) {
     let unique = s
         .root
         .file_name()
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_else(|| "scratch".to_string());
-    let init_cwd = std::env::temp_dir().join(format!("forged-beads-init-{unique}"));
-    let _ = std::fs::remove_dir_all(&init_cwd);
-    std::fs::create_dir_all(&init_cwd).expect("creating ancestor-clean init cwd");
-    let out = raw_bd(bd, s, &["init"])
-        .current_dir(&init_cwd)
+    let clean_cwd = std::env::temp_dir().join(format!("forged-beads-init-{unique}"));
+    let _ = std::fs::remove_dir_all(&clean_cwd);
+    std::fs::create_dir_all(&clean_cwd).expect("creating ancestor-clean cwd");
+    let first = raw_bd(bd, s, &["create", "store bootstrap", "--json"])
+        .current_dir(&clean_cwd)
+        .output()
+        .expect("spawning bd create");
+    if !first.status.success() {
+        let refusal = format!(
+            "{}{}",
+            String::from_utf8_lossy(&first.stdout),
+            String::from_utf8_lossy(&first.stderr)
+        );
+        assert!(
+            refusal.contains("no beads database found"),
+            "bd create on a fresh store failed for an unexpected reason: {refusal}"
+        );
+        eprintln!(
+            "NOTE bd/spec mismatch: this bd does NOT auto-initialize on first create \
+             (\"no beads database found\"); initializing the scratch store explicitly"
+        );
+        let init = raw_bd(
+            bd,
+            s,
+            // Inert init: a bare one writes CLAUDE.md, AGENTS.md, .claude/
+            // and .agents/ into its cwd.
+            &[
+                "init",
+                "--non-interactive",
+                "--quiet",
+                "--skip-agents",
+                "--skip-hooks",
+            ],
+        )
+        .current_dir(&clean_cwd)
         .output()
         .expect("spawning bd init");
-    let _ = std::fs::remove_dir_all(&init_cwd);
-    assert!(
-        out.status.success(),
-        "bd init failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        s.beads.join("config.yaml").exists(),
-        "bd init did not land in the scratch store {} — ancestor workspace discovery \
-         must never win over the test's BEADS_DIR",
-        s.beads.display()
-    );
-    // Belt and braces: bd must resolve the initialized scratch store.
+        assert!(
+            init.status.success(),
+            "initializing the scratch store failed: {}",
+            String::from_utf8_lossy(&init.stderr)
+        );
+        assert!(
+            s.beads.join("config.yaml").exists(),
+            "the scratch store did not land in {} — ancestor workspace discovery \
+             must never win over the test's BEADS_DIR",
+            s.beads.display()
+        );
+    }
+    let _ = std::fs::remove_dir_all(&clean_cwd);
+    // Belt and braces, and the containment check that covers BOTH paths: bd
+    // must resolve the scratch store, never an ancestor's.
     let where_out = raw_bd(bd, s, &["where"])
         .output()
         .expect("spawning bd where");

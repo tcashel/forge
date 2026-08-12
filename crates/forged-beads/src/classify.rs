@@ -302,10 +302,12 @@ pub(crate) async fn write_policy(
                 after_s,
             }) => {
                 if generic_retried {
-                    return Err(BdError::Timeout {
-                        context: c,
-                        after_s,
-                    });
+                    // A Timeout is treated exactly like any other unknown
+                    // failure, terminal step included: the best-effort
+                    // re-read runs before it is surfaced, so a write that
+                    // timed out because someone else holds the bead reports
+                    // LeaseHeld rather than a bare stopwatch reading.
+                    return Err(timeout_terminal(op, runner, c, after_s).await);
                 }
                 generic_retried = true;
                 continue;
@@ -350,16 +352,8 @@ pub(crate) async fn write_policy(
                 // Terminal: re-read state when a bead id is in play. Strictly
                 // best-effort and non-recursive; on any re-read problem, fall
                 // through to Beads with the ORIGINAL stderr.
-                if let Some(bead) = op.bead() {
-                    if let Some(observed) = runner.reread_assignee(bead).await {
-                        let differs = op.actor().is_none_or(|a| a != observed);
-                        if !observed.is_empty() && differs {
-                            return Err(BdError::LeaseHeld {
-                                bead: bead.to_string(),
-                                holder: Some(observed),
-                            });
-                        }
-                    }
+                if let Some(held) = lease_held_from_reread(op, runner).await {
+                    return Err(held);
                 }
                 return Err(BdError::Beads {
                     context: context.to_string(),
@@ -369,6 +363,44 @@ pub(crate) async fn write_policy(
                 });
             }
         }
+    }
+}
+
+/// The generic path's terminal state re-read: when a bead id is in play, ask
+/// bd who holds it. A live DIFFERENT assignee is [`BdError::LeaseHeld`];
+/// anything else — no bead, a failed or unparseable re-read, an empty field,
+/// or our own actor — is `None`, and the caller keeps its original error.
+/// Strictly best-effort and non-recursive: the re-read's own failure is never
+/// surfaced or re-classified.
+pub(crate) async fn lease_held_from_reread(
+    op: &WriteOp,
+    runner: &mut dyn AttemptRunner,
+) -> Option<BdError> {
+    let bead = op.bead()?;
+    let observed = runner.reread_assignee(bead).await?;
+    let differs = op.actor().is_none_or(|a| a != observed);
+    if !observed.is_empty() && differs {
+        return Some(BdError::LeaseHeld {
+            bead: bead.to_string(),
+            holder: Some(observed),
+        });
+    }
+    None
+}
+
+/// Terminal classification for a [`BdError::Timeout`] that survived its one
+/// retry — including a timeout acquiring the write flock, which never reaches
+/// [`write_policy`]. The generic path's best-effort re-read runs first; when
+/// it settles nothing, the `Timeout` stands.
+pub(crate) async fn timeout_terminal(
+    op: &WriteOp,
+    runner: &mut dyn AttemptRunner,
+    context: String,
+    after_s: u64,
+) -> BdError {
+    match lease_held_from_reread(op, runner).await {
+        Some(held) => held,
+        None => BdError::Timeout { context, after_s },
     }
 }
 
@@ -645,12 +677,62 @@ mod tests {
             "got {err:?}"
         );
         assert_eq!(runner.runs, 2);
+        assert_eq!(
+            runner.rereads, 1,
+            "a terminal timeout gets the same best-effort re-read as any other unknown failure"
+        );
 
         let mut runner = Canned::new(vec![t(), success()]);
         write_policy(&other_op(), &mut runner, false, "bd update")
             .await
             .expect("timeout then success");
         assert_eq!(runner.runs, 2);
+    }
+
+    #[tokio::test]
+    async fn a_terminal_timeout_whose_reread_shows_another_holder_is_lease_held() {
+        let t = || {
+            Err(BdError::Timeout {
+                context: "bd update".to_string(),
+                after_s: 60,
+            })
+        };
+        let mut runner = Canned::new(vec![t(), t()]);
+        runner.reread = Some("someone-else".to_string());
+        let err = write_policy(&other_op(), &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        match err {
+            BdError::LeaseHeld { bead, holder } => {
+                assert_eq!(bead, "beads-1al");
+                assert_eq!(holder.as_deref(), Some("someone-else"));
+            }
+            other => panic!("expected LeaseHeld, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_terminal_keeps_the_timeout_when_the_reread_settles_nothing() {
+        // The flock-acquisition path: no attempt ever ran, so this helper is
+        // the whole terminal classification.
+        let mut runner = Canned::new(vec![]);
+        let err =
+            timeout_terminal(&other_op(), &mut runner, "beads write lock".to_string(), 60).await;
+        match err {
+            BdError::Timeout { context, after_s } => {
+                assert_eq!(context, "beads write lock");
+                assert_eq!(after_s, 60);
+            }
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+        assert_eq!(runner.rereads, 1);
+        assert_eq!(runner.runs, 0, "the lock timeout runs no bd attempt");
+
+        let mut runner = Canned::new(vec![]);
+        runner.reread = Some("someone-else".to_string());
+        let err =
+            timeout_terminal(&other_op(), &mut runner, "beads write lock".to_string(), 60).await;
+        assert!(matches!(err, BdError::LeaseHeld { .. }), "got {err:?}");
     }
 
     #[tokio::test]
