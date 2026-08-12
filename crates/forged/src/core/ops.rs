@@ -310,6 +310,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         })
         .await?;
         let action = forged_proto::advance(&view);
+        let controller = super::handoff::controller_status(ctx, run_id).await?;
         let definition = match definition {
             Some(row) => json!({
                 "protocolRef": serde_json::from_str::<Value>(&row.protocol_ref_json)
@@ -435,6 +436,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     forged_proto::NextAction::Stop(t) =>
                         json!({"stop": super::drive::terminal_json(t)}),
                 },
+                "controller": controller,
             }
         }))
     })

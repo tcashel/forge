@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Twenty-five tools, each taking the
+//! `forged mcp` — the rmcp stdio server. Twenty-seven tools, each taking the
 //! same operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -146,6 +146,15 @@ impl ForgedServer {
         self.call("run_advance", args.0).await
     }
 
+    /// Hand a run to a detached durable controller.
+    #[tool(
+        name = "run_submit",
+        description = "Submit a run for detached driving."
+    )]
+    pub async fn run_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_submit", args.0).await
+    }
+
     /// Read-only run projection.
     #[tool(name = "run_status", description = "Project a run's current state.")]
     pub async fn run_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -180,6 +189,15 @@ impl ForgedServer {
     )]
     pub async fn epic_drive(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_drive", args.0).await
+    }
+
+    /// Hand an epic to a detached durable controller.
+    #[tool(
+        name = "epic_submit",
+        description = "Submit an epic for detached driving."
+    )]
+    pub async fn epic_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_submit", args.0).await
     }
 
     /// Project epic waves, child runs, blockers, and PR state.

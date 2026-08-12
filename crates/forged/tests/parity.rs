@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twenty-five public core functions, the CLI path and the MCP tool path produce
+//! the twenty-seven public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twenty_five_tools_match_their_cli_counterparts() {
+fn all_twenty_seven_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -54,6 +54,7 @@ fn all_twenty_five_tools_match_their_cli_counterparts() {
         "epic_resume",
         "epic_start",
         "epic_status",
+        "epic_submit",
         "packet_claim",
         "packet_complete",
         "packet_fail",
@@ -62,6 +63,7 @@ fn all_twenty_five_tools_match_their_cli_counterparts() {
         "run_revise_roster",
         "run_start",
         "run_status",
+        "run_submit",
         "session_list",
         "session_message",
         "session_read",
@@ -69,7 +71,7 @@ fn all_twenty_five_tools_match_their_cli_counterparts() {
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-five tools, exactly");
+    assert_eq!(tools, expected, "the twenty-seven tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -108,13 +110,20 @@ fn all_twenty_five_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "run_start parity");
 
-    // run_advance / run_status: a nonexistent run refuses identically.
+    // run_advance / run_submit / run_status: a nonexistent run refuses identically.
     let cli = env.forged(&["run", "advance", "--run", "absent"]).1;
     let tool = mcp.call_tool(
         "run_advance",
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_advance parity");
+
+    let cli = env.forged(&["run", "submit", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "run_submit",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "run_submit parity");
 
     let cli = env.forged(&["run", "status", "--run", "absent"]).1;
     let tool = mcp.call_tool(
@@ -196,6 +205,7 @@ fn all_twenty_five_tools_match_their_cli_counterparts() {
     for (subcommand, tool_name) in [
         ("advance", "epic_advance"),
         ("drive", "epic_drive"),
+        ("submit", "epic_submit"),
         ("status", "epic_status"),
     ] {
         let cli = env.forged(&["epic", subcommand, "--epic", "absent-epic"]).1;

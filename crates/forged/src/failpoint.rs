@@ -17,6 +17,9 @@
 //! `epic.child.merge.after` is the scheduler's applied-but-response-lost
 //! boundary: GitHub accepted the integration merge, but the operation and
 //! epic journal have not yet been completed.
+//! `controller.record.after` is the handoff equivalent: the detached
+//! controller identity is on disk, but its event and operation response are
+//! not yet durable in the ledger.
 
 /// Hit a failpoint site. A no-op unless the `failpoints` feature is on AND
 /// `FORGED_FAILPOINT` names this exact site.

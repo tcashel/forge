@@ -95,6 +95,8 @@ pub enum RunCmd {
     Advance(RunScoped),
     /// Loop advance until the run stops.
     Drive(RunScoped),
+    /// Hand the run to a detached durable controller.
+    Submit(RunScoped),
     /// Project the run's current state (read-only).
     Status(RunScoped),
     /// Append an explicit roster revision at a durable boundary.
@@ -110,6 +112,8 @@ pub enum EpicCmd {
     Advance(EpicScoped),
     /// Drive until the final draft PR or explicit input is required.
     Drive(EpicScoped),
+    /// Hand the epic to a detached durable controller.
+    Submit(EpicScoped),
     /// Project waves, children, blockers, and the final PR (read-only).
     Status(EpicScoped),
     /// Pause scheduling after the current durable boundary.
@@ -560,6 +564,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Start(_) => "run_start",
             RunCmd::Advance(_) => "run_advance",
             RunCmd::Drive(_) => "run_drive",
+            RunCmd::Submit(_) => "run_submit",
             RunCmd::Status(_) => "run_status",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
         },
@@ -567,6 +572,7 @@ pub fn command_name(command: &Command) -> &'static str {
             EpicCmd::Start(_) => "epic_start",
             EpicCmd::Advance(_) => "epic_advance",
             EpicCmd::Drive(_) => "epic_drive",
+            EpicCmd::Submit(_) => "epic_submit",
             EpicCmd::Status(_) => "epic_status",
             EpicCmd::Pause(_) => "epic_pause",
             EpicCmd::Resume(_) => "epic_resume",
@@ -651,6 +657,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({"run": a.run}),
                 ),
             ),
+            RunCmd::Submit(a) => (
+                "run_submit",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
+                ),
+            ),
             RunCmd::Status(a) => (
                 "run_status",
                 request(
@@ -694,6 +708,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
             EpicCmd::Drive(a) => (
                 "epic_drive",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Submit(a) => (
+                "epic_submit",
                 request(
                     a.idempotency_key,
                     Some(a.epic.clone()),

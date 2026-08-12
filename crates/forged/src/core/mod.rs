@@ -7,6 +7,7 @@
 mod claimnext;
 mod drive;
 mod epic;
+mod handoff;
 mod observe;
 mod ops;
 pub(crate) mod sessions;
@@ -564,11 +565,13 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_start" => ops::run_start(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,
         "run_drive" => drive::run_drive(ctx, &req).await,
+        "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,
         "epic_advance" => epic::epic_advance(ctx, &req).await,
         "epic_drive" => epic::epic_drive(ctx, &req).await,
+        "epic_submit" => handoff::epic_submit(ctx, &mut req).await,
         "epic_status" => epic::epic_status(ctx, &req).await,
         "epic_pause" => epic::epic_pause(ctx, &mut req).await,
         "epic_resume" => epic::epic_resume(ctx, &mut req).await,

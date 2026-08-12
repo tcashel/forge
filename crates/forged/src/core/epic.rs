@@ -170,6 +170,10 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
     Ok(view)
 }
 
+pub(super) async fn epic_repo(ctx: &Ctx, epic: &str) -> Result<String, Failure> {
+    Ok(project(ctx, epic).await?.config.repo)
+}
+
 async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), Failure> {
     let epic = epic.to_owned();
     let kind = kind.to_owned();
@@ -470,6 +474,7 @@ fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str
 }
 
 async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
+    let controller = super::handoff::controller_status(ctx, &view.config.epic_id).await?;
     let live = forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await?;
     let statuses: BTreeMap<_, _> = live
         .into_iter()
@@ -507,6 +512,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "inputRequired": view.input,
         "paused": view.paused,
         "finalPr": view.pr,
+        "controller": controller,
     }))
 }
 

@@ -534,6 +534,76 @@ fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
     assert_eq!(projected["result"]["finalPr"]["number"], json!(8));
 }
 
+// -------------------------------------------------- detached handoff recovery
+
+#[test]
+fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
+    let env = TestEnv::new("km-controller-handoff");
+    start_run(&env, "bead-khandoff");
+    env.set_scenario("implement", "slow", 1);
+    let fp = env.root.join("fp-controller-handoff");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let mut submitter = env
+        .forged_cmd(&["run", "submit", "--run", "bead-khandoff"])
+        .env("FORGED_FAILPOINT", "controller.record.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("submitter spawns");
+    let status = submitter.wait().expect("submitter crashes");
+    assert!(
+        !status.success(),
+        "submitter aborts after recording identity"
+    );
+    assert!(
+        env.anvil
+            .join("runs/bead-khandoff/controller/controller.json")
+            .exists(),
+        "the detached identity reached disk before the crash"
+    );
+
+    // A new lead session recovers the exact same controller and settles the
+    // interrupted submit operation. It never starts a second controller.
+    let (code, recovered) = env.forged(&["run", "submit", "--run", "bead-khandoff"]);
+    assert_eq!(code, 0, "recover submit: {recovered}");
+    assert_eq!(recovered["result"]["submitted"], json!(true));
+    assert_eq!(recovered["result"]["alreadyRunning"], json!(false));
+    {
+        let ledger = env.ledger();
+        let operation = ledger
+            .find_operation("run_submit", "op:run_submit:bead-khandoff:-:1")
+            .expect("submit operation probe")
+            .expect("submit operation survives");
+        assert_eq!(operation.state, forged_ledger::OperationState::Terminal);
+        let controller_events = ledger
+            .list_events(Some("bead-khandoff"), 0, 65_536)
+            .expect("controller events")
+            .into_iter()
+            .filter(|row| row.kind == "forged.controller.started")
+            .count();
+        assert_eq!(controller_events, 1, "one durable controller identity");
+        ledger.close().expect("close");
+    }
+
+    wait_until("detached run completion", || {
+        let (code, projected) = env.forged(&["run", "status", "--run", "bead-khandoff"]);
+        code == 0
+            && projected["result"]["run"]["nextAction"]["stop"]["done"].is_object()
+            && projected["result"]["run"]["controller"]["state"] == json!("exited")
+    });
+    let implementation_starts = env
+        .provider_log()
+        .iter()
+        .filter(|line| {
+            line.starts_with("bead-khandoff/implementation/0") && line.contains(" start ")
+        })
+        .count();
+    assert_eq!(implementation_starts, 1, "no duplicate packet execution");
+    assert_no_overlap(&env.provider_log(), "bead-khandoff/implementation/0");
+}
+
 // ------------------------------------------------------------- schedule 5
 
 #[test]
