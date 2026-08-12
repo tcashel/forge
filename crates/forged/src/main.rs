@@ -16,9 +16,10 @@ mod mcp;
 use std::sync::Arc;
 
 use clap::Parser;
+use forged_types::ErrorCode;
 
 use crate::config::ForgedConfig;
-use crate::core::Ctx;
+use crate::core::{Ctx, Failure};
 
 fn main() {
     let args = cli::Cli::parse();
@@ -38,19 +39,44 @@ fn main() {
     std::process::exit(code);
 }
 
+/// A failure BEFORE dispatch still owes stdout an `OperationResponse`: an
+/// empty stdout with exit 1 is indistinguishable, to envelope-consuming
+/// automation, from a crash. `forged mcp` is the one surface that prints no
+/// envelope, so its pre-dispatch failures stay on stderr.
+fn pre_dispatch_failure(name: &str, code: ErrorCode, message: String) -> i32 {
+    if name == "mcp" {
+        eprintln!("forged: {message}");
+        return 1;
+    }
+    let failure = Failure {
+        code,
+        message,
+        recoverable: false,
+    };
+    let response = core::err_response(&core::derive_key(name, None, None, None), &failure);
+    match serde_json::to_string(&response) {
+        Ok(text) => println!("{text}"),
+        Err(e) => eprintln!("forged: cannot serialize failure envelope: {e}"),
+    }
+    1
+}
+
 async fn run(args: cli::Cli) -> i32 {
+    let name = cli::command_name(&args.command);
     let config = match ForgedConfig::load() {
         Ok(config) => config,
-        Err(message) => {
-            eprintln!("forged: {message}");
-            return 1;
-        }
+        // A malformed or unreadable config file is a bad request, not an
+        // internal fault: the operator can fix the file.
+        Err(message) => return pre_dispatch_failure(name, ErrorCode::InvalidRequest, message),
     };
     let ledger = match forged_ledger::Ledger::open(&config.db_path) {
         Ok(ledger) => ledger,
         Err(e) => {
-            eprintln!("forged: cannot open ledger: {e}");
-            return 1;
+            return pre_dispatch_failure(
+                name,
+                ErrorCode::Internal,
+                format!("cannot open ledger: {e}"),
+            )
         }
     };
     let ctx = Arc::new(Ctx { config, ledger });
@@ -71,9 +97,9 @@ async fn run(args: cli::Cli) -> i32 {
     let (name, request) = match cli::to_request(args.command) {
         Ok(pair) => pair,
         Err(message) => {
-            eprintln!("forged: {message}");
+            let code = pre_dispatch_failure(name, ErrorCode::InvalidRequest, message);
             close(&ctx);
-            return 1;
+            return code;
         }
     };
     let response = core::dispatch(&ctx, name, request).await;

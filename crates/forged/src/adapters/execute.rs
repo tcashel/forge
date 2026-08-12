@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
 use crate::adapters::ports::ForgedPorts;
 use crate::config::{now_iso, stage_str};
-use crate::core::{on_ledger, run_holder, Ctx, Failure};
+use crate::core::{on_ledger, run_holder, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
 /// Everything packet execution needs beyond the packet itself.
@@ -283,16 +283,17 @@ pub async fn execute_packet(
     packet: &WorkPacket,
 ) -> Result<PacketOutcome, Failure> {
     let packet_id = packet.packet_id.clone();
-    let holder = run_holder(&packet.run_id);
 
-    // Claim: the ledger re-checks the stored spec hash against the current
-    // file bytes — the caller re-hashes, the ledger does no file IO.
+    // Claim under the PER-ATTEMPT session identity (the bd lease stays the
+    // run's, held by the driver): the ledger re-checks the stored spec hash
+    // against the current file bytes — the caller re-hashes, the ledger does
+    // no file IO.
     let current_sha = sha256_file(Path::new(&packet.spec.path))?;
     let claimed = {
         let packet_id = packet_id.clone();
-        let holder = holder.clone();
+        let claimant = session_claimant(&packet_id);
         on_ledger(&ctx.ledger, move |l| {
-            l.claim_packet(&packet_id, &holder, &current_sha)
+            l.claim_packet(&packet_id, &claimant, &current_sha)
         })
         .await?
     };
@@ -358,6 +359,7 @@ async fn run_attempt(
     // attempt's shell may write the file back.
     let pid_path = packet_dir.join("provider.pid");
     let _ = std::fs::remove_file(&pid_path);
+    let _ = std::fs::remove_file(packet_dir.join(crate::adapters::ports::PROVIDER_LSTART));
     let shell_line = format!(
         "echo $$ > {}; {}",
         pid_path.to_string_lossy(),
@@ -392,18 +394,34 @@ async fn run_attempt(
 
     // 4. The one pid: the spawned shell, which under setsid is also the
     // process-group id. Guardian heartbeats stop the moment it dies.
-    let watch_pid = await_pid(&packet_dir).await;
-    let mut guardian = None;
-    if let Some(pid) = watch_pid {
-        failpoint::hit("guardian.start");
-        let gcfg = forged_beads::GuardianConfig::new(
-            ctx.config.bd_config(),
-            packet.bead_id.clone(),
-            holder.clone(),
-            pid,
+    //
+    // No pid inside the window is a FAILED SPAWN, not a reason to continue:
+    // an unguarded provider renews no bd lease, so another worker would
+    // reclaim its apparently-expired work while it is still writing to the
+    // worktree. Stop the session, record a transport failure, and let the
+    // transport-retry budget decide whether to try again.
+    let Some(pid) = await_pid(&packet_dir).await else {
+        let _ = host.kill_confirmed(&session).await;
+        let note = "transport: provider pid file never appeared".to_owned();
+        return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+    };
+    // The start-time stamp beside the pid is the pid-reuse guard for every
+    // process that did not spawn this attempt (see `adapters::ports`).
+    if let Some(lstart) = crate::adapters::ports::lstart_of(i32::try_from(pid).unwrap_or(-1)).await
+    {
+        let _ = std::fs::write(
+            packet_dir.join(crate::adapters::ports::PROVIDER_LSTART),
+            lstart,
         );
-        guardian = Some(tokio::spawn(forged_beads::run_guardian(gcfg)));
     }
+    failpoint::hit("guardian.start");
+    let gcfg = forged_beads::GuardianConfig::new(
+        ctx.config.bd_config(),
+        packet.bead_id.clone(),
+        holder.clone(),
+        pid,
+    );
+    let mut guardian = Some(tokio::spawn(forged_beads::run_guardian(gcfg)));
 
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.

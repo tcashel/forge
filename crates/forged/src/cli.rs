@@ -311,6 +311,44 @@ fn request(key: Option<String>, run_id: Option<String>, params: Value) -> Operat
     }
 }
 
+/// The core name a parsed command routes to, WITHOUT consuming it — what a
+/// failure before request mapping (an unloadable config, an unopenable
+/// ledger, an unreadable `--result` file) needs in order to name the
+/// envelope it still owes stdout.
+pub fn command_name(command: &Command) -> &'static str {
+    match command {
+        Command::Doctor(_) => "doctor",
+        Command::Init(_) => "init",
+        Command::Run { command } => match command {
+            RunCmd::Start(_) => "run_start",
+            RunCmd::Advance(_) => "run_advance",
+            RunCmd::Drive(_) => "run_drive",
+            RunCmd::Status(_) => "run_status",
+        },
+        Command::Packet { command } => match command {
+            PacketCmd::Show(_) => "packet_show",
+            PacketCmd::Claim(_) => "packet_claim",
+            PacketCmd::Complete(_) => "packet_complete",
+            PacketCmd::Fail(_) => "packet_fail",
+            PacketCmd::Heartbeat(_) => "packet_heartbeat",
+        },
+        Command::ClaimNext(_) => "claim_next",
+        Command::Gate { command } => match command {
+            GateCmd::Run(_) => "gate_run",
+        },
+        Command::Reconcile(_) => "reconcile",
+        Command::Usage(a) => match a.command {
+            Some(UsageCmd::Ingest { .. }) => "usage_ingest",
+            None => "usage_report",
+        },
+        Command::Events(_) => "events_tail",
+        Command::Worktree { command } => match command {
+            WorktreeCmd::Retire(_) => "worktree_retire",
+        },
+        Command::Mcp => "mcp",
+    }
+}
+
 /// Map a parsed command onto its core name and request. The only error is
 /// an unreadable `--result` file.
 pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), String> {

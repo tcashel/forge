@@ -106,8 +106,21 @@ pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -
         .get("result")
         .and_then(Value::as_str)
         .unwrap_or_default();
-    if result.get("is_error").and_then(Value::as_bool) == Some(true) && is_transport_message(text) {
-        return Harvest::Transport(format!("transport: claude error result: {text}"));
+    if result.get("is_error").and_then(Value::as_bool) == Some(true) {
+        // The marker source for an `is_error` result is `error.message`;
+        // some shapes carry the same sentence in the top-level `result`
+        // text instead, so both are consulted against the closed list —
+        // mirroring the codex rule. Whichever one matched is the note.
+        let error_message = result
+            .get("error")
+            .and_then(|e| e.get("message"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        for candidate in [error_message, text] {
+            if is_transport_message(candidate) {
+                return Harvest::Transport(format!("transport: claude error result: {candidate}"));
+            }
+        }
     }
     finish(text, expected_schema, packet_id)
 }
@@ -283,6 +296,27 @@ mod tests {
             Harvest::Transport(_)
         ));
         let refusal = "{\"type\":\"result\",\"is_error\":true,\"result\":\"policy refusal\"}";
+        assert!(matches!(
+            harvest_claude(refusal, SCHEMA, PKT),
+            Harvest::Semantic(note) if note == "no forged-result block"
+        ));
+    }
+
+    #[test]
+    fn claude_error_message_is_a_marker_source_like_codex() {
+        // The specified marker source for an is_error result is
+        // `error.message`; a timeout carried only there must not become a
+        // semantic missing-block failure that consumes the semantic round.
+        let line = "{\"type\":\"result\",\"is_error\":true,\"result\":\"see error\",\
+                    \"error\":{\"message\":\"Request timeout after 600s\"}}";
+        assert!(matches!(
+            harvest_claude(line, SCHEMA, PKT),
+            Harvest::Transport(note) if note == "transport: claude error result: Request timeout after 600s"
+        ));
+        // The closed list still decides: a refusal in error.message is
+        // semantic.
+        let refusal = "{\"type\":\"result\",\"is_error\":true,\"result\":\"\",\
+                       \"error\":{\"message\":\"policy refusal\"}}";
         assert!(matches!(
             harvest_claude(refusal, SCHEMA, PKT),
             Harvest::Semantic(note) if note == "no forged-result block"

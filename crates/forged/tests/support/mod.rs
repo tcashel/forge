@@ -349,7 +349,7 @@ case "$1" in
       */comments*) key=list_comments ;;
       *) key=repo ;;
     esac ;;
-  auth) exit 0 ;;
+  auth) key=auth ;;
 esac
 code=0
 if [ -f "$GH_SHIM_DIR/$key.exit" ]; then code=$(cat "$GH_SHIM_DIR/$key.exit"); fi
@@ -848,6 +848,17 @@ impl TestEnv {
             .join(stage)
             .join(seq.to_string())
     }
+}
+
+/// Whether `pid` names a live process, via `/bin/kill -0` — a probe, no
+/// signal delivered.
+pub fn pid_alive(pid: i32) -> bool {
+    Command::new("/bin/kill")
+        .args(["-0", &pid.to_string()])
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false)
 }
 
 /// Assert that a provider log shows no interleaved start/end pairs for one

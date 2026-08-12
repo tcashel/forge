@@ -218,6 +218,45 @@ fn read_only_commands_default_their_key_and_never_touch_the_store() {
 }
 
 #[test]
+fn doctor_probes_gh_presence_and_authentication() {
+    // Presence alone is not the question: every PR step goes through an
+    // authenticated gh, so the probe runs `gh auth status` and reads its
+    // exit code.
+    let env = TestEnv::new("forged-doctor-gh");
+    let (code, resp) = env.forged(&["doctor"]);
+    assert_eq!(code, 0, "doctor: {resp}");
+    let probe = resp["result"]["probes"]
+        .as_array()
+        .expect("probes array")
+        .iter()
+        .find(|p| p["name"] == json!("gh-authenticated"))
+        .expect("doctor carries the gh probe")
+        .clone();
+    assert_eq!(
+        probe["ok"],
+        json!(true),
+        "the shim gh authenticates: {probe}"
+    );
+
+    // A gh that refuses `auth status` fails the probe rather than passing on
+    // mere presence.
+    env.gh_set("auth", "exit", "1");
+    let (code, resp) = env.forged(&["doctor"]);
+    assert_eq!(
+        code, 0,
+        "an unauthenticated gh is a failed probe, not an error"
+    );
+    let probe = resp["result"]["probes"]
+        .as_array()
+        .expect("probes array")
+        .iter()
+        .find(|p| p["name"] == json!("gh-authenticated"))
+        .expect("gh probe")
+        .clone();
+    assert_eq!(probe["ok"], json!(false), "{probe}");
+}
+
+#[test]
 fn errors_are_envelopes_on_stdout_with_exit_one() {
     let env = TestEnv::new("forged-error-envelopes");
     let (code, resp) = env.forged(&["run", "status", "--run", "nope"]);
@@ -232,6 +271,55 @@ fn errors_are_envelopes_on_stdout_with_exit_one() {
     let (code, resp) = env.forged(&["reconcile", "--run", "nope"]);
     assert_eq!(code, 1);
     assert_eq!(resp["ok"], json!(false));
+}
+
+#[test]
+fn pre_dispatch_failures_are_envelopes_too_never_a_bare_exit() {
+    // A failure BEFORE dispatch still owes stdout an envelope: empty stdout
+    // with exit 1 is indistinguishable, to envelope-consuming automation,
+    // from a crash. `env.forged` panics unless stdout parses as exactly one
+    // JSON envelope, so reaching these assertions is itself the shape check.
+
+    // 1. An unreadable --result file: the request never maps.
+    let env = TestEnv::new("forged-pre-dispatch");
+    let (code, resp) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        "r/implement/1",
+        "--attempt",
+        "1",
+        "--claim-token",
+        "t",
+        "--result",
+        "/definitely/not/here.json",
+    ]);
+    assert_eq!(code, 1);
+    assert_eq!(resp["ok"], json!(false));
+    assert_eq!(resp["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        resp["error"]["message"]
+            .as_str()
+            .is_some_and(|m| m.contains("--result")),
+        "the message names the unreadable file: {resp}"
+    );
+
+    // 2. A malformed config file, which fails every command alike.
+    let bad = TestEnv::new("forged-pre-dispatch-config");
+    std::fs::write(bad.anvil.join("config.json"), "{not json").expect("write bad config");
+    let (code, resp) = bad.forged(&["doctor"]);
+    assert_eq!(code, 1);
+    assert_eq!(resp["ok"], json!(false));
+    assert_eq!(resp["error"]["code"], json!("INVALID_REQUEST"));
+    assert_eq!(resp["operationId"], json!("op:doctor:-:-:-"));
+
+    // 3. An unopenable ledger is INTERNAL, not a bad request.
+    let broken = TestEnv::new("forged-pre-dispatch-ledger");
+    std::fs::create_dir_all(broken.anvil.join("state.db")).expect("occupy the db path");
+    let (code, resp) = broken.forged(&["run", "status", "--run", "whatever"]);
+    assert_eq!(code, 1);
+    assert_eq!(resp["ok"], json!(false));
+    assert_eq!(resp["error"]["code"], json!("INTERNAL"));
 }
 
 #[test]

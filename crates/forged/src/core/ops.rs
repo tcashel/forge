@@ -14,7 +14,7 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     derive_key, err_response, fenced, key_absent, on_ledger, param_opt_str, param_str, read_only,
-    run_holder, split_packet_id, Ctx, Failure,
+    session_claimant, split_packet_id, Ctx, Failure,
 };
 
 /// Fill an absent idempotency key with the derived one; an explicit
@@ -67,6 +67,14 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     .unwrap_or_else(|| format!("{binary} not found on PATH")),
             }));
         }
+        let gh = gh_auth_status().await;
+        probes.push(json!({
+            "name": "gh-authenticated",
+            "ok": gh.is_ok(),
+            "detail": match gh {
+                Ok(detail) | Err(detail) => detail,
+            },
+        }));
         probes.push(json!({
             "name": "config-file",
             "ok": true,
@@ -82,6 +90,34 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         Ok(json!({"probes": probes}))
     })
     .await
+}
+
+/// Probe `gh`: present AND authenticated. Presence alone is not the
+/// question — every PR step this slice drives goes through an authenticated
+/// `gh`, so the probe runs `gh auth status` against the real environment
+/// and reads its exit code, the same convention the sibling doctors follow.
+async fn gh_auth_status() -> Result<String, String> {
+    let Some(path) = on_path("gh") else {
+        return Err("gh not found on PATH".to_owned());
+    };
+    let out = tokio::process::Command::new(&path)
+        .args(["auth", "status"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|e| format!("{} auth status: {e}", path.display()))?;
+    if out.status.success() {
+        Ok(format!("{} is authenticated", path.display()))
+    } else {
+        let detail = String::from_utf8_lossy(&out.stderr);
+        let detail = detail.trim();
+        let detail = if detail.is_empty() {
+            String::from_utf8_lossy(&out.stdout).trim().to_owned()
+        } else {
+            detail.to_owned()
+        };
+        Err(format!("gh auth status failed: {detail}"))
+    }
 }
 
 /// PATH lookup for a provider binary — presence only, nothing spawned.
@@ -324,8 +360,8 @@ pub async fn packet_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
 
 // ---------------------------------------------------------- packet claim
 
-/// `packet claim` — fenced SafeRetry claim of one packet under the run's
-/// derived holder.
+/// `packet claim` — fenced SafeRetry claim of one packet under its derived
+/// per-attempt session claimant.
 pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let packet_id = match param_str(&req.params, "packet") {
         Ok(p) => p.to_owned(),
@@ -354,11 +390,13 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
             };
             let current_sha = sha256_file(Path::new(&row.spec_path))?;
-            let holder = run_holder(&run_id);
+            // The claimant is the PACKET-scoped session identity, not the
+            // run's bd lease holder — see `core::session_claimant`.
+            let claimant = session_claimant(&packet_id);
             let claimed = {
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| {
-                    l.claim_packet(&packet_id, &holder, &current_sha)
+                    l.claim_packet(&packet_id, &claimant, &current_sha)
                 })
                 .await?
             };

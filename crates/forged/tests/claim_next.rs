@@ -82,7 +82,9 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
         })
         .expect("open packet");
     let claimed = ledger
-        .claim_packet(&packet_id, &format!("forged:{run_id}:0"), &sha)
+        // The claimant is the per-attempt session identity: packet-scoped,
+        // not the run's bd lease holder.
+        .claim_packet(&packet_id, &format!("forged:{packet_id}:0"), &sha)
         .expect("claim packet");
     ledger
         .fail_packet(
@@ -199,6 +201,68 @@ fn anothers_live_lease_leaves_the_run_alone() {
             .expect("live")
             .is_empty(),
         "the held run keeps no new attempt"
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn a_refusal_skips_that_run_and_the_scan_reaches_the_next_resumable() {
+    // The scan is EXHAUSTIVE: a candidate whose lease is live under another
+    // worker is skipped, not treated as "no ledger run is resumable". A
+    // second resumable run sitting behind the refusal must be resumed, and
+    // the fresh frontier must stay untouched.
+    let env = TestEnv::new("forged-claim-next-scan");
+    env.forged(&["init"]);
+    // Ledger order is creation order: the refused run is scanned first.
+    fabricate_resumable(&env, "bead-held");
+    fabricate_resumable(&env, "bead-next");
+    env.set_assignee("bead-held", "someone-else:host:99");
+    env.set_assignee("bead-next", "forged:bead-next:0");
+    env.seed_frontier("bead-fresh");
+
+    let (code, resp) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:scan-1",
+    ]);
+    assert_eq!(code, 0, "claim-next: {resp}");
+    let claimed = &resp["result"]["claimed"];
+    assert_eq!(claimed["resumed"], json!(true), "a run resumed: {resp}");
+    assert_eq!(
+        claimed["run_id"],
+        json!("bead-next"),
+        "the scan continued past the refusal to the second resumable run: {resp}"
+    );
+    assert_eq!(claimed["packet_id"], json!("bead-next/implement/1"));
+
+    // No fresh bead was pulled while a resumable run remained.
+    let calls = env.bd_calls();
+    assert!(
+        !calls.iter().any(|l| l.starts_with("ready ")),
+        "no frontier pull while a resumable run exists: {calls:?}"
+    );
+    assert!(
+        std::fs::read_to_string(env.beads_dir.join("shim-state/frontier"))
+            .expect("frontier")
+            .contains("bead-fresh"),
+        "the fresh bead stays on the frontier"
+    );
+
+    // The refused run was left entirely alone.
+    assert_eq!(
+        env.assignee("bead-held").as_deref(),
+        Some("someone-else:host:99"),
+        "the foreign lease is intact"
+    );
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_live_attempts(Some("bead-held"))
+            .expect("live")
+            .is_empty(),
+        "the refused run keeps no new attempt"
     );
     ledger.close().expect("close");
 }

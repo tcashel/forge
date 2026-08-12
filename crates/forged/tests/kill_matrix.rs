@@ -13,7 +13,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use serde_json::{json, Value};
-use support::{assert_no_overlap, rev_parse, HomeBeadsGuard, TestEnv};
+use support::{assert_no_overlap, pid_alive, rev_parse, HomeBeadsGuard, TestEnv};
 
 const WAIT: Duration = Duration::from_secs(60);
 
@@ -63,15 +63,6 @@ fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
     std::fs::read_to_string(env.packet_dir(run, stage, seq).join("provider.pid"))
         .ok()
         .and_then(|t| t.trim().parse().ok())
-}
-
-fn pid_alive(pid: i32) -> bool {
-    std::process::Command::new("/bin/kill")
-        .args(["-0", &pid.to_string()])
-        .stderr(Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
 }
 
 fn kill_group(pid: i32) {

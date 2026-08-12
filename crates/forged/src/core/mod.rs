@@ -212,6 +212,30 @@ pub fn run_holder(run_id: &str) -> String {
     format!("forged:{run_id}:0")
 }
 
+/// The per-attempt session identity stored in `attempts.claimant` — the
+/// second of the two identity layers, and the one `ReconcilePorts` receives
+/// verbatim as `session`.
+///
+/// It is scoped to the PACKET, not the run: a packet has at most one live
+/// attempt (`claim_packet` refuses a second), so this string maps
+/// one-to-one onto a live attempt and resolves to exactly one packet
+/// directory — which is what makes `liveness` and `kill_confirmed`
+/// per-attempt instead of an aggregate over every leg sharing the run's
+/// lease. The bd lease holder stays [`run_holder`]: one lease per slice,
+/// shared by both concurrent Review legs, translated back at the
+/// `reclaim_lease` seam.
+pub fn session_claimant(packet_id: &str) -> String {
+    format!("forged:{packet_id}:0")
+}
+
+/// The packet id carried by a [`session_claimant`], when the string is one.
+/// A run-scoped holder yields its run id here, which is not a packet id —
+/// callers that need a packet must parse it with [`split_packet_id`].
+pub fn packet_of_session(session: &str) -> Option<&str> {
+    let inner = session.strip_prefix("forged:")?.strip_suffix(":0")?;
+    (!inner.is_empty()).then_some(inner)
+}
+
 /// Build a success envelope.
 pub fn ok_response(operation_id: &str, reused: bool, result: Value) -> OperationResponse {
     OperationResponse {

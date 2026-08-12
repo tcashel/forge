@@ -94,6 +94,29 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         assert_no_overlap(&plog, packet);
     }
 
+    // The two identity layers stayed apart: every attempt's claimant is the
+    // PACKET-scoped session identity, so the two Review legs — which share
+    // the run's one bd lease — are told apart by their claimants and each
+    // resolves to its own packet directory. A run-scoped claimant here would
+    // make liveness and kill aggregate across the legs.
+    {
+        let ledger = env.ledger();
+        let mut seen = 0;
+        for attempt_id in 1..=16i64 {
+            let Ok(attempt) = ledger.get_attempt(attempt_id) else {
+                continue;
+            };
+            seen += 1;
+            assert_eq!(
+                attempt.claimant,
+                format!("forged:{}:0", attempt.packet_id),
+                "attempt {attempt_id} must claim under its packet-scoped session identity"
+            );
+        }
+        assert!(seen >= 6, "every packet's attempt was inspected: {seen}");
+        ledger.close().expect("close");
+    }
+
     // The guardian heartbeated the run's lease (per attempt) through bd,
     // under the derived per-run holder.
     let beats = env
@@ -287,6 +310,94 @@ fn claude_rate_limit_is_a_free_transport_retry() {
     assert!(
         note.starts_with("transport:"),
         "the note's transport: prefix is the classification: {note}"
+    );
+}
+
+#[test]
+fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
+    // No `provider.pid` inside the wait window means no guardian, and a
+    // provider with no guardian stops renewing the bd lease while still
+    // writing to the worktree — another worker would reclaim its
+    // apparently-expired work. The spawn is treated as failed: the session
+    // is killed, the packet fails `transport:`, and the transport-retry
+    // budget decides what happens next.
+    let env = TestEnv::new("forged-e2e-nopid");
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-nopid",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+
+    // Occupy the pid path with a DIRECTORY: the spawned shell's
+    // `echo $$ > provider.pid` fails, the provider still runs, and the file
+    // never appears — deterministically, with no race against the shim.
+    let packet_dir = env.packet_dir("bead-nopid", "implement", 1);
+    std::fs::create_dir_all(packet_dir.join("provider.pid")).expect("occupy the pid path");
+    // A provider that would otherwise outlive the window, so the kill is
+    // observable rather than a no-op on an already-exited shim.
+    env.set_scenario("implement", "hang", 1);
+
+    // `run advance` is one iteration each: resolve, open the packet, then
+    // execute it. `drive` would sleep out the 30s transport backoff.
+    for _ in 0..3 {
+        let (code, resp) = env.forged(&["run", "advance", "--run", "bead-nopid"]);
+        assert_eq!(code, 0, "run advance: {resp}");
+    }
+
+    // The packet failed with the pinned transport note, and the retry was
+    // granted rather than the semantic budget consumed.
+    let (_, events) = env.forged(&["events", "--run", "bead-nopid"]);
+    let rows = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .clone();
+    let notes: Vec<String> = rows
+        .iter()
+        .filter(|e| e["kind"] == json!("attempt.state") && e["payload"]["new"] == json!("failed"))
+        .filter_map(|e| e["payload"]["reason"].as_str().map(str::to_owned))
+        .collect();
+    assert_eq!(
+        notes,
+        vec!["transport: provider pid file never appeared".to_owned()],
+        "the pinned note: {rows:?}"
+    );
+    let retry = rows
+        .iter()
+        .find(|e| e["kind"] == json!("proto.retry"))
+        .expect("a transport failure grants a proto.retry");
+    assert_eq!(retry["payload"]["transportFailures"], json!(1));
+
+    // The provider itself was stopped: it started, never reached its `end`
+    // line, and its pid is verifiably gone.
+    let plog = env.provider_log();
+    let start = plog
+        .iter()
+        .find(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" start "))
+        .expect("the provider did start");
+    assert!(
+        !plog
+            .iter()
+            .any(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" end ")),
+        "the hung provider was killed, so it never wrote its end line: {plog:?}"
+    );
+    let pid: i32 = start
+        .rsplit(' ')
+        .next()
+        .and_then(|p| p.parse().ok())
+        .expect("the log line ends with the provider pid");
+    assert!(
+        !support::pid_alive(pid),
+        "the unguarded provider {pid} must be dead, not left running"
     );
 }
 

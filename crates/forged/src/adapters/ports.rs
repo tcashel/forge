@@ -3,14 +3,26 @@
 //! crate deliberately does not own.
 //!
 //! Identity model (operator-adjudicated): the bd lease holder is the
-//! driver's claimant — one lease per slice, shared by every attempt row of
-//! the run — and per-attempt session identity is the packet directory's
-//! `provider.pid` file plus the attempt row that names it. A process that
-//! spawned an attempt holds its `HostSessionId` and asks the host; any
-//! other process resolves the pid file, which under `ProcessHost`'s
-//! `setsid` is also the process-group id kills signal. A packet directory
-//! with no `provider.pid` is a spawn that never happened: `Vanished`,
-//! never success.
+//! DRIVER's — one lease per slice, shared by every attempt of the run — and
+//! per-attempt session identity is the packet directory's `provider.pid`
+//! file plus the attempt row that names it. The two are deliberately
+//! different strings: `attempts.claimant` carries
+//! [`crate::core::session_claimant`], scoped to the packet, so the `session`
+//! this adapter receives resolves to exactly ONE attempt and one packet
+//! directory. Aggregating by the shared lease holder instead would let one
+//! Review leg report its sibling's liveness and let revoking one leg kill
+//! both providers. The lease holder is recovered from the session only at
+//! the `reclaim_lease` seam, where bd is the one that needs it.
+//!
+//! A process that spawned an attempt holds its `HostSessionId` and asks the
+//! host; any other process reads the pid file, which under `ProcessHost`'s
+//! `setsid` is also the process-group id kills signal. The probe order
+//! mirrors the host's documented ladder: the sentinel status file FIRST (it
+//! is the only exit truth — a written status file means `Exited` whatever
+//! the pid says), then the pid, and a signal only after the pid's identity
+//! is verified against the start time captured at spawn. A packet directory
+//! with no `provider.pid` is a spawn that never happened: `Vanished`, never
+//! success.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -81,10 +93,16 @@ impl ForgedPorts {
             .map_err(|e| PortError::Internal(e.to_string()))
     }
 
-    /// Every live (running or revoking) attempt whose claimant is `session`.
-    async fn attempts_for(&self, session: &str) -> Result<Vec<AttemptRow>, PortError> {
+    /// The ONE live (running or revoking) attempt whose claimant is
+    /// `session`. A session claimant is packet-scoped and `claim_packet`
+    /// refuses a second live attempt on a packet, so this is single-valued
+    /// by construction; the newest row wins if a ledger ever disagrees.
+    async fn attempt_for(&self, session: &str) -> Result<Option<AttemptRow>, PortError> {
         let live = self.on_ledger(|l| l.list_live_attempts(None)).await?;
-        Ok(live.into_iter().filter(|a| a.claimant == session).collect())
+        Ok(live
+            .into_iter()
+            .filter(|a| a.claimant == session)
+            .max_by_key(|a| a.attempt_id))
     }
 
     fn packet_dir_of(&self, packet_id: &str) -> Result<PathBuf, PortError> {
@@ -108,17 +126,37 @@ impl ForgedPorts {
             });
         }
         let dir = self.packet_dir_of(&attempt.packet_id)?;
+        // The sentinel FIRST: it is the only exit truth, so a written status
+        // file means Exited no matter what the pid reads as — a recycled pid
+        // must never resurrect a session that already reported its code.
+        if let Some(code) = read_sentinel_code(&dir, attempt.attempt_id) {
+            return Ok(SessionLiveness::Exited(code));
+        }
         let Some(pid) = read_pid(&dir) else {
             // A spawn that never happened.
             return Ok(SessionLiveness::Vanished);
         };
-        if pid_alive(pid) {
+        // Only then the pid, guarded against reuse. An unverifiable identity
+        // never produces a death verdict — the same fail-safe direction the
+        // host's comparator takes when its capture came back empty.
+        if pid_alive(pid) && pid_identity(&dir, pid).await != PidIdentity::Recycled {
             return Ok(SessionLiveness::Running);
         }
+        // Dead with no status file seen: re-read ONCE before concluding
+        // Vanished — the sentinel may have landed in between.
         match read_sentinel_code(&dir, attempt.attempt_id) {
             Some(code) => Ok(SessionLiveness::Exited(code)),
             None => Ok(SessionLiveness::Vanished),
         }
+    }
+
+    /// Whether this attempt's session is verifiably over: the sentinel
+    /// landed, the pid is gone, or the pid now names a different process.
+    /// Re-checked before every signal escalation.
+    async fn attempt_settled(&self, dir: &Path, attempt_id: i64, pid: i32) -> bool {
+        read_sentinel_code(dir, attempt_id).is_some()
+            || !pid_alive(pid)
+            || pid_identity(dir, pid).await == PidIdentity::Recycled
     }
 
     /// Kill one attempt's session and verify death.
@@ -132,25 +170,52 @@ impl ForgedPorts {
             };
         }
         let dir = self.packet_dir_of(&attempt.packet_id)?;
+        let attempt_id = attempt.attempt_id;
+        // The sentinel FIRST, before any signal: a written status file means
+        // the session already exited, so there is nothing to kill and the
+        // recorded pid may since have been recycled onto a stranger.
+        if read_sentinel_code(&dir, attempt_id).is_some() {
+            return Ok(KillOutcome::AlreadyDead);
+        }
         let Some(pid) = read_pid(&dir) else {
             return Ok(KillOutcome::AlreadyDead);
         };
         if !pid_alive(pid) {
             return Ok(KillOutcome::AlreadyDead);
         }
+        // No signal until the pid is verifiably still OUR process. A
+        // recycled pid means the session we were asked to kill is already
+        // dead; an unverifiable one is refused rather than guessed at —
+        // signalling a process we cannot identify is exactly the harm the
+        // guard exists to prevent, and proto resumes from the durable
+        // `revoking` marker on the next pass.
+        match pid_identity(&dir, pid).await {
+            PidIdentity::Recycled => return Ok(KillOutcome::AlreadyDead),
+            PidIdentity::Unverifiable => {
+                return Err(PortError::Unavailable(format!(
+                    "attempt {attempt_id}: pid {pid} has no recorded start time; refusing to \
+                     signal a process whose identity cannot be verified"
+                )))
+            }
+            PidIdentity::Same => {}
+        }
         // The pid is the setsid leader, so it doubles as the process-group
-        // id. TERM first, then KILL; success only on verified death.
+        // id. TERM first, then KILL; success only on verified death, and the
+        // sentinel is re-consulted before the escalation.
         let pgid = Pid::from_raw(pid);
         let _ = killpg(pgid, Signal::SIGTERM);
         for _ in 0..50 {
-            if !pid_alive(pid) {
+            if self.attempt_settled(&dir, attempt_id, pid).await {
                 return Ok(KillOutcome::Killed);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
+        if self.attempt_settled(&dir, attempt_id, pid).await {
+            return Ok(KillOutcome::Killed);
+        }
         let _ = killpg(pgid, Signal::SIGKILL);
         for _ in 0..20 {
-            if !pid_alive(pid) {
+            if self.attempt_settled(&dir, attempt_id, pid).await {
                 return Ok(KillOutcome::Killed);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -166,10 +231,61 @@ impl ForgedPorts {
     }
 }
 
+/// The start-time stamp written beside `provider.pid` at spawn — the
+/// out-of-process half of the host's pid-reuse guard.
+pub const PROVIDER_LSTART: &str = "provider.lstart";
+
 /// Read `<packet_dir>/provider.pid`.
 fn read_pid(packet_dir: &Path) -> Option<i32> {
     let text = std::fs::read_to_string(packet_dir.join("provider.pid")).ok()?;
     text.trim().parse::<i32>().ok()
+}
+
+/// What a pid's start time says about whether it is still the process the
+/// attempt spawned.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PidIdentity {
+    /// `ps` resolves the pid and its start time is unchanged.
+    Same,
+    /// The pid is gone, or it now names a process that started later — the
+    /// original is dead either way.
+    Recycled,
+    /// No start time was recorded (or `ps` itself could not run), so nothing
+    /// can be concluded. Never a death verdict; never a licence to signal.
+    Unverifiable,
+}
+
+/// `ps -p <pid> -o lstart=`, trimmed. `None` distinguishes nothing here:
+/// callers treat a missing answer as "the pid does not resolve".
+pub async fn lstart_of(pid: i32) -> Option<String> {
+    let out = tokio::process::Command::new("ps")
+        .args(["-p", &pid.to_string(), "-o", "lstart="])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let lstart = String::from_utf8_lossy(&out.stdout).trim().to_owned();
+    (!lstart.is_empty()).then_some(lstart)
+}
+
+/// Compare a pid against the start time captured when the attempt spawned
+/// it, mirroring `forged_host`'s in-process `ProcessIdentity` comparator
+/// for the processes this one did not spawn.
+async fn pid_identity(packet_dir: &Path, pid: i32) -> PidIdentity {
+    let Ok(recorded) = std::fs::read_to_string(packet_dir.join(PROVIDER_LSTART)) else {
+        return PidIdentity::Unverifiable;
+    };
+    let recorded = recorded.trim().to_owned();
+    if recorded.is_empty() {
+        return PidIdentity::Unverifiable;
+    }
+    match lstart_of(pid).await {
+        Some(current) if current == recorded => PidIdentity::Same,
+        Some(_) | None => PidIdentity::Recycled,
+    }
 }
 
 /// Whether `pid` names a live process (signal 0 probe; a permission refusal
@@ -180,6 +296,16 @@ fn pid_alive(pid: i32) -> bool {
         Err(nix::errno::Errno::EPERM) => true,
         Err(_) => false,
     }
+}
+
+/// The bd lease holder behind a per-attempt session claimant: the run's
+/// one lease, derived from the packet the session names. `None` when the
+/// string is not a session claimant — then it is already whatever identity
+/// the caller meant, and is used verbatim.
+fn lease_holder_of(session: &str) -> Option<String> {
+    let packet_id = crate::core::packet_of_session(session)?;
+    let (run_id, _, _) = crate::core::split_packet_id(packet_id).ok()?;
+    Some(crate::core::run_holder(&run_id))
 }
 
 /// Find the attempt's sentinel status file under
@@ -240,37 +366,19 @@ pub fn slug_from_url(url: &str) -> String {
 #[async_trait::async_trait]
 impl ReconcilePorts for ForgedPorts {
     async fn liveness(&self, session: &str) -> Result<SessionLiveness, PortError> {
-        let attempts = self.attempts_for(session).await?;
-        if attempts.is_empty() {
-            return Ok(SessionLiveness::Vanished);
+        // ONE attempt, never an aggregate: a sibling Review leg running
+        // under the same run must not answer for this one.
+        match self.attempt_for(session).await? {
+            Some(attempt) => self.attempt_liveness(&attempt).await,
+            None => Ok(SessionLiveness::Vanished),
         }
-        let mut exited: Option<i32> = None;
-        for attempt in &attempts {
-            match self.attempt_liveness(attempt).await? {
-                SessionLiveness::Running => return Ok(SessionLiveness::Running),
-                SessionLiveness::Exited(code) => exited.get_or_insert(code),
-                SessionLiveness::Vanished => continue,
-            };
-        }
-        Ok(match exited {
-            Some(code) => SessionLiveness::Exited(code),
-            None => SessionLiveness::Vanished,
-        })
     }
 
     async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
-        let attempts = self.attempts_for(session).await?;
-        let mut killed_any = false;
-        for attempt in &attempts {
-            if self.attempt_kill(attempt).await? == KillOutcome::Killed {
-                killed_any = true;
-            }
+        match self.attempt_for(session).await? {
+            Some(attempt) => self.attempt_kill(&attempt).await,
+            None => Ok(KillOutcome::AlreadyDead),
         }
-        Ok(if killed_any {
-            KillOutcome::Killed
-        } else {
-            KillOutcome::AlreadyDead
-        })
     }
 
     async fn reclaim_lease(
@@ -279,15 +387,31 @@ impl ReconcilePorts for ForgedPorts {
         holder: &str,
         older_than_s: u64,
     ) -> Result<LeaseReclaim, PortError> {
+        // `holder` is the attempt's claimant verbatim — per-attempt session
+        // identity. bd knows only the OTHER layer: the run's one lease,
+        // taken under the driver's lease holder. The scoped reclaim must
+        // therefore name that identity, and the answer is reported back in
+        // the vocabulary the caller used, so a caller comparing
+        // `previous_owner` against the claimant it passed reads a truthful
+        // "the lease was taken from the identity you named". A holder that
+        // is not a session claimant passes through untouched.
+        let lease_holder = lease_holder_of(holder);
+        let bd_holder = lease_holder.as_deref().unwrap_or(holder);
         let bd = self.config.bd_config();
         failpoint::hit("bd.reclaim.before");
-        let outcome = forged_beads::reclaim(&bd, bead, holder, older_than_s)
+        let outcome = forged_beads::reclaim(&bd, bead, bd_holder, older_than_s)
             .await
             .map_err(|e| PortError::Unavailable(e.to_string()))?;
         failpoint::hit("bd.reclaim.after");
         Ok(LeaseReclaim {
             scoped: outcome.scoped,
-            previous_owner: outcome.previous_owner,
+            previous_owner: outcome.previous_owner.map(|owner| {
+                if owner == bd_holder {
+                    holder.to_owned()
+                } else {
+                    owner
+                }
+            }),
         })
     }
 
@@ -436,6 +560,30 @@ pub fn report_json(report: &forged_proto::ReconcileReport) -> Value {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_session_claimant_resolves_to_one_packet_and_the_runs_lease_holder() {
+        // The two identity layers: the claimant names the attempt's packet,
+        // and only the bd seam translates it back to the run's one lease.
+        let session = crate::core::session_claimant("run-1/reviewcodex/2");
+        assert_eq!(session, "forged:run-1/reviewcodex/2:0");
+        assert_eq!(
+            crate::core::packet_of_session(&session),
+            Some("run-1/reviewcodex/2")
+        );
+        assert_eq!(
+            lease_holder_of(&session).as_deref(),
+            Some("forged:run-1:0"),
+            "both Review legs of a run reclaim under the ONE lease holder"
+        );
+        // The sibling leg is a different session but the same lease holder.
+        let sibling = crate::core::session_claimant("run-1/reviewclaude/2");
+        assert_ne!(sibling, session);
+        assert_eq!(lease_holder_of(&sibling), lease_holder_of(&session));
+        // Anything that is not a session claimant is used verbatim.
+        assert_eq!(lease_holder_of("someone-else:host:99"), None);
+        assert_eq!(lease_holder_of("forged:run-1:0"), None);
+    }
 
     #[test]
     fn slug_parses_the_known_remote_shapes() {

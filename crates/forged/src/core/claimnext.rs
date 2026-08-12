@@ -3,6 +3,11 @@
 //! ledger run is resumable pull the fresh bd frontier. A claim-next that
 //! pulls a fresh bead while a resumable run sits in the ledger is a
 //! BLOCKER-severity bug.
+//!
+//! "No ledger run is resumable" means the scan was EXHAUSTED, not that its
+//! first candidate declined: both a reclaim refusal (another worker's lease
+//! is live) and a pending retry deadline skip that one run and continue to
+//! the next.
 
 use forged_ledger::{EffectClass, RunState};
 use forged_types::{OperationRequest, OperationResponse};
@@ -10,7 +15,9 @@ use serde_json::{json, Value};
 
 use crate::adapters::execute::sha256_file;
 use crate::config::now_iso;
-use crate::core::{err_response, fenced, on_ledger, param_str, run_holder, Ctx, Failure};
+use crate::core::{
+    err_response, fenced, on_ledger, param_str, run_holder, session_claimant, Ctx, Failure,
+};
 use crate::failpoint;
 
 /// One resumable candidate found in the ledger.
@@ -22,13 +29,21 @@ struct Resumable {
     stage: forged_types::Stage,
 }
 
-/// Scan the ledger for the first Active run with a reopened packet — a
-/// packet with no live attempt and no completed attempt, the shape a
-/// crashed or transport-failed attempt leaves behind — honoring the
-/// packet's retry deadline.
-async fn find_resumable(ctx: &Ctx) -> Result<Option<Resumable>, Failure> {
+/// Scan the ledger for EVERY Active run with a reopened packet — a packet
+/// with no live attempt and no completed attempt, the shape a crashed or
+/// transport-failed attempt leaves behind — honoring each packet's retry
+/// deadline.
+///
+/// Plural by contract: a candidate whose lease turns out to be live under
+/// another worker is skipped and the scan continues, so the fresh bd
+/// frontier is reached only when NO resumable ledger run remains. Returning
+/// the first candidate alone would pull a fresh bead past a resumable run
+/// sitting behind a refusal — the BLOCKER-severity failure this verb exists
+/// to rule out.
+async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
     let runs = on_ledger(&ctx.ledger, |l| l.list_runs()).await?;
     let now = now_iso();
+    let mut resumables = Vec::new();
     for run in runs {
         if run.state != RunState::Active {
             continue;
@@ -60,15 +75,15 @@ async fn find_resumable(ctx: &Ctx) -> Result<Option<Resumable>, Failure> {
             .find(|p| p.packet_id == packet_id)
             .cloned();
         let Some(packet) = packet else { continue };
-        return Ok(Some(Resumable {
+        resumables.push(Resumable {
             run_id: run.run_id,
             bead_id: run.bead_id,
             packet_id,
             spec_path: packet.spec_path,
             stage: packet.stage,
-        }));
+        });
     }
-    Ok(None)
+    Ok(resumables)
 }
 
 /// The core function behind `claim-next` / the `claim_next` tool.
@@ -86,8 +101,9 @@ pub async fn claim_next(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
 async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     let bd = ctx.config.bd_config();
 
-    // 1. Resume from forged's own ledger first.
-    if let Some(candidate) = find_resumable(ctx).await? {
+    // 1. Resume from forged's own ledger first — every resumable candidate
+    //    in ledger order, until one of them actually resumes.
+    for candidate in find_resumables(ctx).await? {
         let run_holder_id = run_holder(&candidate.run_id);
         let budget = ctx
             .config
@@ -121,43 +137,45 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
                 None => (true, true),
             }
         };
-        if proceed {
-            if retake {
-                // (Re-)take the lease under the same derived holder.
-                failpoint::hit("bd.claim.before");
-                forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
-                failpoint::hit("bd.claim.after");
-            }
-            // 2. Hand back the reopened packet of that same run — never a
-            // fresh one.
-            let current_sha = sha256_file(std::path::Path::new(&candidate.spec_path))?;
-            let claimed = {
-                let packet_id = candidate.packet_id.clone();
-                let claimant = run_holder_id.clone();
-                on_ledger(&ctx.ledger, move |l| {
-                    l.claim_packet(&packet_id, &claimant, &current_sha)
-                })
-                .await?
-            };
-            // The packet directory belongs to the new attempt now: a stale
-            // pid file from the dead attempt must not read as its session.
-            let (_, stage, seq) = crate::core::split_packet_id(&candidate.packet_id)?;
-            let _ = std::fs::remove_file(
-                ctx.config
-                    .packet_dir(&candidate.run_id, stage, seq)
-                    .join("provider.pid"),
-            );
-            return Ok(json!({
-                "claimed": {
-                    "run_id": candidate.run_id,
-                    "packet_id": candidate.packet_id,
-                    "attempt_id": claimed.attempt_id,
-                    "claim_token": claimed.claim_token,
-                    "resumed": true,
-                }
-            }));
+        if !proceed {
+            // The refusal stands for THIS run only: another worker's lease
+            // is live on it, so leave it untouched and keep scanning. The
+            // frontier is reached only once the scan is exhausted.
+            continue;
         }
-        // Refusal: leave the run alone and fall through to the frontier.
+        if retake {
+            // (Re-)take the lease under the same derived holder.
+            failpoint::hit("bd.claim.before");
+            forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
+            failpoint::hit("bd.claim.after");
+        }
+        // 2. Hand back the reopened packet of that same run — never a fresh
+        // one.
+        let current_sha = sha256_file(std::path::Path::new(&candidate.spec_path))?;
+        let claimed = {
+            let packet_id = candidate.packet_id.clone();
+            let claimant = session_claimant(&candidate.packet_id);
+            on_ledger(&ctx.ledger, move |l| {
+                l.claim_packet(&packet_id, &claimant, &current_sha)
+            })
+            .await?
+        };
+        // The packet directory belongs to the new attempt now: a stale pid
+        // file (and its start-time stamp) from the dead attempt must not
+        // read as this session.
+        let (_, stage, seq) = crate::core::split_packet_id(&candidate.packet_id)?;
+        let dir = ctx.config.packet_dir(&candidate.run_id, stage, seq);
+        let _ = std::fs::remove_file(dir.join("provider.pid"));
+        let _ = std::fs::remove_file(dir.join(crate::adapters::ports::PROVIDER_LSTART));
+        return Ok(json!({
+            "claimed": {
+                "run_id": candidate.run_id,
+                "packet_id": candidate.packet_id,
+                "attempt_id": claimed.attempt_id,
+                "claim_token": claimed.claim_token,
+                "resumed": true,
+            }
+        }));
     }
 
     // 3. Only now: the fresh bd frontier. An empty frontier is a success.
