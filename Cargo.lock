@@ -417,8 +417,12 @@ dependencies = [
 name = "forged-provider"
 version = "0.1.0"
 dependencies = [
+ "forged-types",
  "minijinja",
  "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
 ]
 
