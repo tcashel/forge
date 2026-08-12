@@ -364,7 +364,13 @@ async fn run_attempt(
         invocation.shell_line
     );
     let status_base = packet_dir.join("status").join(attempt_id.to_string());
-    let host: Arc<dyn SessionHost> = Arc::new(ProcessHost::new(&status_base));
+    // Host selection: the plain process host by default; herdr when a
+    // socket is configured (passed explicitly — the default is never
+    // applied inside connect).
+    let host: Arc<dyn SessionHost> = match &ctx.config.herdr_sock {
+        Some(sock) => Arc::new(forged_host::HerdrHost::connect(sock, &status_base).await?),
+        None => Arc::new(ProcessHost::new(&status_base)),
+    };
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_owned(), path);

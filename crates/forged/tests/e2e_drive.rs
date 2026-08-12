@@ -17,7 +17,15 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
-        "run", "start", "--bead", "bead-e2e", "--repo", &repo, "--spec", &spec, "--base-ref",
+        "run",
+        "start",
+        "--bead",
+        "bead-e2e",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
@@ -36,7 +44,9 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let gh = env.gh_calls();
     let creates = gh
         .iter()
-        .filter(|argv| argv.iter().any(|a| a.contains("/pulls")) && argv.contains(&"POST".to_owned()))
+        .filter(|argv| {
+            argv.iter().any(|a| a.contains("/pulls")) && argv.contains(&"POST".to_owned())
+        })
         .count();
     assert_eq!(creates, 1, "exactly one PR creation: {gh:?}");
     assert!(
@@ -103,7 +113,10 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let (code, report) = env.forged(&["usage", "--run", "bead-e2e"]);
     assert_eq!(code, 0);
     assert!(
-        report["result"]["totals"]["inputTokens"].as_u64().unwrap_or(0) > 0,
+        report["result"]["totals"]["inputTokens"]
+            .as_u64()
+            .unwrap_or(0)
+            > 0,
         "totals reflect ingested rows: {report}"
     );
 
@@ -116,7 +129,12 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         .iter()
         .filter_map(|e| e["kind"].as_str())
         .collect();
-    for kind in ["proto.gate", "proto.pr", "attempt.state", "proto.operation.request"] {
+    for kind in [
+        "proto.gate",
+        "proto.pr",
+        "attempt.state",
+        "proto.operation.request",
+    ] {
         assert!(kinds.contains(&kind), "{kind} in stream: {kinds:?}");
     }
 
@@ -179,7 +197,15 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
-        "run", "start", "--bead", "bead-sem", "--repo", &repo, "--spec", &spec, "--base-ref",
+        "run",
+        "start",
+        "--bead",
+        "bead-sem",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
         "main",
     ]);
     env.set_scenario("implement", "no-block", 1);
@@ -189,7 +215,10 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
 
     // The ledger recorded the semantic note verbatim and no proto.retry.
     let (_, events) = env.forged(&["events", "--run", "bead-sem"]);
-    let rows = events["result"]["events"].as_array().expect("events").clone();
+    let rows = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .clone();
     let failed_notes: Vec<String> = rows
         .iter()
         .filter(|e| e["kind"] == json!("attempt.state") && e["payload"]["new"] == json!("failed"))
@@ -223,7 +252,15 @@ fn claude_rate_limit_is_a_free_transport_retry() {
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
-        "run", "start", "--bead", "bead-tr", "--repo", &repo, "--spec", &spec, "--base-ref",
+        "run",
+        "start",
+        "--bead",
+        "bead-tr",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
         "main",
     ]);
     env.set_scenario("implement", "rate-limit", 1);
@@ -232,7 +269,10 @@ fn claude_rate_limit_is_a_free_transport_retry() {
     assert!(driven["result"]["terminal"]["done"].is_object());
 
     let (_, events) = env.forged(&["events", "--run", "bead-tr"]);
-    let rows = events["result"]["events"].as_array().expect("events").clone();
+    let rows = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .clone();
     let retry = rows
         .iter()
         .find(|e| e["kind"] == json!("proto.retry"))
@@ -259,7 +299,15 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
     env.forged(&[
-        "run", "start", "--bead", "bead-rec", "--repo", &repo, "--spec", &spec, "--base-ref",
+        "run",
+        "start",
+        "--bead",
+        "bead-rec",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
         "main",
     ]);
     let (code, _) = env.forged(&["run", "drive", "--run", "bead-rec"]);

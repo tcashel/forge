@@ -688,9 +688,7 @@ impl TestEnv {
     /// provider (the codex rate-limit case).
     pub fn write_config(&self, fix_provider: Option<&str>) {
         let bd_path = self.shim_bin.join("bd");
-        let hint = |provider: &str, model: &str, effort: Option<&str>, sandbox: &str| {
-            json!({"provider": provider, "model": model, "effort": effort, "sandbox": sandbox})
-        };
+        let hint = |provider: &str, model: &str, effort: Option<&str>, sandbox: &str| json!({"provider": provider, "model": model, "effort": effort, "sandbox": sandbox});
         let fix = match fix_provider {
             Some("codex") => hint("codex", "gpt-5.6-sol", Some("xhigh"), "workspaceWrite"),
             _ => hint("claude", "opus", None, "workspaceWrite"),
@@ -856,8 +854,20 @@ impl TestEnv {
 /// packet: every `start` for the packet is preceded by the previous
 /// attempt's `end` (or nothing).
 pub fn assert_no_overlap(log: &[String], packet_id: &str) {
+    assert_no_overlap_after_kills(log, packet_id, &[]);
+}
+
+/// The same non-overlap scan, excluding pids the TEST ITSELF killed and
+/// verified dead before any successor started: a SIGKILLed shim can never
+/// write its `end` line, so its verified death (asserted separately by the
+/// caller and by the ledger's attempt-order record) stands in for it.
+pub fn assert_no_overlap_after_kills(log: &[String], packet_id: &str, killed_pids: &[i32]) {
     let mut open = 0i32;
-    for line in log.iter().filter(|l| l.starts_with(packet_id)) {
+    let lines = log.iter().filter(|l| l.starts_with(packet_id)).filter(|l| {
+        let pid = l.rsplit(' ').next().and_then(|p| p.parse::<i32>().ok());
+        !pid.is_some_and(|p| killed_pids.contains(&p))
+    });
+    for line in lines {
         if line.contains(" start ") {
             open += 1;
             assert!(
@@ -908,10 +918,7 @@ impl McpClient {
                 "clientInfo": {"name": "forged-test", "version": "0"},
             }),
         );
-        assert!(
-            init.get("result").is_some(),
-            "initialize failed: {init}"
-        );
+        assert!(init.get("result").is_some(), "initialize failed: {init}");
         client.notify("notifications/initialized", json!({}));
         client
     }
@@ -950,10 +957,7 @@ impl McpClient {
     /// Call one tool with an operation envelope; return the parsed
     /// `OperationResponse` from the result's first text content block.
     pub fn call_tool(&mut self, name: &str, envelope: Value) -> Value {
-        let reply = self.request(
-            "tools/call",
-            json!({"name": name, "arguments": envelope}),
-        );
+        let reply = self.request("tools/call", json!({"name": name, "arguments": envelope}));
         let text = reply
             .pointer("/result/content/0/text")
             .and_then(Value::as_str)

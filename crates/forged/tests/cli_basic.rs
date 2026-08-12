@@ -40,8 +40,17 @@ fn help_lists_every_command_and_subcommand_flags() {
         assert!(run.contains(sub), "run --help must list {sub}");
     }
     let start = help_text(&env, &["run", "start", "--help"]);
-    for flag in ["--bead", "--repo", "--spec", "--base-ref", "--idempotency-key"] {
-        assert!(start.contains(flag), "run start --help must document {flag}");
+    for flag in [
+        "--bead",
+        "--repo",
+        "--spec",
+        "--base-ref",
+        "--idempotency-key",
+    ] {
+        assert!(
+            start.contains(flag),
+            "run start --help must document {flag}"
+        );
     }
     let packet = help_text(&env, &["packet", "--help"]);
     for sub in ["show", "claim", "complete", "fail", "heartbeat"] {
@@ -55,7 +64,12 @@ fn help_lists_every_command_and_subcommand_flags() {
         );
     }
     let retire = help_text(&env, &["worktree", "retire", "--help"]);
-    for flag in ["--run", "--force", "--run-state-terminal", "--idempotency-key"] {
+    for flag in [
+        "--run",
+        "--force",
+        "--run-state-terminal",
+        "--idempotency-key",
+    ] {
         assert!(
             retire.contains(flag),
             "worktree retire --help must document {flag}"
@@ -111,7 +125,12 @@ fn replay_uses_the_ledger_operation_outcome() {
         params,
     };
     let first = ledger
-        .begin_operation("test", &request, forged_ledger::EffectClass::SafeRetry, None)
+        .begin_operation(
+            "test",
+            &request,
+            forged_ledger::EffectClass::SafeRetry,
+            None,
+        )
         .expect("begin");
     let ticket = match first {
         forged_ledger::OperationOutcome::Fresh(ticket) => ticket,
@@ -128,7 +147,12 @@ fn replay_uses_the_ledger_operation_outcome() {
         .complete_operation(&ticket.operation_id, &response)
         .expect("complete");
     let second = ledger
-        .begin_operation("test", &request, forged_ledger::EffectClass::SafeRetry, None)
+        .begin_operation(
+            "test",
+            &request,
+            forged_ledger::EffectClass::SafeRetry,
+            None,
+        )
         .expect("second begin");
     match second {
         forged_ledger::OperationOutcome::Replayed(replayed) => {
