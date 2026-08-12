@@ -578,6 +578,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_pause" => epic::epic_pause(ctx, &mut req).await,
         "epic_resume" => epic::epic_resume(ctx, &mut req).await,
         "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
+        "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,

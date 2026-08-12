@@ -512,9 +512,10 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 })
                 .await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+                let view = crate::core::drive::project(ctx, &run_id).await?;
                 let config = forged_proto::ReconcileConfig {
-                    stage_budget_s: ctx.config.stage_budget_s.clone(),
-                    gate_commands: ctx.config.gate_commands.clone(),
+                    stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
+                    gate_commands: view.policy.gate_commands,
                 };
                 let report =
                     forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())

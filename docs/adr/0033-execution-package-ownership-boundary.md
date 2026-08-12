@@ -25,7 +25,9 @@ provider assignments stable while operator config evolves.
 A user works through one lead-agent session. Smithy's planning skills help that
 agent maintain and lock the plan; after the user accepts the direction, Smithy
 hands a versioned execution package to `forged`. The package contains semantic
-roles and seats, an assurance profile, and an ordered provider/model roster.
+roles and seats, an assurance profile, an ordered provider/model roster, and
+the resolved execution policy: gates, stage and retry budgets, and process-host
+selection.
 `forged` validates, canonicalizes, hashes, and stores the resolved package
 before execution begins. Provider adapters perform cognition but do not own
 workflow state.
@@ -49,7 +51,9 @@ panels. Rosters are operator-authored YAML and may be changed cheaply when a
 provider or model becomes unavailable. A run never silently follows such a
 change: its resolved package and roster revision are immutable ledger facts.
 Any later reassignment is an explicit append-only revision at a durable stage
-boundary.
+boundary. An epic freezes the package used to create children. Its roster
+revision atomically updates every current unmerged child and becomes the
+template for future children; no child re-resolves an authoring-config name.
 
 ## Consequences
 

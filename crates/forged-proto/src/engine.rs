@@ -15,8 +15,8 @@ use forged_ledger::{
     RunState,
 };
 use forged_types::{
-    EscalationTrigger, ExecutionPackageV1, Outcome, ProfileDefinitionV1, ProviderHints,
-    SeatDefinitionV1, SeatExecutionV1, SeatPurpose, Stage, Verdict,
+    EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome, ProfileDefinitionV1,
+    ProviderHints, SeatDefinitionV1, SeatExecutionV1, SeatPurpose, Stage, Verdict,
 };
 
 use crate::error::ProtoError;
@@ -73,11 +73,9 @@ pub struct RunView {
     /// because `advance` performs keyed lookups only and never iterates the
     /// roster.
     pub roster: HashMap<Stage, ProviderHints>,
-    /// Gate commands, in order, for `Gate` and `ReGate`.
-    pub gate_commands: Vec<String>,
-    /// Caller-supplied transport-retry budget per packet; this slice's
-    /// callers and every fixture pass `3`.
-    pub transport_retry_budget: u32,
+    /// One immutable execution-policy value. Definition-backed runs source
+    /// it from their hashed package; legacy projection supplies a snapshot.
+    pub policy: ExecutionPolicyV1,
     /// Caller-supplied RFC-3339 UTC stamp in the ledger's fixed-width
     /// 30-byte form, so time is an input, never a read.
     pub now: String,
@@ -959,7 +957,7 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
         AttemptState::Failed => match classify_failure(last.fail_note.as_deref().unwrap_or("")) {
             FailureKind::Transport => {
                 let (attempts, not_before) = transport_retry_state(view, packet_id, history);
-                if attempts > view.transport_retry_budget {
+                if attempts > view.policy.transport_retry_budget {
                     LegState::Exhausted { attempts }
                 } else {
                     LegState::Pending {

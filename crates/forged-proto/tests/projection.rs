@@ -79,8 +79,8 @@ fn projection_reconstructs_history_and_threads_inputs() {
         "no machine step ever began: nothing is settled"
     );
     assert_eq!(view.roster, roster);
-    assert_eq!(view.gate_commands, gates);
-    assert_eq!(view.transport_retry_budget, 3);
+    assert_eq!(view.policy.gate_commands, gates);
+    assert_eq!(view.policy.transport_retry_budget, 3);
     assert_eq!(view.now, T0);
 
     // Terminal history, oldest first, with the fail note verbatim and the

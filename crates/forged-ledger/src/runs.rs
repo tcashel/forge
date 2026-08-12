@@ -15,7 +15,8 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
-    NewRun, NewRunDefinition, RosterRevisionRow, RunDefinitionRow, RunRow, RunState,
+    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunRow,
+    RunState,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -398,6 +399,142 @@ impl Ledger {
             };
             tx.commit()?;
             Ok(row)
+        })
+    }
+
+    /// Append the same validated roster to a set of definition-backed runs
+    /// and append its governing epic event in one transaction. An empty run
+    /// set is valid: it revises the template for future children only.
+    pub fn append_roster_revisions_with_event(
+        &self,
+        batch: RosterRevisionBatch,
+    ) -> Result<Vec<RosterRevisionRow>, LedgerError> {
+        let RosterRevisionBatch {
+            epic_id,
+            event_kind,
+            event_payload,
+            run_ids,
+            roster,
+            roster_sha256,
+            reason,
+            operation_prefix,
+        } = batch;
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "roster revision requires a reason",
+            ));
+        }
+        let (roster_json, actual_sha256) = canonical(&roster)?;
+        if roster_sha256 != actual_sha256 {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "roster revision digest mismatch",
+            ));
+        }
+        let (roster_ref_json, _) = canonical(&roster.roster_ref)?;
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let event_json = serde_json::to_string(&event_payload)?;
+            let event_exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 AND payload_json = ?3)",
+                rusqlite::params![epic_id, event_kind, event_json],
+                |row| row.get(0),
+            )?;
+            let mut rows = Vec::with_capacity(run_ids.len());
+            if event_exists {
+                for run_id in run_ids {
+                    let operation_id = format!("{operation_prefix}:{run_id}");
+                    if let Some(existing) = tx
+                        .query_row(
+                            "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
+                             created_at, operation_id FROM roster_revisions WHERE operation_id = ?1",
+                            [&operation_id],
+                            revision_row,
+                        )
+                        .optional()?
+                    {
+                        rows.push(existing);
+                    }
+                }
+                tx.commit()?;
+                return Ok(rows);
+            }
+            for run_id in run_ids {
+                require_run(&tx, &run_id)?;
+                let has_definition: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM run_definitions WHERE run_id = ?1)",
+                    [&run_id],
+                    |row| row.get(0),
+                )?;
+                if !has_definition {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} has no revisable roster"),
+                    ));
+                }
+                let operation_id = format!("{operation_prefix}:{run_id}");
+                if let Some(existing) = tx
+                    .query_row(
+                        "SELECT run_id, revision, roster_ref_json, roster_sha256, roster_json, reason, \
+                         created_at, operation_id FROM roster_revisions WHERE operation_id = ?1",
+                        [&operation_id],
+                        revision_row,
+                    )
+                    .optional()?
+                {
+                    if existing.run_id != run_id
+                        || existing.roster_sha256 != roster_sha256
+                        || existing.reason != reason
+                    {
+                        return Err(refused(
+                            ErrorCode::InvalidRequest,
+                            "epic roster operation was reused with different content",
+                        ));
+                    }
+                    rows.push(existing);
+                    continue;
+                }
+                let current: i64 = tx.query_row(
+                    "SELECT COALESCE(MAX(revision), 0) FROM roster_revisions WHERE run_id = ?1",
+                    [&run_id],
+                    |row| row.get(0),
+                )?;
+                let next = current
+                    .checked_add(1)
+                    .ok_or_else(|| crate::error::internal("roster revision counter overflow"))?;
+                let revision = u32::try_from(next)
+                    .map_err(|_| crate::error::internal("roster revision does not fit u32"))?;
+                let now = now_iso();
+                tx.execute(
+                    "INSERT INTO roster_revisions (run_id, revision, roster_ref_json, roster_sha256, \
+                     roster_json, reason, created_at, operation_id) \
+                     VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                    rusqlite::params![
+                        run_id,
+                        next,
+                        roster_ref_json,
+                        roster_sha256,
+                        roster_json,
+                        reason,
+                        now,
+                        operation_id,
+                    ],
+                )?;
+                rows.push(RosterRevisionRow {
+                    run_id,
+                    revision,
+                    roster_ref_json: roster_ref_json.clone(),
+                    roster_sha256: roster_sha256.clone(),
+                    roster_json: roster_json.clone(),
+                    reason: reason.clone(),
+                    created_at: now,
+                    operation_id: Some(operation_id),
+                });
+            }
+            append_event_tx(&tx, Some(&epic_id), &event_kind, &event_payload)?;
+            tx.commit()?;
+            Ok(rows)
         })
     }
 

@@ -7,7 +7,9 @@ use std::path::Path;
 
 use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
 use forged_proto::{NextAction, ProtoEvent, Terminal};
-use forged_types::{OperationRequest, OperationResponse, Severity, Verdict};
+use forged_types::{
+    ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
+};
 use serde_json::{json, Map, Value};
 
 use crate::adapters::ports::repo_slug;
@@ -27,6 +29,7 @@ const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
 const PAUSED: &str = "forged.epic.paused";
 const RESUMED: &str = "forged.epic.resumed";
 const EPIC_PR: &str = "forged.epic.pr";
+const ROSTER_REVISED: &str = "forged.epic.roster.revised";
 
 #[derive(Debug, Clone)]
 struct FrozenChild {
@@ -44,8 +47,7 @@ struct EpicConfig {
     spec_path: String,
     base_ref: String,
     integration_branch: String,
-    profile: String,
-    roster: String,
+    execution_package: ExecutionPackageV1,
     children: Vec<FrozenChild>,
 }
 
@@ -66,6 +68,7 @@ struct EpicView {
     input: Option<Value>,
     paused: Option<Value>,
     pr: Option<Value>,
+    roster_revisions: Vec<RosterRevisionV1>,
     cursor: i64,
 }
 
@@ -108,8 +111,15 @@ fn parse_config(value: &Value) -> Result<EpicConfig, Failure> {
         spec_path: string(value, "specPath")?,
         base_ref: string(value, "baseRef")?,
         integration_branch: string(value, "integrationBranch")?,
-        profile: string(value, "profile")?,
-        roster: string(value, "roster")?,
+        execution_package: serde_json::from_value(
+            value
+                .get("executionPackage")
+                .cloned()
+                .ok_or_else(|| Failure::internal("epic start event has no executionPackage"))?,
+        )
+        .map_err(|error| {
+            Failure::internal(format!("epic execution package is invalid: {error}"))
+        })?,
         children,
     })
 }
@@ -138,6 +148,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         input: None,
         paused: None,
         pr: None,
+        roster_revisions: Vec::new(),
         cursor: events.last().map(|row| row.event_id).unwrap_or(0),
     };
     for row in events {
@@ -185,6 +196,12 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
             PAUSED => view.paused = Some(payload(&row)?),
             RESUMED => view.paused = None,
             EPIC_PR => view.pr = Some(payload(&row)?),
+            ROSTER_REVISED => {
+                let revision = serde_json::from_value(payload(&row)?).map_err(|error| {
+                    Failure::internal(format!("epic roster revision is invalid: {error}"))
+                })?;
+                view.roster_revisions.push(revision);
+            }
             _ => {}
         }
     }
@@ -193,6 +210,15 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
 
 pub(super) async fn epic_repo(ctx: &Ctx, epic: &str) -> Result<String, Failure> {
     Ok(project(ctx, epic).await?.config.repo)
+}
+
+pub(super) async fn epic_host_policy(
+    ctx: &Ctx,
+    epic: &str,
+) -> Result<(forged_types::HostPolicyV1, Option<std::path::PathBuf>), Failure> {
+    let view = project(ctx, epic).await?;
+    let policy = &view.config.execution_package.policy;
+    Ok((policy.host_policy, policy.herdr_socket.clone()))
 }
 
 pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
@@ -479,6 +505,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "profile": compiled.package.profile_ref.name,
                     "roster": compiled.package.roster_ref.name,
                     "packageSha256": compiled.package_sha256,
+                    "executionPackage": compiled.package,
                     "children": children,
                 });
                 append(ctx, &epic, STARTED, event.clone()).await?;
@@ -506,7 +533,29 @@ fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str
     })
 }
 
+fn active_execution_package(view: &EpicView) -> ExecutionPackageV1 {
+    let mut package = view.config.execution_package.clone();
+    if let Some(revision) = view.roster_revisions.last() {
+        package.roster_ref = revision.roster_ref.clone();
+        package.roster_sha256 = revision.roster_sha256.clone();
+        package.roster = revision.roster.clone();
+    }
+    package
+}
+
+fn active_compiled_definition(
+    view: &EpicView,
+) -> Result<crate::config::CompiledDefinition, Failure> {
+    crate::config::compile_frozen_package(active_execution_package(view)).map_err(|errors| {
+        Failure::internal(format!(
+            "frozen epic definition is invalid: {}",
+            serde_json::to_string(&errors).unwrap_or_default()
+        ))
+    })
+}
+
 async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
+    let active_definition = active_compiled_definition(&view)?;
     let controller = super::handoff::controller_status(ctx, &view.config.epic_id).await?;
     let live = forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await?;
     let statuses: BTreeMap<_, _> = live
@@ -536,8 +585,12 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "specPath": view.config.spec_path,
         "baseRef": view.config.base_ref,
         "integrationBranch": view.config.integration_branch,
-        "profile": view.config.profile,
-        "roster": view.config.roster,
+        "profile": view.config.execution_package.profile_ref.name,
+        "roster": view.roster_revisions.last()
+            .map(|revision| revision.roster_ref.name.as_str())
+            .unwrap_or(&view.config.execution_package.roster_ref.name),
+        "packageSha256": active_definition.package_sha256,
+        "rosterRevisions": view.roster_revisions,
         "cursor": view.cursor,
         "integration": view.integration,
         "waves": view.waves,
@@ -556,6 +609,164 @@ pub async fn epic_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         status_json(ctx, project(ctx, epic).await?).await
     })
     .await
+}
+
+/// Append one explicit roster revision to an epic. The epic controller lock
+/// makes the active-child set stable while every unmerged child receives the
+/// same resolved snapshot; future children inherit it from the epic stream.
+pub async fn epic_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let epic = match param_str(&req.params, "epic") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(&derive_key("epic_revise_roster", None, None, None), &error)
+        }
+    };
+    let roster_name = match param_str(&req.params, "roster") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), None, None),
+                &error,
+            )
+        }
+    };
+    let reason = match param_str(&req.params, "reason") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), Some(&roster_name), None),
+                &Failure::invalid("roster revision requires a non-empty reason"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), Some(&roster_name), None),
+                &error,
+            )
+        }
+    };
+    let _guard = match acquire_driver(ctx, &epic).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), Some(&roster_name), None),
+                &error,
+            )
+        }
+    };
+    let view = match project(ctx, &epic).await {
+        Ok(view) => view,
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), Some(&roster_name), None),
+                &error,
+            )
+        }
+    };
+    let (roster, roster_sha256) = match ctx
+        .config
+        .compile_roster_revision(&view.config.execution_package, &roster_name)
+    {
+        Ok(value) => value,
+        Err(errors) => {
+            return err_response(
+                &derive_key("epic_revise_roster", Some(&epic), Some(&roster_name), None),
+                &Failure::invalid(format!(
+                    "roster revision is invalid: {}",
+                    serde_json::to_string(&errors).unwrap_or_default()
+                )),
+            )
+        }
+    };
+    let matching_latest = view.roster_revisions.last().is_some_and(|revision| {
+        revision.roster_sha256 == roster_sha256 && revision.reason == reason
+    });
+    let revision = if matching_latest {
+        view.roster_revisions
+            .last()
+            .map(|value| value.revision)
+            .unwrap_or(1)
+    } else {
+        view.roster_revisions
+            .last()
+            .map(|value| value.revision)
+            .unwrap_or(1)
+            .saturating_add(1)
+    };
+    default_key(
+        req,
+        derive_key(
+            "epic_revise_roster",
+            Some(&epic),
+            Some(&roster_name),
+            Some(i64::from(revision)),
+        ),
+    );
+    req.params.insert(
+        "rosterSha256".to_owned(),
+        Value::String(roster_sha256.clone()),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(epic.clone());
+    }
+    let event = RosterRevisionV1 {
+        revision,
+        roster_ref: roster.roster_ref.clone(),
+        roster_sha256: roster_sha256.clone(),
+        roster: roster.clone(),
+        reason: reason.clone(),
+    };
+    let event_value = match serde_json::to_value(&event) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::internal(format!("serializing epic roster revision: {error}")),
+            )
+        }
+    };
+    let active_runs = view
+        .children
+        .values()
+        .filter(|state| state.merged.is_none())
+        .map(|state| state.run_id.clone())
+        .collect::<Vec<_>>();
+    let key = req.idempotency_key.clone();
+    let result = safe_effect(
+        ctx,
+        "epic_revise_roster",
+        key.clone(),
+        &epic,
+        Value::Object(req.params.clone()),
+        {
+            let epic = epic.clone();
+            move |_operation| async move {
+                let epic_for_store = epic.clone();
+                let operation_prefix = format!("epic-roster:{epic}:{revision}");
+                let child_reason = format!("epic {epic}: {reason}");
+                let value_for_store = event_value.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_roster_revisions_with_event(forged_ledger::RosterRevisionBatch {
+                        epic_id: epic_for_store,
+                        event_kind: ROSTER_REVISED.to_owned(),
+                        event_payload: value_for_store,
+                        run_ids: active_runs,
+                        roster,
+                        roster_sha256,
+                        reason: child_reason,
+                        operation_prefix,
+                    })
+                })
+                .await?;
+                Ok(event_value)
+            }
+        },
+    )
+    .await;
+    match result {
+        Ok(value) => ok_response(&key, false, value),
+        Err(error) => err_response(&key, &error),
+    }
 }
 
 async fn require_input(
@@ -641,6 +852,7 @@ async fn start_child(
     child: &FrozenChild,
     wave: u32,
     generation: u32,
+    compiled: crate::config::CompiledDefinition,
 ) -> Result<Value, Failure> {
     let run_id = if generation == 1 {
         child.id.clone()
@@ -657,14 +869,13 @@ async fn start_child(
             "repo": config.repo,
             "spec": child.spec_path,
             "baseRef": config.integration_branch,
-            "profile": config.profile,
-            "roster": config.roster,
         }) {
             Value::Object(map) => map,
             _ => Map::new(),
         },
     };
-    let started = response(super::ops::run_start(ctx, &mut request).await)?;
+    let started =
+        response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)?;
     let event = json!({
         "childId": child.id,
         "runId": run_id,
@@ -1002,8 +1213,9 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
         .copied()
         .unwrap_or(0)
         .saturating_add(1);
+    let compiled = active_compiled_definition(&view)?;
     Ok(Step::Progress(
-        start_child(ctx, &view.config, frontier[0], wave, generation).await?,
+        start_child(ctx, &view.config, frontier[0], wave, generation, compiled).await?,
     ))
 }
 

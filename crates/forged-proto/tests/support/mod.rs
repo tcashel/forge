@@ -361,8 +361,21 @@ impl ViewBuilder {
             settled_operations: self.settled,
             proto_events: self.events,
             roster: self.roster,
-            gate_commands: vec!["cargo test --workspace".to_owned()],
-            transport_retry_budget: self.budget,
+            policy: forged_types::ExecutionPolicyV1 {
+                gate_commands: vec!["cargo test --workspace".to_owned()],
+                stage_budget_s: [
+                    Stage::Implement,
+                    Stage::ReviewClaude,
+                    Stage::ReviewCodex,
+                    Stage::Fix,
+                ]
+                .into_iter()
+                .map(|stage| (stage, 1_800))
+                .collect(),
+                transport_retry_budget: self.budget,
+                host_policy: forged_types::HostPolicyV1::Off,
+                herdr_socket: None,
+            },
             now: T0.to_owned(),
             execution_package: None,
             active_roster_revision: None,

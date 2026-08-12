@@ -34,6 +34,6 @@ pub use ledger::{default_db_path, Ledger};
 pub use types::{
     AttemptRow, AttemptState, ClaimedAttempt, EffectClass, EventRow, MergeSlotRow, NewPacket,
     NewRun, NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState,
-    OperationTicket, PacketRow, Pragmas, RosterRevisionRow, RunDefinitionRow, RunRow, RunState,
-    SlotOutcome, UsageTotals,
+    OperationTicket, PacketRow, Pragmas, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
+    RunRow, RunState, SlotOutcome, UsageTotals,
 };

@@ -241,6 +241,20 @@ pub struct RosterRevisionRow {
     pub operation_id: Option<String>,
 }
 
+/// One atomic epic roster transition: current child revisions plus the
+/// governing parent event.
+#[derive(Debug, Clone)]
+pub struct RosterRevisionBatch {
+    pub epic_id: String,
+    pub event_kind: String,
+    pub event_payload: serde_json::Value,
+    pub run_ids: Vec<String>,
+    pub roster: forged_types::ResolvedRosterV1,
+    pub roster_sha256: String,
+    pub reason: String,
+    pub operation_prefix: String,
+}
+
 /// One row of `packets`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketRow {

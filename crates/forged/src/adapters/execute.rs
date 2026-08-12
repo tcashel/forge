@@ -34,6 +34,10 @@ pub struct ExecutionContext {
     pub review_evidence: Vec<String>,
     /// The run's remote URL (for Fix prompts).
     pub push_url: String,
+    /// Frozen process-host policy for this run.
+    pub host_policy: HostPolicy,
+    /// Frozen Herdr endpoint for this run.
+    pub herdr_socket: Option<std::path::PathBuf>,
 }
 
 /// How one executed packet ended.
@@ -71,6 +75,8 @@ pub fn build_packet(
     intent: &PacketIntent,
     spec_path: &str,
     spec_sha256: &str,
+    gate_commands: &[String],
+    budget_s: u64,
 ) -> WorkPacket {
     let stage = intent.stage;
     let packet_id = intent
@@ -89,12 +95,6 @@ pub fn build_packet(
         }
         Stage::Fix => "address the merged review findings and push the fixes",
     };
-    let budget_s = ctx
-        .config
-        .stage_budget_s
-        .get(&stage)
-        .copied()
-        .unwrap_or(1800);
     WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id,
@@ -112,7 +112,7 @@ pub fn build_packet(
         base_ref: run.base_ref.clone(),
         contract: StageContract {
             instructions: instructions.to_owned(),
-            gate_commands: ctx.config.gate_commands.clone(),
+            gate_commands: gate_commands.to_vec(),
             deliverable,
             budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
         },
@@ -432,11 +432,11 @@ async fn run_attempt(
     // actual host selection, so a missing socket can never masquerade as a
     // Herdr-backed session.
     let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) =
-        match ctx.config.host_policy {
+        match exec.host_policy {
             HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
-            HostPolicy::Preferred | HostPolicy::Required => match ctx.config.herdr_sock.as_ref() {
+            HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
                 None => {
-                    if ctx.config.host_policy == HostPolicy::Required {
+                    if exec.host_policy == HostPolicy::Required {
                         return fail_and_grant_retry(
                             ctx,
                             &packet_id,
@@ -461,7 +461,7 @@ async fn run_attempt(
                         "herdr",
                         Some(sock.to_string_lossy().into_owned()),
                     ),
-                    Err(error) if ctx.config.host_policy == HostPolicy::Preferred => {
+                    Err(error) if exec.host_policy == HostPolicy::Preferred => {
                         crate::core::sessions::record_host_fallback(
                             ctx,
                             &run_id,

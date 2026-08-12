@@ -224,6 +224,14 @@ impl ForgedServer {
         self.call("epic_resolve", args.0).await
     }
 
+    #[tool(
+        name = "epic_revise_roster",
+        description = "Append one durable roster revision for current and future epic children."
+    )]
+    pub async fn epic_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_revise_roster", args.0).await
+    }
+
     /// Unified reconnect projection, rendered by the optional MCP App.
     #[tool(
         name = "overview",

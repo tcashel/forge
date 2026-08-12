@@ -1234,6 +1234,9 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
         serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
             .expect("config json");
     config["roster"]["implement"]["provider"] = json!("unavailable-provider");
+    config["gate_commands"] = json!(["false"]);
+    config["stage_budget_s"]["implement"] = json!(1);
+    config["transport_retry_budget"] = json!(0);
     std::fs::write(
         &config_path,
         serde_json::to_string_pretty(&config).expect("serialize config"),
@@ -1253,6 +1256,138 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
     assert_eq!(
         status["result"]["run"]["definition"]["rosterRevision"],
         json!(1)
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["policy"]["gateCommands"],
+        json!(["true"]),
+        "the gate policy is frozen with the run rather than reread"
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["policy"]["transportRetryBudget"],
+        json!(3)
+    );
+}
+
+#[test]
+fn epic_roster_revision_updates_current_and_future_children() {
+    let env = TestEnv::new("forged-epic-roster-revision");
+    env.enable_dynamic_gh();
+    env.add_uniform_roster("all-codex", "codex", "gpt-5.6-sol");
+    env.seed_epic(
+        "epic-roster",
+        &[
+            ("roster-child-one", &env.spec, true),
+            ("roster-child-two", &env.spec, false),
+        ],
+    );
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-roster",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert!(started["result"]["executionPackage"].is_object());
+
+    for _ in 0..2 {
+        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-roster"]);
+        assert_eq!(code, 0, "advance to first child: {advanced}");
+    }
+    let (code, revised) = env.forged(&[
+        "epic",
+        "revise-roster",
+        "--epic",
+        "epic-roster",
+        "--roster",
+        "all-codex",
+        "--reason",
+        "anthropic access unavailable",
+    ]);
+    assert_eq!(code, 0, "epic roster revision: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    assert_eq!(revised["result"]["rosterRef"]["name"], json!("all-codex"));
+    let current_revision = env
+        .ledger()
+        .latest_roster_revision("roster-child-one")
+        .expect("read current child revision")
+        .expect("current child revision");
+    assert_eq!(current_revision.revision, 2);
+    assert_eq!(
+        serde_json::from_str::<Value>(&current_revision.roster_ref_json).expect("roster ref")
+            ["name"],
+        json!("all-codex")
+    );
+
+    env.set_scenario("reviewclaude", "approve", 2);
+    env.seed_frontier("roster-child-two");
+    let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-roster"]);
+    assert_eq!(code, 0, "drive revised epic: {driven}");
+    let ledger = env.ledger();
+    let future_definition = ledger
+        .get_run_definition("roster-child-two")
+        .expect("read future child definition")
+        .expect("future child definition");
+    let future_package: forged_types::ExecutionPackageV1 =
+        serde_json::from_str(&future_definition.package_json).expect("future package");
+    assert_eq!(future_package.roster_ref.name, "all-codex");
+    let runs = ["roster-child-one", "roster-child-two"];
+    for run in runs {
+        let attempt = ledger
+            .list_packets(run)
+            .expect("packets")
+            .into_iter()
+            .find(|packet| {
+                serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+                    .ok()
+                    .and_then(|packet| packet.execution)
+                    .is_some_and(|execution| {
+                        execution.purpose == forged_types::SeatPurpose::Implement
+                    })
+            })
+            .and_then(|packet| {
+                ledger
+                    .list_live_attempts(Some(run))
+                    .ok()
+                    .and_then(|attempts| {
+                        attempts
+                            .into_iter()
+                            .find(|attempt| attempt.packet_id == packet.packet_id)
+                    })
+                    .or_else(|| {
+                        let events = ledger.list_events(Some(run), 0, 4096).ok()?;
+                        let attempt_id = events.into_iter().find_map(|event| {
+                            let value: Value = serde_json::from_str(&event.payload_json).ok()?;
+                            (event.kind == "attempt.state"
+                                && value.get("packetId")?.as_str()? == packet.packet_id)
+                                .then(|| value.get("attemptId")?.as_i64())
+                                .flatten()
+                        })?;
+                        ledger.get_attempt(attempt_id).ok()
+                    })
+            })
+            .expect("implementation attempt");
+        assert!(
+            attempt.claimant.starts_with("codex:"),
+            "{run} must use the revised roster: {attempt:?}"
+        );
+    }
+    ledger.close().expect("close ledger");
+    let (_, status) = env.forged(&["epic", "status", "--epic", "epic-roster"]);
+    assert_eq!(status["result"]["roster"], json!("all-codex"));
+    assert_eq!(
+        status["result"]["rosterRevisions"].as_array().map(Vec::len),
+        Some(1)
     );
 }
 
