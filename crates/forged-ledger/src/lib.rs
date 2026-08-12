@@ -9,9 +9,13 @@
 //! and no transaction can ever span an `.await` by construction. Callers in
 //! async contexts wrap calls in `spawn_blocking` at their own layer.
 
+mod attempts;
 mod error;
+mod events;
 mod ledger;
 mod migrations;
+mod packets;
+mod runs;
 mod time;
 mod types;
 
