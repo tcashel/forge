@@ -214,9 +214,11 @@ async fn happy_path_over_the_mock_socket() {
             return actions;
         }
         match (method, n) {
+            // kill_confirmed's entry probe sees the pane still live.
+            ("pane.process_info", 2) => vec![Action::Respond(shell_ready("p1"))],
             ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
             // The post-kill liveness probe: hang up with it outstanding.
-            ("pane.process_info", 2) => vec![Action::Hangup],
+            ("pane.process_info", 3) => vec![Action::Hangup],
             other => panic!("unexpected request {other:?}"),
         }
     });
@@ -317,6 +319,8 @@ async fn kill_with_sentinel_on_entry_is_already_dead() {
             return actions;
         }
         match (method, n) {
+            // The entry probe still runs even with the sentinel present.
+            ("pane.process_info", 2) => vec![Action::Respond(shell_ready("p1"))],
             ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
             other => panic!("unexpected request {other:?}"),
         }
@@ -329,6 +333,37 @@ async fn kill_with_sentinel_on_entry_is_already_dead() {
         host.kill_confirmed(&id).await.expect("kill"),
         Confirmed::AlreadyDead
     );
+    // The still-open pane really was closed on the way out.
+    assert!(mock.methods().contains(&"pane.close".to_string()));
+}
+
+#[tokio::test]
+async fn kill_with_sentinel_propagates_a_failed_close() {
+    // Sentinel present but the pane is live and pane.close is REFUSED with
+    // a non-pane-not-found error: the failure must propagate rather than
+    // hide behind AlreadyDead with the pane left open.
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.process_info", 2) => vec![Action::Respond(shell_ready("p1"))],
+            ("pane.close", 1) => vec![Action::RespondErr {
+                code: "INTERNAL",
+                message: "close refused",
+            }],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    std::fs::write(base.path().join("p1").join("status"), "0\n").expect("write sentinel");
+    let err = host
+        .kill_confirmed(&id)
+        .await
+        .expect_err("a refused close must propagate");
+    assert!(matches!(err, HostError::Unavailable { .. }));
 }
 
 #[tokio::test]

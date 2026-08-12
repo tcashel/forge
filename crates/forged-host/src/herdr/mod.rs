@@ -477,5 +477,17 @@ mod tests {
             message: "boom".to_string(),
         };
         assert!(!other.is_pane_not_found());
+        // A bare "not found" about something OTHER than the pane must never
+        // read as pane death.
+        let workspace = WireError {
+            code: Value::String("WORKSPACE_NOT_FOUND".to_string()),
+            message: "workspace not found".to_string(),
+        };
+        assert!(!workspace.is_pane_not_found());
+        let method = WireError {
+            code: Value::String("METHOD_NOT_FOUND".to_string()),
+            message: "method not found: pane.fly".to_string(),
+        };
+        assert!(!method.is_pane_not_found());
     }
 }

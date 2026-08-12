@@ -10,6 +10,7 @@ use std::time::Duration;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use serde_json::json;
+use tokio::time::Instant;
 
 use super::wire::{PaneInfoResult, Pong, ProcessInfo};
 use super::{CallError, Connection};
@@ -19,10 +20,13 @@ use crate::{sentinel, Confirmed, HostError, HostSessionId, Liveness, SessionHost
 /// The protocol this crate is pinned to; anything else refuses to operate.
 const HERDR_PROTOCOL: u32 = 19;
 
-const READINESS_POLLS: u32 = 60; // 50 ms apart ≈ 3 s
+// Phase budgets are WALL-CLOCK deadlines, not iteration counts: each poll
+// iteration may itself await a multi-second RPC or a subprocess, so counting
+// iterations would let the real wait stretch far beyond the spec'd limit.
+const READINESS_BUDGET: Duration = Duration::from_secs(3);
 const READINESS_INTERVAL: Duration = Duration::from_millis(50);
-const CLOSE_VERIFY_POLLS: u32 = 50; // 100 ms apart ≈ 5 s
-const KILL_REVERIFY_POLLS: u32 = 20; // 100 ms apart ≈ 2 s
+const CLOSE_VERIFY_BUDGET: Duration = Duration::from_secs(5);
+const KILL_REVERIFY_BUDGET: Duration = Duration::from_secs(2);
 const KILL_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// What a `pane.process_info` probe concluded about a pane.
@@ -141,28 +145,26 @@ impl HerdrHost {
     /// status-dir creation, and the single `pane.send_input`. Any failure
     /// here makes the caller roll the pane back with a best-effort close.
     async fn finish_spawn(&self, pane_id: &str, shell_line: &str) -> Result<PathBuf, HostError> {
-        // Wait for the pane's shell before typing into it.
-        let mut ready = false;
-        for _ in 0..READINESS_POLLS {
+        // Wait for the pane's shell before typing into it, within a
+        // wall-clock deadline; sleep only the remaining budget.
+        let deadline = Instant::now() + READINESS_BUDGET;
+        loop {
             match self.probe_pane(pane_id).await? {
                 PaneProbe::Gone => {
                     return Err(HostError::spawn_failed(
                         "pane disappeared before its shell started",
                     ))
                 }
-                PaneProbe::Info(info) => {
-                    if info.shell_pid.is_some() {
-                        ready = true;
-                        break;
-                    }
-                }
+                PaneProbe::Info(info) if info.shell_pid.is_some() => break,
+                PaneProbe::Info(_) => {}
             }
-            tokio::time::sleep(READINESS_INTERVAL).await;
-        }
-        if !ready {
-            return Err(HostError::spawn_failed(
-                "pane shell never became ready within the 3 s budget",
-            ));
+            let now = Instant::now();
+            if now >= deadline {
+                return Err(HostError::spawn_failed(
+                    "pane shell never became ready within the 3 s budget",
+                ));
+            }
+            tokio::time::sleep(READINESS_INTERVAL.min(deadline - now)).await;
         }
 
         // Reserve <base>/<pane-id>/ exclusively; pane ids are never reused,
@@ -194,23 +196,33 @@ impl HerdrHost {
         Ok(status_path)
     }
 
-    /// Poll until every captured foreground identity reads dead, within
-    /// `polls` iterations. Returns true when all are verified dead.
-    async fn all_targets_dead(&self, targets: &[ProcessIdentity], polls: u32) -> bool {
-        for _ in 0..polls {
+    /// Poll until every captured foreground identity reads dead, within a
+    /// wall-clock `budget`. `Ok(true)` when all are verified dead;
+    /// `Ok(false)` when the deadline passes first; `Err` when an identity
+    /// probe could not run at all (which proves nothing about death).
+    async fn all_targets_dead(
+        &self,
+        targets: &[ProcessIdentity],
+        budget: Duration,
+    ) -> Result<bool, HostError> {
+        let deadline = Instant::now() + budget;
+        loop {
             let mut any_alive = false;
             for target in targets {
-                if target.is_same_process().await {
+                if target.is_same_process().await? {
                     any_alive = true;
                     break;
                 }
             }
             if !any_alive {
-                return true;
+                return Ok(true);
             }
-            tokio::time::sleep(KILL_POLL_INTERVAL).await;
+            let now = Instant::now();
+            if now >= deadline {
+                return Ok(false);
+            }
+            tokio::time::sleep(KILL_POLL_INTERVAL.min(deadline - now)).await;
         }
-        false
     }
 }
 
@@ -301,13 +313,28 @@ impl SessionHost for HerdrHost {
         let pane_id = id.as_str().to_string();
 
         // Entry reads, once each, before acting: sentinel then pane probe.
-        if sentinel::read_status(&status_path)?.is_some() {
-            // The line already finished; close the pane and report the
-            // verified prior death.
-            self.best_effort_close(&pane_id).await;
+        let sentinel_present = sentinel::read_status(&status_path)?.is_some();
+        let entry_probe = self.probe_pane(&pane_id).await?;
+        if sentinel_present {
+            // The line already finished: verified prior death. If the pane
+            // still exists, close it FOR REAL — only pane-not-found is
+            // tolerated; a transport failure, RPC timeout, or any other
+            // error response propagates rather than hiding behind
+            // AlreadyDead with the pane possibly left open.
+            if let PaneProbe::Info(_) = entry_probe {
+                match self
+                    .conn
+                    .call("pane.close", json!({"pane_id": &pane_id}))
+                    .await
+                {
+                    Ok(_) => {}
+                    Err(CallError::Rpc(e)) if e.is_pane_not_found() => {}
+                    Err(other) => return Err(other.into_host_error()),
+                }
+            }
             return Ok(Confirmed::AlreadyDead);
         }
-        let info = match self.probe_pane(&pane_id).await? {
+        let info = match entry_probe {
             // Verified missing BEFORE pane.close was attempted.
             PaneProbe::Gone => return Ok(Confirmed::AlreadyDead),
             PaneProbe::Info(info) => info,
@@ -343,27 +370,34 @@ impl SessionHost for HerdrHost {
             if close_reported_gone {
                 return Ok(Confirmed::Killed);
             }
-            for _ in 0..CLOSE_VERIFY_POLLS {
+            let deadline = Instant::now() + CLOSE_VERIFY_BUDGET;
+            loop {
                 if self.conn.pane_closed_observed(&pane_id) {
                     return Ok(Confirmed::Killed);
                 }
                 if let PaneProbe::Gone = self.probe_pane(&pane_id).await? {
                     return Ok(Confirmed::Killed);
                 }
-                tokio::time::sleep(KILL_POLL_INTERVAL).await;
+                let now = Instant::now();
+                if now >= deadline {
+                    return Err(HostError::KillVerifyTimeout);
+                }
+                tokio::time::sleep(KILL_POLL_INTERVAL.min(deadline - now)).await;
             }
-            return Err(HostError::KillVerifyTimeout);
         }
 
         // Verify every captured pid dead; escalate to SIGKILL on the
         // foreground process group if survivors remain.
-        if self.all_targets_dead(&targets, CLOSE_VERIFY_POLLS).await {
+        if self.all_targets_dead(&targets, CLOSE_VERIFY_BUDGET).await? {
             return Ok(Confirmed::Killed);
         }
         if let Some(pgid) = pgid {
             let _ = killpg(Pid::from_raw(pgid), Signal::SIGKILL);
         }
-        if self.all_targets_dead(&targets, KILL_REVERIFY_POLLS).await {
+        if self
+            .all_targets_dead(&targets, KILL_REVERIFY_BUDGET)
+            .await?
+        {
             return Ok(Confirmed::Killed);
         }
         Err(HostError::KillVerifyTimeout)

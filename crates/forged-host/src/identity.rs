@@ -2,6 +2,8 @@
 //! `ps -p <pid> -o lstart=` (macOS-only target per ADR-0012 makes this
 //! acceptable; no new dependency).
 
+use crate::HostError;
+
 /// A pid paired with the process start time reported by `ps -o lstart=`.
 ///
 /// `ps` lstart has WHOLE-SECOND precision, so a pid recycled onto a new
@@ -18,45 +20,53 @@ pub(crate) struct ProcessIdentity {
     pub(crate) lstart: String,
 }
 
-/// Run `ps -p <pid> -o lstart=` and return the trimmed stdout, or `None`
-/// when the pid does not resolve (non-zero `ps` exit or empty trimmed
-/// stdout) — the EXPECTED dead signal, never an error.
-async fn lstart_of(pid: u32) -> Option<String> {
+/// Run `ps -p <pid> -o lstart=` and return the trimmed stdout.
+///
+/// `Ok(None)` — non-zero `ps` exit or empty trimmed stdout — is the
+/// EXPECTED dead signal: `ps` ran and confirmed the pid does not resolve.
+/// A failure to EXECUTE `ps` at all proves nothing about the pid and is
+/// kept distinct as `Err(HostError::Unavailable)` — it must never be
+/// collapsed into a death verdict.
+async fn lstart_of(pid: u32) -> Result<Option<String>, HostError> {
     let output = tokio::process::Command::new("ps")
         .args(["-p", &pid.to_string(), "-o", "lstart="])
         .output()
         .await
-        .ok()?;
+        .map_err(|e| HostError::unavailable(format!("running ps for pid {pid}: {e}")))?;
     if !output.status.success() {
-        return None;
+        return Ok(None);
     }
     let lstart = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if lstart.is_empty() {
-        None
+        Ok(None)
     } else {
-        Some(lstart)
+        Ok(Some(lstart))
     }
 }
 
 impl ProcessIdentity {
-    /// Capture the identity of a live pid. `None` means `ps` could not
-    /// resolve the pid — the process is already gone; store no identity and
-    /// keep the session valid (the sentinel and `try_wait` decide
-    /// `Exited` vs `Vanished`).
+    /// Capture the identity of a live pid. `None` means no identity is
+    /// stored: either `ps` confirmed the pid absent (the process is already
+    /// gone — keep the session valid; the sentinel and `try_wait` decide
+    /// `Exited` vs `Vanished`), or `ps` itself could not run. Collapsing the
+    /// exec failure here is safe in the FAIL-SAFE direction only: a missing
+    /// identity never produces a death verdict.
     pub(crate) async fn capture(pid: u32) -> Option<Self> {
-        let lstart = lstart_of(pid).await?;
+        let lstart = lstart_of(pid).await.ok().flatten()?;
         Some(ProcessIdentity { pid, lstart })
     }
 
     /// A pid is "the same process" only if `ps` still resolves it AND the
     /// trimmed lstart is unchanged. A non-zero `ps` exit or empty trimmed
     /// stdout means the pid is gone (dead); a mismatched lstart means the
-    /// pid was recycled — the original process is dead either way.
-    pub(crate) async fn is_same_process(&self) -> bool {
-        match lstart_of(self.pid).await {
+    /// pid was recycled — the original process is dead either way. A
+    /// failure to execute `ps` is `Err`: it proves nothing about the pid
+    /// and must never read as death.
+    pub(crate) async fn is_same_process(&self) -> Result<bool, HostError> {
+        Ok(match lstart_of(self.pid).await? {
             Some(current) => current == self.lstart,
             None => false,
-        }
+        })
     }
 }
 
@@ -72,7 +82,7 @@ mod tests {
             pid: std::process::id(),
             lstart: "Thu Jan  1 00:00:00 1970".to_string(),
         };
-        assert!(!fabricated.is_same_process().await);
+        assert!(!fabricated.is_same_process().await.expect("ps runs"));
     }
 
     #[tokio::test]
@@ -80,7 +90,7 @@ mod tests {
         let own = ProcessIdentity::capture(std::process::id())
             .await
             .expect("own pid resolves");
-        assert!(own.is_same_process().await);
+        assert!(own.is_same_process().await.expect("ps runs"));
     }
 
     #[tokio::test]
