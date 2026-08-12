@@ -52,11 +52,15 @@ fn seed_run(ledger: &Ledger) {
 }
 
 fn request_for(key: &str) -> OperationRequest {
+    request_with(key, serde_json::Map::new())
+}
+
+fn request_with(key: &str, params: serde_json::Map<String, serde_json::Value>) -> OperationRequest {
     OperationRequest {
         schema_version: 1,
         idempotency_key: key.to_owned(),
         run_id: Some(RUN.to_owned()),
-        params: serde_json::Map::new(),
+        params,
     }
 }
 
@@ -67,7 +71,25 @@ fn begin_inflight(
     class: EffectClass,
     claim_token: Option<&str>,
 ) -> String {
-    let request = request_for(key);
+    begin_inflight_with(
+        ledger,
+        name,
+        key,
+        class,
+        claim_token,
+        serde_json::Map::new(),
+    )
+}
+
+fn begin_inflight_with(
+    ledger: &Ledger,
+    name: &str,
+    key: &str,
+    class: EffectClass,
+    claim_token: Option<&str>,
+    params: serde_json::Map<String, serde_json::Value>,
+) -> String {
+    let request = request_with(key, params);
     record(
         ledger,
         RUN,
@@ -291,16 +313,27 @@ async fn observe_only_is_settled_by_observation() {
 
 // An observation settles an `ObserveOnly` step only when it confirms the
 // effect. A push interrupted before the branch reached the remote observes
-// no sha: storing that as the row's terminal envelope would tell `advance`
-// the push is done and let the run open a PR against a ref that does not
-// exist.
+// no sha — and a pre-existing stale branch observes the WRONG sha: storing
+// either as the row's terminal envelope would tell `advance` the push is
+// done and let the run open a PR carrying code that never landed. Only the
+// intended sha, recovered from the request's `params.expectedSha`,
+// confirms.
 #[tokio::test]
 async fn an_observe_only_step_whose_effect_did_not_land_is_released_not_settled() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     seed_run(&ledger);
     let key = format!("{RUN}/push/0");
-    let operation_id = begin_inflight(&ledger, "push", &key, EffectClass::ObserveOnly, None);
+    let mut params = serde_json::Map::new();
+    params.insert("expectedSha".to_owned(), serde_json::json!("deadbeef"));
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "push",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params.clone(),
+    );
 
     // The fake reports no remote sha: the push never landed.
     let ports = FakePorts::new();
@@ -315,9 +348,39 @@ async fn an_observe_only_step_whose_effect_did_not_land_is_released_not_settled(
         .any(|c| matches!(c, PortCall::RemoteSha { branch, .. } if branch == "feat/x")));
     assert!(ledger.find_operation("push", &key).expect("find").is_none());
 
-    // A later pass that does see the sha settles the row.
+    // A stale branch already on the remote answers with SOME sha — not the
+    // intended one. That is not the interrupted push landing; released.
     let ports = FakePorts::new();
-    let operation_id = begin_inflight(&ledger, "push", &key, EffectClass::ObserveOnly, None);
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "push",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params.clone(),
+    );
+    ports
+        .sha_script
+        .lock()
+        .expect("lock")
+        .push_back(Some("0ddc0de".to_owned()));
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("reconcile");
+    assert_eq!(report.released, vec![operation_id]);
+    assert!(report.observed.is_empty(), "{:?}", report.observed);
+    assert!(ledger.find_operation("push", &key).expect("find").is_none());
+
+    // A later pass that sees the INTENDED sha settles the row.
+    let ports = FakePorts::new();
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "push",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params,
+    );
     ports
         .sha_script
         .lock()
@@ -329,6 +392,97 @@ async fn an_observe_only_step_whose_effect_did_not_land_is_released_not_settled(
     assert_eq!(report.observed, vec![operation_id]);
     let row = ledger
         .find_operation("push", &key)
+        .expect("find")
+        .expect("row survives");
+    assert_eq!(row.state, OperationState::Terminal);
+    ledger.close().expect("close");
+}
+
+// Resolve settles only when the observation proves BOTH halves of the
+// effect-class table's row: the worktree is present AND the bd lease is
+// held by the expected holder recovered from the request's
+// `params.leaseHolder`. A worktree with no lease or the wrong lease is an
+// unowned (or hijacked) run: released for redo, never settled.
+#[tokio::test]
+async fn resolve_settles_only_with_worktree_and_the_expected_lease_holder() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+    let key = format!("{RUN}/resolve/0");
+    let mut params = serde_json::Map::new();
+    params.insert(
+        "leaseHolder".to_owned(),
+        serde_json::json!("claude:sess-a:1"),
+    );
+
+    // Worktree present but NO lease held (the fake's default): released.
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "resolve",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params.clone(),
+    );
+    let ports = FakePorts::new();
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("pass 1");
+    assert_eq!(report.released, vec![operation_id]);
+    assert!(report.observed.is_empty(), "{:?}", report.observed);
+    assert!(ledger
+        .find_operation("resolve", &key)
+        .expect("find")
+        .is_none());
+
+    // Worktree present under the WRONG lease holder: released.
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "resolve",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params.clone(),
+    );
+    let ports = FakePorts::new();
+    ports
+        .resolve_script
+        .lock()
+        .expect("lock")
+        .push_back(forged_proto::ResolveState {
+            worktree_present: true,
+            lease_holder: Some("claude:sess-b:9".to_owned()),
+        });
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("pass 2");
+    assert_eq!(report.released, vec![operation_id]);
+    assert!(report.observed.is_empty(), "{:?}", report.observed);
+
+    // Worktree present AND the expected holder: settled by observation.
+    let operation_id = begin_inflight_with(
+        &ledger,
+        "resolve",
+        &key,
+        EffectClass::ObserveOnly,
+        None,
+        params,
+    );
+    let ports = FakePorts::new();
+    ports
+        .resolve_script
+        .lock()
+        .expect("lock")
+        .push_back(forged_proto::ResolveState {
+            worktree_present: true,
+            lease_holder: Some("claude:sess-a:1".to_owned()),
+        });
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("pass 3");
+    assert_eq!(report.observed, vec![operation_id]);
+    let row = ledger
+        .find_operation("resolve", &key)
         .expect("find")
         .expect("row survives");
     assert_eq!(row.state, OperationState::Terminal);

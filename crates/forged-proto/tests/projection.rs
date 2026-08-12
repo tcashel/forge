@@ -164,8 +164,12 @@ fn every_proto_event_kind_round_trips_through_the_ledger() {
         ProtoEvent::Quarantine {
             packet_id: packet_id(RUN, Stage::Implement, 1),
             attempt_id: 1,
-            name: "result.json".to_owned(),
-            result: result_for(&packet_id(RUN, Stage::Implement, 1), implement_ok(5)),
+            reason: "refused (StaleClaimToken): claim token is not running".to_owned(),
+            name: Some("result.json".to_owned()),
+            result: Some(result_for(
+                &packet_id(RUN, Stage::Implement, 1),
+                implement_ok(5),
+            )),
         },
     ];
     for event in &events {

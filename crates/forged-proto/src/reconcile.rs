@@ -14,8 +14,10 @@
 
 use std::collections::HashMap;
 
-use forged_ledger::{AttemptRow, AttemptState, EffectClass, Ledger, LedgerError, RunRow};
-use forged_types::{ErrorCode, OperationResponse, Outcome, PacketResult, Stage};
+use forged_ledger::{
+    AttemptRow, AttemptState, EffectClass, Ledger, LedgerError, OperationRow, RunRow,
+};
+use forged_types::{ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, Stage};
 use serde_json::{json, Value};
 
 use crate::error::{PortError, ProtoError};
@@ -151,8 +153,10 @@ pub async fn land_packet_result(
             let event = ProtoEvent::Quarantine {
                 packet_id: packet_id.to_owned(),
                 attempt_id,
-                name: "result.json".to_owned(),
-                result: result.clone(),
+                // The required `reason` is the fence's refusal, verbatim.
+                reason: err.to_string(),
+                name: Some("result.json".to_owned()),
+                result: Some(result.clone()),
             };
             let run_id = run_id.to_owned();
             on_ledger(ledger, move |l| record(l, &run_id, event)).await?;
@@ -379,10 +383,14 @@ async fn settle_operations(
                 // is not there — those observations say the step did not
                 // happen, and storing them as the row's terminal envelope
                 // would tell `advance` the step is done and let the run walk
-                // straight past it. Unconfirmed, the row is released instead
-                // and the step runs again.
+                // straight past it. Confirmation is judged against the
+                // intent recovered from the row's `proto.operation.request`
+                // event where the observation alone cannot prove it — a
+                // stale remote branch has SOME sha, and a worktree can exist
+                // under someone else's lease. Unconfirmed, the row is
+                // released instead and the step runs again.
                 let observation = observe(ports, run, &op.name).await?;
-                if !confirms_effect(&op.name, &observation) {
+                if !confirms_effect(&op.name, &observation, recovered_request(proto_events, &op)) {
                     let operation_id = op.operation_id.clone();
                     on_ledger(ledger, move |l| {
                         l.release_operation(&operation_id)
@@ -418,17 +426,7 @@ async fn settle_operations(
                     l.find_attempt_by_token(&token).map_err(ProtoError::Ledger)
                 })
                 .await?;
-                let recovered = proto_events.iter().find_map(|e| match e {
-                    ProtoEvent::OperationRequest {
-                        name,
-                        idempotency_key,
-                        request,
-                        ..
-                    } if *name == op.name && *idempotency_key == op.idempotency_key => {
-                        Some(request.clone())
-                    }
-                    _ => None,
-                });
+                let recovered = recovered_request(proto_events, &op).cloned();
                 match (owner, recovered) {
                     (Some(owner), Some(request)) => {
                         let body = serde_json::to_vec(&request).map_err(|err| {
@@ -455,21 +453,68 @@ async fn settle_operations(
     Ok(())
 }
 
+/// The `proto.operation.request` event recorded for an operation row,
+/// recovered by `(name, idempotency_key)` — the only durable copy of an
+/// interrupted operation's parameters (`OperationRow` stores only
+/// `request_sha256`).
+fn recovered_request<'e>(
+    proto_events: &'e [ProtoEvent],
+    op: &OperationRow,
+) -> Option<&'e OperationRequest> {
+    proto_events.iter().find_map(|e| match e {
+        ProtoEvent::OperationRequest {
+            name,
+            idempotency_key,
+            request,
+            ..
+        } if *name == op.name && *idempotency_key == op.idempotency_key => Some(request),
+        _ => None,
+    })
+}
+
 /// Whether an [`observe`] answer confirms its step's effect actually
-/// landed: the worktree is there, the PR exists, the branch reached the
-/// remote. Each mirrors the effect-class table's "settled after a crash by"
-/// column, and anything else — including a shape this crate does not know —
-/// counts as unconfirmed, the conservative direction.
-fn confirms_effect(name: &str, observation: &Value) -> bool {
+/// landed, judged against the intent recovered from the step's
+/// `proto.operation.request` event wherever the observation alone cannot
+/// prove it:
+///
+/// - `resolve` — the worktree is present AND the observed bd lease holder
+///   equals the request's `params.leaseHolder`. A worktree with no lease or
+///   the wrong lease is an unowned (or hijacked) run and must not settle,
+///   per the effect-class table's "worktree presence + bd lease holder".
+/// - `draftpr` — the PR exists.
+/// - `push` — the observed remote sha equals the request's
+///   `params.expectedSha`. A pre-existing stale branch answers with SOME
+///   sha, so bare existence would mark an interrupted push terminal and let
+///   the run advance to `DraftPr` carrying the wrong code; only the
+///   intended sha confirms.
+///
+/// Each rule mirrors the effect-class table's "settled after a crash by"
+/// column, and anything else — a missing or extra-less request event, a
+/// shape this crate does not know — counts as unconfirmed, the conservative
+/// direction: the row is released and the step runs again.
+fn confirms_effect(name: &str, observation: &Value, request: Option<&OperationRequest>) -> bool {
+    let expected = |key: &str| -> Option<&str> {
+        request
+            .and_then(|r| r.params.get(key))
+            .and_then(Value::as_str)
+    };
     match name {
-        "resolve" => observation
-            .get("worktreePresent")
-            .and_then(Value::as_bool)
-            .unwrap_or(false),
+        "resolve" => {
+            let worktree_present = observation
+                .get("worktreePresent")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let holder_held = match expected("leaseHolder") {
+                Some(want) => observation.get("leaseHolder").and_then(Value::as_str) == Some(want),
+                None => false,
+            };
+            worktree_present && holder_held
+        }
         "draftpr" => observation.get("pr").is_some_and(|pr| !pr.is_null()),
-        "push" => observation
-            .get("remoteSha")
-            .is_some_and(|sha| !sha.is_null()),
+        "push" => match expected("expectedSha") {
+            Some(want) => observation.get("remoteSha").and_then(Value::as_str) == Some(want),
+            None => false,
+        },
         _ => false,
     }
 }
@@ -542,10 +587,13 @@ async fn harvest_and_verify(
     let claims: Vec<(&i64, &String, u32, Option<&str>)> = proto_events
         .iter()
         .filter_map(|event| {
+            // A quarantine event without the optional `result` extension —
+            // a spec-shaped payload from another writer — carries no claim
+            // to check.
             let ProtoEvent::Quarantine {
                 packet_id,
                 attempt_id,
-                result,
+                result: Some(result),
                 ..
             } = event
             else {

@@ -81,6 +81,11 @@ pub fn project_run(
 /// it is the engine's only evidence that a step is settled: a step whose row
 /// was released for redo, or whose `begin_operation` never ran, is simply
 /// absent here and runs again.
+///
+/// AMENDMENT PENDING: `find_operation` is a merged ledger read, but the
+/// spec's projection bullet does not list it and the field this feeds
+/// extends the pinned `RunView` — see the note on
+/// [`RunView::settled_operations`].
 fn settled_machine_operations(
     ledger: &Ledger,
     run_id: &str,

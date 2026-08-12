@@ -484,6 +484,8 @@ pub struct FakePorts {
     pub pr_script: Mutex<VecDeque<Option<PrSnapshot>>>,
     /// Scripted remote shas; default `None`.
     pub sha_script: Mutex<VecDeque<Option<String>>>,
+    /// Scripted resolve states; default worktree present, no lease holder.
+    pub resolve_script: Mutex<VecDeque<ResolveState>>,
 }
 
 impl FakePorts {
@@ -613,10 +615,11 @@ impl ReconcilePorts for FakePorts {
 
     async fn resolve_state(&self, run_id: &str) -> Result<ResolveState, PortError> {
         self.push(PortCall::ResolveState(run_id.to_owned()));
-        Ok(ResolveState {
+        let scripted = self.resolve_script.lock().expect("lock").pop_front();
+        Ok(scripted.unwrap_or(ResolveState {
             worktree_present: true,
             lease_holder: None,
-        })
+        }))
     }
 
     async fn pr_for_head(

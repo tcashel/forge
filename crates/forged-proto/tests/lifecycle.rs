@@ -88,11 +88,28 @@ async fn full_slice_v1_lifecycle_in_process() {
             NextAction::RunMachine(step) => {
                 let round = u32::from(fix_completed);
                 let key = machine_idempotency_key(RUN, step, round);
+                // The reconcile contract's intent keys ride in `params`:
+                // `leaseHolder` is what settles a crashed Resolve, and
+                // `expectedSha` is what settles a crashed Push — a bare
+                // "some sha exists" would confirm a stale branch.
+                let mut params = serde_json::Map::new();
+                match step {
+                    MachineStage::Resolve => {
+                        params.insert(
+                            "leaseHolder".to_owned(),
+                            serde_json::json!("claude:sess-1:1"),
+                        );
+                    }
+                    MachineStage::Push => {
+                        params.insert("expectedSha".to_owned(), serde_json::json!("deadbeef"));
+                    }
+                    _ => {}
+                }
                 let request = OperationRequest {
                     schema_version: 1,
                     idempotency_key: key.clone(),
                     run_id: Some(RUN.to_owned()),
-                    params: serde_json::Map::new(),
+                    params,
                 };
                 let class = match step {
                     MachineStage::Gate | MachineStage::ReGate => EffectClass::SafeRetry,

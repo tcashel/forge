@@ -47,6 +47,17 @@ pub struct RunView {
     /// `SafeRetry` step it hands back for redo
     /// (`forged-ledger/src/operations.rs:287`). Both of those states mean the
     /// step still has to run.
+    ///
+    /// **AMENDMENT PENDING (review round 1, operator adjudication
+    /// required).** The spec pins `RunView` *without* this field and this
+    /// addition extends that pinned wave-4 seam; it is deliberately kept —
+    /// not reverted — because the pinned view carries no evidence that
+    /// distinguishes a settled step from a released or never-begun one
+    /// (both crash windows above wear the same "requested, not in flight"
+    /// shape), so removing it would let a resumed run walk past a gate the
+    /// reconciler scheduled for redo. The operator must either amend the
+    /// spec's `RunView` to include this field or direct an alternative
+    /// before merge.
     pub settled_operations: Vec<OperationRow>,
     /// `proto.*` events for this run, in `event_id` order, already parsed.
     pub proto_events: Vec<ProtoEvent>,

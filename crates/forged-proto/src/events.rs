@@ -105,18 +105,27 @@ pub enum ProtoEvent {
         request: OperationRequest,
     },
     /// `proto.quarantine` — a zombie result was refused at the fence and its
-    /// bytes taken into custody. The event preserves the refused claim in
-    /// ledger state so the reconciler's harvest-and-verify can check it; the
-    /// file destination stays the adapter's contract.
+    /// bytes taken into custody. The spec-required wire schema is
+    /// `packetId`, `attemptId`, and `reason` — the fence's refusal, verbatim.
+    /// `name` and `result` are this crate's OPTIONAL extensions (the bare
+    /// custody file name, and the refused claim preserved so
+    /// harvest-and-verify can check it); a spec-conforming payload without
+    /// them still parses, and they never join the required schema. The file
+    /// destination stays the adapter's contract.
     Quarantine {
         /// The packet the refused result named.
         packet_id: String,
         /// The revoked attempt whose token was refused.
         attempt_id: i64,
-        /// The bare file name the bytes were quarantined under.
-        name: String,
-        /// The refused result, verbatim.
-        result: PacketResult,
+        /// Why the bytes were quarantined — the stale-token refusal,
+        /// verbatim. Required by the wire schema.
+        reason: String,
+        /// The bare file name the bytes were quarantined under. Optional
+        /// extension.
+        name: Option<String>,
+        /// The refused result, verbatim. Optional extension; when present,
+        /// harvest-and-verify checks any implement claim inside it.
+        result: Option<PacketResult>,
     },
 }
 
@@ -230,15 +239,32 @@ impl ProtoEvent {
             ProtoEvent::Quarantine {
                 packet_id,
                 attempt_id,
+                reason,
                 name,
                 result,
-            } => json!({
-                "schemaVersion": 1,
-                "packetId": packet_id,
-                "attemptId": attempt_id,
-                "name": name,
-                "result": serde_json::to_value(result).map_err(to_json_error)?,
-            }),
+            } => {
+                // The required schema first; the optional extensions are
+                // appended only when present, so a payload with neither is
+                // exactly the spec shape.
+                let mut payload = json!({
+                    "schemaVersion": 1,
+                    "packetId": packet_id,
+                    "attemptId": attempt_id,
+                    "reason": reason,
+                });
+                if let Some(map) = payload.as_object_mut() {
+                    if let Some(name) = name {
+                        map.insert("name".to_owned(), Value::String(name.clone()));
+                    }
+                    if let Some(result) = result {
+                        map.insert(
+                            "result".to_owned(),
+                            serde_json::to_value(result).map_err(to_json_error)?,
+                        );
+                    }
+                }
+                payload
+            }
         };
         Ok(value)
     }
@@ -262,8 +288,14 @@ impl ProtoEvent {
                 ..
             } => format!("op/{name}/{idempotency_key}"),
             ProtoEvent::Quarantine {
-                attempt_id, name, ..
-            } => format!("quarantine/{attempt_id}/{name}"),
+                packet_id,
+                attempt_id,
+                name,
+                ..
+            } => format!(
+                "quarantine/{packet_id}/{attempt_id}/{}",
+                name.as_deref().unwrap_or("")
+            ),
         }
     }
 }
@@ -501,12 +533,29 @@ fn parse_operation_request(row: &EventRow, value: &Value) -> Result<ProtoEvent, 
 }
 
 fn parse_quarantine(row: &EventRow, value: &Value) -> Result<ProtoEvent, ProtoError> {
-    let result: PacketResult = serde_json::from_value(require(row, value, "result")?.clone())
-        .map_err(|err| malformed(row, &format!("result does not parse: {err}")))?;
+    // Required schema: packetId, attemptId, reason. `name` and `result` are
+    // optional extensions — absent (or null) is a conforming payload, but a
+    // present extension that does not parse is still malformed.
+    let name = match value.get("name") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .ok_or_else(|| malformed(row, "name is not a string"))?
+                .to_owned(),
+        ),
+    };
+    let result: Option<PacketResult> = match value.get("result") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            serde_json::from_value(v.clone())
+                .map_err(|err| malformed(row, &format!("result does not parse: {err}")))?,
+        ),
+    };
     Ok(ProtoEvent::Quarantine {
         packet_id: require_str(row, value, "packetId")?,
         attempt_id: require_i64(row, value, "attemptId")?,
-        name: require_str(row, value, "name")?,
+        reason: require_str(row, value, "reason")?,
+        name,
         result,
     })
 }
@@ -711,6 +760,52 @@ mod tests {
         }
         .payload()
         .expect("an absent leg is recordable");
+    }
+
+    #[test]
+    fn quarantine_requires_reason_and_treats_name_and_result_as_extensions() {
+        // The spec-required shape — packetId, attemptId, reason, nothing
+        // else — is a conforming wave-4 event and must parse here.
+        let minimal = json!({
+            "schemaVersion": 1, "packetId": "run-1/implement/1",
+            "attemptId": 4, "reason": "stale claim token"
+        });
+        let parsed = parse_proto_events(&[row(1, "proto.quarantine", minimal)]).expect("parses");
+        assert_eq!(
+            parsed,
+            vec![ProtoEvent::Quarantine {
+                packet_id: "run-1/implement/1".to_owned(),
+                attempt_id: 4,
+                reason: "stale claim token".to_owned(),
+                name: None,
+                result: None,
+            }]
+        );
+
+        // A payload missing the required `reason` is malformed, whatever
+        // extensions ride along.
+        let missing_reason = json!({
+            "schemaVersion": 1, "packetId": "run-1/implement/1",
+            "attemptId": 4, "name": "result.json"
+        });
+        let err = parse_proto_events(&[row(2, "proto.quarantine", missing_reason)])
+            .expect_err("must refuse");
+        assert!(matches!(err, ProtoError::MalformedEvent { .. }), "{err}");
+
+        // And the writer emits what the parser accepts: the extension keys
+        // are appended only when present.
+        let bare = ProtoEvent::Quarantine {
+            packet_id: "run-1/implement/1".to_owned(),
+            attempt_id: 4,
+            reason: "stale claim token".to_owned(),
+            name: None,
+            result: None,
+        }
+        .payload()
+        .expect("payload");
+        assert!(bare.get("reason").is_some());
+        assert!(bare.get("name").is_none());
+        assert!(bare.get("result").is_none());
     }
 
     #[test]
