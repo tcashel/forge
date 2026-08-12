@@ -221,18 +221,19 @@ pub async fn slot_check(bd: &BdConfig) -> Result<SlotStatus, BdError> {
 
 /// Whether bd's acquire response proves that THIS holder now owns the slot.
 ///
-/// Two guards, both load-bearing because [`AcquiredSlot`] is the caller's
+/// Three guards, all load-bearing because [`AcquiredSlot`] is the caller's
 /// proof of ownership — the ledger persists it and later release/reap
-/// decisions trust it. First, the child must have exited 0: the spec's
-/// classify rule for merge-slot commands is exit-status-and-shape driven (a
-/// held acquire exits 1), so an `acquired: true` printed alongside a refusal
-/// exit is not an acquisition. Second, when the raw response names a holder
-/// (or actor) itself, it must name the one we asked for — a response
-/// describing someone else's acquisition is not ours to record. A response
-/// naming no holder at all is carried by the zero exit alone, which is the
-/// shape bd 1.2.1 emits for `merge-slot create`-adjacent commands.
+/// decisions trust it. The response must say `acquired: true`; the child must
+/// have exited 0 (the spec's classify rule for merge-slot commands is
+/// exit-status-and-shape driven — a held acquire exits 1 — so an
+/// `acquired: true` printed alongside a refusal exit is not an acquisition);
+/// and when the raw response names a holder (or actor) itself, it must name
+/// the one we asked for, since a response describing someone else's
+/// acquisition is not ours to record. A response naming no holder at all is
+/// carried by the zero exit alone, which is the shape bd 1.2.1 emits for
+/// `merge-slot create`-adjacent commands.
 fn acquire_confirmed(exit: Option<i32>, raw: &Value, holder: &str) -> bool {
-    if exit != Some(0) {
+    if exit != Some(0) || raw.get("acquired").and_then(Value::as_bool) != Some(true) {
         return false;
     }
     ["holder", "actor"]
@@ -240,6 +241,27 @@ fn acquire_confirmed(exit: Option<i32>, raw: &Value, holder: &str) -> bool {
         .filter_map(|k| raw.get(*k).and_then(Value::as_str))
         .filter(|h| !h.is_empty())
         .all(|h| h == holder)
+}
+
+/// The EXACT pinned slot-busy shape: exit 1 with `acquired: false` in the raw
+/// (unwrapped) JSON, and no error alongside it. bd 1.2.1 prints precisely
+/// that for a held slot, and the spec's classify rule for merge-slot commands
+/// makes only that outcome contention.
+///
+/// Everything else is a real failure wearing a similar hat and must NOT enter
+/// the busy-retry loop: an `acquired: false` carrying an `error` (bd's own
+/// failure shape — the sibling `check` command emits `{"available": false,
+/// "error": "not found", ...}` for a missing slot), an unexpected exit code,
+/// or an `acquired: true` the exit status and holder field did not confirm.
+/// Retrying those as contention would burn the caller's whole acquire budget
+/// against something that will never resolve, and then report a busy slot,
+/// hiding the `Beads`/`Envelope` error that says what actually broke.
+fn slot_busy_shape(exit: Option<i32>, raw: &Value) -> bool {
+    let acquired_false = raw.get("acquired").and_then(Value::as_bool) == Some(false);
+    let carries_error = raw
+        .get("error")
+        .is_some_and(|e| !e.is_null() && e.as_str() != Some(""));
+    exit == Some(1) && acquired_false && !carries_error
 }
 
 /// Acquire the merge slot for `holder`, retrying with the module-4 backoff
@@ -253,8 +275,13 @@ fn acquire_confirmed(exit: Option<i32>, raw: &Value, holder: &str) -> bool {
 /// outcome is slot-busy, never `Contention`, `LeaseHeld`, or `Beads`.
 ///
 /// An [`AcquiredSlot`] comes back only when the acquire is CONFIRMED (see
-/// `acquire_confirmed`): zero exit, and a response that either names no holder
-/// or names the requested one. Anything weaker takes the slot-busy backoff.
+/// `acquire_confirmed`): `acquired: true`, zero exit, and a response that
+/// either names no holder or names the requested one. The backoff, in turn,
+/// runs only for the pinned busy shape (see `slot_busy_shape`). Every other
+/// outcome — including an unconfirmed `acquired: true` and an
+/// `acquired: false` that carries an error or an unexpected exit code — falls
+/// through to the generic classification below, so a broken bd surfaces as
+/// `Beads`/`Envelope` instead of as contention that never clears.
 pub async fn slot_acquire(
     bd: &BdConfig,
     holder: &str,
@@ -287,40 +314,32 @@ pub async fn slot_acquire(
             Err(e) => return Err(e),
         };
         if let Ok(raw) = serde_json::from_str::<Value>(&out.stdout) {
-            match raw.get("acquired").and_then(Value::as_bool) {
-                Some(true) if acquire_confirmed(out.exit, &raw, holder) => {
-                    return Ok(AcquiredSlot {
-                        holder: holder.to_string(),
-                        acquired_at_epoch_s: epoch_s(),
-                        raw,
-                    });
+            if acquire_confirmed(out.exit, &raw, holder) {
+                return Ok(AcquiredSlot {
+                    holder: holder.to_string(),
+                    acquired_at_epoch_s: epoch_s(),
+                    raw,
+                });
+            }
+            if slot_busy_shape(out.exit, &raw) {
+                busy_attempts += 1;
+                // Floor each accounted sleep at 1 ms so a run of 0-draws
+                // cannot spin past the budget forever.
+                let drawn = classify::jitter_ms(busy_attempts).max(1);
+                if slept_ms + drawn > budget_ms {
+                    let holder_now = match slot_check(bd).await {
+                        Ok(s) => s.holder,
+                        Err(_) => None,
+                    };
+                    return Err(BdError::SlotBusy { holder: holder_now });
                 }
-                // An `acquired: true` that the exit status or the response's
-                // own holder field does not confirm is NOT proof this holder
-                // owns the slot, and `AcquiredSlot` is exactly that proof —
-                // the ledger persists it and later release/reap decisions
-                // trust it. Treat it like any other unconfirmed acquire: back
-                // off and retry within the budget.
-                Some(true) | Some(false) => {
-                    busy_attempts += 1;
-                    // Floor each accounted sleep at 1 ms so a run of 0-draws
-                    // cannot spin past the budget forever.
-                    let drawn = classify::jitter_ms(busy_attempts).max(1);
-                    if slept_ms + drawn > budget_ms {
-                        let holder_now = match slot_check(bd).await {
-                            Ok(s) => s.holder,
-                            Err(_) => None,
-                        };
-                        return Err(BdError::SlotBusy { holder: holder_now });
-                    }
-                    tokio::time::sleep(Duration::from_millis(drawn)).await;
-                    slept_ms += drawn;
-                    continue;
-                }
-                None => {}
+                tokio::time::sleep(Duration::from_millis(drawn)).await;
+                slept_ms += drawn;
+                continue;
             }
         }
-        // Not an acquire-shaped output: classify like any other write.
+        // Neither a confirmed acquire nor the pinned busy shape: classify like
+        // any other write, so a bd-side failure surfaces as itself.
         let env_err = envelope::parse_lenient(&out.stdout)
             .error
             .unwrap_or_default();
@@ -461,6 +480,62 @@ mod tests {
             &json!({"acquired": true, "holder": null}),
             "holder-x"
         ));
+
+        // The `acquired` flag itself is a guard: a zero exit naming our
+        // holder proves nothing without it.
+        assert!(!acquire_confirmed(
+            Some(0),
+            &json!({"acquired": false, "holder": "holder-x"}),
+            "holder-x"
+        ));
+        assert!(!acquire_confirmed(
+            Some(0),
+            &json!({"holder": "holder-x"}),
+            "holder-x"
+        ));
+    }
+
+    #[test]
+    fn only_the_pinned_shape_is_slot_busy() {
+        // The observed bd 1.2.1 held-slot shape, and the only one that backs
+        // off: exit 1, acquired: false, no error.
+        let held = json!({"acquired": false, "holder": "holder-x", "id": "beads-merge-slot"});
+        assert!(slot_busy_shape(Some(1), &held));
+
+        // An internal bd failure shaped like a refusal is a failure, not
+        // contention — retrying it burns the budget against something that
+        // will never clear.
+        let with_error = json!({"acquired": false, "error": "not found", "id": "beads-merge-slot"});
+        assert!(!slot_busy_shape(Some(1), &with_error));
+
+        // Unexpected exit codes are not the pinned shape either.
+        assert!(!slot_busy_shape(Some(0), &held), "a zero exit is not busy");
+        assert!(!slot_busy_shape(Some(2), &held));
+        assert!(!slot_busy_shape(None, &held), "a signal death is not busy");
+
+        // An empty or null error field names no failure, so the pinned shape
+        // still stands.
+        assert!(slot_busy_shape(
+            Some(1),
+            &json!({"acquired": false, "error": null})
+        ));
+        assert!(slot_busy_shape(
+            Some(1),
+            &json!({"acquired": false, "error": ""})
+        ));
+
+        // No `acquired` field at all: not an acquire-shaped answer.
+        assert!(!slot_busy_shape(
+            Some(1),
+            &json!({"id": "beads-merge-slot"})
+        ));
+
+        // An unconfirmed `acquired: true` is neither a confirmed acquire nor
+        // the busy shape: it must reach the generic classification.
+        let unconfirmed = json!({"acquired": true, "holder": "holder-y"});
+        assert!(!acquire_confirmed(Some(0), &unconfirmed, "holder-x"));
+        assert!(!slot_busy_shape(Some(0), &unconfirmed));
+        assert!(!slot_busy_shape(Some(1), &unconfirmed));
     }
 
     #[test]

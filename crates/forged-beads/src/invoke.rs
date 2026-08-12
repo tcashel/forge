@@ -30,6 +30,8 @@ use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
 use std::process::Stdio;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::Value;
@@ -195,11 +197,48 @@ pub(crate) fn lock_file_name(canonical: &Path) -> String {
     format!("beads-{name}-{:016x}.lock", fnv1a64(s.as_bytes()))
 }
 
+/// The blocking half of [`acquire_write_lock`]: open the lock file and park in
+/// `flock` until the lock is ours. The instant the syscall returns — before
+/// the lock is used for anything at all — the caller's cancellation flag is
+/// consulted: a set flag means the caller already gave up (its timeout
+/// elapsed), so the lock is handed straight back and `Ok(None)` reports that
+/// nothing was done. Returning the file to a caller that is no longer waiting
+/// would leave an exclusive lock held on nobody's behalf, blocking the next
+/// live write.
+fn wait_for_lock(
+    lock_path: &Path,
+    cancelled: &AtomicBool,
+) -> std::io::Result<Option<std::fs::File>> {
+    let f = std::fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .truncate(false)
+        .open(lock_path)?;
+    fs2::FileExt::lock_exclusive(&f)?;
+    if cancelled.load(Ordering::SeqCst) {
+        let _ = fs2::FileExt::unlock(&f);
+        return Ok(None);
+    }
+    Ok(Some(f))
+}
+
 /// Acquire the inter-process write lock for `cfg.beads_dir`. Creates
 /// `beads_dir` (and parents) first when absent — `std::fs::canonicalize`
 /// errors on a nonexistent path, and every fresh scratch dir hits this before
 /// bd's first run. The flock is taken inside `spawn_blocking` and bounded by
 /// `write_timeout_s`. Dropping the returned file releases the lock.
+///
+/// TIMEOUT SEMANTICS, and the honest half of them: a `spawn_blocking` task
+/// parked inside the `flock` syscall CANNOT be cancelled mid-call, so on
+/// timeout the worker thread stays parked until the CURRENT lock holder
+/// releases — bounded by that holder's lifetime, not by `write_timeout_s`.
+/// What it can never do is ACT after the timeout. The waiter shares a
+/// cancellation flag with this function; the timeout arm sets it, and the
+/// waiter checks it the instant `lock_exclusive` returns, before doing
+/// anything else: if it is set the waiter unlocks immediately and exits with
+/// no side effects. So a waiter the caller has given up on can never win the
+/// lock and sit on it — the failure mode where a later, live write blocks on
+/// an exclusive lock nobody is using.
 pub(crate) async fn acquire_write_lock(cfg: &BdConfig) -> Result<std::fs::File, BdError> {
     if !cfg.beads_dir.exists() {
         std::fs::create_dir_all(&cfg.beads_dir).map_err(|e| BdError::Beads {
@@ -224,20 +263,17 @@ pub(crate) async fn acquire_write_lock(cfg: &BdConfig) -> Result<std::fs::File, 
     })?;
     let lock_path = locks_dir.join(lock_file_name(&canonical));
     let timeout_s = cfg.write_timeout_s;
-    let task = tokio::task::spawn_blocking(move || -> std::io::Result<std::fs::File> {
-        let f = std::fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .truncate(false)
-            .open(&lock_path)?;
-        fs2::FileExt::lock_exclusive(&f)?;
-        Ok(f)
-    });
+    let cancelled = Arc::new(AtomicBool::new(false));
+    let waiter_cancelled = Arc::clone(&cancelled);
+    let task = tokio::task::spawn_blocking(move || wait_for_lock(&lock_path, &waiter_cancelled));
     match tokio::time::timeout(Duration::from_secs(timeout_s), task).await {
-        Err(_) => Err(BdError::Timeout {
-            context: "beads write lock".to_string(),
-            after_s: timeout_s,
-        }),
+        Err(_) => {
+            cancelled.store(true, Ordering::SeqCst);
+            Err(BdError::Timeout {
+                context: "beads write lock".to_string(),
+                after_s: timeout_s,
+            })
+        }
         Ok(Err(join_err)) => Err(BdError::Beads {
             context: "lock task".to_string(),
             exit: None,
@@ -250,7 +286,15 @@ pub(crate) async fn acquire_write_lock(cfg: &BdConfig) -> Result<std::fs::File, 
             stdout: String::new(),
             stderr: io.to_string(),
         }),
-        Ok(Ok(Ok(f))) => Ok(f),
+        Ok(Ok(Ok(Some(f)))) => Ok(f),
+        // The waiter gave the lock straight back because it saw the cancel
+        // flag — which only this function's timeout arm sets, so the caller
+        // has already been told `Timeout`. Reachable only if the flag and the
+        // join land in the same instant; classified the same way either way.
+        Ok(Ok(Ok(None))) => Err(BdError::Timeout {
+            context: "beads write lock".to_string(),
+            after_s: timeout_s,
+        }),
     }
 }
 
@@ -455,6 +499,47 @@ mod tests {
                 "read must refuse {relative} too"
             );
         }
+    }
+
+    #[test]
+    fn a_cancelled_lock_waiter_gives_the_lock_straight_back() {
+        let dir = std::env::temp_dir().join(format!("forged-lock-cancel-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("scratch lock dir");
+        let lock_path = dir.join("cancel.lock");
+        let open = || {
+            std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .truncate(false)
+                .open(&lock_path)
+                .expect("opening the lock file")
+        };
+
+        // A live waiter keeps the lock, and the lock is genuinely exclusive.
+        let live = AtomicBool::new(false);
+        let held = wait_for_lock(&lock_path, &live)
+            .expect("locking")
+            .expect("a live waiter must return the lock it took");
+        assert!(
+            fs2::FileExt::try_lock_exclusive(&open()).is_err(),
+            "the returned lock must actually be held"
+        );
+        drop(held);
+
+        // A waiter whose caller has already timed out must act on nothing:
+        // no file handed back, and the lock free for the next attempt — the
+        // failure this guards is an abandoned waiter winning the flock and
+        // sitting on it while a live write blocks behind it.
+        let cancelled = AtomicBool::new(true);
+        assert!(
+            wait_for_lock(&lock_path, &cancelled)
+                .expect("locking")
+                .is_none(),
+            "a cancelled waiter must not return the lock"
+        );
+        fs2::FileExt::try_lock_exclusive(&open())
+            .expect("a cancelled waiter must leave the lock free");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

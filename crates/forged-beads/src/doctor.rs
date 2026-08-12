@@ -8,7 +8,7 @@
 //! path resolves against the operator's real home.
 
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::Stdio;
 use std::time::Duration;
 
@@ -128,10 +128,12 @@ async fn bd_version(cfg: &DoctorConfig) -> Result<String, String> {
 }
 
 /// On a scratch `BEADS_DIR` under a scratch `HOME` (both fresh dirs created
-/// under `scratch_root`): create a probe bead, claim / heartbeat as actor
-/// `doctor`, then a heartbeat as actor `doctor-other` which MUST be refused.
-/// All four behaviors green ⇒ ok. The scratch dirs are removed afterwards
-/// (even on failure or timeout), leaving `scratch_root` empty.
+/// under `scratch_root`): initialize the scratch store (see
+/// [`bootstrap_probe_store`] for the guarded, narrowly sanctioned `bd init`),
+/// create a probe bead, claim / heartbeat as actor `doctor`, then a heartbeat
+/// as actor `doctor-other` which MUST be refused. All four behaviors green ⇒
+/// ok. The scratch dirs are removed afterwards (even on failure or timeout),
+/// leaving `scratch_root` empty.
 async fn lease_liveness(cfg: &DoctorConfig) -> ProbeResult {
     let base = cfg
         .scratch_root
@@ -143,7 +145,7 @@ async fn lease_liveness(cfg: &DoctorConfig) -> ProbeResult {
     result
 }
 
-async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Result<String, String> {
+async fn lease_liveness_body(cfg: &DoctorConfig, base: &Path) -> Result<String, String> {
     let home = base.join("home");
     let beads = base.join("beads");
     let anvil = base.join("anvil");
@@ -159,14 +161,13 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         read_timeout_s: PROBE_TIMEOUT_S,
         write_timeout_s: PROBE_TIMEOUT_S,
     };
-    // The store is bootstrapped by its first `bd create` and by nothing else.
-    // The one hazard that shape carries: a bd call against an UNINITIALIZED
-    // $BEADS_DIR falls back to CWD-ancestor workspace discovery, so a stray
-    // `.beads` above the cwd (the operator's machine-global `~/.beads` sits
-    // above every path under a home-dir checkout) would silently receive the
-    // probe's writes. The single pre-store call therefore runs from an
-    // ancestor-clean cwd under the system temp dir, and the store is verified
-    // to have landed in the scratch dir before anything else runs.
+    // The hazard the pre-store calls carry: a bd call against an
+    // UNINITIALIZED $BEADS_DIR falls back to CWD-ancestor workspace discovery,
+    // so a stray `.beads` above the cwd (the operator's machine-global
+    // `~/.beads` sits above every path under a home-dir checkout) would
+    // silently receive the probe's writes. Every pre-store call therefore runs
+    // from an ancestor-clean cwd under the system temp dir, and the store is
+    // verified to have landed in the scratch dir before anything else runs.
     let clean_cwd = std::env::temp_dir().join(format!("forged-doctor-init-{}", std::process::id()));
     std::fs::create_dir_all(&clean_cwd)
         .map_err(|e| format!("creating ancestor-clean cwd {}: {e}", clean_cwd.display()))?;
@@ -174,8 +175,7 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         work_dir: clean_cwd.clone(),
         ..scratch.clone()
     };
-    let create_args = ["create", "doctor probe", "--json"];
-    let bootstrap = create_probe_bead(&clean_cfg, &create_args).await;
+    let bootstrap = bootstrap_probe_store(cfg, &clean_cfg).await;
     let _ = std::fs::remove_dir_all(&clean_cwd);
     let data = bootstrap?;
     let id = envelope::first_obj(&data)
@@ -199,45 +199,115 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
     }
 }
 
-/// The scratch store's ONE bootstrap call: `bd create` against an empty
-/// `$BEADS_DIR`, single-shot (a diagnostic probe retries nothing) and from the
-/// ancestor-clean cwd `clean_cfg` pins. Returns the create's envelope `data`.
+/// Bring the probe's scratch store into existence, then create the probe
+/// bead in it. Both calls are single-shot (a diagnostic probe retries
+/// nothing) and run from the ancestor-clean cwd `clean_cfg` pins. Returns the
+/// create's envelope `data`.
 ///
-/// There is deliberately NO fallback. `bd init` is forbidden for this probe,
-/// so a bd that does not auto-initialize on first create makes the probe
-/// report `ok: false` carrying the refusal bd printed — measured against the
-/// pinned sandboxed bd 1.2.1 (build `634cbbc4`) that is exactly what happens:
-/// `bd create` on an empty `$BEADS_DIR` exits 1 with `no beads database found`
-/// and initializes nothing. Reporting that honestly IS the probe working:
-/// bootstrapping the store some other way would turn the probe green while
-/// the behavior it exists to check stayed absent, and this crate does not
-/// invoke `bd init` anywhere (source-grep enforced).
-async fn create_probe_bead(clean_cfg: &BdConfig, create_args: &[&str]) -> Result<Value, String> {
-    let out = invoke::run_locked_once(clean_cfg, create_args, "bd create")
+/// `bd init` is forbidden throughout this crate — with ONE narrowly
+/// adjudicated exception, this probe (spec amendment 2026-08-12). The pinned
+/// bd 1.2.1 (build `634cbbc4`) does NOT auto-initialize on first create:
+/// `bd create` against an empty `$BEADS_DIR` exits 1 with
+/// `no beads database found` and initializes nothing, so without an init the
+/// create → claim → heartbeat → wrong-actor-refusal behavior this probe
+/// exists to check could never be exercised at all.
+///
+/// The exception is conditional on two MANDATORY guards, and a guard failure
+/// REFUSES — it never falls back to initializing something else:
+///   1. the target must be the EMPTY directory this probe just created under
+///      `cfg.scratch_root` — checked as both, a path inside `scratch_root`
+///      and a directory with nothing in it yet; and
+///   2. it must not be the operator's configured `beads_dir` (nor, for the
+///      same reason, the configured `anvil_home`).
+///
+/// bd may additionally refuse a given temp path as an "unsafe location"; that
+/// refusal is the probe's `ok: false` detail, not a cue to try another
+/// bootstrap strategy. `bd init` stays absent from every other source file
+/// (source-grep enforced in `tests/audit_doctor.rs`).
+async fn bootstrap_probe_store(cfg: &DoctorConfig, clean_cfg: &BdConfig) -> Result<Value, String> {
+    let target = &clean_cfg.beads_dir;
+    if !target.starts_with(&cfg.scratch_root) {
+        return Err(format!(
+            "refusing to initialize {}: outside the probe's scratch root {}",
+            target.display(),
+            cfg.scratch_root.display()
+        ));
+    }
+    if same_dir(target, &cfg.bd.anvil_home) || same_dir(target, &cfg.bd.beads_dir) {
+        return Err(format!(
+            "refusing to initialize {}: it is the operator's own store or anvil home, not scratch",
+            target.display()
+        ));
+    }
+    let mut entries = std::fs::read_dir(target).map_err(|e| {
+        format!(
+            "refusing to initialize {}: unreadable ({e})",
+            target.display()
+        )
+    })?;
+    if entries.next().is_some() {
+        return Err(format!(
+            "refusing to initialize {}: not the empty directory this probe just created",
+            target.display()
+        ));
+    }
+    // Inert init: a bare one writes CLAUDE.md, AGENTS.md, .claude/ and
+    // .agents/ into its cwd.
+    let init_args = [
+        "init",
+        "--prefix",
+        "probe",
+        "--non-interactive",
+        "--quiet",
+        "--skip-agents",
+        "--skip-hooks",
+    ];
+    let init = invoke::run_locked_once(clean_cfg, &init_args, "bd init")
         .await
-        .map_err(|e| format!("scratch create failed: {e}"))?;
+        .map_err(|e| format!("scratch init failed: {e}"))?;
+    if init.exit != Some(0) {
+        return Err(format!(
+            "bd refused to initialize the scratch store (exit {:?}); stdout: {}; stderr: {}",
+            init.exit,
+            init.stdout.trim(),
+            init.stderr.trim()
+        ));
+    }
+    // Containment: the store bd just initialized must be the SCRATCH one, not
+    // an ancestor's that CWD discovery found.
+    if !target.join("config.yaml").exists() {
+        return Err(format!(
+            "the scratch store did not land in {} — CWD-ancestor discovery must never win over \
+             BEADS_DIR; refusing to continue",
+            target.display()
+        ));
+    }
+    let out = invoke::run_locked_once(
+        clean_cfg,
+        &["create", "doctor probe", "--json"],
+        "bd create",
+    )
+    .await
+    .map_err(|e| format!("scratch create failed: {e}"))?;
     if out.exit != Some(0) {
         return Err(format!(
-            "bd did not auto-initialize the scratch store on first create (exit {:?}); stdout: {}; \
-             stderr: {}",
+            "creating the probe bead failed (exit {:?}); stdout: {}; stderr: {}",
             out.exit,
             out.stdout.trim(),
             out.stderr.trim()
         ));
     }
-    // Containment: the store bd just initialized must be the SCRATCH one, not
-    // an ancestor's that CWD discovery found.
-    let landed = std::fs::read_dir(&clean_cfg.beads_dir).is_ok_and(|mut d| d.next().is_some());
-    if !landed {
-        return Err(format!(
-            "the scratch store did not land in {} — CWD-ancestor discovery must never win over \
-             BEADS_DIR; refusing to continue",
-            clean_cfg.beads_dir.display()
-        ));
-    }
     envelope::parse_lenient(&out.stdout)
         .data
         .ok_or_else(|| format!("create returned no envelope data: {}", out.stdout))
+}
+
+/// Whether two paths name the same directory, comparing canonicalized forms
+/// when both resolve (`/tmp` vs `/private/tmp` on macOS) and the given forms
+/// otherwise.
+fn same_dir(a: &Path, b: &Path) -> bool {
+    let canon = |p: &Path| std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+    canon(a) == canon(b)
 }
 
 /// Prove the operator's LIVE store still resolves: a read of `bd list

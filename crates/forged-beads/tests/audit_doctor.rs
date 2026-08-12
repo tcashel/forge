@@ -88,18 +88,18 @@ fn source_hygiene_no_force_flag_and_no_path_bd() {
 }
 
 #[test]
-fn source_hygiene_the_crate_never_invokes_bd_init() {
-    // The spec's doctor module forbids `bd init` — the scratch store must
-    // bootstrap on first create, and a bd that does not auto-initialize makes
-    // the probe report the refusal rather than substituting another bootstrap.
-    // No fallback, so no source file may name the subcommand as an argv token.
-    // (`tests/support/mod.rs` does, deliberately: it is scaffolding that has to
-    // build a store for the lease/slot tests, and it is not part of the crate.)
+fn source_hygiene_bd_init_appears_only_in_the_sanctioned_doctor_probe() {
+    // `bd init` is forbidden across this crate, with the one exception the
+    // spec amendment of 2026-08-12 adjudicated: the doctor's lease-liveness
+    // probe, which needs it because the pinned bd 1.2.1 does not
+    // auto-initialize on first create. Every other source file must still be
+    // free of the subcommand as an argv token. (`tests/support/mod.rs` names
+    // it too, deliberately: it is scaffolding that has to build a store for
+    // the lease/slot tests, and it is not part of the crate.)
     let sources = [
         ("audit.rs", include_str!("../src/audit.rs")),
         ("classify.rs", include_str!("../src/classify.rs")),
         ("config.rs", include_str!("../src/config.rs")),
-        ("doctor.rs", include_str!("../src/doctor.rs")),
         ("envelope.rs", include_str!("../src/envelope.rs")),
         ("guardian.rs", include_str!("../src/guardian.rs")),
         ("invoke.rs", include_str!("../src/invoke.rs")),
@@ -115,6 +115,19 @@ fn source_hygiene_the_crate_never_invokes_bd_init() {
             "{name} must never invoke bd's {init_arg} subcommand"
         );
     }
+    // The exception is exactly one invocation, and it is the guarded probe
+    // bootstrap — an init that reached the crate any other way would show up
+    // here as a second occurrence.
+    let doctor = include_str!("../src/doctor.rs");
+    assert_eq!(
+        doctor.matches(&init_arg).count(),
+        1,
+        "doctor.rs may name bd's {init_arg} subcommand exactly once (the sanctioned probe bootstrap)"
+    );
+    assert!(
+        doctor.contains("--prefix"),
+        "the sanctioned init is the amendment's `bd init --prefix probe`"
+    );
 }
 
 #[tokio::test]
@@ -198,9 +211,16 @@ async fn doctor_with_the_sandboxed_bd_probes_green() {
         results[2].detail
     );
     assert!(results[5].ok, "anvil-home-writable: {}", results[5].detail);
-    // bd-lease-liveness normally passes but shares the machine with parallel
-    // tests inside its pinned 10s budget; gh-auth and herdr-ping depend on
-    // machine state. Report rather than hard-assert.
+    // The spec amendment of 2026-08-12 sanctions the probe's guarded
+    // `bd init --prefix probe`, so create → claim → heartbeat →
+    // wrong-actor-refusal is exercisable against the pinned bd and the
+    // criterion requires this to be ASSERTED, not merely logged.
+    assert!(
+        results[1].ok,
+        "bd-lease-liveness must pass against the pinned bd: {}",
+        results[1].detail
+    );
+    // gh-auth and herdr-ping depend on machine state: report, never assert.
     for r in &results {
         eprintln!("doctor probe {}: ok={} ({})", r.name, r.ok, r.detail);
     }

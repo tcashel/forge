@@ -118,22 +118,17 @@ pub fn raw_bd(bd: &Path, s: &Scratch, args: &[&str]) -> Command {
     c
 }
 
-/// Bring the scratch store into existence — TEST SCAFFOLDING, and the only
-/// place in this slice that runs `bd init`.
+/// Bring the scratch store into existence — TEST SCAFFOLDING.
 ///
-/// The crate itself never does, in doctor or anywhere else: the spec forbids
-/// it, and `source_hygiene_the_crate_never_invokes_bd_init` proves `src/`
-/// carries no such invocation. Doctor's lease-liveness probe consequently
-/// bootstraps by first-create alone and reports `ok: false` with bd's refusal
-/// when a bd does not auto-initialize — which the pinned sandboxed bd 1.2.1
-/// does not (`bd create` on an empty `$BEADS_DIR` exits 1 with "no beads
-/// database found" and initializes nothing).
-///
-/// The integration tests still need a store to exercise leases, slots and the
-/// reaper against, so this helper builds one the only way this binary offers.
-/// It tries the spec's protocol first and unmodified, falls back ONLY on that
-/// exact refusal, and says so on stderr when it has to; the day a bd
-/// auto-initializes again the fallback stops running on its own.
+/// The pinned sandboxed bd 1.2.1 does not auto-initialize on first create
+/// (`bd create` on an empty `$BEADS_DIR` exits 1 with "no beads database
+/// found" and initializes nothing), so an explicit init is the only way this
+/// binary offers to build the store the lease/slot/guardian/reaper tests need.
+/// Inside the crate the same reality is handled by the spec amendment of
+/// 2026-08-12, which sanctions `bd init` for the doctor's lease-liveness probe
+/// alone under two guards;
+/// `source_hygiene_bd_init_appears_only_in_the_sanctioned_doctor_probe` proves
+/// no other `src/` file names the subcommand.
 ///
 /// CRITICAL, dogfood-proven: bd's workspace discovery lets a CWD-ancestor
 /// `.beads` preempt an UNINITIALIZED `$BEADS_DIR` — and the operator's
@@ -155,55 +150,36 @@ pub fn init_store(bd: &Path, s: &Scratch) {
     let clean_cwd = std::env::temp_dir().join(format!("forged-beads-init-{unique}"));
     let _ = std::fs::remove_dir_all(&clean_cwd);
     std::fs::create_dir_all(&clean_cwd).expect("creating ancestor-clean cwd");
-    let first = raw_bd(bd, s, &["create", "store bootstrap", "--json"])
-        .current_dir(&clean_cwd)
-        .output()
-        .expect("spawning bd create");
-    if !first.status.success() {
-        let refusal = format!(
-            "{}{}",
-            String::from_utf8_lossy(&first.stdout),
-            String::from_utf8_lossy(&first.stderr)
-        );
-        assert!(
-            refusal.contains("no beads database found"),
-            "bd create on a fresh store failed for an unexpected reason: {refusal}"
-        );
-        eprintln!(
-            "NOTE bd/spec mismatch: this bd does NOT auto-initialize on first create \
-             (\"no beads database found\"); initializing the scratch store explicitly"
-        );
-        let init = raw_bd(
-            bd,
-            s,
-            // Inert init: a bare one writes CLAUDE.md, AGENTS.md, .claude/
-            // and .agents/ into its cwd.
-            &[
-                "init",
-                "--non-interactive",
-                "--quiet",
-                "--skip-agents",
-                "--skip-hooks",
-            ],
-        )
-        .current_dir(&clean_cwd)
-        .output()
-        .expect("spawning bd init");
-        assert!(
-            init.status.success(),
-            "initializing the scratch store failed: {}",
-            String::from_utf8_lossy(&init.stderr)
-        );
-        assert!(
-            s.beads.join("config.yaml").exists(),
-            "the scratch store did not land in {} — ancestor workspace discovery \
-             must never win over the test's BEADS_DIR",
-            s.beads.display()
-        );
-    }
+    let init = raw_bd(
+        bd,
+        s,
+        // Inert init: a bare one writes CLAUDE.md, AGENTS.md, .claude/
+        // and .agents/ into its cwd.
+        &[
+            "init",
+            "--non-interactive",
+            "--quiet",
+            "--skip-agents",
+            "--skip-hooks",
+        ],
+    )
+    .current_dir(&clean_cwd)
+    .output()
+    .expect("spawning bd init");
+    assert!(
+        init.status.success(),
+        "initializing the scratch store failed: {}",
+        String::from_utf8_lossy(&init.stderr)
+    );
+    assert!(
+        s.beads.join("config.yaml").exists(),
+        "the scratch store did not land in {} — ancestor workspace discovery \
+         must never win over the test's BEADS_DIR",
+        s.beads.display()
+    );
     let _ = std::fs::remove_dir_all(&clean_cwd);
-    // Belt and braces, and the containment check that covers BOTH paths: bd
-    // must resolve the scratch store, never an ancestor's.
+    // Belt and braces on the containment check above: bd must resolve the
+    // scratch store, never an ancestor's.
     let where_out = raw_bd(bd, s, &["where"])
         .output()
         .expect("spawning bd where");
