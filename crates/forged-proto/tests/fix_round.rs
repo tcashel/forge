@@ -1,0 +1,177 @@
+//! Criterion 4: the one-fix-round budget, and why transport failures are
+//! free. A completed fix consumes the round; a semantic failure consumes
+//! it; a `transport:`-prefixed failure never does, riding the per-packet
+//! retry budget of 3 with `30s × 2^n` backoff.
+
+mod support;
+
+use forged_proto::{advance, backoff_deadline, NextAction, Terminal};
+use forged_types::{Stage, Verdict};
+use support::*;
+
+const RUN: &str = "run-1";
+
+#[test]
+fn spent_round_stops_done_with_the_final_verdict_not_another_fix() {
+    // A completed fix consumed the round; the re-review merged to
+    // RequestChanges again. The spent round is a Done stop carrying the
+    // final verdict, never its own terminal variant.
+    let view = at_rereview(RUN)
+        .completed(Stage::ReviewClaude, 2, review(Verdict::RequestChanges))
+        .completed(Stage::ReviewCodex, 2, review(Verdict::RequestChanges))
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::Done {
+            final_verdict: Some(Verdict::RequestChanges)
+        })
+    );
+}
+
+/// A fixture at the fix stage: first review merged to RequestChanges, fix
+/// packet open.
+fn at_fix() -> ViewBuilder {
+    at_first_review(RUN)
+        .completed(Stage::ReviewClaude, 1, review(Verdict::RequestChanges))
+        .completed(Stage::ReviewCodex, 1, review(Verdict::Approve))
+        .packet(Stage::Fix, 1)
+}
+
+#[test]
+fn transport_failed_fix_does_not_consume_the_round_and_waits_the_backoff() {
+    // First transport failure (n = 0, zero-indexed): 30s past the failure.
+    let failed_at = T0;
+    let deadline = backoff_deadline(failed_at, 0).expect("computes");
+    assert_eq!(deadline, "2026-08-12T00:00:30.000000000Z");
+    let view = at_fix()
+        .failed(Stage::Fix, 1, "transport: connection dropped")
+        .retry_event(Stage::Fix, 1, 1, &deadline)
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: Some(deadline)
+        }
+    );
+}
+
+#[test]
+fn second_transport_failure_backs_off_sixty_seconds() {
+    let deadline = backoff_deadline(T0, 1).expect("computes");
+    assert_eq!(deadline, "2026-08-12T00:01:00.000000000Z");
+    let view = at_fix()
+        .failed(Stage::Fix, 1, "transport: connection dropped")
+        .failed(Stage::Fix, 1, "transport: connection dropped again")
+        .retry_event(
+            Stage::Fix,
+            1,
+            1,
+            &backoff_deadline(T0, 0).expect("computes"),
+        )
+        .retry_event(Stage::Fix, 1, 2, &deadline)
+        .build();
+    // The latest proto.retry event carries the deadline advance reports.
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: Some(deadline)
+        }
+    );
+}
+
+#[test]
+fn semantic_failure_consumes_the_round_and_stops_done() {
+    let view = at_fix()
+        .failed(Stage::Fix, 1, "could not apply findings")
+        .build();
+    // Round spent with no completed fix: no re-review exists; the run stops
+    // as Done carrying the standing review verdict.
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::Done {
+            final_verdict: Some(Verdict::RequestChanges)
+        })
+    );
+}
+
+#[test]
+fn empty_and_missing_notes_count_as_semantic() {
+    let view = at_fix().failed(Stage::Fix, 1, "").build();
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::Done {
+            final_verdict: Some(Verdict::RequestChanges)
+        })
+    );
+}
+
+#[test]
+fn fourth_transport_failure_exhausts_the_budget_of_three() {
+    let mut b = at_fix();
+    for _ in 0..4 {
+        b = b.failed(Stage::Fix, 1, "transport: rate limited");
+    }
+    assert_eq!(
+        advance(&b.build()),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::Fix,
+            attempts: 4
+        })
+    );
+}
+
+#[test]
+fn three_transport_failures_stay_within_the_budget() {
+    let deadline = backoff_deadline(T0, 2).expect("computes");
+    assert_eq!(deadline, "2026-08-12T00:02:00.000000000Z");
+    let mut b = at_fix();
+    for _ in 0..3 {
+        b = b.failed(Stage::Fix, 1, "transport: rate limited");
+    }
+    let view = b.retry_event(Stage::Fix, 1, 3, &deadline).build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: Some(deadline)
+        }
+    );
+}
+
+#[test]
+fn transport_policy_applies_uniformly_to_implement() {
+    // The transport retry policy is per packet and uniform across provider
+    // stages.
+    let mut b = ViewBuilder::new(RUN)
+        .op_done(forged_proto::MachineStage::Resolve, 0)
+        .packet(Stage::Implement, 1);
+    for _ in 0..4 {
+        b = b.failed(Stage::Implement, 1, "transport: spawn failed");
+    }
+    assert_eq!(
+        advance(&b.build()),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::Implement,
+            attempts: 4
+        })
+    );
+}
+
+#[test]
+fn transport_failed_review_leg_keeps_the_join_incomplete() {
+    let deadline = backoff_deadline(T0, 0).expect("computes");
+    let view = at_first_review(RUN)
+        .completed(Stage::ReviewClaude, 1, review(Verdict::Approve))
+        .failed(Stage::ReviewCodex, 1, "transport: dropped")
+        .retry_event(Stage::ReviewCodex, 1, 1, &deadline)
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::ReviewCodex, 1),
+            not_before: Some(deadline)
+        }
+    );
+}

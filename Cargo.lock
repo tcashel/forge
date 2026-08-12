@@ -409,8 +409,16 @@ dependencies = [
 name = "forged-proto"
 version = "0.1.0"
 dependencies = [
+ "async-trait",
+ "forged-ledger",
+ "forged-types",
+ "jiff",
+ "proptest",
  "serde",
+ "serde_json",
+ "tempfile",
  "thiserror",
+ "tokio",
 ]
 
 [[package]]
