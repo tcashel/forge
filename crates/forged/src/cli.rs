@@ -33,6 +33,12 @@ pub enum Command {
         #[command(subcommand)]
         command: RunCmd,
     },
+    /// Durable epic/wave scheduling over Beads readiness.
+    Epic {
+        /// The epic subcommand.
+        #[command(subcommand)]
+        command: EpicCmd,
+    },
     /// Packet lifecycle.
     Packet {
         /// The packet subcommand.
@@ -91,6 +97,93 @@ pub enum RunCmd {
     Status(RunScoped),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
+}
+
+/// `epic` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum EpicCmd {
+    /// Freeze an epic inventory and execution defaults.
+    Start(EpicStartArgs),
+    /// Perform one durable scheduler action.
+    Advance(EpicScoped),
+    /// Drive until the final draft PR or explicit input is required.
+    Drive(EpicScoped),
+    /// Project waves, children, blockers, and the final PR (read-only).
+    Status(EpicScoped),
+    /// Pause scheduling after the current durable boundary.
+    Pause(EpicReasonArgs),
+    /// Resume a paused epic.
+    Resume(EpicReasonArgs),
+    /// Resolve a held child after its spec/input was adjudicated.
+    Resolve(EpicResolveArgs),
+}
+
+/// `epic start` flags.
+#[derive(Debug, Args)]
+pub struct EpicStartArgs {
+    /// Beads epic id whose inventory/readiness is authoritative.
+    #[arg(long)]
+    pub epic: String,
+    /// Absolute target checkout path.
+    #[arg(long)]
+    pub repo: String,
+    /// Locked epic-map path.
+    #[arg(long)]
+    pub spec: String,
+    /// Default-branch target; defaults from origin/HEAD.
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    /// Assurance profile inherited by child slices.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Model roster inherited by child slices.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// A command scoped to one durable epic id.
+#[derive(Debug, Args)]
+pub struct EpicScoped {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Override the derived/read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Pause/resume flags.
+#[derive(Debug, Args)]
+pub struct EpicReasonArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Human-readable audit reason.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Explicit input-required resolution flags.
+#[derive(Debug, Args)]
+pub struct EpicResolveArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Held child whose spec/input is now resolved.
+    #[arg(long)]
+    pub child: String,
+    /// Resolution note recorded in the epic stream.
+    #[arg(long)]
+    pub note: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `run revise-roster` flags.
@@ -447,6 +540,15 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Status(_) => "run_status",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
         },
+        Command::Epic { command } => match command {
+            EpicCmd::Start(_) => "epic_start",
+            EpicCmd::Advance(_) => "epic_advance",
+            EpicCmd::Drive(_) => "epic_drive",
+            EpicCmd::Status(_) => "epic_status",
+            EpicCmd::Pause(_) => "epic_pause",
+            EpicCmd::Resume(_) => "epic_resume",
+            EpicCmd::Resolve(_) => "epic_resolve",
+        },
         Command::Packet { command } => match command {
             PacketCmd::Show(_) => "packet_show",
             PacketCmd::Claim(_) => "packet_claim",
@@ -539,6 +641,71 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.run.clone()),
                     json!({"run": a.run, "roster": a.roster, "reason": a.reason}),
+                ),
+            ),
+        },
+        Command::Epic { command } => match command {
+            EpicCmd::Start(a) => (
+                "epic_start",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({
+                        "epic": a.epic,
+                        "repo": a.repo,
+                        "spec": a.spec,
+                        "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                    }),
+                ),
+            ),
+            EpicCmd::Advance(a) => (
+                "epic_advance",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Drive(a) => (
+                "epic_drive",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Status(a) => (
+                "epic_status",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Pause(a) => (
+                "epic_pause",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::Resume(a) => (
+                "epic_resume",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::Resolve(a) => (
+                "epic_resolve",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "child": a.child, "note": a.note}),
                 ),
             ),
         },

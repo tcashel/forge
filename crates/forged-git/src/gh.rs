@@ -214,6 +214,33 @@ impl GhClient {
         Ok(rest.into())
     }
 
+    /// Idempotently move one draft PR to ready-for-review. The PR must still
+    /// target the expected non-default integration branch.
+    pub async fn mark_pr_ready(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        expected_base: &str,
+    ) -> Result<PrMeta, GhError> {
+        let current = self.pr_view(repo, pr_number).await?;
+        let default = self.default_branch(repo).await?;
+        if current.base_ref_name != expected_base || current.base_ref_name == default {
+            return Err(GhError::Exec {
+                status: None,
+                stderr: format!(
+                    "refusing to ready PR #{pr_number}: base {:?}, expected non-default {:?}",
+                    current.base_ref_name, expected_base
+                ),
+            });
+        }
+        if current.state != "OPEN" || !current.is_draft {
+            return Ok(current);
+        }
+        let number = pr_number.to_string();
+        self.run(&["pr", "ready", &number, "--repo", repo]).await?;
+        self.pr_view(repo, pr_number).await
+    }
+
     /// Idempotently post a finding comment on a PR, deduplicated by a hidden
     /// marker line: `<!-- anvil-finding id=<finding_id> -->`. The listing is
     /// paginated; the match is the whole marker, byte-exact, so id `abc`

@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Seventeen tools, each taking the
+//! `forged mcp` — the rmcp stdio server. Twenty-four tools, each taking the
 //! same operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -124,6 +124,51 @@ impl ForgedServer {
     )]
     pub async fn run_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_revise_roster", args.0).await
+    }
+
+    /// Freeze an epic inventory and child execution defaults.
+    #[tool(name = "epic_start", description = "Start a durable Beads epic run.")]
+    pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_start", args.0).await
+    }
+
+    /// Perform one epic scheduler action.
+    #[tool(name = "epic_advance", description = "Advance an epic by one action.")]
+    pub async fn epic_advance(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_advance", args.0).await
+    }
+
+    /// Drive an epic to a durable stop.
+    #[tool(
+        name = "epic_drive",
+        description = "Drive an epic to input or final PR."
+    )]
+    pub async fn epic_drive(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_drive", args.0).await
+    }
+
+    /// Project epic waves, child runs, blockers, and PR state.
+    #[tool(name = "epic_status", description = "Project durable epic state.")]
+    pub async fn epic_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_status", args.0).await
+    }
+
+    /// Pause an epic at its current durable boundary.
+    #[tool(name = "epic_pause", description = "Pause epic scheduling.")]
+    pub async fn epic_pause(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_pause", args.0).await
+    }
+
+    /// Resume a paused epic.
+    #[tool(name = "epic_resume", description = "Resume epic scheduling.")]
+    pub async fn epic_resume(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_resume", args.0).await
+    }
+
+    /// Resolve a child-specific input-required stop.
+    #[tool(name = "epic_resolve", description = "Resolve held epic child input.")]
+    pub async fn epic_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_resolve", args.0).await
     }
 
     /// Claim one packet.

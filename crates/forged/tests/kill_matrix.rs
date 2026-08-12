@@ -59,6 +59,39 @@ fn spawn_drive(env: &TestEnv, run: &str, failpoint: Option<(&str, &str, &Path)>)
         .expect("drive child spawns")
 }
 
+fn start_epic(env: &TestEnv, epic: &str) {
+    env.enable_dynamic_gh();
+    env.seed_epic(epic, &[("child-crash", &env.spec, true)]);
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+}
+
+fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -> Child {
+    let mut cmd = env.forged_cmd(&["epic", "drive", "--epic", epic]);
+    cmd.env("FORGED_FAILPOINT", failpoint.0)
+        .env("FORGED_FAILPOINT_MODE", failpoint.1)
+        .env("FORGED_FAILPOINT_DIR", failpoint.2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("epic drive child spawns")
+}
+
 fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
     std::fs::read_to_string(env.packet_dir(run, stage, seq).join("provider.pid"))
         .ok()
@@ -462,6 +495,43 @@ fn applied_then_response_lost_settles_by_observation_without_repeating() {
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k4"]);
     assert_eq!(code, 0, "drive after observation: {driven}");
     assert!(driven["result"]["terminal"]["done"].is_object());
+}
+
+// ------------------------------------------------------- epic merge recovery
+
+#[test]
+fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
+    let env = TestEnv::new("km-epic-merge");
+    start_epic(&env, "epic-crash");
+    let fp = env.root.join("fp-epic-merge");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let mut drive = spawn_epic_drive(&env, "epic-crash", ("epic.child.merge.after", "crash", &fp));
+    let status = drive.wait().expect("epic drive crashes");
+    assert!(!status.success(), "the controller dies after GitHub merged");
+
+    let merges_before = env
+        .gh_calls()
+        .iter()
+        .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
+        .count();
+    assert_eq!(merges_before, 1, "GitHub received the child merge once");
+
+    // A different OS process reaps the dead controller slot, releases the
+    // interrupted SafeRetry row, observes PR #7 as already merged, records
+    // the child, and creates the sole final draft PR.
+    let (code, resumed) = env.forged(&["epic", "drive", "--epic", "epic-crash"]);
+    assert_eq!(code, 0, "resumed epic drive: {resumed}");
+    assert_eq!(resumed["result"]["stopped"]["finalPr"]["number"], json!(8));
+    let merges_after = env
+        .gh_calls()
+        .iter()
+        .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
+        .count();
+    assert_eq!(merges_after, 1, "resume probes instead of re-merging");
+    let (code, projected) = env.forged(&["epic", "status", "--epic", "epic-crash"]);
+    assert_eq!(code, 0, "epic status: {projected}");
+    assert!(projected["result"]["children"][0]["merged"].is_object());
+    assert_eq!(projected["result"]["finalPr"]["number"], json!(8));
 }
 
 // ------------------------------------------------------------- schedule 5

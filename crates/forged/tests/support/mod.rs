@@ -333,6 +333,14 @@ const GH_SHIM: &str = r#"#!/bin/sh
   printf '%s\037' "$@"
   printf '\036'
 } >> "$GH_SHIM_LOG"
+val() {
+  flag=$1; shift
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "$flag" ]; then printf '%s' "$a"; return; fi
+    prev=$a
+  done
+}
 key=unknown
 case "$1" in
   pr)
@@ -351,6 +359,47 @@ case "$1" in
     esac ;;
   auth) key=auth ;;
 esac
+if [ -f "$GH_SHIM_DIR/dynamic-prs" ]; then
+  case "$key" in
+    repo)
+      printf '{"default_branch":"main"}\n'; exit 0 ;;
+    create_pr)
+      count=$(cat "$GH_SHIM_DIR/pr-counter" 2>/dev/null || echo 6)
+      num=$((count + 1)); printf '%s' "$num" > "$GH_SHIM_DIR/pr-counter"
+      head=""; base=""; prev=""
+      for a in "$@"; do
+        case "$a" in head=*) head=${a#head=} ;; base=*) base=${a#base=} ;; esac
+      done
+      printf '%s' "$head" > "$GH_SHIM_DIR/pr.$num.head"
+      printf '%s' "$base" > "$GH_SHIM_DIR/pr.$num.base"
+      printf 'OPEN' > "$GH_SHIM_DIR/pr.$num.state"
+      printf 'true' > "$GH_SHIM_DIR/pr.$num.draft"
+      printf '{"number":%s,"state":"open","draft":true,"base":{"ref":"%s"},"head":{"ref":"%s"},"html_url":"https://example.invalid/pr/%s"}\n' "$num" "$base" "$head" "$num"
+      exit 0 ;;
+    pr_view)
+      num=$3; state=$(cat "$GH_SHIM_DIR/pr.$num.state"); draft=$(cat "$GH_SHIM_DIR/pr.$num.draft")
+      base=$(cat "$GH_SHIM_DIR/pr.$num.base"); head=$(cat "$GH_SHIM_DIR/pr.$num.head")
+      printf '{"number":%s,"state":"%s","isDraft":%s,"baseRefName":"%s","headRefName":"%s","url":"https://example.invalid/pr/%s"}\n' "$num" "$state" "$draft" "$base" "$head" "$num"
+      exit 0 ;;
+    pr_ready)
+      num=$3; printf 'false' > "$GH_SHIM_DIR/pr.$num.draft"; exit 0 ;;
+    pr_merge)
+      num=$3; printf 'MERGED' > "$GH_SHIM_DIR/pr.$num.state"; exit 0 ;;
+    pr_list)
+      head=$(val --head "$@"); base=$(val --base "$@")
+      found=""
+      for file in "$GH_SHIM_DIR"/pr.*.head; do
+        [ -f "$file" ] || continue
+        num=${file##*/pr.}; num=${num%.head}
+        if [ "$(cat "$file")" = "$head" ] && [ "$(cat "$GH_SHIM_DIR/pr.$num.base")" = "$base" ] && [ "$(cat "$GH_SHIM_DIR/pr.$num.state")" = OPEN ]; then found=$num; break; fi
+      done
+      if [ -z "$found" ]; then printf '[]\n'; else
+        draft=$(cat "$GH_SHIM_DIR/pr.$found.draft")
+        printf '[{"number":%s,"state":"OPEN","isDraft":%s,"baseRefName":"%s","headRefName":"%s","url":"https://example.invalid/pr/%s"}]\n' "$found" "$draft" "$base" "$head" "$found"
+      fi
+      exit 0 ;;
+  esac
+fi
 code=0
 if [ -f "$GH_SHIM_DIR/$key.exit" ]; then code=$(cat "$GH_SHIM_DIR/$key.exit"); fi
 if [ -f "$GH_SHIM_DIR/$key.stderr" ]; then cat "$GH_SHIM_DIR/$key.stderr" >&2; fi
@@ -563,12 +612,27 @@ val() {
   done
 }
 cmd=$1
+issue_json() {
+  id=$1
+  title=$(cat "$state/$id.title" 2>/dev/null || echo "$id")
+  description=$(cat "$state/$id.description" 2>/dev/null || true)
+  status=$(cat "$state/$id.status" 2>/dev/null || echo open)
+  type=$(cat "$state/$id.type" 2>/dev/null || echo task)
+  assignee=$(cat "$state/$id.assignee" 2>/dev/null || true)
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s"}' "$id" "$title" "$description" "$status" "$type" "$assignee"
+}
 case "$cmd" in
   version)
     printf '{"schema_version":1,"data":{"version":"1.2.1"}}\n' ;;
   update)
     id=$2
     actor=$(val --actor "$@")
+    new_status=$(val --status "$@")
+    if [ -n "$new_status" ]; then
+      printf '%s' "$new_status" > "$state/$id.status"
+      printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
+      exit 0
+    fi
     cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
     if [ -z "$cur" ] || [ "$cur" = "$actor" ]; then
       printf '%s' "$actor" > "$state/$id.assignee"
@@ -603,12 +667,31 @@ case "$cmd" in
     fi ;;
   show)
     id=$2
-    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
-    printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s"}]}\n' "$id" "$cur" ;;
+    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+  children)
+    epic=$2; first=1
+    printf '{"schema_version":1,"data":['
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done < "$state/$epic.children"
+    printf ']}\n' ;;
+  close)
+    id=$2; printf 'closed' > "$state/$id.status"
+    rm -f "$state/$id.assignee"
+    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   ready)
     actor=$(val --actor "$@")
     front="$state/frontier"
-    if [ -s "$front" ]; then
+    if [ -z "$actor" ]; then
+      first=1; printf '{"schema_version":1,"data":['
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = closed ] && continue
+        [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      done < "$front"
+      printf ']}\n'
+    elif [ -s "$front" ]; then
       id=$(head -1 "$front")
       tail -n +2 "$front" > "$front.tmp" && mv "$front.tmp" "$front"
       printf '%s' "$actor" > "$state/$id.assignee"
@@ -872,6 +955,40 @@ impl TestEnv {
     pub fn gh_set(&self, key: &str, kind: &str, contents: &str) {
         std::fs::write(self.gh_dir.join(format!("{key}.{kind}")), contents)
             .expect("write gh scenario");
+    }
+
+    /// Enable the stateful gh shim used by epic PR ready/merge/final-PR tests.
+    pub fn enable_dynamic_gh(&self) {
+        std::fs::write(self.gh_dir.join("dynamic-prs"), "1").expect("dynamic gh flag");
+    }
+
+    /// Seed an epic plus child inventory/status/spec pointers in the bd shim.
+    pub fn seed_epic(&self, epic: &str, children: &[(&str, &Path, bool)]) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{epic}.title")), "Test epic").expect("epic title");
+        std::fs::write(state.join(format!("{epic}.type")), "epic").expect("epic type");
+        std::fs::write(state.join(format!("{epic}.status")), "open").expect("epic status");
+        let mut inventory = String::new();
+        let mut frontier = String::new();
+        for (id, spec, ready) in children {
+            inventory.push_str(id);
+            inventory.push('\n');
+            std::fs::write(state.join(format!("{id}.title")), format!("Child {id}"))
+                .expect("child title");
+            std::fs::write(
+                state.join(format!("{id}.description")),
+                format!("spec: {}", spec.display()),
+            )
+            .expect("child description");
+            std::fs::write(state.join(format!("{id}.status")), "open").expect("child status");
+            if *ready {
+                frontier.push_str(id);
+                frontier.push('\n');
+            }
+        }
+        std::fs::write(state.join(format!("{epic}.children")), inventory).expect("inventory");
+        std::fs::write(state.join("frontier"), frontier).expect("frontier");
     }
 
     /// Every recorded gh invocation, oldest first, one argv per entry.

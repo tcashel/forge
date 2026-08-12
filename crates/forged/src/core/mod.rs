@@ -6,6 +6,7 @@
 
 mod claimnext;
 mod drive;
+mod epic;
 mod ops;
 pub(crate) mod sessions;
 
@@ -564,6 +565,13 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_drive" => drive::run_drive(ctx, &req).await,
         "run_status" => ops::run_status(ctx, &req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
+        "epic_start" => epic::epic_start(ctx, &mut req).await,
+        "epic_advance" => epic::epic_advance(ctx, &req).await,
+        "epic_drive" => epic::epic_drive(ctx, &req).await,
+        "epic_status" => epic::epic_status(ctx, &req).await,
+        "epic_pause" => epic::epic_pause(ctx, &mut req).await,
+        "epic_resume" => epic::epic_resume(ctx, &mut req).await,
+        "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,

@@ -92,7 +92,7 @@ pub async fn spec_path_of(ctx: &Ctx, run_id: &str) -> Result<String, Failure> {
 }
 
 /// The draft PR number, from the settled `draftpr` machine operation.
-fn pr_number_of(view: &RunView) -> Option<u64> {
+pub(crate) fn pr_number_of(view: &RunView) -> Option<u64> {
     let key = machine_idempotency_key(&view.run.run_id, MachineStage::DraftPr, 0);
     view.settled_operations
         .iter()
@@ -108,7 +108,7 @@ fn pr_number_of(view: &RunView) -> Option<u64> {
 }
 
 /// The merged findings of the latest review fan-out.
-fn latest_review_findings(view: &RunView) -> Vec<forged_types::Finding> {
+pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Finding> {
     if view.execution_package.is_some() {
         let semantic: Vec<_> = view
             .packets

@@ -273,7 +273,7 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
 
 /// The repo's default branch, from its `origin/HEAD` symref; falls back to
 /// `main`.
-async fn default_branch_of(repo: &str) -> String {
+pub(crate) async fn default_branch_of(repo: &str) -> String {
     let out = tokio::process::Command::new("git")
         .arg("-C")
         .arg(repo)

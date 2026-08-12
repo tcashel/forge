@@ -9,6 +9,73 @@ use serde_json::{json, Value};
 use support::{assert_no_overlap, rev_parse, TestEnv};
 
 #[test]
+fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr() {
+    let env = TestEnv::new("forged-epic-e2e");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-one", &[("child-one", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-one",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
+
+    let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic drive: {driven}");
+    assert_eq!(
+        driven["result"]["stopped"]["finalPr"]["number"],
+        json!(8),
+        "child PR #7 is merged and one epic PR #8 remains: {driven}"
+    );
+    assert_eq!(
+        driven["result"]["stopped"]["finalPr"]["isDraft"],
+        json!(true)
+    );
+
+    let (code, status) = env.forged(&["epic", "status", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic status: {status}");
+    assert_eq!(status["result"]["finalPr"]["number"], json!(8));
+    assert_eq!(status["result"]["waves"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status["result"]["children"][0]["beadsStatus"],
+        json!("closed")
+    );
+    assert!(status["result"]["children"][0]["merged"].is_object());
+    assert!(status["result"]["inputRequired"].is_null());
+
+    let gh = env.gh_calls();
+    assert!(gh.iter().any(|args| args.starts_with(&[
+        "pr".to_owned(),
+        "ready".to_owned(),
+        "7".to_owned()
+    ])));
+    assert!(gh.iter().any(|args| args.starts_with(&[
+        "pr".to_owned(),
+        "merge".to_owned(),
+        "7".to_owned()
+    ])));
+    assert!(!gh
+        .iter()
+        .any(|args| { args.starts_with(&["pr".to_owned(), "merge".to_owned(), "8".to_owned(),]) }));
+    let creates = gh
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg.contains("/pulls")))
+        .count();
+    assert_eq!(creates, 2, "one child PR plus one epic PR: {gh:?}");
+}
+
+#[test]
 fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     let env = TestEnv::new("forged-session-boundary");
     assert_eq!(env.forged(&["init"]).0, 0);

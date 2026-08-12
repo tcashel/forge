@@ -25,6 +25,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "init",
         "definition",
         "run",
+        "epic",
         "packet",
         "session",
         "claim-next",
@@ -40,6 +41,12 @@ fn help_lists_every_command_and_subcommand_flags() {
     let run = help_text(&env, &["run", "--help"]);
     for sub in ["start", "advance", "drive", "status"] {
         assert!(run.contains(sub), "run --help must list {sub}");
+    }
+    let epic = help_text(&env, &["epic", "--help"]);
+    for sub in [
+        "start", "advance", "drive", "status", "pause", "resume", "resolve",
+    ] {
+        assert!(epic.contains(sub), "epic --help must list {sub}");
     }
     let start = help_text(&env, &["run", "start", "--help"]);
     for flag in [
