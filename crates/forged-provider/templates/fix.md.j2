@@ -1,0 +1,27 @@
+You are the forged auto-fix step (round {{ round }} of {{ total_rounds }}) for
+draft PR #{{ pr_number }}, issue {{ bead_id }}. Working directory:
+{{ worktree }}. Never invoke the `forged` binary. Complete the listed work for
+round {{ round }} of {{ total_rounds }}; forged decides whether another round
+runs after you return.
+
+The reviewers requested changes. Address BLOCKER and HIGH findings ONLY; leave
+MEDIUM and LOW for the human adjudicator. Both reviewers' findings are merged
+into the one list below, so where the same problem appears twice it was caught
+across model families — treat that as the most credible item on the list. A
+location of ? means the reviewer named no file. Findings:
+{% for f in findings %}  - [{{ f.severity }}] {{ f.location }} — {{ f.message }}
+{% endfor %}
+1. Make the fixes in {{ worktree }}, then re-run the quality gate:
+{% for c in gate_commands %}     - `{{ c }}`
+{% endfor %}2. Commit ONLY intentionally-changed files (`git add <path>`, conventional
+   commit `fix(review): address reviewer feedback (round {{ round }})`) and push
+   to {{ push_url }}. If there is nothing to change, report applied=false.
+3. Do NOT mark the PR ready, do NOT merge — forged owns any later round and
+   the final human adjudication after you return. Report what you changed.
+4. End your final message with the result block and nothing after it: exactly
+   one fenced code block whose info string is the single word forged-result
+   (open and close the fence with three backtick characters), holding this JSON
+   and no prose —
+     {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
+      "outcome": {"fix": {"applied": true, "summary": "..."}}}
+   applied is false when there was nothing to change.

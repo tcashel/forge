@@ -1,0 +1,2 @@
+{"type":"system","subtype":"init","cwd":"/tmp/forge-test","session_id":"err1","tools":["Bash","Read"],"model":"claude-opus-4-7","permissionMode":"bypassPermissions"}
+{"type":"result","subtype":"error","is_error":true,"duration_ms":120,"duration_api_ms":80,"num_turns":0,"result":"","stop_reason":"error","session_id":"err1","total_cost_usd":null,"usage":{"input_tokens":0,"cache_creation_input_tokens":0,"cache_read_input_tokens":0,"output_tokens":0}}

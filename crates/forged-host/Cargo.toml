@@ -1,0 +1,24 @@
+[package]
+name = "forged-host"
+version = "0.1.0"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[features]
+live = []
+
+[dependencies]
+async-trait.workspace = true
+forged-types = { path = "../forged-types" }
+nix.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true
