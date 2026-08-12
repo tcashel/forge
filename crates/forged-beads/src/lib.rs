@@ -32,7 +32,7 @@ pub use config::BdConfig;
 pub use doctor::{run_doctor, DoctorConfig, ProbeResult};
 pub use guardian::{run_guardian, GuardianConfig, GuardianExit};
 pub use lease::{
-    claim_ready, claim_specific, heartbeat, reclaim, reclaim_older_than, ClaimedBead,
+    claim_ready, claim_specific, heartbeat, lease_holder, reclaim, reclaim_older_than, ClaimedBead,
     ReclaimOutcome, BD_LEASE_TTL_S,
 };
 pub use slot::{

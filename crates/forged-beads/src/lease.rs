@@ -294,6 +294,23 @@ fn older_than_token(older_than_s: u64) -> String {
     format!("{older_than_s}s")
 }
 
+/// Read the bead's current lease holder — the wave-4 slice's one sanctioned
+/// sibling addition (operator-adjudicated 2026-08-12): `resolve_state` needs
+/// the current holder and the read spine is crate-internal.
+///
+/// A pure read through the existing bd envelope spine (`bd show <bead>
+/// --json`): it takes no lease, mutates nothing, and needs no flock. An
+/// absent or empty `assignee` is `Ok(None)` — an unheld lease is data, not
+/// an error.
+pub async fn lease_holder(bd: &BdConfig, bead: &str) -> Result<Option<String>, BdError> {
+    let data = invoke::read(bd, &["show", bead, "--json"]).await?;
+    Ok(envelope::first_obj(&data)
+        .and_then(|obj| obj.get("assignee"))
+        .and_then(Value::as_str)
+        .filter(|assignee| !assignee.is_empty())
+        .map(str::to_string))
+}
+
 /// Scoped reclaim of an expired lease. Scoping is mandatory and
 /// type-enforced: this signature requires both the bead id and the expected
 /// previous holder, so an unscoped or half-scoped reclaim is unconstructible.
