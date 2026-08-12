@@ -9,6 +9,86 @@ use serde_json::{json, Value};
 use support::{assert_no_overlap, rev_parse, TestEnv};
 
 #[test]
+fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
+    let env = TestEnv::new("forged-session-boundary");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-session",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    let (code, queued) = env.forged(&[
+        "session",
+        "message",
+        "--run",
+        "bead-session",
+        "--message",
+        "Keep the public API source compatible.",
+        "--requested-by",
+        "lead-agent",
+    ]);
+    assert_eq!(code, 0, "queue: {queued}");
+    assert_eq!(queued["result"]["delivery"], json!("queued"));
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-session"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    let prompt = std::fs::read_to_string(
+        env.packet_dir("bead-session", "implementation", 0)
+            .join("prompt.md"),
+    )
+    .expect("implementation prompt");
+    assert!(
+        prompt.contains("lead-agent"),
+        "intervention identity: {prompt}"
+    );
+    assert!(
+        prompt.contains("Keep the public API source compatible."),
+        "intervention text: {prompt}"
+    );
+
+    let (code, listed) = env.forged(&["session", "list", "--run", "bead-session"]);
+    assert_eq!(code, 0, "session list: {listed}");
+    assert_eq!(listed["result"]["pendingInterventions"], json!(0));
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert!(!sessions.is_empty(), "durable session rows: {listed}");
+    assert!(sessions.iter().all(|session| session["host"] == "process"));
+    assert!(sessions
+        .iter()
+        .all(|session| session["attachHint"].is_null()));
+
+    let (_, events) = env.forged(&["events", "--run", "bead-session", "--limit", "1000"]);
+    let kinds: Vec<&str> = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect();
+    for kind in [
+        "forged.intervention.queued",
+        "forged.intervention.delivered",
+        "forged.host.fallback",
+        "forged.session.started",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} is durable: {kinds:?}");
+    }
+}
+
+#[test]
 fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     let env = TestEnv::new("forged-e2e");
     let (code, init) = env.forged(&["init"]);

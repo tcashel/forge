@@ -5,7 +5,7 @@
 mod host;
 pub(crate) mod wire;
 
-pub use host::HerdrHost;
+pub use host::{HerdrControl, HerdrHost, PaneSnapshot};
 
 use std::collections::{HashMap, HashSet};
 use std::path::Path;

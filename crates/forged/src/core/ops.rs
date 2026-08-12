@@ -13,17 +13,9 @@ use crate::adapters::execute::sha256_file;
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
-    derive_key, err_response, fenced, key_absent, on_ledger, param_opt_str, param_str, read_only,
-    session_claimant, Ctx, Failure,
+    default_key, derive_key, err_response, fenced, key_absent, on_ledger, param_opt_str, param_str,
+    read_only, session_claimant, Ctx, Failure,
 };
-
-/// Fill an absent idempotency key with the derived one; an explicit
-/// `--idempotency-key` always overrides.
-fn default_key(req: &mut OperationRequest, derived: String) {
-    if key_absent(req) {
-        req.idempotency_key = derived;
-    }
-}
 
 // ---------------------------------------------------------------- doctor
 

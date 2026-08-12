@@ -17,6 +17,7 @@ fn implement_context() -> Value {
         "base_ref": "main",
         "spec_path": "specs/bead-1.md",
         "gate_commands": ["cargo build --workspace --locked", "cargo test --workspace"],
+        "field_notes": [],
         "packet_id": PACKET_ID,
         "result_schema": PromptStage::Implement.result_schema(),
     })
@@ -44,6 +45,7 @@ fn fix_context(findings: &[RenderedFinding]) -> Value {
         "gate_commands": ["cargo test --workspace"],
         "push_url": "https://example.invalid/repo.git",
         "findings": findings,
+        "field_notes": [],
         "packet_id": PACKET_ID,
         "result_schema": PromptStage::Fix.result_schema(),
     })
@@ -225,6 +227,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "base_ref",
             "spec_path",
             "gate_commands",
+            "field_notes",
             "packet_id",
             "result_schema"
         ]
@@ -252,6 +255,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "gate_commands",
             "push_url",
             "findings",
+            "field_notes",
             "packet_id",
             "result_schema"
         ]

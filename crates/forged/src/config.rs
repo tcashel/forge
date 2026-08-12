@@ -46,7 +46,20 @@ pub struct ForgedConfig {
     pub bd_path: PathBuf,
     pub beads_dir: PathBuf,
     pub codex_home: PathBuf,
+    pub host_policy: HostPolicy,
     pub herdr_sock: Option<PathBuf>,
+}
+
+/// How provider sessions use Herdr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostPolicy {
+    /// Prefer Herdr and visibly fall back to a plain process when unavailable.
+    Preferred,
+    /// Require Herdr; unavailability refuses execution.
+    Required,
+    /// Never contact Herdr.
+    Off,
 }
 
 /// On-disk authoring shape. Definition values themselves deny unknown fields.
@@ -74,6 +87,8 @@ struct ConfigFile {
     bd_path: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_home: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    host_policy: Option<HostPolicy>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr_sock: Option<String>,
 }
@@ -319,6 +334,20 @@ impl ForgedConfig {
                 .unwrap_or_default()
                 .join(".codex")
         });
+        let herdr_sock = file
+            .herdr_sock
+            .map(PathBuf::from)
+            .or_else(|| {
+                std::env::var_os("HERDR_SOCK")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+            })
+            .or_else(|| {
+                std::env::var_os("HOME")
+                    .filter(|v| !v.is_empty())
+                    .map(PathBuf::from)
+                    .map(|home| home.join(".config/herdr/herdr.sock"))
+            });
         Ok(ForgedConfig {
             runs_root: anvil_home.join("runs"),
             db_path: forged_ledger::default_db_path(),
@@ -339,7 +368,8 @@ impl ForgedConfig {
             bd_path,
             beads_dir,
             codex_home,
-            herdr_sock: file.herdr_sock.map(PathBuf::from),
+            host_policy: file.host_policy.unwrap_or(HostPolicy::Preferred),
+            herdr_sock,
             anvil_home,
         })
     }
@@ -534,7 +564,11 @@ impl ForgedConfig {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            herdr_sock: None,
+            host_policy: Some(HostPolicy::Preferred),
+            herdr_sock: self
+                .herdr_sock
+                .as_ref()
+                .map(|path| path.to_string_lossy().into_owned()),
         };
         if self
             .config_path
@@ -674,6 +708,7 @@ mod tests {
             bd_path: PathBuf::from("/tmp/anvil/tools/bd-1.2.1/bin/bd"),
             beads_dir: PathBuf::from("/tmp/anvil/beads"),
             codex_home: PathBuf::from("/tmp/home/.codex"),
+            host_policy: HostPolicy::Preferred,
             herdr_sock: None,
         }
     }

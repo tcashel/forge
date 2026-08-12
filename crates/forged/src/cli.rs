@@ -39,6 +39,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PacketCmd,
     },
+    /// Provider-session observation and intervention.
+    Session {
+        /// The session subcommand.
+        #[command(subcommand)]
+        command: SessionCmd,
+    },
     /// Resume a ledger run or claim the next ready bead (explicit
     /// idempotency key required).
     ClaimNext(ClaimNextArgs),
@@ -242,6 +248,67 @@ pub struct PacketTokenArgs {
     pub claim_token: String,
 }
 
+/// `session` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SessionCmd {
+    /// List durable provider-session metadata for a run.
+    List(RunScoped),
+    /// Read recent output from a Herdr-backed attempt.
+    Read(SessionReadArgs),
+    /// Queue an intervention, delivering live only when capability permits.
+    Message(SessionMessageArgs),
+    /// Revoke and confirmed-stop one attempt.
+    Stop(SessionStopArgs),
+}
+
+/// `session read` flags.
+#[derive(Debug, Args)]
+pub struct SessionReadArgs {
+    /// Attempt id whose durable Herdr pane should be read.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Recent unwrapped terminal lines to return.
+    #[arg(long, default_value_t = 120)]
+    pub lines: u32,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `session message` flags.
+#[derive(Debug, Args)]
+pub struct SessionMessageArgs {
+    /// Run receiving the intervention.
+    #[arg(long)]
+    pub run: String,
+    /// Live attempt to target when interactive delivery is supported.
+    #[arg(long)]
+    pub attempt: Option<i64>,
+    /// Message delivered live or at the next durable provider boundary.
+    #[arg(long)]
+    pub message: String,
+    /// Human or agent identity requesting the intervention.
+    #[arg(long, default_value = "operator")]
+    pub requested_by: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `session stop` flags.
+#[derive(Debug, Args)]
+pub struct SessionStopArgs {
+    /// Attempt id to revoke and stop.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Reason written to the durable revocation marker.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `claim-next` flags.
 #[derive(Debug, Args)]
 pub struct ClaimNextArgs {
@@ -387,6 +454,12 @@ pub fn command_name(command: &Command) -> &'static str {
             PacketCmd::Fail(_) => "packet_fail",
             PacketCmd::Heartbeat(_) => "packet_heartbeat",
         },
+        Command::Session { command } => match command {
+            SessionCmd::List(_) => "session_list",
+            SessionCmd::Read(_) => "session_read",
+            SessionCmd::Message(_) => "session_message",
+            SessionCmd::Stop(_) => "session_stop",
+        },
         Command::ClaimNext(_) => "claim_next",
         Command::Gate { command } => match command {
             GateCmd::Run(_) => "gate_run",
@@ -520,6 +593,45 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "attempt": a.attempt,
                         "claimToken": a.claim_token,
                     }),
+                ),
+            ),
+        },
+        Command::Session { command } => match command {
+            SessionCmd::List(a) => (
+                "session_list",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
+                ),
+            ),
+            SessionCmd::Read(a) => (
+                "session_read",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "lines": a.lines}),
+                ),
+            ),
+            SessionCmd::Message(a) => (
+                "session_message",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({
+                        "run": a.run,
+                        "attempt": a.attempt,
+                        "message": a.message,
+                        "requestedBy": a.requested_by,
+                    }),
+                ),
+            ),
+            SessionCmd::Stop(a) => (
+                "session_stop",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "reason": a.reason}),
                 ),
             ),
         },

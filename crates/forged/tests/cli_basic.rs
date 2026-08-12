@@ -26,6 +26,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "definition",
         "run",
         "packet",
+        "session",
         "claim-next",
         "gate",
         "reconcile",
@@ -71,6 +72,17 @@ fn help_lists_every_command_and_subcommand_flags() {
         assert!(
             complete.contains(flag),
             "packet complete --help must document {flag}"
+        );
+    }
+    let session = help_text(&env, &["session", "--help"]);
+    for sub in ["list", "read", "message", "stop"] {
+        assert!(session.contains(sub), "session --help must list {sub}");
+    }
+    let message = help_text(&env, &["session", "message", "--help"]);
+    for flag in ["--run", "--attempt", "--message", "--requested-by"] {
+        assert!(
+            message.contains(flag),
+            "session message --help must document {flag}"
         );
     }
     let retire = help_text(&env, &["worktree", "retire", "--help"]);

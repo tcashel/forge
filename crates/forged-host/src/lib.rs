@@ -13,7 +13,7 @@ mod identity;
 mod process;
 mod sentinel;
 
-pub use herdr::HerdrHost;
+pub use herdr::{HerdrControl, HerdrHost, PaneSnapshot};
 pub use process::ProcessHost;
 
 use std::collections::HashMap;

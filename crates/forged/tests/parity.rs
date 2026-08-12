@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the thirteen core functions, the CLI path and the MCP tool path produce
+//! the seventeen public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_thirteen_tools_match_their_cli_counterparts() {
+fn all_seventeen_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -54,10 +54,14 @@ fn all_thirteen_tools_match_their_cli_counterparts() {
         "run_revise_roster",
         "run_start",
         "run_status",
+        "session_list",
+        "session_message",
+        "session_read",
+        "session_stop",
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the thirteen tools, exactly");
+    assert_eq!(tools, expected, "the seventeen tools, exactly");
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
@@ -201,6 +205,63 @@ fn all_thirteen_tools_match_their_cli_counterparts() {
         })),
     );
     assert_eq!(normalized(cli), normalized(tool), "packet_fail parity");
+
+    // Session controls: missing durable state refuses identically.
+    let cli = env.forged(&["session", "list", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "session_list",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_list parity");
+
+    let cli = env.forged(&["session", "read", "--attempt", "1"]).1;
+    let tool = mcp.call_tool(
+        "session_read",
+        envelope(json!({"attempt": 1, "lines": 120})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_read parity");
+
+    let cli = env
+        .forged(&[
+            "session",
+            "message",
+            "--run",
+            "absent",
+            "--message",
+            "checkpoint",
+            "--idempotency-key",
+            "op:session_message:par-cli",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_message",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": "op:session_message:par-mcp",
+            "runId": "absent",
+            "params": {
+                "run": "absent", "attempt": null, "message": "checkpoint",
+                "requestedBy": "operator"
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_message parity");
+
+    let cli = env
+        .forged(&[
+            "session",
+            "stop",
+            "--attempt",
+            "1",
+            "--reason",
+            "operator requested",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_stop",
+        envelope(json!({"attempt": 1, "reason": "operator requested"})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_stop parity");
 
     // claim_next: the missing-key refusal is identical; the real call (an
     // empty frontier) is identical too, under distinct explicit keys.

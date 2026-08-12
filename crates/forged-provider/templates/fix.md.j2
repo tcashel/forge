@@ -3,6 +3,10 @@ draft PR #{{ pr_number }}, issue {{ bead_id }}. Working directory:
 {{ worktree }}. Never invoke the `forged` binary. Complete the listed work for
 round {{ round }} of {{ total_rounds }}; forged decides whether another round
 runs after you return.
+{% if field_notes %}
+Operator interventions recorded before this provider boundary:
+{% for note in field_notes %}  - {{ note }}
+{% endfor %}{% endif %}
 
 The reviewers requested changes. Address BLOCKER and HIGH findings ONLY; leave
 MEDIUM and LOW for the human adjudicator. Both reviewers' findings are merged

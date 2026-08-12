@@ -57,6 +57,23 @@ pub(crate) struct PaneInfo {
     pub(crate) pane_id: String,
 }
 
+/// `pane.read` result wrapper.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneReadResponse {
+    pub(crate) read: PaneReadResult,
+}
+
+/// Stable text snapshot returned by Herdr.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneReadResult {
+    pub(crate) pane_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) text: String,
+    pub(crate) revision: u64,
+    pub(crate) truncated: bool,
+}
+
 /// `pane.process_info` result.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProcessInfo {

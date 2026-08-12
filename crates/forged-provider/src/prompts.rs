@@ -51,6 +51,7 @@ impl PromptStage {
                 "base_ref",
                 "spec_path",
                 "gate_commands",
+                "field_notes",
                 "packet_id",
                 "result_schema",
             ],
@@ -72,6 +73,7 @@ impl PromptStage {
                 "gate_commands",
                 "push_url",
                 "findings",
+                "field_notes",
                 "packet_id",
                 "result_schema",
             ],
@@ -109,6 +111,7 @@ impl PromptStage {
                 "base_ref": "main",
                 "spec_path": "specs/bead-1.md",
                 "gate_commands": ["cargo test --workspace"],
+                "field_notes": [],
                 "packet_id": "pkt-1",
                 "result_schema": self.result_schema(),
             }),
@@ -132,6 +135,7 @@ impl PromptStage {
                 "findings": [
                     {"severity": "HIGH", "location": "src/x.rs:42", "message": "sample"}
                 ],
+                "field_notes": [],
                 "packet_id": "pkt-1",
                 "result_schema": self.result_schema(),
             }),
@@ -359,6 +363,7 @@ mod tests {
             "gate_commands": ["cargo test --workspace"],
             "push_url": "https://example.invalid/repo.git",
             "findings": rendered_findings,
+            "field_notes": [],
             "packet_id": "pkt-1",
             "result_schema": PromptStage::Fix.result_schema(),
         });

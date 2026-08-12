@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
 use crate::adapters::ports::ForgedPorts;
-use crate::config::{now_iso, stage_str};
+use crate::config::{now_iso, stage_str, HostPolicy};
 use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
@@ -210,6 +210,7 @@ fn render_context(
             "base_ref": format!("origin/{}", packet.base_ref),
             "spec_path": packet.spec.path,
             "gate_commands": packet.contract.gate_commands,
+            "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -241,6 +242,7 @@ fn render_context(
             "gate_commands": packet.contract.gate_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
+            "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -365,8 +367,18 @@ async fn run_attempt(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
+    let mut packet = packet.clone();
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
+    let interventions = crate::core::sessions::pending_interventions(ctx, &run_id).await?;
+    packet
+        .field_notes
+        .extend(interventions.iter().map(|intervention| {
+            format!(
+                "Intervention {} from {}: {}",
+                intervention.id, intervention.requested_by, intervention.message
+            )
+        }));
     // The guardian heartbeats the lease that is actually held — bd's
     // heartbeat is owner-only, and a heartbeat under a second, derived
     // identity would be refused and let the run's own lease lapse under it.
@@ -387,7 +399,7 @@ async fn run_attempt(
         .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
     let dirs = PacketDirs::new(&packet_dir);
     let templates = PromptTemplates::load()?;
-    let context = render_context(exec, packet, seq)?;
+    let context = render_context(exec, &packet, seq)?;
     let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
     std::fs::write(dirs.prompt(), prompt)
         .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
@@ -400,7 +412,7 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
-    let invocation = driver.invocation(packet, &dirs, &claim_token)?;
+    let invocation = driver.invocation(&packet, &dirs, &claim_token)?;
 
     // 3. Prefix the pid capture (no exec — the host appends the sentinel to
     // the same shell, and `$$` is that shell's pid either way) and spawn
@@ -416,13 +428,64 @@ async fn run_attempt(
         invocation.shell_line
     );
     let status_base = packet_dir.join("status").join(attempt_id.to_string());
-    // Host selection: the plain process host by default; herdr when a
-    // socket is configured (passed explicitly — the default is never
-    // applied inside connect).
-    let host: Arc<dyn SessionHost> = match &ctx.config.herdr_sock {
-        Some(sock) => Arc::new(forged_host::HerdrHost::connect(sock, &status_base).await?),
-        None => Arc::new(ProcessHost::new(&status_base)),
-    };
+    // Herdr is the preferred visibility adapter. The ledger records the
+    // actual host selection, so a missing socket can never masquerade as a
+    // Herdr-backed session.
+    let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) =
+        match ctx.config.host_policy {
+            HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
+            HostPolicy::Preferred | HostPolicy::Required => match ctx.config.herdr_sock.as_ref() {
+                None => {
+                    if ctx.config.host_policy == HostPolicy::Required {
+                        return fail_and_grant_retry(
+                            ctx,
+                            &packet_id,
+                            &claim_token,
+                            "transport: Herdr is required but no socket is configured".to_owned(),
+                        )
+                        .await;
+                    }
+                    crate::core::sessions::record_host_fallback(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        attempt_id,
+                        "no Herdr socket is configured",
+                    )
+                    .await?;
+                    (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                }
+                Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
+                    Ok(herdr) => (
+                        Arc::new(herdr),
+                        "herdr",
+                        Some(sock.to_string_lossy().into_owned()),
+                    ),
+                    Err(error) if ctx.config.host_policy == HostPolicy::Preferred => {
+                        crate::core::sessions::record_host_fallback(
+                            ctx,
+                            &run_id,
+                            &packet_id,
+                            attempt_id,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                    }
+                    Err(error) => {
+                        return fail_and_grant_retry(
+                            ctx,
+                            &packet_id,
+                            &claim_token,
+                            format!("transport: required Herdr host unavailable: {error}"),
+                        )
+                        .await;
+                    }
+                },
+            },
+        };
+    let attach_hint =
+        (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_owned(), path);
@@ -450,6 +513,28 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
+    crate::core::sessions::record_session_started(
+        ctx,
+        crate::core::sessions::SessionStarted {
+            run_id: &run_id,
+            packet_id: &packet_id,
+            attempt_id,
+            host: host_kind,
+            session_id: session.as_str(),
+            socket_path: socket_path.as_deref(),
+            attach_hint: attach_hint.as_deref(),
+        },
+    )
+    .await?;
+    crate::core::sessions::record_interventions_delivered(
+        ctx,
+        &run_id,
+        &packet_id,
+        attempt_id,
+        &interventions,
+        "boundary",
+    )
+    .await?;
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;

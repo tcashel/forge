@@ -719,6 +719,7 @@ mod tests {
             bd_path: root.join("bd"),
             beads_dir: root.join("beads"),
             codex_home: root.join("codex"),
+            host_policy: crate::config::HostPolicy::Off,
             herdr_sock: None,
         };
         (config, ledger, attempt)

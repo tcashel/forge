@@ -5,6 +5,10 @@ WORKING DIRECTORY (everything happens here, and nowhere else):
   {{ worktree }}
 BRANCH: {{ branch }}
 SPEC:   {{ spec_path }}
+{% if field_notes %}
+Operator interventions recorded before this provider boundary:
+{% for note in field_notes %}  - {{ note }}
+{% endfor %}{% endif %}
 
 1. Read {{ spec_path }} in full, first. It is your SOLE source of requirements:
    build what it says rather than what you would have designed. Where the spec

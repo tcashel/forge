@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Thirteen tools, each taking the
+//! `forged mcp` — the rmcp stdio server. Seventeen tools, each taking the
 //! same operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -142,6 +142,39 @@ impl ForgedServer {
     #[tool(name = "packet_fail", description = "Report a packet failure.")]
     pub async fn packet_fail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("packet_fail", args.0).await
+    }
+
+    /// Durable provider-session metadata for a run.
+    #[tool(
+        name = "session_list",
+        description = "List provider sessions for a run."
+    )]
+    pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_list", args.0).await
+    }
+
+    /// Read recent output from a Herdr-backed session.
+    #[tool(name = "session_read", description = "Read a Herdr session pane.")]
+    pub async fn session_read(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_read", args.0).await
+    }
+
+    /// Queue or capability-gated live-deliver an intervention.
+    #[tool(
+        name = "session_message",
+        description = "Queue an intervention for a run or live session."
+    )]
+    pub async fn session_message(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_message", args.0).await
+    }
+
+    /// Revoke and confirmed-stop one provider attempt.
+    #[tool(
+        name = "session_stop",
+        description = "Revoke and stop a provider attempt."
+    )]
+    pub async fn session_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_stop", args.0).await
     }
 
     /// The stateless resume verb.

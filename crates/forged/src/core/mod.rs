@@ -7,6 +7,7 @@
 mod claimnext;
 mod drive;
 mod ops;
+pub(crate) mod sessions;
 
 use forged_ledger::{EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
@@ -165,6 +166,13 @@ pub fn derive_key(
 /// The defaulted read-only key: `op:<name>:read`.
 pub fn read_key(name: &str) -> String {
     format!("op:{name}:read")
+}
+
+/// Fill an absent idempotency key with the derived one; an explicit key wins.
+pub(crate) fn default_key(req: &mut OperationRequest, derived: String) {
+    if key_absent(req) {
+        req.idempotency_key = derived;
+    }
 }
 
 /// Read a required string param.
@@ -561,6 +569,10 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,
         "packet_fail" => ops::packet_fail(ctx, &mut req).await,
         "packet_heartbeat" => ops::packet_heartbeat(ctx, &req).await,
+        "session_list" => sessions::session_list(ctx, &req).await,
+        "session_read" => sessions::session_read(ctx, &req).await,
+        "session_message" => sessions::session_message(ctx, &mut req).await,
+        "session_stop" => sessions::session_stop(ctx, &mut req).await,
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,
