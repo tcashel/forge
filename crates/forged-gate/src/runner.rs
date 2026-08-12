@@ -11,6 +11,7 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Stdio;
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -124,7 +125,9 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
     let (stdout_pipe, stderr_pipe) = match (child.stdout.take(), child.stderr.take()) {
         (Some(out), Some(err)) => (out, err),
         _ => {
-            kill_group(pgid);
+            // Already failing: the kill and reap are best-effort so the
+            // original error is the one reported.
+            let _ = kill_group(pgid);
             let _ = child.wait().await;
             return Err(GateError::Io(std::io::Error::other(
                 "child stdio pipes missing after spawn",
@@ -152,10 +155,15 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
 
     if timed_out {
         // SIGKILL the recorded process group even if the leader already
-        // exited: a background descendant can hold the pipes open.
-        kill_group(pgid);
+        // exited: a background descendant can hold the pipes open. A
+        // non-ESRCH failure means the group may still be running and the
+        // unbounded reap/drain below could hang on it, so fail out instead
+        // of reporting a timeout row whose cleanup never happened.
+        kill_group(pgid).map_err(GateError::Io)?;
         if wait_result.is_none() {
-            let _ = child.wait().await;
+            // Retain the reap outcome: a wait failure here must surface as
+            // GateError::Io below, never vanish into a timeout row.
+            wait_result = Some(child.wait().await);
         }
         if stdout_result.is_none() {
             stdout_result = Some(flatten_join((&mut stdout_task).await));
@@ -170,13 +178,13 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
     let stderr_result =
         stderr_result.unwrap_or_else(|| Err(std::io::Error::other("stderr drain unresolved")));
 
-    // Post-spawn capture/wait failures: best-effort group kill (ESRCH
-    // tolerated), leader reaped and drains completed above, then Err — no
-    // honest complete row exists.
+    // Post-spawn capture/wait failures: best-effort group kill and reap
+    // (already failing, so the capture error stays the reported one), then
+    // Err — no honest complete row exists.
     let (stdout_tail, stderr_tail) = match (stdout_result, stderr_result) {
         (Ok(out), Ok(err)) => (out, err),
         (out, err) => {
-            kill_group(pgid);
+            let _ = kill_group(pgid);
             let _ = child.wait().await;
             let first = out
                 .err()
@@ -186,16 +194,27 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
         }
     };
     let exit_code = if timed_out {
-        None
+        // A timeout row asserts the cleanup happened: the group kill above
+        // succeeded, so the leader reap must also have. A wait failure is
+        // GateError::Io — never a plausible-looking timed_out row.
+        match wait_result {
+            Some(Ok(_)) => None,
+            Some(Err(e)) => return Err(GateError::Io(e)),
+            None => {
+                return Err(GateError::Io(std::io::Error::other(
+                    "child wait unresolved after timeout cleanup",
+                )))
+            }
+        }
     } else {
         let status = match wait_result {
             Some(Ok(status)) => status,
             Some(Err(e)) => {
-                kill_group(pgid);
+                let _ = kill_group(pgid);
                 return Err(GateError::Io(e));
             }
             None => {
-                kill_group(pgid);
+                let _ = kill_group(pgid);
                 return Err(GateError::Io(std::io::Error::other(
                     "child wait unresolved without a timeout",
                 )));
@@ -252,10 +271,18 @@ fn exit_code_of(status: std::process::ExitStatus) -> i32 {
     }
 }
 
-/// Best-effort SIGKILL of the whole process group; ESRCH is tolerated.
-fn kill_group(pgid: Option<Pid>) {
-    if let Some(pgid) = pgid {
-        let _ = killpg(pgid, Signal::SIGKILL);
+/// SIGKILL the whole process group. ESRCH alone is tolerated as success —
+/// every member already exited and was reaped, which IS completed cleanup.
+/// Any other failure is returned, because the group may still be running
+/// and the caller must not report cleanup that never happened.
+fn kill_group(pgid: Option<Pid>) -> std::io::Result<()> {
+    let Some(pgid) = pgid else {
+        // No pgid was ever recorded, so there is nothing to signal.
+        return Ok(());
+    };
+    match killpg(pgid, Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => Ok(()),
+        Err(errno) => Err(std::io::Error::from_raw_os_error(errno as i32)),
     }
 }
 
@@ -319,4 +346,22 @@ fn validate_abs_path(path: &Path, name: &str) -> Result<(), GateError> {
         });
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn kill_group_tolerates_a_vanished_group_as_success() {
+        // i32::MAX exceeds every platform's pid cap (Linux PID_MAX_LIMIT is
+        // 2^22; macOS is far lower), so this group cannot exist: killpg
+        // reports ESRCH, which kill_group reports as completed cleanup.
+        assert!(kill_group(Some(Pid::from_raw(i32::MAX))).is_ok());
+    }
+
+    #[test]
+    fn kill_group_without_a_recorded_pgid_is_success() {
+        assert!(kill_group(None).is_ok());
+    }
 }

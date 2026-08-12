@@ -41,7 +41,8 @@ struct RepoMeta {
     default_branch: String,
 }
 
-/// One issue comment body from the REST listing.
+/// One issue comment body — a REST listing entry, and also the shape the
+/// create-comment POST replies with.
 #[derive(serde::Deserialize)]
 struct CommentBody {
     body: String,
@@ -216,7 +217,10 @@ impl GhClient {
     /// Idempotently post a finding comment on a PR, deduplicated by a hidden
     /// marker line: `<!-- anvil-finding id=<finding_id> -->`. The listing is
     /// paginated; the match is the whole marker, byte-exact, so id `abc`
-    /// cannot collide with `abcd`.
+    /// cannot collide with `abcd`. A listing that parses into zero pages is
+    /// [`GhError::Json`], never an empty comment list — a malformed listing
+    /// must not cause a duplicate post — and the POST reply must itself
+    /// parse before `Posted` is reported.
     pub async fn ensure_finding_comment(
         &self,
         repo: &str,
@@ -229,14 +233,26 @@ impl GhClient {
 
         let stdout = self.run(&["api", &path, "--paginate"]).await?;
         // `--paginate` concatenates one JSON array per page; deserialize the
-        // stream of `[{ "body": ... }]` pages.
+        // stream of `[{ "body": ... }]` pages. Even a PR with no comments is
+        // one `[]` page, so zero parsed pages means gh's stdout was not the
+        // promised JSON (empty or whitespace-only) — treating that as an
+        // empty listing would silently post a duplicate comment.
         let mut comments: Vec<CommentBody> = Vec::new();
+        let mut pages = 0usize;
         let stream = serde_json::Deserializer::from_slice(&stdout);
         for page in stream.into_iter::<Vec<CommentBody>>() {
             let page = page.map_err(|e| GhError::Json {
                 message: e.to_string(),
             })?;
+            pages += 1;
             comments.extend(page);
+        }
+        if pages == 0 {
+            return Err(GhError::Json {
+                message: "comment listing produced no JSON pages: \
+                          empty stdout is not an empty comment list"
+                    .to_owned(),
+            });
         }
         let already_present = comments
             .iter()
@@ -246,8 +262,12 @@ impl GhClient {
         }
 
         let body_field = format!("body={marker}\n{body}");
-        self.run(&["api", "--method", "POST", &path, "-f", &body_field])
+        let stdout = self
+            .run(&["api", "--method", "POST", &path, "-f", &body_field])
             .await?;
+        // The POST reply is the created comment; parse it so a malformed
+        // response is GhError::Json, never a blind `Posted`.
+        let _created: CommentBody = parse_json(&stdout)?;
         Ok(CommentOutcome::Posted)
     }
 

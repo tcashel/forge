@@ -244,7 +244,11 @@ async fn finding_comments_deduplicate_on_the_exact_marker() {
     enter_non_git_cwd();
     let shim = Shim::new();
     shim.set("list_comments", "stdout", "[]");
-    shim.set("post_comment", "stdout", r#"{"id":1}"#);
+    shim.set(
+        "post_comment",
+        "stdout",
+        r#"{"id":1,"body":"<!-- anvil-finding id=f-1 -->\nfinding body"}"#,
+    );
 
     let first = shim
         .client()
@@ -303,7 +307,11 @@ async fn marker_match_is_whole_line_never_substring() {
         "stdout",
         r#"[{"body":"<!-- anvil-finding id=abcd -->\nother finding"}]"#,
     );
-    shim.set("post_comment", "stdout", r#"{"id":2}"#);
+    shim.set(
+        "post_comment",
+        "stdout",
+        r#"{"id":2,"body":"<!-- anvil-finding id=abc -->\nbody"}"#,
+    );
 
     let outcome = shim
         .client()
@@ -311,6 +319,59 @@ async fn marker_match_is_whole_line_never_substring() {
         .await
         .expect("posts despite near-collision");
     assert_eq!(outcome, CommentOutcome::Posted);
+}
+
+#[tokio::test]
+async fn empty_comment_listing_stdout_is_json_error_and_never_posts() {
+    enter_non_git_cwd();
+    // No list_comments scenario file: the shim exits zero with EMPTY stdout.
+    // A genuinely empty comment list is one `[]` page, so zero parsed pages
+    // is GhError::Json — and no comment may be posted on the strength of an
+    // unparsed listing, or the dedup guarantee is gone.
+    let shim = Shim::new();
+    shim.set(
+        "post_comment",
+        "stdout",
+        r#"{"id":3,"body":"<!-- anvil-finding id=f-1 -->\nbody"}"#,
+    );
+
+    let err = shim
+        .client()
+        .ensure_finding_comment(REPO, 5, "f-1", "body")
+        .await
+        .expect_err("empty listing stdout is an error");
+    assert!(matches!(err, GhError::Json { .. }), "got {err:?}");
+
+    // Whitespace-only stdout is the same refusal.
+    shim.set("list_comments", "stdout", "  \n\t\n");
+    let err = shim
+        .client()
+        .ensure_finding_comment(REPO, 5, "f-1", "body")
+        .await
+        .expect_err("whitespace listing stdout is an error");
+    assert!(matches!(err, GhError::Json { .. }), "got {err:?}");
+
+    let posts = shim
+        .calls()
+        .into_iter()
+        .filter(|argv| argv.get(1).map(String::as_str) == Some("--method"))
+        .count();
+    assert_eq!(posts, 0, "no comment posted after an unparseable listing");
+}
+
+#[tokio::test]
+async fn unparseable_post_reply_is_json_error_not_posted() {
+    enter_non_git_cwd();
+    let shim = Shim::new();
+    shim.set("list_comments", "stdout", "[]");
+    shim.set("post_comment", "stdout", "created, but not json");
+
+    let err = shim
+        .client()
+        .ensure_finding_comment(REPO, 5, "f-1", "body")
+        .await
+        .expect_err("malformed POST reply is an error");
+    assert!(matches!(err, GhError::Json { .. }), "got {err:?}");
 }
 
 #[tokio::test]
