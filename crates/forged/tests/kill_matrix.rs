@@ -12,6 +12,9 @@ use std::path::Path;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
 use support::{assert_no_overlap, pid_alive, rev_parse, HomeBeadsGuard, TestEnv};
 
@@ -99,10 +102,10 @@ fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
 }
 
 fn kill_group(pid: i32) {
-    let _ = std::process::Command::new("/bin/kill")
-        .args(["-9", &format!("-{pid}")])
-        .stderr(Stdio::null())
-        .status();
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => panic!("kill provider process group {pid}: {error}"),
+    }
 }
 
 /// Attempt ids and states for a packet, from the ledger's attempt.state
