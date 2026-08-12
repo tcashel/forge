@@ -356,7 +356,11 @@ dependencies = [
 name = "forged-gate"
 version = "0.1.0"
 dependencies = [
+ "forged-types",
+ "nix",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
 ]
 
@@ -364,7 +368,11 @@ dependencies = [
 name = "forged-git"
 version = "0.1.0"
 dependencies = [
+ "forged-types",
+ "serde",
  "serde_json",
+ "tempfile",
+ "thiserror",
  "tokio",
 ]
 
