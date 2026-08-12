@@ -1,10 +1,8 @@
 //! forged-beads owns every bd invocation: leases, guardian, classifier,
 //! reaper.
+//!
+//! Module map:
+//! - [`envelope`] — parser for bd's JSON envelope (`BD_JSON_ENVELOPE=1`).
+#![deny(missing_docs)]
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_builds() {
-        assert_eq!(2_u32 + 2, 4);
-    }
-}
+pub mod envelope;
