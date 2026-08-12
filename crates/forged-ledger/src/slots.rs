@@ -33,11 +33,7 @@ impl Ledger {
     /// an error: a held slot returns `Held` with the current row, and
     /// re-acquiring a slot you already hold returns `Acquired` with the
     /// ORIGINAL `acquired_at` — the clock never resets while held.
-    pub fn acquire_merge_slot(
-        &self,
-        slot: &str,
-        holder: &str,
-    ) -> Result<SlotOutcome, LedgerError> {
+    pub fn acquire_merge_slot(&self, slot: &str, holder: &str) -> Result<SlotOutcome, LedgerError> {
         let slot = slot.to_owned();
         let holder = holder.to_owned();
         self.submit(move |conn| {

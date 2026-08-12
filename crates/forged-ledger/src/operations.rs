@@ -10,8 +10,8 @@ use forged_types::{request_sha256, ErrorCode, OperationRequest, OperationRespons
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{internal, refused, LedgerError};
 use crate::attempts::{find_attempt_by_token_tx, run_of_packet};
+use crate::error::{internal, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -48,7 +48,7 @@ fn operation_row(row: &rusqlite::Row<'_>) -> Result<OperationRow, rusqlite::Erro
 
 fn get_operation_tx(conn: &Connection, operation_id: &str) -> Result<OperationRow, LedgerError> {
     let sql = format!("SELECT {OPERATION_COLUMNS} FROM operations WHERE operation_id = ?1");
-    conn.query_row(&sql, [operation_id], |row| operation_row(row))
+    conn.query_row(&sql, [operation_id], operation_row)
         .optional()?
         .ok_or_else(|| {
             refused(
@@ -67,7 +67,7 @@ fn find_operation_tx(
         "SELECT {OPERATION_COLUMNS} FROM operations WHERE name = ?1 AND idempotency_key = ?2"
     );
     Ok(conn
-        .query_row(&sql, [name, idempotency_key], |row| operation_row(row))
+        .query_row(&sql, [name, idempotency_key], operation_row)
         .optional()?)
 }
 
@@ -222,8 +222,7 @@ impl Ledger {
                             let stored = row.response_json.ok_or_else(|| {
                                 internal("terminal operation row has no stored response")
                             })?;
-                            let mut response: OperationResponse =
-                                serde_json::from_str(&stored)?;
+                            let mut response: OperationResponse = serde_json::from_str(&stored)?;
                             response.reused = true;
                             tx.commit()?;
                             Ok(OperationOutcome::Replayed(response))
@@ -325,7 +324,7 @@ impl Ledger {
                  AND (?1 IS NULL OR run_id = ?1) ORDER BY rowid"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([&run_id], |row| operation_row(row))?;
+            let rows = stmt.query_map([&run_id], operation_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);

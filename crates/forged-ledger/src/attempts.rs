@@ -53,13 +53,13 @@ pub(crate) fn find_attempt_by_token_tx(
 ) -> Result<Option<AttemptRow>, LedgerError> {
     let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE claim_token = ?1");
     Ok(conn
-        .query_row(&sql, [claim_token], |row| attempt_row(row))
+        .query_row(&sql, [claim_token], attempt_row)
         .optional()?)
 }
 
 fn get_attempt_tx(conn: &Connection, attempt_id: i64) -> Result<AttemptRow, LedgerError> {
     let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE attempt_id = ?1");
-    conn.query_row(&sql, [attempt_id], |row| attempt_row(row))
+    conn.query_row(&sql, [attempt_id], attempt_row)
         .optional()?
         .ok_or_else(|| {
             refused(
@@ -77,7 +77,9 @@ pub(crate) fn run_of_packet(conn: &Connection, packet_id: &str) -> Result<String
         |row| row.get(0),
     )
     .optional()?
-    .ok_or_else(|| crate::error::internal(format!("attempt references missing packet {packet_id:?}")))
+    .ok_or_else(|| {
+        crate::error::internal(format!("attempt references missing packet {packet_id:?}"))
+    })
 }
 
 /// Append the `attempt.state` event for a transition, in the caller's
@@ -290,8 +292,7 @@ impl Ledger {
         let claim_token = claim_token.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let attempt =
-                find_attempt_by_token_tx(&tx, &claim_token)?.ok_or_else(stale_token)?;
+            let attempt = find_attempt_by_token_tx(&tx, &claim_token)?.ok_or_else(stale_token)?;
             if attempt.state != AttemptState::Running {
                 return Err(stale_token());
             }
@@ -323,22 +324,17 @@ impl Ledger {
     /// Attempts in `running` or `revoking`, ordered by rowid ascending.
     /// `run_id: None` returns all; `Some(r)` only the attempts whose packet
     /// belongs to `r`.
-    pub fn list_live_attempts(
-        &self,
-        run_id: Option<&str>,
-    ) -> Result<Vec<AttemptRow>, LedgerError> {
+    pub fn list_live_attempts(&self, run_id: Option<&str>) -> Result<Vec<AttemptRow>, LedgerError> {
         let run_id = run_id.map(str::to_owned);
         self.submit(move |conn| {
-            let sql = format!(
-                "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
+            let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
                  a.revoke_reason, a.fail_note, a.result_json, a.started_at, a.updated_at, \
                  a.last_heartbeat_at, a.ended_at \
                  FROM attempts a JOIN packets p ON p.packet_id = a.packet_id \
                  WHERE a.state IN ('running','revoking') \
-                 AND (?1 IS NULL OR p.run_id = ?1) ORDER BY a.rowid"
-            );
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([&run_id], |row| attempt_row(row))?;
+                 AND (?1 IS NULL OR p.run_id = ?1) ORDER BY a.rowid";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map([&run_id], attempt_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);
@@ -434,8 +430,7 @@ impl Ledger {
     pub fn assert_attempt_live(&self, claim_token: &str) -> Result<(), LedgerError> {
         let claim_token = claim_token.to_owned();
         self.submit(move |conn| {
-            let attempt =
-                find_attempt_by_token_tx(conn, &claim_token)?.ok_or_else(stale_token)?;
+            let attempt = find_attempt_by_token_tx(conn, &claim_token)?.ok_or_else(stale_token)?;
             if attempt.state != AttemptState::Running {
                 return Err(stale_token());
             }

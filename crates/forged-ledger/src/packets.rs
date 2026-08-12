@@ -33,7 +33,7 @@ fn packet_row(row: &rusqlite::Row<'_>) -> Result<PacketRow, rusqlite::Error> {
 
 pub(crate) fn get_packet_tx(conn: &Connection, packet_id: &str) -> Result<PacketRow, LedgerError> {
     let sql = format!("SELECT {PACKET_COLUMNS} FROM packets WHERE packet_id = ?1");
-    conn.query_row(&sql, [packet_id], |row| packet_row(row))
+    conn.query_row(&sql, [packet_id], packet_row)
         .optional()?
         .ok_or_else(|| {
             refused(
@@ -119,7 +119,7 @@ impl Ledger {
                  ORDER BY created_at, rowid"
             );
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([&run_id], |row| packet_row(row))?;
+            let rows = stmt.query_map([&run_id], packet_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);

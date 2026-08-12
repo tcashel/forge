@@ -33,9 +33,7 @@ impl Ledger {
             let output_tokens = as_i64(usage.output_tokens, "output_tokens")?;
             let cache_read = opt_as_i64(usage.cache_read_tokens, "cache_read_tokens")?;
             let cache_write = opt_as_i64(usage.cache_write_tokens, "cache_write_tokens")?;
-            let tx = conn.transaction_with_behavior(
-                rusqlite::TransactionBehavior::Immediate,
-            )?;
+            let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO usage (run_id, packet_id, attempt_id, provider, model, \
                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \

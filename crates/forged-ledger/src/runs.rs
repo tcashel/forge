@@ -33,7 +33,7 @@ const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, st
 
 pub(crate) fn get_run_tx(conn: &Connection, run_id: &str) -> Result<RunRow, LedgerError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
-    conn.query_row(&sql, [run_id], |row| run_row(row))
+    conn.query_row(&sql, [run_id], run_row)
         .optional()?
         .ok_or_else(|| refused(ErrorCode::RunNotFound, format!("no run {run_id:?}")))
 }
@@ -103,7 +103,7 @@ impl Ledger {
         self.submit(move |conn| {
             let sql = format!("SELECT {RUN_COLUMNS} FROM runs ORDER BY created_at, rowid");
             let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([], |row| run_row(row))?;
+            let rows = stmt.query_map([], run_row)?;
             let mut out = Vec::new();
             for row in rows {
                 out.push(row?);

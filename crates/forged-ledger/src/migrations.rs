@@ -237,7 +237,10 @@ mod tests {
     fn reopening_a_migrated_db_is_a_no_op() {
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("state.db");
-        Ledger::open(&path).expect("first open").close().expect("close");
+        Ledger::open(&path)
+            .expect("first open")
+            .close()
+            .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
         assert_eq!(ledger.pragmas().expect("pragmas").user_version, 1);
         ledger.close().expect("close");

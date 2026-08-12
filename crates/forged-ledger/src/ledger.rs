@@ -72,8 +72,9 @@ impl Ledger {
     pub fn open(db_path: &Path) -> Result<Ledger, LedgerError> {
         if let Some(parent) = db_path.parent() {
             if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|err| internal(format!("cannot create {}: {err}", parent.display())))?;
+                std::fs::create_dir_all(parent).map_err(|err| {
+                    internal(format!("cannot create {}: {err}", parent.display()))
+                })?;
             }
         }
         let mut conn = Connection::open(db_path)
@@ -144,9 +145,7 @@ impl Ledger {
             let job: Job = Box::new(move |conn| {
                 let _ = reply_tx.send(f(conn));
             });
-            sender
-                .send(job)
-                .map_err(|_| internal(WRITER_UNAVAILABLE))?;
+            sender.send(job).map_err(|_| internal(WRITER_UNAVAILABLE))?;
         }
         reply_rx.recv().map_err(|_| internal(WRITER_UNAVAILABLE))?
     }
