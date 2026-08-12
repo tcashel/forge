@@ -9,5 +9,15 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait.workspace = true
+forged-ledger = { path = "../forged-ledger" }
+forged-types = { path = "../forged-types" }
+jiff.workspace = true
 serde.workspace = true
+serde_json.workspace = true
 thiserror.workspace = true
+tokio.workspace = true
+
+[dev-dependencies]
+proptest.workspace = true
+tempfile.workspace = true
