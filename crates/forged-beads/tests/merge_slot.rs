@@ -121,4 +121,36 @@ async fn merge_slot_discipline_and_reaper() {
     slot_release(&cfg, "alive-holder")
         .await
         .expect("release alive-holder");
+
+    // A holder whose pid cannot be probed CONCLUSIVELY is never reaped. Pid 1
+    // exists but is not ours, so `/bin/kill -0 1` fails with "Operation not
+    // permitted" — a probe failure, not a death. Fail-open here would release
+    // a live holder's merge slot.
+    slot_acquire(&cfg, "unprobeable-holder", Duration::from_millis(200))
+        .await
+        .expect("acquire as unprobeable-holder");
+    let recorded_unprobeable = [RecordedHolder {
+        holder: "unprobeable-holder".to_string(),
+        attempt_pid: 1,
+        pid_start_hint: None,
+    }];
+    let report = reap_stale_holders(&cfg, &recorded_unprobeable).await;
+    assert!(
+        report
+            .entries
+            .iter()
+            .all(|e| e.outcome != ReapOutcome::Released),
+        "an inconclusive pid probe must never release: {report:?}"
+    );
+    let status = slot_check(&cfg)
+        .await
+        .expect("check after unprobeable reap");
+    assert_eq!(
+        status.holder.as_deref(),
+        Some("unprobeable-holder"),
+        "the slot must still be held after a refused reap"
+    );
+    slot_release(&cfg, "unprobeable-holder")
+        .await
+        .expect("release unprobeable-holder");
 }

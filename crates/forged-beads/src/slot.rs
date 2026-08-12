@@ -27,7 +27,7 @@ use serde_json::Value;
 use crate::classify::{self, BdError};
 use crate::config::BdConfig;
 use crate::envelope;
-use crate::guardian::pid_alive;
+use crate::guardian::{probe_pid, PidState};
 use crate::invoke;
 
 /// A successful merge-slot acquisition.
@@ -73,7 +73,9 @@ pub struct RecordedHolder {
 #[derive(Debug, Clone)]
 pub struct ReapReport {
     /// Per-holder outcomes. Fail-closed: an EMPTY report means the reaper
-    /// could not act (the check failed, or a release attempt failed).
+    /// could not act — the `check` failed, the holder's pid could not be
+    /// probed conclusively, or a release attempt failed. It never means
+    /// "nothing needed doing" (that is [`ReapOutcome::SlotFree`]).
     pub entries: Vec<ReapEntry>,
 }
 
@@ -330,6 +332,13 @@ pub async fn slot_acquire(
 /// after its attempt process is confirmed dead (pid probe as in the
 /// guardian; start-hint mismatch counts as dead). A live recorded holder is
 /// left alone.
+///
+/// The pid probe is tri-state and the reaper honours all three: it releases
+/// ONLY on [`PidState::Dead`] (a confirmed-absent pid or a start-hint
+/// mismatch). A probe that could not be completed — spawn failure, timeout,
+/// a permission refusal, an unreadable `ps` — is [`PidState::Unknown`] and
+/// the reaper REFUSES to act on it, reporting the empty "could not act"
+/// report rather than releasing a holder that may well be alive.
 pub async fn reap_stale_holders(bd: &BdConfig, recorded: &[RecordedHolder]) -> ReapReport {
     let status = match slot_check(bd).await {
         Ok(s) => s,
@@ -352,13 +361,19 @@ pub async fn reap_stale_holders(bd: &BdConfig, recorded: &[RecordedHolder]) -> R
             }],
         };
     };
-    if pid_alive(rec.attempt_pid, rec.pid_start_hint.as_deref()).await {
-        return ReapReport {
-            entries: vec![ReapEntry {
-                holder: current,
-                outcome: ReapOutcome::HolderAlive,
-            }],
-        };
+    match probe_pid(rec.attempt_pid, rec.pid_start_hint.as_deref()).await {
+        PidState::Alive => {
+            return ReapReport {
+                entries: vec![ReapEntry {
+                    holder: current,
+                    outcome: ReapOutcome::HolderAlive,
+                }],
+            };
+        }
+        // Fail-closed: an inconclusive probe is NOT a death certificate. The
+        // slot stays held and the empty report says the reaper could not act.
+        PidState::Unknown => return ReapReport { entries: vec![] },
+        PidState::Dead => {}
     }
     match slot_release(bd, &current).await {
         Ok(()) => ReapReport {
