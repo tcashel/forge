@@ -1,21 +1,16 @@
 # Dependabot configuration.
 # https://docs.github.com/code-security/dependabot/working-with-dependabot/dependabot-options-reference
-#
-# This is a Bun-only repo (package.json + bun.lock), so the JS/TS block uses the
-# "bun" ecosystem — Dependabot's Bun updater keeps bun.lock in sync, which the
-# "npm" updater would not.
 version: 2
 updates:
-  # JavaScript / TypeScript dependencies (package.json + bun.lock)
-  - package-ecosystem: "bun"
+  # Rust dependencies (Cargo.toml + Cargo.lock, workspace-wide)
+  - package-ecosystem: "cargo"
     directory: "/"
     schedule:
       interval: "weekly"
       day: "monday"
     open-pull-requests-limit: 10
-    # No `labels:` block — Dependabot then auto-creates and applies its default
-    # `dependencies` label. Custom labels that don't already exist in the repo
-    # are silently ignored, so relying on the default is the robust choice.
+    # No `labels:` block — Dependabot auto-applies its default `dependencies`
+    # label; custom labels that don't exist in the repo are silently ignored.
     commit-message:
       prefix: "chore"
       include: "scope"

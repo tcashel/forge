@@ -43,8 +43,9 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0027 | [Publish PR review findings to GitHub and resolve on fix](./0027-publish-pr-review-findings-to-github.md) | Accepted (clarified by 0031) |
 | 0028 | [Cross-spec dependency graph, lazy materialization + orchestration agent](./0028-spec-dependency-graph-and-orchestration-agent.md) | Superseded by 0030 |
 | 0029 | [Repo setup lifecycle + validated quality-gate contract](./0029-repo-setup-lifecycle-and-quality-gate-contract.md) | Proposed |
-| 0030 | [Strategy reset: surfaces commoditized — pause Track B, keep Track A](./0030-strategy-reset-surfaces-commoditized.md) | Proposed |
+| 0030 | [Strategy reset: surfaces commoditized — pause Track B, keep Track A](./0030-strategy-reset-surfaces-commoditized.md) | Superseded by 0032 |
 | 0031 | [Review publishing is at-least-once with persisted per-finding state](./0031-review-publish-at-least-once-persisted-state.md) | Accepted |
+| 0032 | [forged: a provider-neutral Rust orchestrator supersedes both product lines](./0032-forged-provider-neutral-rust-orchestrator.md) | Accepted |
 
 ## Foundational ADRs
 

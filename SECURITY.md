@@ -2,8 +2,8 @@
 
 ## Supported versions
 
-Forge is pre-release (`0.4.0`). Only the latest `main` is supported —
-security fixes land there. There are no backported releases yet.
+forged is pre-release (v0, pre-falsifier). Only the latest `main` is
+supported — security fixes land there. There are no backported releases.
 
 ## Reporting a vulnerability
 
@@ -13,33 +13,27 @@ Instead, use GitHub's private vulnerability reporting:
 [**Report a vulnerability**](https://github.com/tcashel/forge/security/advisories/new).
 This opens a private advisory visible only to the maintainers.
 
-Please include enough detail to reproduce — affected command/endpoint, version
-or commit, and the impact you observed. You'll get an acknowledgement as soon as
+Please include enough detail to reproduce — affected command, version or
+commit, and the impact you observed. You'll get an acknowledgement as soon as
 the report is triaged.
 
-## Trust model — read this before you run Forge
+## Trust model — read this before you run forged
 
-Forge orchestrates coding agents on your own machine, and it is built for an
-operator who trusts their agents. A few deliberate design choices matter for
-security:
+forged orchestrates coding agents on your own machine, and it is built for an
+operator who trusts their agents. Deliberate design choices that matter:
 
-- **`forge serve` (the Workbench) defaults to binding `127.0.0.1`, with no
-  authentication and no TLS.** It is a local, single-operator UI. The `--host`
-  flag lets you bind a non-loopback address (e.g. `0.0.0.0`) — **don't**, unless
-  you fully control the network. With no auth or TLS, anyone who can reach the
-  port can launch, kill, and review tasks, and the Workbench spawns real
-  subprocesses on your machine — so treat the port as privileged and never proxy
-  it to the public internet.
 - **Launched agents run headless with permission prompts disabled** (e.g.
-  `claude --dangerously-skip-permissions`, `codex --dangerously-bypass-approvals-and-sandbox`).
-  Forge assumes you enforce policy at the agent level via hooks
-  (Claude Code hooks, opencode permissions, your own scripts). Agents execute
-  with your full local privileges inside per-task git worktrees — only point
-  Forge at repos and specs you trust.
-- **Specs are prompts.** A spec you launch is fed to an agent that can run
-  arbitrary commands. Review specs from untrusted sources before launching them.
-- Forge shells out to `gh`, `git`, `tmux`, and `python3`; it relies on your
-  authenticated `gh` session for any PR operations.
+  `claude --dangerously-skip-permissions`, codex with a workspace-write
+  sandbox). forged assumes you enforce policy at the agent level via hooks
+  and guards. Agents execute with your local privileges inside per-task git
+  worktrees — only point forged at repos and specs you trust.
+- **Specs and packets are prompts.** Anything forged hands an agent can lead
+  to arbitrary command execution. Review material from untrusted sources
+  before running it.
+- forged shells out to `bd`, `git`, `gh`, and the agent CLIs; it relies on
+  your authenticated `gh` session for any PR operations. Its MCP server
+  speaks stdio only — there is no network listener.
 
-State lives under `~/.forge/` (override with `FORGE_HOME`). No data is sent
-anywhere except through the agent CLIs and `gh` that you invoke.
+State lives under `~/.anvil/` (ledger, run artifacts) and `$BEADS_DIR`. No
+data is sent anywhere except through the agent CLIs and `gh` that you
+invoke.
