@@ -11,5 +11,9 @@
 //! repo paths explicitly.
 
 mod error;
+mod worktree;
 
 pub use error::{GhError, GitError};
+pub use worktree::{
+    prepare_worktree, retire_worktree, PreparedWorktree, RetireOptions, WorktreeSpec,
+};

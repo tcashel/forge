@@ -12,10 +12,7 @@ pub enum GhError {
     /// gh exited nonzero (or could not be spawned; `status` is `None` then
     /// and when gh died to a signal).
     #[error("gh failed with status {status:?}: {stderr}")]
-    Exec {
-        status: Option<i32>,
-        stderr: String,
-    },
+    Exec { status: Option<i32>, stderr: String },
     /// gh exited zero but its stdout did not parse as the expected JSON.
     #[error("gh output did not parse: {message}")]
     Json { message: String },
