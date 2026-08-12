@@ -12,10 +12,14 @@
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{AttemptState, EventRow, Ledger, OperationRow, OperationState};
-use forged_types::{PacketResult, ProviderHints, Stage};
+use forged_types::{
+    EscalationTrigger, ExecutionPackageV1, PacketResult, ProviderHints, ResolvedRosterV1, Stage,
+};
 use serde_json::Value;
 
-use crate::engine::{machine_idempotency_key, RunView, TerminalAttempt, MACHINE_STEPS};
+use crate::engine::{
+    machine_idempotency_key, ProfileEscalation, RunView, TerminalAttempt, MACHINE_STEPS,
+};
 use crate::error::ProtoError;
 use crate::events::parse_proto_events;
 
@@ -59,6 +63,32 @@ pub fn project_run(
     let events = fetch_all_events(ledger, run_id)?;
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
+    let profile_escalations = parse_profile_escalations(&events)?;
+    let mut active_roster_revision = None;
+    let execution_package = match ledger.get_run_definition(run_id)? {
+        Some(definition) => {
+            let mut package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
+                .map_err(|error| {
+                    ProtoError::Projection(format!(
+                        "stored execution package does not parse: {error}"
+                    ))
+                })?;
+            if let Some(revision) = ledger.latest_roster_revision(run_id)? {
+                let resolved: ResolvedRosterV1 = serde_json::from_str(&revision.roster_json)
+                    .map_err(|error| {
+                        ProtoError::Projection(format!(
+                            "stored roster revision does not parse: {error}"
+                        ))
+                    })?;
+                package.roster_ref = resolved.roster_ref.clone();
+                package.roster_sha256 = revision.roster_sha256.clone();
+                package.roster = resolved;
+                active_roster_revision = Some(revision);
+            }
+            Some(package)
+        }
+        None => None,
+    };
     Ok(RunView {
         run,
         packets,
@@ -71,7 +101,52 @@ pub fn project_run(
         gate_commands,
         transport_retry_budget,
         now: now.to_owned(),
+        execution_package,
+        active_roster_revision,
+        profile_escalations,
     })
+}
+
+fn parse_profile_escalations(events: &[EventRow]) -> Result<Vec<ProfileEscalation>, ProtoError> {
+    let mut out = Vec::new();
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "forged.profile.escalated")
+    {
+        let value: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
+            ProtoError::MalformedEvent {
+                event_id: event.event_id,
+                detail: format!("profile escalation payload is not JSON: {error}"),
+            }
+        })?;
+        let required = |key: &str| {
+            value
+                .get(key)
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+                .ok_or_else(|| ProtoError::MalformedEvent {
+                    event_id: event.event_id,
+                    detail: format!("profile escalation has no {key}"),
+                })
+        };
+        let trigger: EscalationTrigger =
+            serde_json::from_value(value.get("trigger").cloned().ok_or_else(|| {
+                ProtoError::MalformedEvent {
+                    event_id: event.event_id,
+                    detail: "profile escalation has no trigger".to_owned(),
+                }
+            })?)
+            .map_err(|error| ProtoError::MalformedEvent {
+                event_id: event.event_id,
+                detail: format!("profile escalation trigger is invalid: {error}"),
+            })?;
+        out.push(ProfileEscalation {
+            from: required("from")?,
+            to: required("to")?,
+            trigger,
+        });
+    }
+    Ok(out)
 }
 
 /// The terminal operation row of every machine step that has one.
@@ -149,8 +224,8 @@ fn reconstruct_terminal_attempts(
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let attempt = ledger.get_attempt(attempt_id)?;
         let outcome = if state == AttemptState::Completed {
-            let attempt = ledger.get_attempt(attempt_id)?;
             attempt
                 .result_json
                 .as_deref()
@@ -170,6 +245,7 @@ fn reconstruct_terminal_attempts(
             state,
             outcome,
             fail_note,
+            started_at: attempt.started_at,
         });
     }
     Ok(out)

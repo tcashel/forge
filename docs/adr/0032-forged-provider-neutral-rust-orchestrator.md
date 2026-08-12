@@ -135,9 +135,8 @@ dependencies. Herdr (Apache-2.0) remains an optional vessel behind
 - smithy's cardinal rule "anvil never shells out to forge" is retired with
   the experiment that needed it. Successor rule: **anvil reaches forged only
   through its typed CLI/MCP contracts; no cognitive stage lives in forged.**
-  The migration of anvil's deterministic plumbing onto forged (dispatch
-  first; run-epic/watch-epic later) is deliberately pending until after the
-  falsifier.
+  Anvil 0.3 completed that migration: dispatch and epic execution submit to
+  forged, while the Workflow/watch execution stack was removed.
 - The build retro's process actions (resumable blocked-state fix rounds,
   deterministic readiness, chunked review coverage, evidence persisted on
   PRs, spec-size enforcement) belong to smithy and are tracked there.

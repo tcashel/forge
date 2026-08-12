@@ -83,3 +83,50 @@ pub async fn merge_pr(
     .await?;
     Ok(pr)
 }
+
+/// Probe-before-mutate epic merge. A PR already merged into the expected
+/// non-default integration branch is success, which makes controller-death
+/// recovery safe after GitHub accepted the merge but before the ledger did.
+pub async fn merge_pr_idempotent(
+    gh: &GhClient,
+    repo: &str,
+    pr_number: u64,
+    expected_base: &str,
+) -> Result<PrMeta, GitError> {
+    let pr_result = gh.pr_view(repo, pr_number).await;
+    let default_result = gh.default_branch(repo).await;
+    let pr = pr_result?;
+    let default = default_result?;
+    if pr.base_ref_name != expected_base {
+        return Err(GitError::PrBaseMismatch {
+            expected: expected_base.to_owned(),
+            actual: pr.base_ref_name,
+        });
+    }
+    if pr.base_ref_name == default {
+        return Err(GitError::DefaultBranchForbidden {
+            default_branch: default,
+        });
+    }
+    if pr.state == "MERGED" {
+        return Ok(pr);
+    }
+    if pr.state != "OPEN" || pr.is_draft {
+        return Err(GitError::PrNotMergeable {
+            state: pr.state,
+            is_draft: pr.is_draft,
+        });
+    }
+    let number = pr_number.to_string();
+    gh.run(&[
+        "pr",
+        "merge",
+        &number,
+        "--repo",
+        repo,
+        "--squash",
+        "--delete-branch=false",
+    ])
+    .await?;
+    Ok(pr)
+}

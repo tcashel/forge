@@ -12,6 +12,9 @@ use std::path::Path;
 use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
+use nix::errno::Errno;
+use nix::sys::signal::{killpg, Signal};
+use nix::unistd::Pid;
 use serde_json::{json, Value};
 use support::{assert_no_overlap, pid_alive, rev_parse, HomeBeadsGuard, TestEnv};
 
@@ -59,6 +62,39 @@ fn spawn_drive(env: &TestEnv, run: &str, failpoint: Option<(&str, &str, &Path)>)
         .expect("drive child spawns")
 }
 
+fn start_epic(env: &TestEnv, epic: &str) {
+    env.enable_dynamic_gh();
+    env.seed_epic(epic, &[("child-crash", &env.spec, true)]);
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+}
+
+fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -> Child {
+    let mut cmd = env.forged_cmd(&["epic", "drive", "--epic", epic]);
+    cmd.env("FORGED_FAILPOINT", failpoint.0)
+        .env("FORGED_FAILPOINT_MODE", failpoint.1)
+        .env("FORGED_FAILPOINT_DIR", failpoint.2)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("epic drive child spawns")
+}
+
 fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
     std::fs::read_to_string(env.packet_dir(run, stage, seq).join("provider.pid"))
         .ok()
@@ -66,10 +102,10 @@ fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
 }
 
 fn kill_group(pid: i32) {
-    let _ = std::process::Command::new("/bin/kill")
-        .args(["-9", &format!("-{pid}")])
-        .stderr(Stdio::null())
-        .status();
+    match killpg(Pid::from_raw(pid), Signal::SIGKILL) {
+        Ok(()) | Err(Errno::ESRCH) => {}
+        Err(error) => panic!("kill provider process group {pid}: {error}"),
+    }
 }
 
 /// Attempt ids and states for a packet, from the ledger's attempt.state
@@ -148,14 +184,14 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     // and the shim logged its start (so the hang scenario is consumed by
     // THIS attempt, never left armed for the resume).
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k1", "implement", 1).is_some()
+        read_pid(&env, "bead-k1", "implementation", 0).is_some()
     });
     wait_until("implement shim start", || {
         env.provider_log()
             .iter()
-            .any(|l| l.starts_with("bead-k1/implement/1") && l.contains(" start "))
+            .any(|l| l.starts_with("bead-k1/implementation/0") && l.contains(" start "))
     });
-    let provider_pid = read_pid(&env, "bead-k1", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k1", "implementation", 0).expect("pid");
 
     // Kill the driver mid-packet, then the orphaned provider group — the
     // machine died. Disarm the scenario so the timing of the kill can
@@ -168,7 +204,7 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     // A SIGKILLed shim never writes its `end` line; its pid — verified
     // dead above, before any successor starts — is excluded from the log
     // scan (the ledger's attempt-order record covers it).
-    let killed_pids = shim_pids(&env, "bead-k1/implement/1");
+    let killed_pids = shim_pids(&env, "bead-k1/implementation/0");
 
     // Reconcile revokes the dead attempt and reclaims the scoped lease.
     let (code, reconciled) = env.forged(&["reconcile", "--run", "bead-k1"]);
@@ -192,7 +228,7 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     assert_eq!(resumed["result"]["claimed"]["resumed"], json!(true));
     assert_eq!(
         resumed["result"]["claimed"]["packet_id"],
-        json!("bead-k1/implement/1")
+        json!("bead-k1/implementation/0")
     );
 
     // Finish the run: drive adopts the resumed claim and completes.
@@ -210,10 +246,10 @@ fn kill_mid_packet_then_resume_through_claim_next() {
     assert!(log.contains("shim fix"), "fix commit: {log}");
 
     // Process non-overlap: the ledger's attempt order and the shim log.
-    assert_attempts_serialized(&env, "bead-k1", "bead-k1/implement/1");
+    assert_attempts_serialized(&env, "bead-k1", "bead-k1/implementation/0");
     support::assert_no_overlap_after_kills(
         &env.provider_log(),
-        "bead-k1/implement/1",
+        "bead-k1/implementation/0",
         &killed_pids,
     );
 }
@@ -308,7 +344,7 @@ fn pause_after_reservation_zombie_send_is_refused_and_quarantined() {
             .any(|e| e["kind"] == json!("proto.quarantine")),
         "the quarantine event is durable"
     );
-    assert_attempts_serialized(&env, "bead-k2", "bead-k2/implement/1");
+    assert_attempts_serialized(&env, "bead-k2", "bead-k2/implementation/0");
 }
 
 fn wait_release_consumed(release: &Path) -> bool {
@@ -464,6 +500,113 @@ fn applied_then_response_lost_settles_by_observation_without_repeating() {
     assert!(driven["result"]["terminal"]["done"].is_object());
 }
 
+// ------------------------------------------------------- epic merge recovery
+
+#[test]
+fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
+    let env = TestEnv::new("km-epic-merge");
+    start_epic(&env, "epic-crash");
+    let fp = env.root.join("fp-epic-merge");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let mut drive = spawn_epic_drive(&env, "epic-crash", ("epic.child.merge.after", "crash", &fp));
+    let status = drive.wait().expect("epic drive crashes");
+    assert!(!status.success(), "the controller dies after GitHub merged");
+
+    let merges_before = env
+        .gh_calls()
+        .iter()
+        .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
+        .count();
+    assert_eq!(merges_before, 1, "GitHub received the child merge once");
+
+    // A different OS process reaps the dead controller slot, releases the
+    // interrupted SafeRetry row, observes PR #7 as already merged, records
+    // the child, and creates the sole final draft PR.
+    let (code, resumed) = env.forged(&["epic", "drive", "--epic", "epic-crash"]);
+    assert_eq!(code, 0, "resumed epic drive: {resumed}");
+    assert_eq!(resumed["result"]["stopped"]["finalPr"]["number"], json!(8));
+    let merges_after = env
+        .gh_calls()
+        .iter()
+        .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
+        .count();
+    assert_eq!(merges_after, 1, "resume probes instead of re-merging");
+    let (code, projected) = env.forged(&["epic", "status", "--epic", "epic-crash"]);
+    assert_eq!(code, 0, "epic status: {projected}");
+    assert!(projected["result"]["children"][0]["merged"].is_object());
+    assert_eq!(projected["result"]["finalPr"]["number"], json!(8));
+}
+
+// -------------------------------------------------- detached handoff recovery
+
+#[test]
+fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
+    let env = TestEnv::new("km-controller-handoff");
+    start_run(&env, "bead-khandoff");
+    env.set_scenario("implement", "slow", 1);
+    let fp = env.root.join("fp-controller-handoff");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let mut submitter = env
+        .forged_cmd(&["run", "submit", "--run", "bead-khandoff"])
+        .env("FORGED_FAILPOINT", "controller.record.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("submitter spawns");
+    let status = submitter.wait().expect("submitter crashes");
+    assert!(
+        !status.success(),
+        "submitter aborts after recording identity"
+    );
+    assert!(
+        env.anvil
+            .join("runs/bead-khandoff/controller/controller.json")
+            .exists(),
+        "the detached identity reached disk before the crash"
+    );
+
+    // A new lead session recovers the exact same controller and settles the
+    // interrupted submit operation. It never starts a second controller.
+    let (code, recovered) = env.forged(&["run", "submit", "--run", "bead-khandoff"]);
+    assert_eq!(code, 0, "recover submit: {recovered}");
+    assert_eq!(recovered["result"]["submitted"], json!(true));
+    assert_eq!(recovered["result"]["alreadyRunning"], json!(false));
+    {
+        let ledger = env.ledger();
+        let operation = ledger
+            .find_operation("run_submit", "op:run_submit:bead-khandoff:-:1")
+            .expect("submit operation probe")
+            .expect("submit operation survives");
+        assert_eq!(operation.state, forged_ledger::OperationState::Terminal);
+        let controller_events = ledger
+            .list_events(Some("bead-khandoff"), 0, 65_536)
+            .expect("controller events")
+            .into_iter()
+            .filter(|row| row.kind == "forged.controller.started")
+            .count();
+        assert_eq!(controller_events, 1, "one durable controller identity");
+        ledger.close().expect("close");
+    }
+
+    wait_until("detached run completion", || {
+        let (code, projected) = env.forged(&["run", "status", "--run", "bead-khandoff"]);
+        code == 0
+            && projected["result"]["run"]["nextAction"]["stop"]["done"].is_object()
+            && projected["result"]["run"]["controller"]["state"] == json!("exited")
+    });
+    let implementation_starts = env
+        .provider_log()
+        .iter()
+        .filter(|line| {
+            line.starts_with("bead-khandoff/implementation/0") && line.contains(" start ")
+        })
+        .count();
+    assert_eq!(implementation_starts, 1, "no duplicate packet execution");
+    assert_no_overlap(&env.provider_log(), "bead-khandoff/implementation/0");
+}
+
 // ------------------------------------------------------------- schedule 5
 
 #[test]
@@ -473,20 +616,20 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     env.set_scenario("implement", "hang", 1);
     let mut drive = spawn_drive(&env, "bead-k5", None);
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k5", "implement", 1).is_some()
+        read_pid(&env, "bead-k5", "implementation", 0).is_some()
     });
     wait_until("implement shim start", || {
         env.provider_log()
             .iter()
-            .any(|l| l.starts_with("bead-k5/implement/1") && l.contains(" start "))
+            .any(|l| l.starts_with("bead-k5/implementation/0") && l.contains(" start "))
     });
-    let provider_pid = read_pid(&env, "bead-k5", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k5", "implementation", 0).expect("pid");
     drive.kill().expect("kill driver");
     let _ = drive.wait();
     kill_group(provider_pid);
     wait_until("provider death", || !pid_alive(provider_pid));
     env.set_scenario("implement", "hang", 0);
-    let killed_pids = shim_pids(&env, "bead-k5/implement/1");
+    let killed_pids = shim_pids(&env, "bead-k5/implementation/0");
 
     // Two INDEPENDENT OS processes reconcile the same run, concurrently.
     let mut first = env
@@ -560,10 +703,10 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k5"]);
     assert_eq!(code, 0, "resumed drive: {driven}");
     assert!(driven["result"]["terminal"]["done"].is_object());
-    assert_attempts_serialized(&env, "bead-k5", "bead-k5/implement/1");
+    assert_attempts_serialized(&env, "bead-k5", "bead-k5/implementation/0");
     support::assert_no_overlap_after_kills(
         &env.provider_log(),
-        "bead-k5/implement/1",
+        "bead-k5/implementation/0",
         &killed_pids,
     );
 }
@@ -577,9 +720,9 @@ fn a_live_slow_worker_inside_its_budget_is_not_robbed() {
     env.set_scenario("implement", "slow", 1);
     let mut drive = spawn_drive(&env, "bead-k6", None);
     wait_until("implement provider.pid", || {
-        read_pid(&env, "bead-k6", "implement", 1).is_some()
+        read_pid(&env, "bead-k6", "implementation", 0).is_some()
     });
-    let provider_pid = read_pid(&env, "bead-k6", "implement", 1).expect("pid");
+    let provider_pid = read_pid(&env, "bead-k6", "implementation", 0).expect("pid");
     assert!(pid_alive(provider_pid), "the slow worker is alive");
 
     // Reconcile while the worker is alive and inside its budget.
@@ -644,7 +787,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .iter()
         .find(|e| e["kind"] == json!("proto.retry"))
         .expect("a proto.retry carries the backoff");
-    assert_eq!(retry["payload"]["packetId"], json!("bead-k7/fix/1"));
+    assert_eq!(retry["payload"]["packetId"], json!("bead-k7/remediation/0"));
     assert_eq!(retry["payload"]["transportFailures"], json!(1));
     assert!(retry["payload"]["retryAfter"].as_str().is_some());
 
@@ -655,7 +798,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .as_array()
         .expect("packets")
         .iter()
-        .filter(|p| p["stage"] == json!("fix"))
+        .filter(|p| p["storageLane"] == json!("fix"))
         .cloned()
         .collect();
     assert_eq!(fix_packets.len(), 1, "one fix packet only: {fix_packets:?}");
@@ -665,8 +808,8 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
         .find_map(|e| e["payload"]["reason"].as_str())
         .expect("the failed fix attempt note");
     assert_eq!(fail_note, "transport: codex turn failed: rate limit");
-    assert_attempts_serialized(&env, "bead-k7", "bead-k7/fix/1");
-    assert_no_overlap(&env.provider_log(), "bead-k7/fix/1");
+    assert_attempts_serialized(&env, "bead-k7", "bead-k7/remediation/0");
+    assert_no_overlap(&env.provider_log(), "bead-k7/remediation/0");
 }
 
 // ------------------------------------------------------------- schedule 8

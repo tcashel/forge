@@ -333,6 +333,14 @@ const GH_SHIM: &str = r#"#!/bin/sh
   printf '%s\037' "$@"
   printf '\036'
 } >> "$GH_SHIM_LOG"
+val() {
+  flag=$1; shift
+  prev=""
+  for a in "$@"; do
+    if [ "$prev" = "$flag" ]; then printf '%s' "$a"; return; fi
+    prev=$a
+  done
+}
 key=unknown
 case "$1" in
   pr)
@@ -351,6 +359,47 @@ case "$1" in
     esac ;;
   auth) key=auth ;;
 esac
+if [ -f "$GH_SHIM_DIR/dynamic-prs" ]; then
+  case "$key" in
+    repo)
+      printf '{"default_branch":"main"}\n'; exit 0 ;;
+    create_pr)
+      count=$(cat "$GH_SHIM_DIR/pr-counter" 2>/dev/null || echo 6)
+      num=$((count + 1)); printf '%s' "$num" > "$GH_SHIM_DIR/pr-counter"
+      head=""; base=""; prev=""
+      for a in "$@"; do
+        case "$a" in head=*) head=${a#head=} ;; base=*) base=${a#base=} ;; esac
+      done
+      printf '%s' "$head" > "$GH_SHIM_DIR/pr.$num.head"
+      printf '%s' "$base" > "$GH_SHIM_DIR/pr.$num.base"
+      printf 'OPEN' > "$GH_SHIM_DIR/pr.$num.state"
+      printf 'true' > "$GH_SHIM_DIR/pr.$num.draft"
+      printf '{"number":%s,"state":"open","draft":true,"base":{"ref":"%s"},"head":{"ref":"%s"},"html_url":"https://example.invalid/pr/%s"}\n' "$num" "$base" "$head" "$num"
+      exit 0 ;;
+    pr_view)
+      num=$3; state=$(cat "$GH_SHIM_DIR/pr.$num.state"); draft=$(cat "$GH_SHIM_DIR/pr.$num.draft")
+      base=$(cat "$GH_SHIM_DIR/pr.$num.base"); head=$(cat "$GH_SHIM_DIR/pr.$num.head")
+      printf '{"number":%s,"state":"%s","isDraft":%s,"baseRefName":"%s","headRefName":"%s","url":"https://example.invalid/pr/%s"}\n' "$num" "$state" "$draft" "$base" "$head" "$num"
+      exit 0 ;;
+    pr_ready)
+      num=$3; printf 'false' > "$GH_SHIM_DIR/pr.$num.draft"; exit 0 ;;
+    pr_merge)
+      num=$3; printf 'MERGED' > "$GH_SHIM_DIR/pr.$num.state"; exit 0 ;;
+    pr_list)
+      head=$(val --head "$@"); base=$(val --base "$@")
+      found=""
+      for file in "$GH_SHIM_DIR"/pr.*.head; do
+        [ -f "$file" ] || continue
+        num=${file##*/pr.}; num=${num%.head}
+        if [ "$(cat "$file")" = "$head" ] && [ "$(cat "$GH_SHIM_DIR/pr.$num.base")" = "$base" ] && [ "$(cat "$GH_SHIM_DIR/pr.$num.state")" = OPEN ]; then found=$num; break; fi
+      done
+      if [ -z "$found" ]; then printf '[]\n'; else
+        draft=$(cat "$GH_SHIM_DIR/pr.$found.draft")
+        printf '[{"number":%s,"state":"OPEN","isDraft":%s,"baseRefName":"%s","headRefName":"%s","url":"https://example.invalid/pr/%s"}]\n' "$found" "$draft" "$base" "$head" "$found"
+      fi
+      exit 0 ;;
+  esac
+fi
 code=0
 if [ -f "$GH_SHIM_DIR/$key.exit" ]; then code=$(cat "$GH_SHIM_DIR/$key.exit"); fi
 if [ -f "$GH_SHIM_DIR/$key.stderr" ]; then cat "$GH_SHIM_DIR/$key.stderr" >&2; fi
@@ -371,11 +420,18 @@ pkt=$(printf '%s\n' "$prompt" | sed -n 's/.*"packetId": "\([^"]*\)".*/\1/p' | he
 schema=$(printf '%s\n' "$prompt" | sed -n 's/.*"schema": "\([^"]*\)".*/\1/p' | head -1)
 stage=$(printf '%s' "$pkt" | awk -F/ '{print $(NF-1)}')
 seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
+scenario_stage=$stage
+case "$stage" in
+  implementation) scenario_stage=implement ;;
+  review-1) scenario_stage=reviewclaude ;;
+  review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
+  remediation) scenario_stage=fix ;;
+esac
 log="${FORGED_SHIM_DIR:?}/provider.log"
 echo "$pkt start $(date +%s) $$" >> "$log"
 
 mode=normal
-sf="$FORGED_SHIM_DIR/scenario.$stage"
+sf="$FORGED_SHIM_DIR/scenario.$scenario_stage"
 if [ -f "$sf" ]; then
   read -r m n < "$sf"
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
@@ -414,21 +470,23 @@ esac
 
 inner=""
 case "$stage" in
-  implement)
+  implement|implementation)
     printf 'impl by shim\n' > "impl-$seq.txt"
     git add "impl-$seq.txt"
     git commit -q -m "feat: shim implement $seq"
     commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
     inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     ;;
-  reviewclaude|reviewcodex)
-    if [ "$seq" -le 1 ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
+    if [ "$mode" = approve ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix)
+  fix|remediation)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -462,11 +520,18 @@ pkt=$(printf '%s\n' "$prompt" | sed -n 's/.*"packetId": "\([^"]*\)".*/\1/p' | he
 schema=$(printf '%s\n' "$prompt" | sed -n 's/.*"schema": "\([^"]*\)".*/\1/p' | head -1)
 stage=$(printf '%s' "$pkt" | awk -F/ '{print $(NF-1)}')
 seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
+scenario_stage=$stage
+case "$stage" in
+  implementation) scenario_stage=implement ;;
+  review-1) scenario_stage=reviewclaude ;;
+  review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
+  remediation) scenario_stage=fix ;;
+esac
 log="${FORGED_SHIM_DIR:?}/provider.log"
 echo "$pkt start $(date +%s) $$" >> "$log"
 
 mode=normal
-sf="$FORGED_SHIM_DIR/scenario.$stage"
+sf="$FORGED_SHIM_DIR/scenario.$scenario_stage"
 if [ -f "$sf" ]; then
   read -r m n < "$sf"
   if [ "${n:-0}" -gt 0 ] 2>/dev/null; then
@@ -502,21 +567,23 @@ esac
 
 inner=""
 case "$stage" in
-  implement)
+  implement|implementation)
     printf 'impl by shim\n' > "impl-$seq.txt"
     git add "impl-$seq.txt"
     git commit -q -m "feat: shim implement $seq"
     commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
     inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     ;;
-  reviewclaude|reviewcodex)
-    if [ "$seq" -le 1 ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
+    if [ "$mode" = approve ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix)
+  fix|remediation)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -545,12 +612,27 @@ val() {
   done
 }
 cmd=$1
+issue_json() {
+  id=$1
+  title=$(cat "$state/$id.title" 2>/dev/null || echo "$id")
+  description=$(cat "$state/$id.description" 2>/dev/null || true)
+  status=$(cat "$state/$id.status" 2>/dev/null || echo open)
+  type=$(cat "$state/$id.type" 2>/dev/null || echo task)
+  assignee=$(cat "$state/$id.assignee" 2>/dev/null || true)
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s"}' "$id" "$title" "$description" "$status" "$type" "$assignee"
+}
 case "$cmd" in
   version)
     printf '{"schema_version":1,"data":{"version":"1.2.1"}}\n' ;;
   update)
     id=$2
     actor=$(val --actor "$@")
+    new_status=$(val --status "$@")
+    if [ -n "$new_status" ]; then
+      printf '%s' "$new_status" > "$state/$id.status"
+      printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
+      exit 0
+    fi
     cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
     if [ -z "$cur" ] || [ "$cur" = "$actor" ]; then
       printf '%s' "$actor" > "$state/$id.assignee"
@@ -585,12 +667,31 @@ case "$cmd" in
     fi ;;
   show)
     id=$2
-    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
-    printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s"}]}\n' "$id" "$cur" ;;
+    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+  children)
+    epic=$2; first=1
+    printf '{"schema_version":1,"data":['
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done < "$state/$epic.children"
+    printf ']}\n' ;;
+  close)
+    id=$2; printf 'closed' > "$state/$id.status"
+    rm -f "$state/$id.assignee"
+    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   ready)
     actor=$(val --actor "$@")
     front="$state/frontier"
-    if [ -s "$front" ]; then
+    if [ -z "$actor" ]; then
+      first=1; printf '{"schema_version":1,"data":['
+      while IFS= read -r id; do
+        [ -n "$id" ] || continue
+        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = closed ] && continue
+        [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      done < "$front"
+      printf ']}\n'
+    elif [ -s "$front" ]; then
       id=$(head -1 "$front")
       tail -n +2 "$front" > "$front.tmp" && mv "$front.tmp" "$front"
       printf '%s' "$actor" > "$state/$id.assignee"
@@ -720,6 +821,113 @@ impl TestEnv {
         .expect("write config");
     }
 
+    /// Add a provider-uniform semantic roster while retaining the mixed
+    /// default roster. Every role remains present so any stored profile can
+    /// escalate without consulting config again.
+    pub fn add_uniform_roster(&self, name: &str, provider: &str, model: &str) {
+        let path = self.anvil.join("config.json");
+        let mut config: Value = serde_json::from_str(
+            &std::fs::read_to_string(&path).expect("read config for roster extension"),
+        )
+        .expect("config json");
+        let candidate = |provider: &str, model: &str, write: bool| {
+            let mut capabilities = vec!["repositoryRead", "structuredOutput"];
+            if write {
+                capabilities.push("repositoryWrite");
+            }
+            json!({
+                "provider": provider,
+                "model": model,
+                "effort": (provider == "codex").then_some("xhigh"),
+                "sandbox": if write { "workspaceWrite" } else { "readOnly" },
+                "capabilities": capabilities,
+            })
+        };
+        let roster = |roster_name: &str, uniform: Option<(&str, &str)>| {
+            let for_role = |role: &str, write: bool| match uniform {
+                Some((provider, model)) => candidate(provider, model, write),
+                None => match role {
+                    "review.secondary" | "synthesis" => candidate("codex", "gpt-5.6-sol", write),
+                    _ => candidate("claude", "opus", write),
+                },
+            };
+            json!({
+                "schema": "forged.roster/1",
+                "name": roster_name,
+                "roles": {
+                    "implementation": [for_role("implementation", true)],
+                    "review.primary": [for_role("review.primary", false)],
+                    "review.secondary": [for_role("review.secondary", false)],
+                    "review.tertiary": [for_role("review.tertiary", false)],
+                    "synthesis": [for_role("synthesis", false)],
+                    "remediation": [for_role("remediation", true)],
+                }
+            })
+        };
+        let mut rosters = serde_json::Map::new();
+        rosters.insert("default".to_owned(), roster("default", None));
+        rosters.insert(name.to_owned(), roster(name, Some((provider, model))));
+        config["rosters"] = Value::Object(rosters);
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("extended config json"),
+        )
+        .expect("write extended config");
+    }
+
+    /// Add a roster whose implementation role first names an unavailable
+    /// adapter and then Claude. Other roles are Claude-only.
+    pub fn add_implementation_fallback_roster(&self, name: &str) {
+        self.add_uniform_roster(name, "claude", "opus");
+        let path = self.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read fallback config"))
+                .expect("fallback config json");
+        let candidates = config
+            .pointer_mut(&format!("/rosters/{name}/roles/implementation"))
+            .and_then(Value::as_array_mut)
+            .expect("implementation candidates");
+        candidates.insert(
+            0,
+            json!({
+                "provider": "uninstalled",
+                "model": "unavailable-model",
+                "effort": null,
+                "sandbox": "workspaceWrite",
+                "capabilities": ["repositoryRead", "repositoryWrite", "structuredOutput"],
+            }),
+        );
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("fallback config json"),
+        )
+        .expect("write fallback config");
+    }
+
+    /// Append one implementation candidate to an existing named roster.
+    pub fn append_implementation_candidate(&self, name: &str, provider: &str, model: &str) {
+        let path = self.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read roster config"))
+                .expect("roster config json");
+        let candidates = config
+            .pointer_mut(&format!("/rosters/{name}/roles/implementation"))
+            .and_then(Value::as_array_mut)
+            .expect("implementation candidates");
+        candidates.push(json!({
+            "provider": provider,
+            "model": model,
+            "effort": (provider == "codex").then_some("xhigh"),
+            "sandbox": "workspaceWrite",
+            "capabilities": ["repositoryRead", "repositoryWrite", "structuredOutput"],
+        }));
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("roster config json"),
+        )
+        .expect("write roster config");
+    }
+
     /// The environment a forged child (or MCP server) runs under.
     pub fn forged_cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_forged"));
@@ -771,6 +979,40 @@ impl TestEnv {
     pub fn gh_set(&self, key: &str, kind: &str, contents: &str) {
         std::fs::write(self.gh_dir.join(format!("{key}.{kind}")), contents)
             .expect("write gh scenario");
+    }
+
+    /// Enable the stateful gh shim used by epic PR ready/merge/final-PR tests.
+    pub fn enable_dynamic_gh(&self) {
+        std::fs::write(self.gh_dir.join("dynamic-prs"), "1").expect("dynamic gh flag");
+    }
+
+    /// Seed an epic plus child inventory/status/spec pointers in the bd shim.
+    pub fn seed_epic(&self, epic: &str, children: &[(&str, &Path, bool)]) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{epic}.title")), "Test epic").expect("epic title");
+        std::fs::write(state.join(format!("{epic}.type")), "epic").expect("epic type");
+        std::fs::write(state.join(format!("{epic}.status")), "open").expect("epic status");
+        let mut inventory = String::new();
+        let mut frontier = String::new();
+        for (id, spec, ready) in children {
+            inventory.push_str(id);
+            inventory.push('\n');
+            std::fs::write(state.join(format!("{id}.title")), format!("Child {id}"))
+                .expect("child title");
+            std::fs::write(
+                state.join(format!("{id}.description")),
+                format!("spec: {}", spec.display()),
+            )
+            .expect("child description");
+            std::fs::write(state.join(format!("{id}.status")), "open").expect("child status");
+            if *ready {
+                frontier.push_str(id);
+                frontier.push('\n');
+            }
+        }
+        std::fs::write(state.join(format!("{epic}.children")), inventory).expect("inventory");
+        std::fs::write(state.join("frontier"), frontier).expect("frontier");
     }
 
     /// Every recorded gh invocation, oldest first, one argv per entry.
@@ -991,6 +1233,14 @@ impl McpClient {
             .unwrap_or_else(|e| panic!("tool {name} text is not an envelope ({e}): {text}"))
     }
 
+    /// Call a tool and return its raw JSON-RPC result object.
+    pub fn call_tool_result(&mut self, name: &str, envelope: Value) -> Value {
+        self.request("tools/call", json!({"name": name, "arguments": envelope}))
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
     /// The tool names the server declares.
     pub fn list_tools(&mut self) -> Vec<String> {
         let reply = self.request("tools/list", json!({}));
@@ -1005,6 +1255,40 @@ impl McpClient {
                     .collect()
             })
             .unwrap_or_default()
+    }
+
+    /// One declared tool, including extension metadata.
+    pub fn tool(&mut self, name: &str) -> Value {
+        let reply = self.request("tools/list", json!({}));
+        reply
+            .pointer("/result/tools")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|tool| tool.get("name").and_then(Value::as_str) == Some(name))
+            .cloned()
+            .unwrap_or(Value::Null)
+    }
+
+    /// Resource URIs declared by the server.
+    pub fn list_resources(&mut self) -> Vec<String> {
+        let reply = self.request("resources/list", json!({}));
+        reply
+            .pointer("/result/resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(|resource| resource.get("uri").and_then(Value::as_str))
+            .map(str::to_owned)
+            .collect()
+    }
+
+    /// Read one text resource.
+    pub fn read_resource(&mut self, uri: &str) -> Value {
+        self.request("resources/read", json!({"uri": uri}))
+            .get("result")
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 }
 

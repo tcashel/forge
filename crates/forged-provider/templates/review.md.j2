@@ -9,6 +9,13 @@ number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url`;
 `gh pr checks {{ pr_number }}`; and the spec at {{ spec_path }}. The
 implementing agent saw ONLY that spec — it is the sole contract you grade
 against.
+{% if field_notes %}
+
+Additional execution context:
+{% for note in field_notes %}
+- {{ note }}
+{% endfor %}
+{% endif %}
 
 1. Anchor on the spec. Walk its Acceptance Criteria one at a time and mark each
    Met (cite file and lines) / Partial (name the gap) / Missing / N/A (already

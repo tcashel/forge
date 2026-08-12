@@ -6,7 +6,11 @@
 
 mod claimnext;
 mod drive;
+mod epic;
+mod handoff;
+mod observe;
 mod ops;
+pub(crate) mod sessions;
 
 use forged_ledger::{EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
@@ -167,6 +171,13 @@ pub fn read_key(name: &str) -> String {
     format!("op:{name}:read")
 }
 
+/// Fill an absent idempotency key with the derived one; an explicit key wins.
+pub(crate) fn default_key(req: &mut OperationRequest, derived: String) {
+    if key_absent(req) {
+        req.idempotency_key = derived;
+    }
+}
+
 /// Read a required string param.
 pub fn param_str<'p>(params: &'p Map<String, Value>, key: &str) -> Result<&'p str, Failure> {
     params
@@ -187,6 +198,18 @@ pub fn param_opt_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'
 /// Split a deterministic packet id (`<run_id>/<stage>/<seq>`) into its
 /// parts.
 pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, i64), Failure> {
+    let (run_id, stage_key, seq) = split_packet_key(packet_id)?;
+    let stage = crate::config::stage_from_str(&stage_key).ok_or_else(|| {
+        Failure::invalid(format!(
+            "packet id {packet_id:?} has no legacy stage segment"
+        ))
+    })?;
+    Ok((run_id, stage, seq))
+}
+
+/// Split either a legacy or semantic packet id into run, stage key, and
+/// logical round/sequence. The stage key remains an opaque semantic string.
+pub fn split_packet_key(packet_id: &str) -> Result<(String, String, i64), Failure> {
     let mut parts = packet_id.rsplitn(3, '/');
     let seq = parts
         .next()
@@ -194,13 +217,13 @@ pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, 
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no seq segment")))?;
     let stage = parts
         .next()
-        .and_then(crate::config::stage_from_str)
+        .filter(|stage| !stage.is_empty())
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no stage segment")))?;
     let run_id = parts
         .next()
         .filter(|r| !r.is_empty())
         .ok_or_else(|| Failure::invalid(format!("packet id {packet_id:?} has no run segment")))?;
-    Ok((run_id.to_owned(), stage, seq))
+    Ok((run_id.to_owned(), stage.to_owned(), seq))
 }
 
 /// The pre-run bd lease identity: the actor a FRESH frontier claim in
@@ -218,11 +241,13 @@ pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, 
 /// (operator adjudication, 2026-08-12).
 pub const FRONTIER_HOLDER: &str = "forged:frontier:0";
 
-/// The driver's derived lease-holder id for a run: seam contract 5's
+/// The driver's derived lease-holder id for a Bead execution chain: seam contract 5's
 /// `<provider>:<session-or-host>:<pid>` shape, filled with what a LEASE can
 /// honestly carry — `forged` (the DRIVER claims the bead, not the model
 /// vendor: one run drives both provider families under this one lease), the
-/// run as the session ref, and a fixed `0` pid segment.
+/// Bead as the session ref, and a fixed `0` pid segment. Child run generations
+/// deliberately share this identity: the Bead owns one lease while each
+/// generation keeps independent run, branch, packet, and controller state.
 ///
 /// The fixed pid is load-bearing, not laziness. The lease must resolve to
 /// the same string in every process that touches it — the driver that took
@@ -232,8 +257,8 @@ pub const FRONTIER_HOLDER: &str = "forged:frontier:0";
 /// holder. Real per-process, per-attempt identity — a real provider and a
 /// real pid — is [`session_claimant`], which is STORED on the attempt row
 /// rather than re-derived, and so can carry values only one process knows.
-pub fn run_holder(run_id: &str) -> String {
-    format!("forged:{run_id}:0")
+pub fn run_holder(bead_id: &str) -> String {
+    format!("forged:{bead_id}:0")
 }
 
 /// The bd lease identity in force for a run: the holder forged already has
@@ -250,9 +275,9 @@ pub fn run_holder(run_id: &str) -> String {
 pub async fn lease_identity(
     bd: &forged_beads::BdConfig,
     bead: &str,
-    run_id: &str,
+    _run_id: &str,
 ) -> Result<String, Failure> {
-    let derived = run_holder(run_id);
+    let derived = run_holder(bead);
     let current = forged_beads::lease_holder(bd, bead).await?;
     Ok(match current {
         Some(held) if held == derived || held == FRONTIER_HOLDER => held,
@@ -538,15 +563,31 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
     match name {
         "doctor" => ops::doctor(ctx, &req).await,
         "init" => ops::init(ctx, &mut req).await,
+        "definition_validate" => ops::definition_validate(ctx, &req).await,
         "run_start" => ops::run_start(ctx, &mut req).await,
         "run_advance" => drive::run_advance(ctx, &req).await,
         "run_drive" => drive::run_drive(ctx, &req).await,
+        "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
+        "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
+        "epic_start" => epic::epic_start(ctx, &mut req).await,
+        "epic_advance" => epic::epic_advance(ctx, &req).await,
+        "epic_drive" => epic::epic_drive(ctx, &req).await,
+        "epic_submit" => handoff::epic_submit(ctx, &mut req).await,
+        "epic_status" => epic::epic_status(ctx, &req).await,
+        "epic_pause" => epic::epic_pause(ctx, &mut req).await,
+        "epic_resume" => epic::epic_resume(ctx, &mut req).await,
+        "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
+        "overview" => observe::overview(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,
         "packet_fail" => ops::packet_fail(ctx, &mut req).await,
         "packet_heartbeat" => ops::packet_heartbeat(ctx, &req).await,
+        "session_list" => sessions::session_list(ctx, &req).await,
+        "session_read" => sessions::session_read(ctx, &req).await,
+        "session_message" => sessions::session_message(ctx, &mut req).await,
+        "session_stop" => sessions::session_stop(ctx, &mut req).await,
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,

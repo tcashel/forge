@@ -1,0 +1,98 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Forged Control Plane</title>
+  <style>
+    :root { color-scheme: light dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; }
+    * { box-sizing:border-box; }
+    body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:13px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif; }
+    header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:12px; }
+    h1 { margin:0; font-size:18px; letter-spacing:.01em; }
+    h2 { margin:0 0 8px; color:var(--muted); font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
+    button { border:1px solid var(--line); border-radius:7px; padding:6px 10px; background:var(--panel); color:var(--text); cursor:pointer; }
+    button:hover { border-color:var(--accent); }
+    .sub { color:var(--muted); font-family:ui-monospace,SFMono-Regular,monospace; }
+    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
+    .card { min-width:0; padding:12px; border:1px solid var(--line); border-radius:9px; background:var(--panel); }
+    .wide { grid-column:1/-1; }
+    .metric { font-size:22px; font-weight:650; }
+    .row { display:flex; justify-content:space-between; gap:12px; padding:5px 0; border-top:1px solid color-mix(in srgb,var(--line) 60%,transparent); }
+    .row:first-of-type { border-top:0; }
+    .row span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .pill { display:inline-block; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); }
+    .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
+    pre { max-height:220px; margin:0; overflow:auto; color:var(--muted); font:11px/1.5 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; }
+    #empty { padding:28px; text-align:center; color:var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <div><h1>Forged</h1><div class="sub" id="identity">waiting for projection</div></div>
+    <button id="refresh" type="button">Refresh</button>
+  </header>
+  <main id="empty">Connecting to the host…</main>
+  <script>
+    (() => {
+      const initId = "forged-overview-init";
+      let requestId = 1;
+      let lastArguments = null;
+      const root = document.querySelector("main");
+      const identity = document.querySelector("#identity");
+      const send = message => window.parent.postMessage(message, "*");
+      const el = (tag, cls, text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!==undefined)n.textContent=String(text); return n; };
+      const array = value => Array.isArray(value) ? value : [];
+      const valueAt = (obj, path, fallback="—") => path.split(".").reduce((v,k)=>v?.[k],obj) ?? fallback;
+      const card = (title, rows, wide=false) => {
+        const node=el("section",`card${wide?" wide":""}`); node.append(el("h2","",title));
+        rows.forEach(([a,b,c])=>{ const r=el("div","row"); r.append(el("span","",a),el("span",c||"sub",b)); node.append(r); });
+        return node;
+      };
+      function render(raw) {
+        const data = raw?.result ?? raw;
+        if (!data || data.schema !== "forged.overview/1") { root.textContent="No Forged projection returned."; return; }
+        identity.textContent=`${data.kind} · ${data.id} · cursor ${data.cursor ?? 0}`;
+        root.textContent=""; root.className="grid";
+        const epic=data.kind==="epic"; const status=data.status || {};
+        const state=epic ? (status.finalPr ? "final PR" : status.inputRequired ? "input required" : status.paused ? "paused" : "running") : valueAt(status,"state");
+        root.append(card("Execution", [["State",state,state==="running"||state==="active"?"ok":state==="input required"?"warn":""],["Profile",valueAt(epic?status:status.execution,"profile",valueAt(status,"execution.activeProfileRef.name"))],["Roster",valueAt(status,"roster",valueAt(status,"definition.activeRosterRef.name",valueAt(status,"definition.rosterRef.name")))] ]));
+        const workers=epic ? array(data.workers) : array(data.workers?.sessions);
+        root.append(card("Workers", [["Known sessions",workers.length],["Live",workers.filter(w=>w.state==="running").length,"ok"],["Interventions",array(data.interventions).length]]));
+        const totals=data.usage?.totals || {};
+        root.append(card("Usage", [["Input",Math.round(totals.inputTokens||0).toLocaleString()],["Output",Math.round(totals.outputTokens||0).toLocaleString()],["Known cost",`$${Number(totals.costUsdKnown||0).toFixed(3)}`]]));
+        const children=epic ? array(status.children) : array(status.packets);
+        root.append(card(epic?"Children":"Packets", children.length ? children.map(item=>[item.id||item.packetId,item.beadsStatus||item.stage||item.storageLane,item.merged?"ok":"sub"]) : [["None","—"]], true));
+        root.append(card("Evidence", [["Gates",array(data.gates).length],["Review findings",array(epic?data.reviews:data.reviews?.latestFindings).length],["Artifact groups",array(data.artifacts).length]], false));
+        const stop=status.inputRequired || data.inputRequired || status.paused || data.paused;
+        if (stop) root.append(card("Attention", [[stop.code||"Paused",stop.detail||stop.reason||JSON.stringify(stop),"warn"]], true));
+        const events=array(data.events?.events);
+        const eventCard=el("section","card wide"); eventCard.append(el("h2","","Recent events")); const pre=el("pre"); pre.textContent=events.slice(-30).map(e=>`${e.eventId}  ${e.kind}`).join("\n")||"No new events."; eventCard.append(pre); root.append(eventCard);
+      }
+      function toolResult(params) {
+        let value=params?.structuredContent;
+        if (!value) { const text=array(params?.content).find(c=>c.type==="text")?.text; try { value=JSON.parse(text); } catch {} }
+        render(value);
+      }
+      window.addEventListener("message", event => {
+        const msg=event.data;
+        if (!msg || msg.jsonrpc!=="2.0") return;
+        if (msg.id===initId && msg.result) {
+          send({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}});
+          const theme=msg.result.hostContext?.theme; if(theme) document.documentElement.style.colorScheme=theme;
+          return;
+        }
+        if (msg.method==="ui/notifications/tool-input") lastArguments=msg.params?.arguments;
+        if (msg.method==="ui/notifications/tool-result") toolResult(msg.params);
+        if (msg.id && msg.result?.structuredContent) toolResult(msg.result);
+        if (msg.method==="ui/resource-teardown" && msg.id) send({jsonrpc:"2.0",id:msg.id,result:{}});
+      });
+      document.querySelector("#refresh").addEventListener("click", () => {
+        if (!lastArguments) return;
+        send({jsonrpc:"2.0",id:`forged-refresh-${requestId++}`,method:"tools/call",params:{name:"overview",arguments:lastArguments}});
+      });
+      send({jsonrpc:"2.0",id:initId,method:"ui/initialize",params:{protocolVersion:"2026-01-26",appInfo:{name:"forged-overview",version:"1.0.0"},appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}});
+    })();
+  </script>
+</body>
+</html>

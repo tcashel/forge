@@ -33,6 +33,7 @@ pub use error::LedgerError;
 pub use ledger::{default_db_path, Ledger};
 pub use types::{
     AttemptRow, AttemptState, ClaimedAttempt, EffectClass, EventRow, MergeSlotRow, NewPacket,
-    NewRun, NewUsage, OperationOutcome, OperationRow, OperationState, OperationTicket, PacketRow,
-    Pragmas, RunRow, RunState, SlotOutcome, UsageTotals,
+    NewRun, NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState,
+    OperationTicket, PacketRow, Pragmas, RosterRevisionRow, RunDefinitionRow, RunRow, RunState,
+    SlotOutcome, UsageTotals,
 };

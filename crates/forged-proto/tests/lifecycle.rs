@@ -244,6 +244,9 @@ async fn full_slice_v1_lifecycle_in_process() {
                 }
                 visited.push(format!("done:{pid}"));
             }
+            NextAction::EscalateProfile(escalation) => {
+                panic!("legacy lifecycle must not escalate: {escalation:?}")
+            }
             NextAction::Stop(terminal) => break terminal,
         }
     };

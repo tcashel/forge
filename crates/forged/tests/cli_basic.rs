@@ -23,13 +23,17 @@ fn help_lists_every_command_and_subcommand_flags() {
     for command in [
         "doctor",
         "init",
+        "definition",
         "run",
+        "epic",
         "packet",
+        "session",
         "claim-next",
         "gate",
         "reconcile",
         "usage",
         "events",
+        "overview",
         "worktree",
         "mcp",
     ] {
@@ -39,17 +43,32 @@ fn help_lists_every_command_and_subcommand_flags() {
     for sub in ["start", "advance", "drive", "status"] {
         assert!(run.contains(sub), "run --help must list {sub}");
     }
+    let epic = help_text(&env, &["epic", "--help"]);
+    for sub in [
+        "start", "advance", "drive", "status", "pause", "resume", "resolve",
+    ] {
+        assert!(epic.contains(sub), "epic --help must list {sub}");
+    }
     let start = help_text(&env, &["run", "start", "--help"]);
     for flag in [
         "--bead",
         "--repo",
         "--spec",
         "--base-ref",
+        "--profile",
+        "--roster",
         "--idempotency-key",
     ] {
         assert!(
             start.contains(flag),
             "run start --help must document {flag}"
+        );
+    }
+    let definition = help_text(&env, &["definition", "validate", "--help"]);
+    for flag in ["--profile", "--roster", "--idempotency-key"] {
+        assert!(
+            definition.contains(flag),
+            "definition validate --help must document {flag}"
         );
     }
     let packet = help_text(&env, &["packet", "--help"]);
@@ -61,6 +80,17 @@ fn help_lists_every_command_and_subcommand_flags() {
         assert!(
             complete.contains(flag),
             "packet complete --help must document {flag}"
+        );
+    }
+    let session = help_text(&env, &["session", "--help"]);
+    for sub in ["list", "read", "message", "stop"] {
+        assert!(session.contains(sub), "session --help must list {sub}");
+    }
+    let message = help_text(&env, &["session", "message", "--help"]);
+    for flag in ["--run", "--attempt", "--message", "--requested-by"] {
+        assert!(
+            message.contains(flag),
+            "session message --help must document {flag}"
         );
     }
     let retire = help_text(&env, &["worktree", "retire", "--help"]);
@@ -80,6 +110,13 @@ fn help_lists_every_command_and_subcommand_flags() {
     let events = help_text(&env, &["events", "--help"]);
     for flag in ["--run", "--after", "--limit"] {
         assert!(events.contains(flag), "events --help must document {flag}");
+    }
+    let overview = help_text(&env, &["overview", "--help"]);
+    for flag in ["--run", "--epic", "--after", "--limit"] {
+        assert!(
+            overview.contains(flag),
+            "overview --help must document {flag}"
+        );
     }
 }
 
@@ -106,6 +143,26 @@ fn init_derives_its_key_replays_and_is_idempotent() {
     assert_eq!(code, 0);
     assert_eq!(third["reused"], json!(false));
     assert_ne!(third["operationId"], first["operationId"]);
+}
+
+#[test]
+fn init_creates_yaml_only_when_no_config_exists() {
+    let env = TestEnv::new("forged-init-yaml");
+    std::fs::remove_file(env.anvil.join("config.json")).expect("remove legacy fixture config");
+    let (code, response) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {response}");
+    let path = env.anvil.join("config.yaml");
+    let original = std::fs::read_to_string(&path).expect("default YAML created");
+    assert!(original.starts_with("# forged authoring config"));
+    assert_eq!(response["result"]["config_path"], json!(path));
+    assert!(!env.anvil.join("config.json").exists());
+
+    let mut edited = original;
+    edited.push_str("# operator note\n");
+    std::fs::write(&path, &edited).expect("operator edit");
+    let (code, _) = env.forged(&["init", "--idempotency-key", "init-yaml-again"]);
+    assert_eq!(code, 0);
+    assert_eq!(std::fs::read_to_string(path).expect("read"), edited);
 }
 
 #[test]

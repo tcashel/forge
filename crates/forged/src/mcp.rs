@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Eleven tools, each taking the
+//! `forged mcp` — the rmcp stdio server. Twenty-seven tools, each taking the
 //! same operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -11,8 +11,14 @@ use std::sync::Arc;
 
 use rmcp::handler::server::router::tool::ToolRouter;
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::{CallToolResult, ContentBlock, ServerCapabilities, ServerInfo};
+use rmcp::model::{
+    CallToolResult, ContentBlock, ErrorData, ExtensionCapabilities, JsonObject,
+    ListResourcesResult, MetaObject, PaginatedRequestParams, ReadResourceRequestParams,
+    ReadResourceResponse, ReadResourceResult, Resource, ResourceContents, ServerCapabilities,
+    ServerInfo,
+};
 use rmcp::schemars::JsonSchema;
+use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
 use serde::Deserialize;
 use serde_json::Value;
@@ -20,6 +26,25 @@ use serde_json::Value;
 use forged_types::OperationRequest;
 
 use crate::core::{dispatch, Ctx};
+
+const OVERVIEW_URI: &str = "ui://forged/overview.html";
+const APP_MIME: &str = "text/html;profile=mcp-app";
+const OVERVIEW_HTML: &str = include_str!("../assets/overview.html");
+
+fn overview_tool_meta() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert(
+        "ui".to_owned(),
+        serde_json::json!({"resourceUri": OVERVIEW_URI}),
+    );
+    // Pre-standard hosts used this flat spelling. Keeping both is harmless
+    // and lets the same binary progressively enhance older Apps clients.
+    meta.insert(
+        "ui/resourceUri".to_owned(),
+        Value::String(OVERVIEW_URI.to_owned()),
+    );
+    meta
+}
 
 /// The operation envelope as a tool input — one envelope type on every
 /// surface. `schemaVersion` defaults to 1 and `idempotencyKey` to absent,
@@ -80,6 +105,16 @@ impl ForgedServer {
             .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
         CallToolResult::success(vec![ContentBlock::text(text)])
     }
+
+    async fn call_structured(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
+        let resp = dispatch(&self.ctx, name, args.into_request()).await;
+        let structured = serde_json::to_value(&resp).unwrap_or(Value::Null);
+        let text = serde_json::to_string(&resp)
+            .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
+        let mut result = CallToolResult::success(vec![ContentBlock::text(text)]);
+        result.structured_content = Some(structured);
+        result
+    }
 }
 
 #[tool_router(router = tool_router)]
@@ -88,6 +123,15 @@ impl ForgedServer {
     #[tool(name = "doctor", description = "Run the forged environment probes.")]
     pub async fn doctor(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("doctor", args.0).await
+    }
+
+    /// Resolve and validate a profile/roster selection.
+    #[tool(
+        name = "definition_validate",
+        description = "Resolve and validate an execution definition."
+    )]
+    pub async fn definition_validate(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("definition_validate", args.0).await
     }
 
     /// Start a run for a bead.
@@ -102,10 +146,92 @@ impl ForgedServer {
         self.call("run_advance", args.0).await
     }
 
+    /// Hand a run to a detached durable controller.
+    #[tool(
+        name = "run_submit",
+        description = "Submit a run for detached driving."
+    )]
+    pub async fn run_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_submit", args.0).await
+    }
+
     /// Read-only run projection.
     #[tool(name = "run_status", description = "Project a run's current state.")]
     pub async fn run_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_status", args.0).await
+    }
+
+    /// Append an explicit roster revision.
+    #[tool(
+        name = "run_revise_roster",
+        description = "Append a validated roster revision for a run."
+    )]
+    pub async fn run_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_revise_roster", args.0).await
+    }
+
+    /// Freeze an epic inventory and child execution defaults.
+    #[tool(name = "epic_start", description = "Start a durable Beads epic run.")]
+    pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_start", args.0).await
+    }
+
+    /// Perform one epic scheduler action.
+    #[tool(name = "epic_advance", description = "Advance an epic by one action.")]
+    pub async fn epic_advance(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_advance", args.0).await
+    }
+
+    /// Drive an epic to a durable stop.
+    #[tool(
+        name = "epic_drive",
+        description = "Drive an epic to input or final PR."
+    )]
+    pub async fn epic_drive(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_drive", args.0).await
+    }
+
+    /// Hand an epic to a detached durable controller.
+    #[tool(
+        name = "epic_submit",
+        description = "Submit an epic for detached driving."
+    )]
+    pub async fn epic_submit(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_submit", args.0).await
+    }
+
+    /// Project epic waves, child runs, blockers, and PR state.
+    #[tool(name = "epic_status", description = "Project durable epic state.")]
+    pub async fn epic_status(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_status", args.0).await
+    }
+
+    /// Pause an epic at its current durable boundary.
+    #[tool(name = "epic_pause", description = "Pause epic scheduling.")]
+    pub async fn epic_pause(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_pause", args.0).await
+    }
+
+    /// Resume a paused epic.
+    #[tool(name = "epic_resume", description = "Resume epic scheduling.")]
+    pub async fn epic_resume(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_resume", args.0).await
+    }
+
+    /// Resolve a child-specific input-required stop.
+    #[tool(name = "epic_resolve", description = "Resolve held epic child input.")]
+    pub async fn epic_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("epic_resolve", args.0).await
+    }
+
+    /// Unified reconnect projection, rendered by the optional MCP App.
+    #[tool(
+        name = "overview",
+        description = "Project one slice or epic with workers, evidence, usage, and events.",
+        meta = overview_tool_meta()
+    )]
+    pub async fn overview(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call_structured("overview", args.0).await
     }
 
     /// Claim one packet.
@@ -124,6 +250,39 @@ impl ForgedServer {
     #[tool(name = "packet_fail", description = "Report a packet failure.")]
     pub async fn packet_fail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("packet_fail", args.0).await
+    }
+
+    /// Durable provider-session metadata for a run.
+    #[tool(
+        name = "session_list",
+        description = "List provider sessions for a run."
+    )]
+    pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_list", args.0).await
+    }
+
+    /// Read recent output from a Herdr-backed session.
+    #[tool(name = "session_read", description = "Read a Herdr session pane.")]
+    pub async fn session_read(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_read", args.0).await
+    }
+
+    /// Queue or capability-gated live-deliver an intervention.
+    #[tool(
+        name = "session_message",
+        description = "Queue an intervention for a run or live session."
+    )]
+    pub async fn session_message(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_message", args.0).await
+    }
+
+    /// Revoke and confirmed-stop one provider attempt.
+    #[tool(
+        name = "session_stop",
+        description = "Revoke and stop a provider attempt."
+    )]
+    pub async fn session_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("session_stop", args.0).await
     }
 
     /// The stateless resume verb.
@@ -159,7 +318,15 @@ impl ServerHandler for ForgedServer {
     fn get_info(&self) -> ServerInfo {
         // ServerInfo::default() then mutate — the adjudicated idiom.
         let mut info = ServerInfo::default();
-        info.capabilities = ServerCapabilities::builder().enable_tools().build();
+        let mut ui = JsonObject::new();
+        ui.insert("mimeTypes".to_owned(), serde_json::json!([APP_MIME]));
+        let mut extensions = ExtensionCapabilities::new();
+        extensions.insert("io.modelcontextprotocol/ui".to_owned(), ui);
+        info.capabilities = ServerCapabilities::builder()
+            .enable_tools()
+            .enable_resources()
+            .enable_extensions_with(extensions)
+            .build();
         info.server_info.name = "forged".into();
         info.server_info.version = env!("CARGO_PKG_VERSION").into();
         info.instructions = Some(
@@ -169,6 +336,37 @@ impl ServerHandler for ForgedServer {
                 .into(),
         );
         info
+    }
+
+    async fn list_resources(
+        &self,
+        _request: Option<PaginatedRequestParams>,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ListResourcesResult, ErrorData> {
+        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
+            OVERVIEW_URI,
+            "forged-overview",
+        )
+        .with_title("Forged Control Plane")
+        .with_description("View-only projection of Forged slice and epic execution.")
+        .with_mime_type(APP_MIME)]))
+    }
+
+    async fn read_resource(
+        &self,
+        request: ReadResourceRequestParams,
+        _context: RequestContext<RoleServer>,
+    ) -> Result<ReadResourceResponse, ErrorData> {
+        if request.uri != OVERVIEW_URI {
+            return Err(ErrorData::resource_not_found(
+                format!("unknown forged resource {:?}", request.uri),
+                None,
+            ));
+        }
+        Ok(ReadResourceResult::new(vec![
+            ResourceContents::text(OVERVIEW_HTML, OVERVIEW_URI).with_mime_type(APP_MIME)
+        ])
+        .into())
     }
 }
 

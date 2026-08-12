@@ -12,7 +12,7 @@ use nix::unistd::Pid;
 use serde_json::json;
 use tokio::time::Instant;
 
-use super::wire::{PaneInfoResult, Pong, ProcessInfo};
+use super::wire::{PaneInfoResult, PaneReadResponse, Pong, ProcessInfo};
 use super::{CallError, Connection};
 use crate::identity::ProcessIdentity;
 use crate::{sentinel, Confirmed, HostError, HostSessionId, Liveness, SessionHost};
@@ -55,6 +55,96 @@ pub struct HerdrHost {
     sessions: Mutex<HashMap<HostSessionId, PathBuf>>,
 }
 
+/// A controller connection for durable pane ids recorded by forged. Unlike
+/// [`HerdrHost`], it does not own or spawn sessions.
+pub struct HerdrControl {
+    conn: Arc<Connection>,
+}
+
+/// Plain-text pane output safe to expose through CLI/MCP.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PaneSnapshot {
+    pub pane_id: String,
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub text: String,
+    pub revision: u64,
+    pub truncated: bool,
+}
+
+async fn connect_pinned(socket_path: &Path) -> Result<Arc<Connection>, HostError> {
+    let conn = Connection::dial(socket_path).await?;
+    let pong_value = conn
+        .call("ping", json!({}))
+        .await
+        .map_err(CallError::into_host_error)?;
+    let pong: Pong = serde_json::from_value(pong_value)
+        .map_err(|_| HostError::unavailable("malformed pong from herdr"))?;
+    if pong.protocol != HERDR_PROTOCOL {
+        return Err(HostError::ProtocolMismatch {
+            expected: HERDR_PROTOCOL,
+            got: pong.protocol,
+        });
+    }
+    Ok(conn)
+}
+
+impl HerdrControl {
+    /// Connect to protocol 19 without subscribing to session events.
+    pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HostError> {
+        Ok(Self {
+            conn: connect_pinned(socket_path.as_ref()).await?,
+        })
+    }
+
+    /// Read a bounded recent-unwrapped text snapshot.
+    pub async fn read_pane(&self, pane_id: &str, lines: u32) -> Result<PaneSnapshot, HostError> {
+        let value = self
+            .conn
+            .call(
+                "pane.read",
+                json!({
+                    "pane_id": pane_id,
+                    "source": "recent_unwrapped",
+                    "lines": lines,
+                    "format": "text",
+                    "strip_ansi": true,
+                }),
+            )
+            .await
+            .map_err(CallError::into_host_error)?;
+        let response: PaneReadResponse = serde_json::from_value(value)
+            .map_err(|_| HostError::unavailable("malformed pane.read result from herdr"))?;
+        Ok(PaneSnapshot {
+            pane_id: response.read.pane_id,
+            workspace_id: response.read.workspace_id,
+            tab_id: response.read.tab_id,
+            text: response.read.text,
+            revision: response.read.revision,
+            truncated: response.read.truncated,
+        })
+    }
+
+    /// Deliver one message plus Enter to an interactive agent pane.
+    pub async fn send_message(&self, pane_id: &str, message: &str) -> Result<(), HostError> {
+        if message.trim().is_empty() {
+            return Err(HostError::spawn_failed("message must not be empty"));
+        }
+        if message.len() > 16 * 1024 {
+            return Err(HostError::spawn_failed("message exceeds 16 KiB"));
+        }
+        self.conn
+            .call(
+                "pane.send_input",
+                json!({"pane_id": pane_id, "text": message, "keys": ["Enter"]}),
+            )
+            .await
+            .map_err(CallError::into_host_error)?;
+        Ok(())
+    }
+}
+
 impl HerdrHost {
     /// Dial `socket_path`, pin the protocol with `ping` (anything other
     /// than 19 → [`HostError::ProtocolMismatch`], and no further requests
@@ -64,19 +154,7 @@ impl HerdrHost {
         socket_path: impl AsRef<Path>,
         base_status_dir: impl Into<PathBuf>,
     ) -> Result<Self, HostError> {
-        let conn = Connection::dial(socket_path.as_ref()).await?;
-        let pong_value = conn
-            .call("ping", json!({}))
-            .await
-            .map_err(CallError::into_host_error)?;
-        let pong: Pong = serde_json::from_value(pong_value)
-            .map_err(|_| HostError::unavailable("malformed pong from herdr"))?;
-        if pong.protocol != HERDR_PROTOCOL {
-            return Err(HostError::ProtocolMismatch {
-                expected: HERDR_PROTOCOL,
-                got: pong.protocol,
-            });
-        }
+        let conn = connect_pinned(socket_path.as_ref()).await?;
         conn.call(
             "events.subscribe",
             json!({

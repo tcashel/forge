@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
 use crate::adapters::ports::ForgedPorts;
-use crate::config::{now_iso, stage_str};
+use crate::config::{now_iso, stage_str, HostPolicy};
 use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
@@ -30,6 +30,8 @@ pub struct ExecutionContext {
     pub pr_number: Option<u64>,
     /// The merged findings of the latest review fan-out (for Fix prompts).
     pub findings: Vec<forged_types::Finding>,
+    /// Standing review evidence supplied to an adaptive synthesis seat.
+    pub review_evidence: Vec<String>,
     /// The run's remote URL (for Fix prompts).
     pub push_url: String,
 }
@@ -71,7 +73,10 @@ pub fn build_packet(
     spec_sha256: &str,
 ) -> WorkPacket {
     let stage = intent.stage;
-    let packet_id = format!("{}/{}/{}", run.run_id, stage_str(stage), intent.seq);
+    let packet_id = intent
+        .packet_id
+        .clone()
+        .unwrap_or_else(|| format!("{}/{}/{}", run.run_id, stage_str(stage), intent.seq));
     let deliverable = match stage {
         Stage::Implement => Deliverable::CommitsInWorktree,
         Stage::ReviewClaude | Stage::ReviewCodex => Deliverable::ReviewBlock,
@@ -96,6 +101,8 @@ pub fn build_packet(
         run_id: run.run_id.clone(),
         bead_id: run.bead_id.clone(),
         stage,
+        execution: intent.execution.clone(),
+        lane_seq: intent.execution.as_ref().map(|_| intent.seq),
         spec: forged_types::SpecRef {
             path: spec_path.to_owned(),
             sha256: spec_sha256.to_owned(),
@@ -119,26 +126,38 @@ pub fn build_packet(
 pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Result<(), Failure> {
     let body_json = serde_json::to_string(packet)
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
-    let (run_id, stage, seq) = crate::core::split_packet_id(&packet.packet_id)?;
+    let (stage_key, logical_seq, lane_seq) = match &packet.execution {
+        Some(execution) => (
+            execution.stage_id.clone(),
+            i64::from(execution.round),
+            packet
+                .lane_seq
+                .ok_or_else(|| Failure::internal("semantic packet has no lane sequence"))?,
+        ),
+        None => {
+            let (_, stage, seq) = crate::core::split_packet_id(&packet.packet_id)?;
+            (stage_str(stage).to_owned(), seq, seq)
+        }
+    };
     let key = crate::core::derive_key(
         "packet_open",
-        Some(&run_id),
-        Some(stage_str(stage)),
-        Some(seq),
+        Some(&run.run_id),
+        Some(&stage_key),
+        Some(logical_seq),
     );
     let req = OperationRequest {
         schema_version: 1,
         idempotency_key: key,
         run_id: Some(run.run_id.clone()),
-        params: match json!({"stage": stage_str(stage), "seq": seq}) {
+        params: match json!({"stage": stage_key, "seq": logical_seq}) {
             Value::Object(map) => map,
             _ => unreachable!("literal is an object"),
         },
     };
     let new_packet = forged_ledger::NewPacket {
         run_id: run.run_id.clone(),
-        stage,
-        seq,
+        stage: packet.stage,
+        seq: lane_seq,
         spec_path: packet.spec.path.clone(),
         spec_sha256: packet.spec.sha256.clone(),
         body_json,
@@ -146,9 +165,13 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
     let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
         let ledger = ctx.ledger.clone();
         move |_op_id| async move {
-            let packet_id = tokio::task::spawn_blocking(move || ledger.open_packet(new_packet))
-                .await
-                .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
+            let semantic_id = packet.execution.as_ref().map(|_| packet.packet_id.clone());
+            let packet_id = tokio::task::spawn_blocking(move || match semantic_id {
+                Some(packet_id) => ledger.open_packet_with_id(new_packet, packet_id),
+                None => ledger.open_packet(new_packet),
+            })
+            .await
+            .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
             Ok(json!({"packetId": packet_id}))
         }
     })
@@ -187,6 +210,7 @@ fn render_context(
             "base_ref": format!("origin/{}", packet.base_ref),
             "spec_path": packet.spec.path,
             "gate_commands": packet.contract.gate_commands,
+            "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -195,6 +219,17 @@ fn render_context(
             "pr_number": exec.pr_number.unwrap_or(0),
             "spec_path": packet.spec.path,
             "worktree": worktree,
+            "field_notes": if packet.execution.as_ref().is_some_and(|value|
+                value.purpose == forged_types::SeatPurpose::Synthesis
+            ) {
+                let mut notes = vec![
+                    "Synthesize the standing independent review evidence into one controlling verdict; do not perform a fresh independent review.".to_owned()
+                ];
+                notes.extend(exec.review_evidence.iter().cloned());
+                notes
+            } else {
+                packet.field_notes.clone()
+            },
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -207,6 +242,7 @@ fn render_context(
             "gate_commands": packet.contract.gate_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
+            "field_notes": packet.field_notes,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -331,30 +367,52 @@ async fn run_attempt(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
+    let mut packet = packet.clone();
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
+    let interventions = crate::core::sessions::pending_interventions(ctx, &run_id).await?;
+    packet
+        .field_notes
+        .extend(interventions.iter().map(|intervention| {
+            format!(
+                "Intervention {} from {}: {}",
+                intervention.id, intervention.requested_by, intervention.message
+            )
+        }));
     // The guardian heartbeats the lease that is actually held — bd's
     // heartbeat is owner-only, and a heartbeat under a second, derived
     // identity would be refused and let the run's own lease lapse under it.
     let holder =
         crate::core::lease_identity(&ctx.config.bd_config(), &packet.bead_id, &run_id).await?;
-    let (_, stage, seq) = crate::core::split_packet_id(&packet_id)?;
+    let (stage_key, seq) = match &packet.execution {
+        Some(execution) => (execution.stage_id.as_str(), i64::from(execution.round)),
+        None => {
+            let (_, stage, seq) = crate::core::split_packet_id(&packet_id)?;
+            (stage_str(stage), seq)
+        }
+    };
     let claim_token = claim_token.to_owned();
 
     // 1. Materialize the packet directory and render the prompt.
-    let packet_dir = ctx.config.packet_dir(&run_id, stage, seq);
+    let packet_dir = ctx.config.packet_dir_key(&run_id, stage_key, seq);
     std::fs::create_dir_all(&packet_dir)
         .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
     let dirs = PacketDirs::new(&packet_dir);
     let templates = PromptTemplates::load()?;
-    let context = render_context(exec, packet, seq)?;
+    let context = render_context(exec, &packet, seq)?;
     let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
     std::fs::write(dirs.prompt(), prompt)
         .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
 
     // 2. The sentinel-free shell line.
-    let driver = driver_for(&packet.provider_hints.provider)?;
-    let invocation = driver.invocation(packet, &dirs, &claim_token)?;
+    let driver = match driver_for(&packet.provider_hints.provider) {
+        Ok(driver) => driver,
+        Err(error) => {
+            let note = format!("transport: provider adapter unavailable: {}", error.message);
+            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+        }
+    };
+    let invocation = driver.invocation(&packet, &dirs, &claim_token)?;
 
     // 3. Prefix the pid capture (no exec — the host appends the sentinel to
     // the same shell, and `$$` is that shell's pid either way) and spawn
@@ -370,13 +428,64 @@ async fn run_attempt(
         invocation.shell_line
     );
     let status_base = packet_dir.join("status").join(attempt_id.to_string());
-    // Host selection: the plain process host by default; herdr when a
-    // socket is configured (passed explicitly — the default is never
-    // applied inside connect).
-    let host: Arc<dyn SessionHost> = match &ctx.config.herdr_sock {
-        Some(sock) => Arc::new(forged_host::HerdrHost::connect(sock, &status_base).await?),
-        None => Arc::new(ProcessHost::new(&status_base)),
-    };
+    // Herdr is the preferred visibility adapter. The ledger records the
+    // actual host selection, so a missing socket can never masquerade as a
+    // Herdr-backed session.
+    let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) =
+        match ctx.config.host_policy {
+            HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
+            HostPolicy::Preferred | HostPolicy::Required => match ctx.config.herdr_sock.as_ref() {
+                None => {
+                    if ctx.config.host_policy == HostPolicy::Required {
+                        return fail_and_grant_retry(
+                            ctx,
+                            &packet_id,
+                            &claim_token,
+                            "transport: Herdr is required but no socket is configured".to_owned(),
+                        )
+                        .await;
+                    }
+                    crate::core::sessions::record_host_fallback(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        attempt_id,
+                        "no Herdr socket is configured",
+                    )
+                    .await?;
+                    (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                }
+                Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
+                    Ok(herdr) => (
+                        Arc::new(herdr),
+                        "herdr",
+                        Some(sock.to_string_lossy().into_owned()),
+                    ),
+                    Err(error) if ctx.config.host_policy == HostPolicy::Preferred => {
+                        crate::core::sessions::record_host_fallback(
+                            ctx,
+                            &run_id,
+                            &packet_id,
+                            attempt_id,
+                            &error.to_string(),
+                        )
+                        .await?;
+                        (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                    }
+                    Err(error) => {
+                        return fail_and_grant_retry(
+                            ctx,
+                            &packet_id,
+                            &claim_token,
+                            format!("transport: required Herdr host unavailable: {error}"),
+                        )
+                        .await;
+                    }
+                },
+            },
+        };
+    let attach_hint =
+        (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_owned(), path);
@@ -404,6 +513,28 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
+    crate::core::sessions::record_session_started(
+        ctx,
+        crate::core::sessions::SessionStarted {
+            run_id: &run_id,
+            packet_id: &packet_id,
+            attempt_id,
+            host: host_kind,
+            session_id: session.as_str(),
+            socket_path: socket_path.as_deref(),
+            attach_hint: attach_hint.as_deref(),
+        },
+    )
+    .await?;
+    crate::core::sessions::record_interventions_delivered(
+        ctx,
+        &run_id,
+        &packet_id,
+        attempt_id,
+        &interventions,
+        "boundary",
+    )
+    .await?;
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;
@@ -536,10 +667,10 @@ pub async fn land_result(
     claim_token: &str,
     result: forged_types::PacketResult,
 ) -> Result<PacketOutcome, Failure> {
-    let (_, stage, seq) = crate::core::split_packet_id(packet_id)?;
+    let (_, stage_key, seq) = crate::core::split_packet_key(packet_id)?;
     let key = format!(
         "op:packet_complete:{run_id}:{}:{seq}:a{attempt_id}",
-        stage_str(stage)
+        stage_key
     );
     let req = OperationRequest {
         schema_version: 1,
@@ -619,7 +750,7 @@ async fn fail_and_grant_retry(
     claim_token: &str,
     note: String,
 ) -> Result<PacketOutcome, Failure> {
-    let (run_id, _, _) = crate::core::split_packet_id(packet_id)?;
+    let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
     let failed_at = {
         let packet_id = packet_id.to_owned();
         let token = claim_token.to_owned();

@@ -45,6 +45,33 @@ impl Ledger {
         })
     }
 
+    /// Append an event only when the same run/kind/payload tuple is absent.
+    /// This is the crash-safe seam for deterministic protocol transitions
+    /// whose operation wrapper may be retried after the event landed.
+    pub fn append_event_once(
+        &self,
+        run_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, LedgerError> {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let payload_json = serde_json::to_string(&payload)?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 AND payload_json = ?3)",
+                rusqlite::params![run_id, kind, payload_json],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            }
+            tx.commit()?;
+            Ok(!exists)
+        })
+    }
+
     /// Rows with `event_id > after_event_id` (exclusive), ordered by
     /// `event_id` ascending, at most `limit` rows; `limit == 0` returns an
     /// empty vec. `run_id: None` returns all rows including NULL-run rows;

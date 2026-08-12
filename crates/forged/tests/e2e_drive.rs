@@ -3,10 +3,546 @@
 //! shim call log shows exactly one draft PR creation and zero merge or
 //! ready-for-review calls; the origin repo holds the real commits.
 
+use std::process::Stdio;
+
 mod support;
 
-use serde_json::json;
+use serde_json::{json, Value};
 use support::{assert_no_overlap, rev_parse, TestEnv};
+
+fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..600 {
+        let (code, value) = env.forged(args);
+        if code == 0 && ready(&value) {
+            return value;
+        }
+        last = value;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out waiting for forged {args:?}: {last}")
+}
+
+#[test]
+fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr() {
+    let env = TestEnv::new("forged-epic-e2e");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-one", &[("child-one", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-one",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(started["result"]["schema"], json!("forged.epic/1"));
+
+    env.set_scenario("implement", "slow", 1);
+    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic submit: {submitted}");
+    assert_eq!(submitted["result"]["submitted"], json!(true));
+    assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
+    assert!(submitted["result"]["controller"]["sessionId"].is_string());
+
+    let mut provider_started = false;
+    for _ in 0..100 {
+        if env
+            .provider_log()
+            .iter()
+            .any(|line| line.starts_with("child-one/implementation/0") && line.contains(" start "))
+        {
+            provider_started = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(provider_started, "detached epic reached a live provider");
+    let (code, paused) = env.forged(&[
+        "epic",
+        "pause",
+        "--epic",
+        "epic-one",
+        "--reason",
+        "operator checkpoint",
+    ]);
+    assert_eq!(
+        code, 0,
+        "out-of-band pause while controller owns slot: {paused}"
+    );
+    let held = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
+        value["result"]["paused"].is_object()
+            && value["result"]["controller"]["state"] == json!("exited")
+    });
+    assert!(
+        held["result"]["finalPr"].is_null(),
+        "pause precedes merge: {held}"
+    );
+    let (code, resumed) = env.forged(&[
+        "epic",
+        "resume",
+        "--epic",
+        "epic-one",
+        "--reason",
+        "operator approved continuation",
+    ]);
+    assert_eq!(code, 0, "resume: {resumed}");
+    let (code, resubmitted) = env.forged(&["epic", "submit", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic resubmit: {resubmitted}");
+    assert_eq!(resubmitted["result"]["controller"]["generation"], json!(2));
+
+    let driven = wait_for(&env, &["epic", "status", "--epic", "epic-one"], |value| {
+        value["result"]["finalPr"]["number"] == json!(8)
+    });
+    assert_eq!(
+        driven["result"]["finalPr"]["number"],
+        json!(8),
+        "child PR #7 is merged and one epic PR #8 remains: {driven}"
+    );
+    assert_eq!(driven["result"]["finalPr"]["isDraft"], json!(true));
+
+    let (code, status) = env.forged(&["epic", "status", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic status: {status}");
+    assert_eq!(status["result"]["finalPr"]["number"], json!(8));
+    assert_eq!(status["result"]["waves"].as_array().map(Vec::len), Some(1));
+    assert_eq!(
+        status["result"]["children"][0]["beadsStatus"],
+        json!("closed")
+    );
+    assert!(status["result"]["children"][0]["merged"].is_object());
+    assert!(status["result"]["inputRequired"].is_null());
+
+    let (code, overview) = env.forged(&["overview", "--epic", "epic-one"]);
+    assert_eq!(code, 0, "epic overview: {overview}");
+    assert_eq!(overview["result"]["schema"], json!("forged.overview/1"));
+    assert_eq!(overview["result"]["kind"], json!("epic"));
+    assert_eq!(
+        overview["result"]["childRuns"].as_array().map(Vec::len),
+        Some(1)
+    );
+    assert!(!overview["result"]["gates"].as_array().unwrap().is_empty());
+    assert!(overview["result"]["cursor"].as_i64().is_some());
+
+    let gh = env.gh_calls();
+    assert!(gh.iter().any(|args| args.starts_with(&[
+        "pr".to_owned(),
+        "ready".to_owned(),
+        "7".to_owned()
+    ])));
+    assert!(gh.iter().any(|args| args.starts_with(&[
+        "pr".to_owned(),
+        "merge".to_owned(),
+        "7".to_owned()
+    ])));
+    assert!(!gh
+        .iter()
+        .any(|args| { args.starts_with(&["pr".to_owned(), "merge".to_owned(), "8".to_owned(),]) }));
+    let creates = gh
+        .iter()
+        .filter(|args| args.iter().any(|arg| arg.contains("/pulls")))
+        .count();
+    assert_eq!(creates, 2, "one child PR plus one epic PR: {gh:?}");
+}
+
+#[test]
+fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
+    let env = TestEnv::new("forged-session-boundary");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-session",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    let (code, queued) = env.forged(&[
+        "session",
+        "message",
+        "--run",
+        "bead-session",
+        "--message",
+        "Keep the public API source compatible.",
+        "--requested-by",
+        "lead-agent",
+    ]);
+    assert_eq!(code, 0, "queue: {queued}");
+    assert_eq!(queued["result"]["delivery"], json!("queued"));
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-session"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    let prompt = std::fs::read_to_string(
+        env.packet_dir("bead-session", "implementation", 0)
+            .join("prompt.md"),
+    )
+    .expect("implementation prompt");
+    assert!(
+        prompt.contains("lead-agent"),
+        "intervention identity: {prompt}"
+    );
+    assert!(
+        prompt.contains("Keep the public API source compatible."),
+        "intervention text: {prompt}"
+    );
+
+    let (code, listed) = env.forged(&["session", "list", "--run", "bead-session"]);
+    assert_eq!(code, 0, "session list: {listed}");
+    assert_eq!(listed["result"]["pendingInterventions"], json!(0));
+    let sessions = listed["result"]["sessions"]
+        .as_array()
+        .expect("sessions array");
+    assert!(!sessions.is_empty(), "durable session rows: {listed}");
+    assert!(sessions.iter().all(|session| session["host"] == "process"));
+    assert!(sessions
+        .iter()
+        .all(|session| session["attachHint"].is_null()));
+
+    let (_, events) = env.forged(&["events", "--run", "bead-session", "--limit", "1000"]);
+    let kinds: Vec<&str> = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect();
+    for kind in [
+        "forged.intervention.queued",
+        "forged.intervention.delivered",
+        "forged.host.fallback",
+        "forged.session.started",
+    ] {
+        assert!(kinds.contains(&kind), "{kind} is durable: {kinds:?}");
+    }
+}
+
+#[test]
+fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
+    let env = TestEnv::new("forged-session-ownership");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    for bead in ["bead-message-target", "bead-message-owner"] {
+        let (code, started) = env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            bead,
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+            "--profile",
+            "lean",
+        ]);
+        assert_eq!(code, 0, "start {bead}: {started}");
+    }
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-message-owner"]);
+    assert_eq!(code, 0, "owner drive: {driven}");
+    let owner_attempt = env
+        .ledger()
+        .get_attempt(1)
+        .expect("owner implementation attempt");
+    assert!(
+        owner_attempt.packet_id.starts_with("bead-message-owner/"),
+        "attempt fixture belongs to the owner run"
+    );
+
+    let (code, refused) = env.forged(&[
+        "session",
+        "message",
+        "--run",
+        "bead-message-target",
+        "--attempt",
+        &owner_attempt.attempt_id.to_string(),
+        "--message",
+        "must not cross the run boundary",
+    ]);
+    assert_ne!(code, 0, "cross-run target must be refused: {refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("does not belong")));
+    let (_, events) = env.forged(&["events", "--run", "bead-message-target", "--limit", "1000"]);
+    assert!(events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .all(|event| event["kind"] != json!("forged.intervention.queued")));
+}
+
+#[test]
+fn concurrent_submit_keys_share_one_controller_generation() {
+    let env = TestEnv::new("forged-submit-singleton");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-submit-singleton",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.set_scenario("implement", "slow", 1);
+
+    let spawn = |key: &str| {
+        env.forged_cmd(&[
+            "run",
+            "submit",
+            "--run",
+            "bead-submit-singleton",
+            "--idempotency-key",
+            key,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("submitter spawns")
+    };
+    let first = spawn("submit-race-a");
+    let second = spawn("submit-race-b");
+    let outputs = [
+        first.wait_with_output().expect("first submit exits"),
+        second.wait_with_output().expect("second submit exits"),
+    ];
+    let responses = outputs
+        .iter()
+        .map(|output| {
+            assert!(output.status.success(), "submit output: {output:?}");
+            serde_json::from_slice::<Value>(&output.stdout).expect("submit response")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response["result"]["submitted"] == json!(true))
+            .count(),
+        1,
+        "one request spawns: {responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response["result"]["alreadyRunning"] == json!(true))
+            .count(),
+        1,
+        "the other request adopts: {responses:?}"
+    );
+
+    let status = wait_for(
+        &env,
+        &["run", "status", "--run", "bead-submit-singleton"],
+        |value| value["result"]["run"]["nextAction"]["stop"]["done"].is_object(),
+    );
+    assert_eq!(
+        status["result"]["run"]["controller"]["generation"],
+        json!(1)
+    );
+    let (_, events) = env.forged(&[
+        "events",
+        "--run",
+        "bead-submit-singleton",
+        "--limit",
+        "1000",
+    ]);
+    let controller_starts = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.controller.started"))
+        .count();
+    assert_eq!(controller_starts, 1, "one durable controller identity");
+}
+
+#[test]
+fn resolving_an_unclean_child_starts_a_fresh_generation() {
+    let env = TestEnv::new("forged-epic-child-retry");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-retry", &[("child-retry", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-retry",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    env.set_scenario("implement", "no-block", 1);
+    let (code, stopped) = env.forged(&["epic", "drive", "--epic", "epic-retry"]);
+    assert_eq!(code, 0, "first drive reaches input: {stopped}");
+    assert_eq!(
+        stopped["result"]["stopped"]["code"],
+        json!("child-not-clean"),
+        "unexpected first-generation stop: {stopped}"
+    );
+
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-retry",
+        "--child",
+        "child-retry",
+        "--note",
+        "spec corrected; execute a fresh slice",
+    ]);
+    assert_eq!(code, 0, "resolve: {resolved}");
+    env.set_scenario("reviewclaude", "approve", 1);
+    let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-retry"]);
+    assert_eq!(code, 0, "second generation drive: {driven}");
+    assert!(
+        driven["result"]["stopped"]["finalPr"].is_object(),
+        "second generation reaches the epic PR: {driven}"
+    );
+    let (_, status) = env.forged(&["epic", "status", "--epic", "epic-retry"]);
+    assert_eq!(
+        status["result"]["children"][0]["runId"],
+        json!("child-retry-g2")
+    );
+    assert_eq!(status["result"]["children"][0]["generation"], json!(2));
+    assert!(status["result"]["children"][0]["merged"].is_object());
+    assert!(status["result"]["inputRequired"].is_null());
+}
+
+#[test]
+fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
+    let env = TestEnv::new("forged-epic-control-cycles");
+    env.seed_epic("epic-controls", &[("child-controls", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-controls",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    let mut ids = Vec::new();
+    for (command, reason) in [
+        ("pause", "first checkpoint"),
+        ("resume", "first continuation"),
+        ("pause", "second checkpoint"),
+        ("resume", "second continuation"),
+    ] {
+        let (code, response) = env.forged(&[
+            "epic",
+            command,
+            "--epic",
+            "epic-controls",
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code, 0, "{command}: {response}");
+        ids.push(response["operationId"].as_str().unwrap().to_owned());
+    }
+    assert_ne!(ids[0], ids[2], "pause epochs differ");
+    assert_ne!(ids[1], ids[3], "resume epochs differ");
+    let (_, events) = env.forged(&["events", "--run", "epic-controls", "--limit", "1000"]);
+    let kinds = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "forged.epic.paused")
+            .count(),
+        2
+    );
+    assert_eq!(
+        kinds
+            .iter()
+            .filter(|kind| **kind == "forged.epic.resumed")
+            .count(),
+        2
+    );
+}
+
+#[test]
+fn roster_failover_cycles_get_distinct_revision_keys() {
+    let env = TestEnv::new("forged-roster-cycles");
+    env.forged(&["init"]);
+    env.add_uniform_roster("outage", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-roster-cycles",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    for (expected, roster, reason) in [
+        (2, "outage", "anthropic unavailable"),
+        (3, "default", "anthropic restored"),
+        (4, "outage", "second anthropic outage"),
+    ] {
+        let (code, revised) = env.forged(&[
+            "run",
+            "revise-roster",
+            "--run",
+            "bead-roster-cycles",
+            "--roster",
+            roster,
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code, 0, "revise to {roster}: {revised}");
+        assert_eq!(revised["result"]["revision"], json!(expected));
+    }
+}
 
 #[test]
 fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
@@ -32,12 +568,41 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert_eq!(started["result"]["run_id"], json!("bead-e2e"));
     assert_eq!(started["result"]["branch"], json!("forged/bead-e2e"));
 
-    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-e2e"]);
-    assert_eq!(code, 0, "run drive: {driven}");
+    env.set_scenario("implement", "slow", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "bead-e2e"]);
+    assert_eq!(code, 0, "run submit: {submitted}");
+    assert_eq!(submitted["result"]["submitted"], json!(true));
+    assert_eq!(submitted["result"]["controller"]["host"], json!("process"));
+    let (code, duplicate) = env.forged(&["run", "submit", "--run", "bead-e2e"]);
+    assert_eq!(code, 0, "duplicate submit: {duplicate}");
+    assert_eq!(duplicate["reused"], json!(true));
+    assert_eq!(duplicate["result"]["submitted"], json!(true));
+    assert_eq!(duplicate["result"]["alreadyRunning"], json!(false));
     assert_eq!(
-        driven["result"]["terminal"]["done"]["finalVerdict"],
+        duplicate["result"]["controller"]["sessionId"],
+        submitted["result"]["controller"]["sessionId"]
+    );
+
+    let driven = wait_for(&env, &["run", "status", "--run", "bead-e2e"], |value| {
+        value["result"]["run"]["nextAction"]["stop"]["done"]["finalVerdict"] == json!("approve")
+    });
+    assert_eq!(
+        driven["result"]["run"]["nextAction"]["stop"]["done"]["finalVerdict"],
         json!("approve"),
         "drive must stop Done(approve): {driven}"
+    );
+    let stopped = wait_for(&env, &["run", "status", "--run", "bead-e2e"], |value| {
+        value["result"]["run"]["controller"]["state"] == json!("exited")
+    });
+    assert_eq!(stopped["result"]["run"]["controller"]["exitCode"], json!(0));
+    let (code, terminal_submit) = env.forged(&["run", "submit", "--run", "bead-e2e"]);
+    assert_eq!(code, 0, "terminal submit is a no-op: {terminal_submit}");
+    assert_eq!(terminal_submit["result"]["submitted"], json!(false));
+    assert!(terminal_submit["result"]["stopped"]["terminal"].is_object());
+    assert_eq!(
+        terminal_submit["result"]["controller"]["generation"],
+        json!(1),
+        "a completed run never starts a second controller"
     );
 
     // Exactly one draft PR creation; zero merge or ready-for-review calls.
@@ -80,12 +645,12 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     // overlapped.
     let plog = env.provider_log();
     for packet in [
-        "bead-e2e/implement/1",
-        "bead-e2e/reviewclaude/1",
-        "bead-e2e/reviewcodex/1",
-        "bead-e2e/fix/1",
-        "bead-e2e/reviewclaude/2",
-        "bead-e2e/reviewcodex/2",
+        "bead-e2e/implementation/0",
+        "bead-e2e/review-1/0",
+        "bead-e2e/review-2/0",
+        "bead-e2e/remediation/0",
+        "bead-e2e/review-1/1",
+        "bead-e2e/review-2/1",
     ] {
         assert!(
             plog.iter().any(|l| l.starts_with(packet)),
@@ -187,7 +752,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     );
 
     // packet show returns the stored packet body and its attempts.
-    let (code, shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/implement/1"]);
+    let (code, shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/implementation/0"]);
     assert_eq!(code, 0);
     assert_eq!(
         shown["result"]["packet"]["schema"],
@@ -204,7 +769,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         json!("claude"),
         "implement routed to the claude driver"
     );
-    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/reviewcodex/1"]);
+    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/review-2/0"]);
     assert_eq!(
         codex_shown["result"]["packet"]["providerHints"]["provider"],
         json!("codex"),
@@ -225,6 +790,470 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert_eq!(code, 0, "worktree retire: {retired}");
     assert_eq!(retired["result"]["retired"], json!(true));
     assert!(!env.worktree("bead-e2e").exists());
+}
+
+#[test]
+fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_family() {
+    // Lean proves inexpensive work uses one reviewer and no fix/synthesis.
+    let lean = TestEnv::new("forged-profile-lean");
+    lean.forged(&["init"]);
+    lean.add_uniform_roster("all-claude", "claude", "opus");
+    let repo = lean.repos.repo.to_string_lossy().into_owned();
+    let spec = lean.spec.to_string_lossy().into_owned();
+    let (code, started) = lean.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-lean",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+        "--roster",
+        "all-claude",
+    ]);
+    assert_eq!(code, 0, "lean start: {started}");
+    let (code, driven) = lean.forged(&["run", "drive", "--run", "bead-lean"]);
+    assert_eq!(code, 0, "lean drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["done"]["finalVerdict"],
+        json!("requestChanges")
+    );
+    let log = lean.provider_log();
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-lean/review-1/0")));
+    assert!(!log.iter().any(|line| line.contains("/review-2/")));
+    assert!(!log.iter().any(|line| line.contains("/remediation/")));
+    assert!(!log.iter().any(|line| line.contains("/synthesis/")));
+    let ledger = lean.ledger();
+    for attempt_id in 1..=8 {
+        let Ok(attempt) = ledger.get_attempt(attempt_id) else {
+            continue;
+        };
+        assert!(attempt.claimant.starts_with("claude:"));
+    }
+    ledger.close().expect("close lean ledger");
+
+    // A run freezes topology, then an explicit revision replaces only its
+    // provider roster. The subsequent full run is driven entirely by Codex.
+    let switched = TestEnv::new("forged-roster-switch");
+    switched.forged(&["init"]);
+    switched.add_uniform_roster("all-codex", "codex", "gpt-5.6-sol");
+    let repo = switched.repos.repo.to_string_lossy().into_owned();
+    let spec = switched.spec.to_string_lossy().into_owned();
+    let (code, started) = switched.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-switch",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "switch start: {started}");
+    let original = started["result"]["roster_sha256"].clone();
+    let (code, revised) = switched.forged(&[
+        "run",
+        "revise-roster",
+        "--run",
+        "bead-switch",
+        "--roster",
+        "all-codex",
+        "--reason",
+        "Anthropic harness unavailable",
+    ]);
+    assert_eq!(code, 0, "roster revision: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+    assert_ne!(revised["result"]["roster_sha256"], original);
+    let (code, status) = switched.forged(&["run", "status", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "status after revision: {status}");
+    assert_eq!(
+        status["result"]["run"]["definition"]["activeRosterRef"]["name"],
+        json!("all-codex")
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["rosterRevision"],
+        json!(2)
+    );
+    let (code, overview) = switched.forged(&["overview", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "overview after revision: {overview}");
+    let revisions = overview["result"]["rosterRevisions"]
+        .as_array()
+        .expect("roster revision history");
+    assert_eq!(revisions.len(), 2, "initial plus explicit revision");
+    assert_eq!(revisions[1]["revision"], json!(2));
+    assert_eq!(revisions[1]["rosterRef"]["name"], json!("all-codex"));
+    let (code, driven) = switched.forged(&["run", "drive", "--run", "bead-switch"]);
+    assert_eq!(code, 0, "drive after roster revision: {driven}");
+    let ledger = switched.ledger();
+    for attempt_id in 1..=32 {
+        let Ok(attempt) = ledger.get_attempt(attempt_id) else {
+            continue;
+        };
+        assert!(
+            attempt.claimant.starts_with("codex:"),
+            "all-codex roster selected for {}: {}",
+            attempt.packet_id,
+            attempt.claimant
+        );
+    }
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
+    let env = TestEnv::new("forged-roster-fallback");
+    env.forged(&["init"]);
+    env.add_implementation_fallback_roster("fallback");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-fallback",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+        "--roster",
+        "fallback",
+    ]);
+    assert_eq!(code, 0, "fallback start: {started}");
+    // Resolve, open, and execute candidate 1. Advance the durable retry
+    // clock in the test database instead of sleeping through the production
+    // 30-second backoff; the next projection still reads the real event.
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-fallback"]);
+        assert_eq!(code, 0, "fallback advance: {advanced}");
+    }
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
+            ["bead-fallback"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retry event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+    drop(connection);
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-fallback"]);
+    assert_eq!(code, 0, "fallback drive: {driven}");
+
+    let ledger = env.ledger();
+    let first = ledger.get_attempt(1).expect("first implementation attempt");
+    let second = ledger
+        .get_attempt(2)
+        .expect("fallback implementation attempt");
+    assert!(first.claimant.starts_with("uninstalled:"), "{first:?}");
+    assert!(second.claimant.starts_with("claude:"), "{second:?}");
+    assert_eq!(first.state, forged_ledger::AttemptState::Failed);
+    assert_eq!(second.state, forged_ledger::AttemptState::Completed);
+    let completed_implementation = [first, second]
+        .iter()
+        .filter(|attempt| attempt.state == forged_ledger::AttemptState::Completed)
+        .count();
+    assert_eq!(
+        completed_implementation, 1,
+        "exactly one implementation landed"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
+    let env = TestEnv::new("forged-roster-revision-fallback");
+    env.forged(&["init"]);
+    env.add_uniform_roster("revised-order", "claude", "opus");
+    env.append_implementation_candidate("revised-order", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-revision-fallback",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.set_scenario("implement", "rate-limit", 1);
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-revision-fallback"]);
+        assert_eq!(code, 0, "advance to retry boundary: {advanced}");
+    }
+    let first = env.ledger().get_attempt(1).expect("old roster attempt");
+    assert_eq!(first.state, forged_ledger::AttemptState::Failed);
+    assert!(first.claimant.starts_with("claude:"), "{first:?}");
+
+    let (code, revised) = env.forged(&[
+        "run",
+        "revise-roster",
+        "--run",
+        "bead-revision-fallback",
+        "--roster",
+        "revised-order",
+        "--reason",
+        "switch after transport failure",
+    ]);
+    assert_eq!(code, 0, "revise: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
+            ["bead-revision-fallback"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retry event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+    drop(connection);
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-revision-fallback"]);
+    assert_eq!(code, 0, "drive revised roster: {driven}");
+    let ledger = env.ledger();
+    let first_revised = ledger.get_attempt(2).expect("first revised attempt");
+    assert!(
+        first_revised.claimant.starts_with("claude:"),
+        "the revised roster starts at candidate zero: {first_revised:?}"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
+    let env = TestEnv::new("forged-profile-high");
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-high",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "high",
+    ]);
+    assert_eq!(code, 0, "high start: {started}");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-high"]);
+    assert_eq!(code, 0, "high drive: {driven}");
+    let log = env.provider_log();
+    for seat in ["review-1", "review-2", "review-3", "synthesis"] {
+        assert!(
+            log.iter()
+                .any(|line| line.starts_with(&format!("bead-high/{seat}/0"))),
+            "{seat} ran: {log:?}"
+        );
+    }
+}
+
+#[test]
+fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
+    // Gate failure raises lean to its stored standard edge and survives
+    // repeated projection/drive without duplicating the transition.
+    let gate = TestEnv::new("forged-escalate-gate");
+    gate.forged(&["init"]);
+    let config_path = gate.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("gate config"))
+            .expect("gate config json");
+    config["gate_commands"] = json!(["false"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("gate config json"),
+    )
+    .expect("write failing gate");
+    let repo = gate.repos.repo.to_string_lossy().into_owned();
+    let spec = gate.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        gate.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-gate-edge",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+            "--profile",
+            "lean",
+        ])
+        .0,
+        0
+    );
+    assert_eq!(
+        gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
+        0
+    );
+    assert_eq!(
+        gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
+        0
+    );
+    let (_, events) = gate.forged(&["events", "--run", "bead-gate-edge"]);
+    let escalations: Vec<_> = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.profile.escalated"))
+        .collect();
+    assert_eq!(escalations.len(), 1, "one durable gate escalation");
+    assert_eq!(escalations[0]["payload"]["from"], json!("lean"));
+    assert_eq!(escalations[0]["payload"]["to"], json!("standard"));
+    assert_eq!(escalations[0]["payload"]["trigger"], json!("gateFailure"));
+
+    // Conflicting standard reviewers raise to high and materialize only its
+    // added review/synthesis seats.
+    let conflict = TestEnv::new("forged-escalate-conflict");
+    conflict.forged(&["init"]);
+    let repo = conflict.repos.repo.to_string_lossy().into_owned();
+    let spec = conflict.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        conflict
+            .forged(&[
+                "run",
+                "start",
+                "--bead",
+                "bead-conflict-edge",
+                "--repo",
+                &repo,
+                "--spec",
+                &spec,
+                "--base-ref",
+                "main",
+            ])
+            .0,
+        0
+    );
+    conflict.set_scenario("reviewclaude", "approve", 1);
+    assert_eq!(
+        conflict
+            .forged(&["run", "drive", "--run", "bead-conflict-edge"])
+            .0,
+        0
+    );
+    let (_, status) = conflict.forged(&["run", "status", "--run", "bead-conflict-edge"]);
+    assert_eq!(
+        status["result"]["run"]["execution"]["activeProfileRef"]["name"],
+        json!("high")
+    );
+    assert_eq!(
+        status["result"]["run"]["execution"]["profileHistory"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+    let log = conflict.provider_log();
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-conflict-edge/review-3/0")));
+    assert!(log
+        .iter()
+        .any(|line| line.starts_with("bead-conflict-edge/synthesis/0")));
+}
+
+#[test]
+fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
+    let env = TestEnv::new("forged-frozen-roster");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-frozen",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
+    assert_eq!(started["result"]["roster_ref"]["name"], json!("default"));
+    let original_digest = started["result"]["package_sha256"]
+        .as_str()
+        .expect("package digest")
+        .to_owned();
+
+    // Make the live authoring roster unusable. A projection that consulted
+    // config again would fail before the implement packet could run.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config json");
+    config["roster"]["implement"]["provider"] = json!("unavailable-provider");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("rewrite config");
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-frozen"]);
+    assert_eq!(code, 0, "drive must use the stored roster: {driven}");
+    assert!(driven["result"]["terminal"]["done"].is_object());
+
+    let (code, status) = env.forged(&["run", "status", "--run", "bead-frozen"]);
+    assert_eq!(code, 0, "status: {status}");
+    assert_eq!(
+        status["result"]["run"]["definition"]["packageSha256"],
+        json!(original_digest)
+    );
+    assert_eq!(
+        status["result"]["run"]["definition"]["rosterRevision"],
+        json!(1)
+    );
 }
 
 #[test]
@@ -274,10 +1303,10 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
         "a semantic failure grants no transport retry"
     );
     let plog = env.provider_log();
-    assert_no_overlap(&plog, "bead-sem/implement/1");
+    assert_no_overlap(&plog, "bead-sem/implementation/0");
     let starts = plog
         .iter()
-        .filter(|l| l.starts_with("bead-sem/implement/1") && l.contains(" start "))
+        .filter(|l| l.starts_with("bead-sem/implementation/0") && l.contains(" start "))
         .count();
     assert_eq!(starts, 2, "one failed and one successful attempt: {plog:?}");
 }
@@ -358,7 +1387,7 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     // Occupy the pid path with a DIRECTORY: the spawned shell's
     // `echo $$ > provider.pid` fails, the provider still runs, and the file
     // never appears — deterministically, with no race against the shim.
-    let packet_dir = env.packet_dir("bead-nopid", "implement", 1);
+    let packet_dir = env.packet_dir("bead-nopid", "implementation", 0);
     std::fs::create_dir_all(packet_dir.join("provider.pid")).expect("occupy the pid path");
     // A provider that would otherwise outlive the window, so the kill is
     // observable rather than a no-op on an already-exited shim.
@@ -399,12 +1428,12 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
     let plog = env.provider_log();
     let start = plog
         .iter()
-        .find(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" start "))
+        .find(|l| l.starts_with("bead-nopid/implementation/0") && l.contains(" start "))
         .expect("the provider did start");
     assert!(
         !plog
             .iter()
-            .any(|l| l.starts_with("bead-nopid/implement/1") && l.contains(" end ")),
+            .any(|l| l.starts_with("bead-nopid/implementation/0") && l.contains(" end ")),
         "the hung provider was killed, so it never wrote its end line: {plog:?}"
     );
     let pid: i32 = start

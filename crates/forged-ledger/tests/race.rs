@@ -76,7 +76,7 @@ fn eight_independent_ledgers_race_one_claim() {
 }
 
 /// 8 threads calling `Ledger::open` on the same fresh temp path all return
-/// Ok and `user_version` ends at 1.
+/// Ok and `user_version` ends at the latest embedded migration.
 #[test]
 fn eight_concurrent_opens_migrate_once() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -97,7 +97,7 @@ fn eight_concurrent_opens_migrate_once() {
         ledgers.push(handle.join().expect("open thread").expect("open succeeds"));
     }
     for ledger in &ledgers {
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 1);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
     }
     for ledger in ledgers {
         ledger.close().expect("close");

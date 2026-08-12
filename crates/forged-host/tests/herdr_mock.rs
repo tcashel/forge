@@ -6,7 +6,7 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forged_host::{Confirmed, HerdrHost, HostError, Liveness, SessionHost};
+use forged_host::{Confirmed, HerdrControl, HerdrHost, HostError, Liveness, SessionHost};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -133,6 +133,57 @@ fn shell_ready(pane_id: &str) -> Value {
 
 fn pane_created(pane_id: &str) -> Value {
     json!({"event": "pane_created", "data": {"pane_id": pane_id, "workspace_id": "ws-1"}})
+}
+
+#[tokio::test]
+async fn controller_reads_and_messages_a_durable_pane_id() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(19))],
+        "pane.read" => vec![Action::Respond(json!({
+            "type": "pane_read",
+            "read": {
+                "pane_id": "w1:p7",
+                "workspace_id": "w1",
+                "tab_id": "t1",
+                "source": "recent_unwrapped",
+                "format": "text",
+                "text": "working on the gate",
+                "revision": 42,
+                "truncated": false
+            }
+        }))],
+        "pane.send_input" => vec![Action::Respond(json!({"type": "ok"}))],
+        other => panic!("unexpected request {other}"),
+    });
+    let control = HerdrControl::connect(&mock.socket_path)
+        .await
+        .expect("control connection");
+    let snapshot = control.read_pane("w1:p7", 120).await.expect("read");
+    assert_eq!(snapshot.pane_id, "w1:p7");
+    assert_eq!(snapshot.text, "working on the gate");
+    assert_eq!(snapshot.revision, 42);
+    control
+        .send_message("w1:p7", "Please checkpoint before changing the API")
+        .await
+        .expect("message");
+    assert_eq!(
+        mock.params_of("pane.read"),
+        json!({
+            "pane_id": "w1:p7",
+            "source": "recent_unwrapped",
+            "lines": 120,
+            "format": "text",
+            "strip_ansi": true
+        })
+    );
+    assert_eq!(
+        mock.params_of("pane.send_input"),
+        json!({
+            "pane_id": "w1:p7",
+            "text": "Please checkpoint before changing the API",
+            "keys": ["Enter"]
+        })
+    );
 }
 
 const PANE_NOT_FOUND: Action = Action::RespondErr {

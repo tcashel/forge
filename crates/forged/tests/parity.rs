@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the eleven core functions, the CLI path and the MCP tool path produce
+//! the twenty-seven public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,31 +33,70 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_eleven_tools_match_their_cli_counterparts() {
+fn all_twenty_seven_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
 
-    // The server declares exactly the eleven tools of section (b).
+    // The server declares exactly the public operation tools.
     let mut tools = mcp.list_tools();
     tools.sort();
     let mut expected = vec![
         "claim_next",
         "doctor",
+        "definition_validate",
         "events_tail",
+        "overview",
+        "epic_advance",
+        "epic_drive",
+        "epic_pause",
+        "epic_resolve",
+        "epic_resume",
+        "epic_start",
+        "epic_status",
+        "epic_submit",
         "packet_claim",
         "packet_complete",
         "packet_fail",
         "reconcile",
         "run_advance",
+        "run_revise_roster",
         "run_start",
         "run_status",
+        "run_submit",
+        "session_list",
+        "session_message",
+        "session_read",
+        "session_stop",
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the eleven tools, exactly");
+    assert_eq!(tools, expected, "the twenty-seven tools, exactly");
+
+    let overview_tool = mcp.tool("overview");
+    assert_eq!(
+        overview_tool.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/overview.html"))
+    );
+    assert_eq!(
+        mcp.list_resources(),
+        vec!["ui://forged/overview.html".to_owned()]
+    );
+    let app = mcp.read_resource("ui://forged/overview.html");
+    assert_eq!(
+        app.pointer("/contents/0/mimeType"),
+        Some(&json!("text/html;profile=mcp-app"))
+    );
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Control Plane")));
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
+
+    let cli = env.forged(&["definition", "validate"]).1;
+    let tool = mcp.call_tool("definition_validate", envelope(json!({})));
+    assert_eq!(cli, tool, "definition_validate parity");
 
     // run_start: an invalid (relative) repo path refuses identically.
     let cli = env
@@ -71,7 +110,7 @@ fn all_eleven_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "run_start parity");
 
-    // run_advance / run_status: a nonexistent run refuses identically.
+    // run_advance / run_submit / run_status: a nonexistent run refuses identically.
     let cli = env.forged(&["run", "advance", "--run", "absent"]).1;
     let tool = mcp.call_tool(
         "run_advance",
@@ -79,12 +118,146 @@ fn all_eleven_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "run_advance parity");
 
+    let cli = env.forged(&["run", "submit", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "run_submit",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "run_submit parity");
+
     let cli = env.forged(&["run", "status", "--run", "absent"]).1;
     let tool = mcp.call_tool(
         "run_status",
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
+
+    let cli = env.forged(&["overview", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "overview",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "overview parity");
+    let structured = mcp.call_tool_result(
+        "overview",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert!(structured["structuredContent"].is_object());
+    assert_eq!(structured["structuredContent"]["ok"], json!(false));
+
+    // run_revise_roster: a nonexistent run refuses identically.
+    let cli = env
+        .forged(&[
+            "run",
+            "revise-roster",
+            "--run",
+            "absent",
+            "--roster",
+            "default",
+            "--reason",
+            "provider access changed",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "run_revise_roster",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {
+                "run": "absent",
+                "roster": "default",
+                "reason": "provider access changed"
+            }
+        }),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "run_revise_roster parity"
+    );
+
+    // Epic lifecycle and control refusals have identical envelopes.
+    let cli = env
+        .forged(&[
+            "epic",
+            "start",
+            "--epic",
+            "absent-epic",
+            "--repo",
+            "relative",
+            "--spec",
+            "relative",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "epic_start",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent-epic",
+            "params": {
+                "epic": "absent-epic", "repo": "relative", "spec": "relative",
+                "baseRef": null, "profile": null, "roster": null
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "epic_start parity");
+
+    for (subcommand, tool_name) in [
+        ("advance", "epic_advance"),
+        ("drive", "epic_drive"),
+        ("submit", "epic_submit"),
+        ("status", "epic_status"),
+    ] {
+        let cli = env.forged(&["epic", subcommand, "--epic", "absent-epic"]).1;
+        let tool = mcp.call_tool(
+            tool_name,
+            json!({
+                "schemaVersion": 1, "runId": "absent-epic",
+                "params": {"epic": "absent-epic"}
+            }),
+        );
+        assert_eq!(normalized(cli), normalized(tool), "{tool_name} parity");
+    }
+    for (subcommand, tool_name) in [("pause", "epic_pause"), ("resume", "epic_resume")] {
+        let cli = env
+            .forged(&[
+                "epic",
+                subcommand,
+                "--epic",
+                "absent-epic",
+                "--reason",
+                "operator test",
+            ])
+            .1;
+        let tool = mcp.call_tool(
+            tool_name,
+            json!({
+                "schemaVersion": 1, "runId": "absent-epic",
+                "params": {"epic": "absent-epic", "reason": "operator test"}
+            }),
+        );
+        assert_eq!(normalized(cli), normalized(tool), "{tool_name} parity");
+    }
+    let cli = env
+        .forged(&[
+            "epic",
+            "resolve",
+            "--epic",
+            "absent-epic",
+            "--child",
+            "child-a",
+            "--note",
+            "resolved",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "epic_resolve",
+        json!({
+            "schemaVersion": 1, "runId": "absent-epic",
+            "params": {"epic": "absent-epic", "child": "child-a", "note": "resolved"}
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "epic_resolve parity");
 
     // packet_claim: an absent packet refuses identically.
     let cli = env
@@ -164,6 +337,63 @@ fn all_eleven_tools_match_their_cli_counterparts() {
         })),
     );
     assert_eq!(normalized(cli), normalized(tool), "packet_fail parity");
+
+    // Session controls: missing durable state refuses identically.
+    let cli = env.forged(&["session", "list", "--run", "absent"]).1;
+    let tool = mcp.call_tool(
+        "session_list",
+        json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_list parity");
+
+    let cli = env.forged(&["session", "read", "--attempt", "1"]).1;
+    let tool = mcp.call_tool(
+        "session_read",
+        envelope(json!({"attempt": 1, "lines": 120})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_read parity");
+
+    let cli = env
+        .forged(&[
+            "session",
+            "message",
+            "--run",
+            "absent",
+            "--message",
+            "checkpoint",
+            "--idempotency-key",
+            "op:session_message:par-cli",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_message",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": "op:session_message:par-mcp",
+            "runId": "absent",
+            "params": {
+                "run": "absent", "attempt": null, "message": "checkpoint",
+                "requestedBy": "operator"
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_message parity");
+
+    let cli = env
+        .forged(&[
+            "session",
+            "stop",
+            "--attempt",
+            "1",
+            "--reason",
+            "operator requested",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_stop",
+        envelope(json!({"attempt": 1, "reason": "operator requested"})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "session_stop parity");
 
     // claim_next: the missing-key refusal is identical; the real call (an
     // empty frontier) is identical too, under distinct explicit keys.

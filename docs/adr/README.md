@@ -46,6 +46,7 @@ Each ADR is **self-contained**. Read individual files on demand — **do not loa
 | 0030 | [Strategy reset: surfaces commoditized — pause Track B, keep Track A](./0030-strategy-reset-surfaces-commoditized.md) | Superseded by 0032 |
 | 0031 | [Review publishing is at-least-once with persisted per-finding state](./0031-review-publish-at-least-once-persisted-state.md) | Accepted |
 | 0032 | [forged: a provider-neutral Rust orchestrator supersedes both product lines](./0032-forged-provider-neutral-rust-orchestrator.md) | Accepted |
+| 0033 | [Execution packages separate planning, orchestration, and provider cognition](./0033-execution-package-ownership-boundary.md) | Accepted |
 
 ## Foundational ADRs
 

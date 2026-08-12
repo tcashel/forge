@@ -22,17 +22,34 @@ pub enum Command {
     Doctor(KeyOnly),
     /// Create <anvil_home>/runs, the default config, and the ledger schema.
     Init(KeyOnly),
+    /// Execution-definition operations.
+    Definition {
+        #[command(subcommand)]
+        command: DefinitionCmd,
+    },
     /// Run lifecycle.
     Run {
         /// The run subcommand.
         #[command(subcommand)]
         command: RunCmd,
     },
+    /// Durable epic/wave scheduling over Beads readiness.
+    Epic {
+        /// The epic subcommand.
+        #[command(subcommand)]
+        command: EpicCmd,
+    },
     /// Packet lifecycle.
     Packet {
         /// The packet subcommand.
         #[command(subcommand)]
         command: PacketCmd,
+    },
+    /// Provider-session observation and intervention.
+    Session {
+        /// The session subcommand.
+        #[command(subcommand)]
+        command: SessionCmd,
     },
     /// Resume a ledger run or claim the next ready bead (explicit
     /// idempotency key required).
@@ -49,6 +66,8 @@ pub enum Command {
     Usage(UsageArgs),
     /// List ledger events, paged (read-only).
     Events(EventsArgs),
+    /// Reconnect projection for one slice or epic (read-only).
+    Overview(OverviewArgs),
     /// Worktree lifecycle.
     Worktree {
         /// The worktree subcommand.
@@ -76,8 +95,139 @@ pub enum RunCmd {
     Advance(RunScoped),
     /// Loop advance until the run stops.
     Drive(RunScoped),
+    /// Hand the run to a detached durable controller.
+    Submit(RunScoped),
     /// Project the run's current state (read-only).
     Status(RunScoped),
+    /// Append an explicit roster revision at a durable boundary.
+    ReviseRoster(RunReviseRosterArgs),
+}
+
+/// `epic` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum EpicCmd {
+    /// Freeze an epic inventory and execution defaults.
+    Start(EpicStartArgs),
+    /// Perform one durable scheduler action.
+    Advance(EpicScoped),
+    /// Drive until the final draft PR or explicit input is required.
+    Drive(EpicScoped),
+    /// Hand the epic to a detached durable controller.
+    Submit(EpicScoped),
+    /// Project waves, children, blockers, and the final PR (read-only).
+    Status(EpicScoped),
+    /// Pause scheduling after the current durable boundary.
+    Pause(EpicReasonArgs),
+    /// Resume a paused epic.
+    Resume(EpicReasonArgs),
+    /// Resolve a held child after its spec/input was adjudicated.
+    Resolve(EpicResolveArgs),
+}
+
+/// `epic start` flags.
+#[derive(Debug, Args)]
+pub struct EpicStartArgs {
+    /// Beads epic id whose inventory/readiness is authoritative.
+    #[arg(long)]
+    pub epic: String,
+    /// Absolute target checkout path.
+    #[arg(long)]
+    pub repo: String,
+    /// Locked epic-map path.
+    #[arg(long)]
+    pub spec: String,
+    /// Default-branch target; defaults from origin/HEAD.
+    #[arg(long)]
+    pub base_ref: Option<String>,
+    /// Assurance profile inherited by child slices.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Model roster inherited by child slices.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// A command scoped to one durable epic id.
+#[derive(Debug, Args)]
+pub struct EpicScoped {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Override the derived/read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Pause/resume flags.
+#[derive(Debug, Args)]
+pub struct EpicReasonArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Human-readable audit reason.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Explicit input-required resolution flags.
+#[derive(Debug, Args)]
+pub struct EpicResolveArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Held child whose spec/input is now resolved.
+    #[arg(long)]
+    pub child: String,
+    /// Resolution note recorded in the epic stream.
+    #[arg(long)]
+    pub note: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `run revise-roster` flags.
+#[derive(Debug, Args)]
+pub struct RunReviseRosterArgs {
+    /// Run id.
+    #[arg(long)]
+    pub run: String,
+    /// Named roster from the once-read config.
+    #[arg(long)]
+    pub roster: String,
+    /// Human-readable reason recorded with the revision.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `definition` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum DefinitionCmd {
+    /// Resolve and validate a profile/roster selection (read-only).
+    Validate(DefinitionValidateArgs),
+}
+
+/// `definition validate` flags.
+#[derive(Debug, Args)]
+pub struct DefinitionValidateArgs {
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `run start` flags.
@@ -95,6 +245,12 @@ pub struct RunStartArgs {
     /// Base ref; defaults to the repo's default branch.
     #[arg(long)]
     pub base_ref: Option<String>,
+    /// Named assurance profile; defaults from config.
+    #[arg(long)]
+    pub profile: Option<String>,
+    /// Named model roster; defaults from config.
+    #[arg(long)]
+    pub roster: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -191,6 +347,67 @@ pub struct PacketTokenArgs {
     pub claim_token: String,
 }
 
+/// `session` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum SessionCmd {
+    /// List durable provider-session metadata for a run.
+    List(RunScoped),
+    /// Read recent output from a Herdr-backed attempt.
+    Read(SessionReadArgs),
+    /// Queue an intervention, delivering live only when capability permits.
+    Message(SessionMessageArgs),
+    /// Revoke and confirmed-stop one attempt.
+    Stop(SessionStopArgs),
+}
+
+/// `session read` flags.
+#[derive(Debug, Args)]
+pub struct SessionReadArgs {
+    /// Attempt id whose durable Herdr pane should be read.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Recent unwrapped terminal lines to return.
+    #[arg(long, default_value_t = 120)]
+    pub lines: u32,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `session message` flags.
+#[derive(Debug, Args)]
+pub struct SessionMessageArgs {
+    /// Run receiving the intervention.
+    #[arg(long)]
+    pub run: String,
+    /// Live attempt to target when interactive delivery is supported.
+    #[arg(long)]
+    pub attempt: Option<i64>,
+    /// Message delivered live or at the next durable provider boundary.
+    #[arg(long)]
+    pub message: String,
+    /// Human or agent identity requesting the intervention.
+    #[arg(long, default_value = "operator")]
+    pub requested_by: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `session stop` flags.
+#[derive(Debug, Args)]
+pub struct SessionStopArgs {
+    /// Attempt id to revoke and stop.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Reason written to the durable revocation marker.
+    #[arg(long)]
+    pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `claim-next` flags.
 #[derive(Debug, Args)]
 pub struct ClaimNextArgs {
@@ -274,6 +491,27 @@ pub struct EventsArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `overview` flags. Exactly one scope is required.
+#[derive(Debug, Args)]
+#[group(required = true, multiple = false, args = ["run", "epic"])]
+pub struct OverviewArgs {
+    /// Project one slice run.
+    #[arg(long)]
+    pub run: Option<String>,
+    /// Project one epic and its child runs.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Return event rows with event_id greater than this.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Maximum event rows in the polling page (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `worktree` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorktreeCmd {
@@ -319,11 +557,26 @@ pub fn command_name(command: &Command) -> &'static str {
     match command {
         Command::Doctor(_) => "doctor",
         Command::Init(_) => "init",
+        Command::Definition { command } => match command {
+            DefinitionCmd::Validate(_) => "definition_validate",
+        },
         Command::Run { command } => match command {
             RunCmd::Start(_) => "run_start",
             RunCmd::Advance(_) => "run_advance",
             RunCmd::Drive(_) => "run_drive",
+            RunCmd::Submit(_) => "run_submit",
             RunCmd::Status(_) => "run_status",
+            RunCmd::ReviseRoster(_) => "run_revise_roster",
+        },
+        Command::Epic { command } => match command {
+            EpicCmd::Start(_) => "epic_start",
+            EpicCmd::Advance(_) => "epic_advance",
+            EpicCmd::Drive(_) => "epic_drive",
+            EpicCmd::Submit(_) => "epic_submit",
+            EpicCmd::Status(_) => "epic_status",
+            EpicCmd::Pause(_) => "epic_pause",
+            EpicCmd::Resume(_) => "epic_resume",
+            EpicCmd::Resolve(_) => "epic_resolve",
         },
         Command::Packet { command } => match command {
             PacketCmd::Show(_) => "packet_show",
@@ -331,6 +584,12 @@ pub fn command_name(command: &Command) -> &'static str {
             PacketCmd::Complete(_) => "packet_complete",
             PacketCmd::Fail(_) => "packet_fail",
             PacketCmd::Heartbeat(_) => "packet_heartbeat",
+        },
+        Command::Session { command } => match command {
+            SessionCmd::List(_) => "session_list",
+            SessionCmd::Read(_) => "session_read",
+            SessionCmd::Message(_) => "session_message",
+            SessionCmd::Stop(_) => "session_stop",
         },
         Command::ClaimNext(_) => "claim_next",
         Command::Gate { command } => match command {
@@ -342,6 +601,7 @@ pub fn command_name(command: &Command) -> &'static str {
             None => "usage_report",
         },
         Command::Events(_) => "events_tail",
+        Command::Overview(_) => "overview",
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
@@ -355,6 +615,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
     Ok(match command {
         Command::Doctor(a) => ("doctor", request(a.idempotency_key, None, json!({}))),
         Command::Init(a) => ("init", request(a.idempotency_key, None, json!({}))),
+        Command::Definition { command } => match command {
+            DefinitionCmd::Validate(a) => (
+                "definition_validate",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"profile": a.profile, "roster": a.roster}),
+                ),
+            ),
+        },
         Command::Run { command } => match command {
             RunCmd::Start(a) => (
                 "run_start",
@@ -366,6 +636,8 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "repo": a.repo,
                         "spec": a.spec,
                         "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
                     }),
                 ),
             ),
@@ -385,12 +657,101 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({"run": a.run}),
                 ),
             ),
+            RunCmd::Submit(a) => (
+                "run_submit",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
+                ),
+            ),
             RunCmd::Status(a) => (
                 "run_status",
                 request(
                     a.idempotency_key,
                     Some(a.run.clone()),
                     json!({"run": a.run}),
+                ),
+            ),
+            RunCmd::ReviseRoster(a) => (
+                "run_revise_roster",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run, "roster": a.roster, "reason": a.reason}),
+                ),
+            ),
+        },
+        Command::Epic { command } => match command {
+            EpicCmd::Start(a) => (
+                "epic_start",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({
+                        "epic": a.epic,
+                        "repo": a.repo,
+                        "spec": a.spec,
+                        "baseRef": a.base_ref,
+                        "profile": a.profile,
+                        "roster": a.roster,
+                    }),
+                ),
+            ),
+            EpicCmd::Advance(a) => (
+                "epic_advance",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Drive(a) => (
+                "epic_drive",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Submit(a) => (
+                "epic_submit",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Status(a) => (
+                "epic_status",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic}),
+                ),
+            ),
+            EpicCmd::Pause(a) => (
+                "epic_pause",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::Resume(a) => (
+                "epic_resume",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "reason": a.reason}),
+                ),
+            ),
+            EpicCmd::Resolve(a) => (
+                "epic_resolve",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "child": a.child, "note": a.note}),
                 ),
             ),
         },
@@ -448,6 +809,45 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 ),
             ),
         },
+        Command::Session { command } => match command {
+            SessionCmd::List(a) => (
+                "session_list",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
+                ),
+            ),
+            SessionCmd::Read(a) => (
+                "session_read",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "lines": a.lines}),
+                ),
+            ),
+            SessionCmd::Message(a) => (
+                "session_message",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({
+                        "run": a.run,
+                        "attempt": a.attempt,
+                        "message": a.message,
+                        "requestedBy": a.requested_by,
+                    }),
+                ),
+            ),
+            SessionCmd::Stop(a) => (
+                "session_stop",
+                request(
+                    a.idempotency_key,
+                    None,
+                    json!({"attempt": a.attempt, "reason": a.reason}),
+                ),
+            ),
+        },
         Command::ClaimNext(a) => (
             "claim_next",
             request(a.idempotency_key, None, json!({"holder": a.holder})),
@@ -500,6 +900,22 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 json!({"run": a.run, "after": a.after, "limit": a.limit}),
             ),
         ),
+        Command::Overview(a) => {
+            let scope = a.run.clone().or_else(|| a.epic.clone());
+            (
+                "overview",
+                request(
+                    a.idempotency_key,
+                    scope,
+                    json!({
+                        "run": a.run,
+                        "epic": a.epic,
+                        "after": a.after,
+                        "limit": a.limit,
+                    }),
+                ),
+            )
+        }
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (
                 "worktree_retire",

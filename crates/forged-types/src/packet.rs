@@ -69,6 +69,13 @@ pub struct WorkPacket {
     pub run_id: String,
     pub bead_id: String,
     pub stage: Stage,
+    /// Semantic topology identity. Absent only on legacy v0 packets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution: Option<crate::SeatExecutionV1>,
+    /// Temporary v0 storage-lane sequence. Absent on legacy packets, whose
+    /// sequence is the final packet-id segment.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub lane_seq: Option<i64>,
     pub spec: SpecRef,
     pub worktree: PathBuf,
     pub branch: String,
@@ -175,6 +182,8 @@ mod tests {
             run_id: "run-1".to_owned(),
             bead_id: "bead-1".to_owned(),
             stage: Stage::Implement,
+            execution: None,
+            lane_seq: None,
             spec: SpecRef {
                 path: "specs/bead-1.md".to_owned(),
                 sha256: "cafe".to_owned(),

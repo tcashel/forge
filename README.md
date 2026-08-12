@@ -7,9 +7,10 @@ forged is a Rust binary that owns *where* work runs and *what happened* —
 stage cursor, attempts, operations, artifacts, usage — while delegating *who*
 and *when* to [beads](https://github.com/gastownhall/beads) (`bd` ≥ 1.2.x,
 whose native lease primitives carry claims, TTLs, heartbeats, and reclaims)
-and keeping GitHub as the code truth. Any driver — a Claude Code session, a
-`codex exec` run, a cron tick — can push a run forward: the engine is a pure
-`advance(run_id)` over ledger state, re-entrant and caller-agnostic.
+and keeping GitHub as the code truth. Any lead-agent harness can use the same
+CLI or MCP contracts. `forged run submit` and `forged epic submit` detach a
+durable controller (Herdr-backed when available), so the initiating session is
+not the lifetime of the job.
 
 The design requirement is durable **cross-provider continuation**: a slice
 started by one provider's agent, killed mid-flight, is resumed by another
@@ -43,7 +44,7 @@ workers never write bd.
 | `forged-beads` | bd lease wrapper: claim/heartbeat/scoped reclaim, TTL/3 guardian, contention classifier |
 | `forged-provider` | Claude + Codex drivers; usage parsers golden-tested against real captures |
 | `forged-proto` | The slice/v1 advance engine and the kill-confirmed reclaim saga |
-| `forged` (bin) | clap CLI + rmcp MCP server over one shared core; `forged claim-next` is the stateless resume verb |
+| `forged` (bin) | clap CLI + rmcp MCP/App server over one shared core; detached slice/epic submission, reconnect overview, and session controls |
 
 All operator state lives out-of-repo under `~/.anvil/` (ledger at
 `~/.anvil/state.db`, run artifacts under `~/.anvil/runs/`). forged imposes
@@ -67,14 +68,15 @@ real 5-minute TTL) is `#[ignore]`d and run deliberately:
 
 ## Status
 
-v0 built and merged (2026-08-12), constructed by the
-[anvil](https://github.com/tcashel/smithy) pipeline as its own last dogfood —
-eight slices, dual-model review, operator-adjudicated merges. The
-cross-provider falsifier is the outstanding acceptance gate. History and
-rationale live in [`docs/adr/`](docs/adr/) — start at
-[ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md), which
-supersedes the earlier product line (the TypeScript cockpit this repository
-used to contain).
+The Rust product now owns adaptive execution packages, YAML profiles/rosters,
+Claude and Codex provider adapters, Herdr supervision, durable epic waves,
+detached handoff, and one CLI/MCP/MCP-App control plane. Smithy/Anvil 0.3 is the
+thin planning client: it hands locked slices and epics to these typed
+contracts instead of running Claude-specific execution Workflows.
+
+History and rationale live in [`docs/adr/`](docs/adr/) — start at
+[ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md) and
+[ADR-0033](docs/adr/0033-execution-package-ownership-boundary.md).
 
 ## License
 

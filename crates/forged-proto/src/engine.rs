@@ -11,9 +11,13 @@
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{
-    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RunRow, RunState,
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow, RunRow,
+    RunState,
 };
-use forged_types::{Outcome, ProviderHints, Stage, Verdict};
+use forged_types::{
+    EscalationTrigger, ExecutionPackageV1, Outcome, ProfileDefinitionV1, ProviderHints,
+    SeatDefinitionV1, SeatExecutionV1, SeatPurpose, Stage, Verdict,
+};
 
 use crate::error::ProtoError;
 use crate::events::{stage_str, widen_rfc3339, ProtoEvent};
@@ -77,6 +81,25 @@ pub struct RunView {
     /// Caller-supplied RFC-3339 UTC stamp in the ledger's fixed-width
     /// 30-byte form, so time is an input, never a read.
     pub now: String,
+    /// Immutable execution package with its latest explicit roster revision
+    /// projected over the package's original roster. Absent on legacy runs.
+    pub execution_package: Option<ExecutionPackageV1>,
+    /// The roster revision overlaid into `execution_package`. Its durable
+    /// creation boundary resets transport fallback for the revised roster.
+    pub active_roster_revision: Option<RosterRevisionRow>,
+    /// Durable adaptive-profile transitions, in event order.
+    pub profile_escalations: Vec<ProfileEscalation>,
+}
+
+/// One stored profile escalation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProfileEscalation {
+    /// Profile active before the transition.
+    pub from: String,
+    /// Profile active after the transition.
+    pub to: String,
+    /// Durable evidence class that authorized the transition.
+    pub trigger: EscalationTrigger,
 }
 
 /// One terminal attempt in a packet's history.
@@ -90,6 +113,9 @@ pub struct TerminalAttempt {
     pub outcome: Option<Outcome>,
     /// The note supplied to `fail_packet`, for failed attempts.
     pub fail_note: Option<String>,
+    /// Durable attempt start time, used to associate transport fallback with
+    /// the roster revision active when the attempt began.
+    pub started_at: String,
 }
 
 /// One packet the caller must open.
@@ -102,6 +128,10 @@ pub struct PacketIntent {
     pub seq: i64,
     /// Provider hints, copied verbatim from `RunView.roster[stage]`.
     pub hints: ProviderHints,
+    /// Semantic topology identity for definition-backed runs.
+    pub execution: Option<SeatExecutionV1>,
+    /// Semantic packet id override. Legacy intents derive their old id.
+    pub packet_id: Option<String>,
 }
 
 /// What the run should do next.
@@ -124,6 +154,8 @@ pub enum NextAction {
         /// `None` unless a transport retry is pending.
         not_before: Option<String>,
     },
+    /// Persist an adaptive-profile transition before opening more work.
+    EscalateProfile(ProfileEscalation),
     /// The run is over.
     Stop(Terminal),
 }
@@ -149,6 +181,13 @@ pub enum Terminal {
         /// The packet's stage.
         stage: Stage,
         /// The number of transport failures observed.
+        attempts: u32,
+    },
+    /// An adaptive semantic seat exhausted its transport policy.
+    SemanticProviderUnavailable {
+        /// Semantic stage/seat identifier.
+        stage_id: String,
+        /// Transport failures observed.
         attempts: u32,
     },
     /// The run's lifecycle column left `Active` outside the protocol — an
@@ -287,6 +326,9 @@ enum LegState<'v> {
 /// `Stop(Terminal::ExternallyStopped { reason: "roster missing stage
 /// <stage>" })` — loud, inspectable, and never a panic in the orchestrator.
 pub fn advance(view: &RunView) -> NextAction {
+    if let Some(package) = &view.execution_package {
+        return advance_adaptive(view, package);
+    }
     if view.run.state == RunState::Stopped {
         return NextAction::Stop(Terminal::ExternallyStopped {
             reason: view.run.stop_reason.clone().unwrap_or_default(),
@@ -398,6 +440,349 @@ pub fn advance(view: &RunView) -> NextAction {
             final_verdict: produced.or(first_produced),
         }),
     }
+}
+
+/// Definition-backed `slice/v1`: topology comes from semantic seats, while
+/// the legacy `Stage` on each intent is only a result/storage codec.
+fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction {
+    if view.run.state == RunState::Stopped {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: view.run.stop_reason.clone().unwrap_or_default(),
+        });
+    }
+    let Some(profile) = active_profile(view, package) else {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "stored active profile is missing from its execution package".to_owned(),
+        });
+    };
+
+    if !op_settled(view, MachineStage::Resolve, 0) {
+        return NextAction::RunMachine(MachineStage::Resolve);
+    }
+
+    let implement = seats_for(profile, SeatPurpose::Implement);
+    match adaptive_group(view, package, &implement, 0) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) if done.semantic_failure => {
+            if let Some(packet) = implement
+                .first()
+                .and_then(|seat| adaptive_packet(view, seat, 0))
+            {
+                return NextAction::AwaitPacket {
+                    packet_id: packet.packet_id.clone(),
+                    not_before: None,
+                };
+            }
+            return NextAction::Stop(Terminal::ExternallyStopped {
+                reason: "semantic implement failure has no reopenable packet".to_owned(),
+            });
+        }
+        AdaptiveGroup::Done { .. } => {}
+    }
+
+    if !op_settled(view, MachineStage::Gate, 0) {
+        return NextAction::RunMachine(MachineStage::Gate);
+    }
+    if gate_failed(view) {
+        if let Some(action) = escalation_action(view, profile, EscalationTrigger::GateFailure) {
+            return action;
+        }
+    }
+    if !op_settled(view, MachineStage::Push, 0) {
+        return NextAction::RunMachine(MachineStage::Push);
+    }
+    if !op_settled(view, MachineStage::DraftPr, 0) {
+        return NextAction::RunMachine(MachineStage::DraftPr);
+    }
+
+    let reviews = seats_for(profile, SeatPurpose::Review);
+    let first = match adaptive_group(view, package, &reviews, 0) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) => done,
+    };
+    if verdicts_conflict(&first.verdicts) {
+        if let Some(action) = escalation_action(view, profile, EscalationTrigger::ReviewConflict) {
+            return action;
+        }
+    }
+    let first = match synthesis_verdict(view, package, profile, 0, first) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) => done,
+    };
+    if first.control == Verdict::Approve {
+        return NextAction::Stop(Terminal::Done {
+            final_verdict: first.produced,
+        });
+    }
+    if profile.fix_round_budget == 0 {
+        return NextAction::Stop(Terminal::Done {
+            final_verdict: first.produced,
+        });
+    }
+
+    let fixes = seats_for(profile, SeatPurpose::Fix);
+    match adaptive_group(view, package, &fixes, 0) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) if done.semantic_failure => {
+            return NextAction::Stop(Terminal::Done {
+                final_verdict: first.produced,
+            })
+        }
+        AdaptiveGroup::Done { .. } => {}
+    }
+    if !op_settled(view, MachineStage::ReGate, 1) {
+        return NextAction::RunMachine(MachineStage::ReGate);
+    }
+    if !op_settled(view, MachineStage::Push, 1) {
+        return NextAction::RunMachine(MachineStage::Push);
+    }
+
+    let second = match adaptive_group(view, package, &reviews, 1) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) => done,
+    };
+    let second = match synthesis_verdict(view, package, profile, 1, second) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) => done,
+    };
+    NextAction::Stop(Terminal::Done {
+        final_verdict: second.produced.or(first.produced),
+    })
+}
+
+fn active_profile<'a>(
+    view: &RunView,
+    package: &'a ExecutionPackageV1,
+) -> Option<&'a ProfileDefinitionV1> {
+    let mut name = package.profile_ref.name.as_str();
+    for escalation in &view.profile_escalations {
+        if escalation.from == name {
+            name = &escalation.to;
+        }
+    }
+    package
+        .profile_catalog
+        .get(name)
+        .or_else(|| (name == package.profile.name.as_str()).then_some(&package.profile))
+}
+
+fn seats_for(profile: &ProfileDefinitionV1, purpose: SeatPurpose) -> Vec<&SeatDefinitionV1> {
+    profile
+        .seats
+        .iter()
+        .filter(|seat| seat.purpose == purpose)
+        .collect()
+}
+
+fn gate_failed(view: &RunView) -> bool {
+    view.proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Gate {
+                phase: crate::events::GatePhase::Gate,
+                passed,
+                ..
+            } => Some(!passed),
+            _ => None,
+        })
+        == Some(true)
+}
+
+fn escalation_action(
+    view: &RunView,
+    profile: &ProfileDefinitionV1,
+    trigger: EscalationTrigger,
+) -> Option<NextAction> {
+    if !profile.escalate_on.contains(&trigger)
+        || view
+            .profile_escalations
+            .iter()
+            .any(|event| event.trigger == trigger)
+    {
+        return None;
+    }
+    let target = profile.escalate_to.as_ref()?;
+    Some(NextAction::EscalateProfile(ProfileEscalation {
+        from: profile.name.clone(),
+        to: target.name.clone(),
+        trigger,
+    }))
+}
+
+#[derive(Debug)]
+struct AdaptiveDone {
+    control: Verdict,
+    produced: Option<Verdict>,
+    verdicts: Vec<Verdict>,
+    semantic_failure: bool,
+}
+
+enum AdaptiveGroup {
+    Action(NextAction),
+    Done(AdaptiveDone),
+}
+
+fn adaptive_group(
+    view: &RunView,
+    package: &ExecutionPackageV1,
+    seats: &[&SeatDefinitionV1],
+    round: u8,
+) -> AdaptiveGroup {
+    let missing: Vec<PacketIntent> = seats
+        .iter()
+        .enumerate()
+        .filter(|(_, seat)| adaptive_packet(view, seat, round).is_none())
+        .filter_map(|(index, seat)| adaptive_intent(view, package, seat, round, index))
+        .collect();
+    if !missing.is_empty() {
+        return AdaptiveGroup::Action(NextAction::OpenPackets(missing));
+    }
+
+    let mut pending = Vec::new();
+    let mut verdicts = Vec::new();
+    let mut semantic_failure = false;
+    for seat in seats {
+        let Some(packet) = adaptive_packet(view, seat, round) else {
+            return AdaptiveGroup::Action(NextAction::Stop(Terminal::ExternallyStopped {
+                reason: format!("roster missing semantic role {}", seat.role.as_str()),
+            }));
+        };
+        match packet_state(view, packet) {
+            LegState::Pending {
+                packet_id,
+                not_before,
+            } => pending.push((packet_id.to_owned(), not_before)),
+            LegState::Exhausted { attempts } => {
+                return AdaptiveGroup::Action(NextAction::Stop(
+                    Terminal::SemanticProviderUnavailable {
+                        stage_id: seat.id.as_str().to_owned(),
+                        attempts,
+                    },
+                ))
+            }
+            LegState::FailedSemantic => {
+                semantic_failure = true;
+                verdicts.push(Verdict::RequestChanges);
+            }
+            LegState::Completed { outcome } => match outcome {
+                Some(Outcome::Review {
+                    verdict,
+                    available: true,
+                    ..
+                }) => verdicts.push(*verdict),
+                Some(Outcome::Review {
+                    available: false, ..
+                }) => {}
+                Some(Outcome::Implement {
+                    implemented: true, ..
+                })
+                | Some(Outcome::Fix { applied: true, .. }) => {}
+                _ => {
+                    semantic_failure = true;
+                    verdicts.push(Verdict::RequestChanges);
+                }
+            },
+            LegState::Missing => unreachable!("missing packets returned above"),
+        }
+    }
+    if let Some((packet_id, not_before)) = pending.into_iter().min_by(|a, b| a.0.cmp(&b.0)) {
+        return AdaptiveGroup::Action(NextAction::AwaitPacket {
+            packet_id,
+            not_before,
+        });
+    }
+    let produced = verdicts
+        .iter()
+        .copied()
+        .max_by_key(|value| severity(*value));
+    AdaptiveGroup::Done(AdaptiveDone {
+        control: produced.unwrap_or(Verdict::RequestChanges),
+        produced,
+        verdicts,
+        semantic_failure,
+    })
+}
+
+fn synthesis_verdict(
+    view: &RunView,
+    package: &ExecutionPackageV1,
+    profile: &ProfileDefinitionV1,
+    round: u8,
+    reviews: AdaptiveDone,
+) -> AdaptiveGroup {
+    let synthesis = seats_for(profile, SeatPurpose::Synthesis);
+    if synthesis.is_empty() {
+        return AdaptiveGroup::Done(reviews);
+    }
+    adaptive_group(view, package, &synthesis, round)
+}
+
+fn verdicts_conflict(verdicts: &[Verdict]) -> bool {
+    verdicts
+        .first()
+        .is_some_and(|first| verdicts.iter().any(|value| value != first))
+}
+
+fn adaptive_packet<'a>(
+    view: &'a RunView,
+    seat: &SeatDefinitionV1,
+    round: u8,
+) -> Option<&'a PacketRow> {
+    view.packets.iter().find(|packet| {
+        serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+            .ok()
+            .and_then(|packet| packet.execution)
+            .is_some_and(|execution| execution.seat_id == seat.id && execution.round == round)
+    })
+}
+
+fn adaptive_intent(
+    view: &RunView,
+    package: &ExecutionPackageV1,
+    seat: &SeatDefinitionV1,
+    round: u8,
+    index: usize,
+) -> Option<PacketIntent> {
+    let candidate = package.roster.roles.get(&seat.role)?.first()?;
+    let stage = match seat.purpose {
+        SeatPurpose::Implement => Stage::Implement,
+        SeatPurpose::Review if index.is_multiple_of(2) => Stage::ReviewClaude,
+        SeatPurpose::Review | SeatPurpose::Synthesis => Stage::ReviewCodex,
+        SeatPurpose::Fix => Stage::Fix,
+    };
+    // `packets` retains its v0 UNIQUE(run, storage-stage, seq) codec. Give
+    // synthesis a reserved lane so its one-element group cannot collide
+    // with review index zero while semantic identity stays in packet_id.
+    let lane = if seat.purpose == SeatPurpose::Synthesis {
+        16
+    } else {
+        i64::try_from(index).unwrap_or(30) + 1
+    };
+    let seq = i64::from(round) * 32 + lane;
+    Some(PacketIntent {
+        stage,
+        seq,
+        hints: ProviderHints {
+            provider: candidate.provider.clone(),
+            model: candidate.model.clone(),
+            effort: candidate.effort.clone(),
+            sandbox: candidate.sandbox,
+        },
+        execution: Some(SeatExecutionV1 {
+            stage_id: seat.id.as_str().to_owned(),
+            seat_id: seat.id.clone(),
+            role_id: seat.role.clone(),
+            purpose: seat.purpose,
+            round,
+        }),
+        packet_id: Some(format!(
+            "{}/{}/{}",
+            view.run.run_id,
+            seat.id.as_str(),
+            round
+        )),
+    })
 }
 
 /// The distinct review-fan-out seqs present in the view, ascending.
@@ -537,6 +922,10 @@ fn leg_state<'v>(view: &'v RunView, stage: Stage, seq: Option<i64>) -> LegState<
     let Some(packet) = packet else {
         return LegState::Missing;
     };
+    packet_state(view, packet)
+}
+
+fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
     let packet_id = packet.packet_id.as_str();
     let history: &[TerminalAttempt] = view
         .terminal_attempts
@@ -673,7 +1062,13 @@ fn next_seq(view: &RunView, stage: Stage) -> i64 {
 /// for it — hints are input and `advance` never invents them.
 fn intent(view: &RunView, stage: Stage, seq: i64) -> Option<PacketIntent> {
     let hints = view.roster.get(&stage)?.clone();
-    Some(PacketIntent { stage, seq, hints })
+    Some(PacketIntent {
+        stage,
+        seq,
+        hints,
+        execution: None,
+        packet_id: None,
+    })
 }
 
 /// What a roster gap resolves to. The run cannot proceed — the engine would

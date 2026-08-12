@@ -109,8 +109,42 @@ CREATE TABLE usage (
 );
 ";
 
+/// Migration 002: immutable run definitions and append-only roster history.
+const MIGRATION_002: &str = "
+CREATE TABLE run_definitions (
+  run_id                    TEXT PRIMARY KEY REFERENCES runs(run_id),
+  protocol_ref_json         TEXT NOT NULL,
+  profile_ref_json          TEXT NOT NULL,
+  roster_ref_json           TEXT NOT NULL,
+  package_sha256            TEXT NOT NULL,
+  profile_sha256            TEXT NOT NULL,
+  roster_sha256             TEXT NOT NULL,
+  package_json              TEXT NOT NULL,
+  compatibility_roster_json TEXT NOT NULL,
+  created_at                TEXT NOT NULL
+);
+
+CREATE TABLE roster_revisions (
+  run_id        TEXT NOT NULL REFERENCES runs(run_id),
+  revision      INTEGER NOT NULL CHECK (revision > 0),
+  roster_ref_json TEXT NOT NULL,
+  roster_sha256 TEXT NOT NULL,
+  roster_json   TEXT NOT NULL,
+  reason        TEXT NOT NULL,
+  created_at    TEXT NOT NULL,
+  PRIMARY KEY (run_id, revision)
+);
+";
+
+/// Migration 003: fence explicit roster revisions by operation identity.
+const MIGRATION_003: &str = "
+ALTER TABLE roster_revisions ADD COLUMN operation_id TEXT;
+CREATE UNIQUE INDEX roster_revision_operation
+  ON roster_revisions(operation_id) WHERE operation_id IS NOT NULL;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
-const MIGRATIONS: &[&str] = &[MIGRATION_001];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
 pub(crate) fn configure_connection(conn: &mut Connection) -> Result<(), LedgerError> {
@@ -185,6 +219,7 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), LedgerError> {
 
 #[cfg(test)]
 mod tests {
+    use super::MIGRATION_001;
     use crate::Ledger;
 
     #[test]
@@ -199,7 +234,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 1);
+        assert_eq!(pragmas.user_version, 3);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -213,6 +248,8 @@ mod tests {
             "merge_slots",
             "events",
             "usage",
+            "run_definitions",
+            "roster_revisions",
         ] {
             let found: String = conn
                 .query_row(
@@ -242,8 +279,36 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 1);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
         ledger.close().expect("close");
+    }
+
+    #[test]
+    fn v0_database_migrates_additively_without_losing_runs() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            conn.execute_batch(MIGRATION_001).expect("v0 schema");
+            conn.execute(
+                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, created_at, updated_at) \
+                 VALUES ('old-run', 'old-bead', '/repo', 'main', 'forged/old', 't', 't')",
+                [],
+            )
+            .expect("old run");
+            conn.execute_batch("PRAGMA user_version=1;")
+                .expect("mark v0");
+        }
+        let ledger = Ledger::open(&path).expect("migrate");
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
+        assert_eq!(
+            ledger.get_run("old-run").expect("old run").bead_id,
+            "old-bead"
+        );
+        assert!(ledger
+            .get_run_definition("old-run")
+            .expect("legacy definition query")
+            .is_none());
     }
 
     #[test]

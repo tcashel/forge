@@ -5,7 +5,9 @@
 //! `Option<_>`) — except state/stage/effect-class columns, which use the Rust
 //! enums below (and [`Stage`] from forged-types).
 
-use forged_types::{ErrorCode, RunId, Stage};
+use std::collections::HashMap;
+
+use forged_types::{ErrorCode, ExecutionPackageV1, ProviderHints, RunId, Stage};
 
 use crate::error::{refused, LedgerError};
 
@@ -210,6 +212,35 @@ pub struct RunRow {
     pub updated_at: String,
 }
 
+/// One immutable `run_definitions` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RunDefinitionRow {
+    pub run_id: String,
+    pub protocol_ref_json: String,
+    pub profile_ref_json: String,
+    pub roster_ref_json: String,
+    pub package_sha256: String,
+    pub profile_sha256: String,
+    pub roster_sha256: String,
+    pub package_json: String,
+    /// Temporary v0 executor projection, frozen with the package.
+    pub compatibility_roster_json: String,
+    pub created_at: String,
+}
+
+/// One append-only `roster_revisions` row.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RosterRevisionRow {
+    pub run_id: String,
+    pub revision: u32,
+    pub roster_ref_json: String,
+    pub roster_sha256: String,
+    pub roster_json: String,
+    pub reason: String,
+    pub created_at: String,
+    pub operation_id: Option<String>,
+}
+
 /// One row of `packets`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketRow {
@@ -326,6 +357,14 @@ pub struct NewRun {
     pub base_ref: String,
     /// Working branch.
     pub branch: String,
+}
+
+/// Definition snapshot inserted atomically with a new run.
+#[derive(Debug, Clone, PartialEq)]
+pub struct NewRunDefinition {
+    pub package: ExecutionPackageV1,
+    pub package_sha256: String,
+    pub compatibility_roster: HashMap<Stage, ProviderHints>,
 }
 
 /// Input to [`crate::Ledger::open_packet`].
