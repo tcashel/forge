@@ -153,47 +153,49 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         beads_dir: beads.clone(),
         home_override: Some(home),
         anvil_home: anvil,
-        work_dir: beads,
+        work_dir: beads.clone(),
         read_timeout_s: PROBE_TIMEOUT_S,
         write_timeout_s: PROBE_TIMEOUT_S,
     };
-    let create_op = || WriteOp::Other {
+    // The spec pinned bd's auto-init-on-first-create (P0 probe), but the
+    // sandboxed bd 1.2.1 build refuses a bare scratch dir with "no beads
+    // database found" — and, dogfood-proven WORSE: any bd call against an
+    // UNINITIALIZED $BEADS_DIR falls back to CWD-ancestor workspace
+    // discovery, so a stray `.beads` in an ancestor (the operator's
+    // machine-global `~/.beads` sits above every path under a home-dir
+    // checkout) would silently receive the probe's writes. Therefore: init
+    // FIRST, from an ancestor-clean cwd under the system temp dir, and
+    // verify the init landed in the scratch store before writing anything.
+    let init_cwd = std::env::temp_dir().join(format!("forged-doctor-init-{}", std::process::id()));
+    std::fs::create_dir_all(&init_cwd)
+        .map_err(|e| format!("creating init cwd {}: {e}", init_cwd.display()))?;
+    let init_cfg = BdConfig {
+        work_dir: init_cwd.clone(),
+        ..scratch.clone()
+    };
+    let init = invoke::run_locked_once(&init_cfg, &["init"], "bd init").await;
+    let _ = std::fs::remove_dir_all(&init_cwd);
+    let init = init.map_err(|e| format!("scratch bd init failed: {e}"))?;
+    if init.exit != Some(0) {
+        return Err(format!(
+            "scratch bd init exited {:?}: {}",
+            init.exit, init.stderr
+        ));
+    }
+    if !beads.join("config.yaml").exists() {
+        return Err(format!(
+            "bd init did not land in the scratch store {} — refusing to write",
+            beads.display()
+        ));
+    }
+    let create_op = WriteOp::Other {
         bead: None,
         actor: Some("doctor".to_string()),
     };
     let create_args = ["create", "doctor probe", "--json"];
-    let created = invoke::write(&scratch, create_op(), &create_args).await;
-    let data = match created {
-        Ok(d) => d,
-        Err(e) => {
-            // The spec pinned bd's auto-init-on-first-create (P0 probe), but
-            // the sandboxed bd 1.2.1 build refuses with "no beads database
-            // found" on a bare scratch dir. Fall back to `bd init` — with
-            // BEADS_DIR set explicitly it does NOT hit the "unsafe location"
-            // refusal, and its cwd side-effect files land in the scratch dir.
-            let refused_no_db = matches!(
-                &e,
-                BdError::Beads { stderr, stdout, .. }
-                    if stderr.contains("no beads database found")
-                        || stdout.contains("no beads database found")
-            );
-            if !refused_no_db {
-                return Err(format!("scratch create failed: {e}"));
-            }
-            let init = invoke::run_locked_once(&scratch, &["init"], "bd init")
-                .await
-                .map_err(|e| format!("scratch bd init failed: {e}"))?;
-            if init.exit != Some(0) {
-                return Err(format!(
-                    "scratch bd init exited {:?}: {}",
-                    init.exit, init.stderr
-                ));
-            }
-            invoke::write(&scratch, create_op(), &create_args)
-                .await
-                .map_err(|e| format!("scratch create after init failed: {e}"))?
-        }
-    };
+    let data = invoke::write(&scratch, create_op, &create_args)
+        .await
+        .map_err(|e| format!("scratch create failed: {e}"))?;
     let id = envelope::first_obj(&data)
         .and_then(|o| o.get("id"))
         .and_then(Value::as_str)
