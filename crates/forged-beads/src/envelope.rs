@@ -10,7 +10,11 @@
 //!   initialized store returns `data: []` — both are the empty list here).
 //! - `bd show <id> --json` returns `data` as an ARRAY — take the first
 //!   element. Only show is pinned to an array: every other enveloped command
-//!   resolves `data` defensively via [`first_obj`].
+//!   resolves `data` defensively via `first_obj`.
+//!
+//! Everything here is CRATE-INTERNAL: the frozen public surface hands
+//! consumers typed result structs, each carrying the call's parsed `data` in
+//! its own `raw` field, so no caller needs the parser itself.
 //! - stderr may carry warnings even on success (bd 1.2.1 routinely emits a
 //!   `beads.role not configured (GH#2950)` warning): stderr content alone is
 //!   never failure — exit status plus stdout parse govern.
@@ -20,7 +24,7 @@
 //!   `{"data":{"error":"1 of 1 issues failed to update","failed":[{"id":
 //!   "beads-1al","error":"updating issue: issue already claimed by doctor"}]},
 //!   "schema_version":1}` (probe: second `--claim` by another actor, exit 1).
-//!   [`extract_error`] handles both shapes and folds `failed[].error` entries
+//!   `extract_error` handles both shapes and folds `failed[].error` entries
 //!   into the returned string.
 
 use serde_json::Value;
@@ -69,7 +73,7 @@ pub(crate) fn parse_lenient(stdout: &str) -> Lenient {
 /// `data` as an OBJECT (`{"id":"beads-1al","title":"doctor probe",...}`) while
 /// `bd show <id> --json` and `bd update <id> --claim ... --json` return `data`
 /// as an ARRAY of one issue object.
-pub fn first_obj(data: &Value) -> Option<&Value> {
+pub(crate) fn first_obj(data: &Value) -> Option<&Value> {
     match data {
         Value::Object(_) => Some(data),
         Value::Array(items) => items.first(),

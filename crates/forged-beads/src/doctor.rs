@@ -17,24 +17,12 @@ use serde_json::Value;
 use crate::classify::BdError;
 use crate::config::BdConfig;
 use crate::envelope;
-use crate::invoke::{self, WriteOp};
+use crate::invoke;
 use crate::lease;
 
 /// Per-probe timeout: probes report `ok: false` with detail
 /// "timed out after 10s" rather than hanging.
 const PROBE_TIMEOUT_S: u64 = 10;
-
-/// bd's refusal when `$BEADS_DIR` holds no initialized store — the exact
-/// string that authorizes [`lease_liveness_body`]'s fallback, and nothing
-/// else does.
-const UNINITIALIZED_STORE_REFUSAL: &str = "no beads database found";
-
-/// What the fallback appends to the probe detail, so an operator reading
-/// doctor output learns the environment deviates from the spec instead of the
-/// deviation living only in this source file.
-const AUTO_INIT_MISMATCH_NOTE: &str = "; NOTE bd/spec mismatch: this bd does NOT auto-initialize \
-     on first create (it answered \"no beads database found\"), so the scratch store was \
-     initialized explicitly — see doctor.rs";
 
 /// Configuration for a doctor run.
 #[derive(Debug, Clone)]
@@ -171,28 +159,14 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         read_timeout_s: PROBE_TIMEOUT_S,
         write_timeout_s: PROBE_TIMEOUT_S,
     };
-    // The spec's protocol is tried FIRST and unmodified: a fresh store is
-    // initialized by its first `bd create`, because the P0 probe recorded
-    // `bd init` refusing temp paths as an "unsafe location".
-    //
-    // Measured against the pinned sandboxed bd 1.2.1 (build 634cbbc4), BOTH
-    // halves of that premise are false: `bd create` against an empty
-    // $BEADS_DIR exits 1 with "no beads database found" and initializes
-    // nothing, while `bd init` accepts a temp path happily. The mismatch is
-    // reported rather than papered over — the fallback below fires ONLY on
-    // that exact refusal, says so in the probe detail, and disappears by
-    // itself the day a bd restores auto-init.
-    //
-    // Two hazards fix the fallback's shape. First, any bd call against an
-    // UNINITIALIZED $BEADS_DIR falls back to CWD-ancestor workspace
-    // discovery, so a stray `.beads` above the cwd (the operator's
-    // machine-global `~/.beads` sits above every path under a home-dir
-    // checkout) would silently receive the probe's writes — every pre-init
-    // call therefore runs from an ancestor-clean cwd under the system temp
-    // dir, and the store is verified to have landed in the scratch dir before
-    // anything else runs. Second, a bare `bd init` writes CLAUDE.md,
-    // AGENTS.md, .claude/ and .agents/ into its cwd, so it is made inert with
-    // --non-interactive --quiet --skip-agents --skip-hooks.
+    // The store is bootstrapped by its first `bd create` and by nothing else.
+    // The one hazard that shape carries: a bd call against an UNINITIALIZED
+    // $BEADS_DIR falls back to CWD-ancestor workspace discovery, so a stray
+    // `.beads` above the cwd (the operator's machine-global `~/.beads` sits
+    // above every path under a home-dir checkout) would silently receive the
+    // probe's writes. The single pre-store call therefore runs from an
+    // ancestor-clean cwd under the system temp dir, and the store is verified
+    // to have landed in the scratch dir before anything else runs.
     let clean_cwd = std::env::temp_dir().join(format!("forged-doctor-init-{}", std::process::id()));
     std::fs::create_dir_all(&clean_cwd)
         .map_err(|e| format!("creating ancestor-clean cwd {}: {e}", clean_cwd.display()))?;
@@ -201,9 +175,9 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         ..scratch.clone()
     };
     let create_args = ["create", "doctor probe", "--json"];
-    let bootstrap = bootstrap_store(&scratch, &clean_cfg, &create_args).await;
+    let bootstrap = create_probe_bead(&clean_cfg, &create_args).await;
     let _ = std::fs::remove_dir_all(&clean_cwd);
-    let (data, note) = bootstrap?;
+    let data = bootstrap?;
     let id = envelope::first_obj(&data)
         .and_then(|o| o.get("id"))
         .and_then(Value::as_str)
@@ -215,83 +189,55 @@ async fn lease_liveness_body(cfg: &DoctorConfig, base: &std::path::Path) -> Resu
         .await
         .map_err(|e| format!("owner heartbeat failed: {e}"))?;
     match lease::heartbeat(&scratch, id, "doctor-other").await {
-        Err(BdError::HeartbeatRefused { .. }) => Ok(format!(
-            "create/claim/heartbeat ok; wrong-actor heartbeat refused{note}"
-        )),
+        Err(BdError::HeartbeatRefused { .. }) => {
+            Ok("create/claim/heartbeat ok; wrong-actor heartbeat refused".to_string())
+        }
         Ok(()) => Err("wrong-actor heartbeat was unexpectedly accepted".to_string()),
         Err(e) => Err(format!(
-            "wrong-actor heartbeat failed with {e} (expected a refusal){note}"
+            "wrong-actor heartbeat failed with {e} (expected a refusal)"
         )),
     }
 }
 
-/// Get the scratch store to the point where it holds one probe bead, and
-/// report whether that took the spec's protocol or the fallback.
+/// The scratch store's ONE bootstrap call: `bd create` against an empty
+/// `$BEADS_DIR`, single-shot (a diagnostic probe retries nothing) and from the
+/// ancestor-clean cwd `clean_cfg` pins. Returns the create's envelope `data`.
 ///
-/// Returns the create's envelope `data` plus a note that is EMPTY when the
-/// spec's first-create auto-init worked and carries
-/// [`AUTO_INIT_MISMATCH_NOTE`] when it did not. `clean_cfg` is `scratch` with
-/// its cwd moved to an ancestor-clean directory — mandatory for every call
-/// made before the store exists.
-async fn bootstrap_store(
-    scratch: &BdConfig,
-    clean_cfg: &BdConfig,
-    create_args: &[&str],
-) -> Result<(Value, String), String> {
-    // Attempt 1: the spec's protocol, single-shot (a diagnostic probe retries
-    // nothing) and from the ancestor-clean cwd.
-    let first = invoke::run_locked_once(clean_cfg, create_args, "bd create")
+/// There is deliberately NO fallback. `bd init` is forbidden for this probe,
+/// so a bd that does not auto-initialize on first create makes the probe
+/// report `ok: false` carrying the refusal bd printed — measured against the
+/// pinned sandboxed bd 1.2.1 (build `634cbbc4`) that is exactly what happens:
+/// `bd create` on an empty `$BEADS_DIR` exits 1 with `no beads database found`
+/// and initializes nothing. Reporting that honestly IS the probe working:
+/// bootstrapping the store some other way would turn the probe green while
+/// the behavior it exists to check stayed absent, and this crate does not
+/// invoke `bd init` anywhere (source-grep enforced).
+async fn create_probe_bead(clean_cfg: &BdConfig, create_args: &[&str]) -> Result<Value, String> {
+    let out = invoke::run_locked_once(clean_cfg, create_args, "bd create")
         .await
         .map_err(|e| format!("scratch create failed: {e}"))?;
-    if first.exit == Some(0) {
-        return envelope::parse_lenient(&first.stdout)
-            .data
-            .map(|data| (data, String::new()))
-            .ok_or_else(|| format!("create returned no envelope data: {}", first.stdout));
-    }
-    let refusal = format!("{}\n{}", first.stdout, first.stderr);
-    if !refusal.contains(UNINITIALIZED_STORE_REFUSAL) {
+    if out.exit != Some(0) {
         return Err(format!(
-            "scratch create exited {:?}: {}",
-            first.exit, first.stderr
+            "bd did not auto-initialize the scratch store on first create (exit {:?}); stdout: {}; \
+             stderr: {}",
+            out.exit,
+            out.stdout.trim(),
+            out.stderr.trim()
         ));
     }
-    let init = invoke::run_locked_once(
-        clean_cfg,
-        &[
-            "init",
-            "--non-interactive",
-            "--quiet",
-            "--skip-agents",
-            "--skip-hooks",
-        ],
-        "bd init",
-    )
-    .await
-    .map_err(|e| format!("scratch store initialization failed: {e}"))?;
-    if init.exit != Some(0) {
-        return Err(format!(
-            "scratch store initialization exited {:?}: {}",
-            init.exit, init.stderr
-        ));
-    }
-    if !clean_cfg.beads_dir.join("config.yaml").exists() {
+    // Containment: the store bd just initialized must be the SCRATCH one, not
+    // an ancestor's that CWD discovery found.
+    let landed = std::fs::read_dir(&clean_cfg.beads_dir).is_ok_and(|mut d| d.next().is_some());
+    if !landed {
         return Err(format!(
             "the scratch store did not land in {} — CWD-ancestor discovery must never win over \
-             BEADS_DIR; refusing to write",
+             BEADS_DIR; refusing to continue",
             clean_cfg.beads_dir.display()
         ));
     }
-    // The store exists now, so the real create runs against it under the
-    // normal write policy with the normal cwd.
-    let create_op = WriteOp::Other {
-        bead: None,
-        actor: Some("doctor".to_string()),
-    };
-    let data = invoke::write(scratch, create_op, create_args)
-        .await
-        .map_err(|e| format!("scratch create failed: {e}"))?;
-    Ok((data, AUTO_INIT_MISMATCH_NOTE.to_string()))
+    envelope::parse_lenient(&out.stdout)
+        .data
+        .ok_or_else(|| format!("create returned no envelope data: {}", out.stdout))
 }
 
 /// Prove the operator's LIVE store still resolves: a read of `bd list

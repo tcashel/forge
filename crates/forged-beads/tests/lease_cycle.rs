@@ -5,7 +5,7 @@
 
 mod support;
 
-use forged_beads::{claim_specific, heartbeat, invoke, reclaim, BdError};
+use forged_beads::{claim_specific, heartbeat, reclaim, BdError};
 use serde_json::Value;
 
 #[tokio::test]
@@ -50,12 +50,9 @@ async fn lease_cycle() {
     );
 
     // The bead keeps its original assignee.
-    let show = invoke::read(&cfg, &["show", &id, "--json"])
-        .await
-        .expect("show");
-    let obj = forged_beads::envelope::first_obj(&show).expect("show data");
+    let bead = support::show_bead(&bd, &s, &id);
     assert_eq!(
-        obj.get("assignee").and_then(Value::as_str),
+        bead.get("assignee").and_then(Value::as_str),
         Some("actor-a"),
         "assignee must be intact after the refused reclaim"
     );

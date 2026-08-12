@@ -87,6 +87,36 @@ fn source_hygiene_no_force_flag_and_no_path_bd() {
     }
 }
 
+#[test]
+fn source_hygiene_the_crate_never_invokes_bd_init() {
+    // The spec's doctor module forbids `bd init` — the scratch store must
+    // bootstrap on first create, and a bd that does not auto-initialize makes
+    // the probe report the refusal rather than substituting another bootstrap.
+    // No fallback, so no source file may name the subcommand as an argv token.
+    // (`tests/support/mod.rs` does, deliberately: it is scaffolding that has to
+    // build a store for the lease/slot tests, and it is not part of the crate.)
+    let sources = [
+        ("audit.rs", include_str!("../src/audit.rs")),
+        ("classify.rs", include_str!("../src/classify.rs")),
+        ("config.rs", include_str!("../src/config.rs")),
+        ("doctor.rs", include_str!("../src/doctor.rs")),
+        ("envelope.rs", include_str!("../src/envelope.rs")),
+        ("guardian.rs", include_str!("../src/guardian.rs")),
+        ("invoke.rs", include_str!("../src/invoke.rs")),
+        ("lease.rs", include_str!("../src/lease.rs")),
+        ("lib.rs", include_str!("../src/lib.rs")),
+        ("slot.rs", include_str!("../src/slot.rs")),
+    ];
+    // Built at runtime so this test file cannot trip its own needle.
+    let init_arg = ["\"", "init", "\""].concat();
+    for (name, src) in sources {
+        assert!(
+            !src.contains(&init_arg),
+            "{name} must never invoke bd's {init_arg} subcommand"
+        );
+    }
+}
+
 #[tokio::test]
 async fn doctor_returns_six_probes_and_never_panics_without_bd() {
     let _guard = support::HomeBeadsGuard::new();

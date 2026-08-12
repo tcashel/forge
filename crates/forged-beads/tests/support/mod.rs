@@ -118,17 +118,22 @@ pub fn raw_bd(bd: &Path, s: &Scratch, args: &[&str]) -> Command {
     c
 }
 
-/// Bring the scratch store into existence.
+/// Bring the scratch store into existence — TEST SCAFFOLDING, and the only
+/// place in this slice that runs `bd init`.
 ///
-/// The spec's protocol is tried FIRST and unmodified: a fresh store is
-/// initialized by its first `bd create`, and `bd init` is forbidden because
-/// the P0 probe recorded it refusing temp paths as an "unsafe location". The
-/// pinned sandboxed bd 1.2.1 contradicts both halves — `bd create` on an
-/// empty `$BEADS_DIR` exits 1 with "no beads database found", and `bd init`
-/// accepts a temp path — so the fallback fires ONLY on that exact refusal and
-/// says so on stderr. That mismatch is a reported environment fact, not a
-/// silent protocol change: the day a bd auto-initializes again, the fallback
-/// stops running on its own.
+/// The crate itself never does, in doctor or anywhere else: the spec forbids
+/// it, and `source_hygiene_the_crate_never_invokes_bd_init` proves `src/`
+/// carries no such invocation. Doctor's lease-liveness probe consequently
+/// bootstraps by first-create alone and reports `ok: false` with bd's refusal
+/// when a bd does not auto-initialize — which the pinned sandboxed bd 1.2.1
+/// does not (`bd create` on an empty `$BEADS_DIR` exits 1 with "no beads
+/// database found" and initializes nothing).
+///
+/// The integration tests still need a store to exercise leases, slots and the
+/// reaper against, so this helper builds one the only way this binary offers.
+/// It tries the spec's protocol first and unmodified, falls back ONLY on that
+/// exact refusal, and says so on stderr when it has to; the day a bd
+/// auto-initializes again the fallback stops running on its own.
 ///
 /// CRITICAL, dogfood-proven: bd's workspace discovery lets a CWD-ancestor
 /// `.beads` preempt an UNINITIALIZED `$BEADS_DIR` — and the operator's
@@ -208,6 +213,31 @@ pub fn init_store(bd: &Path, s: &Scratch) {
         "bd where must resolve the scratch store {}, got: {resolved}",
         s.beads.display()
     );
+}
+
+/// Read a bead through a RAW `bd show <id> --json` and return its first data
+/// object.
+///
+/// The crate's own read spine is crate-internal — the frozen public surface
+/// exposes typed operations only — so the tests observe the store directly,
+/// which is the stronger assertion anyway: it checks what bd holds, not what
+/// the wrapper reports.
+pub fn show_bead(bd: &Path, s: &Scratch, id: &str) -> Value {
+    let out = raw_bd(bd, s, &["show", id, "--json"])
+        .output()
+        .expect("spawning bd show");
+    assert!(
+        out.status.success(),
+        "bd show failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let v: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("show envelope");
+    // `bd show` returns `data` as an ARRAY — take the first element.
+    match v.get("data").cloned().expect("show envelope data") {
+        Value::Array(items) => items.into_iter().next().expect("bd show returned no issue"),
+        other => other,
+    }
 }
 
 /// Create a bead in the scratch store and return its id.

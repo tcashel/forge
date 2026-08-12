@@ -1,6 +1,6 @@
 //! The contention classifier and the crate error type [`BdError`].
 //!
-//! Classification is OPERATION-AWARE (see [`crate::invoke::WriteOp`]): claim
+//! Classification is OPERATION-AWARE (see the crate-internal `WriteOp`): claim
 //! operations map bd's claim-CAS refusal copy to [`BdError::LeaseHeld`]
 //! immediately (an outcome, not a fault), heartbeats never enter the generic
 //! retry/re-read path, and everything else follows the Dolt-contention /
@@ -214,7 +214,17 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
         // here is a refusal — heartbeats never enter the generic retry or
         // re-read paths and never yield LeaseHeld.
         if out.exit == Some(0) && lenient.parsed && lenient.schema_ok && lenient.error.is_none() {
-            return Class::Success(lenient.data.unwrap_or(Value::Null));
+            // The `data` key must be PRESENT, exactly as on the generic path
+            // below: a heartbeat's success is what the guardian takes as proof
+            // the lease is still held (it appends a beat-file line on it), so
+            // an envelope carrying no data at all is EnvelopeBad, not a beat.
+            // (`"data": null` is a present key and stays a success.)
+            return match lenient.data {
+                Some(d) => Class::Success(d),
+                None => Class::EnvelopeBad {
+                    detail: format!("envelope missing data key; {}", both_streams(out)),
+                },
+            };
         }
         if out.exit == Some(0) && (!lenient.parsed || !lenient.schema_ok) {
             return Class::EnvelopeBad {
@@ -372,10 +382,19 @@ pub(crate) async fn write_policy(
 /// or our own actor — is `None`, and the caller keeps its original error.
 /// Strictly best-effort and non-recursive: the re-read's own failure is never
 /// surfaced or re-classified.
+///
+/// Heartbeats are excluded outright: `bd heartbeat` NEVER enters the re-read
+/// path and never yields `LeaseHeld`. Without this guard a heartbeat whose
+/// child timed out twice would reach here through [`timeout_terminal`] and
+/// come back `LeaseHeld` — the one classification the heartbeat contract
+/// forbids, and one callers act on differently from a lost lease.
 pub(crate) async fn lease_held_from_reread(
     op: &WriteOp,
     runner: &mut dyn AttemptRunner,
 ) -> Option<BdError> {
+    if matches!(op, WriteOp::Heartbeat { .. }) {
+        return None;
+    }
     let bead = op.bead()?;
     let observed = runner.reread_assignee(bead).await?;
     let differs = op.actor().is_none_or(|a| a != observed);
@@ -658,6 +677,67 @@ mod tests {
             .await
             .expect("contention then success");
         assert_eq!(runner.runs, 2);
+    }
+
+    #[tokio::test]
+    async fn a_heartbeat_envelope_with_no_data_key_is_not_a_beat() {
+        let op = WriteOp::Heartbeat {
+            bead: "beads-1al".to_string(),
+            actor: "me".to_string(),
+        };
+        // Zero exit, schema-valid, error-free — and no `data` key at all. The
+        // guardian treats a successful heartbeat as proof the lease is still
+        // held and appends a beat-file line on it, so this envelope must not
+        // pass as one.
+        let no_data = Ok(RawOutcome {
+            exit: Some(0),
+            stdout: r#"{"schema_version": 1}"#.to_string(),
+            stderr: String::new(),
+        });
+        let mut runner = Canned::new(vec![no_data]);
+        let err = write_policy(&op, &mut runner, false, "bd heartbeat")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert_eq!(runner.runs, 1);
+
+        // `data: null` is a PRESENT key (the empty-list shape) and stays a beat.
+        let null_data = Ok(RawOutcome {
+            exit: Some(0),
+            stdout: r#"{"data": null, "schema_version": 1}"#.to_string(),
+            stderr: String::new(),
+        });
+        let mut runner = Canned::new(vec![null_data]);
+        write_policy(&op, &mut runner, false, "bd heartbeat")
+            .await
+            .expect("a present data key, even null, is a beat");
+    }
+
+    #[tokio::test]
+    async fn a_terminally_timed_out_heartbeat_never_becomes_lease_held() {
+        let t = || {
+            Err(BdError::Timeout {
+                context: "bd heartbeat".to_string(),
+                after_s: 60,
+            })
+        };
+        let op = WriteOp::Heartbeat {
+            bead: "beads-1al".to_string(),
+            actor: "me".to_string(),
+        };
+        let mut runner = Canned::new(vec![t(), t()]);
+        // Even with another holder there to be found, the heartbeat contract
+        // forbids LeaseHeld — callers act on "lease lost" differently from
+        // "bd did not answer".
+        runner.reread = Some("someone-else".to_string());
+        let err = write_policy(&op, &mut runner, false, "bd heartbeat")
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(err, BdError::Timeout { after_s: 60, .. }),
+            "got {err:?}"
+        );
+        assert_eq!(runner.rereads, 0, "heartbeats never re-read");
     }
 
     #[tokio::test]

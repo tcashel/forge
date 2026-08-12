@@ -219,6 +219,29 @@ pub async fn slot_check(bd: &BdConfig) -> Result<SlotStatus, BdError> {
     })
 }
 
+/// Whether bd's acquire response proves that THIS holder now owns the slot.
+///
+/// Two guards, both load-bearing because [`AcquiredSlot`] is the caller's
+/// proof of ownership — the ledger persists it and later release/reap
+/// decisions trust it. First, the child must have exited 0: the spec's
+/// classify rule for merge-slot commands is exit-status-and-shape driven (a
+/// held acquire exits 1), so an `acquired: true` printed alongside a refusal
+/// exit is not an acquisition. Second, when the raw response names a holder
+/// (or actor) itself, it must name the one we asked for — a response
+/// describing someone else's acquisition is not ours to record. A response
+/// naming no holder at all is carried by the zero exit alone, which is the
+/// shape bd 1.2.1 emits for `merge-slot create`-adjacent commands.
+fn acquire_confirmed(exit: Option<i32>, raw: &Value, holder: &str) -> bool {
+    if exit != Some(0) {
+        return false;
+    }
+    ["holder", "actor"]
+        .iter()
+        .filter_map(|k| raw.get(*k).and_then(Value::as_str))
+        .filter(|h| !h.is_empty())
+        .all(|h| h == holder)
+}
+
 /// Acquire the merge slot for `holder`, retrying with the module-4 backoff
 /// while it is busy, up to the caller-supplied `budget` of cumulative sleep.
 /// When the budget would be exceeded, returns [`BdError::SlotBusy`] with the
@@ -228,6 +251,10 @@ pub async fn slot_check(bd: &BdConfig) -> Result<SlotStatus, BdError> {
 /// "holder-x", "id": "beads-merge-slot"}`, exit 0; held `{"acquired": false,
 /// "holder": "holder-x", "id": "beads-merge-slot"}`, exit 1 — exactly that
 /// outcome is slot-busy, never `Contention`, `LeaseHeld`, or `Beads`.
+///
+/// An [`AcquiredSlot`] comes back only when the acquire is CONFIRMED (see
+/// `acquire_confirmed`): zero exit, and a response that either names no holder
+/// or names the requested one. Anything weaker takes the slot-busy backoff.
 pub async fn slot_acquire(
     bd: &BdConfig,
     holder: &str,
@@ -261,14 +288,20 @@ pub async fn slot_acquire(
         };
         if let Ok(raw) = serde_json::from_str::<Value>(&out.stdout) {
             match raw.get("acquired").and_then(Value::as_bool) {
-                Some(true) => {
+                Some(true) if acquire_confirmed(out.exit, &raw, holder) => {
                     return Ok(AcquiredSlot {
                         holder: holder.to_string(),
                         acquired_at_epoch_s: epoch_s(),
                         raw,
                     });
                 }
-                Some(false) => {
+                // An `acquired: true` that the exit status or the response's
+                // own holder field does not confirm is NOT proof this holder
+                // owns the slot, and `AcquiredSlot` is exactly that proof —
+                // the ledger persists it and later release/reap decisions
+                // trust it. Treat it like any other unconfirmed acquire: back
+                // off and retry within the budget.
+                Some(true) | Some(false) => {
                     busy_attempts += 1;
                     // Floor each accounted sleep at 1 ms so a run of 0-draws
                     // cannot spin past the budget forever.
@@ -385,5 +418,55 @@ pub async fn reap_stale_holders(bd: &BdConfig, recorded: &[RecordedHolder]) -> R
         // Fail-closed: a failed release is reported as an empty report, not
         // a claimed success.
         Err(_) => ReapReport { entries: vec![] },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn acquire_is_confirmed_only_by_a_zero_exit_naming_this_holder() {
+        // The observed bd 1.2.1 success shape.
+        let ours = json!({"acquired": true, "holder": "holder-x", "id": "beads-merge-slot"});
+        assert!(acquire_confirmed(Some(0), &ours, "holder-x"));
+
+        // bd refused, or died on a signal, while still printing acquired: true.
+        assert!(!acquire_confirmed(Some(1), &ours, "holder-x"));
+        assert!(!acquire_confirmed(None, &ours, "holder-x"));
+
+        // The response describes a DIFFERENT holder's acquisition.
+        assert!(!acquire_confirmed(Some(0), &ours, "holder-y"));
+
+        // An `actor` field is held to the same rule.
+        let actor = json!({"acquired": true, "actor": "holder-z"});
+        assert!(!acquire_confirmed(Some(0), &actor, "holder-x"));
+        assert!(acquire_confirmed(Some(0), &actor, "holder-z"));
+
+        // A response that names nobody is carried by the zero exit alone; an
+        // empty or null holder field names nobody either.
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "id": "beads-merge-slot"}),
+            "holder-x"
+        ));
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "holder": "", "id": "beads-merge-slot"}),
+            "holder-x"
+        ));
+        assert!(acquire_confirmed(
+            Some(0),
+            &json!({"acquired": true, "holder": null}),
+            "holder-x"
+        ));
+    }
+
+    #[test]
+    fn a_holder_must_be_non_empty_and_newline_free() {
+        assert!(validate_holder("cc:host:4242").is_ok());
+        assert!(validate_holder("").is_err());
+        assert!(validate_holder("cc:host:4242\nrelease").is_err());
     }
 }

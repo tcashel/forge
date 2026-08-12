@@ -1,4 +1,16 @@
-//! The two spines every bd call goes through: [`read`] and [`write`].
+//! The two spines every bd call goes through: `read` and `write`.
+//!
+//! Both spines — and the `WriteOp` shape they classify against — are
+//! CRATE-INTERNAL. They take an arbitrary argv, so exporting them would put a
+//! bare `bd merge-slot release` with no holder, an unscoped `bd reclaim`, or
+//! bd's documented claim-theft bypass flag back within a caller's reach, and
+//! defeat the type-level guarantees the frozen public surface exists to give
+//! ("no bare-release call is constructible from this crate's API", "an
+//! unscoped or half-scoped reclaim is unconstructible"). Consumers get the
+//! frozen typed operations in [`crate::lease`], [`crate::slot`],
+//! [`crate::doctor`] and the mirror module, and nothing else; the
+//! `raw: serde_json::Value` on every result struct is the escape hatch for
+//! fields this API does not model.
 //!
 //! Every bd child is spawned with `tokio::process::Command`,
 //! `kill_on_drop(true)`, `env_clear()` and an explicit allowlist and nothing
@@ -29,7 +41,7 @@ use crate::envelope;
 /// Operation shape for module-4 classification — the write policy is
 /// operation-aware.
 #[derive(Debug, Clone)]
-pub enum WriteOp {
+pub(crate) enum WriteOp {
     /// A claim operation (`bd update --claim`, `bd ready --claim`): the
     /// claim-CAS refusal copy maps to [`BdError::LeaseHeld`] immediately.
     Claim {
@@ -261,7 +273,7 @@ fn context_of(args: &[&str]) -> String {
 /// Run a bd READ directly: no lock, no retries, and no classification beyond
 /// envelope parsing. A nonzero exit yields [`BdError::Beads`] with both
 /// streams attached; a zero exit yields the envelope `data`.
-pub async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError> {
+pub(crate) async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError> {
     let context = context_of(args);
     let out = run_bd(cfg, args, cfg.read_timeout_s, &context).await?;
     if out.exit != Some(0) {
@@ -302,7 +314,7 @@ pub async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError> {
 /// policy entirely. It is retried once and then classified terminally like
 /// any other unknown failure (best-effort re-read first, so a write blocked
 /// by another holder surfaces as `LeaseHeld`).
-pub async fn write(cfg: &BdConfig, op: WriteOp, args: &[&str]) -> Result<Value, BdError> {
+pub(crate) async fn write(cfg: &BdConfig, op: WriteOp, args: &[&str]) -> Result<Value, BdError> {
     let context = context_of(args);
     let mut runner = LiveRunner {
         cfg,
