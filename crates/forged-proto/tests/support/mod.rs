@@ -263,6 +263,7 @@ impl ViewBuilder {
             state: AttemptState::Completed,
             outcome: Some(outcome),
             fail_note: None,
+            started_at: T0.to_owned(),
         });
         self
     }
@@ -277,6 +278,7 @@ impl ViewBuilder {
             state: AttemptState::Failed,
             outcome: None,
             fail_note: Some(note.to_owned()),
+            started_at: T0.to_owned(),
         });
         self
     }
@@ -291,6 +293,7 @@ impl ViewBuilder {
             state: AttemptState::Reclaimed,
             outcome: None,
             fail_note: None,
+            started_at: T0.to_owned(),
         });
         self
     }
@@ -362,6 +365,7 @@ impl ViewBuilder {
             transport_retry_budget: self.budget,
             now: T0.to_owned(),
             execution_package: None,
+            active_roster_revision: None,
             profile_escalations: Vec::new(),
         }
     }

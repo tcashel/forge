@@ -64,6 +64,7 @@ pub fn project_run(
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
     let profile_escalations = parse_profile_escalations(&events)?;
+    let mut active_roster_revision = None;
     let execution_package = match ledger.get_run_definition(run_id)? {
         Some(definition) => {
             let mut package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
@@ -80,8 +81,9 @@ pub fn project_run(
                         ))
                     })?;
                 package.roster_ref = resolved.roster_ref.clone();
-                package.roster_sha256 = revision.roster_sha256;
+                package.roster_sha256 = revision.roster_sha256.clone();
                 package.roster = resolved;
+                active_roster_revision = Some(revision);
             }
             Some(package)
         }
@@ -100,6 +102,7 @@ pub fn project_run(
         transport_retry_budget,
         now: now.to_owned(),
         execution_package,
+        active_roster_revision,
         profile_escalations,
     })
 }
@@ -221,8 +224,8 @@ fn reconstruct_terminal_attempts(
             .get("reason")
             .and_then(Value::as_str)
             .map(str::to_owned);
+        let attempt = ledger.get_attempt(attempt_id)?;
         let outcome = if state == AttemptState::Completed {
-            let attempt = ledger.get_attempt(attempt_id)?;
             attempt
                 .result_json
                 .as_deref()
@@ -242,6 +245,7 @@ fn reconstruct_terminal_attempts(
             state,
             outcome,
             fail_note,
+            started_at: attempt.started_at,
         });
     }
     Ok(out)

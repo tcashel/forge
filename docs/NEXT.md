@@ -59,6 +59,11 @@ forged epic start --epic <epic-id> --repo /absolute/repo \
 forged epic submit --epic <epic-id>
 ```
 
+Resolving a child-specific stop retires that terminal child binding from the
+epic projection. The next wave starts a fresh child run generation (for
+example, `<child>-g2`) from the adjudicated spec; it never reuses or silently
+accepts the unclean terminal run.
+
 Forged freezes the Beads inventory, drives ready children in waves, and
 squash-merges only mechanically clean slices into
 `forged/epic-<epic-id>`. It never merges that branch to the default branch. A

@@ -174,14 +174,16 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 
 // ------------------------------------------------------------- run start
 
-/// `run start` — mint the RunId from the bead id and fill `NewRun` from the
-/// config plus the `--repo`, `--spec`, and `--base-ref` arguments.
+/// `run start` — mint the RunId from the bead id (or the epic scheduler's
+/// explicit child generation id) and fill `NewRun` from the config plus the
+/// `--repo`, `--spec`, and `--base-ref` arguments.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let bead = match param_str(&req.params, "bead") {
         Ok(v) => v.to_owned(),
         Err(f) => return err_response(&derive_key("run_start", None, None, None), &f),
     };
-    let run_id = match RunId::new(bead.clone()) {
+    let run_name = param_opt_str(&req.params, "run").unwrap_or(&bead);
+    let run_id = match RunId::new(run_name.to_owned()) {
         Ok(id) => id,
         Err(e) => {
             return err_response(
@@ -227,7 +229,7 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                             .unwrap_or_else(|_| "validation failed".to_owned())
                     ))
                 })?;
-            let branch = format!("forged/{bead}");
+            let branch = format!("forged/{run_id}");
             let new_run = NewRun {
                 run_id: run_id.clone(),
                 bead_id: bead.clone(),

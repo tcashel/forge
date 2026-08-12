@@ -241,11 +241,13 @@ pub fn split_packet_key(packet_id: &str) -> Result<(String, String, i64), Failur
 /// (operator adjudication, 2026-08-12).
 pub const FRONTIER_HOLDER: &str = "forged:frontier:0";
 
-/// The driver's derived lease-holder id for a run: seam contract 5's
+/// The driver's derived lease-holder id for a Bead execution chain: seam contract 5's
 /// `<provider>:<session-or-host>:<pid>` shape, filled with what a LEASE can
 /// honestly carry — `forged` (the DRIVER claims the bead, not the model
 /// vendor: one run drives both provider families under this one lease), the
-/// run as the session ref, and a fixed `0` pid segment.
+/// Bead as the session ref, and a fixed `0` pid segment. Child run generations
+/// deliberately share this identity: the Bead owns one lease while each
+/// generation keeps independent run, branch, packet, and controller state.
 ///
 /// The fixed pid is load-bearing, not laziness. The lease must resolve to
 /// the same string in every process that touches it — the driver that took
@@ -255,8 +257,8 @@ pub const FRONTIER_HOLDER: &str = "forged:frontier:0";
 /// holder. Real per-process, per-attempt identity — a real provider and a
 /// real pid — is [`session_claimant`], which is STORED on the attempt row
 /// rather than re-derived, and so can carry values only one process knows.
-pub fn run_holder(run_id: &str) -> String {
-    format!("forged:{run_id}:0")
+pub fn run_holder(bead_id: &str) -> String {
+    format!("forged:{bead_id}:0")
 }
 
 /// The bd lease identity in force for a run: the holder forged already has
@@ -273,9 +275,9 @@ pub fn run_holder(run_id: &str) -> String {
 pub async fn lease_identity(
     bd: &forged_beads::BdConfig,
     bead: &str,
-    run_id: &str,
+    _run_id: &str,
 ) -> Result<String, Failure> {
-    let derived = run_holder(run_id);
+    let derived = run_holder(bead);
     let current = forged_beads::lease_holder(bd, bead).await?;
     Ok(match current {
         Some(held) if held == derived || held == FRONTIER_HOLDER => held,

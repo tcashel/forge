@@ -11,7 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{
-    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RunRow, RunState,
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow, RunRow,
+    RunState,
 };
 use forged_types::{
     EscalationTrigger, ExecutionPackageV1, Outcome, ProfileDefinitionV1, ProviderHints,
@@ -83,6 +84,9 @@ pub struct RunView {
     /// Immutable execution package with its latest explicit roster revision
     /// projected over the package's original roster. Absent on legacy runs.
     pub execution_package: Option<ExecutionPackageV1>,
+    /// The roster revision overlaid into `execution_package`. Its durable
+    /// creation boundary resets transport fallback for the revised roster.
+    pub active_roster_revision: Option<RosterRevisionRow>,
     /// Durable adaptive-profile transitions, in event order.
     pub profile_escalations: Vec<ProfileEscalation>,
 }
@@ -109,6 +113,9 @@ pub struct TerminalAttempt {
     pub outcome: Option<Outcome>,
     /// The note supplied to `fail_packet`, for failed attempts.
     pub fail_note: Option<String>,
+    /// Durable attempt start time, used to associate transport fallback with
+    /// the roster revision active when the attempt began.
+    pub started_at: String,
 }
 
 /// One packet the caller must open.

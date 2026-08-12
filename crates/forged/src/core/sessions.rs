@@ -343,6 +343,22 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         None,
         {
             move |operation_id| async move {
+                let attempt = match target_attempt {
+                    Some(attempt_id) => {
+                        let attempt =
+                            on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
+                                .await?;
+                        let (attempt_run, _, _) =
+                            crate::core::split_packet_key(&attempt.packet_id)?;
+                        if attempt_run != run_id {
+                            return Err(Failure::invalid(format!(
+                                "attempt {attempt_id} does not belong to run {run_id}"
+                            )));
+                        }
+                        Some(attempt)
+                    }
+                    None => None,
+                };
                 on_ledger(&ctx.ledger, {
                     let run_id = run_id.clone();
                     let intervention_id = operation_id.clone();
@@ -366,17 +382,10 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                 })
                 .await?;
 
-                let Some(attempt_id) = target_attempt else {
+                let Some(attempt) = attempt else {
                     return Ok(json!({"interventionId": operation_id, "delivery": "queued"}));
                 };
-                let attempt =
-                    on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
-                let (attempt_run, _, _) = crate::core::split_packet_key(&attempt.packet_id)?;
-                if attempt_run != run_id {
-                    return Err(Failure::invalid(format!(
-                        "attempt {attempt_id} does not belong to run {run_id}"
-                    )));
-                }
+                let attempt_id = attempt.attempt_id;
                 if attempt.state != AttemptState::Running
                     || !interactive_capability(ctx, &run_id, attempt_id).await?
                 {

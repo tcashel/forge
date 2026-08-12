@@ -904,6 +904,30 @@ impl TestEnv {
         .expect("write fallback config");
     }
 
+    /// Append one implementation candidate to an existing named roster.
+    pub fn append_implementation_candidate(&self, name: &str, provider: &str, model: &str) {
+        let path = self.anvil.join("config.json");
+        let mut config: Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).expect("read roster config"))
+                .expect("roster config json");
+        let candidates = config
+            .pointer_mut(&format!("/rosters/{name}/roles/implementation"))
+            .and_then(Value::as_array_mut)
+            .expect("implementation candidates");
+        candidates.push(json!({
+            "provider": provider,
+            "model": model,
+            "effort": (provider == "codex").then_some("xhigh"),
+            "sandbox": "workspaceWrite",
+            "capabilities": ["repositoryRead", "repositoryWrite", "structuredOutput"],
+        }));
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&config).expect("roster config json"),
+        )
+        .expect("write roster config");
+    }
+
     /// The environment a forged child (or MCP server) runs under.
     pub fn forged_cmd(&self, args: &[&str]) -> Command {
         let mut cmd = Command::new(env!("CARGO_BIN_EXE_forged"));

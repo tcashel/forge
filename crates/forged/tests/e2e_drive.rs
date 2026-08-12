@@ -3,6 +3,8 @@
 //! shim call log shows exactly one draft PR creation and zero merge or
 //! ready-for-review calls; the origin repo holds the real commits.
 
+use std::process::Stdio;
+
 mod support;
 
 use serde_json::{json, Value};
@@ -228,6 +230,213 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     ] {
         assert!(kinds.contains(&kind), "{kind} is durable: {kinds:?}");
     }
+}
+
+#[test]
+fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
+    let env = TestEnv::new("forged-session-ownership");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    for bead in ["bead-message-target", "bead-message-owner"] {
+        let (code, started) = env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            bead,
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+            "--profile",
+            "lean",
+        ]);
+        assert_eq!(code, 0, "start {bead}: {started}");
+    }
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-message-owner"]);
+    assert_eq!(code, 0, "owner drive: {driven}");
+    let owner_attempt = env
+        .ledger()
+        .get_attempt(1)
+        .expect("owner implementation attempt");
+    assert!(
+        owner_attempt.packet_id.starts_with("bead-message-owner/"),
+        "attempt fixture belongs to the owner run"
+    );
+
+    let (code, refused) = env.forged(&[
+        "session",
+        "message",
+        "--run",
+        "bead-message-target",
+        "--attempt",
+        &owner_attempt.attempt_id.to_string(),
+        "--message",
+        "must not cross the run boundary",
+    ]);
+    assert_ne!(code, 0, "cross-run target must be refused: {refused}");
+    assert!(refused["error"]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("does not belong")));
+    let (_, events) = env.forged(&["events", "--run", "bead-message-target", "--limit", "1000"]);
+    assert!(events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .all(|event| event["kind"] != json!("forged.intervention.queued")));
+}
+
+#[test]
+fn concurrent_submit_keys_share_one_controller_generation() {
+    let env = TestEnv::new("forged-submit-singleton");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-submit-singleton",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.set_scenario("implement", "slow", 1);
+
+    let spawn = |key: &str| {
+        env.forged_cmd(&[
+            "run",
+            "submit",
+            "--run",
+            "bead-submit-singleton",
+            "--idempotency-key",
+            key,
+        ])
+        .stdout(Stdio::piped())
+        .spawn()
+        .expect("submitter spawns")
+    };
+    let first = spawn("submit-race-a");
+    let second = spawn("submit-race-b");
+    let outputs = [
+        first.wait_with_output().expect("first submit exits"),
+        second.wait_with_output().expect("second submit exits"),
+    ];
+    let responses = outputs
+        .iter()
+        .map(|output| {
+            assert!(output.status.success(), "submit output: {output:?}");
+            serde_json::from_slice::<Value>(&output.stdout).expect("submit response")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response["result"]["submitted"] == json!(true))
+            .count(),
+        1,
+        "one request spawns: {responses:?}"
+    );
+    assert_eq!(
+        responses
+            .iter()
+            .filter(|response| response["result"]["alreadyRunning"] == json!(true))
+            .count(),
+        1,
+        "the other request adopts: {responses:?}"
+    );
+
+    let status = wait_for(
+        &env,
+        &["run", "status", "--run", "bead-submit-singleton"],
+        |value| value["result"]["run"]["nextAction"]["stop"]["done"].is_object(),
+    );
+    assert_eq!(
+        status["result"]["run"]["controller"]["generation"],
+        json!(1)
+    );
+    let (_, events) = env.forged(&[
+        "events",
+        "--run",
+        "bead-submit-singleton",
+        "--limit",
+        "1000",
+    ]);
+    let controller_starts = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.controller.started"))
+        .count();
+    assert_eq!(controller_starts, 1, "one durable controller identity");
+}
+
+#[test]
+fn resolving_an_unclean_child_starts_a_fresh_generation() {
+    let env = TestEnv::new("forged-epic-child-retry");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-retry", &[("child-retry", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-retry",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    env.set_scenario("implement", "no-block", 1);
+    let (code, stopped) = env.forged(&["epic", "drive", "--epic", "epic-retry"]);
+    assert_eq!(code, 0, "first drive reaches input: {stopped}");
+    assert_eq!(
+        stopped["result"]["stopped"]["code"],
+        json!("child-not-clean"),
+        "unexpected first-generation stop: {stopped}"
+    );
+
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-retry",
+        "--child",
+        "child-retry",
+        "--note",
+        "spec corrected; execute a fresh slice",
+    ]);
+    assert_eq!(code, 0, "resolve: {resolved}");
+    env.set_scenario("reviewclaude", "approve", 1);
+    let (code, driven) = env.forged(&["epic", "drive", "--epic", "epic-retry"]);
+    assert_eq!(code, 0, "second generation drive: {driven}");
+    assert!(
+        driven["result"]["stopped"]["finalPr"].is_object(),
+        "second generation reaches the epic PR: {driven}"
+    );
+    let (_, status) = env.forged(&["epic", "status", "--epic", "epic-retry"]);
+    assert_eq!(
+        status["result"]["children"][0]["runId"],
+        json!("child-retry-g2")
+    );
+    assert_eq!(status["result"]["children"][0]["generation"], json!(2));
+    assert!(status["result"]["children"][0]["merged"].is_object());
+    assert!(status["result"]["inputRequired"].is_null());
 }
 
 #[test]
@@ -658,6 +867,84 @@ fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
     assert_eq!(
         completed_implementation, 1,
         "exactly one implementation landed"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
+    let env = TestEnv::new("forged-roster-revision-fallback");
+    env.forged(&["init"]);
+    env.add_uniform_roster("revised-order", "claude", "opus");
+    env.append_implementation_candidate("revised-order", "codex", "gpt-5.6-sol");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-revision-fallback",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.set_scenario("implement", "rate-limit", 1);
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-revision-fallback"]);
+        assert_eq!(code, 0, "advance to retry boundary: {advanced}");
+    }
+    let first = env.ledger().get_attempt(1).expect("old roster attempt");
+    assert_eq!(first.state, forged_ledger::AttemptState::Failed);
+    assert!(first.claimant.starts_with("claude:"), "{first:?}");
+
+    let (code, revised) = env.forged(&[
+        "run",
+        "revise-roster",
+        "--run",
+        "bead-revision-fallback",
+        "--roster",
+        "revised-order",
+        "--reason",
+        "switch after transport failure",
+    ]);
+    assert_eq!(code, 0, "revise: {revised}");
+    assert_eq!(revised["result"]["revision"], json!(2));
+
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
+            ["bead-revision-fallback"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retry event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+    drop(connection);
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-revision-fallback"]);
+    assert_eq!(code, 0, "drive revised roster: {driven}");
+    let ledger = env.ledger();
+    let first_revised = ledger.get_attempt(2).expect("first revised attempt");
+    assert!(
+        first_revised.claimant.starts_with("claude:"),
+        "the revised roster starts at candidate zero: {first_revised:?}"
     );
     ledger.close().expect("close ledger");
 }

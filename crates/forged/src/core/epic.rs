@@ -20,6 +20,7 @@ const STARTED: &str = "forged.epic.started";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
 const WAVE_STARTED: &str = "forged.epic.wave.started";
 const CHILD_STARTED: &str = "forged.epic.child.started";
+const CHILD_RESET: &str = "forged.epic.child.reset";
 const CHILD_MERGED: &str = "forged.epic.child.merged";
 const INPUT_REQUIRED: &str = "forged.epic.input.required";
 const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
@@ -52,6 +53,7 @@ struct EpicConfig {
 struct ChildState {
     run_id: String,
     wave: u32,
+    generation: u32,
     merged: Option<Value>,
 }
 
@@ -60,6 +62,7 @@ struct EpicView {
     integration: Option<Value>,
     waves: Vec<Value>,
     children: BTreeMap<String, ChildState>,
+    child_generations: BTreeMap<String, u32>,
     input: Option<Value>,
     paused: Option<Value>,
     pr: Option<Value>,
@@ -131,6 +134,7 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         integration: None,
         waves: Vec::new(),
         children: BTreeMap::new(),
+        child_generations: BTreeMap::new(),
         input: None,
         paused: None,
         pr: None,
@@ -143,14 +147,31 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
             CHILD_STARTED => {
                 let event = payload(&row)?;
                 let child = string(&event, "childId")?;
+                let generation = event
+                    .get("generation")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok())
+                    .unwrap_or_else(|| {
+                        view.child_generations
+                            .get(&child)
+                            .copied()
+                            .unwrap_or(0)
+                            .saturating_add(1)
+                    });
+                view.child_generations.insert(child.clone(), generation);
                 view.children.insert(
                     child,
                     ChildState {
                         run_id: string(&event, "runId")?,
                         wave: event.get("wave").and_then(Value::as_u64).unwrap_or(0) as u32,
+                        generation,
                         merged: None,
                     },
                 );
+            }
+            CHILD_RESET => {
+                let event = payload(&row)?;
+                view.children.remove(&string(&event, "childId")?);
             }
             CHILD_MERGED => {
                 let event = payload(&row)?;
@@ -480,6 +501,7 @@ fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str
         "beadsStatus": bead_status,
         "runId": state.map(|value| value.run_id.as_str()),
         "wave": state.map(|value| value.wave),
+        "generation": state.map(|value| value.generation),
         "merged": state.and_then(|value| value.merged.as_ref()),
     })
 }
@@ -618,13 +640,20 @@ async fn start_child(
     config: &EpicConfig,
     child: &FrozenChild,
     wave: u32,
+    generation: u32,
 ) -> Result<Value, Failure> {
+    let run_id = if generation == 1 {
+        child.id.clone()
+    } else {
+        format!("{}-g{generation}", child.id)
+    };
     let mut request = OperationRequest {
         schema_version: 1,
-        idempotency_key: derive_key("run_start", Some(&child.id), None, None),
-        run_id: Some(child.id.clone()),
+        idempotency_key: derive_key("run_start", Some(&run_id), None, None),
+        run_id: Some(run_id.clone()),
         params: match json!({
             "bead": child.id,
+            "run": run_id,
             "repo": config.repo,
             "spec": child.spec_path,
             "baseRef": config.integration_branch,
@@ -638,8 +667,9 @@ async fn start_child(
     let started = response(super::ops::run_start(ctx, &mut request).await)?;
     let event = json!({
         "childId": child.id,
-        "runId": child.id,
+        "runId": run_id,
         "wave": wave,
+        "generation": generation,
         "branch": started.get("branch"),
         "baseRef": config.integration_branch,
     });
@@ -743,7 +773,7 @@ async fn merge_child(
     .await?;
     let event = json!({
         "childId": child.id,
-        "runId": child.id,
+        "runId": run.run.run_id,
         "pr": pr_number,
         "ready": ready,
         "merge": merged,
@@ -966,8 +996,14 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
         });
         append(ctx, epic, WAVE_STARTED, wave_event).await?;
     }
+    let generation = view
+        .child_generations
+        .get(&frontier[0].id)
+        .copied()
+        .unwrap_or(0)
+        .saturating_add(1);
     Ok(Step::Progress(
-        start_child(ctx, &view.config, frontier[0], wave).await?,
+        start_child(ctx, &view.config, frontier[0], wave, generation).await?,
     ))
 }
 
@@ -1109,12 +1145,36 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     "child {child:?} is not in epic {epic:?}"
                 )));
             }
+            let Some(input) = view.input.as_ref() else {
+                return Err(Failure::invalid(format!(
+                    "epic {epic:?} has no input requirement to resolve"
+                )));
+            };
+            if input.get("childId").and_then(Value::as_str) != Some(child.as_str()) {
+                return Err(Failure::invalid(format!(
+                    "epic {epic:?} input requirement does not target child {child:?}"
+                )));
+            }
             let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
             if issue.status != "closed" && issue.status != "open" {
                 forged_beads::reopen_issue(
                     &ctx.config.bd_config(),
                     &child,
                     &format!("forged:{epic}"),
+                )
+                .await?;
+            }
+            if let Some(previous) = view.children.get(&child) {
+                append(
+                    ctx,
+                    &epic,
+                    CHILD_RESET,
+                    json!({
+                        "childId": child,
+                        "previousRunId": previous.run_id,
+                        "nextGeneration": previous.generation.saturating_add(1),
+                        "note": note,
+                    }),
                 )
                 .await?;
             }

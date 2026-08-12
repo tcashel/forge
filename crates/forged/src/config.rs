@@ -396,42 +396,43 @@ impl ForgedConfig {
         };
         let mut errors = Vec::new();
         let mut profile_catalog = BTreeMap::new();
-        let mut cursor = Some(profile.clone());
+        let mut cursor = Some((profile_name.to_owned(), profile.clone()));
         let mut seen = BTreeSet::new();
-        while let Some(current) = cursor {
+        while let Some((reference, current)) = cursor {
             let name = current.name.clone();
-            if !seen.insert(name.clone()) {
+            if !seen.insert(reference.clone()) {
                 errors.push(DefinitionError {
                     path: "$.profile.escalateTo".to_owned(),
-                    message: format!("escalation cycle reaches {name:?}"),
+                    message: format!("escalation cycle reaches {reference:?}"),
                 });
                 break;
+            }
+            if name != reference {
+                errors.push(DefinitionError {
+                    path: format!("$.profiles.{reference}.name"),
+                    message: format!(
+                        "definition name {name:?} does not match referenced key {reference:?}"
+                    ),
+                });
             }
             errors.extend(current.validate());
             errors.extend(roster.validate_for(&current));
             let next = current.escalate_to.as_ref().and_then(|target| {
                 match self.profiles.get(&target.name) {
-                    Some(value) if target.version == 1 => Some(value.clone()),
+                    Some(value) if target.version == 1 => {
+                        Some((target.name.clone(), value.clone()))
+                    }
                     _ => {
                         errors.push(DefinitionError {
-                            path: format!("$.profiles.{name}.escalateTo"),
+                            path: format!("$.profiles.{reference}.escalateTo"),
                             message: format!("missing escalation target {:?}", target.name),
                         });
                         None
                     }
                 }
             });
-            profile_catalog.insert(name, current);
+            profile_catalog.insert(reference, current);
             cursor = next;
-        }
-        if profile.name != profile_name {
-            errors.push(DefinitionError {
-                path: "$.profile.name".to_owned(),
-                message: format!(
-                    "definition name {:?} does not match selected key {profile_name:?}",
-                    profile.name
-                ),
-            });
         }
         if roster.name != roster_name {
             errors.push(DefinitionError {
@@ -818,6 +819,19 @@ mod tests {
         for profile in ["lean", "standard", "high"] {
             assert!(cfg.compile_definition(Some(profile), None).is_ok());
         }
+    }
+
+    #[test]
+    fn reachable_profile_names_must_match_their_map_keys() {
+        let mut cfg = config();
+        cfg.profiles.get_mut("high").expect("high profile").name = "misnamed".to_owned();
+        let errors = cfg
+            .compile_definition(Some("standard"), None)
+            .expect_err("reachable mismatched profile must fail");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.profiles.high.name"
+                && error.message.contains("referenced key \"high\"")
+        }));
     }
 
     #[test]

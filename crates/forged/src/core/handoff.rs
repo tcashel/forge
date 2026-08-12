@@ -4,11 +4,12 @@
 //! remains execution truth. Herdr supplies a durable pane when available.
 
 use std::collections::HashMap;
+use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
-use forged_ledger::{EffectClass, OperationState};
+use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
@@ -24,6 +25,7 @@ const PID_FILE: &str = "controller.pid";
 const LSTART_FILE: &str = "controller.lstart";
 const RECORD_FILE: &str = "controller.json";
 const OUTPUT_FILE: &str = "controller.log";
+const SUBMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -77,6 +79,105 @@ fn pid_alive(pid: i32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
+}
+
+fn lstart_hash(value: &str) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    value.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn submit_holder_identity(holder: &str) -> Option<(i32, Option<u64>)> {
+    let mut fields = holder.strip_prefix("forged-submit:")?.split(':');
+    let pid = fields.next()?.parse().ok()?;
+    let identity = fields.next().and_then(|value| value.parse().ok());
+    Some((pid, identity))
+}
+
+struct SubmitGuard {
+    ledger: Ledger,
+    slot: String,
+    holder: String,
+}
+
+impl Drop for SubmitGuard {
+    fn drop(&mut self) {
+        let _ = self.ledger.release_merge_slot(&self.slot, &self.holder);
+    }
+}
+
+/// Serialize generation allocation and controller spawning per logical id.
+/// Request idempotency keys remain replay identities; they are deliberately
+/// not the singleton boundary.
+async fn acquire_submit(ctx: &Ctx, id: &str, scope: Scope) -> Result<SubmitGuard, Failure> {
+    let slot = format!("controller-submit:{}:{id}", scope.noun());
+    let pid = std::process::id() as i32;
+    let identity = crate::adapters::ports::lstart_of(pid)
+        .await
+        .map(|value| lstart_hash(&value));
+    let holder = format!(
+        "forged-submit:{}:{}:{}",
+        pid,
+        identity
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unknown".to_owned()),
+        uuid::Uuid::new_v4()
+    );
+    let started = Instant::now();
+    loop {
+        let outcome = {
+            let slot = slot.clone();
+            let holder = holder.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.acquire_merge_slot(&slot, &holder)
+            })
+            .await?
+        };
+        match outcome {
+            SlotOutcome::Acquired(_) => {
+                return Ok(SubmitGuard {
+                    ledger: ctx.ledger.clone(),
+                    slot,
+                    holder,
+                });
+            }
+            SlotOutcome::Held(row) => {
+                let stale = match submit_holder_identity(&row.holder) {
+                    Some((held_pid, held_identity)) => {
+                        !pid_alive(held_pid)
+                            || matches!(
+                                (
+                                    held_identity,
+                                    crate::adapters::ports::lstart_of(held_pid).await
+                                ),
+                                (Some(recorded), Some(current))
+                                    if recorded != lstart_hash(&current)
+                            )
+                    }
+                    None => false,
+                };
+                if stale {
+                    let slot = slot.clone();
+                    on_ledger(&ctx.ledger, move |ledger| {
+                        ledger.force_release_merge_slot(&slot)
+                    })
+                    .await?;
+                    continue;
+                }
+                if started.elapsed() >= SUBMIT_LOCK_WAIT {
+                    return Err(Failure::refused(
+                        ErrorCode::BeadsContention,
+                        format!(
+                            "{} {id} controller submission is still owned by {}",
+                            scope.noun(),
+                            row.holder
+                        ),
+                    ));
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+        }
+    }
 }
 
 async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
@@ -381,6 +482,15 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     if req.run_id.is_none() {
         req.run_id = Some(id.clone());
     }
+    let _submit_guard = match acquire_submit(ctx, &id, scope).await {
+        Ok(guard) => guard,
+        Err(error) => {
+            return err_response(
+                &derive_key(scope.operation(), Some(&id), None, None),
+                &error,
+            )
+        }
+    };
 
     let records = match events(ctx, &id).await {
         Ok(records) => records,

@@ -484,7 +484,14 @@ pub(crate) fn stored_packet_for_attempt(
         let failures = view
             .terminal_attempts
             .get(packet_id)
-            .map(|history| transport_fallback_index(history))
+            .map(|history| {
+                transport_fallback_index(
+                    history,
+                    view.active_roster_revision
+                        .as_ref()
+                        .map(|revision| revision.created_at.as_str()),
+                )
+            })
             .unwrap_or(0);
         let index = failures.min(candidates.len().saturating_sub(1));
         let candidate = candidates.get(index).ok_or_else(|| {
@@ -503,11 +510,15 @@ pub(crate) fn stored_packet_for_attempt(
     Ok(packet)
 }
 
-fn transport_fallback_index(history: &[forged_proto::TerminalAttempt]) -> usize {
+fn transport_fallback_index(
+    history: &[forged_proto::TerminalAttempt],
+    revision_started_at: Option<&str>,
+) -> usize {
     history
         .iter()
         .filter(|attempt| {
-            attempt.state == forged_ledger::AttemptState::Failed
+            revision_started_at.is_none_or(|boundary| attempt.started_at.as_str() >= boundary)
+                && attempt.state == forged_ledger::AttemptState::Failed
                 && forged_proto::classify_failure(attempt.fail_note.as_deref().unwrap_or(""))
                     == forged_proto::FailureKind::Transport
         })
@@ -539,7 +550,7 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
             // hashed for idempotency, so this must not vary with whatever
             // the bead happens to be held under at the moment of a redo.
             // The identity actually taken is reported in the result.
-            "leaseHolder": run_holder(&run.run_id),
+            "leaseHolder": run_holder(&run.bead_id),
             "repo": run.repo,
             "base": run.base_ref,
             "branch": run.branch,
@@ -874,23 +885,34 @@ mod adaptive_tests {
             state: AttemptState::Failed,
             outcome: None,
             fail_note: Some(note.to_owned()),
+            started_at: "2026-08-12T00:00:00.000000000Z".to_owned(),
         }
     }
 
     #[test]
     fn only_transport_failures_advance_the_ordered_provider_fallback() {
-        assert_eq!(transport_fallback_index(&[]), 0);
+        assert_eq!(transport_fallback_index(&[], None), 0);
         assert_eq!(
-            transport_fallback_index(&[failed("no forged-result block")]),
+            transport_fallback_index(&[failed("no forged-result block")], None),
             0
         );
         assert_eq!(
-            transport_fallback_index(&[
-                failed("transport: provider unavailable"),
-                failed("malformed result"),
-                failed("transport: rate limit"),
-            ]),
+            transport_fallback_index(
+                &[
+                    failed("transport: provider unavailable"),
+                    failed("malformed result"),
+                    failed("transport: rate limit"),
+                ],
+                None
+            ),
             2
+        );
+        assert_eq!(
+            transport_fallback_index(
+                &[failed("transport: provider unavailable")],
+                Some("2026-08-12T00:00:00.000000001Z"),
+            ),
+            0
         );
     }
 }
