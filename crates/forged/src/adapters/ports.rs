@@ -3,16 +3,18 @@
 //! crate deliberately does not own.
 //!
 //! Identity model (operator-adjudicated): the bd lease holder is the
-//! DRIVER's — one lease per slice, shared by every attempt of the run — and
-//! per-attempt session identity is the packet directory's `provider.pid`
-//! file plus the attempt row that names it. The two are deliberately
-//! different strings: `attempts.claimant` carries
-//! [`crate::core::session_claimant`], scoped to the packet, so the `session`
-//! this adapter receives resolves to exactly ONE attempt and one packet
-//! directory. Aggregating by the shared lease holder instead would let one
-//! Review leg report its sibling's liveness and let revoking one leg kill
-//! both providers. The lease holder is recovered from the session only at
-//! the `reclaim_lease` seam, where bd is the one that needs it.
+//! DRIVER's — one lease per slice, shared by every attempt of the run, and
+//! ONE string across every process that touches it
+//! ([`crate::core::lease_identity`]) — and per-attempt session identity is
+//! the packet directory's `provider.pid` file plus the attempt row that
+//! names it. The two are deliberately different strings:
+//! `attempts.claimant` carries [`crate::core::session_claimant`], scoped to
+//! the packet, so the `session` this adapter receives resolves to exactly
+//! ONE attempt and one packet directory. Aggregating by the shared lease
+//! holder instead would let one Review leg report its sibling's liveness and
+//! let revoking one leg kill both providers. The lease holder is recovered
+//! from the session only at the `reclaim_lease` seam, where bd is the one
+//! that needs it.
 //!
 //! A process that spawned an attempt holds its `HostSessionId` and asks the
 //! host; any other process reads the pid file, which under `ProcessHost`'s
@@ -23,6 +25,12 @@
 //! is verified against the start time captured at spawn. A packet directory
 //! with no `provider.pid` is a spawn that never happened: `Vanished`, never
 //! success.
+//!
+//! An identity that never materializes AT ALL is the adjudicated bounded
+//! orphan. Inside `IDENTITY_GRACE_S` the port defers; past it the attempt is
+//! settled as a transport failure carrying `ORPHAN_NOTE`, and never answered
+//! with `PortError::Unavailable` — see `ForgedPorts::fail_unidentifiable`
+//! for the containment argument.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -111,6 +119,59 @@ impl ForgedPorts {
         Ok(self.config.packet_dir(&run_id, stage, seq))
     }
 
+    /// Whether an attempt's process identity is past the window in which it
+    /// could still be materializing.
+    ///
+    /// The driver writes `provider.pid` (from the spawned shell itself) and
+    /// `provider.lstart` within a second or two of the spawn. Inside that
+    /// window a missing stamp means "the spawn is still in flight"; past it,
+    /// the only thing that writes those files is gone, so no later pass will
+    /// ever find them.
+    fn identity_grace_elapsed(&self, attempt: &AttemptRow) -> bool {
+        let anchor = attempt
+            .last_heartbeat_at
+            .as_deref()
+            .unwrap_or(&attempt.started_at);
+        let (Ok(anchor), Ok(now)) = (
+            anchor.parse::<jiff::Timestamp>(),
+            crate::config::now_iso().parse::<jiff::Timestamp>(),
+        ) else {
+            // An unparseable stamp is not evidence that the window is still
+            // open; treat the identity as never established rather than
+            // holding the attempt hostage to a bad row.
+            return true;
+        };
+        now.as_second().saturating_sub(anchor.as_second()) > IDENTITY_GRACE_S
+    }
+
+    /// Settle an attempt whose process identity was never established: fail
+    /// it as a TRANSPORT failure with the pinned note, so the packet reopens
+    /// on the transport-retry budget.
+    ///
+    /// This is the reconcile half of the bounded-orphan containment the
+    /// operator adjudicated (2026-08-12). A crash between the host spawn and
+    /// the shell writing `provider.pid` can leave a provider process no
+    /// later process can name, and therefore cannot kill. The residual is
+    /// accepted because it is contained: the orphan never heartbeats, so the
+    /// bd lease lapses and the packet is reclaimed, and its eventual result
+    /// is fenced by a claim token that is no longer live, so it is
+    /// quarantined rather than landed. What must NOT happen is the port
+    /// answering `Unavailable` — that aborts the whole reconcile pass and
+    /// wedges the attempt in `running`/`revoking` forever, which is exactly
+    /// the failure this path exists to rule out.
+    async fn fail_unidentifiable(&self, attempt: &AttemptRow) {
+        let packet_id = attempt.packet_id.clone();
+        let token = attempt.claim_token.clone();
+        let _ = self
+            .on_ledger(move |l| {
+                l.fail_packet(&packet_id, &token, ORPHAN_NOTE)
+                    // A row that already settled (revoking, failed, or won
+                    // by a racing reconciler) needs no settling from us.
+                    .or(Ok(()))
+            })
+            .await;
+    }
+
     /// One attempt's liveness, resolved per the identity model.
     async fn attempt_liveness(&self, attempt: &AttemptRow) -> Result<SessionLiveness, PortError> {
         let owned = self.sessions.lock().await.get(&attempt.attempt_id).cloned();
@@ -133,14 +194,30 @@ impl ForgedPorts {
             return Ok(SessionLiveness::Exited(code));
         }
         let Some(pid) = read_pid(&dir) else {
-            // A spawn that never happened.
+            // A spawn that never happened — or one whose shell died before
+            // it could say so. Past the grace window the attempt is settled
+            // as a transport failure rather than left for a kill that can
+            // never be aimed.
+            if self.identity_grace_elapsed(attempt) {
+                self.fail_unidentifiable(attempt).await;
+            }
             return Ok(SessionLiveness::Vanished);
         };
         // Only then the pid, guarded against reuse. An unverifiable identity
-        // never produces a death verdict — the same fail-safe direction the
-        // host's comparator takes when its capture came back empty.
-        if pid_alive(pid) && pid_identity(&dir, pid).await != PidIdentity::Recycled {
-            return Ok(SessionLiveness::Running);
+        // never produces a death verdict inside the grace window — the same
+        // fail-safe direction the host's comparator takes when its capture
+        // came back empty. Past it, the start stamp is never coming, so the
+        // attempt is settled instead of reported live forever.
+        match pid_identity(&dir, pid).await {
+            PidIdentity::Unverifiable if self.identity_grace_elapsed(attempt) => {
+                self.fail_unidentifiable(attempt).await;
+                return Ok(SessionLiveness::Vanished);
+            }
+            identity => {
+                if pid_alive(pid) && identity != PidIdentity::Recycled {
+                    return Ok(SessionLiveness::Running);
+                }
+            }
         }
         // Dead with no status file seen: re-read ONCE before concluding
         // Vanished — the sentinel may have landed in between.
@@ -178,6 +255,9 @@ impl ForgedPorts {
             return Ok(KillOutcome::AlreadyDead);
         }
         let Some(pid) = read_pid(&dir) else {
+            if self.identity_grace_elapsed(attempt) {
+                self.fail_unidentifiable(attempt).await;
+            }
             return Ok(KillOutcome::AlreadyDead);
         };
         if !pid_alive(pid) {
@@ -185,17 +265,29 @@ impl ForgedPorts {
         }
         // No signal until the pid is verifiably still OUR process. A
         // recycled pid means the session we were asked to kill is already
-        // dead; an unverifiable one is refused rather than guessed at —
-        // signalling a process we cannot identify is exactly the harm the
-        // guard exists to prevent, and proto resumes from the durable
-        // `revoking` marker on the next pass.
+        // dead; an unverifiable one is never signalled — signalling a
+        // process we cannot identify is exactly the harm the guard exists to
+        // prevent.
+        //
+        // Inside the grace window the start stamp may still be landing, so
+        // the port defers (`Unavailable`) and proto resumes from the durable
+        // `revoking` marker on the next pass. Past it the stamp is never
+        // coming: this is the adjudicated bounded orphan, so the attempt is
+        // failed as a transport failure and the kill reports the only honest
+        // answer it has — there is nothing here it may signal. `Unavailable`
+        // past the window would abort every reconcile pass of the run
+        // forever.
         match pid_identity(&dir, pid).await {
             PidIdentity::Recycled => return Ok(KillOutcome::AlreadyDead),
             PidIdentity::Unverifiable => {
+                if self.identity_grace_elapsed(attempt) {
+                    self.fail_unidentifiable(attempt).await;
+                    return Ok(KillOutcome::AlreadyDead);
+                }
                 return Err(PortError::Unavailable(format!(
-                    "attempt {attempt_id}: pid {pid} has no recorded start time; refusing to \
-                     signal a process whose identity cannot be verified"
-                )))
+                    "attempt {attempt_id}: pid {pid} has no recorded start time yet; deferring \
+                     rather than signalling a process whose identity cannot be verified"
+                )));
             }
             PidIdentity::Same => {}
         }
@@ -229,11 +321,35 @@ impl ForgedPorts {
         let run_id = run_id.to_owned();
         self.on_ledger(move |l| l.get_run(&run_id)).await
     }
+
+    /// The bd lease holder behind a per-attempt session claimant: the ONE
+    /// identity the run's lease is held under, for the run the session
+    /// names. `None` when the string is not a session claimant — then it is
+    /// already whatever identity the caller meant, and is used verbatim.
+    async fn lease_holder_of(
+        &self,
+        bd: &forged_beads::BdConfig,
+        bead: &str,
+        session: &str,
+    ) -> Option<String> {
+        let run_id = run_of_session(session)?;
+        crate::core::lease_identity(bd, bead, &run_id).await.ok()
+    }
 }
 
 /// The start-time stamp written beside `provider.pid` at spawn — the
 /// out-of-process half of the host's pid-reuse guard.
 pub const PROVIDER_LSTART: &str = "provider.lstart";
+
+/// How long after an attempt's last sign of life its process identity may
+/// still be materializing. Generous by an order of magnitude: the pid file
+/// and its start stamp are written within a second or two of the spawn.
+const IDENTITY_GRACE_S: i64 = 60;
+
+/// The pinned note for an attempt whose provider identity never appeared —
+/// `transport:`-prefixed, so the engine classifies it as a transport failure
+/// and the packet reopens on the transport-retry budget.
+const ORPHAN_NOTE: &str = "transport: provider identity never established";
 
 /// Read `<packet_dir>/provider.pid`.
 fn read_pid(packet_dir: &Path) -> Option<i32> {
@@ -298,14 +414,11 @@ fn pid_alive(pid: i32) -> bool {
     }
 }
 
-/// The bd lease holder behind a per-attempt session claimant: the run's
-/// one lease, derived from the packet the session names. `None` when the
-/// string is not a session claimant — then it is already whatever identity
-/// the caller meant, and is used verbatim.
-fn lease_holder_of(session: &str) -> Option<String> {
+/// Whether `session` is a per-attempt claimant, and if so the run it names.
+fn run_of_session(session: &str) -> Option<String> {
     let packet_id = crate::core::packet_of_session(session)?;
     let (run_id, _, _) = crate::core::split_packet_id(packet_id).ok()?;
-    Some(crate::core::run_holder(&run_id))
+    Some(run_id)
 }
 
 /// Find the attempt's sentinel status file under
@@ -390,14 +503,15 @@ impl ReconcilePorts for ForgedPorts {
         // `holder` is the attempt's claimant verbatim — per-attempt session
         // identity. bd knows only the OTHER layer: the run's one lease,
         // taken under the driver's lease holder. The scoped reclaim must
-        // therefore name that identity, and the answer is reported back in
-        // the vocabulary the caller used, so a caller comparing
+        // therefore name that identity — the one actually in force, which is
+        // what `lease_identity` resolves — and the answer is reported back
+        // in the vocabulary the caller used, so a caller comparing
         // `previous_owner` against the claimant it passed reads a truthful
         // "the lease was taken from the identity you named". A holder that
         // is not a session claimant passes through untouched.
-        let lease_holder = lease_holder_of(holder);
-        let bd_holder = lease_holder.as_deref().unwrap_or(holder);
         let bd = self.config.bd_config();
+        let lease_holder = self.lease_holder_of(&bd, bead, holder).await;
+        let bd_holder = lease_holder.as_deref().unwrap_or(holder);
         failpoint::hit("bd.reclaim.before");
         let outcome = forged_beads::reclaim(&bd, bead, bd_holder, older_than_s)
             .await
@@ -561,28 +675,151 @@ pub fn report_json(report: &forged_proto::ReconcileReport) -> Value {
 mod tests {
     use super::*;
 
+    /// A ledger holding one running attempt on one packet, plus the config
+    /// whose `packet_dir` that attempt resolves to.
+    fn one_running_attempt(root: &Path) -> (ForgedConfig, Ledger, AttemptRow) {
+        let ledger = Ledger::open(&root.join("state.db")).expect("open ledger");
+        ledger
+            .create_run(forged_ledger::NewRun {
+                run_id: forged_types::RunId::new("run-orphan").expect("run id"),
+                bead_id: "run-orphan".to_owned(),
+                repo: root.to_string_lossy().into_owned(),
+                base_ref: "main".to_owned(),
+                branch: "forged/run-orphan".to_owned(),
+            })
+            .expect("create run");
+        let packet_id = ledger
+            .open_packet(forged_ledger::NewPacket {
+                run_id: "run-orphan".to_owned(),
+                stage: forged_types::Stage::Implement,
+                seq: 1,
+                spec_path: "/dev/null".to_owned(),
+                spec_sha256: "sha".to_owned(),
+                body_json: "{}".to_owned(),
+            })
+            .expect("open packet");
+        let claimed = ledger
+            .claim_packet(&packet_id, "claude:run-orphan/implement/1:1", "sha")
+            .expect("claim packet");
+        let attempt = ledger.get_attempt(claimed.attempt_id).expect("attempt");
+        let config = ForgedConfig {
+            anvil_home: root.to_path_buf(),
+            runs_root: root.join("runs"),
+            db_path: root.join("state.db"),
+            config_path: root.join("config.json"),
+            config_file_read: false,
+            roster: HashMap::new(),
+            gate_commands: Vec::new(),
+            stage_budget_s: HashMap::new(),
+            transport_retry_budget: 3,
+            bd_path: root.join("bd"),
+            beads_dir: root.join("beads"),
+            codex_home: root.join("codex"),
+            herdr_sock: None,
+        };
+        (config, ledger, attempt)
+    }
+
+    /// The same row, anchored far enough in the past that its process
+    /// identity can never still be materializing.
+    fn backdated(attempt: &AttemptRow) -> AttemptRow {
+        AttemptRow {
+            started_at: "2020-01-01T00:00:00.000000000Z".to_owned(),
+            last_heartbeat_at: None,
+            ..attempt.clone()
+        }
+    }
+
     #[test]
-    fn a_session_claimant_resolves_to_one_packet_and_the_runs_lease_holder() {
-        // The two identity layers: the claimant names the attempt's packet,
-        // and only the bd seam translates it back to the run's one lease.
-        let session = crate::core::session_claimant("run-1/reviewcodex/2");
-        assert_eq!(session, "forged:run-1/reviewcodex/2:0");
+    fn an_identity_that_never_appeared_fails_the_attempt_instead_of_the_port() {
+        // The bounded-orphan containment: a pid with no start stamp is a
+        // process nothing may signal. Inside the grace window the port
+        // DEFERS (the stamp may still be landing); past it the attempt is
+        // settled as a transport failure — never `PortError::Unavailable`,
+        // which would abort every reconcile pass of the run forever.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, attempt) = one_running_attempt(tmp.path());
+        let dir = config.packet_dir("run-orphan", forged_types::Stage::Implement, 1);
+        std::fs::create_dir_all(&dir).expect("packet dir");
+        // A live pid (this test process) and NO `provider.lstart`: exactly
+        // the crash window between the host spawn and the identity stamp.
+        std::fs::write(dir.join("provider.pid"), std::process::id().to_string()).expect("pid");
+        let ports = ForgedPorts::new(ledger.clone(), config);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        assert!(
+            !ports.identity_grace_elapsed(&attempt),
+            "a fresh attempt is still inside its grace window"
+        );
+        let deferred = rt.block_on(ports.attempt_kill(&attempt));
+        assert!(
+            matches!(deferred, Err(PortError::Unavailable(_))),
+            "inside the window the port defers: {deferred:?}"
+        );
+        assert_eq!(
+            ledger
+                .get_attempt(attempt.attempt_id)
+                .expect("attempt")
+                .state,
+            forged_ledger::AttemptState::Running,
+            "a deferral settles nothing"
+        );
+
+        let old = backdated(&attempt);
+        assert!(ports.identity_grace_elapsed(&old));
+        let settled = rt.block_on(ports.attempt_kill(&old));
+        assert!(
+            matches!(settled, Ok(KillOutcome::AlreadyDead)),
+            "past the window the kill reports the only honest answer it has: {settled:?}"
+        );
+        let row = ledger.get_attempt(attempt.attempt_id).expect("attempt");
+        assert_eq!(row.state, forged_ledger::AttemptState::Failed);
+        assert_eq!(
+            row.fail_note.as_deref(),
+            Some("transport: provider identity never established"),
+            "the pinned note, `transport:`-prefixed so the packet reopens on \
+             the transport-retry budget"
+        );
+        // And liveness agrees rather than reporting the orphan live forever.
+        assert_eq!(
+            rt.block_on(ports.attempt_liveness(&old)).expect("liveness"),
+            SessionLiveness::Vanished
+        );
+        ledger.close().expect("close");
+    }
+
+    #[test]
+    fn a_session_claimant_carries_seam_contract_5_and_resolves_to_one_packet() {
+        // Seam contract 5, `<provider>:<session-or-host>:<pid>`, with real
+        // values: the packet's provider, the packet as the session ref, and
+        // this process's own pid.
+        let session = crate::core::session_claimant("run-1/reviewcodex/2", "codex");
+        assert_eq!(
+            session,
+            format!("codex:run-1/reviewcodex/2:{}", std::process::id())
+        );
         assert_eq!(
             crate::core::packet_of_session(&session),
             Some("run-1/reviewcodex/2")
         );
         assert_eq!(
-            lease_holder_of(&session).as_deref(),
-            Some("forged:run-1:0"),
-            "both Review legs of a run reclaim under the ONE lease holder"
+            run_of_session(&session).as_deref(),
+            Some("run-1"),
+            "both Review legs of a run reclaim under the ONE run lease"
         );
-        // The sibling leg is a different session but the same lease holder.
-        let sibling = crate::core::session_claimant("run-1/reviewclaude/2");
+        // The sibling leg is a different session (different provider AND a
+        // different packet) but the same run, so the same lease.
+        let sibling = crate::core::session_claimant("run-1/reviewclaude/2", "claude");
         assert_ne!(sibling, session);
-        assert_eq!(lease_holder_of(&sibling), lease_holder_of(&session));
+        assert_eq!(run_of_session(&sibling), run_of_session(&session));
         // Anything that is not a session claimant is used verbatim.
-        assert_eq!(lease_holder_of("someone-else:host:99"), None);
-        assert_eq!(lease_holder_of("forged:run-1:0"), None);
+        assert_eq!(run_of_session("someone-else:host:99"), None);
+        assert_eq!(
+            run_of_session("forged:run-1:0"),
+            None,
+            "a run-scoped lease holder is not a packet-scoped claimant"
+        );
+        assert_eq!(run_of_session(crate::core::FRONTIER_HOLDER), None);
     }
 
     #[test]

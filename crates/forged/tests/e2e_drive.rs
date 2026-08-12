@@ -5,7 +5,7 @@
 
 mod support;
 
-use serde_json::{json, Value};
+use serde_json::json;
 use support::{assert_no_overlap, rev_parse, TestEnv};
 
 #[test]
@@ -107,10 +107,27 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
                 continue;
             };
             seen += 1;
+            // Seam contract 5, `<provider>:<session-or-host>:<pid>`, with
+            // real values: the packet's own provider, the PACKET as the
+            // session ref, and the driver process's pid.
+            let (provider, rest) = attempt
+                .claimant
+                .split_once(':')
+                .expect("claimant has a provider segment");
+            let (packet, pid) = rest.rsplit_once(':').expect("claimant has a pid segment");
+            assert!(
+                ["claude", "codex"].contains(&provider),
+                "attempt {attempt_id} names its real provider: {}",
+                attempt.claimant
+            );
             assert_eq!(
-                attempt.claimant,
-                format!("forged:{}:0", attempt.packet_id),
+                packet, attempt.packet_id,
                 "attempt {attempt_id} must claim under its packet-scoped session identity"
+            );
+            assert!(
+                pid.parse::<u32>().is_ok_and(|p| p > 0),
+                "attempt {attempt_id} carries a real driver pid: {}",
+                attempt.claimant
             );
         }
         assert!(seen >= 6, "every packet's attempt was inspected: {seen}");
@@ -430,25 +447,17 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
     assert_eq!(reconciled["result"]["report"]["reclaimed"], json!([]));
     assert_eq!(reconciled["result"]["report"]["leftRunning"], json!([]));
 
-    // Each sweep derives a fresh key: a second reconcile is not a replay.
-    let (code, second) = env.forged(&["reconcile", "--run", "bead-rec"]);
-    assert_eq!(code, 0);
-    assert_eq!(second["reused"], json!(false));
-    assert_ne!(second["operationId"], reconciled["operationId"]);
-
-    let sweep_keys: Vec<Value> = {
-        let ledger = env.ledger();
-        let keys = ["op:reconcile:bead-rec:-:0", "op:reconcile:bead-rec:-:1"]
-            .iter()
-            .map(|k| {
-                json!(ledger
-                    .find_operation("reconcile", k)
-                    .expect("probe")
-                    .is_some())
-            })
-            .collect();
-        ledger.close().expect("close");
-        keys
-    };
-    assert_eq!(sweep_keys, vec![json!(true), json!(true)]);
+    // Every invocation derives a FRESH key: no reconcile is ever a replay of
+    // the last one, which is what keeps an interrupted pass from wedging the
+    // run (see `core::reconcile_key`).
+    let mut ids = vec![reconciled["operationId"].clone()];
+    for _ in 0..2 {
+        let (code, again) = env.forged(&["reconcile", "--run", "bead-rec"]);
+        assert_eq!(code, 0, "reconcile: {again}");
+        assert_eq!(again["reused"], json!(false), "never a replay: {again}");
+        ids.push(again["operationId"].clone());
+    }
+    let unique: std::collections::BTreeSet<String> =
+        ids.iter().map(std::string::ToString::to_string).collect();
+    assert_eq!(unique.len(), ids.len(), "distinct operation ids: {ids:?}");
 }

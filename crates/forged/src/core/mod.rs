@@ -203,37 +203,101 @@ pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, 
     Ok((run_id.to_owned(), stage, seq))
 }
 
-/// The driver's lease-holder id for a run — deterministic (seam contract 5
-/// shape `<provider>:<session-or-host>:<pid>` with a fixed pid segment), so
-/// a resumed driver derives the same holder, machine-step operation params
-/// replay byte-identically, and the reconcile saga's scoped reclaim
-/// converges on the same holder every process computes.
+/// The pre-run bd lease identity: the actor a FRESH frontier claim in
+/// `claim-next` is taken under.
+///
+/// `bd ready --claim --actor <holder>` demands its actor BEFORE it says
+/// which bead it handed over, so at that moment no run exists to derive
+/// [`run_holder`] from. Claiming under the operator's `--holder` instead
+/// wedges the driver against its own lease minutes later, when `run drive`'s
+/// Resolve claims the same bead under the identity it derives: bd 1.2.1
+/// refuses a claim by any other actor outright ("issue already claimed by
+/// …", exit 1 — probe-verified). This constant is that pre-run identity, and
+/// Resolve adopts it verbatim for the run minted from the bead, so
+/// claim-next → run start → run drive share ONE lease identity end to end
+/// (operator adjudication, 2026-08-12).
+pub const FRONTIER_HOLDER: &str = "forged:frontier:0";
+
+/// The driver's derived lease-holder id for a run: seam contract 5's
+/// `<provider>:<session-or-host>:<pid>` shape, filled with what a LEASE can
+/// honestly carry — `forged` (the DRIVER claims the bead, not the model
+/// vendor: one run drives both provider families under this one lease), the
+/// run as the session ref, and a fixed `0` pid segment.
+///
+/// The fixed pid is load-bearing, not laziness. The lease must resolve to
+/// the same string in every process that touches it — the driver that took
+/// it, a restarted driver, a reconciler in a third process — or a scoped
+/// reclaim names the wrong previous owner and a re-claim is refused as
+/// theft. A live pid here would make each of those derive a different
+/// holder. Real per-process, per-attempt identity — a real provider and a
+/// real pid — is [`session_claimant`], which is STORED on the attempt row
+/// rather than re-derived, and so can carry values only one process knows.
 pub fn run_holder(run_id: &str) -> String {
     format!("forged:{run_id}:0")
+}
+
+/// The bd lease identity in force for a run: the holder forged already has
+/// the bead under when that holder is one of ours — [`FRONTIER_HOLDER`] from
+/// a fresh `claim-next` claim, or this run's derived [`run_holder`] from an
+/// earlier pass — else the derived holder.
+///
+/// Every consumer of the run's lease (Resolve's claim, the guardian's
+/// heartbeat, claim-next's scoped reclaim, the `reclaim_lease` port) reads
+/// the identity here rather than deriving a second, differing one, which is
+/// what makes the chain unwedgeable against itself. A holder this driver
+/// could not have taken is deliberately NOT adopted: the derived holder is
+/// returned, bd refuses the claim, and another worker's live lease stands.
+pub async fn lease_identity(
+    bd: &forged_beads::BdConfig,
+    bead: &str,
+    run_id: &str,
+) -> Result<String, Failure> {
+    let derived = run_holder(run_id);
+    let current = forged_beads::lease_holder(bd, bead).await?;
+    Ok(match current {
+        Some(held) if held == derived || held == FRONTIER_HOLDER => held,
+        _ => derived,
+    })
 }
 
 /// The per-attempt session identity stored in `attempts.claimant` — the
 /// second of the two identity layers, and the one `ReconcilePorts` receives
 /// verbatim as `session`.
 ///
-/// It is scoped to the PACKET, not the run: a packet has at most one live
-/// attempt (`claim_packet` refuses a second), so this string maps
-/// one-to-one onto a live attempt and resolves to exactly one packet
-/// directory — which is what makes `liveness` and `kill_confirmed`
-/// per-attempt instead of an aggregate over every leg sharing the run's
-/// lease. The bd lease holder stays [`run_holder`]: one lease per slice,
-/// shared by both concurrent Review legs, translated back at the
+/// Seam contract 5's `<provider>:<session-or-host>:<pid>` with real values:
+/// the provider the packet's hints select, the PACKET as the session ref,
+/// and this driver process's own pid. It is scoped to the packet, not the
+/// run: a packet has at most one live attempt (`claim_packet` refuses a
+/// second), so this string maps one-to-one onto a live attempt and resolves
+/// to exactly one packet directory — which is what makes `liveness` and
+/// `kill_confirmed` per-attempt instead of an aggregate over every leg
+/// sharing the run's lease. Being stored rather than re-derived is what lets
+/// it carry a real pid: no other process has to reproduce the string, only
+/// read it back from the row.
+///
+/// The bd lease holder stays the run's ([`lease_identity`]): one lease per
+/// slice, shared by both concurrent Review legs, translated back at the
 /// `reclaim_lease` seam.
-pub fn session_claimant(packet_id: &str) -> String {
-    format!("forged:{packet_id}:0")
+pub fn session_claimant(packet_id: &str, provider: &str) -> String {
+    let provider = provider.trim();
+    let provider = if provider.is_empty() || provider.contains(':') {
+        "forged"
+    } else {
+        provider
+    };
+    format!("{provider}:{packet_id}:{}", std::process::id())
 }
 
-/// The packet id carried by a [`session_claimant`], when the string is one.
-/// A run-scoped holder yields its run id here, which is not a packet id —
-/// callers that need a packet must parse it with [`split_packet_id`].
+/// The packet id carried by a [`session_claimant`], when the string is one:
+/// the middle segment of `<provider>:<packet-id>:<pid>`. A run-scoped lease
+/// holder yields its run id here, which is not a packet id — callers that
+/// need a packet must parse it with [`split_packet_id`], which refuses
+/// anything without all three packet segments.
 pub fn packet_of_session(session: &str) -> Option<&str> {
-    let inner = session.strip_prefix("forged:")?.strip_suffix(":0")?;
-    (!inner.is_empty()).then_some(inner)
+    let (_provider, rest) = session.split_once(':')?;
+    let (packet_id, pid) = rest.rsplit_once(':')?;
+    pid.parse::<u32>().ok()?;
+    (!packet_id.is_empty()).then_some(packet_id)
 }
 
 /// Build a success envelope.
@@ -497,20 +561,19 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
     }
 }
 
-/// The reconcile sweep count: settled `reconcile` operations already
-/// recorded for the run, probed in key order so each sweep derives a fresh
-/// key rather than replaying the previous one.
-pub async fn reconcile_sweep(ctx: &Ctx, run_id: &str) -> Result<i64, Failure> {
-    let mut sweep = 0i64;
-    loop {
-        let key = derive_key("reconcile", Some(run_id), None, Some(sweep));
-        let row = {
-            let key = key.clone();
-            on_ledger(&ctx.ledger, move |l| l.find_operation("reconcile", &key)).await?
-        };
-        match row {
-            Some(row) if row.state == forged_ledger::OperationState::Terminal => sweep += 1,
-            _ => return Ok(sweep),
-        }
-    }
+/// A reconcile pass's own idempotency key: the run's derived key plus a
+/// fresh nonce, so no two invocations ever collide.
+///
+/// Reconcile is the one command that must not be replay-protected by its
+/// key. It is observational and idempotent — it settles OTHER operations and
+/// owns no effect a redo could double — and its wrapper row is deliberately
+/// run-UNSCOPED, so the pass cannot release its own row and no later
+/// run-scoped pass can see it. An invocation interrupted after
+/// `op.begin.after` therefore leaves an `in_progress` row forever; reusing
+/// the key would wedge every subsequent reconcile of that run on
+/// `OPERATION_IN_PROGRESS`. A per-invocation nonce is the whole fix
+/// (operator adjudication, 2026-08-12: reconcile needs no replay
+/// protection).
+pub fn reconcile_key(run_id: &str) -> String {
+    format!("op:reconcile:{run_id}:-:{}", uuid::Uuid::now_v7())
 }

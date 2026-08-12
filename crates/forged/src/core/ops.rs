@@ -391,8 +391,12 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             };
             let current_sha = sha256_file(Path::new(&row.spec_path))?;
             // The claimant is the PACKET-scoped session identity, not the
-            // run's bd lease holder — see `core::session_claimant`.
-            let claimant = session_claimant(&packet_id);
+            // run's bd lease holder — see `core::session_claimant`. The
+            // stored body carries the hints the packet was opened with.
+            let provider = serde_json::from_str::<WorkPacket>(&row.body_json)
+                .map(|p| p.provider_hints.provider)
+                .unwrap_or_default();
+            let claimant = session_claimant(&packet_id, &provider);
             let claimed = {
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| {
@@ -590,11 +594,10 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         Err(f) => return err_response(&derive_key("reconcile", None, None, None), &f),
     };
     if key_absent(req) {
-        let sweep = match super::reconcile_sweep(ctx, &run_id).await {
-            Ok(sweep) => sweep,
-            Err(f) => return err_response(&derive_key("reconcile", Some(&run_id), None, None), &f),
-        };
-        req.idempotency_key = derive_key("reconcile", Some(&run_id), None, Some(sweep));
+        // A FRESH nonce per invocation, never a replayable sweep number: see
+        // `core::reconcile_key` for why this one command must not be
+        // replay-protected by its key.
+        req.idempotency_key = super::reconcile_key(&run_id);
     }
     // The reconcile operation is deliberately run-UNSCOPED in the store: a
     // run-scoped row would be found by the pass's own

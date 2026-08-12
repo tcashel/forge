@@ -381,6 +381,10 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
     };
     let params: Map<String, Value> = match step {
         MachineStage::Resolve => obj(json!({
+            // The request descriptor names the DERIVED holder: params are
+            // hashed for idempotency, so this must not vary with whatever
+            // the bead happens to be held under at the moment of a redo.
+            // The identity actually taken is reported in the result.
             "leaseHolder": run_holder(&run.run_id),
             "repo": run.repo,
             "base": run.base_ref,
@@ -476,8 +480,15 @@ async fn machine_effect(
                 Err(forged_git::GitError::WorktreeExists { .. }) => None,
                 Err(e) => return Err(e.into()),
             };
-            let holder = run_holder(&run.run_id);
+            // ONE lease identity end to end: a bead already held under the
+            // pre-run identity a fresh `claim-next` claimed it with — or
+            // under this run's derived holder from an earlier pass — IS this
+            // run's lease. Claim under that string rather than a second,
+            // differing one: bd refuses a claim by any other actor outright
+            // ("issue already claimed by …"), which is how a driver used to
+            // wedge on BEAD_LEASE_HELD against its own frontier claim.
             let bd = ctx.config.bd_config();
+            let holder = crate::core::lease_identity(&bd, &run.bead_id, &run.run_id).await?;
             failpoint::hit("bd.claim.before");
             forged_beads::claim_specific(&bd, &run.bead_id, &holder).await?;
             failpoint::hit("bd.claim.after");

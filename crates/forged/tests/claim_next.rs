@@ -305,3 +305,148 @@ fn a_pending_retry_deadline_defers_the_resume() {
         "a future retry deadline defers the resume: {resp}"
     );
 }
+
+#[test]
+fn a_lease_already_under_our_identity_resumes_without_retaking_it() {
+    // Whitelisted resume branch (i): the reclaim REFUSES because the lease
+    // is unexpired, and the holder it names is this run's own identity — a
+    // driver restart resuming its own work. Proceed, and take no second
+    // claim (there is nothing to retake).
+    let env = TestEnv::new("forged-claim-next-ours");
+    env.forged(&["init"]);
+    fabricate_resumable(&env, "bead-ours");
+    env.set_assignee("bead-ours", "forged:bead-ours:0");
+    env.set_lease_unexpired("bead-ours");
+    env.seed_frontier("bead-fresh");
+
+    let (code, resp) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:ours-1",
+    ]);
+    assert_eq!(code, 0, "claim-next: {resp}");
+    let claimed = &resp["result"]["claimed"];
+    assert_eq!(
+        claimed["resumed"],
+        json!(true),
+        "our own live lease is not a reason to skip the run: {resp}"
+    );
+    assert_eq!(claimed["run_id"], json!("bead-ours"));
+    // No retake: the lease was already ours, so no claim call was needed.
+    let calls = env.bd_calls();
+    assert!(
+        !calls
+            .iter()
+            .any(|l| l.starts_with("update bead-ours") && l.contains("--claim")),
+        "a lease already under our identity is never re-claimed: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|l| l.starts_with("ready ")),
+        "no frontier pull while a resumable run exists: {calls:?}"
+    );
+    assert_eq!(
+        env.assignee("bead-ours").as_deref(),
+        Some("forged:bead-ours:0")
+    );
+}
+
+#[test]
+fn an_unheld_bead_resumes_and_retakes_the_lease() {
+    // Whitelisted resume branch (ii): no lease at all — expired and already
+    // reclaimed, released by an earlier reconcile pass, or never taken.
+    // Nothing can overlap, so resume and (re-)take the lease.
+    let env = TestEnv::new("forged-claim-next-unheld");
+    env.forged(&["init"]);
+    fabricate_resumable(&env, "bead-unheld");
+    env.seed_frontier("bead-fresh");
+
+    let (code, resp) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:unheld-1",
+    ]);
+    assert_eq!(code, 0, "claim-next: {resp}");
+    assert_eq!(resp["result"]["claimed"]["resumed"], json!(true), "{resp}");
+    assert_eq!(resp["result"]["claimed"]["run_id"], json!("bead-unheld"));
+    assert_eq!(
+        env.assignee("bead-unheld").as_deref(),
+        Some("forged:bead-unheld:0"),
+        "the lease is retaken under the run's derived identity"
+    );
+}
+
+#[test]
+fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
+    // The composed path, end to end: claim-next pulls a FRESH bead, the
+    // caller starts the run from it, and `run drive` resolves — which claims
+    // the same bead again. One identity throughout, so the second claim is
+    // this driver finding its own lease, never BEAD_LEASE_HELD against
+    // itself. The operator's `--holder` never reaches bd.
+    let env = TestEnv::new("forged-claim-next-composed");
+    env.forged(&["init"]);
+    env.seed_frontier("bead-composed");
+
+    let (code, claimed) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "operator:laptop:4242",
+        "--idempotency-key",
+        "op:claim_next:composed-1",
+    ]);
+    assert_eq!(code, 0, "claim-next: {claimed}");
+    assert_eq!(claimed["result"]["claimed"]["resumed"], json!(false));
+    assert_eq!(
+        claimed["result"]["claimed"]["bead_id"],
+        json!("bead-composed")
+    );
+    assert_ne!(
+        env.assignee("bead-composed").as_deref(),
+        Some("operator:laptop:4242"),
+        "the operator's --holder must never become the bd actor"
+    );
+
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-composed",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-composed"]);
+    assert_eq!(code, 0, "run drive: {driven}");
+    assert_eq!(
+        driven["error"],
+        Value::Null,
+        "resolve must not wedge on the lease claim-next took: {driven}"
+    );
+    assert!(
+        driven["result"]["terminal"]["done"].is_object(),
+        "the run drives to Done over its own lease: {driven}"
+    );
+    let calls = env.bd_calls();
+    assert!(
+        !calls.iter().any(|l| l.contains("operator:laptop:4242")),
+        "no bd call may carry the operator holder: {calls:?}"
+    );
+    // The guardian heartbeated the ONE identity the lease is held under.
+    let holder = env.assignee("bead-composed").expect("the lease is held");
+    assert!(
+        calls
+            .iter()
+            .any(|l| l.starts_with("heartbeat bead-composed") && l.contains(&holder)),
+        "the guardian heartbeats the identity actually in force ({holder}): {calls:?}"
+    );
+}

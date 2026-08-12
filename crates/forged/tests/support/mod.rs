@@ -572,7 +572,12 @@ case "$cmd" in
     id=$(val --id "$@")
     assignee=$(val --assignee "$@")
     cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
-    if [ -n "$cur" ] && [ "$cur" = "$assignee" ]; then
+    if [ -f "$state/$id.unexpired" ]; then
+      # bd 1.2.1's probe-verified refusal shape: an UNEXPIRED lease is
+      # unreclaimable even at --older-than 0s — exit 0, nothing reclaimed,
+      # the assignee left intact.
+      printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
+    elif [ -n "$cur" ] && [ "$cur" = "$assignee" ]; then
       rm -f "$state/$id.assignee"
       printf '{"schema_version":1,"data":{"count":1,"reclaimed":[{"id":"%s","previous_owner":"%s"}],"scoped":true}}\n' "$id" "$cur"
     else
@@ -820,6 +825,15 @@ impl TestEnv {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
         std::fs::write(state.join(format!("{bead}.assignee")), holder).expect("set assignee");
+    }
+
+    /// Mark a bead's lease UNEXPIRED in the bd shim state: every scoped
+    /// reclaim of it answers the refusal shape (nothing reclaimed, assignee
+    /// intact), whoever asks — real bd's behavior for a live lease.
+    pub fn set_lease_unexpired(&self, bead: &str) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{bead}.unexpired")), "1").expect("set unexpired");
     }
 
     /// A bead's current assignee in the bd shim state.

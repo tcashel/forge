@@ -85,9 +85,9 @@ pub fn extract_forged_result(
 
 /// Harvest a claude run: the final `type=result` record of the stream-json
 /// capture holds the result text. A stream with no final result record is a
-/// transport failure; an `is_error` result whose message carries a
-/// transport marker is transport; every other shape falls through to
-/// extraction.
+/// transport failure; an `is_error` result whose message carries a transport
+/// marker is transport and every other `is_error` result is semantic; only a
+/// non-error result falls through to extraction.
 pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
     let mut last_result: Option<Value> = None;
     for line in out_jsonl.lines() {
@@ -121,6 +121,17 @@ pub fn harvest_claude(out_jsonl: &str, expected_schema: &str, packet_id: &str) -
                 return Harvest::Transport(format!("transport: claude error result: {candidate}"));
             }
         }
+        // No marker: an `is_error` result is a SEMANTIC failure, full stop.
+        // It never falls through to extraction — a policy or configuration
+        // refusal can still carry a valid-looking forged-result block in its
+        // text, and landing that would turn the provider's own error into a
+        // success. Mirrors the codex `turn.failed` rule exactly.
+        let detail = if error_message.is_empty() {
+            text
+        } else {
+            error_message
+        };
+        return Harvest::Semantic(format!("claude error result: {detail}"));
     }
     finish(text, expected_schema, packet_id)
 }
@@ -298,8 +309,29 @@ mod tests {
         let refusal = "{\"type\":\"result\",\"is_error\":true,\"result\":\"policy refusal\"}";
         assert!(matches!(
             harvest_claude(refusal, SCHEMA, PKT),
-            Harvest::Semantic(note) if note == "no forged-result block"
+            Harvest::Semantic(note) if note == "claude error result: policy refusal"
         ));
+    }
+
+    #[test]
+    fn an_is_error_result_carrying_a_valid_block_is_still_a_semantic_failure() {
+        // The provider said it failed. A valid-looking forged-result block in
+        // the same payload does not overrule that: without a transport
+        // marker, every is_error result is semantic, and landing the block
+        // would turn a refusal into a success.
+        let line = format!(
+            "{{\"type\":\"result\",\"is_error\":true,\"result\":{},\
+             \"error\":{{\"message\":\"policy refusal\"}}}}",
+            serde_json::Value::String(block(&implement_json(PKT, SCHEMA, 3)))
+        );
+        assert!(
+            matches!(
+                harvest_claude(&line, SCHEMA, PKT),
+                Harvest::Semantic(ref note) if note == "claude error result: policy refusal"
+            ),
+            "got {:?}",
+            harvest_claude(&line, SCHEMA, PKT)
+        );
     }
 
     #[test]
@@ -319,7 +351,7 @@ mod tests {
                        \"error\":{\"message\":\"policy refusal\"}}";
         assert!(matches!(
             harvest_claude(refusal, SCHEMA, PKT),
-            Harvest::Semantic(note) if note == "no forged-result block"
+            Harvest::Semantic(note) if note == "claude error result: policy refusal"
         ));
     }
 

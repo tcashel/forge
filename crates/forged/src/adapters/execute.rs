@@ -21,7 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
 use crate::adapters::ports::ForgedPorts;
 use crate::config::{now_iso, stage_str};
-use crate::core::{on_ledger, run_holder, session_claimant, Ctx, Failure};
+use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
 /// Everything packet execution needs beyond the packet itself.
@@ -291,7 +291,7 @@ pub async fn execute_packet(
     let current_sha = sha256_file(Path::new(&packet.spec.path))?;
     let claimed = {
         let packet_id = packet_id.clone();
-        let claimant = session_claimant(&packet_id);
+        let claimant = session_claimant(&packet_id, &packet.provider_hints.provider);
         on_ledger(&ctx.ledger, move |l| {
             l.claim_packet(&packet_id, &claimant, &current_sha)
         })
@@ -333,7 +333,11 @@ async fn run_attempt(
 ) -> Result<PacketOutcome, Failure> {
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
-    let holder = run_holder(&run_id);
+    // The guardian heartbeats the lease that is actually held — bd's
+    // heartbeat is owner-only, and a heartbeat under a second, derived
+    // identity would be refused and let the run's own lease lapse under it.
+    let holder =
+        crate::core::lease_identity(&ctx.config.bd_config(), &packet.bead_id, &run_id).await?;
     let (_, stage, seq) = crate::core::split_packet_id(&packet_id)?;
     let claim_token = claim_token.to_owned();
 
@@ -377,6 +381,18 @@ async fn run_attempt(
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_owned(), path);
     }
+    // The bounded-orphan window (operator-adjudicated, accepted as a
+    // residual): a crash between here and the shell writing `provider.pid`
+    // leaves a provider no later process can identify, so no later process
+    // can kill it. It is CONTAINED rather than prevented — nothing this
+    // side of the spawn can make a process identity durable before the
+    // process exists. The orphan never heartbeats, so the bd lease lapses
+    // and the packet is reclaimed; and its eventual result is fenced by a
+    // claim token that is no longer live, so `land_packet_result` quarantines
+    // it instead of landing it. Reconcile's half of the containment is in
+    // `adapters::ports`: an attempt whose identity never materialized past
+    // the grace window is failed as a transport failure, never an
+    // unavailable port.
     failpoint::hit("provider.spawn.before");
     let spawned = host.spawn(&packet.worktree, &shell_line, &env).await;
     failpoint::hit("provider.spawn.after");

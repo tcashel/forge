@@ -669,6 +669,47 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
     assert_no_overlap(&env.provider_log(), "bead-k7/fix/1");
 }
 
+// ------------------------------------------------------------- schedule 8
+
+#[test]
+fn a_crashed_reconcile_never_wedges_the_next_one() {
+    // Reconcile's own operation row is deliberately run-UNSCOPED, so no
+    // later pass can settle it. A pass killed after `op.begin.after` would
+    // therefore wedge every subsequent reconcile of the run on
+    // OPERATION_IN_PROGRESS if its key were replayable — the whole reason
+    // each invocation carries a fresh nonce.
+    let env = TestEnv::new("km8");
+    env.write_config(None);
+    start_run(&env, "bead-k8");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k8"]);
+    assert_eq!(code, 0, "drive: {driven}");
+
+    // Crash one reconcile at the boundary just past its own begin: the row
+    // is committed `in_progress` and the process dies before completing it.
+    let mut cmd = env.forged_cmd(&["reconcile", "--run", "bead-k8"]);
+    let status = cmd
+        .env("FORGED_FAILPOINT", "op.begin.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("reconcile child runs");
+    assert!(!status.success(), "the crashed pass must not exit 0");
+
+    // The very next pass proceeds — it neither replays nor collides.
+    for attempt in 0..2 {
+        let (code, again) = env.forged(&["reconcile", "--run", "bead-k8"]);
+        assert_eq!(code, 0, "reconcile {attempt} after the crash: {again}");
+        assert_eq!(again["reused"], json!(false), "never a replay: {again}");
+        assert_ne!(
+            again["error"]["code"],
+            json!("OPERATION_IN_PROGRESS"),
+            "an interrupted pass must not wedge the run: {again}"
+        );
+        assert!(again["result"]["report"].is_object(), "{again}");
+    }
+}
+
 // ---------------------------------------------------- the embedded-bd case
 
 #[test]
@@ -738,6 +779,102 @@ fn real_bd_lease_cycle_against_a_temp_beads_dir() {
         after.get("assignee").and_then(Value::as_str),
         Some("forged:bead-bd:0"),
         "the lease survived the refused reclaim"
+    );
+    let _ = std::fs::remove_dir_all(&s.root);
+}
+
+/// The genuine expiry half of the cycle, against the real bd binary: claim a
+/// bead, never heartbeat it, and let bd's 5-minute TTL actually lapse, then
+/// scoped-reclaim it and watch the lease come back.
+///
+/// `#[ignore]`d and additionally gated on `FORGED_SLOW_TESTS=1` by the
+/// operator's convention (2026-08-12): it costs ~6 minutes of real waiting,
+/// so the in-suite case above keeps the fast refusal shape and this one is
+/// run deliberately —
+/// `FORGED_SLOW_TESTS=1 cargo test -p forged --features failpoints -- --ignored --nocapture`.
+#[test]
+#[ignore = "slow: waits out bd's real 5-minute lease TTL (set FORGED_SLOW_TESTS=1)"]
+fn real_bd_lease_expiry_then_scoped_reclaim() {
+    let _guard = HomeBeadsGuard::new();
+    if std::env::var("FORGED_SLOW_TESTS").unwrap_or_default() != "1" {
+        eprintln!("SKIP: real-bd expiry cycle needs FORGED_SLOW_TESTS=1");
+        return;
+    }
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("forged-km-bd-expiry");
+    support::init_store(&bd, &s);
+    let bead = support::create_bead(&bd, &s, "kill matrix expiry bead");
+
+    let cfg = forged_beads::BdConfig {
+        bd_path: bd.clone(),
+        beads_dir: s.beads.clone(),
+        home_override: Some(s.home.clone()),
+        anvil_home: s.anvil.clone(),
+        work_dir: s.beads.clone(),
+        read_timeout_s: 30,
+        write_timeout_s: 60,
+    };
+    // The dead driver's identity: claimed once, then never heartbeated
+    // again — exactly what a killed guardian leaves behind.
+    let holder = "forged:bead-expiry:0";
+    let rt = tokio::runtime::Runtime::new().expect("runtime");
+    let (elapsed, outcome) = rt.block_on(async {
+        let claimed = forged_beads::claim_specific(&cfg, &bead, holder)
+            .await
+            .expect("claim");
+        assert_eq!(claimed.assignee, holder);
+        eprintln!(
+            "claimed {bead} under {holder}; lease_expires_at={:?}",
+            support::show_bead(&bd, &s, &bead).get("lease_expires_at")
+        );
+        // Poll the scoped reclaim until the TTL genuinely lapses. Every call
+        // before expiry answers the refusal shape, which is itself the
+        // assertion that an unexpired lease is unreclaimable.
+        let started = Instant::now();
+        let deadline = Duration::from_secs(600);
+        loop {
+            let outcome = forged_beads::reclaim(&cfg, &bead, holder, 0)
+                .await
+                .expect("scoped reclaim");
+            assert!(outcome.scoped, "bd confirms the reclaim was scoped");
+            if outcome.previous_owner.is_some() {
+                break (started.elapsed(), outcome);
+            }
+            assert!(
+                started.elapsed() < deadline,
+                "bd's lease never expired within {deadline:?} — TTL assumption broken"
+            );
+            tokio::time::sleep(Duration::from_secs(15)).await;
+        }
+    });
+
+    assert_eq!(
+        outcome.previous_owner.as_deref(),
+        Some(holder),
+        "the reclaim names the dead holder it took the lease from"
+    );
+    let after = support::show_bead(&bd, &s, &bead);
+    eprintln!(
+        "reclaimed after {}s: previous_owner={:?}, bead now status={:?} assignee={:?}",
+        elapsed.as_secs(),
+        outcome.previous_owner,
+        after.get("status"),
+        after.get("assignee"),
+    );
+    assert_eq!(
+        after
+            .get("assignee")
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        "",
+        "the lease is released: {after}"
+    );
+    assert_eq!(
+        after.get("status").and_then(Value::as_str),
+        Some("open"),
+        "the bead returns to the frontier: {after}"
     );
     let _ = std::fs::remove_dir_all(&s.root);
 }

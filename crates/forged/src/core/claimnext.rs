@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use crate::adapters::execute::sha256_file;
 use crate::config::now_iso;
 use crate::core::{
-    err_response, fenced, on_ledger, param_str, run_holder, session_claimant, Ctx, Failure,
+    err_response, fenced, lease_identity, on_ledger, param_str, session_claimant, Ctx, Failure,
+    FRONTIER_HOLDER,
 };
 use crate::failpoint;
 
@@ -27,6 +28,47 @@ struct Resumable {
     packet_id: String,
     spec_path: String,
     stage: forged_types::Stage,
+    /// The packet's own provider hint — the `<provider>` segment of the
+    /// attempt claimant this resume mints.
+    provider: String,
+}
+
+/// What a reclaim outcome plus the bead's current lease holder mean for one
+/// candidate — the operator-adjudicated refusal semantics (2026-08-12),
+/// stated once so it can be tested without bd.
+///
+/// `previous_owner: None` is the refusal shape: nothing was reclaimed. It
+/// means leave-the-run-alone-and-keep-scanning EXCEPT in two whitelisted
+/// resume branches, both of which are this driver resuming its OWN work and
+/// neither of which can overlap a live process: the lease is already held
+/// under this run's identity (a driver restart resuming itself), or there is
+/// no lease at all (expired and reclaimed, released by an earlier reconcile
+/// pass, or never taken). Any other holder is another worker's live lease.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Resume {
+    /// Resume this run; `retake` says whether the lease must be (re-)taken.
+    Proceed { retake: bool },
+    /// Leave this run untouched and keep scanning.
+    Skip,
+}
+
+fn resume_decision(
+    previous_owner: Option<&str>,
+    current_holder: Option<&str>,
+    ours: &str,
+) -> Resume {
+    if previous_owner.is_some() {
+        // We reclaimed an expired lease: it is ours to retake.
+        return Resume::Proceed { retake: true };
+    }
+    match current_holder {
+        // Whitelisted (i): already held under this run's identity.
+        Some(holder) if holder == ours => Resume::Proceed { retake: false },
+        // Another worker's live lease.
+        Some(_) => Resume::Skip,
+        // Whitelisted (ii): no lease at all.
+        None => Resume::Proceed { retake: true },
+    }
 }
 
 /// Scan the ledger for EVERY Active run with a reopened packet — a packet
@@ -75,12 +117,26 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
             .find(|p| p.packet_id == packet_id)
             .cloned();
         let Some(packet) = packet else { continue };
+        // The stored body carries the hints the packet was opened with; the
+        // roster is the same source `build_packet` read, and is the fallback
+        // when a body predates them.
+        let provider = serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+            .map(|p| p.provider_hints.provider)
+            .ok()
+            .or_else(|| {
+                ctx.config
+                    .roster
+                    .get(&packet.stage)
+                    .map(|h| h.provider.clone())
+            })
+            .unwrap_or_default();
         resumables.push(Resumable {
             run_id: run.run_id,
             bead_id: run.bead_id,
             packet_id,
             spec_path: packet.spec_path,
             stage: packet.stage,
+            provider,
         });
     }
     Ok(resumables)
@@ -104,7 +160,10 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     // 1. Resume from forged's own ledger first — every resumable candidate
     //    in ledger order, until one of them actually resumes.
     for candidate in find_resumables(ctx).await? {
-        let run_holder_id = run_holder(&candidate.run_id);
+        // The ONE lease identity for this run: whatever forged already holds
+        // the bead under, else the derived holder. Never a second, differing
+        // identity of our own making.
+        let run_holder_id = lease_identity(&bd, &candidate.bead_id, &candidate.run_id).await?;
         let budget = ctx
             .config
             .stage_budget_s
@@ -114,37 +173,33 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         let older_than = forged_beads::reclaim_older_than(budget);
 
         // Scoped reclaim — `--id` and `--assignee` both mandatory; an
-        // unscoped reclaim would rob every other worker. The previous
-        // holder is the derived per-run driver id every process computes.
+        // unscoped reclaim would rob every other worker. The previous holder
+        // named here is that one identity, so the reclaim can only ever take
+        // back forged's own expired lease.
         failpoint::hit("bd.reclaim.before");
         let outcome =
             forged_beads::reclaim(&bd, &candidate.bead_id, &run_holder_id, older_than).await?;
         failpoint::hit("bd.reclaim.after");
         // On the refusal shape (`previous_owner: None`, nothing reclaimed)
-        // the lease may be genuinely live under someone else — leave the
-        // run alone — or already ours, or already released by an earlier
-        // reconcile pass (revoke-reclaim frees it). Only another worker's
-        // live lease blocks the resume.
-        let (proceed, retake) = if outcome.previous_owner.is_some() {
-            (true, true)
+        // only the two whitelisted branches resume — see `resume_decision`.
+        let current = if outcome.previous_owner.is_some() {
+            None
         } else {
-            match forged_beads::lease_holder(&bd, &candidate.bead_id)
-                .await?
-                .as_deref()
-            {
-                Some(holder) if holder == run_holder_id => (true, false),
-                Some(_) => (false, false),
-                None => (true, true),
-            }
+            forged_beads::lease_holder(&bd, &candidate.bead_id).await?
         };
-        if !proceed {
+        let retake = match resume_decision(
+            outcome.previous_owner.as_deref(),
+            current.as_deref(),
+            &run_holder_id,
+        ) {
+            Resume::Proceed { retake } => retake,
             // The refusal stands for THIS run only: another worker's lease
             // is live on it, so leave it untouched and keep scanning. The
             // frontier is reached only once the scan is exhausted.
-            continue;
-        }
+            Resume::Skip => continue,
+        };
         if retake {
-            // (Re-)take the lease under the same derived holder.
+            // (Re-)take the lease under that same one identity.
             failpoint::hit("bd.claim.before");
             forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
             failpoint::hit("bd.claim.after");
@@ -154,7 +209,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         let current_sha = sha256_file(std::path::Path::new(&candidate.spec_path))?;
         let claimed = {
             let packet_id = candidate.packet_id.clone();
-            let claimant = session_claimant(&candidate.packet_id);
+            let claimant = session_claimant(&candidate.packet_id, &candidate.provider);
             on_ledger(&ctx.ledger, move |l| {
                 l.claim_packet(&packet_id, &claimant, &current_sha)
             })
@@ -179,8 +234,20 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     }
 
     // 3. Only now: the fresh bd frontier. An empty frontier is a success.
+    //
+    // The bd actor is the DERIVED pre-run identity, never the caller's
+    // `--holder`: `bd ready --claim` needs its actor before it says which
+    // bead it gave us, and a lease taken under the operator's own string
+    // would be refused to `run drive`'s Resolve minutes later as a claim by
+    // a stranger. `--holder` names the caller for its own bookkeeping; it
+    // never reaches bd.
+    tracing::debug!(
+        caller = %holder,
+        actor = %FRONTIER_HOLDER,
+        "frontier claim: the bd actor is the derived pre-run identity"
+    );
     failpoint::hit("bd.claim.before");
-    let claimed = forged_beads::claim_ready(&bd, holder).await?;
+    let claimed = forged_beads::claim_ready(&bd, FRONTIER_HOLDER).await?;
     failpoint::hit("bd.claim.after");
     Ok(match claimed {
         None => json!({"claimed": null}),
@@ -195,4 +262,55 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             }
         }),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{resume_decision, Resume};
+
+    const OURS: &str = "forged:bead-1:0";
+
+    #[test]
+    fn a_reclaimed_lease_resumes_and_is_retaken() {
+        assert_eq!(
+            resume_decision(Some(OURS), None, OURS),
+            Resume::Proceed { retake: true },
+            "we reclaimed an expired lease: retake it"
+        );
+    }
+
+    #[test]
+    fn whitelisted_i_a_lease_already_under_our_identity_resumes_without_retaking() {
+        // A driver restart resuming its own work: the reclaim refuses
+        // because the lease is live, and it is live under US.
+        assert_eq!(
+            resume_decision(None, Some(OURS), OURS),
+            Resume::Proceed { retake: false }
+        );
+    }
+
+    #[test]
+    fn whitelisted_ii_no_lease_at_all_resumes_and_retakes() {
+        // Expired-and-reclaimed, released by an earlier reconcile pass, or
+        // never taken: nothing to overlap with.
+        assert_eq!(
+            resume_decision(None, None, OURS),
+            Resume::Proceed { retake: true }
+        );
+    }
+
+    #[test]
+    fn a_foreign_live_lease_skips_that_run() {
+        // The refusal shape with someone else's live lease: leave the run
+        // untouched and keep scanning. NOT a fall-through to the frontier.
+        assert_eq!(
+            resume_decision(None, Some("someone-else:host:99"), OURS),
+            Resume::Skip
+        );
+        // Including another forged driver's run identity.
+        assert_eq!(
+            resume_decision(None, Some("forged:bead-2:0"), OURS),
+            Resume::Skip
+        );
+    }
 }
