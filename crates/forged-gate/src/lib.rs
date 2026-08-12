@@ -1,9 +1,17 @@
 //! forged-gate owns ordered gate execution with artifact capture.
+//!
+//! `run_gates` executes caller-supplied shell lines in order, streams full
+//! stdout/stderr to per-command artifact files, and reports one
+//! `forged_types::GateRow` per command. A failing or timed-out gate is data
+//! in its row — never an error — and never stops later commands.
+//!
+//! This crate is Unix-only by design: gate children run in their own process
+//! group and timeouts SIGKILL the whole group. No `#[cfg]` fallbacks exist
+//! for other platforms. The crate reads no environment variables: callers
+//! pass `cwd` and `artifacts_dir` explicitly.
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_builds() {
-        assert_eq!(2_u32 + 2, 4);
-    }
-}
+mod error;
+mod runner;
+
+pub use error::GateError;
+pub use runner::{run_gates, GateOutcome, GateRequest};
