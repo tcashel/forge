@@ -104,6 +104,46 @@ fn eight_concurrent_opens_migrate_once() {
     }
 }
 
+/// 8 clones of ONE ledger, barrier-released to `close` concurrently: every
+/// closer returns `Ok` — and only after the writer thread has exited (close
+/// holds the writer mutex across the join), so the immediate reopen races
+/// nothing.
+#[test]
+fn concurrent_closers_all_wait_for_the_writer_to_exit() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let ledger = Ledger::open(&path).expect("open");
+    seed_packet(&ledger, "run-close-race");
+
+    let barrier = Arc::new(Barrier::new(8));
+    let mut handles = Vec::new();
+    for _ in 0..8 {
+        let clone = ledger.clone();
+        let barrier = Arc::clone(&barrier);
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            clone.close()
+        }));
+    }
+    drop(ledger);
+    for handle in handles {
+        handle
+            .join()
+            .expect("closer thread")
+            .expect("every concurrent close is Ok");
+    }
+
+    // Reopen immediately — no sleep anywhere: every closer waited for the
+    // real exit, including the ones that found the handle already taken.
+    let reopened = Ledger::open(&path).expect("reopen");
+    assert_eq!(
+        reopened.list_runs().expect("list").len(),
+        1,
+        "state persisted"
+    );
+    reopened.close().expect("close reopened");
+}
+
 /// Spec drift: a claim whose re-hashed spec differs from the stored hash
 /// refuses with `SpecDrift` and inserts no attempt row.
 #[test]

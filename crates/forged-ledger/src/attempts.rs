@@ -10,7 +10,7 @@ use forged_types::{new_claim_token, ErrorCode, PacketResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{refused, LedgerError};
+use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -20,13 +20,18 @@ const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, fail_note, \
      result_json, started_at, updated_at, last_heartbeat_at, ended_at";
 
-fn attempt_state(s: &str) -> AttemptState {
+/// Decode a stored `attempts.state`, failing CLOSED: only the five DDL CHECK
+/// strings are accepted, and `running` in particular must be stored
+/// explicitly — an unrecognized string surfaces as an internal storage
+/// error, never as a live attempt the fence would honor.
+fn attempt_state(idx: usize, s: &str) -> Result<AttemptState, rusqlite::Error> {
     match s {
-        "completed" => AttemptState::Completed,
-        "failed" => AttemptState::Failed,
-        "revoking" => AttemptState::Revoking,
-        "reclaimed" => AttemptState::Reclaimed,
-        _ => AttemptState::Running,
+        "running" => Ok(AttemptState::Running),
+        "completed" => Ok(AttemptState::Completed),
+        "failed" => Ok(AttemptState::Failed),
+        "revoking" => Ok(AttemptState::Revoking),
+        "reclaimed" => Ok(AttemptState::Reclaimed),
+        other => Err(column_decode_error(idx, "attempt state", other)),
     }
 }
 
@@ -36,7 +41,7 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
         packet_id: row.get(1)?,
         claim_token: row.get(2)?,
         claimant: row.get(3)?,
-        state: attempt_state(&row.get::<_, String>(4)?),
+        state: attempt_state(4, &row.get::<_, String>(4)?)?,
         revoke_reason: row.get(5)?,
         fail_note: row.get(6)?,
         result_json: row.get(7)?,
@@ -436,5 +441,36 @@ impl Ledger {
             }
             Ok(())
         })
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn attempt_state_decodes_every_check_string() {
+        for (s, want) in [
+            ("running", AttemptState::Running),
+            ("completed", AttemptState::Completed),
+            ("failed", AttemptState::Failed),
+            ("revoking", AttemptState::Revoking),
+            ("reclaimed", AttemptState::Reclaimed),
+        ] {
+            assert_eq!(attempt_state(4, s).expect(s), want);
+        }
+    }
+
+    #[test]
+    fn attempt_state_fails_closed_on_unknown_strings() {
+        for bad in ["", "Running", "runnin", "zombie"] {
+            let err: LedgerError = attempt_state(4, bad)
+                .expect_err("unknown state must fail closed, never default to Running")
+                .into();
+            assert!(
+                matches!(err, LedgerError::Internal { .. }),
+                "{bad:?}: {err}"
+            );
+        }
     }
 }

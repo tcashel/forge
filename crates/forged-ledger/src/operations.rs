@@ -11,7 +11,7 @@ use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
 use crate::attempts::{find_attempt_by_token_tx, run_of_packet};
-use crate::error::{internal, refused, LedgerError};
+use crate::error::{column_decode_error, internal, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -23,23 +23,39 @@ const OPERATION_COLUMNS: &str =
     "operation_id, name, idempotency_key, request_sha256, effect_class, run_id, \
      claim_token, state, response_json, created_at, updated_at";
 
+/// Decode a stored `operations.effect_class`, failing CLOSED: `safe-retry`
+/// must be stored explicitly — the reconciler must never inherit redo
+/// permission from an unrecognized (corrupt) class string.
+fn effect_class_from_db(idx: usize, s: &str) -> Result<EffectClass, rusqlite::Error> {
+    match s {
+        "safe-retry" => Ok(EffectClass::SafeRetry),
+        "observe-only" => Ok(EffectClass::ObserveOnly),
+        "human-ambiguous" => Ok(EffectClass::HumanAmbiguous),
+        other => Err(column_decode_error(idx, "effect class", other)),
+    }
+}
+
+/// Decode a stored `operations.state`, failing CLOSED: `in_progress` must be
+/// stored explicitly — an unrecognized string is a storage error, never a
+/// row the reconciler may treat as in flight.
+fn operation_state_from_db(idx: usize, s: &str) -> Result<OperationState, rusqlite::Error> {
+    match s {
+        "in_progress" => Ok(OperationState::InProgress),
+        "terminal" => Ok(OperationState::Terminal),
+        other => Err(column_decode_error(idx, "operation state", other)),
+    }
+}
+
 fn operation_row(row: &rusqlite::Row<'_>) -> Result<OperationRow, rusqlite::Error> {
     Ok(OperationRow {
         operation_id: row.get(0)?,
         name: row.get(1)?,
         idempotency_key: row.get(2)?,
         request_sha256: row.get(3)?,
-        effect_class: match row.get::<_, String>(4)?.as_str() {
-            "observe-only" => EffectClass::ObserveOnly,
-            "human-ambiguous" => EffectClass::HumanAmbiguous,
-            _ => EffectClass::SafeRetry,
-        },
+        effect_class: effect_class_from_db(4, &row.get::<_, String>(4)?)?,
         run_id: row.get(5)?,
         claim_token: row.get(6)?,
-        state: match row.get::<_, String>(7)?.as_str() {
-            "terminal" => OperationState::Terminal,
-            _ => OperationState::InProgress,
-        },
+        state: operation_state_from_db(7, &row.get::<_, String>(7)?)?,
         response_json: row.get(8)?,
         created_at: row.get(9)?,
         updated_at: row.get(10)?,
@@ -342,5 +358,49 @@ impl Ledger {
         let name = name.to_owned();
         let idempotency_key = idempotency_key.to_owned();
         self.submit(move |conn| find_operation_tx(conn, &name, &idempotency_key))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn effect_class_decodes_every_check_string_and_fails_closed() {
+        for (s, want) in [
+            ("safe-retry", EffectClass::SafeRetry),
+            ("observe-only", EffectClass::ObserveOnly),
+            ("human-ambiguous", EffectClass::HumanAmbiguous),
+        ] {
+            assert_eq!(effect_class_from_db(4, s).expect(s), want);
+        }
+        for bad in ["", "SafeRetry", "safe_retry", "retry"] {
+            let err: LedgerError = effect_class_from_db(4, bad)
+                .expect_err("unknown class must fail closed, never default to SafeRetry")
+                .into();
+            assert!(
+                matches!(err, LedgerError::Internal { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn operation_state_decodes_every_check_string_and_fails_closed() {
+        for (s, want) in [
+            ("in_progress", OperationState::InProgress),
+            ("terminal", OperationState::Terminal),
+        ] {
+            assert_eq!(operation_state_from_db(7, s).expect(s), want);
+        }
+        for bad in ["", "in-progress", "Terminal", "done"] {
+            let err: LedgerError = operation_state_from_db(7, bad)
+                .expect_err("unknown state must fail closed, never default to InProgress")
+                .into();
+            assert!(
+                matches!(err, LedgerError::Internal { .. }),
+                "{bad:?}: {err}"
+            );
+        }
     }
 }

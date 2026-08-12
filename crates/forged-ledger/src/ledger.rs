@@ -103,8 +103,12 @@ impl Ledger {
     /// Drop the process's only job sender and JOIN the writer thread.
     ///
     /// Returns after the thread has exited, so reopening the same DB path
-    /// races nothing. A second `close` is an idempotent `Ok(())`; a panicked
-    /// writer thread surfaces as `Internal`.
+    /// races nothing. The writer mutex is held ACROSS the join: a concurrent
+    /// closer that finds the handle already taken blocks on the lock until
+    /// the joining closer finishes, so EVERY `close` returns only after the
+    /// thread has really exited — never early with a hollow `Ok`. A second
+    /// `close` is an idempotent `Ok(())`; a panicked writer thread surfaces
+    /// as `Internal`.
     pub fn close(self) -> Result<(), LedgerError> {
         let sender = self
             .sender
@@ -112,12 +116,13 @@ impl Ledger {
             .map_err(|_| internal(WRITER_UNAVAILABLE))?
             .take();
         drop(sender);
-        let handle = self
+        let mut writer = self
             .writer
             .lock()
-            .map_err(|_| internal(WRITER_UNAVAILABLE))?
-            .take();
-        if let Some(handle) = handle {
+            .map_err(|_| internal(WRITER_UNAVAILABLE))?;
+        if let Some(handle) = writer.take() {
+            // Join with the guard held — the writer thread never touches
+            // this mutex, so this cannot deadlock.
             handle
                 .join()
                 .map_err(|_| internal("ledger writer thread panicked"))?;

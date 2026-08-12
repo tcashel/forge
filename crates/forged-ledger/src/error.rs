@@ -59,6 +59,21 @@ impl From<rusqlite::Error> for LedgerError {
     }
 }
 
+/// The row-mapper error for an unrecognized stored enum string.
+///
+/// Row mappers run inside rusqlite's `query_row`/`query_map` and must return
+/// `rusqlite::Error`; this builds a conversion failure that the
+/// `From<rusqlite::Error>` impl above surfaces as [`LedgerError::Internal`].
+/// Decoding fails CLOSED: a stored state outside the DDL CHECK set is
+/// storage corruption and must never map to a permissive default.
+pub(crate) fn column_decode_error(idx: usize, what: &str, value: &str) -> rusqlite::Error {
+    rusqlite::Error::FromSqlConversionFailure(
+        idx,
+        rusqlite::types::Type::Text,
+        format!("unknown {what} in database: {value:?}").into(),
+    )
+}
+
 impl From<serde_json::Error> for LedgerError {
     fn from(err: serde_json::Error) -> Self {
         internal(format!("json error: {err}"))
