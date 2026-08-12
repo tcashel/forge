@@ -8,16 +8,20 @@
 //!   flock-serialized `write`.
 //! - [`classify`] — the operation-aware contention classifier and [`BdError`].
 //! - [`lease`] — claim / heartbeat / scoped reclaim and the TTL constants.
+//! - [`guardian`] — the detached heartbeat guardian (heartbeat means
+//!   "process alive").
 #![deny(missing_docs)]
 
 pub mod classify;
 pub mod config;
 pub mod envelope;
+pub mod guardian;
 pub mod invoke;
 pub mod lease;
 
 pub use classify::BdError;
 pub use config::BdConfig;
+pub use guardian::{run_guardian, GuardianConfig, GuardianExit};
 pub use lease::{
     claim_ready, claim_specific, heartbeat, reclaim, reclaim_older_than, ClaimedBead,
     ReclaimOutcome, BD_LEASE_TTL_S,
