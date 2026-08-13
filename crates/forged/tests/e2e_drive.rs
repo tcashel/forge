@@ -10,7 +10,7 @@ mod support;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{assert_no_overlap, rev_parse, TestEnv};
+use support::{assert_no_overlap, render_cost, require_node, rev_parse, TestEnv};
 
 fn canonical_json_and_sha(value: &Value) -> (String, String) {
     let bytes = forged_types::canonical_json_bytes(value).expect("canonical fixture JSON");
@@ -206,18 +206,34 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     );
 
     // A codex seat is priced from the operator's rate card, never billed by
-    // the provider. The App's spend header calls an epic "provider-billed"
-    // exactly when no hoisted row is imputed, so that row has to survive the
-    // hoist with its cost intact.
-    let imputed: f64 = epic_rows
-        .iter()
-        .filter(|row| row["pricingBasis"] == json!("imputed_api_rate"))
-        .filter_map(|row| row["costUsd"].as_f64())
-        .sum();
+    // the provider. Rendered through the App's own Cost tab — this real
+    // projection, not a fixture — the spend header must split that spend out
+    // instead of claiming the provider billed all of it.
     assert!(
-        imputed > 0.0,
-        "an epic whose child ran a codex seat does not read as fully billed: {epic_rows:?}"
+        epic_rows
+            .iter()
+            .any(|row| row["pricingBasis"] == json!("imputed_api_rate")),
+        "the epic's child ran a codex seat, so a hoisted row is imputed: {epic_rows:?}"
     );
+    if let Some(node) = require_node() {
+        let rendered = render_cost(&node, &overview["result"]);
+        assert!(
+            !rendered.text.contains("provider-billed"),
+            "an epic whose child ran a codex seat renders as fully billed: {}",
+            rendered.text
+        );
+        assert!(
+            rendered.spend_subtitle().ends_with(" imputed"),
+            "the spend header splits imputed spend out of the billed total: {}",
+            rendered.spend_subtitle()
+        );
+        assert_eq!(
+            rendered.stat("priced attempts"),
+            epic_rows.len().to_string(),
+            "the priced-attempt count is the hoisted row count: {}",
+            rendered.text
+        );
+    }
 
     let gh = env.gh_calls();
     assert!(gh.iter().any(|args| args.starts_with(&[
