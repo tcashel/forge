@@ -1,23 +1,22 @@
-//! herdr connection plumbing: one demuxed NDJSON Unix-socket connection,
-//! request/response correlation, and the replay gate that filters the stale
-//! event prefix herdr replays on subscribe.
+//! herdr connection plumbing: one-shot NDJSON Unix-socket RPCs, one dedicated
+//! long-lived subscription connection, and the replay gate that filters the
+//! stale event prefix herdr replays on subscribe.
 
 mod host;
 pub(crate) mod wire;
 
 pub use host::{HerdrControl, HerdrHost, PaneSnapshot};
 
-use std::collections::{HashMap, HashSet};
-use std::path::Path;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::sync::{Arc, Mutex};
+use std::collections::HashSet;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
-use tokio::net::unix::{OwnedReadHalf, OwnedWriteHalf};
 use tokio::net::UnixStream;
-use tokio::sync::{mpsc, oneshot};
+use tokio::task::AbortHandle;
 
 use crate::HostError;
 use wire::{PaneEvent, PaneEventKind, WireError};
@@ -161,71 +160,49 @@ pub(crate) fn parse_frame(line: &str) -> Frame {
         let Ok(data) = serde_json::from_value::<wire::PaneEventData>(data.clone()) else {
             return Frame::Skip;
         };
-        return Frame::Event(PaneEvent {
-            kind,
-            pane_id: data.pane_id,
-        });
+        let Some(pane_id) = data.pane_id() else {
+            return Frame::Skip;
+        };
+        return Frame::Event(PaneEvent { kind, pane_id });
     }
     Frame::Skip
 }
 
-type Pending = Arc<Mutex<HashMap<String, oneshot::Sender<Result<Value, WireError>>>>>;
-
-/// One demuxed connection to a herdr server. Requests go through a writer
-/// task; responses and events come back through the demux task. On EOF or
-/// any socket I/O error the pending requests are failed, the connection is
-/// marked permanently unavailable, and the host NEVER reconnects —
-/// reconnect/re-sync is a later slice.
+/// Herdr closes an ordinary request connection after its response. Event
+/// subscriptions are the sole long-lived connection mode, so RPCs and event
+/// observation must never share a socket.
 pub(crate) struct Connection {
-    writer_tx: mpsc::UnboundedSender<String>,
-    pending: Pending,
+    socket_path: PathBuf,
     next_request_id: AtomicU64,
-    unavailable: Arc<AtomicBool>,
     gate: Arc<Mutex<ReplayGate>>,
     closed_panes: Arc<Mutex<HashSet<String>>>,
+    subscription: OnceLock<AbortHandle>,
+}
+
+impl Drop for Connection {
+    fn drop(&mut self) {
+        if let Some(subscription) = self.subscription.get() {
+            subscription.abort();
+        }
+    }
 }
 
 impl Connection {
-    /// Dial the socket and start the demux and writer tasks. No protocol
-    /// traffic happens here — `ping`/`events.subscribe` are ordinary
-    /// requests issued through the demux by the caller.
+    /// Retain the endpoint. Each ordinary call dials it independently; the
+    /// protocol pin performed immediately by the caller proves reachability.
     pub(crate) async fn dial(socket_path: &Path) -> Result<Arc<Connection>, HostError> {
-        let stream = UnixStream::connect(socket_path).await.map_err(|e| {
-            HostError::unavailable(format!("connecting to {}: {e}", socket_path.display()))
-        })?;
-        let (read_half, write_half) = stream.into_split();
-        let (writer_tx, writer_rx) = mpsc::unbounded_channel::<String>();
-        let pending: Pending = Arc::new(Mutex::new(HashMap::new()));
-        let unavailable = Arc::new(AtomicBool::new(false));
-        let gate = Arc::new(Mutex::new(ReplayGate::new()));
-        let closed_panes = Arc::new(Mutex::new(HashSet::new()));
-
-        tokio::spawn(demux_task(
-            read_half,
-            Arc::clone(&pending),
-            Arc::clone(&unavailable),
-            Arc::clone(&gate),
-            Arc::clone(&closed_panes),
-        ));
-        tokio::spawn(writer_task(
-            write_half,
-            writer_rx,
-            Arc::clone(&pending),
-            Arc::clone(&unavailable),
-        ));
-
         Ok(Arc::new(Connection {
-            writer_tx,
-            pending,
+            socket_path: socket_path.to_path_buf(),
             next_request_id: AtomicU64::new(1),
-            unavailable,
-            gate,
-            closed_panes,
+            gate: Arc::new(Mutex::new(ReplayGate::new())),
+            closed_panes: Arc::new(Mutex::new(HashSet::new())),
+            subscription: OnceLock::new(),
         }))
     }
 
-    pub(crate) fn is_unavailable(&self) -> bool {
-        self.unavailable.load(Ordering::SeqCst)
+    fn next_request_id(&self) -> String {
+        let n = self.next_request_id.fetch_add(1, Ordering::SeqCst);
+        format!("forged-{n}")
     }
 
     /// Record a `pane.split` response's pane_id with the replay gate.
@@ -244,128 +221,182 @@ impl Connection {
             .contains(pane_id)
     }
 
-    /// Issue one request and await its response with the 5 s RPC timeout.
+    /// Issue one request on one fresh connection and await its response. This
+    /// mirrors Herdr's transport contract: the server closes ordinary request
+    /// sockets after the first response.
     pub(crate) async fn call(&self, method: &str, params: Value) -> Result<Value, CallError> {
-        if self.is_unavailable() {
-            return Err(CallError::Unavailable(
-                "herdr connection is gone; the host does not reconnect".to_string(),
-            ));
-        }
-        let n = self.next_request_id.fetch_add(1, Ordering::SeqCst);
-        let request_id = format!("forged-{n}");
-        let (tx, rx) = oneshot::channel();
-        self.pending
-            .lock()
-            .expect("pending lock")
-            .insert(request_id.clone(), tx);
-        // Re-check after insert so a concurrent teardown cannot strand us.
-        if self.is_unavailable() {
-            self.pending
-                .lock()
-                .expect("pending lock")
-                .remove(&request_id);
-            return Err(CallError::Unavailable(
-                "herdr connection is gone; the host does not reconnect".to_string(),
-            ));
-        }
+        let request_id = self.next_request_id();
         let frame = serde_json::json!({
-            "id": request_id,
+            "id": &request_id,
             "method": method,
             "params": params,
         });
-        let line = frame.to_string();
-        if self.writer_tx.send(line).is_err() {
-            self.pending
-                .lock()
-                .expect("pending lock")
-                .remove(&request_id);
-            return Err(CallError::Unavailable(
-                "herdr writer task is gone".to_string(),
-            ));
-        }
-        match tokio::time::timeout(RPC_TIMEOUT, rx).await {
-            Ok(Ok(Ok(result))) => Ok(result),
-            Ok(Ok(Err(wire_error))) => Err(CallError::Rpc(wire_error)),
-            Ok(Err(_dropped)) => Err(CallError::Unavailable(
-                "herdr connection closed with the request outstanding".to_string(),
-            )),
-            Err(_elapsed) => {
-                self.pending
-                    .lock()
-                    .expect("pending lock")
-                    .remove(&request_id);
-                Err(CallError::Unavailable(format!(
-                    "herdr did not answer {method} within the RPC timeout"
-                )))
-            }
-        }
-    }
-}
+        let line = format!("{}\n", frame);
+        let socket_path = &self.socket_path;
 
-/// Fail every pending request (dropping the senders completes each caller's
-/// await with a channel error mapped to `HostError::Unavailable`) and mark
-/// the connection permanently unavailable.
-fn tear_down(pending: &Pending, unavailable: &AtomicBool) {
-    unavailable.store(true, Ordering::SeqCst);
-    pending.lock().expect("pending lock").clear();
-}
-
-async fn demux_task(
-    read_half: OwnedReadHalf,
-    pending: Pending,
-    unavailable: Arc<AtomicBool>,
-    gate: Arc<Mutex<ReplayGate>>,
-    closed_panes: Arc<Mutex<HashSet<String>>>,
-) {
-    let mut lines = BufReader::new(read_half).lines();
-    // EOF or any socket I/O error falls out of the loop into tear_down.
-    while let Ok(Some(line)) = lines.next_line().await {
-        match parse_frame(&line) {
-            Frame::Response { id, result } => {
-                let sender = pending.lock().expect("pending lock").remove(&id);
-                if let Some(sender) = sender {
-                    let _ = sender.send(result);
-                }
-            }
-            Frame::Event(event) => {
-                let emitted = {
-                    let mut gate = gate.lock().expect("gate lock");
-                    gate.feed(GateInput::Event(event))
+        let response = tokio::time::timeout(RPC_TIMEOUT, async {
+            let stream = UnixStream::connect(socket_path).await.map_err(|error| {
+                CallError::Unavailable(format!("connecting to {}: {error}", socket_path.display()))
+            })?;
+            let (read_half, mut write_half) = stream.into_split();
+            write_half
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|error| {
+                    CallError::Unavailable(format!("writing herdr {method} request: {error}"))
+                })?;
+            let mut lines = BufReader::new(read_half).lines();
+            loop {
+                let next = lines.next_line().await.map_err(|error| {
+                    CallError::Unavailable(format!("reading herdr {method} response: {error}"))
+                })?;
+                let Some(incoming) = next else {
+                    return Err(CallError::Unavailable(format!(
+                        "herdr closed the {method} connection before responding"
+                    )));
                 };
-                if let Some(event) = emitted {
-                    if event.kind == PaneEventKind::Closed {
-                        closed_panes
-                            .lock()
-                            .expect("closed_panes lock")
-                            .insert(event.pane_id);
+                match parse_frame(&incoming) {
+                    Frame::Response { id, result } if id == request_id => {
+                        return result.map_err(CallError::Rpc);
+                    }
+                    Frame::Response { .. } => {
+                        return Err(CallError::Unavailable(format!(
+                            "herdr returned a mismatched response id for {method}"
+                        )));
+                    }
+                    Frame::Event(event) => {
+                        observe_event(&self.gate, &self.closed_panes, event);
+                    }
+                    Frame::Skip => {
+                        eprintln!("forged-host: skipping unrecognized herdr frame: {incoming}");
                     }
                 }
             }
-            Frame::Skip => {
-                eprintln!("forged-host: skipping unrecognized herdr frame: {line}");
-            }
+        })
+        .await;
+
+        match response {
+            Ok(result) => result,
+            Err(_elapsed) => Err(CallError::Unavailable(format!(
+                "herdr did not answer {method} within the RPC timeout"
+            ))),
         }
     }
-    tear_down(&pending, &unavailable);
+
+    /// Open Herdr's dedicated long-lived subscription mode. Ordinary RPCs
+    /// continue to use independent sockets while this reader observes events.
+    pub(crate) async fn subscribe(&self, params: Value) -> Result<(), CallError> {
+        if self.subscription.get().is_some() {
+            return Err(CallError::Unavailable(
+                "herdr event subscription already started".to_string(),
+            ));
+        }
+
+        let request_id = self.next_request_id();
+        let frame = serde_json::json!({
+            "id": &request_id,
+            "method": "events.subscribe",
+            "params": params,
+        });
+        let line = format!("{}\n", frame);
+        let socket_path = &self.socket_path;
+        let gate = Arc::clone(&self.gate);
+        let closed_panes = Arc::clone(&self.closed_panes);
+
+        let setup = tokio::time::timeout(RPC_TIMEOUT, async {
+            let stream = UnixStream::connect(socket_path).await.map_err(|error| {
+                CallError::Unavailable(format!(
+                    "connecting subscription to {}: {error}",
+                    socket_path.display()
+                ))
+            })?;
+            let (read_half, mut write_half) = stream.into_split();
+            write_half
+                .write_all(line.as_bytes())
+                .await
+                .map_err(|error| {
+                    CallError::Unavailable(format!("writing herdr subscription request: {error}"))
+                })?;
+            let mut lines = BufReader::new(read_half).lines();
+            loop {
+                let next = lines.next_line().await.map_err(|error| {
+                    CallError::Unavailable(format!("reading herdr subscription response: {error}"))
+                })?;
+                let Some(incoming) = next else {
+                    return Err(CallError::Unavailable(
+                        "herdr closed the subscription connection before acknowledging it"
+                            .to_string(),
+                    ));
+                };
+                match parse_frame(&incoming) {
+                    Frame::Response { id, result } if id == request_id => {
+                        result.map_err(CallError::Rpc)?;
+                        return Ok((lines, write_half));
+                    }
+                    Frame::Response { .. } => {
+                        return Err(CallError::Unavailable(
+                            "herdr returned a mismatched subscription response id".to_string(),
+                        ));
+                    }
+                    Frame::Event(event) => observe_event(&gate, &closed_panes, event),
+                    Frame::Skip => {
+                        eprintln!("forged-host: skipping unrecognized herdr frame: {incoming}");
+                    }
+                }
+            }
+        })
+        .await;
+        let (mut lines, write_half) = match setup {
+            Ok(result) => result?,
+            Err(_elapsed) => {
+                return Err(CallError::Unavailable(
+                    "herdr did not acknowledge events.subscribe within the RPC timeout".to_string(),
+                ));
+            }
+        };
+
+        let task = tokio::spawn(async move {
+            // Herdr keeps subscriptions alive only while the full duplex socket
+            // remains open, even though this client sends no more requests.
+            let _write_half = write_half;
+            while let Ok(Some(incoming)) = lines.next_line().await {
+                match parse_frame(&incoming) {
+                    Frame::Event(event) => observe_event(&gate, &closed_panes, event),
+                    Frame::Response { .. } => {}
+                    Frame::Skip => {
+                        eprintln!("forged-host: skipping unrecognized herdr frame: {incoming}");
+                    }
+                }
+            }
+        });
+        let abort = task.abort_handle();
+        if let Err(abort) = self.subscription.set(abort) {
+            abort.abort();
+            return Err(CallError::Unavailable(
+                "herdr event subscription raced with another start".to_string(),
+            ));
+        }
+        Ok(())
+    }
 }
 
-async fn writer_task(
-    mut write_half: OwnedWriteHalf,
-    mut writer_rx: mpsc::UnboundedReceiver<String>,
-    pending: Pending,
-    unavailable: Arc<AtomicBool>,
+fn observe_event(
+    gate: &Mutex<ReplayGate>,
+    closed_panes: &Mutex<HashSet<String>>,
+    event: PaneEvent,
 ) {
-    while let Some(line) = writer_rx.recv().await {
-        let write = async {
-            write_half.write_all(line.as_bytes()).await?;
-            write_half.write_all(b"\n").await
-        };
-        if write.await.is_err() {
-            tear_down(&pending, &unavailable);
-            return;
+    let emitted = gate
+        .lock()
+        .expect("gate lock")
+        .feed(GateInput::Event(event));
+    if let Some(event) = emitted {
+        if event.kind == PaneEventKind::Closed {
+            closed_panes
+                .lock()
+                .expect("closed_panes lock")
+                .insert(event.pane_id);
         }
     }
-    // Writer channel closed: the host was dropped; nothing pending to fail.
 }
 
 #[cfg(test)]
@@ -376,11 +407,11 @@ mod tests {
     /// stale foreign `pane_created`/`pane_exited` lines, then the
     /// self-triggered `pane_created`, then a genuine `pane_exited`.
     const REPLAY_NDJSON: &str = concat!(
-        r#"{"event":"pane_created","data":{"pane_id":"stale-1","workspace_id":"ws-0"}}"#,
+        r#"{"event":"pane_created","data":{"type":"pane_created","pane":{"pane_id":"stale-1","workspace_id":"ws-0"}}}"#,
         "\n",
         r#"{"event":"pane_exited","data":{"pane_id":"stale-1","workspace_id":"ws-0"}}"#,
         "\n",
-        r#"{"event":"pane_created","data":{"pane_id":"self-pane","workspace_id":"ws-0"}}"#,
+        r#"{"event":"pane_created","data":{"type":"pane_created","pane":{"pane_id":"self-pane","workspace_id":"ws-0"}}}"#,
         "\n",
         r#"{"event":"pane_exited","data":{"pane_id":"self-pane","workspace_id":"ws-0"}}"#,
     );
