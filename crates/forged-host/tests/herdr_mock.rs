@@ -562,3 +562,108 @@ async fn bare_close_acknowledgement_is_never_confirmation() {
     let err = host.kill_confirmed(&id).await.expect_err("must time out");
     assert!(matches!(err, HostError::KillVerifyTimeout));
 }
+
+// ---------------------------------------------------------------------------
+// Placement: seats land in a forged-owned workspace, never the focused one.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn a_host_with_a_workspace_reuses_a_matching_label_and_targets_the_split() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        // The operator's own `forge` workspace is present and must be
+        // ignored; only the `forged-` prefixed one is ever targeted.
+        ("workspace.list", 1) => vec![Action::Respond(json!({
+            "type": "workspace_list",
+            "workspaces": [
+                {"workspace_id": "w6", "label": "drover"},
+                {"workspace_id": "w7", "label": "forge"},
+                {"workspace_id": "w9", "label": "forged-forge"},
+            ],
+        }))],
+        (m, c) => spawn_script(m, c, true).unwrap_or_default(),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_workspace("forged-forge");
+    host.spawn(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("spawn");
+
+    let split = mock.params_of("pane.split");
+    assert_eq!(
+        split["workspace_id"], "w9",
+        "the split must target the forged-owned workspace"
+    );
+    assert!(
+        !mock.methods().iter().any(|m| m == "workspace.create"),
+        "a matching label must be reused, never duplicated: {:?}",
+        mock.methods()
+    );
+}
+
+#[tokio::test]
+async fn a_host_with_a_workspace_creates_it_unfocused_when_absent() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("workspace.list", 1) => vec![Action::Respond(json!({
+            "type": "workspace_list",
+            "workspaces": [{"workspace_id": "w7", "label": "forge"}],
+        }))],
+        ("workspace.create", 1) => vec![Action::Respond(json!({
+            "workspace": {"workspace_id": "w9", "label": "forged-forge"},
+        }))],
+        (m, c) => spawn_script(m, c, true).unwrap_or_default(),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_workspace("forged-forge");
+    host.spawn(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("spawn");
+
+    let created = mock.params_of("workspace.create");
+    assert_eq!(created["label"], "forged-forge");
+    assert_eq!(
+        created["focus"],
+        json!(false),
+        "creating a workspace must never move the operator's focus"
+    );
+    assert_eq!(mock.params_of("pane.split")["workspace_id"], "w9");
+}
+
+#[tokio::test]
+async fn placement_failure_degrades_to_an_untargeted_split() {
+    // A seat that cannot start is worse than a pane in the wrong place, so
+    // an unusable workspace surface must not fail the spawn.
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("workspace.list", 1) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "workspace surface unavailable",
+        }],
+        ("workspace.create", 1) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "workspace surface unavailable",
+        }],
+        (m, c) => spawn_script(m, c, true).unwrap_or_default(),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_workspace("forged-forge");
+    let id = host
+        .spawn(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("the spawn must still succeed");
+    assert_eq!(id.as_str(), TEST_PANE_ID);
+    assert!(
+        mock.params_of("pane.split").get("workspace_id").is_none(),
+        "an unresolved workspace must leave the split untargeted"
+    );
+}
