@@ -355,7 +355,12 @@ async fn spawn(
                 }
                 Some(socket) => match HerdrHost::connect(socket, &status_base).await {
                     Ok(host) => (
-                        Box::new(host),
+                        Box::new(
+                            match crate::adapters::execute::workspace_label_for_repo(repo) {
+                                Some(label) => host.with_workspace(label),
+                                None => host,
+                            },
+                        ),
                         "herdr",
                         Some(socket.to_string_lossy().into_owned()),
                     ),

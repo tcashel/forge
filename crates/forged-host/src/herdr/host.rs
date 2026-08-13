@@ -66,6 +66,14 @@ pub struct HerdrHost {
     conn: Arc<Connection>,
     base_status_dir: PathBuf,
     sessions: Mutex<HashMap<HostSessionId, PathBuf>>,
+    /// Label of the workspace seats are placed in, when the caller named one.
+    /// `None` reproduces the pre-placement behaviour: an untargeted split,
+    /// which herdr resolves against the UI-FOCUSED pane — one that may belong
+    /// to the operator or another client.
+    workspace_label: Option<String>,
+    /// The resolved id for [`Self::workspace_label`], memoized after the
+    /// first successful lookup.
+    workspace: Mutex<Option<String>>,
 }
 
 /// A controller connection for durable pane ids recorded by forged. Unlike
@@ -181,7 +189,72 @@ impl HerdrHost {
             conn,
             base_status_dir: base_status_dir.into(),
             sessions: Mutex::new(HashMap::new()),
+            workspace_label: None,
+            workspace: Mutex::new(None),
         })
+    }
+
+    /// Place every seat this host spawns inside the workspace named `label`,
+    /// creating it on first use.
+    ///
+    /// The label is the caller's to choose and MUST be one only forged owns:
+    /// targeting a workspace the operator works in defeats the purpose, since
+    /// the seats then split the panes the operator is using.
+    pub fn with_workspace(mut self, label: impl Into<String>) -> Self {
+        self.workspace_label = Some(label.into());
+        self
+    }
+
+    /// The workspace id seats are placed in, resolved once and memoized.
+    ///
+    /// Every failure degrades to `None`, which spawns an untargeted pane. A
+    /// pane in the wrong workspace is a strictly better outcome than a seat
+    /// that cannot start, so placement never propagates an error. This crate
+    /// carries no logging dependency; the degraded case is silent by
+    /// construction and is why `workspace.list` is re-consulted on each new
+    /// host rather than cached process-wide — a workspace the operator closed
+    /// is recreated on the next spawn instead of stranding placement.
+    async fn workspace_id(&self) -> Option<String> {
+        let label = self.workspace_label.as_deref()?;
+        if let Some(id) = self.workspace.lock().expect("workspace lock").clone() {
+            return Some(id);
+        }
+        let id = self.resolve_workspace(label).await?;
+        *self.workspace.lock().expect("workspace lock") = Some(id.clone());
+        Some(id)
+    }
+
+    /// Find the workspace labelled `label`, else create it unfocused.
+    ///
+    /// `focus: false` is load-bearing: creating a workspace must never move
+    /// the operator's focus, and a run that starts while they are working
+    /// elsewhere has to stay invisible until they go looking for it.
+    async fn resolve_workspace(&self, label: &str) -> Option<String> {
+        let listed = self.conn.call("workspace.list", json!({})).await.ok()?;
+        let existing = listed
+            .get("workspaces")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|workspace| {
+                workspace.get("label").and_then(serde_json::Value::as_str) == Some(label)
+            })
+            .and_then(|workspace| workspace.get("workspace_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned);
+        if let Some(id) = existing {
+            return Some(id);
+        }
+        let created = self
+            .conn
+            .call("workspace.create", json!({"label": label, "focus": false}))
+            .await
+            .ok()?;
+        created
+            .get("workspace")
+            .and_then(|workspace| workspace.get("workspace_id"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_owned)
     }
 
     /// `$HOME/.config/herdr/herdr.sock`.
@@ -329,12 +402,19 @@ impl SessionHost for HerdrHost {
             .to_str()
             .ok_or_else(|| HostError::spawn_failed("cwd is not valid UTF-8"))?;
 
+        // Placement is decided HERE and never revised. herdr pane ids are
+        // workspace-qualified and a pane moved between workspaces receives a
+        // NEW id; the id returned below becomes this session's
+        // `HostSessionId`, which the reclaim saga is fenced on. Relocating a
+        // pane afterwards would therefore invalidate a live session identity
+        // and break confirmed-death verification.
+        let mut split = json!({"direction": "right", "cwd": cwd, "env": env, "focus": false});
+        if let Some(workspace) = self.workspace_id().await {
+            split["workspace_id"] = json!(workspace);
+        }
         let split_result = self
             .conn
-            .call(
-                "pane.split",
-                json!({"direction": "right", "cwd": cwd, "env": env, "focus": false}),
-            )
+            .call("pane.split", split)
             .await
             .map_err(|e| match e {
                 CallError::Rpc(e) => {
