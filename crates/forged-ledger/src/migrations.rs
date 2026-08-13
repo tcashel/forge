@@ -162,8 +162,39 @@ CREATE TABLE runtime_migrations (
 CREATE INDEX events_kind_run ON events(kind, run_id, event_id);
 ";
 
+/// Migration 005: a natural key for usage.
+///
+/// Usage is captured when an attempt settles and can be re-derived from the
+/// same packet directory afterwards by `usage ingest`. Without a natural key
+/// the second read duplicates the first, so idempotency had to be borrowed
+/// from the operation fence — which keys per run and therefore refuses the
+/// second ingest outright, leaving later rounds uncounted. The key makes
+/// re-recording a no-op at the storage layer instead.
+///
+/// `COALESCE` because SQLite treats NULLs in a unique index as distinct,
+/// which would let unattributed rows duplicate freely.
+const MIGRATION_005: &str = "
+CREATE UNIQUE INDEX usage_natural_key ON usage(
+  run_id, COALESCE(packet_id, ''), COALESCE(attempt_id, -1), provider, model
+);
+";
+
+/// Migration 006: server-side tool calls, billed per call rather than per
+/// token. Kept out of the token columns because it is a different unit and
+/// a different rate; folding it in would corrupt every token aggregate.
+const MIGRATION_006: &str = "
+ALTER TABLE usage ADD COLUMN web_search_requests INTEGER;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004];
+const MIGRATIONS: &[&str] = &[
+    MIGRATION_001,
+    MIGRATION_002,
+    MIGRATION_003,
+    MIGRATION_004,
+    MIGRATION_005,
+    MIGRATION_006,
+];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
 pub(crate) fn configure_connection(conn: &mut Connection) -> Result<(), LedgerError> {
@@ -282,7 +313,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 4);
+        assert_eq!(pragmas.user_version, 6);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -329,7 +360,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 4);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
         ledger.close().expect("close");
     }
 
@@ -350,7 +381,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 4);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"

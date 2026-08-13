@@ -425,6 +425,41 @@ pub struct NewUsage {
     pub pricing_basis: Option<String>,
     /// Rate-limit consumption, when reported.
     pub rate_limit_used_percent: Option<f64>,
+    /// Server-side web searches, billed per call rather than per token.
+    pub web_search_requests: Option<u64>,
+}
+
+/// One stored usage row, as [`crate::Ledger::list_usage`] returns it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UsageRecord {
+    /// Owning run id.
+    pub run_id: String,
+    /// Packet attribution, when the recorder knew one.
+    pub packet_id: Option<String>,
+    /// Attempt attribution, when the recorder knew one.
+    pub attempt_id: Option<i64>,
+    /// Provider name.
+    pub provider: String,
+    /// Model name.
+    pub model: String,
+    /// Tokens billed at the uncached input rate.
+    pub input_tokens: u64,
+    /// Output tokens.
+    pub output_tokens: u64,
+    /// Cache-read tokens, when reported.
+    pub cache_read_tokens: Option<u64>,
+    /// Cache-write tokens, when reported.
+    pub cache_write_tokens: Option<u64>,
+    /// Cost in USD — NULL means unknown, never zero.
+    pub cost_usd: Option<f64>,
+    /// `billed` | `imputed_api_rate` | `none`.
+    pub pricing_basis: Option<String>,
+    /// Rate-limit consumption, when reported.
+    pub rate_limit_used_percent: Option<f64>,
+    /// Server-side web searches, billed per call rather than per token.
+    pub web_search_requests: Option<u64>,
+    /// When the row was recorded.
+    pub ts: String,
 }
 
 /// Aggregate returned by [`crate::Ledger::usage_totals`].

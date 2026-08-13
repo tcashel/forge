@@ -9,7 +9,8 @@ use crate::invocation::{
     validate_embedded_path, validate_model, Invocation, PacketDirs, ProviderDriver,
 };
 use crate::usage::{
-    object_line, optional_token, required_token, PricingBasis, UsageCapture, UsageRow,
+    disjoint_input, object_line, optional_token, required_token, PricingBasis, UsageCapture,
+    UsageRow,
 };
 
 /// The closed set of reasoning efforts the codex CLI accepts. The closed
@@ -75,6 +76,7 @@ impl ProviderDriver for CodexDriver {
     fn parse_usage(&self, stdout: &str, model: &str) -> Result<UsageCapture, ProviderError> {
         let mut session_ref: Option<String> = None;
         let mut last_turn: Option<Map<String, Value>> = None;
+        let mut web_searches = 0u64;
         for line in stdout.lines() {
             let Some(obj) = object_line(line) else {
                 continue;
@@ -86,6 +88,7 @@ impl ProviderDriver for CodexDriver {
                     }
                 }
                 Some("turn.completed") => last_turn = Some(obj),
+                Some("item.completed") if is_web_search_item(&obj) => web_searches += 1,
                 _ => {}
             }
         }
@@ -110,17 +113,43 @@ impl ProviderDriver for CodexDriver {
                 })
             }
         };
+        let total_input = required_token(usage, "input_tokens", context)?;
+        let cache_read = required_token(usage, "cached_input_tokens", context)?;
+        let cache_write = optional_token(usage, "cache_write_input_tokens", context)?;
         let rows = vec![UsageRow {
             provider: "codex".to_owned(),
             model: model.to_owned(),
-            input_tokens: required_token(usage, "input_tokens", context)?,
+            input_tokens: disjoint_input(
+                total_input,
+                cache_read,
+                cache_write.unwrap_or(0),
+                context,
+            )?,
             output_tokens: required_token(usage, "output_tokens", context)?,
-            cache_read_tokens: Some(required_token(usage, "cached_input_tokens", context)?),
-            cache_write_tokens: optional_token(usage, "cache_write_input_tokens", context)?,
+            cache_read_tokens: Some(cache_read),
+            cache_write_tokens: cache_write,
             cost_usd: None,
             pricing_basis: PricingBasis::None,
             rate_limit_used_percent: None,
+            web_search_requests: Some(web_searches),
         }];
         Ok(UsageCapture { session_ref, rows })
     }
+}
+
+/// Does this `item.completed` envelope describe a server-side web search?
+///
+/// Matched on a `web_search` prefix rather than one exact string. The
+/// rollout names the response item `web_search_call`, which is verified
+/// against real captures; the `codex exec --json` stream renames items as
+/// it emits them (`function_call` surfaces as `command_execution`), and no
+/// capture in hand performs a search, so its exact spelling is unverified.
+/// A prefix match counts `web_search` and `web_search_call` alike and
+/// costs nothing when neither appears.
+fn is_web_search_item(obj: &Map<String, Value>) -> bool {
+    obj.get("item")
+        .and_then(Value::as_object)
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
 }

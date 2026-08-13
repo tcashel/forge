@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 
 use crate::error::ProviderError;
 use crate::usage::{
-    object_line, optional_token, required_token, PricingBasis, UsageCapture, UsageRow,
+    disjoint_input, object_line, optional_token, required_token, PricingBasis, UsageCapture,
+    UsageRow,
 };
 
 /// Directory recursion cap below each search root (`sessions/` nests
@@ -171,17 +172,25 @@ fn parse_rollout(
 ) -> Result<UsageCapture, ProviderError> {
     let mut usage_info: Option<Value> = None;
     let mut used_percent: Option<f64> = None;
+    let mut web_searches = 0u64;
     for line in content.lines() {
         let Some(obj) = object_line(line) else {
             continue;
         };
-        if obj.get("type").and_then(Value::as_str) != Some("event_msg") {
-            continue;
-        }
+        let envelope = obj.get("type").and_then(Value::as_str);
         let Some(Value::Object(payload)) = obj.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        let kind = payload.get("type").and_then(Value::as_str);
+        // A rollout records one `web_search_call` response item per billed
+        // search. `web_search_end` is the streaming companion and fires
+        // repeatedly for a single call, so counting it would multiply the
+        // bill severalfold.
+        if envelope == Some("response_item") && kind == Some("web_search_call") {
+            web_searches += 1;
+            continue;
+        }
+        if envelope != Some("event_msg") || kind != Some("token_count") {
             continue;
         }
         if let Some(percent) = payload
@@ -213,16 +222,20 @@ fn parse_rollout(
             })
         }
     };
+    let total_input = required_token(usage, "input_tokens", context)?;
+    let cache_read = required_token(usage, "cached_input_tokens", context)?;
+    let cache_write = optional_token(usage, "cache_write_input_tokens", context)?;
     let rows = vec![UsageRow {
         provider: "codex".to_owned(),
         model: model.to_owned(),
-        input_tokens: required_token(usage, "input_tokens", context)?,
+        input_tokens: disjoint_input(total_input, cache_read, cache_write.unwrap_or(0), context)?,
         output_tokens: required_token(usage, "output_tokens", context)?,
-        cache_read_tokens: Some(required_token(usage, "cached_input_tokens", context)?),
-        cache_write_tokens: optional_token(usage, "cache_write_input_tokens", context)?,
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: cache_write,
         cost_usd: None,
         pricing_basis: PricingBasis::None,
         rate_limit_used_percent: used_percent,
+        web_search_requests: Some(web_searches),
     }];
     Ok(UsageCapture { session_ref, rows })
 }

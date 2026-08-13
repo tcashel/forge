@@ -12,6 +12,7 @@ mod config;
 mod core;
 mod failpoint;
 mod mcp;
+mod pricing;
 
 use std::sync::Arc;
 

@@ -69,10 +69,11 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
         "session_message",
         "session_read",
         "session_stop",
+        "usage_ingest",
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-eight tools, exactly");
+    assert_eq!(tools, expected, "the twenty-nine tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(

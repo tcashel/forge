@@ -6,7 +6,7 @@ use forged_types::ErrorCode;
 use crate::error::{internal, refused, LedgerError};
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{NewUsage, UsageTotals};
+use crate::types::{NewUsage, UsageRecord, UsageTotals};
 
 fn as_i64(value: u64, what: &str) -> Result<i64, LedgerError> {
     i64::try_from(value).map_err(|_| {
@@ -26,19 +26,38 @@ fn as_u64(value: i64, what: &str) -> Result<u64, LedgerError> {
 }
 
 impl Ledger {
-    /// Record one usage row.
+    /// Record one usage row, keyed by
+    /// `(run_id, packet_id, attempt_id, provider, model)`.
+    ///
+    /// Upsert, not insert: the same attempt's capture may be read more than
+    /// once — once when it settles and again by a later `usage ingest` over
+    /// the same packet directory — and the second read must not double the
+    /// first. Re-recording overwrites, so the newest read of a capture wins.
     pub fn record_usage(&self, usage: NewUsage) -> Result<(), LedgerError> {
         self.submit(move |conn| {
             let input_tokens = as_i64(usage.input_tokens, "input_tokens")?;
             let output_tokens = as_i64(usage.output_tokens, "output_tokens")?;
             let cache_read = opt_as_i64(usage.cache_read_tokens, "cache_read_tokens")?;
             let cache_write = opt_as_i64(usage.cache_write_tokens, "cache_write_tokens")?;
+            let web_searches = opt_as_i64(usage.web_search_requests, "web_search_requests")?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO usage (run_id, packet_id, attempt_id, provider, model, \
                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
-                 cost_usd, pricing_basis, rate_limit_used_percent, ts) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+                 cost_usd, pricing_basis, rate_limit_used_percent, ts, \
+                 web_search_requests) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
+                 ON CONFLICT (run_id, COALESCE(packet_id, ''), COALESCE(attempt_id, -1), \
+                 provider, model) DO UPDATE SET \
+                 input_tokens = excluded.input_tokens, \
+                 output_tokens = excluded.output_tokens, \
+                 cache_read_tokens = excluded.cache_read_tokens, \
+                 cache_write_tokens = excluded.cache_write_tokens, \
+                 cost_usd = excluded.cost_usd, \
+                 pricing_basis = excluded.pricing_basis, \
+                 rate_limit_used_percent = excluded.rate_limit_used_percent, \
+                 web_search_requests = excluded.web_search_requests, \
+                 ts = excluded.ts",
                 rusqlite::params![
                     usage.run_id,
                     usage.packet_id,
@@ -53,6 +72,7 @@ impl Ledger {
                     usage.pricing_basis,
                     usage.rate_limit_used_percent,
                     now_iso(),
+                    web_searches,
                 ],
             )?;
             tx.commit()?;
@@ -102,6 +122,74 @@ impl Ledger {
                 rows_missing_cost: u32::try_from(missing)
                     .map_err(|_| internal("rows_missing_cost overflows u32"))?,
             })
+        })
+    }
+
+    /// Every stored usage row for a run, oldest first.
+    ///
+    /// Totals answer "what did this run cost"; these answer "which seat
+    /// spent it". Rows are returned exactly as stored — a NULL `cost_usd`
+    /// stays NULL rather than becoming 0, so a seat whose provider bills no
+    /// money is distinguishable from one that cost nothing.
+    pub fn list_usage(&self, run_id: &str) -> Result<Vec<UsageRecord>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let mut stmt = conn.prepare(
+                "SELECT run_id, packet_id, attempt_id, provider, model, \
+                        input_tokens, output_tokens, cache_read_tokens, \
+                        cache_write_tokens, cost_usd, pricing_basis, \
+                        rate_limit_used_percent, ts, web_search_requests \
+                 FROM usage WHERE run_id = ?1 ORDER BY usage_id",
+            )?;
+            let rows = stmt
+                .query_map([&run_id], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<i64>>(2)?,
+                        row.get::<_, String>(3)?,
+                        row.get::<_, String>(4)?,
+                        row.get::<_, i64>(5)?,
+                        row.get::<_, i64>(6)?,
+                        row.get::<_, Option<i64>>(7)?,
+                        row.get::<_, Option<i64>>(8)?,
+                        row.get::<_, Option<f64>>(9)?,
+                        row.get::<_, Option<String>>(10)?,
+                        row.get::<_, Option<f64>>(11)?,
+                        row.get::<_, String>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
+                    ))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
+            rows.into_iter()
+                .map(|r| {
+                    Ok(UsageRecord {
+                        run_id: r.0,
+                        packet_id: r.1,
+                        attempt_id: r.2,
+                        provider: r.3,
+                        model: r.4,
+                        input_tokens: as_u64(r.5, "input_tokens")?,
+                        output_tokens: as_u64(r.6, "output_tokens")?,
+                        cache_read_tokens: r
+                            .7
+                            .map(|v| as_u64(v, "cache_read_tokens"))
+                            .transpose()?,
+                        cache_write_tokens: r
+                            .8
+                            .map(|v| as_u64(v, "cache_write_tokens"))
+                            .transpose()?,
+                        cost_usd: r.9,
+                        pricing_basis: r.10,
+                        rate_limit_used_percent: r.11,
+                        ts: r.12,
+                        web_search_requests: r
+                            .13
+                            .map(|v| as_u64(v, "web_search_requests"))
+                            .transpose()?,
+                    })
+                })
+                .collect()
         })
     }
 }
