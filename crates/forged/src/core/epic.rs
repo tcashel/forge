@@ -630,16 +630,19 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 }
                 let mut children = Vec::new();
                 for child in inventory {
-                    // The bead's own fields win. Only a child that carries no
-                    // spec at all falls back to its `spec:` pointer — the
-                    // route every epic frozen before this used.
+                    // The bead's own fields win, but only when they are a
+                    // WHOLE spec. A child missing either required section
+                    // falls back to its `spec:` pointer — the route every
+                    // epic frozen before this used — rather than freezing
+                    // bead-sourced around a fragment.
                     let child_spec = if super::spec::carries_spec(&child) {
                         None
                     } else {
+                        let missing = super::spec::missing_spec_fields(&child).join(", ");
                         let pointer = spec_pointer(&child.description).ok_or_else(|| {
                             Failure::invalid(format!(
-                                "epic child {} has no spec: its spec fields are empty and it \
-                                 carries no spec: pointer",
+                                "epic child {} has no spec: {missing} empty and it carries no \
+                                 spec: pointer",
                                 child.id
                             ))
                         })?;

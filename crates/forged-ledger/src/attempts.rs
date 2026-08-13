@@ -136,12 +136,20 @@ impl Ledger {
     ///
     /// The packet must exist and have no completed attempt
     /// (`PacketNotClaimable`); `current` — the fence the caller observed
-    /// just now, by re-hashing the spec file or re-reading the bead's
-    /// revision, because the ledger does no file or process IO — must equal
-    /// the stored fence, else `SpecDrift`. Re-claim is legal after `failed`
+    /// just now, by re-hashing the spec file or re-rendering the bead's
+    /// body, because the ledger does no file or process IO — must equal the
+    /// stored fence, else `SpecDrift`. Re-claim is legal after `failed`
     /// or `reclaimed`, refused while any attempt is `running` or `revoking`
     /// (the partial unique index is the race backstop), and refused after
     /// `completed`.
+    ///
+    /// RE-PIN OF THE WRITE TOKEN: for a bead-sourced packet the comparison
+    /// is over `body_sha256` alone. bd mints a fresh `revision` on every
+    /// write to the bead — the lease claim and status change forged itself
+    /// performs before it resumes a packet included — so a moved revision
+    /// over an UNCHANGED body is not drift, and the row's `spec_revision`
+    /// is re-pinned to the observed value in this same transaction. A moved
+    /// body is drift, whatever the revision says.
     pub fn claim_packet(
         &self,
         packet_id: &str,
@@ -167,7 +175,10 @@ impl Ledger {
                 )
             })?;
             let pinned = match spec_revision {
-                Some(revision) => SpecFence::Revision(revision),
+                Some(revision) => SpecFence::Revision {
+                    revision,
+                    body_sha256: spec_sha256,
+                },
                 None => SpecFence::Sha256(spec_sha256),
             };
             let blocking: Option<String> = tx
@@ -184,11 +195,37 @@ impl Ledger {
                     format!("packet {packet_id:?} has a {state} attempt"),
                 ));
             }
-            if pinned != current {
-                return Err(refused(
-                    ErrorCode::SpecDrift,
-                    format!("stored spec fence differs for packet {packet_id:?}"),
-                ));
+            // The drift test, and the one place the write token is allowed
+            // to move: same arm and same CONTENT claims, and re-pins the
+            // revision if bd has since minted a new one.
+            let repin = match (&pinned, &current) {
+                (SpecFence::Sha256(stored), SpecFence::Sha256(observed)) if stored == observed => {
+                    None
+                }
+                (
+                    SpecFence::Revision {
+                        revision: pinned_revision,
+                        body_sha256: pinned_body,
+                    },
+                    SpecFence::Revision {
+                        revision: observed_revision,
+                        body_sha256: observed_body,
+                    },
+                ) if pinned_body == observed_body => {
+                    (pinned_revision != observed_revision).then(|| observed_revision.clone())
+                }
+                _ => {
+                    return Err(refused(
+                        ErrorCode::SpecDrift,
+                        format!("stored spec fence differs for packet {packet_id:?}"),
+                    ))
+                }
+            };
+            if let Some(revision) = repin {
+                tx.execute(
+                    "UPDATE packets SET spec_revision = ?2 WHERE packet_id = ?1",
+                    rusqlite::params![packet_id, revision],
+                )?;
             }
             let claim_token = new_claim_token();
             let now = now_iso();

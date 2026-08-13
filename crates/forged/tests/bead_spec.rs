@@ -1,6 +1,7 @@
 //! Bead-sourced specs end to end: a run started from a bead alone, the
-//! rendered body every seat reads, the revision fence under a spec edit,
-//! and the refusals that keep an empty spec away from a seat.
+//! rendered body every seat reads, the body fence under a spec edit (and
+//! under the write token bd moves on every write), and the refusals that
+//! keep an empty spec away from a seat.
 
 mod support;
 
@@ -64,14 +65,15 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     assert_eq!(code, 0, "bead-sourced run start: {started}");
     assert_eq!(started["result"]["run_id"], json!("bead-sourced"));
 
-    // The packet pins the bead's revision, not a file hash, and its spec
-    // path is the body materialized inside the packet directory.
+    // The packet is bead-sourced — it carries a revision where a file-sourced
+    // one carries none — and its spec path is the body materialized inside
+    // the packet directory.
     let packet = advance_to_open_packet(&env, "bead-sourced");
-    assert_eq!(
-        packet.spec_revision.as_deref(),
-        Some("-6192208415116251521"),
-        "a bead-sourced packet pins the bead revision: {packet:?}"
+    assert!(
+        packet.spec_revision.is_some(),
+        "a bead-sourced packet records the bead revision: {packet:?}"
     );
+    let pinned_body = packet.spec_sha256.clone();
     assert!(
         !packet.body_json.contains("\"spec\""),
         "body_json must not duplicate the spec its row carries as columns: {}",
@@ -101,15 +103,16 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     );
 
     // Byte-identical for every seat of the run: each packet materialized the
-    // body it was fenced on, and all of them pinned the same revision.
+    // body it was fenced on, and all of them pinned the same BODY. Not the
+    // same revision — bd mints a fresh one on every write to the bead, and
+    // the run writes its own lease between packets.
     let ledger = env.ledger();
     let packets = ledger.list_packets("bead-sourced").expect("packets");
     assert!(packets.len() > 1, "the run opened more than one packet");
     for packet in &packets {
         assert_eq!(
-            packet.spec_revision.as_deref(),
-            Some("-6192208415116251521"),
-            "every packet pins the same revision: {packet:?}"
+            packet.spec_sha256, pinned_body,
+            "every packet pins the same body: {packet:?}"
         );
         let seat_body = std::fs::read_to_string(&packet.spec_path).unwrap_or_else(|e| {
             panic!("seat spec for {}: {e}", packet.packet_id);
@@ -147,10 +150,10 @@ fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
         message.contains("bead-empty"),
         "the refusal must name the bead: {message}"
     );
-    for field in ["description", "acceptance_criteria", "design", "notes"] {
+    for field in ["description", "acceptance_criteria"] {
         assert!(
             message.contains(field),
-            "the refusal must name the empty field {field:?}: {message}"
+            "the refusal must name the empty required field {field:?}: {message}"
         );
     }
     // And nothing was created: an empty spec never reaches a seat because
@@ -161,7 +164,7 @@ fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
 }
 
 #[test]
-fn a_seat_claim_refuses_once_the_bead_moves_off_the_pinned_revision() {
+fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
     let env = TestEnv::new("forged-bead-spec-edit");
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_bead_spec("bead-edited", DESCRIPTION, ACCEPTANCE);
@@ -179,27 +182,109 @@ fn a_seat_claim_refuses_once_the_bead_moves_off_the_pinned_revision() {
     assert_eq!(code, 0, "run start: {started}");
 
     let packet = advance_to_open_packet(&env, "bead-edited");
-    assert_eq!(
-        packet.spec_revision.as_deref(),
-        Some("-6192208415116251521")
-    );
+    let pinned_revision = packet.spec_revision.clone().expect("a bead-sourced packet");
 
-    // The operator revises the spec; bd mints a new revision for the write.
+    // The operator revises the spec. bd mints a new revision for the write —
+    // and so does the shim — but it is the changed BODY that has to refuse
+    // the claim, exactly as the hash check refuses a file edited under an
+    // open packet.
     env.set_bead_field("bead-edited", "acceptance", "- revised acceptance");
-    env.set_bead_field("bead-edited", "revision", "9146914492635073757");
-
-    // The packet is still pinned to the revision it was opened at, so the
-    // seat claim refuses — exactly as the hash check refuses a file edited
-    // under an open packet.
     let (code, drifted) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
-    assert_ne!(code, 0, "a moved bead must refuse the claim: {drifted}");
+    assert_ne!(code, 0, "an edited bead must refuse the claim: {drifted}");
     assert_eq!(drifted["error"]["code"], json!("SPEC_DRIFT"));
 
-    // Putting the bead back where the packet pinned it lets the seat claim
-    // again: the fence is equality on the revision, nothing else.
-    env.set_bead_field("bead-edited", "revision", "-6192208415116251521");
+    // The operator puts the spec back. The revision has now moved TWICE and
+    // will never return to the value the packet pinned — bd's revision is a
+    // write token, not a digest — so a fence on the token alone would refuse
+    // this claim forever. The body is what is pinned, and it matches.
+    env.set_bead_field("bead-edited", "acceptance", ACCEPTANCE);
+    assert_ne!(
+        env.bead_revision("bead-edited"),
+        pinned_revision,
+        "the write token must have moved off the pinned value"
+    );
     let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
-    assert_eq!(code, 0, "claim at the pinned revision: {claimed}");
+    assert_eq!(code, 0, "claim at the pinned body: {claimed}");
+
+    // And the claim re-pinned the row to the token bd reports now, so the
+    // next reader of this packet is not comparing against a dead value.
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    ledger.close().expect("close");
+    assert_eq!(
+        row.spec_revision.as_deref(),
+        Some(env.bead_revision("bead-edited").as_str()),
+        "the claim re-pins the write token: {row:?}"
+    );
+    assert_eq!(
+        row.spec_sha256, packet.spec_sha256,
+        "the re-pin must not move the body the packet is fenced on"
+    );
+
+    // The claim also wrote the body where the packet contract says the seat
+    // reads it — `packet claim` -> `packet complete` never enters the
+    // in-process attempt pipeline, so nothing else would.
+    let seat_body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("seat spec at {}: {e}", row.spec_path));
+    assert!(
+        seat_body.contains("## Acceptance Criteria") && seat_body.contains(ACCEPTANCE),
+        "an externally claimed seat must find its rendered spec: {seat_body}"
+    );
+}
+
+#[test]
+fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
+    // Adoption is the crash window between claim and spawn: a `running`
+    // attempt with no process behind it. It claims nothing, so re-reading the
+    // spec is the only fence it has — and a refusal there used to propagate
+    // with the attempt left running, which blocks both the re-claim and the
+    // re-pin that would clear it, so the driver re-entered adoption and failed
+    // identically forever.
+    let env = TestEnv::new("forged-bead-spec-adopt");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-adopted", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-adopted",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    // Claim without ever spawning a provider: exactly the crashed shape.
+    let packet = advance_to_open_packet(&env, "bead-adopted");
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "packet claim: {claimed}");
+
+    // The operator revises the spec while that pid-less attempt is live.
+    env.set_bead_field("bead-adopted", "acceptance", "- revised acceptance");
+
+    let (code, drifted) = env.forged(&["run", "advance", "--run", "bead-adopted"]);
+    assert_ne!(code, 0, "adoption must refuse a drifted bead: {drifted}");
+    assert_eq!(drifted["error"]["code"], json!("SPEC_DRIFT"));
+
+    // The attempt is SETTLED, so the packet is re-claimable and the ledger
+    // will accept the re-pin that clears the drift. A second advance must
+    // therefore not report the same adoption failure again.
+    let ledger = env.ledger();
+    let live = ledger
+        .list_live_attempts(Some("bead-adopted"))
+        .expect("live attempts");
+    ledger.close().expect("close");
+    assert!(
+        live.is_empty(),
+        "a refused adoption must retire its own attempt: {live:?}"
+    );
+    let (_, again) = env.forged(&["run", "advance", "--run", "bead-adopted"]);
+    assert_ne!(
+        again["error"]["message"], drifted["error"]["message"],
+        "the run must not be wedged re-adopting the same dead attempt: {again}"
+    );
 }
 
 #[test]
@@ -245,7 +330,7 @@ fn a_file_sourced_run_still_works_and_is_recorded_as_deprecated() {
 }
 
 #[test]
-fn a_spec_edit_between_stages_pins_the_new_revision_on_the_next_packet_open() {
+fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
     // The defect this whole change exists to fix: under the file route the
     // re-open replayed its stored response and pinned nothing new, so a spec
     // could not be revised for a live run at all.
@@ -276,8 +361,9 @@ fn a_spec_edit_between_stages_pins_the_new_revision_on_the_next_packet_open() {
             line.starts_with("bead-repinned/implementation/0") && line.contains(" end ")
         });
         if implement_done && !edited {
+            // The edit alone: bd mints the new revision for the write, the
+            // way it does for every write to a bead.
             env.set_bead_field("bead-repinned", "acceptance", "- revised acceptance");
-            env.set_bead_field("bead-repinned", "revision", "9146914492635073757");
             edited = true;
         }
         let ledger = env.ledger();
@@ -295,10 +381,21 @@ fn a_spec_edit_between_stages_pins_the_new_revision_on_the_next_packet_open() {
         "the implement seat must run before the spec is revised"
     );
     let later = later.expect("a packet opened after the edit");
-    assert_eq!(
-        later.spec_revision.as_deref(),
-        Some("9146914492635073757"),
-        "a packet opened after the edit pins the NEW revision: {later:?}"
+    let ledger = env.ledger();
+    let implement = ledger
+        .list_packets("bead-repinned")
+        .expect("packets")
+        .into_iter()
+        .find(|packet| packet.packet_id.contains("/implementation/"))
+        .expect("the implement packet");
+    ledger.close().expect("close");
+    assert!(
+        later.spec_revision.is_some(),
+        "a packet opened after the edit is still bead-sourced: {later:?}"
+    );
+    assert_ne!(
+        later.spec_sha256, implement.spec_sha256,
+        "a packet opened after the edit pins the NEW body: {later:?}"
     );
 
     // Its seat materializes the REVISED body when it claims — the spec was
@@ -427,7 +524,7 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         "a child carrying only a `spec:` pointer keeps the file route"
     );
 
-    // And the bead-sourced child's run really is fenced on the revision.
+    // And the bead-sourced child's run really is fenced on its own bead.
     let mut packet = None;
     for _ in 0..12 {
         let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-bead"]);
@@ -444,9 +541,13 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         }
     }
     let packet = packet.expect("the epic started the bead-sourced child");
-    assert_eq!(
-        packet.spec_revision.as_deref(),
-        Some("-6192208415116251521"),
-        "the child run pins its bead revision: {packet:?}"
+    assert!(
+        packet.spec_revision.is_some(),
+        "the child run is bead-sourced, not file-sourced: {packet:?}"
+    );
+    assert!(
+        packet.spec_path.ends_with("/spec.md") && !packet.spec_path.starts_with(&spec),
+        "a bead-sourced child reads the materialized body, not the pointed-to \
+         file: {packet:?}"
     );
 }

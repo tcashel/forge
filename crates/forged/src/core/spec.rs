@@ -3,8 +3,11 @@
 //! The bead is the source of truth: its `description`,
 //! `acceptance_criteria`, `design`, and `notes` fields ARE the spec body,
 //! assembled here in one documented order so every seat of a packet reads
-//! identical bytes. The bead's opaque `revision` is the packet's drift
-//! fence, replacing the file hash.
+//! identical bytes. The digest of THAT body is the packet's drift fence,
+//! replacing the file hash; the bead's opaque `revision` rides along as
+//! bookkeeping only, because bd mints a new one on every write to the bead
+//! — forged's own lease claim included — and a fence that moved for a
+//! lease write would refuse the run its own crash resume.
 //!
 //! `--spec <path>` is deprecated but still honored for one release, so a
 //! file-sourced run keeps working with the hash fence it was opened under.
@@ -88,10 +91,10 @@ pub struct ResolvedSpec {
 }
 
 impl ResolvedSpec {
-    /// The pinned bead revision, or `None` for a file-sourced spec.
+    /// The observed bead revision, or `None` for a file-sourced spec.
     pub fn revision(&self) -> Option<String> {
         match &self.fence {
-            SpecFence::Revision(revision) => Some(revision.clone()),
+            SpecFence::Revision { revision, .. } => Some(revision.clone()),
             SpecFence::Sha256(_) => None,
         }
     }
@@ -123,20 +126,33 @@ pub fn render_body(issue: &IssueSummary) -> String {
     out
 }
 
-/// The bead fields a spec needs that this bead leaves empty, named as bd
-/// names them. An empty return means the bead carries a spec.
-pub fn empty_spec_fields(issue: &IssueSummary) -> Vec<&'static str> {
-    SECTIONS
+/// The sections a spec body cannot do without, as indices into [`SECTIONS`]:
+/// prose Context and Acceptance Criteria. `design` and `notes` are
+/// commentary — a seat handed those two alone gets no statement of what it
+/// is building and no test of when it is done.
+const REQUIRED_SECTIONS: [usize; 2] = [0, 1];
+
+/// The required spec fields this bead leaves empty, named as bd names them.
+/// An empty return is exactly [`carries_spec`].
+pub fn missing_spec_fields(issue: &IssueSummary) -> Vec<&'static str> {
+    REQUIRED_SECTIONS
         .iter()
+        .map(|index| SECTIONS[*index])
         .filter(|(_, field)| field(issue).trim().is_empty())
-        .map(|(name, _)| *name)
+        .map(|(name, _)| name)
         .collect::<Vec<_>>()
 }
 
-/// Whether this bead carries a spec of its own — any one populated section
-/// is enough. `false` is the bead that must still point at a spec file.
+/// Whether this bead carries a spec of its own: BOTH required sections
+/// populated, not merely one of the four.
+///
+/// The bar is deliberately the whole spec, not any fragment of one. A bead
+/// with a valid `spec:` pointer and a stray `design` note would otherwise
+/// freeze bead-sourced, never read the file it points at, and hand its seat
+/// a body with no Context and no Acceptance Criteria. `false` is the bead
+/// that must still point at a spec file.
 pub fn carries_spec(issue: &IssueSummary) -> bool {
-    empty_spec_fields(issue).len() < SECTIONS.len()
+    missing_spec_fields(issue).is_empty()
 }
 
 /// SHA-256 hex over in-memory bytes.
@@ -175,15 +191,18 @@ async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
 
 /// Resolve a bead into a spec: one read, rendered body, revision fence.
 ///
-/// Refused when the bead carries no spec at all — a seat handed an empty
-/// spec is worse than a run that never started, so the refusal names the
-/// bead and every empty field.
+/// Refused when the bead carries no spec — a seat handed a body with no
+/// Context or no Acceptance Criteria is worse than a run that never
+/// started, so the refusal names the bead and every required field it left
+/// empty.
 pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Failure> {
     let issue = read_bead(ctx, bead_id).await?;
-    if !carries_spec(&issue) {
+    let missing = missing_spec_fields(&issue);
+    if !missing.is_empty() {
         return Err(Failure::invalid(format!(
-            "bead {bead_id} carries no spec: {} are all empty",
-            empty_spec_fields(&issue).join(", ")
+            "bead {bead_id} carries no spec: {} {} empty",
+            missing.join(", "),
+            if missing.len() == 1 { "is" } else { "are" }
         )));
     }
     let revision = issue.revision.clone().ok_or_else(|| {
@@ -192,10 +211,14 @@ pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Fail
         ))
     })?;
     let body = render_body(&issue);
+    let body_sha256 = sha256_bytes(body.as_bytes());
     Ok(ResolvedSpec {
-        sha256: sha256_bytes(body.as_bytes()),
+        sha256: body_sha256.clone(),
         body: Some(body),
-        fence: SpecFence::Revision(revision),
+        fence: SpecFence::Revision {
+            revision,
+            body_sha256,
+        },
     })
 }
 
@@ -249,14 +272,22 @@ pub fn materialize(spec: &ResolvedSpec, path: &Path) -> Result<(), Failure> {
 /// Only bead-sourced packets are checked: their body is materialized from a
 /// read that the ledger did not fence (the adoption path claims nothing), so
 /// this is the check that keeps every seat of one packet byte-identical.
+///
+/// The comparison is over the RENDERED BODY, matching the ledger's own
+/// fence: bd's revision moves on every write to the bead, and `claim_packet`
+/// re-pins the row's `spec_revision` when it does, so the revision a caller
+/// read before its claim is stale by construction. The bytes are not.
 pub fn assert_pinned(spec: &SpecRef, resolved: &ResolvedSpec) -> Result<(), Failure> {
-    let Some(pinned) = &spec.revision else {
+    if spec.revision.is_none() {
         return Ok(());
-    };
-    if resolved.fence != SpecFence::Revision(pinned.clone()) {
+    }
+    if resolved.sha256 != spec.sha256 {
         return Err(Failure::refused(
             ErrorCode::SpecDrift,
-            format!("bead moved off the revision this packet pins ({pinned})"),
+            format!(
+                "bead moved off the body this packet pins: rendered {}, pinned {}",
+                resolved.sha256, spec.sha256
+            ),
         ));
     }
     Ok(())
@@ -314,17 +345,50 @@ mod tests {
     }
 
     #[test]
-    fn empty_spec_fields_names_every_empty_field_as_bd_names_it() {
+    fn missing_spec_fields_names_every_required_empty_field_as_bd_names_it() {
         let mut issue = issue();
-        assert!(empty_spec_fields(&issue).is_empty());
-        issue.description = String::new();
+        assert!(missing_spec_fields(&issue).is_empty());
+        // Commentary alone is not a spec: the two required sections are.
         issue.notes = "   \n".to_owned();
-        assert_eq!(empty_spec_fields(&issue), vec!["description", "notes"]);
-        issue.acceptance_criteria = String::new();
         issue.design = String::new();
+        assert!(
+            missing_spec_fields(&issue).is_empty(),
+            "design and notes are optional"
+        );
+        issue.description = String::new();
+        assert_eq!(missing_spec_fields(&issue), vec!["description"]);
+        issue.acceptance_criteria = String::new();
         assert_eq!(
-            empty_spec_fields(&issue),
-            vec!["description", "acceptance_criteria", "design", "notes"]
+            missing_spec_fields(&issue),
+            vec!["description", "acceptance_criteria"]
+        );
+    }
+
+    #[test]
+    fn a_bead_with_only_commentary_does_not_carry_a_spec() {
+        // The epic child this guards: a valid `spec:` pointer plus a stray
+        // `design` note. Preferring the bead here would hand the seat a body
+        // with no Context and no Acceptance Criteria and never read the file.
+        let mut issue = issue();
+        issue.description = "spec: /specs/child.md".to_owned();
+        issue.acceptance_criteria = String::new();
+        assert!(
+            !carries_spec(&issue),
+            "a `design` note beside a pointer is not a spec"
+        );
+        assert_eq!(
+            missing_spec_fields(&issue),
+            vec!["description", "acceptance_criteria"]
+        );
+
+        // Context beside the pointer, but still no acceptance criteria: just
+        // as partial, and still the file's job.
+        issue.description = "spec: /specs/child.md\n## Context\n\nwhy this exists".to_owned();
+        assert!(!carries_spec(&issue), "context alone is not a spec");
+        issue.acceptance_criteria = "- it works".to_owned();
+        assert!(
+            carries_spec(&issue),
+            "both required sections present: the bead is the spec"
         );
     }
 
@@ -347,7 +411,7 @@ mod tests {
     }
 
     #[test]
-    fn assert_pinned_refuses_a_bead_that_moved_and_ignores_file_specs() {
+    fn assert_pinned_refuses_a_moved_body_and_ignores_file_specs() {
         let pinned = SpecRef {
             path: "/runs/r/packets/implementation/0/spec.md".to_owned(),
             sha256: "cafe".to_owned(),
@@ -356,15 +420,31 @@ mod tests {
         let moved = ResolvedSpec {
             body: Some("new".to_owned()),
             sha256: "beef".to_owned(),
-            fence: SpecFence::Revision("8".to_owned()),
+            fence: SpecFence::Revision {
+                revision: "8".to_owned(),
+                body_sha256: "beef".to_owned(),
+            },
         };
         let failure = assert_pinned(&pinned, &moved).expect_err("must refuse");
         assert_eq!(failure.code, ErrorCode::SpecDrift);
-        let same = ResolvedSpec {
-            fence: SpecFence::Revision("7".to_owned()),
+
+        // A moved WRITE TOKEN over the same body is not drift: bd mints a
+        // revision on every write, forged's own lease claim included, and
+        // `claim_packet` has already re-pinned the row by the time a seat
+        // gets here.
+        let relabelled = ResolvedSpec {
+            sha256: "cafe".to_owned(),
+            fence: SpecFence::Revision {
+                revision: "8".to_owned(),
+                body_sha256: "cafe".to_owned(),
+            },
             ..moved.clone()
         };
-        assert!(assert_pinned(&pinned, &same).is_ok());
+        assert!(
+            assert_pinned(&pinned, &relabelled).is_ok(),
+            "a revision that moved without the body must not read as drift"
+        );
+
         // A file-sourced packet is fenced by the ledger's hash comparison
         // alone; nothing is materialized for it to disagree with.
         let file = SpecRef {

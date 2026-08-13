@@ -215,9 +215,15 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         }
         // 2. Hand back the reopened packet of that same run — never a fresh
         // one. One spec read per claim, fencing on whatever the packet pins.
-        let fence = crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id)
-            .await?
-            .fence;
+        //
+        // This read happens AFTER the reclaim and the (re-)claim above, both
+        // of which write the bead and so mint a fresh bd revision. That is
+        // exactly why the fence is the rendered body and not the revision:
+        // fenced on the write token, a crash resume would be refused for
+        // forged's own lease write.
+        let resolved =
+            crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id).await?;
+        let fence = resolved.fence.clone();
         let claimed = {
             let packet_id = candidate.packet_id.clone();
             let claimant = session_claimant(&candidate.packet_id, &candidate.provider);
@@ -226,6 +232,11 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             })
             .await?
         };
+        // The claim fenced these bytes; write them where the packet contract
+        // already tells the resuming seat to read them. An external seat
+        // never enters `run_attempt`, so nothing else would.
+        crate::core::spec::assert_pinned(&candidate.spec, &resolved)?;
+        crate::core::spec::materialize(&resolved, std::path::Path::new(&candidate.spec.path))?;
         // The packet directory belongs to the new attempt now: a stale pid
         // file (and its start-time stamp) from the dead attempt must not
         // read as this session.

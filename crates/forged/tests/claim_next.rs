@@ -455,3 +455,112 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
         "the guardian heartbeats the identity actually in force ({holder}): {calls:?}"
     );
 }
+
+#[test]
+fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
+    // The crash-resume path for the supported route. `claim-next` RECLAIMS
+    // and then RE-CLAIMS the run's bd lease before it re-reads the spec, and
+    // each of those writes mints a fresh bd revision — so the revision the
+    // packet was opened at is already gone by the time the fence is checked.
+    // Fenced on that token, this resume would fail SpecDrift, non-recoverably
+    // and forever; fenced on the rendered body, it resumes.
+    let env = TestEnv::new("forged-claim-next-bead");
+    env.forged(&["init"]);
+    env.seed_bead_spec(
+        "bead-resume",
+        "## Context\\n\\nthe bead is the spec.",
+        "- the resume survives its own lease write",
+    );
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-resume",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    // Advance to an open packet, then leave the shape a crashed driver
+    // leaves: one transport-failed attempt, no live attempt.
+    let packet = loop {
+        let ledger = env.ledger();
+        let opened = ledger
+            .list_packets("bead-resume")
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        ledger.close().expect("close");
+        if let Some(packet) = opened {
+            break packet;
+        }
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-resume"]);
+        assert_eq!(code, 0, "advance: {advanced}");
+    };
+    let opened_at = packet.spec_revision.clone().expect("a bead-sourced packet");
+    let ledger = env.ledger();
+    let claimed = ledger
+        .claim_packet(
+            &packet.packet_id,
+            &format!("forged:{}:0", packet.packet_id),
+            &forged_ledger::SpecFence::Revision {
+                revision: opened_at.clone(),
+                body_sha256: packet.spec_sha256.clone(),
+            },
+        )
+        .expect("claim at the pinned body");
+    ledger
+        .fail_packet(
+            &packet.packet_id,
+            &claimed.claim_token,
+            "transport: session vanished",
+        )
+        .expect("fail packet");
+    ledger.close().expect("close");
+
+    let (code, resumed) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:bead-resume-1",
+    ]);
+    assert_eq!(code, 0, "the bead-sourced packet must resume: {resumed}");
+    let claimed = &resumed["result"]["claimed"];
+    assert_eq!(claimed["resumed"], json!(true), "ledger first: {resumed}");
+    assert_eq!(claimed["packet_id"], json!(packet.packet_id));
+
+    // The lease writes really did move the token, and the claim re-pinned
+    // the row to where bd is now rather than leaving a dead value behind.
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    ledger.close().expect("close");
+    assert_ne!(
+        env.bead_revision("bead-resume"),
+        opened_at,
+        "the reclaim and re-claim must have moved the write token"
+    );
+    assert_eq!(
+        row.spec_revision.as_deref(),
+        Some(env.bead_revision("bead-resume").as_str()),
+        "the resuming claim re-pins the write token: {row:?}"
+    );
+    assert_eq!(
+        row.spec_sha256, packet.spec_sha256,
+        "the body it is fenced on never moved"
+    );
+
+    // And the resumed seat finds the rendered body on disk: `claim-next`
+    // hands work to an EXTERNAL worker, which never enters the in-process
+    // attempt pipeline that used to be the only writer of this file.
+    let body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("resumed seat spec at {}: {e}", row.spec_path));
+    assert!(
+        body.contains("## Acceptance Criteria")
+            && body.contains("- the resume survives its own lease write"),
+        "the resumed seat must find its spec materialized: {body}"
+    );
+}

@@ -4,7 +4,13 @@
 //! contract. `design`, `notes`, and `spec_id` round-trip in 1.2.1 but are
 //! NOT documented, so this test is the only thing standing between a bd
 //! upgrade that quietly drops one of them and forged handing a seat a spec
-//! with a section silently missing. It must fail loudly, not skip.
+//! with a section silently missing.
+//!
+//! It must fail loudly, not skip: `support::require_bd` PANICS when a bd
+//! binary is present at an unaccepted version — the upgrade case, which is
+//! exactly when this contract is most likely to have moved — and when
+//! `FORGED_REQUIRE_BD=1` declares that a run without bd is a failed run. The
+//! one skippable state left is a machine that provisioned no bd at all.
 
 mod support;
 
@@ -155,4 +161,62 @@ async fn a_spec_edit_mints_a_new_revision() {
     // where the operator changed it.
     assert_eq!(after.acceptance_criteria, ACCEPTANCE);
     assert_eq!(after.notes, NOTES);
+}
+
+/// The reason the packet fence is the RENDERED BODY and not the revision.
+///
+/// bd's `revision` is a write token: a lease claim and a status change mint
+/// a new one with not one byte of the spec touched, and the old value never
+/// comes back. Every crash resume forged performs writes the bead — reclaim,
+/// then re-claim — BEFORE it re-reads the spec, so a packet fenced on the
+/// token would refuse its own resume as drift, permanently. If this test
+/// ever starts failing because bd made `revision` content-derived, the fence
+/// could be simplified; until then it must not be.
+#[tokio::test]
+async fn a_lease_write_mints_a_new_revision_though_the_spec_is_untouched() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("spec-contract-write-token");
+    support::init_store(&bd, &s);
+    let id = create_spec_bead(&bd, &s);
+    let cfg = support::cfg_for(&bd, &s);
+    let before = show_issue(&cfg, &id).await.expect("show before");
+    let before_revision = before.revision.clone().expect("revision before");
+
+    // The exact write forged performs to (re-)take a run's lease.
+    let out = support::raw_bd(
+        &bd,
+        &s,
+        &[
+            "update",
+            &id,
+            "--claim",
+            "--actor",
+            "forged:probe",
+            "--json",
+        ],
+    )
+    .output()
+    .expect("spawning bd update --claim");
+    assert!(
+        out.status.success(),
+        "bd update --claim failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Not one spec field moved — the rendered body is byte-identical...
+    let after = show_issue(&cfg, &id).await.expect("show after the claim");
+    assert_eq!(after.description, before.description);
+    assert_eq!(after.acceptance_criteria, before.acceptance_criteria);
+    assert_eq!(after.design, before.design);
+    assert_eq!(after.notes, before.notes);
+    // ...and the revision moved anyway.
+    assert_ne!(
+        after.revision.expect("revision after the claim"),
+        before_revision,
+        "a lease claim mints a new revision: fencing a packet on the revision \
+         would call forged's own resume drift"
+    );
 }

@@ -408,17 +408,30 @@ pub struct NewPacket {
 /// What a packet's spec is pinned to — the value `claim_packet` compares.
 ///
 /// The two arms are NOT interchangeable: a bead-sourced packet is fenced on
-/// the bead's opaque revision, a file-sourced one on the file's content
-/// hash, and a claim presenting the wrong ARM is drift just as surely as one
-/// presenting the wrong value.
+/// its rendered body, a file-sourced one on the file's content hash, and a
+/// claim presenting the wrong ARM is drift just as surely as one presenting
+/// the wrong value.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SpecFence {
     /// A file-sourced spec (the deprecated `--spec <path>` route), pinned by
     /// the file's SHA-256.
     Sha256(String),
-    /// A bead-sourced spec, pinned by the bead's `revision`. OPAQUE: equality
-    /// only — never ordered, parsed, incremented, or assumed positive.
-    Revision(String),
+    /// A bead-sourced spec.
+    ///
+    /// DRIFT IS JUDGED ON `body_sha256`, NEVER on `revision`. bd's revision
+    /// is a WRITE TOKEN, not a spec digest: `bd update --claim`, a status
+    /// change and a reclaim each mint a new one and the old value never
+    /// returns, so a packet fenced on the token alone would call forged's
+    /// own lease write drift the moment it resumed. The token still travels
+    /// so [`crate::Ledger::claim_packet`] can re-pin the row to whatever bd
+    /// reports now. OPAQUE: equality only — never ordered, parsed,
+    /// incremented, or assumed positive.
+    Revision {
+        /// bd's `revision` as observed on this read.
+        revision: String,
+        /// SHA-256 over the rendered body the seat reads.
+        body_sha256: String,
+    },
 }
 
 /// Input to [`crate::Ledger::record_usage`].

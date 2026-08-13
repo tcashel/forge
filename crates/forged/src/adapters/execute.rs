@@ -185,6 +185,11 @@ pub fn build_packet(
 /// re-open after a spec revision replayed its stored response verbatim and
 /// left the packet pinned to bytes nobody could reach any more. A revised
 /// spec now mints a fresh key, so the re-open genuinely re-pins.
+///
+/// The fence in the key is the CONTENT digest, never the bead revision:
+/// bd mints a revision on every write to the bead, so a revision-keyed open
+/// would mint a fresh key — and attempt a re-pin the ledger rightly refuses
+/// while a seat is live — every time the run touched its own lease.
 pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Result<(), Failure> {
     let body_json = packet
         .stored_body()
@@ -202,11 +207,7 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
             (stage_str(stage).to_owned(), seq, seq)
         }
     };
-    let fence = packet
-        .spec
-        .revision
-        .clone()
-        .unwrap_or_else(|| packet.spec.sha256.clone());
+    let fence = packet.spec.sha256.clone();
     let key = format!(
         "{}:{fence}",
         crate::core::derive_key(
@@ -427,8 +428,14 @@ pub async fn execute_packet(
 /// and run the rest of the pipeline unchanged.
 ///
 /// The spec is re-resolved here because adoption claims nothing, so no
-/// ledger comparison stands behind it; `run_attempt` refuses outright if the
-/// bead has moved off the revision the packet pins.
+/// ledger comparison stands behind it; the attempt refuses outright if the
+/// bead has moved off the body the packet pins.
+///
+/// A spec failure SETTLES the attempt before it propagates. The attempt is
+/// already `running` with no process behind it: left that way, the row keeps
+/// blocking both a re-claim and the re-pin that would clear the drift, and
+/// `honor_await` re-enters adoption and fails identically forever. Failing
+/// it hands the packet back to the reclaim saga, which can retire it.
 pub async fn execute_adopted(
     ctx: &Ctx,
     ports: &ForgedPorts,
@@ -437,8 +444,45 @@ pub async fn execute_adopted(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
-    let spec = crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await?;
+    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    {
+        Ok(spec) => spec,
+        Err(failure) => return settle_adoption(ctx, packet, claim_token, failure).await,
+    };
+    if let Err(failure) = crate::core::spec::assert_pinned(&packet.spec, &spec) {
+        return settle_adoption(ctx, packet, claim_token, failure).await;
+    }
     run_attempt(ctx, ports, exec, packet, &spec, attempt_id, claim_token).await
+}
+
+/// Retire an adopted attempt whose spec could not be resolved or no longer
+/// matches what the packet pins.
+///
+/// A TRANSPORT failure (bd unreachable) goes onto the packet's existing
+/// bounded-retry budget — the same budget a provider transport failure uses.
+/// A refusal (drift) is terminal for this attempt: the row is failed so the
+/// packet becomes re-claimable and re-pinnable, and the refusal still
+/// surfaces to the caller rather than being swallowed into a retry.
+async fn settle_adoption(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    claim_token: &str,
+    failure: Failure,
+) -> Result<PacketOutcome, Failure> {
+    if failure.recoverable {
+        let note = format!("transport: adoption could not read the spec: {failure}");
+        return fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note).await;
+    }
+    let note = format!("adoption refused: {failure}");
+    {
+        let packet_id = packet.packet_id.clone();
+        let token = claim_token.to_owned();
+        on_ledger(&ctx.ledger, move |l| {
+            l.fail_packet(&packet_id, &token, &note)
+        })
+        .await?;
+    }
+    Err(failure)
 }
 
 /// The shared attempt pipeline: render, spawn, await, harvest, settle.

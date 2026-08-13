@@ -612,6 +612,18 @@ val() {
   done
 }
 cmd=$1
+# Probe-verified against bd 1.2.1: `revision` is a WRITE TOKEN, not a spec
+# digest. EVERY write to a bead mints a new one — a lease claim and a status
+# change included — and the old value never returns. The shim mints one the
+# same way, because a shim whose revision only moved on a spec edit would let
+# a fence-on-the-token bug pass the whole suite.
+bump_revision() {
+  id=$1
+  n=$(cat "$state/$id.revseq" 2>/dev/null || echo 0)
+  n=$((n + 1))
+  printf '%s' "$n" > "$state/$id.revseq"
+  printf -- '-61922084151162515%02d' "$((n % 100))" > "$state/$id.revision"
+}
 issue_json() {
   id=$1
   title=$(cat "$state/$id.title" 2>/dev/null || echo "$id")
@@ -636,12 +648,14 @@ case "$cmd" in
     new_status=$(val --status "$@")
     if [ -n "$new_status" ]; then
       printf '%s' "$new_status" > "$state/$id.status"
+      bump_revision "$id"
       printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
       exit 0
     fi
     cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
     if [ -z "$cur" ] || [ "$cur" = "$actor" ]; then
       printf '%s' "$actor" > "$state/$id.assignee"
+      bump_revision "$id"
       printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s","status":"in_progress"}]}\n' "$id" "$actor"
     else
       printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s"}]}\n' "$id" "$cur"
@@ -667,6 +681,7 @@ case "$cmd" in
       printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
     elif [ -n "$cur" ] && [ "$cur" = "$assignee" ]; then
       rm -f "$state/$id.assignee"
+      bump_revision "$id"
       printf '{"schema_version":1,"data":{"count":1,"reclaimed":[{"id":"%s","previous_owner":"%s"}],"scoped":true}}\n' "$id" "$cur"
     else
       printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
@@ -690,6 +705,7 @@ case "$cmd" in
   close)
     id=$2; printf 'closed' > "$state/$id.status"
     rm -f "$state/$id.assignee"
+    bump_revision "$id"
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   ready)
     actor=$(val --actor "$@")
@@ -706,6 +722,7 @@ case "$cmd" in
       id=$(head -1 "$front")
       tail -n +2 "$front" > "$front.tmp" && mv "$front.tmp" "$front"
       printf '%s' "$actor" > "$state/$id.assignee"
+      bump_revision "$id"
       printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s","status":"in_progress"}]}\n' "$id" "$actor"
     else
       printf '{"schema_version":1,"data":[]}\n'
@@ -1080,6 +1097,34 @@ impl TestEnv {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
         std::fs::write(state.join(format!("{bead}.{field}")), value).expect("set bead field");
+        if field == "revision" {
+            // Pinning the token itself is the one write that does not mint a
+            // new one — the escape hatch for a test that needs an exact value.
+            return;
+        }
+        // Every other write to a bead mints a fresh revision, exactly as it
+        // does in bd 1.2.1 and in the shim's own write paths.
+        let seq = std::fs::read_to_string(state.join(format!("{bead}.revseq")))
+            .ok()
+            .and_then(|text| text.trim().parse::<u32>().ok())
+            .unwrap_or(0)
+            + 1;
+        std::fs::write(state.join(format!("{bead}.revseq")), seq.to_string()).expect("revseq");
+        std::fs::write(
+            state.join(format!("{bead}.revision")),
+            format!("-61922084151162515{:02}", seq % 100),
+        )
+        .expect("revision");
+    }
+
+    /// The revision the bd shim reports for a bead right now.
+    pub fn bead_revision(&self, bead: &str) -> String {
+        std::fs::read_to_string(
+            self.beads_dir
+                .join("shim-state")
+                .join(format!("{bead}.revision")),
+        )
+        .unwrap_or_else(|_| "-6192208415116251521".to_owned())
     }
 
     /// Seed a bead whose OWN fields are the spec — the supported route.

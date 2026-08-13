@@ -773,13 +773,12 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             // run's bd lease holder — see `core::session_claimant`. The
             // stored body carries the hints the packet was opened with.
             let view = super::drive::project(ctx, &row.run_id).await?;
-            let fence = super::spec::resolve_for_packet(
-                ctx,
-                &forged_proto::packet_spec(&row),
-                &view.run.bead_id,
-            )
-            .await?
-            .fence;
+            // ONE spec read for this claim: it answers both the fence the
+            // ledger compares and the bytes the seat will read.
+            let spec_ref = forged_proto::packet_spec(&row);
+            let resolved =
+                super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
+            let fence = resolved.fence.clone();
             let provider = if view.execution_package.is_some() {
                 super::drive::stored_packet_for_attempt(&view, &packet_id)?
                     .provider_hints
@@ -803,6 +802,13 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 })
                 .await?
             };
+            // The claim is what fenced these bytes, so the body is written
+            // only once it has succeeded. An external seat on the
+            // `packet claim` -> `packet complete` path never enters
+            // `run_attempt`, so this is the only thing that puts the spec
+            // where its own packet contract says it is.
+            super::spec::assert_pinned(&spec_ref, &resolved)?;
+            super::spec::materialize(&resolved, std::path::Path::new(&spec_ref.path))?;
             Ok(json!({
                 "attempt_id": claimed.attempt_id,
                 "claim_token": claimed.claim_token,
