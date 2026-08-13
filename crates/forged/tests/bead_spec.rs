@@ -313,3 +313,140 @@ fn a_spec_edit_between_stages_pins_the_new_revision_on_the_next_packet_open() {
         "the seat opened after the edit reads the revised spec: {body}"
     );
 }
+
+#[test]
+fn an_unreachable_bd_at_claim_time_is_transport_never_drift_and_never_terminal() {
+    let env = TestEnv::new("forged-bead-spec-outage");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-outage", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-outage",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    let packet = advance_to_open_packet(&env, "bead-outage");
+
+    // bd goes away. The claim cannot read the fence, which says NOTHING
+    // about whether the spec changed.
+    env.set_bd_show_unreachable(true);
+    let (code, failed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_ne!(code, 0, "an unreachable bd must fail the claim: {failed}");
+    assert_ne!(
+        failed["error"]["code"],
+        json!("SPEC_DRIFT"),
+        "an unreachable bd must never be reported as drift: {failed}"
+    );
+    assert_eq!(
+        failed["error"]["recoverable"],
+        json!(true),
+        "the claim must stay on the bounded-retry budget: {failed}"
+    );
+
+    // Nothing terminal was recorded: no attempt row, and the claim operation
+    // was released rather than stored as a terminal failure.
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_live_attempts(Some("bead-outage"))
+            .expect("live attempts")
+            .is_empty(),
+        "a failed claim leaves no attempt behind"
+    );
+    ledger.close().expect("close");
+
+    // bd comes back and the same claim succeeds — the failure cost the
+    // packet nothing.
+    env.set_bd_show_unreachable(false);
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "the retry must succeed once bd answers: {claimed}");
+}
+
+#[test]
+fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
+    let env = TestEnv::new("forged-bead-spec-epic");
+    env.enable_dynamic_gh();
+    assert_eq!(env.forged(&["init"]).0, 0);
+    // Two children: one carrying a spec of its own (with a `spec:` pointer
+    // still in its description), one carrying only the pointer.
+    env.seed_epic(
+        "epic-bead",
+        &[
+            ("child-fields", &env.spec, true),
+            ("child-pointer", &env.spec, false),
+        ],
+    );
+    env.set_bead_field(
+        "child-fields",
+        "description",
+        &format!("spec: {}\\n{DESCRIPTION}", env.spec.display()),
+    );
+    env.set_bead_field("child-fields", "acceptance", ACCEPTANCE);
+
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-bead",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+
+    let children = started["result"]["children"]
+        .as_array()
+        .expect("frozen children")
+        .clone();
+    let by_id = |id: &str| -> Value {
+        children
+            .iter()
+            .find(|child| child["id"] == json!(id))
+            .cloned()
+            .unwrap_or_else(|| panic!("child {id} in {children:?}"))
+    };
+    assert!(
+        by_id("child-fields")["specPath"].is_null(),
+        "a child carrying spec fields is frozen bead-sourced: {:?}",
+        by_id("child-fields")
+    );
+    assert_eq!(
+        by_id("child-pointer")["specPath"],
+        json!(spec),
+        "a child carrying only a `spec:` pointer keeps the file route"
+    );
+
+    // And the bead-sourced child's run really is fenced on the revision.
+    let mut packet = None;
+    for _ in 0..12 {
+        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-bead"]);
+        assert_eq!(code, 0, "epic advance: {advanced}");
+        let ledger = env.ledger();
+        packet = ledger
+            .list_packets("child-fields")
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        ledger.close().expect("close");
+        if packet.is_some() {
+            break;
+        }
+    }
+    let packet = packet.expect("the epic started the bead-sourced child");
+    assert_eq!(
+        packet.spec_revision.as_deref(),
+        Some("-6192208415116251521"),
+        "the child run pins its bead revision: {packet:?}"
+    );
+}

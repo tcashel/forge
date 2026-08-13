@@ -673,6 +673,11 @@ case "$cmd" in
     fi ;;
   show)
     id=$2
+    # Simulated bd outage: `show` is the read the spec fence depends on.
+    if [ -f "$state/show.unreachable" ]; then
+      printf 'bd: connection refused\n' >&2
+      exit 1
+    fi
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   children)
     epic=$2; first=1
@@ -1083,6 +1088,18 @@ impl TestEnv {
         self.set_bead_field(bead, "description", description);
         self.set_bead_field(bead, "acceptance", acceptance);
         self.set_bead_field(bead, "status", "open");
+    }
+
+    /// Make every `bd show` fail, the way an unreachable bd does.
+    pub fn set_bd_show_unreachable(&self, unreachable: bool) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        let marker = state.join("show.unreachable");
+        if unreachable {
+            std::fs::write(marker, "1").expect("set bd outage");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
     }
 
     /// Set a bead's assignee in the bd shim state directly.
