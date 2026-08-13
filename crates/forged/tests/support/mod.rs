@@ -619,7 +619,13 @@ issue_json() {
   status=$(cat "$state/$id.status" 2>/dev/null || echo open)
   type=$(cat "$state/$id.type" 2>/dev/null || echo task)
   assignee=$(cat "$state/$id.assignee" 2>/dev/null || true)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s"}' "$id" "$title" "$description" "$status" "$type" "$assignee"
+  acceptance=$(cat "$state/$id.acceptance" 2>/dev/null || true)
+  design=$(cat "$state/$id.design" 2>/dev/null || true)
+  notes=$(cat "$state/$id.notes" 2>/dev/null || true)
+  # bd emits `revision` on show/children only, as a signed 64-bit integer
+  # that changes on every write.
+  revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$revision"
 }
 case "$cmd" in
   version)

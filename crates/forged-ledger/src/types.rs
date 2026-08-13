@@ -270,6 +270,9 @@ pub struct PacketRow {
     pub spec_path: String,
     /// `packets.spec_sha256`.
     pub spec_sha256: String,
+    /// `packets.spec_revision` — the pinned bead revision, `None` on a
+    /// file-sourced packet.
+    pub spec_revision: Option<String>,
     /// `packets.body_json` — stored verbatim, never parsed by the ledger.
     pub body_json: String,
     /// `packets.created_at`.
@@ -394,8 +397,28 @@ pub struct NewPacket {
     pub spec_path: String,
     /// Content hash of that spec.
     pub spec_sha256: String,
-    /// Caller-serialized `WorkPacket`, stored verbatim.
+    /// The bead revision this packet pins, `None` when the spec came from a
+    /// file. A non-`None` value is the packet's drift fence.
+    pub spec_revision: Option<String>,
+    /// Caller-serialized `WorkPacket` minus the columns above, stored
+    /// verbatim.
     pub body_json: String,
+}
+
+/// What a packet's spec is pinned to — the value `claim_packet` compares.
+///
+/// The two arms are NOT interchangeable: a bead-sourced packet is fenced on
+/// the bead's opaque revision, a file-sourced one on the file's content
+/// hash, and a claim presenting the wrong ARM is drift just as surely as one
+/// presenting the wrong value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecFence {
+    /// A file-sourced spec (the deprecated `--spec <path>` route), pinned by
+    /// the file's SHA-256.
+    Sha256(String),
+    /// A bead-sourced spec, pinned by the bead's `revision`. OPAQUE: equality
+    /// only — never ordered, parsed, incremented, or assumed positive.
+    Revision(String),
 }
 
 /// Input to [`crate::Ledger::record_usage`].

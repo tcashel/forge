@@ -37,7 +37,9 @@ const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 struct FrozenChild {
     id: String,
     title: String,
-    spec_path: String,
+    /// The child's frozen spec FILE, when it has one. `None` is the
+    /// bead-sourced child: its run start reads the spec from the bead.
+    spec_path: Option<String>,
     initially_closed: bool,
 }
 
@@ -98,7 +100,10 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             Ok(FrozenChild {
                 id: string(child, "id")?,
                 title: string(child, "title")?,
-                spec_path: string(child, "specPath")?,
+                spec_path: child
+                    .get("specPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 initially_closed: child
                     .get("initiallyClosed")
                     .and_then(Value::as_bool)
@@ -625,15 +630,27 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 }
                 let mut children = Vec::new();
                 for child in inventory {
-                    let child_spec = spec_pointer(&child.description).ok_or_else(|| {
-                        Failure::invalid(format!("epic child {} has no spec: pointer", child.id))
-                    })?;
-                    if !Path::new(&child_spec).is_absolute() || !Path::new(&child_spec).exists() {
-                        return Err(Failure::invalid(format!(
-                            "epic child {} spec {:?} is not an existing absolute path",
-                            child.id, child_spec
-                        )));
-                    }
+                    // The bead's own fields win. Only a child that carries no
+                    // spec at all falls back to its `spec:` pointer — the
+                    // route every epic frozen before this used.
+                    let child_spec = if super::spec::carries_spec(&child) {
+                        None
+                    } else {
+                        let pointer = spec_pointer(&child.description).ok_or_else(|| {
+                            Failure::invalid(format!(
+                                "epic child {} has no spec: its spec fields are empty and it \
+                                 carries no spec: pointer",
+                                child.id
+                            ))
+                        })?;
+                        if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
+                            return Err(Failure::invalid(format!(
+                                "epic child {} spec {:?} is not an existing absolute path",
+                                child.id, pointer
+                            )));
+                        }
+                        Some(pointer)
+                    };
                     children.push(json!({
                         "id": child.id,
                         "title": child.title,

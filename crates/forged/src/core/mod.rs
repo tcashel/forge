@@ -11,6 +11,7 @@ mod handoff;
 mod observe;
 mod ops;
 pub(crate) mod sessions;
+pub(crate) mod spec;
 pub(crate) mod usage;
 
 use forged_ledger::{EffectClass, Ledger, LedgerError, OperationOutcome};

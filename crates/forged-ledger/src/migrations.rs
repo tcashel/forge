@@ -186,6 +186,16 @@ const MIGRATION_006: &str = "
 ALTER TABLE usage ADD COLUMN web_search_requests INTEGER;
 ";
 
+/// Migration 007: the bead revision a packet's spec is pinned to.
+///
+/// NULL means file-sourced — every packet opened before this column existed,
+/// plus the deprecated `--spec <path>` route — and those keep `spec_sha256`
+/// as their fence. A non-NULL revision IS the fence: bd's opaque
+/// guarded-write token, compared for equality and never ordered.
+const MIGRATION_007: &str = "
+ALTER TABLE packets ADD COLUMN spec_revision TEXT;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -194,6 +204,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_004,
     MIGRATION_005,
     MIGRATION_006,
+    MIGRATION_007,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -313,7 +324,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 6);
+        assert_eq!(pragmas.user_version, 7);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -360,7 +371,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 7);
         ledger.close().expect("close");
     }
 
@@ -381,7 +392,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 7);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"

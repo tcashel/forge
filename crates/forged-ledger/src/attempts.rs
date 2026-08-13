@@ -14,7 +14,7 @@ use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{AttemptRow, AttemptState, ClaimedAttempt};
+use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, SpecFence};
 
 const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, fail_note, \
@@ -135,36 +135,41 @@ impl Ledger {
     /// Claim a packet: insert a `running` attempt with a fresh fencing token.
     ///
     /// The packet must exist and have no completed attempt
-    /// (`PacketNotClaimable`); `current_spec_sha256` — the caller re-hashes
-    /// the spec file, the ledger does no file IO — must equal the stored
-    /// hash, else `SpecDrift`. Re-claim is legal after `failed` or
-    /// `reclaimed`, refused while any attempt is `running` or `revoking`
+    /// (`PacketNotClaimable`); `current` — the fence the caller observed
+    /// just now, by re-hashing the spec file or re-reading the bead's
+    /// revision, because the ledger does no file or process IO — must equal
+    /// the stored fence, else `SpecDrift`. Re-claim is legal after `failed`
+    /// or `reclaimed`, refused while any attempt is `running` or `revoking`
     /// (the partial unique index is the race backstop), and refused after
     /// `completed`.
     pub fn claim_packet(
         &self,
         packet_id: &str,
         claimant: &str,
-        current_spec_sha256: &str,
+        current: &SpecFence,
     ) -> Result<ClaimedAttempt, LedgerError> {
         let packet_id = packet_id.to_owned();
         let claimant = claimant.to_owned();
-        let current_spec_sha256 = current_spec_sha256.to_owned();
+        let current = current.clone();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let stored: Option<String> = tx
+            let stored: Option<(String, Option<String>)> = tx
                 .query_row(
-                    "SELECT spec_sha256 FROM packets WHERE packet_id = ?1",
+                    "SELECT spec_sha256, spec_revision FROM packets WHERE packet_id = ?1",
                     [&packet_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let spec_sha256 = stored.ok_or_else(|| {
+            let (spec_sha256, spec_revision) = stored.ok_or_else(|| {
                 refused(
                     ErrorCode::PacketNotClaimable,
                     format!("no packet {packet_id:?}"),
                 )
             })?;
+            let pinned = match spec_revision {
+                Some(revision) => SpecFence::Revision(revision),
+                None => SpecFence::Sha256(spec_sha256),
+            };
             let blocking: Option<String> = tx
                 .query_row(
                     "SELECT state FROM attempts WHERE packet_id = ?1 \
@@ -179,10 +184,10 @@ impl Ledger {
                     format!("packet {packet_id:?} has a {state} attempt"),
                 ));
             }
-            if spec_sha256 != current_spec_sha256 {
+            if pinned != current {
                 return Err(refused(
                     ErrorCode::SpecDrift,
-                    format!("stored spec hash differs for packet {packet_id:?}"),
+                    format!("stored spec fence differs for packet {packet_id:?}"),
                 ));
             }
             let claim_token = new_claim_token();

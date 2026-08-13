@@ -19,10 +19,11 @@ use forged_types::{
 use serde_json::{json, Map, Value};
 
 use crate::adapters::execute::{
-    build_packet, execute_packet, open_packet_op, sha256_file, ExecutionContext, PacketOutcome,
+    build_packet, execute_packet, open_packet_op, ExecutionContext, PacketOutcome,
 };
 use crate::adapters::ports::{repo_slug, ForgedPorts};
 use crate::config::now_iso;
+use crate::core::spec::SpecSource;
 use crate::core::{
     derive_key, err_response, fenced, ok_response, on_ledger, param_str, run_holder, Ctx, Failure,
 };
@@ -82,8 +83,12 @@ fn round_of(view: &RunView, step: MachineStage) -> u32 {
     }
 }
 
-/// The spec path recorded at run start (the `forged.run.spec` event).
-pub async fn spec_path_of(ctx: &Ctx, run_id: &str) -> Result<String, Failure> {
+/// The spec source recorded at run start (the `forged.run.spec` event).
+///
+/// A payload carrying `specPath` is the deprecated file route — including
+/// every run started before the bead became the source of truth, which is
+/// why the path is still read first.
+pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failure> {
     let run_id_owned = run_id.to_owned();
     let events = on_ledger(&ctx.ledger, move |l| {
         l.list_events(Some(&run_id_owned), 0, 4096)
@@ -93,13 +98,16 @@ pub async fn spec_path_of(ctx: &Ctx, run_id: &str) -> Result<String, Failure> {
         if row.kind == "forged.run.spec" {
             if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
                 if let Some(path) = payload.get("specPath").and_then(Value::as_str) {
-                    return Ok(path.to_owned());
+                    return Ok(SpecSource::File(path.to_owned()));
+                }
+                if let Some(bead) = payload.get("beadId").and_then(Value::as_str) {
+                    return Ok(SpecSource::Bead(bead.to_owned()));
                 }
             }
         }
     }
     Err(Failure::internal(format!(
-        "run {run_id} has no recorded spec path"
+        "run {run_id} has no recorded spec source"
     )))
 }
 
@@ -126,8 +134,7 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
             .packets
             .iter()
             .filter_map(|row| {
-                let packet =
-                    serde_json::from_str::<forged_types::WorkPacket>(&row.body_json).ok()?;
+                let packet = forged_proto::stored_packet(row).ok()?;
                 let execution = packet.execution?;
                 (execution.purpose == forged_types::SeatPurpose::Review)
                     .then_some((row, execution.round))
@@ -192,7 +199,7 @@ fn latest_review_evidence(view: &RunView) -> Vec<String> {
         .packets
         .iter()
         .filter_map(|row| {
-            let packet = serde_json::from_str::<forged_types::WorkPacket>(&row.body_json).ok()?;
+            let packet = forged_proto::stored_packet(row).ok()?;
             let execution = packet.execution?;
             (execution.purpose == forged_types::SeatPurpose::Review).then_some((
                 row,
@@ -317,8 +324,10 @@ async fn honor(
             Ok(Honored::Progressed)
         }
         NextAction::OpenPackets(intents) => {
-            let spec_path = spec_path_of(ctx, &view.run.run_id).await?;
-            let spec_sha = sha256_file(std::path::Path::new(&spec_path))?;
+            // ONE spec resolution for the whole batch — one bd read per
+            // packet open, never one per seat.
+            let source = spec_source_of(ctx, &view.run.run_id).await?;
+            let spec = crate::core::spec::resolve(ctx, &source).await?;
             for intent in intents {
                 let budget = view
                     .policy
@@ -330,11 +339,11 @@ async fn honor(
                     ctx,
                     &view.run,
                     intent,
-                    &spec_path,
-                    &spec_sha,
+                    &source,
+                    &spec,
                     &view.policy.gate_commands,
                     budget,
-                );
+                )?;
                 open_packet_op(ctx, &view.run, &packet).await?;
             }
             Ok(Honored::Progressed)
@@ -489,7 +498,8 @@ async fn sleep_until(deadline: &str) {
     }
 }
 
-/// The stored `WorkPacket` for a packet row (`body_json` verbatim).
+/// The stored `WorkPacket` for a packet row, rehydrated with the spec its
+/// columns pin.
 pub(crate) fn stored_packet_for_attempt(
     view: &RunView,
     packet_id: &str,
@@ -499,7 +509,7 @@ pub(crate) fn stored_packet_for_attempt(
         .iter()
         .find(|p| p.packet_id == packet_id)
         .ok_or_else(|| Failure::invalid(format!("no packet {packet_id:?} in view")))?;
-    let mut packet: forged_types::WorkPacket = serde_json::from_str(&row.body_json)
+    let mut packet = forged_proto::stored_packet(row)
         .map_err(|e| Failure::internal(format!("stored packet body does not parse: {e}")))?;
     if let (Some(package), Some(execution)) = (&view.execution_package, &packet.execution) {
         let candidates = package

@@ -15,12 +15,20 @@ pub enum Stage {
     Fix,
 }
 
-/// The spec a packet implements, pinned by content hash.
+/// The spec a packet implements, pinned against edits under it.
+///
+/// A bead-sourced spec pins the bead's opaque `revision`; a file-sourced one
+/// — the deprecated `--spec <path>` route — pins the file's content hash.
+/// `path` is where the seat reads the bytes either way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecRef {
     pub path: String,
     pub sha256: String,
+    /// The bead revision this packet is pinned to; absent on a file-sourced
+    /// spec. OPAQUE: compared for equality only, never ordered or parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// What a stage must hand back to count as done.
@@ -84,6 +92,30 @@ pub struct WorkPacket {
     pub result_schema: String,
     pub provider_hints: ProviderHints,
     pub field_notes: Vec<String>,
+}
+
+impl WorkPacket {
+    /// The row-storage projection of this packet: the wire form minus the
+    /// spec ref, which `packets` carries as its own columns. A packet row
+    /// never stores a value twice.
+    pub fn stored_body(&self) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(map) = &mut value {
+            map.remove("spec");
+        }
+        serde_json::to_string(&value)
+    }
+
+    /// Rebuild a packet from a stored body and the spec ref its row pins.
+    /// A body written before the projection still carries `spec`; the row's
+    /// columns win, because they are what the claim fence reads.
+    pub fn from_stored_body(body_json: &str, spec: SpecRef) -> Result<Self, serde_json::Error> {
+        let mut value: serde_json::Value = serde_json::from_str(body_json)?;
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert("spec".to_owned(), serde_json::to_value(spec)?);
+        }
+        serde_json::from_value(value)
+    }
 }
 
 /// A reviewer's overall call on a packet.
@@ -187,6 +219,7 @@ mod tests {
             spec: SpecRef {
                 path: "specs/bead-1.md".to_owned(),
                 sha256: "cafe".to_owned(),
+                revision: None,
             },
             worktree: PathBuf::from("/tmp/worktrees/run-1"),
             branch: "feat/bead-1".to_owned(),
@@ -247,6 +280,12 @@ mod tests {
         round_trip(&SpecRef {
             path: "specs/x.md".to_owned(),
             sha256: "beef".to_owned(),
+            revision: None,
+        });
+        round_trip(&SpecRef {
+            path: "specs/x.md".to_owned(),
+            sha256: "beef".to_owned(),
+            revision: Some("-6192208415116251521".to_owned()),
         });
     }
 
@@ -287,6 +326,38 @@ mod tests {
         assert_eq!(value["providerHints"]["sandbox"], json!("workspaceWrite"));
         assert_eq!(value["fieldNotes"][0], json!("watch the seam"));
         assert_eq!(value["spec"]["sha256"], json!("cafe"));
+    }
+
+    #[test]
+    fn the_stored_body_omits_the_spec_the_row_carries_as_columns() {
+        let mut packet = sample_packet();
+        packet.spec.revision = Some("-6192208415116251521".to_owned());
+        let body = packet.stored_body().expect("stored body");
+        let value: serde_json::Value = serde_json::from_str(&body).expect("parses");
+        assert!(
+            value.get("spec").is_none(),
+            "the spec ref lives in packet columns, never in body_json: {body}"
+        );
+        assert_eq!(
+            WorkPacket::from_stored_body(&body, packet.spec.clone()).expect("rehydrates"),
+            packet,
+            "rehydrating with the row's spec must reproduce the packet exactly"
+        );
+    }
+
+    #[test]
+    fn a_body_written_before_the_projection_still_rehydrates_from_its_columns() {
+        // Legacy rows carry the whole packet, spec included. The columns are
+        // what the claim fence reads, so they win.
+        let packet = sample_packet();
+        let legacy = serde_json::to_string(&packet).expect("legacy body");
+        let pinned = SpecRef {
+            path: "specs/bead-1.md".to_owned(),
+            sha256: "cafe".to_owned(),
+            revision: Some("77".to_owned()),
+        };
+        let rehydrated = WorkPacket::from_stored_body(&legacy, pinned.clone()).expect("rehydrates");
+        assert_eq!(rehydrated.spec, pinned);
     }
 
     #[test]

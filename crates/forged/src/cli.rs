@@ -258,9 +258,10 @@ pub struct RunStartArgs {
     /// Absolute path of the target checkout.
     #[arg(long)]
     pub repo: String,
-    /// Path of the spec the run builds.
+    /// DEPRECATED: path of a spec file. Omit it — the bead's own fields are
+    /// the spec. Honored for one release so in-flight runs keep working.
     #[arg(long)]
-    pub spec: String,
+    pub spec: Option<String>,
     /// Base ref; defaults to the repo's default branch.
     #[arg(long)]
     pub base_ref: Option<String>,

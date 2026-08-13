@@ -78,13 +78,18 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
             seq: 1,
             spec_path: env.spec.to_string_lossy().into_owned(),
             spec_sha256: sha.clone(),
+            spec_revision: None,
             body_json: json!({"fabricated": true}).to_string(),
         })
         .expect("open packet");
     let claimed = ledger
         // The claimant is the per-attempt session identity: packet-scoped,
         // not the run's bd lease holder.
-        .claim_packet(&packet_id, &format!("forged:{packet_id}:0"), &sha)
+        .claim_packet(
+            &packet_id,
+            &format!("forged:{packet_id}:0"),
+            &forged_ledger::SpecFence::Sha256(sha.clone()),
+        )
         .expect("claim packet");
     ledger
         .fail_packet(

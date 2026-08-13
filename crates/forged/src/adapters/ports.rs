@@ -695,11 +695,16 @@ mod tests {
                 seq: 1,
                 spec_path: "/dev/null".to_owned(),
                 spec_sha256: "sha".to_owned(),
+                spec_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("open packet");
         let claimed = ledger
-            .claim_packet(&packet_id, "claude:run-orphan/implement/1:1", "sha")
+            .claim_packet(
+                &packet_id,
+                "claude:run-orphan/implement/1:1",
+                &forged_ledger::SpecFence::Sha256("sha".to_owned()),
+            )
             .expect("claim packet");
         let attempt = ledger.get_attempt(claimed.attempt_id).expect("attempt");
         let config = ForgedConfig {

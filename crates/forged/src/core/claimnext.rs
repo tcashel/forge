@@ -13,7 +13,6 @@ use forged_ledger::{EffectClass, RunState};
 use forged_types::{OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
-use crate::adapters::execute::sha256_file;
 use crate::config::now_iso;
 use crate::core::{
     err_response, fenced, lease_identity, on_ledger, param_str, session_claimant, Ctx, Failure,
@@ -26,7 +25,7 @@ struct Resumable {
     run_id: String,
     bead_id: String,
     packet_id: String,
-    spec_path: String,
+    spec: forged_types::SpecRef,
     stage_key: String,
     logical_seq: i64,
     stage_budget_s: u64,
@@ -148,7 +147,7 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
             run_id: run.run_id,
             bead_id: run.bead_id,
             packet_id,
-            spec_path: packet.spec_path,
+            spec: forged_proto::packet_spec(&packet),
             stage_key,
             logical_seq,
             stage_budget_s,
@@ -215,13 +214,15 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             failpoint::hit("bd.claim.after");
         }
         // 2. Hand back the reopened packet of that same run — never a fresh
-        // one.
-        let current_sha = sha256_file(std::path::Path::new(&candidate.spec_path))?;
+        // one. One spec read per claim, fencing on whatever the packet pins.
+        let fence = crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id)
+            .await?
+            .fence;
         let claimed = {
             let packet_id = candidate.packet_id.clone();
             let claimant = session_claimant(&candidate.packet_id, &candidate.provider);
             on_ledger(&ctx.ledger, move |l| {
-                l.claim_packet(&packet_id, &claimant, &current_sha)
+                l.claim_packet(&packet_id, &claimant, &fence)
             })
             .await?
         };

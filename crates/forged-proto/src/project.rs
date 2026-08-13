@@ -28,6 +28,28 @@ use crate::events::parse_proto_events;
 /// empty page, so the loop always asks for a full one).
 const EVENT_PAGE: u32 = 256;
 
+/// The spec ref a packet row pins, rebuilt from its columns.
+///
+/// `spec_revision` is present exactly when the packet is bead-sourced, and
+/// is then the fence; a file-sourced packet keeps the content hash.
+pub fn packet_spec(row: &forged_ledger::PacketRow) -> forged_types::SpecRef {
+    forged_types::SpecRef {
+        path: row.spec_path.clone(),
+        sha256: row.spec_sha256.clone(),
+        revision: row.spec_revision.clone(),
+    }
+}
+
+/// The `WorkPacket` a row stores, rehydrated with the spec its columns pin.
+///
+/// `body_json` deliberately holds no spec — the columns are the one copy —
+/// so this is the ONLY way to read a stored packet back.
+pub fn stored_packet(
+    row: &forged_ledger::PacketRow,
+) -> Result<forged_types::WorkPacket, serde_json::Error> {
+    forged_types::WorkPacket::from_stored_body(&row.body_json, packet_spec(row))
+}
+
 /// Read every event row for a run, in `event_id` order.
 pub(crate) fn fetch_all_events(ledger: &Ledger, run_id: &str) -> Result<Vec<EventRow>, ProtoError> {
     let mut out: Vec<EventRow> = Vec::new();

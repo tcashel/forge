@@ -728,7 +728,7 @@ fn adaptive_packet<'a>(
     round: u8,
 ) -> Option<&'a PacketRow> {
     view.packets.iter().find(|packet| {
-        serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+        crate::project::stored_packet(packet)
             .ok()
             .and_then(|packet| packet.execution)
             .is_some_and(|execution| execution.seat_id == seat.id && execution.round == round)

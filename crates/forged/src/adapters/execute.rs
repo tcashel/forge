@@ -21,6 +21,7 @@ use sha2::{Digest, Sha256};
 use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
 use crate::adapters::ports::ForgedPorts;
 use crate::config::{now_iso, stage_str, HostPolicy};
+use crate::core::spec::{ResolvedSpec, SpecSource};
 use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
@@ -94,16 +95,32 @@ async fn workspace_label(ctx: &Ctx, run_id: &str) -> Option<String> {
     workspace_label_for_repo(&run.repo)
 }
 
+/// The semantic (stage key, round) a packet is filed under — the packet
+/// directory's coordinates, and the same pair `run_attempt` derives.
+pub(crate) fn packet_keys(packet: &WorkPacket) -> Result<(String, i64), Failure> {
+    match &packet.execution {
+        Some(execution) => Ok((execution.stage_id.clone(), i64::from(execution.round))),
+        None => {
+            let (_, stage, seq) = crate::core::split_packet_id(&packet.packet_id)?;
+            Ok((stage_str(stage).to_owned(), seq))
+        }
+    }
+}
+
 /// Fill every `WorkPacket` field the intent does not carry.
+///
+/// A bead-sourced packet reads its spec from the packet directory, where
+/// `run_attempt` materializes the rendered body; a file-sourced one keeps
+/// pointing at the operator's file.
 pub fn build_packet(
     ctx: &Ctx,
     run: &RunRow,
     intent: &PacketIntent,
-    spec_path: &str,
-    spec_sha256: &str,
+    source: &SpecSource,
+    spec: &ResolvedSpec,
     gate_commands: &[String],
     budget_s: u64,
-) -> WorkPacket {
+) -> Result<WorkPacket, Failure> {
     let stage = intent.stage;
     let packet_id = intent
         .packet_id
@@ -121,7 +138,7 @@ pub fn build_packet(
         }
         Stage::Fix => "address the merged review findings and push the fixes",
     };
-    WorkPacket {
+    let mut packet = WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id,
         run_id: run.run_id.clone(),
@@ -130,8 +147,9 @@ pub fn build_packet(
         execution: intent.execution.clone(),
         lane_seq: intent.execution.as_ref().map(|_| intent.seq),
         spec: forged_types::SpecRef {
-            path: spec_path.to_owned(),
-            sha256: spec_sha256.to_owned(),
+            path: String::new(),
+            sha256: spec.sha256.clone(),
+            revision: spec.revision(),
         },
         worktree: ctx.config.worktree(&run.run_id),
         branch: run.branch.clone(),
@@ -145,12 +163,31 @@ pub fn build_packet(
         result_schema: PromptStage::for_stage(stage).result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
         field_notes: Vec::new(),
-    }
+    };
+    packet.spec.path = match source {
+        SpecSource::File(path) => path.clone(),
+        SpecSource::Bead(_) => {
+            let (stage_key, seq) = packet_keys(&packet)?;
+            ctx.config
+                .packet_dir_key(&run.run_id, &stage_key, seq)
+                .join(crate::core::spec::BEAD_SPEC_FILE)
+                .to_string_lossy()
+                .into_owned()
+        }
+    };
+    Ok(packet)
 }
 
 /// Open a packet through the fence (`packet_open`, SafeRetry, ledger-local).
+///
+/// The idempotency key carries the spec fence. That is the fix for the
+/// defect this file used to have: keyed on (run, stage, seq) alone, a
+/// re-open after a spec revision replayed its stored response verbatim and
+/// left the packet pinned to bytes nobody could reach any more. A revised
+/// spec now mints a fresh key, so the re-open genuinely re-pins.
 pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Result<(), Failure> {
-    let body_json = serde_json::to_string(packet)
+    let body_json = packet
+        .stored_body()
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
     let (stage_key, logical_seq, lane_seq) = match &packet.execution {
         Some(execution) => (
@@ -165,17 +202,25 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
             (stage_str(stage).to_owned(), seq, seq)
         }
     };
-    let key = crate::core::derive_key(
-        "packet_open",
-        Some(&run.run_id),
-        Some(&stage_key),
-        Some(logical_seq),
+    let fence = packet
+        .spec
+        .revision
+        .clone()
+        .unwrap_or_else(|| packet.spec.sha256.clone());
+    let key = format!(
+        "{}:{fence}",
+        crate::core::derive_key(
+            "packet_open",
+            Some(&run.run_id),
+            Some(&stage_key),
+            Some(logical_seq),
+        )
     );
     let req = OperationRequest {
         schema_version: 1,
         idempotency_key: key,
         run_id: Some(run.run_id.clone()),
-        params: match json!({"stage": stage_key, "seq": logical_seq}) {
+        params: match json!({"stage": stage_key, "seq": logical_seq, "specFence": fence}) {
             Value::Object(map) => map,
             _ => unreachable!("literal is an object"),
         },
@@ -186,6 +231,7 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
         seq: lane_seq,
         spec_path: packet.spec.path.clone(),
         spec_sha256: packet.spec.sha256.clone(),
+        spec_revision: packet.spec.revision.clone(),
         body_json,
     };
     let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
@@ -346,16 +392,21 @@ pub async fn execute_packet(
 ) -> Result<PacketOutcome, Failure> {
     let packet_id = packet.packet_id.clone();
 
+    // ONE spec read for this claim: it answers both the fence the ledger
+    // compares and the bytes the seat will read, so the seat can never work
+    // from a body the claim did not fence.
+    let spec = crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await?;
+
     // Claim under the PER-ATTEMPT session identity (the bd lease stays the
-    // run's, held by the driver): the ledger re-checks the stored spec hash
-    // against the current file bytes — the caller re-hashes, the ledger does
-    // no file IO.
-    let current_sha = sha256_file(Path::new(&packet.spec.path))?;
+    // run's, held by the driver): the ledger re-checks the stored fence
+    // against what the caller just observed — the caller re-reads, the
+    // ledger does no file or process IO.
+    let fence = spec.fence.clone();
     let claimed = {
         let packet_id = packet_id.clone();
         let claimant = session_claimant(&packet_id, &packet.provider_hints.provider);
         on_ledger(&ctx.ledger, move |l| {
-            l.claim_packet(&packet_id, &claimant, &current_sha)
+            l.claim_packet(&packet_id, &claimant, &fence)
         })
         .await?
     };
@@ -364,6 +415,7 @@ pub async fn execute_packet(
         ports,
         exec,
         packet,
+        &spec,
         claimed.attempt_id,
         &claimed.claim_token,
     )
@@ -373,6 +425,10 @@ pub async fn execute_packet(
 /// Adopt an already-claimed attempt whose provider was never spawned (the
 /// crash window between claim and spawn): spawn under the row's own token
 /// and run the rest of the pipeline unchanged.
+///
+/// The spec is re-resolved here because adoption claims nothing, so no
+/// ledger comparison stands behind it; `run_attempt` refuses outright if the
+/// bead has moved off the revision the packet pins.
 pub async fn execute_adopted(
     ctx: &Ctx,
     ports: &ForgedPorts,
@@ -381,7 +437,8 @@ pub async fn execute_adopted(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
-    run_attempt(ctx, ports, exec, packet, attempt_id, claim_token).await
+    let spec = crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await?;
+    run_attempt(ctx, ports, exec, packet, &spec, attempt_id, claim_token).await
 }
 
 /// The shared attempt pipeline: render, spawn, await, harvest, settle.
@@ -390,6 +447,7 @@ async fn run_attempt(
     ports: &ForgedPorts,
     exec: &ExecutionContext,
     packet: &WorkPacket,
+    spec: &ResolvedSpec,
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
@@ -419,10 +477,14 @@ async fn run_attempt(
     };
     let claim_token = claim_token.to_owned();
 
-    // 1. Materialize the packet directory and render the prompt.
+    // 1. Materialize the packet directory, the spec the seat reads, and the
+    // rendered prompt. The spec bytes are written from the read this attempt
+    // was fenced on, so every seat of this packet reads the same bytes.
     let packet_dir = ctx.config.packet_dir_key(&run_id, stage_key, seq);
     std::fs::create_dir_all(&packet_dir)
         .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
+    crate::core::spec::assert_pinned(&packet.spec, spec)?;
+    crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
     let dirs = PacketDirs::new(&packet_dir);
     let templates = PromptTemplates::load()?;
     let context = render_context(exec, &packet, seq)?;

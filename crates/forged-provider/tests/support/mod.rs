@@ -26,6 +26,7 @@ pub fn sample_packet() -> WorkPacket {
         spec: SpecRef {
             path: "specs/bead-1.md".to_owned(),
             sha256: "cafe".to_owned(),
+            revision: None,
         },
         worktree: PathBuf::from("/tmp/worktrees/run-1"),
         branch: "feat/bead-1".to_owned(),

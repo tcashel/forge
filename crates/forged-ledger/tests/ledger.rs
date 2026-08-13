@@ -2,7 +2,7 @@
 //! slots, usage totals, and deterministic close.
 
 use forged_ledger::{
-    EffectClass, Ledger, NewPacket, NewRun, NewUsage, OperationOutcome, SlotOutcome,
+    EffectClass, Ledger, NewPacket, NewRun, NewUsage, OperationOutcome, SlotOutcome, SpecFence,
 };
 use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse, RunId, Stage};
 use serde_json::json;
@@ -27,6 +27,7 @@ fn new_packet(run_id: &str) -> NewPacket {
         seq: 7,
         spec_path: "specs/y.md".to_owned(),
         spec_sha256: "beef".to_owned(),
+        spec_revision: None,
         body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
     }
 }
@@ -82,11 +83,17 @@ fn open_packet_is_idempotent_on_byte_identical_content() {
     assert_eq!(again, id);
     assert_eq!(ledger.list_packets(&run).expect("list").len(), 1);
 
-    // A one-byte change to body_json refuses.
+    // A one-byte change to body_json re-pins the unclaimed packet in place.
     let mut drifted = new_packet(&run);
     drifted.body_json.push(' ');
-    let err = ledger.open_packet(drifted).expect_err("must refuse");
-    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+    assert_eq!(ledger.open_packet(drifted.clone()).expect("re-pin"), id);
+    assert_eq!(ledger.list_packets(&run).expect("list").len(), 1);
+    assert_eq!(
+        ledger.get_packet(&id).expect("get packet").body_json,
+        drifted.body_json
+    );
+    // Put the row back so the rest of this test reads the original body.
+    ledger.open_packet(new_packet(&run)).expect("restore");
 
     // Unknown run refuses with RunNotFound, explicitly, not via FK.
     let mut orphan = new_packet("run-missing");
@@ -367,11 +374,16 @@ fn idempotency_identity_spans_run_and_effect_class() {
             seq: 1,
             spec_path: "specs/y.md".to_owned(),
             spec_sha256: "beef".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&packet, "claude:sess:9", "beef")
+        .claim_packet(
+            &packet,
+            "claude:sess:9",
+            &SpecFence::Sha256("beef".to_owned()),
+        )
         .expect("claim");
     let wrong_run = request("key-t", Some(&run_b), json!({}));
     let err = ledger
