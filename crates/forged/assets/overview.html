@@ -1,98 +1,1830 @@
 <!doctype html>
 <html lang="en">
 <head>
-  <meta charset="utf-8">
-  <meta name="viewport" content="width=device-width,initial-scale=1">
-  <title>Forged Control Plane</title>
-  <style>
-    :root { color-scheme: light dark; --bg:#0d1117; --panel:#161b22; --line:#30363d; --text:#e6edf3; --muted:#8b949e; --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; }
-    * { box-sizing:border-box; }
-    body { margin:0; padding:16px; background:var(--bg); color:var(--text); font:13px/1.45 ui-sans-serif,system-ui,-apple-system,sans-serif; }
-    header { display:flex; align-items:flex-start; justify-content:space-between; gap:16px; margin-bottom:12px; }
-    h1 { margin:0; font-size:18px; letter-spacing:.01em; }
-    h2 { margin:0 0 8px; color:var(--muted); font-size:11px; letter-spacing:.08em; text-transform:uppercase; }
-    button { border:1px solid var(--line); border-radius:7px; padding:6px 10px; background:var(--panel); color:var(--text); cursor:pointer; }
-    button:hover { border-color:var(--accent); }
-    .sub { color:var(--muted); font-family:ui-monospace,SFMono-Regular,monospace; }
-    .grid { display:grid; grid-template-columns:repeat(auto-fit,minmax(210px,1fr)); gap:10px; }
-    .card { min-width:0; padding:12px; border:1px solid var(--line); border-radius:9px; background:var(--panel); }
-    .wide { grid-column:1/-1; }
-    .metric { font-size:22px; font-weight:650; }
-    .row { display:flex; justify-content:space-between; gap:12px; padding:5px 0; border-top:1px solid color-mix(in srgb,var(--line) 60%,transparent); }
-    .row:first-of-type { border-top:0; }
-    .row span:first-child { overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
-    .pill { display:inline-block; padding:2px 7px; border:1px solid var(--line); border-radius:999px; color:var(--muted); }
-    .ok { color:var(--ok); } .warn { color:var(--warn); } .bad { color:var(--bad); }
-    pre { max-height:220px; margin:0; overflow:auto; color:var(--muted); font:11px/1.5 ui-monospace,SFMono-Regular,monospace; white-space:pre-wrap; }
-    #empty { padding:28px; text-align:center; color:var(--muted); }
-  </style>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forged Control Plane</title>
+<style>
+/* ---------------------------------------------------------------- tokens
+   Every color, font, and radius below is a HOST style variable with a
+   fallback. The host overwrites these on the root element at handshake, so
+   the app inherits its chrome. The only tokens forged owns outright are the
+   execution-state chroma: the host's success/danger are tuned for prose and
+   cannot carry five distinguishable states at 8px. */
+:root {
+  color-scheme: light dark;
+
+  --font-sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, "SF Mono", Menlo, Consolas, monospace;
+
+  --color-background-primary: light-dark(#fcfcfb, #131417);
+  --color-background-secondary: light-dark(#f5f5f2, #191b1f);
+  --color-background-tertiary: light-dark(#eceae5, #21242a);
+  --color-text-primary: light-dark(#16181d, #e9eaed);
+  --color-text-secondary: light-dark(#585c66, #9ea3ad);
+  --color-text-tertiary: light-dark(#82868f, #6d727c);
+  --color-text-success: light-dark(#2c7a41, #61b975);
+  --color-text-danger: light-dark(#b23a30, #e2776d);
+  --color-text-warning: light-dark(#8a6314, #d6a441);
+  --color-border-primary: light-dark(#dfddd7, #2b2e35);
+  --color-border-secondary: light-dark(#eceae4, #24272d);
+
+  --border-radius-sm: 3px;
+  --border-radius-md: 5px;
+  --border-radius-lg: 9px;
+
+  /* forged's own: run state chroma. Live is deliberately NOT green — a seat
+     that is still thinking has not passed anything yet. */
+  --live: light-dark(#0e7d72, #2fc2ae);
+  --idle: var(--color-text-tertiary);
+
+  --u: 4px;
+  --rule: 1px solid var(--color-border-primary);
+  --hair: 1px solid var(--color-border-secondary);
+}
+
+* { box-sizing: border-box; min-width: 0; }
+
+body {
+  margin: 0;
+  background: var(--color-background-primary);
+  color: var(--color-text-primary);
+  font: 400 13px/1.5 var(--font-sans);
+  -webkit-font-smoothing: antialiased;
+}
+
+.eyebrow {
+  font: 500 10px/1 var(--font-sans);
+  letter-spacing: .13em;
+  text-transform: uppercase;
+  color: var(--color-text-tertiary);
+}
+
+button {
+  font: inherit; color: inherit; cursor: pointer;
+  background: transparent;
+  border: var(--rule);
+  border-radius: var(--border-radius-md);
+  padding: calc(var(--u) * 1.25) calc(var(--u) * 2);
+}
+button:hover { background: var(--color-background-tertiary); }
+button:focus-visible, [tabindex]:focus-visible, a:focus-visible {
+  outline: 2px solid var(--live);
+  outline-offset: 2px;
+}
+a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-underline-offset: 2px; }
+
+/* ------------------------------------------------------------------ shell */
+#app { padding: calc(var(--u) * 4); display: flex; flex-direction: column; gap: calc(var(--u) * 3); }
+
+.bar { display: flex; align-items: flex-start; gap: calc(var(--u) * 4); flex-wrap: wrap; }
+.bar__id { flex: 1 1 260px; }
+
+/* The run id set large in mono: the run's identity IS a machine string. */
+.ident {
+  font: 500 20px/1.15 var(--font-mono);
+  letter-spacing: -.01em;
+  display: flex; align-items: center; gap: calc(var(--u) * 2);
+  flex-wrap: wrap;
+}
+.copy {
+  border: 0; padding: 1px 5px; margin-left: 4px;
+  font: 400 10px/1.4 var(--font-sans); color: var(--color-text-tertiary);
+  border-radius: var(--border-radius-sm);
+}
+.copy:hover { color: var(--color-text-primary); background: var(--color-background-tertiary); }
+.subident {
+  margin-top: calc(var(--u) * 1.5);
+  display: flex; gap: calc(var(--u) * 3); flex-wrap: wrap;
+  color: var(--color-text-secondary);
+  font-family: var(--font-mono); font-size: 11px;
+}
+.subident b { font-weight: 400; color: var(--color-text-tertiary); }
+
+.controls { display: flex; align-items: center; gap: var(--u); flex-wrap: wrap; }
+.controls select {
+  font: 400 11px/1 var(--font-sans); color: inherit;
+  background: transparent; border: var(--rule);
+  border-radius: var(--border-radius-md); padding: calc(var(--u) * 1.5) var(--u);
+}
+
+/* ------------------------------------------------------------------ chips */
+.chip {
+  display: inline-flex; align-items: center; gap: 6px;
+  padding: 3px 9px 3px 8px;
+  border: 1px solid currentColor;
+  border-radius: var(--border-radius-full, 999px);
+  font: 500 11px/1.4 var(--font-sans);
+  white-space: nowrap;
+}
+.chip::before {
+  content: ""; width: 6px; height: 6px; border-radius: 50%;
+  background: currentColor; flex: none;
+}
+.chip--live { color: var(--live); }
+.chip--live::before { animation: pulse 1.9s ease-in-out infinite; }
+.chip--pass { color: var(--color-text-success); }
+.chip--block { color: var(--color-text-danger); }
+.chip--warn { color: var(--color-text-warning); }
+.chip--idle { color: var(--idle); }
+
+@keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
+
+/* ------------------------------------------------------------- attention */
+.rail { display: flex; flex-direction: column; border: var(--rule); border-radius: var(--border-radius-lg); overflow: hidden; }
+.rail__item {
+  display: grid; grid-template-columns: 3px 128px 1fr; align-items: baseline;
+  gap: calc(var(--u) * 2.5);
+  padding: calc(var(--u) * 2) calc(var(--u) * 2.5) calc(var(--u) * 2) 0;
+  border-top: var(--hair);
+}
+.rail__item:first-child { border-top: 0; }
+.rail__item::before { content: ""; align-self: stretch; background: currentColor; }
+.rail__item--block { color: var(--color-text-danger); }
+.rail__item--warn { color: var(--color-text-warning); }
+.rail__item--info { color: var(--color-text-tertiary); }
+.rail__label { font: 500 10px/1.6 var(--font-sans); letter-spacing: .11em; text-transform: uppercase; }
+.rail__detail { color: var(--color-text-primary); font-size: 12px; }
+.rail__detail em { color: var(--color-text-secondary); font-style: normal; }
+
+/* -------------------------------------------------------------- tab rail */
+.tabs { display: flex; gap: calc(var(--u) * 5); border-bottom: var(--rule); overflow-x: auto; scrollbar-width: none; }
+.tabs::-webkit-scrollbar { display: none; }
+.tab {
+  border: 0; border-bottom: 2px solid transparent; border-radius: 0;
+  padding: 0 0 calc(var(--u) * 2); margin-bottom: -1px;
+  color: var(--color-text-tertiary);
+  font: 500 12px/1 var(--font-sans);
+  display: flex; align-items: baseline; gap: 6px; white-space: nowrap;
+}
+.tab:hover { background: transparent; color: var(--color-text-primary); }
+.tab[aria-selected="true"] { color: var(--color-text-primary); border-bottom-color: var(--color-text-primary); }
+.tab__n { font-family: var(--font-mono); font-size: 10px; color: var(--color-text-tertiary); }
+
+.view { display: flex; flex-direction: column; gap: calc(var(--u) * 3); }
+.view--enter { animation: fade .14s ease-out; }
+@keyframes fade { from { opacity: 0; transform: translateY(2px); } }
+
+/* ------------------------------------------------------------- panel */
+.panel { border: var(--rule); border-radius: var(--border-radius-lg); }
+.panel__head {
+  display: flex; align-items: baseline; justify-content: space-between; gap: calc(var(--u) * 3);
+  padding: calc(var(--u) * 2.5) calc(var(--u) * 3);
+  border-bottom: var(--hair);
+}
+.panel__note { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-tertiary); }
+.panel__body { padding: calc(var(--u) * 3); }
+.panel__body--flush { padding: 0; }
+
+.cols { display: grid; gap: calc(var(--u) * 3); grid-template-columns: repeat(auto-fit, minmax(230px, 1fr)); }
+
+/* key/value list */
+.kv { display: grid; grid-template-columns: minmax(88px, auto) 1fr; gap: calc(var(--u) * 1.5) calc(var(--u) * 3); align-items: baseline; }
+.kv dt { font: 400 11px/1.5 var(--font-sans); color: var(--color-text-tertiary); }
+.kv dd { margin: 0; font-family: var(--font-mono); font-size: 11.5px; overflow-wrap: anywhere; }
+
+/* --------------------------------------------------------- the signature
+   Seats × rounds. Rows are the profile's seats in topology order; columns
+   are protocol rounds, which are a real typed sequence, so numbering them
+   encodes the run rather than decorating it. Reading down a column is one
+   round; reading across a row is one seat's behaviour over the whole run. */
+.matrix { overflow-x: auto; }
+.matrix__grid { display: grid; gap: 1px; background: var(--color-border-secondary); min-width: max-content; }
+.matrix__corner, .matrix__round, .matrix__seat, .cell { background: var(--color-background-primary); }
+.matrix__corner { padding: calc(var(--u) * 2) calc(var(--u) * 3); }
+.matrix__round {
+  padding: calc(var(--u) * 2) calc(var(--u) * 3);
+  display: flex; align-items: baseline; gap: var(--u);
+}
+.matrix__round b { font: 500 12px/1 var(--font-mono); }
+.matrix__seat {
+  padding: calc(var(--u) * 2.5) calc(var(--u) * 3);
+  display: flex; flex-direction: column; gap: 3px; justify-content: center;
+  position: sticky; left: 0; z-index: 1;
+  border-right: var(--hair);
+}
+.matrix__seat b { font: 500 12px/1.2 var(--font-mono); }
+.matrix__seat span { font-size: 10.5px; color: var(--color-text-tertiary); }
+
+.cell { padding: calc(var(--u) * 2.5) calc(var(--u) * 3); min-width: 188px; display: flex; flex-direction: column; gap: calc(var(--u) * 1.5); }
+.cell--empty { background: var(--color-background-secondary); }
+.cell__top { display: flex; align-items: center; justify-content: space-between; gap: var(--u); }
+.cell__who { font-family: var(--font-mono); font-size: 11px; color: var(--color-text-secondary); overflow-wrap: anywhere; }
+.cell__who b { color: var(--color-text-primary); font-weight: 500; }
+.cell__meta { display: flex; align-items: baseline; justify-content: space-between; gap: var(--u); font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); }
+.cell__dash { font-size: 11px; color: var(--color-text-tertiary); }
+
+/* Duration bar: width is wall-clock, scaled to the longest attempt in the
+   run. The matrix doubles as a Gantt without a second chart. */
+.dur { height: 3px; background: var(--color-background-tertiary); border-radius: 2px; overflow: hidden; }
+.dur__fill { height: 100%; background: currentColor; display: block; border-radius: 2px; }
+.dur--live { color: var(--live); }
+.dur--pass { color: var(--color-text-success); }
+.dur--block { color: var(--color-text-danger); }
+.dur--warn { color: var(--color-text-warning); }
+.dur--idle { color: var(--idle); }
+.dur--live .dur__fill { animation: sweep 1.6s ease-in-out infinite; }
+@keyframes sweep { 0% { opacity: .35; } 50% { opacity: 1; } 100% { opacity: .35; } }
+
+/* ------------------------------------------------------------- timeline */
+.gantt { display: flex; flex-direction: column; }
+.lane {
+  display: grid; grid-template-columns: 168px 1fr 62px; align-items: center;
+  gap: calc(var(--u) * 2); padding: calc(var(--u) * 1.5) calc(var(--u) * 3);
+  border-top: var(--hair);
+}
+.lane:first-child { border-top: 0; }
+.lane__name { font-family: var(--font-mono); font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lane__track { position: relative; height: 12px; background: var(--color-background-secondary); border-radius: 2px; }
+.lane__bar { position: absolute; top: 0; bottom: 0; min-width: 2px; border-radius: 2px; background: currentColor; }
+.lane__bar--live { animation: sweep 1.6s ease-in-out infinite; }
+.lane__dur { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); text-align: right; }
+.marks { display: grid; grid-template-columns: 168px 1fr 62px; gap: calc(var(--u) * 2); padding: 0 calc(var(--u) * 3) calc(var(--u) * 1.5); }
+.marks__track { position: relative; }
+.mark { position: absolute; transform: translateX(-50%); font-family: var(--font-mono); font-size: 9.5px; line-height: 11px; white-space: nowrap; color: var(--color-text-tertiary); }
+.mark::after { content: ""; position: absolute; left: 50%; top: 11px; width: 1px; height: var(--tick, 5px); background: var(--color-border-primary); }
+
+/* -------------------------------------------------------------- findings */
+.find { display: grid; grid-template-columns: 76px 1fr; gap: calc(var(--u) * 3); padding: calc(var(--u) * 2.5) calc(var(--u) * 3); border-top: var(--hair); }
+.find:first-child { border-top: 0; }
+.find__sev { font: 500 10px/1.6 var(--font-sans); letter-spacing: .11em; text-transform: uppercase; overflow-wrap: anywhere; }
+.find__sev--blocker, .find__sev--high { color: var(--color-text-danger); }
+.find__sev--medium { color: var(--color-text-warning); }
+.find__sev--low { color: var(--color-text-tertiary); }
+/* Seat ids are machine strings, not severity words: set them in mono so they
+   do not break mid-word in the label column. */
+.find__sev--id { font: 500 11px/1.45 var(--font-mono); letter-spacing: 0; text-transform: none; white-space: pre-line; }
+.find__where { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); margin-bottom: 3px; overflow-wrap: anywhere; }
+.find__msg { font-size: 12.5px; line-height: 1.55; overflow-wrap: anywhere; }
+.find__msg--clamp { display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden; }
+.find__more {
+  border: 0; padding: 2px 0; margin-top: 3px; border-radius: 0;
+  font: 400 10.5px/1.4 var(--font-sans); color: var(--color-text-tertiary);
+  text-decoration: underline; text-underline-offset: 2px;
+}
+.find__more:hover { background: transparent; color: var(--color-text-primary); }
+.find__src { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); margin-top: calc(var(--u) * 1.5); overflow-wrap: anywhere; }
+
+/* ----------------------------------------------------------------- table */
+.tbl { width: 100%; border-collapse: collapse; font-family: var(--font-mono); font-size: 11px; }
+.tbl th {
+  text-align: left; font: 500 10px/1 var(--font-sans); letter-spacing: .11em; text-transform: uppercase;
+  color: var(--color-text-tertiary); padding: calc(var(--u) * 2) calc(var(--u) * 3); border-bottom: var(--hair);
+  white-space: nowrap;
+}
+.tbl td { padding: calc(var(--u) * 2) calc(var(--u) * 3); border-top: var(--hair); vertical-align: top; overflow-wrap: anywhere; }
+.tbl tr:first-child td { border-top: 0; }
+.tbl .num { text-align: right; }
+
+/* ---------------------------------------------------------------- ledger */
+.filters { display: flex; gap: var(--u); flex-wrap: wrap; padding: calc(var(--u) * 2.5) calc(var(--u) * 3); border-bottom: var(--hair); align-items: center; }
+.filters input {
+  flex: 1 1 140px; min-width: 120px; font: 400 11px/1 var(--font-mono); color: inherit;
+  background: transparent; border: var(--rule); border-radius: var(--border-radius-md);
+  padding: calc(var(--u) * 1.5) calc(var(--u) * 2);
+}
+.filters input::placeholder { color: var(--color-text-tertiary); }
+.pill { border: var(--rule); border-radius: 999px; padding: 3px 10px; font: 400 10.5px/1.5 var(--font-mono); color: var(--color-text-secondary); }
+.pill[aria-pressed="true"] { color: var(--color-text-primary); border-color: var(--color-text-primary); }
+
+.ev { border-top: var(--hair); }
+.ev:first-child { border-top: 0; }
+.ev__head {
+  display: grid; grid-template-columns: 34px 62px 190px 1fr; gap: calc(var(--u) * 2); align-items: baseline;
+  width: 100%; text-align: left; border: 0; border-radius: 0;
+  padding: calc(var(--u) * 1.75) calc(var(--u) * 3);
+  font-family: var(--font-mono); font-size: 11px;
+}
+.ev__id { color: var(--color-text-tertiary); text-align: right; }
+.ev__ts { color: var(--color-text-tertiary); }
+.ev__kind--proto { color: var(--color-text-primary); }
+.ev__kind--attempt { color: var(--live); }
+.ev__kind--forged { color: var(--color-text-secondary); }
+.ev__sum { color: var(--color-text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ev__body { margin: 0; padding: 0 calc(var(--u) * 3) calc(var(--u) * 3) calc(var(--u) * 12); }
+.ev__body pre, .code {
+  margin: 0; max-height: 260px; overflow: auto;
+  padding: calc(var(--u) * 2.5); border-radius: var(--border-radius-md);
+  background: var(--color-background-secondary);
+  font: 400 10.5px/1.6 var(--font-mono); white-space: pre-wrap; overflow-wrap: anywhere;
+}
+
+/* ----------------------------------------------------------------- waves */
+.wave { border-top: var(--hair); padding: calc(var(--u) * 3); }
+.wave:first-child { border-top: 0; }
+.wave__head { display: flex; align-items: baseline; gap: calc(var(--u) * 2); margin-bottom: calc(var(--u) * 2.5); }
+.wave__head b { font: 500 12px/1 var(--font-mono); }
+.beads { display: grid; gap: calc(var(--u) * 2); grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); }
+.bead { border: var(--rule); border-radius: var(--border-radius-md); padding: calc(var(--u) * 2.5); display: flex; flex-direction: column; gap: var(--u); }
+.bead__top { display: flex; align-items: center; justify-content: space-between; gap: var(--u); }
+.bead__id { font: 500 11px/1 var(--font-mono); }
+.bead__title { font-size: 12px; line-height: 1.4; }
+.bead__foot { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; }
+
+/* ------------------------------------------------------------- utilities */
+.empty { padding: calc(var(--u) * 8) calc(var(--u) * 3); text-align: center; color: var(--color-text-tertiary); font-size: 12px; }
+.stack { display: flex; flex-direction: column; gap: calc(var(--u) * 2); }
+.row-wrap { display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; align-items: center; }
+.scroll { max-height: 420px; overflow: auto; }
+/* Fullscreen hands the view real estate; long lists should use it. */
+[data-display="fullscreen"] .scroll { max-height: 70vh; }
+.foot { display: flex; gap: calc(var(--u) * 3); flex-wrap: wrap; font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); }
+.trunc { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after { animation: none !important; transition: none !important; }
+}
+</style>
 </head>
 <body>
-  <header>
-    <div><h1>Forged</h1><div class="sub" id="identity">waiting for projection</div></div>
-    <button id="refresh" type="button">Refresh</button>
-  </header>
-  <main id="empty">Connecting to the host…</main>
-  <script>
-    (() => {
-      const initId = "forged-overview-init";
-      let requestId = 1;
-      let lastArguments = null;
-      const root = document.querySelector("main");
-      const identity = document.querySelector("#identity");
-      const send = message => window.parent.postMessage(message, "*");
-      const el = (tag, cls, text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!==undefined)n.textContent=String(text); return n; };
-      const array = value => Array.isArray(value) ? value : [];
-      const valueAt = (obj, path, fallback="—") => path.split(".").reduce((v,k)=>v?.[k],obj) ?? fallback;
-      const card = (title, rows, wide=false) => {
-        const node=el("section",`card${wide?" wide":""}`); node.append(el("h2","",title));
-        rows.forEach(([a,b,c])=>{ const r=el("div","row"); r.append(el("span","",a),el("span",c||"sub",b)); node.append(r); });
-        return node;
+<div id="app">
+  <div class="bar">
+    <div class="bar__id">
+      <div class="ident" id="ident"><span id="identText">forged</span></div>
+      <div class="subident" id="subident">Connecting to the host…</div>
+    </div>
+    <div class="controls" id="controls" hidden>
+      <button type="button" id="refresh">Refresh</button>
+      <select id="poll" aria-label="Auto refresh">
+        <option value="0">Manual</option>
+        <option value="10">Every 10s</option>
+        <option value="30">Every 30s</option>
+        <option value="120">Every 2m</option>
+      </select>
+      <button type="button" id="expand" hidden>Expand</button>
+    </div>
+  </div>
+  <div id="rail"></div>
+  <div class="tabs" id="tabs" role="tablist" hidden></div>
+  <div class="view" id="view"><div class="empty">Waiting for a projection.</div></div>
+  <div class="foot" id="foot"></div>
+</div>
+
+<script>
+(() => {
+  "use strict";
+
+  // ------------------------------------------------------------ host bridge
+  // Hand-written because forged embeds this file with include_str! and ships
+  // no JS toolchain; the wire format is the MCP Apps protocol verbatim.
+  const PROTOCOL_VERSION = "2026-01-26";
+  const APP_INFO = { name: "forged-overview", version: "2.0.0" };
+
+  let rpcId = 0;
+  const pending = new Map();
+  const post = (message) => window.parent.postMessage(message, "*");
+  const notify = (method, params) => post({ jsonrpc: "2.0", method, params: params || {} });
+
+  function request(method, params) {
+    const id = `forged-${++rpcId}`;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      post({ jsonrpc: "2.0", id, method, params: params || {} });
+      setTimeout(() => {
+        if (pending.delete(id)) reject(new Error(`${method} timed out`));
+      }, 120000);
+    });
+  }
+
+  const host = { capabilities: {}, context: {}, connected: false };
+
+  // ------------------------------------------------------------------ state
+  const state = {
+    data: null,        // the forged.overview/1 projection
+    error: null,       // an operation-envelope error, verbatim
+    args: null,        // the arguments the host called `overview` with
+    view: "flow",
+    pollSeconds: 0,
+    pollTimer: null,
+    loading: false,
+    eventKinds: new Set(),
+    eventQuery: "",
+    openEvents: new Set(),
+    findingScope: "carried",
+  };
+
+  // --------------------------------------------------------------- helpers
+  const el = (tag, className, text) => {
+    const node = document.createElement(tag);
+    if (className) node.className = className;
+    if (text !== undefined && text !== null) node.textContent = String(text);
+    return node;
+  };
+  const arr = (value) => (Array.isArray(value) ? value : []);
+  const at = (obj, path) => path.split(".").reduce((v, k) => (v == null ? v : v[k]), obj);
+  const num = (value) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
+  const int = (value) => Math.round(num(value)).toLocaleString();
+
+  function ms(value) {
+    if (!Number.isFinite(value) || value < 0) return "—";
+    const s = Math.round(value / 1000);
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`;
+    return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`;
+  }
+
+  const stamp = (ts) => (ts ? Date.parse(ts) : NaN);
+
+  function clock(ts) {
+    const t = stamp(ts);
+    if (!Number.isFinite(t)) return "—";
+    const d = new Date(t);
+    const pad = (n) => String(n).padStart(2, "0");
+    return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`;
+  }
+
+  function ago(ts) {
+    const t = stamp(ts);
+    if (!Number.isFinite(t)) return "";
+    const delta = Date.now() - t;
+    if (delta < 0) return "just now";
+    return `${ms(delta)} ago`;
+  }
+
+  const VERDICT = {
+    approve: { label: "approve", tone: "pass" },
+    requestChanges: { label: "changes", tone: "warn" },
+    block: { label: "block", tone: "block" },
+  };
+
+  function chip(label, tone) {
+    return el("span", `chip chip--${tone || "idle"}`, label);
+  }
+
+  function copyable(text) {
+    const node = el("button", "copy", "copy");
+    node.title = `Copy ${text}`;
+    node.addEventListener("click", async () => {
+      try {
+        await navigator.clipboard.writeText(text);
+        node.textContent = "copied";
+      } catch {
+        node.textContent = "select it";
+      }
+      setTimeout(() => { node.textContent = "copy"; }, 1400);
+    });
+    return node;
+  }
+
+  /** Long prose stays scannable: three lines, then the reader opts in. */
+  function clampedText(text, threshold) {
+    const wrap = el("div");
+    const body = el("div", "find__msg", text);
+    wrap.append(body);
+    if (String(text).length <= threshold) return wrap;
+    body.classList.add("find__msg--clamp");
+    const more = el("button", "find__more", "show all");
+    more.addEventListener("click", () => {
+      const clamped = body.classList.toggle("find__msg--clamp");
+      more.textContent = clamped ? "show all" : "show less";
+    });
+    wrap.append(more);
+    return wrap;
+  }
+
+  function panel(title, note) {
+    const box = el("section", "panel");
+    const head = el("div", "panel__head");
+    head.append(el("h2", "eyebrow", title));
+    if (note) head.append(el("span", "panel__note", note));
+    box.append(head);
+    const body = el("div", "panel__body");
+    box.append(body);
+    box.body = body;
+    box.flush = () => { body.classList.add("panel__body--flush"); return body; };
+    return box;
+  }
+
+  function kv(pairs) {
+    const list = el("dl", "kv");
+    for (const [key, value] of pairs) {
+      if (value === undefined || value === null || value === "") continue;
+      list.append(el("dt", "", key));
+      const dd = el("dd");
+      if (value instanceof Node) dd.append(value); else dd.textContent = String(value);
+      list.append(dd);
+    }
+    return list;
+  }
+
+  // ------------------------------------------------------------ derivation
+  // Everything below reads the projection only. The app never guesses a
+  // state the ledger did not record.
+
+  const isEpic = () => state.data?.kind === "epic";
+
+  function seatOf(packetId) {
+    const parts = String(packetId || "").split("/");
+    const round = Number(parts[parts.length - 1]);
+    return {
+      seat: parts.length > 1 ? parts[parts.length - 2] : String(packetId || ""),
+      round: Number.isFinite(round) ? round : 0,
+    };
+  }
+
+  /** Attempt spans reconstructed from `attempt.state` in the loaded event page. */
+  function attemptSpans(data) {
+    const spans = new Map();
+    const take = (id) => {
+      let row = spans.get(id);
+      if (!row) { row = { attemptId: id, packetId: null, start: null, end: null, state: null, host: null, fallback: null }; spans.set(id, row); }
+      return row;
+    };
+    for (const event of arr(at(data, "events.events"))) {
+      const p = event.payload || {};
+      if (event.kind === "attempt.state" && p.attemptId != null) {
+        const row = take(p.attemptId);
+        row.packetId = row.packetId || p.packetId || null;
+        if (p.new === "running") row.start = row.start || event.ts;
+        else row.end = event.ts;
+        row.state = p.new || row.state;
+        if (p.reason) row.reason = p.reason;
+      }
+      if (event.kind === "forged.session.started" && p.attemptId != null) {
+        const row = take(p.attemptId);
+        row.packetId = row.packetId || p.packetId || null;
+        row.host = p.host || row.host;
+        row.sessionId = p.sessionId || row.sessionId;
+        row.attachHint = p.attachHint || row.attachHint;
+      }
+      if (event.kind === "forged.host.fallback" && p.attemptId != null) {
+        take(p.attemptId).fallback = p.reason || "host unavailable";
+      }
+    }
+    for (const row of spans.values()) {
+      const from = stamp(row.start);
+      const to = row.end ? stamp(row.end) : Date.now();
+      row.durationMs = Number.isFinite(from) ? to - from : NaN;
+      row.live = !row.end && row.state === "running";
+    }
+    return spans;
+  }
+
+  /** One row per packet: who ran it, what it landed, how long it took. */
+  function packetRows(data) {
+    const status = data.status || {};
+    const history = data.packetHistory || {};
+    const spans = attemptSpans(data);
+    const byPacket = new Map();
+    for (const span of spans.values()) {
+      if (!span.packetId) continue;
+      if (!byPacket.has(span.packetId)) byPacket.set(span.packetId, []);
+      byPacket.get(span.packetId).push(span);
+    }
+    const candidates = new Map(
+      arr(at(status, "execution.candidateSelections")).map((c) => [c.packetId, c]),
+    );
+    const live = new Map(arr(status.liveAttempts).map((a) => [a.packetId, a]));
+    const sessions = new Map();
+    for (const s of arr(at(data, "workers.sessions"))) sessions.set(s.packetId, s);
+
+    return arr(status.packets).map((packet) => {
+      const id = packet.packetId;
+      const parsed = seatOf(id);
+      const candidate = candidates.get(id) || {};
+      const attempts = arr(history[id]);
+      const last = attempts[attempts.length - 1] || null;
+      const outcome = last?.outcome || null;
+      const kind = outcome ? Object.keys(outcome)[0] : null;
+      const body = kind ? outcome[kind] : null;
+      const liveAttempt = live.get(id) || null;
+      const spanList = (byPacket.get(id) || []).sort((a, b) => (stamp(a.start) || 0) - (stamp(b.start) || 0));
+      const span = spanList[spanList.length - 1] || null;
+
+      let tone = "idle";
+      let label = "not opened";
+      if (liveAttempt) {
+        tone = liveAttempt.state === "revoking" ? "warn" : "live";
+        label = liveAttempt.state;
+      } else if (last?.state === "failed") {
+        tone = "block"; label = "failed";
+      } else if (last?.state === "reclaimed") {
+        tone = "warn"; label = "reclaimed";
+      } else if (kind === "review" && body?.verdict) {
+        const v = VERDICT[body.verdict] || { label: body.verdict, tone: "idle" };
+        tone = v.tone; label = v.label;
+      } else if (kind === "review" && body && body.available === false) {
+        tone = "warn"; label = "unavailable";
+      } else if (kind === "implement") {
+        tone = body?.implemented ? "pass" : "warn";
+        label = body?.implemented ? `+${num(body.commitsAhead)} commits` : "nothing implemented";
+      } else if (kind === "fix") {
+        tone = body?.applied ? "pass" : "warn";
+        label = body?.applied ? "fix applied" : "no fix";
+      } else if (last?.state === "completed") {
+        tone = "pass"; label = "completed";
+      }
+
+      return {
+        packetId: id,
+        seat: candidate.seatId || parsed.seat,
+        round: candidate.round != null ? candidate.round : parsed.round,
+        role: candidate.roleId || null,
+        purpose: candidate.purpose || null,
+        provider: candidate.provider || null,
+        model: candidate.model || null,
+        effort: candidate.effort || null,
+        stage: packet.stage,
+        storageLane: packet.storageLane,
+        attempts, last, outcome: body, outcomeKind: kind,
+        liveAttempt, span, spans: spanList,
+        session: sessions.get(id) || null,
+        durationMs: span ? span.durationMs : NaN,
+        tone, label,
+        findings: kind === "review" ? arr(body?.findings) : [],
+        summary: body?.summary || null,
       };
-      function render(raw) {
-        const data = raw?.result ?? raw;
-        if (!data || data.schema !== "forged.overview/1") { root.textContent="No Forged projection returned."; return; }
-        identity.textContent=`${data.kind} · ${data.id} · cursor ${data.cursor ?? 0}`;
-        root.textContent=""; root.className="grid";
-        const epic=data.kind==="epic"; const status=data.status || {};
-        const state=epic ? (status.finalPr ? "final PR" : status.inputRequired ? "input required" : status.paused ? "paused" : "running") : valueAt(status,"state");
-        root.append(card("Execution", [["State",state,state==="running"||state==="active"?"ok":state==="input required"?"warn":""],["Profile",valueAt(epic?status:status.execution,"profile",valueAt(status,"execution.activeProfileRef.name"))],["Roster",valueAt(status,"roster",valueAt(status,"definition.activeRosterRef.name",valueAt(status,"definition.rosterRef.name")))] ]));
-        const workers=epic ? array(data.workers) : array(data.workers?.sessions);
-        root.append(card("Workers", [["Known sessions",workers.length],["Live",workers.filter(w=>w.state==="running").length,"ok"],["Interventions",array(data.interventions).length]]));
-        const totals=data.usage?.totals || {};
-        root.append(card("Usage", [["Input",Math.round(totals.inputTokens||0).toLocaleString()],["Output",Math.round(totals.outputTokens||0).toLocaleString()],["Known cost",`$${Number(totals.costUsdKnown||0).toFixed(3)}`]]));
-        const children=epic ? array(status.children) : array(status.packets);
-        root.append(card(epic?"Children":"Packets", children.length ? children.map(item=>[item.id||item.packetId,item.beadsStatus||item.stage||item.storageLane,item.merged?"ok":"sub"]) : [["None","—"]], true));
-        root.append(card("Evidence", [["Gates",array(data.gates).length],["Review findings",array(epic?data.reviews:data.reviews?.latestFindings).length],["Artifact groups",array(data.artifacts).length]], false));
-        const stop=status.inputRequired || data.inputRequired || status.paused || data.paused;
-        if (stop) root.append(card("Attention", [[stop.code||"Paused",stop.detail||stop.reason||JSON.stringify(stop),"warn"]], true));
-        const events=array(data.events?.events);
-        const eventCard=el("section","card wide"); eventCard.append(el("h2","","Recent events")); const pre=el("pre"); pre.textContent=events.slice(-30).map(e=>`${e.eventId}  ${e.kind}`).join("\n")||"No new events."; eventCard.append(pre); root.append(eventCard);
+    });
+  }
+
+  /** The headline: what the ledger says this run is doing right now. */
+  function headline(data) {
+    if (data.kind === "epic") {
+      const status = data.status || {};
+      if (status.finalPr) return { tone: "pass", label: "final PR open", detail: `#${at(status, "finalPr.number") ?? "?"}` };
+      if (status.inputRequired) return { tone: "block", label: "input required", detail: at(status, "inputRequired.code") || "" };
+      if (status.paused) return { tone: "warn", label: "paused", detail: at(status, "paused.reason") || "" };
+      const running = arr(status.children).filter((c) => c.runId && !c.merged).length;
+      return { tone: running ? "live" : "idle", label: running ? "waves running" : "idle", detail: running ? `${running} child ${running === 1 ? "run" : "runs"} open` : "" };
+    }
+    const status = data.status || {};
+    const next = status.nextAction || {};
+    const liveCount = arr(status.liveAttempts).length;
+    if (next.stop) {
+      const stop = next.stop;
+      if (stop.done) {
+        const verdict = stop.done.finalVerdict;
+        const v = verdict ? VERDICT[verdict] : null;
+        return { tone: v ? v.tone : "pass", label: verdict ? `stopped · ${v ? v.label : verdict}` : "stopped · done", detail: "the protocol reached a terminal verdict" };
       }
-      function toolResult(params) {
-        let value=params?.structuredContent;
-        if (!value) { const text=array(params?.content).find(c=>c.type==="text")?.text; try { value=JSON.parse(text); } catch {} }
-        render(value);
+      if (stop.providerUnavailable) {
+        return { tone: "block", label: "stopped · provider unavailable", detail: `${stop.providerUnavailable.stage} after ${num(stop.providerUnavailable.attempts)} attempts` };
       }
-      window.addEventListener("message", event => {
-        const msg=event.data;
-        if (!msg || msg.jsonrpc!=="2.0") return;
-        if (msg.id===initId && msg.result) {
-          send({jsonrpc:"2.0",method:"ui/notifications/initialized",params:{}});
-          const theme=msg.result.hostContext?.theme; if(theme) document.documentElement.style.colorScheme=theme;
-          return;
-        }
-        if (msg.method==="ui/notifications/tool-input") lastArguments=msg.params?.arguments;
-        if (msg.method==="ui/notifications/tool-result") toolResult(msg.params);
-        if (msg.id && msg.result?.structuredContent) toolResult(msg.result);
-        if (msg.method==="ui/resource-teardown" && msg.id) send({jsonrpc:"2.0",id:msg.id,result:{}});
-      });
-      document.querySelector("#refresh").addEventListener("click", () => {
-        if (!lastArguments) return;
-        send({jsonrpc:"2.0",id:`forged-refresh-${requestId++}`,method:"tools/call",params:{name:"overview",arguments:lastArguments}});
-      });
-      send({jsonrpc:"2.0",id:initId,method:"ui/initialize",params:{protocolVersion:"2026-01-26",appInfo:{name:"forged-overview",version:"1.0.0"},appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}});
+      if (stop.externallyStopped) {
+        return { tone: "warn", label: "stopped externally", detail: stop.externallyStopped.reason || "" };
+      }
+      return { tone: "warn", label: "stopped", detail: "" };
+    }
+    if (liveCount) {
+      const revoking = arr(status.liveAttempts).filter((a) => a.state === "revoking").length;
+      return revoking
+        ? { tone: "warn", label: "reclaiming", detail: `${revoking} attempt${revoking === 1 ? "" : "s"} revoking` }
+        : { tone: "live", label: "running", detail: `${liveCount} attempt${liveCount === 1 ? "" : "s"} in flight` };
+    }
+    if (next.awaitPacket) return { tone: "live", label: "awaiting packet", detail: next.awaitPacket.packetId || "" };
+    if (next.openPackets) {
+      const seats = arr(next.openPackets).map((i) => i.seat || i.stage).join(", ");
+      return { tone: "warn", label: "ready to open", detail: seats };
+    }
+    if (next.runMachine) return { tone: "warn", label: `machine step · ${next.runMachine}`, detail: "queued, not yet settled" };
+    if (next.escalateProfile) return { tone: "warn", label: "escalating profile", detail: `${next.escalateProfile.from} → ${next.escalateProfile.to}` };
+    return { tone: "idle", label: status.state || "unknown", detail: "" };
+  }
+
+  /** Only what needs the operator. Nothing here is decorative. */
+  function attention(data, rows) {
+    const items = [];
+    const status = data.status || {};
+    const push = (tone, label, detail) => items.push({ tone, label, detail });
+
+    if (data.kind === "epic") {
+      if (status.inputRequired) push("block", "input required", `${at(status, "inputRequired.childId") || "epic"} · ${at(status, "inputRequired.code") || ""} ${at(status, "inputRequired.detail") || ""}`.trim());
+      if (status.paused) push("warn", "paused", at(status, "paused.reason") || "scheduling is held");
+    } else {
+      const stop = at(status, "nextAction.stop");
+      const verdict = at(stop, "done.finalVerdict");
+      if (verdict && verdict !== "approve") {
+        push("block", "final verdict", `The protocol stopped at ${verdict === "block" ? "block" : "requestChanges"} — the branch is not clear to merge.`);
+      }
+      if (stop?.providerUnavailable) push("block", "provider unavailable", `${stop.providerUnavailable.stage} gave up after ${num(stop.providerUnavailable.attempts)} attempts.`);
+      if (stop?.externallyStopped) push("warn", "stopped externally", stop.externallyStopped.reason || "");
+      const controller = status.controller;
+      if (controller && controller.state !== "running" && !stop) {
+        push("block", "nothing driving", `The detached controller is ${controller.state}. Run \`forged run submit --run ${data.id}\` to hand it back to a driver.`);
+      }
+    }
+
+    const failed = rows.filter((r) => r.last?.state === "failed");
+    if (failed.length) {
+      push("block", "attempt failed", failed.map((r) => `${r.seat}: ${r.last.failNote || "no note"}`).join(" · "));
+    }
+    const reclaimed = rows.filter((r) => r.last?.state === "reclaimed");
+    if (reclaimed.length) push("warn", "reclaimed", `${reclaimed.length} attempt${reclaimed.length === 1 ? " was" : "s were"} revoked and reclaimed.`);
+
+    const escalations = arr(at(status, "execution.profileHistory")).filter((h) => h.from);
+    for (const step of escalations) {
+      push("warn", "profile escalated", `${step.from} → ${at(step, "profile.name")} on ${step.trigger || "an escalation trigger"}.`);
+    }
+
+    const gates = arr(data.gates).filter((g) => at(g, "payload.passed") === false);
+    for (const gate of gates) {
+      const failing = arr(at(gate, "payload.rows")).filter((r) => r.exitCode !== 0 || r.timedOut);
+      push("block", `${at(gate, "payload.phase") || "gate"} failed`, failing.map((r) => `${r.command} → ${r.timedOut ? "timed out" : `exit ${r.exitCode}`}`).join(" · "));
+    }
+
+    const events = arr(at(data, "events.events"));
+    const seatFallback = events.filter((e) => e.kind === "forged.host.fallback");
+    const driverFallback = events.filter((e) => e.kind === "forged.controller.host.fallback");
+    if (seatFallback.length || driverFallback.length) {
+      const sample = seatFallback[0] || driverFallback[0];
+      const who = [
+        seatFallback.length ? `${seatFallback.length} attempt${seatFallback.length === 1 ? "" : "s"}` : null,
+        driverFallback.length ? "the controller" : null,
+      ].filter(Boolean).join(" and ");
+      push("warn", "host fallback", `${who} fell back off ${at(sample, "payload.requested") || "herdr"} — ${at(sample, "payload.reason") || "the requested host was unavailable"}. Sessions started this way cannot be attached or messaged live.`);
+    }
+
+    const retries = arr(at(data, "events.events")).filter((e) => e.kind === "proto.retry");
+    if (retries.length) {
+      const worst = retries[retries.length - 1];
+      push("warn", "transport retry", `${retries.length} granted; ${at(worst, "payload.packetId")} has ${num(at(worst, "payload.transportFailures"))} transport failures, next claim after ${at(worst, "payload.retryAfter")}.`);
+    }
+
+    const quarantine = arr(at(data, "events.events")).filter((e) => e.kind === "proto.quarantine");
+    if (quarantine.length) push("block", "quarantined", `${quarantine.length} zombie result${quarantine.length === 1 ? " was" : "s were"} refused at the fence and taken into custody.`);
+
+    const pending = num(at(data, "workers.pendingInterventions"));
+    if (pending) push("warn", "interventions queued", `${pending} message${pending === 1 ? "" : "s"} waiting for the next provider boundary.`);
+
+    // Reviewer dissent in the latest round is the signal that produced the
+    // escalation; naming it saves reading six cells.
+    const reviews = rows.filter((r) => r.purpose === "review" && r.outcomeKind === "review");
+    if (reviews.length > 1) {
+      const round = Math.max(...reviews.map((r) => r.round));
+      const latest = reviews.filter((r) => r.round === round && r.outcome?.verdict);
+      const verdicts = new Set(latest.map((r) => r.outcome.verdict));
+      if (verdicts.size > 1) {
+        const tally = {};
+        for (const r of latest) tally[r.outcome.verdict] = (tally[r.outcome.verdict] || 0) + 1;
+        push("warn", "reviewers split", `Round ${round}: ${Object.entries(tally).map(([v, n]) => `${n} ${VERDICT[v]?.label || v}`).join(", ")}.`);
+      }
+    }
+
+    if (num(at(data, "usage.totals.rowsMissingCost"))) {
+      push("info", "cost incomplete", `${int(at(data, "usage.totals.rowsMissingCost"))} usage rows carry no price. Run \`forged usage ingest --run ${data.id}\` to fill them.`);
+    }
+    return items;
+  }
+
+  // ------------------------------------------------------------ views
+  function viewFlow(data, rows) {
+    const out = [];
+    const status = data.status || {};
+
+    // What happens next, in words.
+    const next = status.nextAction || {};
+    const nextText = (() => {
+      if (data.kind === "epic") {
+        if (status.finalPr) return `The epic PR is open at ${at(status, "finalPr.url") || `#${at(status, "finalPr.number")}`}.`;
+        if (status.inputRequired) return `A child is holding for input: ${at(status, "inputRequired.detail") || at(status, "inputRequired.code")}.`;
+        if (status.paused) return "Scheduling is paused. Resume it to continue the wave.";
+        return "The scheduler advances the current wave on the next drive.";
+      }
+      if (next.stop) return "This run is over. Nothing further will be scheduled.";
+      if (next.awaitPacket) return `Waiting on ${next.awaitPacket.packetId}${next.awaitPacket.notBefore ? ` until ${clock(next.awaitPacket.notBefore)}` : ""}.`;
+      if (next.openPackets) return `Next drive opens ${arr(next.openPackets).map((i) => i.seat || i.stage).join(", ")}.`;
+      if (next.runMachine) return `Next drive runs the ${next.runMachine} machine step.`;
+      if (next.escalateProfile) return `Next drive escalates ${next.escalateProfile.from} → ${next.escalateProfile.to}.`;
+      return "No action is queued.";
     })();
-  </script>
+
+    const driver = status.controller;
+    const lastEvent = arr(at(data, "events.events")).slice(-1)[0];
+    const nowPanel = panel("Next action", "");
+    const nowCols = el("div", "cols");
+    const sentence = el("div", "", nextText);
+    sentence.style.gridColumn = "1 / -1";
+    nowCols.append(sentence);
+    nowCols.append(kv([
+      ["driver", driver
+        ? `${driver.host} · ${driver.state}${driver.pid ? ` · pid ${driver.pid}` : ""}`
+        : "no detached controller"],
+      ["in flight", `${arr(status.liveAttempts).length} attempt${arr(status.liveAttempts).length === 1 ? "" : "s"}`],
+    ]));
+    nowCols.append(kv([
+      ["last event", lastEvent ? `${lastEvent.kind} · ${ago(lastEvent.ts)}` : null],
+      ["settled ops", arr(status.settledOperations).length || null],
+    ]));
+    nowPanel.body.append(nowCols);
+    out.push(nowPanel);
+
+    if (data.kind !== "epic") out.push(matrixPanel(data, rows));
+
+    // Definition: what this run was frozen against.
+    const definition = status.definition || {};
+    const execution = status.execution || {};
+    const escalations = arr(execution.profileHistory).filter((h) => h.from);
+    const policy = definition.policy || {};
+    const defPanel = panel("Definition", data.kind === "epic" ? "" : status.protocolMode || "");
+    const cols = el("div", "cols");
+    cols.append(kv([
+      ["protocol", at(execution, "protocolRef.name") || at(definition, "protocolRef.name")],
+      ["profile", escalations.length
+        ? `${arr(execution.profileHistory).map((h) => at(h, "profile.name")).join(" → ")}`
+        : at(execution, "activeProfileRef.name") || at(definition, "profileRef.name") || status.profile],
+      ["roster", at(definition, "activeRosterRef.name") || at(definition, "rosterRef.name") || status.roster],
+      ["revision", definition.rosterRevision != null ? `r${definition.rosterRevision}` : (arr(data.rosterRevisions).length ? `r${arr(data.rosterRevisions).slice(-1)[0].revision}` : null)],
+    ]));
+    cols.append(kv([
+      ["repo", status.repo],
+      ["branch", status.branch || status.integrationBranch],
+      ["base", status.baseRef],
+      ["bead", status.beadId],
+    ]));
+    cols.append(kv([
+      ["gates", (() => {
+        const commands = arr(policy.gateCommands);
+        if (!commands.length) return null;
+        const list = el("div", "stack");
+        for (const command of commands) list.append(el("div", "trunc", command));
+        return list;
+      })()],
+      ["host policy", policy.hostPolicy],
+      ["retry budget", policy.transportRetryBudget],
+      ["fix rounds", at(execution, "topology.fixRoundBudget")],
+    ]));
+    defPanel.body.append(cols);
+    out.push(defPanel);
+
+    // Usage. Zero known cost is not the same as free; say which one it is.
+    const totals = at(data, "usage.totals") || {};
+    const recorded = num(totals.inputTokens) + num(totals.outputTokens);
+    const usagePanel = panel("Usage", recorded ? "" : "no usage ingested");
+    const usageCols = el("div", "cols");
+    usageCols.append(kv([
+      ["input", recorded ? int(totals.inputTokens) : "—"],
+      ["output", recorded ? int(totals.outputTokens) : "—"],
+    ]));
+    usageCols.append(kv([
+      ["cache read", recorded ? int(totals.cacheReadTokens) : "—"],
+      ["cache write", recorded ? int(totals.cacheWriteTokens) : "—"],
+    ]));
+    usageCols.append(kv([
+      ["known cost", num(totals.costUsdKnown) ? `$${num(totals.costUsdKnown).toFixed(3)}` : recorded ? "$0.000" : "—"],
+      ["unpriced rows", int(totals.rowsMissingCost)],
+    ]));
+    usagePanel.body.append(usageCols);
+    out.push(usagePanel);
+    return out;
+  }
+
+  function matrixPanel(data, rows) {
+    const seats = arr(at(data, "status.execution.topology.seats"));
+    const rounds = [...new Set(rows.map((r) => r.round))].sort((a, b) => a - b);
+    const box = panel("Seats × rounds", `${rows.length} packet${rows.length === 1 ? "" : "s"}`);
+    const body = box.flush();
+
+    if (!rows.length) {
+      body.append(el("div", "empty", "No packets have been opened yet."));
+      return box;
+    }
+
+    // Rows follow topology order when the run is definition-backed; a legacy
+    // run falls back to first-seen order so it still renders.
+    const seatOrder = seats.length
+      ? seats.map((s) => ({ id: s.id, role: s.role, purpose: s.purpose }))
+      : [...new Set(rows.map((r) => r.seat))].map((id) => {
+          const first = rows.find((r) => r.seat === id);
+          return { id, role: first?.role || first?.storageLane, purpose: first?.purpose };
+        });
+
+    const longest = Math.max(1, ...rows.map((r) => (Number.isFinite(r.durationMs) ? r.durationMs : 0)));
+
+    const wrap = el("div", "matrix");
+    const grid = el("div", "matrix__grid");
+    grid.style.gridTemplateColumns = `minmax(140px, auto) repeat(${rounds.length}, minmax(188px, 1fr))`;
+
+    grid.append(el("div", "matrix__corner"));
+    for (const round of rounds) {
+      const head = el("div", "matrix__round");
+      head.append(el("b", "", `R${round}`));
+      head.append(el("span", "eyebrow", round === 0 ? "first pass" : "after fix"));
+      grid.append(head);
+    }
+
+    for (const seat of seatOrder) {
+      const label = el("div", "matrix__seat");
+      label.append(el("b", "", seat.id));
+      if (seat.role) label.append(el("span", "", seat.role));
+      grid.append(label);
+      for (const round of rounds) {
+        const row = rows.find((r) => r.seat === seat.id && r.round === round);
+        if (!row) {
+          const empty = el("div", "cell cell--empty");
+          empty.append(el("span", "cell__dash", "—"));
+          grid.append(empty);
+          continue;
+        }
+        grid.append(matrixCell(row, longest));
+      }
+    }
+    wrap.append(grid);
+    body.append(wrap);
+    return box;
+  }
+
+  function matrixCell(row, longest) {
+    const cell = el("div", "cell");
+    const top = el("div", "cell__top");
+    const who = el("div", "cell__who");
+    if (row.provider) {
+      who.append(el("b", "", row.provider));
+      who.append(document.createTextNode(` ${row.model || ""}${row.effort ? ` · ${row.effort}` : ""}`));
+    } else {
+      who.textContent = row.storageLane || "—";
+    }
+    top.append(who, chip(row.label, row.tone));
+    cell.append(top);
+
+    const bar = el("div", `dur dur--${row.tone}`);
+    const fill = el("span", "dur__fill");
+    const width = Number.isFinite(row.durationMs) ? Math.max(2, (row.durationMs / longest) * 100) : 2;
+    fill.style.width = `${Math.min(100, width)}%`;
+    bar.append(fill);
+    cell.append(bar);
+
+    const meta = el("div", "cell__meta");
+    meta.append(el("span", "", Number.isFinite(row.durationMs) ? ms(row.durationMs) : "—"));
+    const right = row.findings.length
+      ? `${row.findings.length} finding${row.findings.length === 1 ? "" : "s"}`
+      : row.last ? `attempt ${row.last.attemptId}` : "";
+    meta.append(el("span", "trunc", right));
+    cell.append(meta);
+    if (row.summary) cell.title = row.summary;
+    return cell;
+  }
+
+  function viewTimeline(data, rows) {
+    const spans = [...attemptSpans(data).values()].filter((s) => s.start).sort((a, b) => stamp(a.start) - stamp(b.start));
+    const box = panel("Attempt timeline", `${spans.length} attempt${spans.length === 1 ? "" : "s"} in the loaded event window`);
+    const body = box.flush();
+    if (!spans.length) {
+      body.append(el("div", "empty", "No attempt transitions in the loaded events."));
+      return [box];
+    }
+
+    const t0 = stamp(spans[0].start);
+    const live = spans.some((s) => s.live);
+    const t1 = Math.max(...spans.map((s) => (s.end ? stamp(s.end) : Date.now())));
+    const width = Math.max(1, t1 - t0);
+    const seatFor = new Map(rows.map((r) => [r.packetId, r]));
+
+    // Milestones sit above the lanes. Runs cluster them — a gate settles and
+    // the PR opens three seconds later — so labels stagger onto extra rows
+    // rather than overprinting each other.
+    const marksRow = el("div", "marks");
+    marksRow.append(el("div"));
+    const track = el("div", "marks__track");
+    const milestones = arr(at(data, "events.events"))
+      .filter((e) => ["proto.gate", "proto.pr", "forged.profile.escalated", "forged.epic.wave.started", "proto.quarantine"].includes(e.kind))
+      .map((event) => ({ event, t: stamp(event.ts) }))
+      .filter((m) => Number.isFinite(m.t))
+      .sort((a, b) => a.t - b.t);
+
+    const lanes = [];
+    let deepest = 0;
+    for (const { event, t } of milestones) {
+      const left = Math.min(99, Math.max(1, ((t - t0) / width) * 100));
+      let level = 0;
+      while (lanes[level] !== undefined && left - lanes[level] < 11) level += 1;
+      lanes[level] = left;
+      deepest = Math.max(deepest, level);
+      const mark = el("div", "mark", {
+        "proto.gate": `${at(event, "payload.phase") || "gate"}${at(event, "payload.passed") === false ? " ✗" : ""}`,
+        "proto.pr": `PR #${at(event, "payload.number")}`,
+        "forged.profile.escalated": `→ ${at(event, "payload.to")}`,
+        "forged.epic.wave.started": `wave ${at(event, "payload.wave")}`,
+        "proto.quarantine": "quarantine",
+      }[event.kind] || event.kind);
+      mark.style.left = `${left}%`;
+      mark.style.top = `${level * 13}px`;
+      mark.style.setProperty("--tick", `${(deepest - level) * 13 + 13}px`);
+      if (at(event, "payload.passed") === false) mark.style.color = "var(--color-text-danger)";
+      mark.title = `${clock(event.ts)} · ${event.kind}`;
+      track.append(mark);
+    }
+    track.style.height = `${deepest * 13 + 18}px`;
+    for (const mark of track.children) {
+      const level = Number(String(mark.style.top).replace("px", "")) / 13;
+      mark.style.setProperty("--tick", `${(deepest - level) * 13 + 14}px`);
+    }
+    marksRow.append(track, el("div"));
+    body.append(marksRow);
+
+    const gantt = el("div", "gantt");
+    for (const span of spans) {
+      const row = span.packetId ? seatFor.get(span.packetId) : null;
+      const lane = el("div", "lane");
+      const name = el("div", "lane__name");
+      name.textContent = row ? `${row.seat} · R${row.round}` : span.packetId || `attempt ${span.attemptId}`;
+      name.title = span.packetId || "";
+      lane.append(name);
+
+      const laneTrack = el("div", "lane__track");
+      const bar = el("div", `lane__bar${span.live ? " lane__bar--live" : ""}`);
+      const start = ((stamp(span.start) - t0) / width) * 100;
+      const end = (((span.end ? stamp(span.end) : Date.now()) - t0) / width) * 100;
+      bar.style.left = `${Math.max(0, start)}%`;
+      bar.style.width = `${Math.max(0.6, end - start)}%`;
+      bar.style.color = `var(--${{ live: "live", pass: "color-text-success", block: "color-text-danger", warn: "color-text-warning" }[row ? row.tone : "idle"] || "idle"})`;
+      bar.title = `${clock(span.start)} → ${span.end ? clock(span.end) : "now"}`;
+      laneTrack.append(bar);
+      lane.append(laneTrack);
+      lane.append(el("div", "lane__dur", Number.isFinite(span.durationMs) ? ms(span.durationMs) : "—"));
+      gantt.append(lane);
+    }
+    body.append(gantt);
+
+    const foot = el("div", "filters");
+    foot.style.borderBottom = "0";
+    foot.style.borderTop = "1px solid var(--color-border-secondary)";
+    foot.append(el("span", "panel__note", `${clock(spans[0].start)} → ${live ? "now" : clock(spans[spans.length - 1].end)} · ${ms(width)} wall clock`));
+    body.append(foot);
+    return [box];
+  }
+
+  function viewEvidence(data, rows) {
+    const out = [];
+
+    // Findings. `carried` is what the engine hands the fix seat; `all` is
+    // every reviewer's own list, which is where dissent is legible.
+    const carried = data.kind === "epic" ? arr(data.reviews) : arr(at(data, "reviews.latestFindings"));
+    const perSeat = rows.filter((r) => r.findings.length);
+    const allCount = perSeat.reduce((n, r) => n + r.findings.length, 0);
+
+    const box = panel("Review findings", "");
+    const head = box.querySelector(".panel__head");
+    const toggle = el("div", "row-wrap");
+    for (const [key, label, count] of [["carried", "carried forward", carried.length], ["all", "every seat", allCount]]) {
+      const button = el("button", "pill", `${label} · ${count}`);
+      button.setAttribute("aria-pressed", String(state.findingScope === key));
+      button.addEventListener("click", () => { state.findingScope = key; render(); });
+      toggle.append(button);
+    }
+    head.append(toggle);
+    const body = box.flush();
+
+    const rank = { blocker: 0, high: 1, medium: 2, low: 3 };
+    const findingRow = (finding, source) => {
+      const node = el("div", "find");
+      node.append(el("div", `find__sev find__sev--${finding.severity}`, finding.severity));
+      const right = el("div");
+      if (finding.file) right.append(el("div", "find__where", `${finding.file}${finding.line ? `:${finding.line}` : ""}`));
+      right.append(clampedText(finding.message, 260));
+      if (source) right.append(el("div", "find__src", source));
+      node.append(right);
+      return node;
+    };
+
+    if (state.findingScope === "carried") {
+      const sorted = [...carried].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9));
+      if (!sorted.length) body.append(el("div", "empty", "No findings were carried into the fix round."));
+      for (const finding of sorted) body.append(findingRow(finding, null));
+    } else if (!allCount) {
+      body.append(el("div", "empty", "No reviewer has landed findings yet."));
+    } else {
+      for (const row of [...perSeat].sort((a, b) => b.round - a.round || a.seat.localeCompare(b.seat))) {
+        for (const finding of [...row.findings].sort((a, b) => (rank[a.severity] ?? 9) - (rank[b.severity] ?? 9))) {
+          body.append(findingRow(finding, `${row.seat} · R${row.round} · ${row.provider || "?"} ${row.model || ""} · ${VERDICT[row.outcome?.verdict]?.label || "—"}`));
+        }
+      }
+    }
+    out.push(box);
+
+    // Seat summaries: what each seat said in its own words.
+    const summaries = rows.filter((r) => r.summary);
+    if (summaries.length) {
+      const sBox = panel("Seat reports", `${summaries.length}`);
+      const sBody = sBox.flush();
+      for (const row of summaries.sort((a, b) => a.round - b.round || a.seat.localeCompare(b.seat))) {
+        const item = el("div", "find");
+        item.append(el("div", "find__sev find__sev--id", `${row.seat}\nR${row.round}`));
+        const right = el("div");
+        right.append(el("div", "find__where", `${row.provider || ""} ${row.model || ""}${row.outcome?.verdict ? ` · ${VERDICT[row.outcome.verdict]?.label || row.outcome.verdict}` : ""}`.trim()));
+        right.append(clampedText(row.summary, 300));
+        item.append(right);
+        sBody.append(item);
+      }
+      out.push(sBox);
+    }
+
+    // Gates.
+    const gates = arr(data.gates);
+    const gBox = panel("Gates", `${gates.length} pass${gates.length === 1 ? "" : "es"}`);
+    const gBody = gBox.flush();
+    if (!gates.length) gBody.append(el("div", "empty", "No gate has run yet."));
+    for (const gate of gates) {
+      const payload = gate.payload || {};
+      const head = el("div", "filters");
+      head.append(el("span", "eyebrow", `${payload.phase || "gate"} · round ${num(payload.seq)}`));
+      head.append(chip(payload.passed ? "passed" : "failed", payload.passed ? "pass" : "block"));
+      head.append(el("span", "panel__note", clock(gate.ts)));
+      gBody.append(head);
+      const table = el("table", "tbl");
+      const thead = el("thead");
+      const hr = el("tr");
+      for (const [label, cls] of [["command", ""], ["exit", "num"], ["took", "num"], ["output", ""]]) hr.append(el("th", cls, label));
+      thead.append(hr); table.append(thead);
+      const tbody = el("tbody");
+      for (const row of arr(payload.rows)) {
+        const tr = el("tr");
+        tr.append(el("td", "", row.command));
+        const exit = el("td", "num", row.timedOut ? "timeout" : String(row.exitCode ?? "—"));
+        exit.style.color = row.timedOut || row.exitCode !== 0 ? "var(--color-text-danger)" : "var(--color-text-success)";
+        tr.append(exit);
+        tr.append(el("td", "num", ms(num(row.durationMs))));
+        const preview = el("td", "", (row.stderrPreview || row.stdoutPreview || "").split("\n").slice(0, 2).join(" · ").slice(0, 160));
+        preview.style.color = "var(--color-text-tertiary)";
+        tr.append(preview);
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      gBody.append(table);
+    }
+    out.push(gBox);
+
+    // Artifacts.
+    const artifacts = arr(data.artifacts).filter((a) => arr(a.files).length);
+    if (artifacts.length) {
+      const aBox = panel("Artifacts", `${artifacts.reduce((n, a) => n + arr(a.files).length, 0)} files`);
+      const aBody = aBox.flush();
+      const table = el("table", "tbl");
+      const tbody = el("tbody");
+      for (const group of artifacts) {
+        const tr = el("tr");
+        tr.append(el("td", "", group.packetId));
+        tr.append(el("td", "", arr(group.files).map((f) => f.split("/").pop()).join("  ")));
+        const dir = el("td");
+        dir.append(el("span", "trunc", group.directory));
+        dir.style.color = "var(--color-text-tertiary)";
+        tr.append(dir);
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      aBody.append(table);
+      out.push(aBox);
+    }
+    return out;
+  }
+
+  function viewWorkers(data, rows) {
+    const out = [];
+    const sessions = data.kind === "epic" ? arr(data.workers) : arr(at(data, "workers.sessions"));
+    const seatFor = new Map(rows.map((r) => [r.packetId, r]));
+
+    const box = panel("Provider sessions", `${sessions.length} recorded`);
+    const body = box.flush();
+    if (!sessions.length) {
+      body.append(el("div", "empty", "No provider session has started."));
+    } else {
+      const table = el("table", "tbl");
+      const thead = el("thead"); const hr = el("tr");
+      for (const label of ["attempt", "seat", "state", "host", "session", "attach"]) hr.append(el("th", "", label));
+      thead.append(hr); table.append(thead);
+      const tbody = el("tbody");
+      for (const session of sessions) {
+        const row = seatFor.get(session.packetId);
+        const tr = el("tr");
+        tr.append(el("td", "num", session.attemptId));
+        const seat = el("td");
+        seat.append(el("div", "", row ? `${row.seat} · R${row.round}` : session.packetId));
+        const who = el("div", "", session.providerClaimant || "");
+        who.style.color = "var(--color-text-tertiary)";
+        who.style.fontSize = "10.5px";
+        seat.append(who);
+        tr.append(seat);
+        const live = session.state === "running" || session.state === "revoking";
+        const stateCell = el("td");
+        stateCell.append(chip(session.state, live ? (session.state === "revoking" ? "warn" : "live") : session.state === "failed" ? "block" : "pass"));
+        tr.append(stateCell);
+        tr.append(el("td", "", session.host || "—"));
+        tr.append(el("td", "", session.sessionId || "—"));
+        const attach = el("td");
+        if (session.attachHint) {
+          attach.append(el("span", "", session.attachHint));
+          attach.append(copyable(session.attachHint));
+        } else {
+          const none = el("span", "", session.host === "herdr" ? "—" : "not attachable");
+          none.style.color = "var(--color-text-tertiary)";
+          attach.append(none);
+        }
+        tr.append(attach);
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      body.append(table);
+    }
+    out.push(box);
+
+    const controller = at(data, "status.controller");
+    if (controller) {
+      const cBox = panel("Controller", controller.scope || "");
+      const cols = el("div", "cols");
+      cols.append(kv([
+        ["state", (() => { const s = el("span"); s.append(chip(controller.state, controller.state === "running" ? "live" : controller.exitCode ? "block" : "idle")); return s; })()],
+        ["host", controller.host],
+        ["generation", controller.generation],
+      ]));
+      cols.append(kv([
+        ["pid", controller.pid],
+        ["session", controller.sessionId],
+        ["exit", controller.exitCode],
+      ]));
+      cols.append(kv([
+        ["submitted", controller.submittedAt ? `${clock(controller.submittedAt)} · ${ago(controller.submittedAt)}` : null],
+        ["log", controller.outputPath],
+        ["attach", controller.attachHint ? (() => {
+          const wrap = el("span");
+          wrap.append(document.createTextNode(controller.attachHint), copyable(controller.attachHint));
+          return wrap;
+        })() : null],
+      ]));
+      cBox.body.append(cols);
+      out.push(cBox);
+    }
+
+    const interventions = arr(data.interventions);
+    if (interventions.length) {
+      const iBox = panel("Interventions", `${interventions.length}`);
+      const iBody = iBox.flush();
+      const table = el("table", "tbl");
+      const tbody = el("tbody");
+      for (const event of interventions) {
+        const tr = el("tr");
+        tr.append(el("td", "", clock(event.ts)));
+        tr.append(el("td", "", String(event.kind).replace("forged.intervention.", "")));
+        tr.append(el("td", "", at(event, "payload.message") || at(event, "payload.reason") || ""));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      iBody.append(table);
+      out.push(iBox);
+    }
+
+    const revisions = arr(data.rosterRevisions);
+    if (revisions.length) {
+      const rBox = panel("Roster revisions", `${revisions.length}`);
+      const rBody = rBox.flush();
+      const table = el("table", "tbl");
+      const thead = el("thead"); const hr = el("tr");
+      for (const label of ["rev", "roster", "reason", "when"]) hr.append(el("th", "", label));
+      thead.append(hr); table.append(thead);
+      const tbody = el("tbody");
+      for (const revision of revisions) {
+        const tr = el("tr");
+        tr.append(el("td", "num", `r${revision.revision}`));
+        tr.append(el("td", "", at(revision, "rosterRef.name") || ""));
+        tr.append(el("td", "", revision.reason || ""));
+        tr.append(el("td", "", revision.createdAt ? ago(revision.createdAt) : ""));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      rBody.append(table);
+      out.push(rBox);
+    }
+    return out;
+  }
+
+  function viewWaves(data) {
+    const out = [];
+    const status = data.status || {};
+    const children = arr(status.children);
+    const waves = arr(status.waves);
+    const byId = new Map(children.map((c) => [c.id, c]));
+
+    const box = panel("Waves", `${children.length} bead${children.length === 1 ? "" : "s"}`);
+    const body = box.flush();
+    if (!children.length) {
+      body.append(el("div", "empty", "The epic inventory is empty."));
+    } else {
+      const grouped = waves.length
+        ? waves.map((w) => ({ wave: w.wave, ids: arr(w.children) }))
+        : [{ wave: null, ids: children.map((c) => c.id) }];
+      const placed = new Set(grouped.flatMap((g) => g.ids));
+      const rest = children.filter((c) => !placed.has(c.id));
+      if (rest.length) grouped.push({ wave: null, ids: rest.map((c) => c.id) });
+
+      for (const group of grouped) {
+        const wave = el("div", "wave");
+        const head = el("div", "wave__head");
+        head.append(el("b", "", group.wave != null ? `Wave ${group.wave}` : "Not scheduled"));
+        const merged = group.ids.filter((id) => byId.get(id)?.merged).length;
+        head.append(el("span", "panel__note", `${merged}/${group.ids.length} merged`));
+        wave.append(head);
+        const beads = el("div", "beads");
+        for (const id of group.ids) {
+          const child = byId.get(id);
+          if (!child) continue;
+          const card = el("div", "bead");
+          const top = el("div", "bead__top");
+          top.append(el("span", "bead__id", child.id));
+          // Beads status outranks "has a run": a blocked bead with a live run
+          // is still blocked, and the operator needs to see that first.
+          const held = at(status, "inputRequired.childId") === child.id;
+          const [label, tone] = child.merged ? ["merged", "pass"]
+            : held ? ["needs input", "block"]
+            : child.beadsStatus === "blocked" ? ["blocked", "block"]
+            : child.runId && child.beadsStatus === "in_progress" ? ["running", "live"]
+            : [child.beadsStatus || "unknown", "idle"];
+          top.append(chip(label, tone));
+          card.append(top);
+          card.append(el("div", "bead__title", child.title || ""));
+          const foot = el("div", "bead__foot");
+          if (child.beadsStatus) foot.append(el("span", "", `bd ${child.beadsStatus}`));
+          if (child.runId && child.runId !== child.id) foot.append(el("span", "trunc", child.runId));
+          if (child.generation) foot.append(el("span", "", `gen ${child.generation}`));
+          if (at(child, "merged.pr")) foot.append(el("span", "", `PR #${at(child, "merged.pr")}`));
+          card.append(foot);
+          beads.append(card);
+        }
+        wave.append(beads);
+        body.append(wave);
+      }
+    }
+    out.push(box);
+
+    const integration = status.integration;
+    const finalPr = status.finalPr;
+    if (integration || finalPr) {
+      const iBox = panel("Integration", "");
+      const cols = el("div", "cols");
+      cols.append(kv([
+        ["branch", at(integration, "branch")],
+        ["base", at(integration, "baseRef")],
+        ["cut at", at(integration, "cutSha")],
+      ]));
+      if (finalPr) {
+        const link = el("span", "", finalPr.url || "");
+        cols.append(kv([
+          ["final PR", `#${finalPr.number}${finalPr.isDraft ? " (draft)" : ""}`],
+          ["head", finalPr.head],
+          ["url", host.capabilities.openLinks && finalPr.url ? linkButton(finalPr.url) : link],
+        ]));
+      }
+      iBox.body.append(cols);
+      out.push(iBox);
+    }
+
+    // Child runs roll up their own evidence; surface the counts that matter.
+    const childRuns = arr(data.childRuns);
+    if (childRuns.length) {
+      const cBox = panel("Child runs", `${childRuns.length}`);
+      const cBody = cBox.flush();
+      const table = el("table", "tbl");
+      const thead = el("thead"); const hr = el("tr");
+      for (const label of ["run", "state", "packets", "findings", "gates"]) hr.append(el("th", "", label));
+      thead.append(hr); table.append(thead);
+      const tbody = el("tbody");
+      for (const child of childRuns) {
+        const tr = el("tr");
+        tr.append(el("td", "", child.id));
+        const cell = el("td");
+        if (child.error) cell.append(chip(child.error.code || "error", "block"));
+        else { const h = headline(child); cell.append(chip(h.label, h.tone)); }
+        tr.append(cell);
+        tr.append(el("td", "num", arr(at(child, "status.packets")).length || "—"));
+        tr.append(el("td", "num", arr(at(child, "reviews.latestFindings")).length || "—"));
+        tr.append(el("td", "num", arr(child.gates).length || "—"));
+        tbody.append(tr);
+      }
+      table.append(tbody);
+      cBody.append(table);
+      out.push(cBox);
+    }
+    return out;
+  }
+
+  function linkButton(url) {
+    const button = el("button", "pill", url.replace(/^https?:\/\//, ""));
+    button.addEventListener("click", () => { request("ui/open-link", { url }).catch(() => {}); });
+    return button;
+  }
+
+  function eventSummary(event) {
+    const p = event.payload || {};
+    switch (event.kind) {
+      case "attempt.state": return `attempt ${p.attemptId} ${p.old || "∅"} → ${p.new}${p.reason ? ` (${p.reason})` : ""} · ${p.packetId || ""}`;
+      case "forged.session.started": return `${p.host} session ${p.sessionId} for attempt ${p.attemptId}`;
+      case "forged.host.fallback":
+      case "forged.controller.host.fallback": return `${p.requested} → ${p.selected}: ${p.reason || ""}`;
+      case "proto.gate": return `${p.phase} round ${p.seq} ${p.passed ? "passed" : "FAILED"} · ${arr(p.rows).length} commands`;
+      case "proto.pr": return `${p.isDraft ? "draft " : ""}PR #${p.number} ${p.url || ""}`;
+      case "proto.retry": return `${p.packetId} retry ${p.transportFailures} after ${p.retryAfter}`;
+      case "proto.review": return `${p.stage} seq ${p.seq} ${p.verdict || (p.available === false ? "unavailable" : "")}`;
+      case "proto.quarantine": return `attempt ${p.attemptId} refused: ${p.reason || ""}`;
+      case "proto.operation.request": return `${p.name} ${p.effectClass} · ${p.idempotencyKey || ""}`;
+      case "forged.profile.escalated": return `${p.from} → ${p.to} on ${p.trigger}`;
+      case "forged.controller.started": return `${p.host} controller ${p.sessionId} gen ${p.generation}`;
+      case "forged.run.spec": return p.specPath || "";
+      default: {
+        const text = JSON.stringify(p);
+        return text === "{}" ? "" : text.slice(1, 200);
+      }
+    }
+  }
+
+  function viewLedger(data) {
+    const events = arr(at(data, "events.events"));
+    const kinds = [...new Set(events.map((e) => e.kind))].sort();
+    const box = panel("Ledger", `${events.length} of ${data.cursor ?? events.length} events`);
+    const body = box.flush();
+
+    const filters = el("div", "filters");
+    for (const kind of kinds) {
+      const on = state.eventKinds.size === 0 || state.eventKinds.has(kind);
+      const button = el("button", "pill", `${kind.replace(/^(proto|forged)\./, "")} ${events.filter((e) => e.kind === kind).length}`);
+      button.setAttribute("aria-pressed", String(state.eventKinds.size > 0 && on));
+      button.title = kind;
+      button.addEventListener("click", () => {
+        if (state.eventKinds.has(kind)) state.eventKinds.delete(kind); else state.eventKinds.add(kind);
+        render();
+      });
+      filters.append(button);
+    }
+    const search = el("input");
+    search.type = "search";
+    search.placeholder = "filter payloads";
+    search.value = state.eventQuery;
+    search.addEventListener("input", () => {
+      state.eventQuery = search.value;
+      renderLedgerRows(list, data);
+    });
+    filters.append(search);
+    body.append(filters);
+
+    const list = el("div", "scroll");
+    body.append(list);
+    renderLedgerRows(list, data);
+    return [box];
+  }
+
+  function renderLedgerRows(list, data) {
+    list.textContent = "";
+    const query = state.eventQuery.trim().toLowerCase();
+    const events = arr(at(data, "events.events")).filter((event) => {
+      if (state.eventKinds.size && !state.eventKinds.has(event.kind)) return false;
+      if (!query) return true;
+      return JSON.stringify(event).toLowerCase().includes(query);
+    }).reverse();
+
+    if (!events.length) {
+      list.append(el("div", "empty", "No events match this filter."));
+      return;
+    }
+    for (const event of events) {
+      const wrap = el("div", "ev");
+      const head = el("button", "ev__head");
+      head.setAttribute("aria-expanded", String(state.openEvents.has(event.eventId)));
+      head.append(el("span", "ev__id", event.eventId));
+      head.append(el("span", "ev__ts", clock(event.ts)));
+      const family = event.kind.startsWith("proto.") ? "proto" : event.kind.startsWith("attempt.") ? "attempt" : "forged";
+      head.append(el("span", `ev__kind--${family}`, event.kind));
+      head.append(el("span", "ev__sum", eventSummary(event)));
+      head.addEventListener("click", () => {
+        if (state.openEvents.has(event.eventId)) state.openEvents.delete(event.eventId);
+        else state.openEvents.add(event.eventId);
+        renderLedgerRows(list, data);
+      });
+      wrap.append(head);
+      if (state.openEvents.has(event.eventId)) {
+        const detail = el("div", "ev__body");
+        detail.append(el("pre", "", JSON.stringify(event.payload, null, 2)));
+        wrap.append(detail);
+      }
+      list.append(wrap);
+    }
+  }
+
+  // ------------------------------------------------------------------ shell
+  const nodes = {
+    ident: document.getElementById("ident"),
+    identText: document.getElementById("identText"),
+    subident: document.getElementById("subident"),
+    controls: document.getElementById("controls"),
+    rail: document.getElementById("rail"),
+    tabs: document.getElementById("tabs"),
+    view: document.getElementById("view"),
+    foot: document.getElementById("foot"),
+    refresh: document.getElementById("refresh"),
+    poll: document.getElementById("poll"),
+    expand: document.getElementById("expand"),
+  };
+
+  function render() {
+    const data = state.data;
+    nodes.view.textContent = "";
+    nodes.rail.textContent = "";
+    nodes.foot.textContent = "";
+
+    if (state.error) {
+      nodes.identText.textContent = "forged";
+      nodes.subident.textContent = "the operation was refused";
+      nodes.controls.hidden = false;
+      nodes.tabs.hidden = true;
+      const box = panel("Refused", state.error.code || "");
+      box.body.append(el("p", "", state.error.message || "The overview call returned an error envelope."));
+      box.body.firstChild.style.margin = "0";
+      if (state.error.detail) {
+        const detail = el("pre", "code", JSON.stringify(state.error.detail, null, 2));
+        detail.style.marginTop = "12px";
+        box.body.append(detail);
+      }
+      nodes.view.append(box);
+      return;
+    }
+    if (!data) return;
+
+    const rows = data.kind === "epic" ? [] : packetRows(data);
+    const head = headline(data);
+
+    nodes.identText.textContent = data.id;
+    const existing = nodes.ident.querySelectorAll(".chip, .ident__copy");
+    existing.forEach((node) => node.remove());
+    nodes.ident.append(chip(head.label, head.tone));
+
+    nodes.subident.textContent = "";
+    const bits = data.kind === "epic"
+      ? [["kind", "epic"], ["title", at(data, "status.title")], ["branch", at(data, "status.integrationBranch")], ["cursor", data.cursor]]
+      : [["kind", "slice"], ["bead", at(data, "status.beadId")], ["branch", at(data, "status.branch")], ["cursor", data.cursor]];
+    for (const [label, value] of bits) {
+      if (value === undefined || value === null || value === "") continue;
+      const span = el("span", "trunc");
+      span.append(el("b", "", `${label} `), document.createTextNode(String(value)));
+      nodes.subident.append(span);
+    }
+    if (head.detail) {
+      const detail = el("span", "trunc");
+      detail.style.color = "var(--color-text-secondary)";
+      detail.textContent = head.detail;
+      nodes.subident.append(detail);
+    }
+    nodes.controls.hidden = false;
+
+    const order = { block: 0, warn: 1, info: 2 };
+    const items = attention(data, rows).sort((a, b) => (order[a.tone] ?? 3) - (order[b.tone] ?? 3));
+    for (const item of items) {
+      const node = el("div", `rail__item rail__item--${item.tone}`);
+      node.append(el("div", "rail__label", item.label));
+      node.append(el("div", "rail__detail", item.detail));
+      nodes.rail.append(node);
+    }
+
+    const tabs = data.kind === "epic"
+      ? [["flow", "Overview", null], ["waves", "Waves", arr(at(data, "status.children")).length],
+         ["evidence", "Evidence", arr(data.reviews).length], ["workers", "Workers", arr(data.workers).length],
+         ["ledger", "Ledger", arr(at(data, "events.events")).length]]
+      : [["flow", "Flow", rows.length], ["timeline", "Timeline", null],
+         ["evidence", "Evidence", arr(at(data, "reviews.latestFindings")).length],
+         ["workers", "Workers", arr(at(data, "workers.sessions")).length],
+         ["ledger", "Ledger", arr(at(data, "events.events")).length]];
+    if (!tabs.some(([key]) => key === state.view)) state.view = "flow";
+
+    nodes.tabs.textContent = "";
+    nodes.tabs.hidden = false;
+    tabs.forEach(([key, label, count], index) => {
+      const tab = el("button", "tab");
+      tab.type = "button";
+      tab.setAttribute("role", "tab");
+      tab.setAttribute("aria-selected", String(state.view === key));
+      tab.tabIndex = state.view === key ? 0 : -1;
+      tab.append(document.createTextNode(label));
+      if (count) tab.append(el("span", "tab__n", count));
+      tab.addEventListener("click", () => { state.view = key; render(); });
+      tab.addEventListener("keydown", (event) => {
+        const delta = event.key === "ArrowRight" ? 1 : event.key === "ArrowLeft" ? -1 : 0;
+        if (!delta) return;
+        event.preventDefault();
+        state.view = tabs[(index + delta + tabs.length) % tabs.length][0];
+        render();
+        nodes.tabs.querySelector('[aria-selected="true"]')?.focus();
+      });
+      nodes.tabs.append(tab);
+    });
+
+    nodes.view.className = "view view--enter";
+    const panels = {
+      flow: () => viewFlow(data, rows),
+      timeline: () => viewTimeline(data, rows),
+      evidence: () => viewEvidence(data, rows),
+      workers: () => viewWorkers(data, rows),
+      waves: () => viewWaves(data),
+      ledger: () => viewLedger(data),
+    }[state.view];
+    for (const node of panels()) nodes.view.append(node);
+
+    // ResizeObserver covers layout changes, but a render that lands between
+    // observer ticks would leave the host sizing the frame to the previous
+    // view. Re-measure on the way out, and once more after fonts settle.
+    reportSize();
+    setTimeout(reportSize, 250);
+
+    const last = arr(at(data, "events.events")).slice(-1)[0];
+    nodes.foot.append(el("span", "", `schema ${data.schema}`));
+    if (last) nodes.foot.append(el("span", "", `last event ${last.eventId} · ${ago(last.ts)}`));
+    if (state.loading) nodes.foot.append(el("span", "", "refreshing…"));
+    pushModelContext(data, rows, head, items);
+  }
+
+  /** Keep the model's picture of the run current without a tool round-trip. */
+  let lastContext = "";
+  function pushModelContext(data, rows, head, items) {
+    if (!host.capabilities.updateModelContext) return;
+    const lines = [
+      `forged ${data.kind} ${data.id}: ${head.label}${head.detail ? ` (${head.detail})` : ""}`,
+    ];
+    for (const item of items.slice(0, 6)) lines.push(`- ${item.label}: ${item.detail}`);
+    if (rows.length) {
+      lines.push("seats:");
+      for (const row of rows) lines.push(`- ${row.seat} R${row.round} ${row.provider || ""} ${row.model || ""} → ${row.label}${Number.isFinite(row.durationMs) ? ` (${ms(row.durationMs)})` : ""}`);
+    }
+    const text = lines.join("\n").slice(0, 4000);
+    if (text === lastContext) return;
+    lastContext = text;
+    request("ui/update-model-context", { content: [{ type: "text", text }] }).catch(() => {});
+  }
+
+  // -------------------------------------------------------------- ingestion
+  function ingest(envelope) {
+    const value = envelope && typeof envelope === "object" ? envelope : null;
+    if (value && value.ok === false && value.error) {
+      state.error = value.error;
+      state.data = null;
+      render();
+      return;
+    }
+    const data = value?.result ?? value;
+    if (!data || data.schema !== "forged.overview/1") {
+      state.error = { code: "unexpected", message: "The host returned a payload this view does not know how to draw." };
+      state.data = null;
+      render();
+      return;
+    }
+    state.error = null;
+    state.data = data;
+    if (!state.args) {
+      state.args = { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
+    }
+    render();
+  }
+
+  function readToolResult(params) {
+    let value = params?.structuredContent;
+    if (!value) {
+      const text = arr(params?.content).find((block) => block.type === "text")?.text;
+      try { value = JSON.parse(text); } catch { value = null; }
+    }
+    if (value) ingest(value);
+  }
+
+  async function refresh() {
+    if (state.loading || !host.connected) return;
+    const args = state.args || (state.data
+      ? { schemaVersion: 1, params: state.data.kind === "epic" ? { epic: state.data.id } : { run: state.data.id } }
+      : null);
+    if (!args) return;
+    state.loading = true;
+    render();
+    try {
+      const result = await request("tools/call", { name: "overview", arguments: args });
+      readToolResult(result);
+    } catch (error) {
+      state.error = { code: "unreachable", message: String(error.message || error) };
+    } finally {
+      state.loading = false;
+      render();
+    }
+  }
+
+  function setPoll(seconds) {
+    state.pollSeconds = seconds;
+    if (state.pollTimer) clearInterval(state.pollTimer);
+    state.pollTimer = seconds ? setInterval(refresh, seconds * 1000) : null;
+  }
+
+  nodes.refresh.addEventListener("click", refresh);
+  nodes.poll.addEventListener("change", () => setPoll(Number(nodes.poll.value)));
+  nodes.expand.addEventListener("click", async () => {
+    const next = host.context.displayMode === "fullscreen" ? "inline" : "fullscreen";
+    try {
+      const result = await request("ui/request-display-mode", { mode: next });
+      applyContext({ displayMode: result?.mode || next });
+    } catch { /* the host may decline; the button simply does nothing */ }
+  });
+  document.addEventListener("visibilitychange", () => {
+    if (document.visibilityState === "visible" && state.pollSeconds) refresh();
+  });
+
+  // ---------------------------------------------------------- host context
+  function applyContext(context) {
+    if (!context) return;
+    host.context = { ...host.context, ...context };
+    if (context.theme) {
+      document.documentElement.setAttribute("data-theme", context.theme);
+      document.documentElement.style.colorScheme = context.theme;
+    }
+    const variables = context.styles?.variables;
+    if (variables) {
+      for (const [key, value] of Object.entries(variables)) {
+        if (value !== undefined && value !== null) document.documentElement.style.setProperty(key, value);
+      }
+    }
+    const fonts = context.styles?.css?.fonts;
+    if (fonts && !document.getElementById("__mcp-host-fonts")) {
+      const style = el("style");
+      style.id = "__mcp-host-fonts";
+      style.textContent = fonts;
+      document.head.append(style);
+    }
+    if (context.displayMode) {
+      document.documentElement.setAttribute("data-display", context.displayMode);
+      nodes.expand.textContent = context.displayMode === "fullscreen" ? "Collapse" : "Expand";
+    }
+    const modes = context.availableDisplayModes;
+    if (modes) nodes.expand.hidden = !modes.includes("fullscreen");
+  }
+
+  // The host sizes the iframe from this notification. Without it a dense view
+  // is silently clipped, which is what made the previous version unreadable.
+  let sizeQueued = false;
+  let lastW = 0;
+  let lastH = 0;
+  function reportSize() {
+    if (sizeQueued) return;
+    sizeQueued = true;
+    requestAnimationFrame(() => {
+      sizeQueued = false;
+      const root = document.documentElement;
+      const restore = root.style.height;
+      root.style.height = "max-content";
+      const height = Math.ceil(root.getBoundingClientRect().height);
+      root.style.height = restore;
+      const width = Math.ceil(window.innerWidth);
+      if (width === lastW && height === lastH) return;
+      lastW = width; lastH = height;
+      notify("ui/notifications/size-changed", { width, height });
+    });
+  }
+
+  // ---------------------------------------------------------- message loop
+  window.addEventListener("message", (event) => {
+    const message = event.data;
+    if (!message || message.jsonrpc !== "2.0") return;
+
+    if (message.id !== undefined && pending.has(message.id)) {
+      const entry = pending.get(message.id);
+      pending.delete(message.id);
+      if (message.error) entry.reject(new Error(message.error.message || "request failed"));
+      else entry.resolve(message.result);
+      return;
+    }
+
+    switch (message.method) {
+      case "ui/notifications/tool-input":
+        state.args = message.params?.arguments || state.args;
+        break;
+      case "ui/notifications/tool-result":
+        readToolResult(message.params);
+        break;
+      case "ui/notifications/tool-cancelled":
+        state.loading = false;
+        state.error = { code: "cancelled", message: message.params?.reason || "The host cancelled the call." };
+        render();
+        break;
+      case "ui/notifications/host-context-changed":
+        applyContext(message.params);
+        break;
+      case "ui/resource-teardown":
+        if (state.pollTimer) clearInterval(state.pollTimer);
+        if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} });
+        break;
+      default:
+        break;
+    }
+  });
+
+  request("ui/initialize", {
+    protocolVersion: PROTOCOL_VERSION,
+    appInfo: APP_INFO,
+    appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] },
+  }).then((result) => {
+    host.connected = true;
+    host.capabilities = result?.hostCapabilities || {};
+    notify("ui/notifications/initialized", {});
+    applyContext(result?.hostContext);
+    if (!host.capabilities.serverTools) {
+      nodes.refresh.disabled = true;
+      nodes.poll.disabled = true;
+      nodes.refresh.title = "This host does not proxy tool calls.";
+    }
+    reportSize();
+    const observer = new ResizeObserver(reportSize);
+    observer.observe(document.documentElement);
+    observer.observe(document.body);
+  }).catch(() => {
+    nodes.subident.textContent = "The host did not complete the MCP Apps handshake.";
+  });
+})();
+</script>
 </body>
 </html>

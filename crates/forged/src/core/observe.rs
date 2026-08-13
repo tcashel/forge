@@ -87,6 +87,32 @@ fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Vec<Value> {
         .collect()
 }
 
+/// Per-packet terminal attempt history. The projection already carries live
+/// attempts and the latest review findings; this carries what every settled
+/// attempt actually landed, which is the only place a seat's own verdict,
+/// summary, or failure note is readable without re-reading the ledger.
+fn packet_history(view: &forged_proto::RunView) -> Value {
+    view.terminal_attempts
+        .iter()
+        .map(|(packet_id, attempts)| {
+            let rows = attempts
+                .iter()
+                .map(|attempt| {
+                    json!({
+                        "attemptId": attempt.attempt_id,
+                        "state": attempt.state.as_str(),
+                        "outcome": attempt.outcome,
+                        "failNote": attempt.fail_note,
+                        "startedAt": attempt.started_at,
+                    })
+                })
+                .collect::<Vec<_>>();
+            (packet_id.clone(), Value::Array(rows))
+        })
+        .collect::<Map<String, Value>>()
+        .into()
+}
+
 async fn roster_revisions(ctx: &Ctx, run_id: &str) -> Result<Vec<Value>, Failure> {
     let run_id = run_id.to_owned();
     let rows = on_ledger(&ctx.ledger, move |ledger| {
@@ -134,6 +160,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
             "events": event_payloads(&all_events, |kind| kind == "proto.review"),
             "latestFindings": findings,
         },
+        "packetHistory": packet_history(&view),
         "artifacts": packet_artifacts(ctx, &view),
         "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
         "rosterRevisions": roster_revisions,
