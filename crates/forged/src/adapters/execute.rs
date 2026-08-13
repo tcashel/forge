@@ -684,10 +684,12 @@ async fn run_attempt(
         forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
     };
 
-    match harvest {
+    // 7. Settle. Every arm BINDS rather than returns, so the three settle
+    // paths share one exit and none of them can skip the release below.
+    let settled = match harvest {
         Harvest::Result(result) => {
-            // 7. Land through the seam that turns a stale-token refusal into
-            // a quarantine — never Ledger::complete_packet directly. The
+            // Land through the seam that turns a stale-token refusal into a
+            // quarantine — never Ledger::complete_packet directly. The
             // landing is itself a fenced HumanAmbiguous operation whose key
             // carries the attempt (an explicit key: attempts of one packet
             // must not replay each other's envelopes).
@@ -710,10 +712,18 @@ async fn run_attempt(
             on_ledger(&ctx.ledger, move |l| {
                 l.fail_packet(&packet_for_fail, &token, &fail_note)
             })
-            .await?;
-            Ok(PacketOutcome::Semantic(note))
+            .await
+            .map(|()| PacketOutcome::Semantic(note))
         }
-    }
+    };
+
+    // Release the seat's terminal, after the section-(d) order rather than
+    // inside it. Bookkeeping, never fencing: the attempt is settled either
+    // way, so this can neither fail it nor delay it. The revoked path above
+    // does NOT come here — its `kill_confirmed` already closed the pane as
+    // part of verified death.
+    host.release(&session).await;
+    settled
 }
 
 /// Land a harvested result under the fenced `packet_complete` operation.
