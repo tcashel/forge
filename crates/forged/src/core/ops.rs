@@ -4,9 +4,11 @@
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, RunState};
+use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, OperationState, RunState};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
-use forged_types::{ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket};
+use forged_types::{
+    request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
+};
 use serde_json::{json, Value};
 
 use crate::adapters::execute::sha256_file;
@@ -225,6 +227,47 @@ pub(crate) async fn run_start_with_definition(
     );
     if req.run_id.is_none() {
         req.run_id = Some(run_id.as_str().to_owned());
+    }
+    // Pre-policy binaries fenced run_start before packageSha256 joined the
+    // request. A terminal row with that exact legacy hash must replay its
+    // stored response verbatim; only new/current operations use the augmented
+    // request identity below.
+    let legacy_hash = match request_sha256(req) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+            )
+        }
+    };
+    let existing = {
+        let key = req.idempotency_key.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation("run_start", &key)
+        })
+        .await
+    };
+    match existing {
+        Ok(Some(row))
+            if row.state == OperationState::Terminal && row.request_sha256 == legacy_hash =>
+        {
+            return fenced(
+                ctx,
+                "run_start",
+                EffectClass::SafeRetry,
+                req,
+                None,
+                |_operation| async {
+                    Err(Failure::internal(
+                        "terminal legacy run_start replay unexpectedly executed",
+                    ))
+                },
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
     }
     req.params.insert(
         "packageSha256".to_owned(),

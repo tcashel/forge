@@ -260,6 +260,14 @@ fn default_stage_budget_s() -> HashMap<Stage, u64> {
     ])
 }
 
+fn resolve_stage_budget_s(overrides: Option<HashMap<Stage, u64>>) -> HashMap<Stage, u64> {
+    let mut budgets = default_stage_budget_s();
+    if let Some(overrides) = overrides {
+        budgets.extend(overrides);
+    }
+    budgets
+}
+
 const DEFAULT_TRANSPORT_RETRY_BUDGET: u32 = 3;
 
 fn anvil_home() -> PathBuf {
@@ -375,7 +383,7 @@ impl ForgedConfig {
                 .unwrap_or_else(|| "standard".to_owned()),
             default_roster: file.default_roster.unwrap_or_else(|| "default".to_owned()),
             gate_commands: file.gate_commands.unwrap_or_else(default_gate_commands),
-            stage_budget_s: file.stage_budget_s.unwrap_or_else(default_stage_budget_s),
+            stage_budget_s: resolve_stage_budget_s(file.stage_budget_s),
             transport_retry_budget: file
                 .transport_retry_budget
                 .unwrap_or(DEFAULT_TRANSPORT_RETRY_BUDGET),
@@ -1058,5 +1066,14 @@ mod tests {
         let stamp = now_iso();
         assert_eq!(stamp.len(), 30, "{stamp}");
         assert!(stamp.ends_with('Z'));
+    }
+
+    #[test]
+    fn partial_stage_budgets_overlay_the_legacy_defaults() {
+        let budgets = resolve_stage_budget_s(Some(HashMap::from([(Stage::Implement, 42)])));
+        assert_eq!(budgets[&Stage::Implement], 42);
+        for stage in [Stage::ReviewClaude, Stage::ReviewCodex, Stage::Fix] {
+            assert_eq!(budgets[&stage], 1800, "missing {stage:?} keeps its default");
+        }
     }
 }

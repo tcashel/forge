@@ -1326,6 +1326,71 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
 }
 
 #[test]
+fn pre_upgrade_run_start_operation_replays_with_its_legacy_request_hash() {
+    let env = TestEnv::new("forged-legacy-run-start-replay");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let args = [
+        "run",
+        "start",
+        "--bead",
+        "legacy-start-replay",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ];
+    let (code, started) = env.forged(&args);
+    assert_eq!(code, 0, "start: {started}");
+
+    // Recreate the exact pre-upgrade request identity in both durable seams:
+    // the operation hash and its recoverable proto.operation.request event.
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open legacy operation fixture");
+    let (event_id, payload_json): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 \
+             AND kind = 'proto.operation.request'",
+            ["legacy-start-replay"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("run-start request event");
+    let mut payload: Value = serde_json::from_str(&payload_json).expect("request event JSON");
+    payload["request"]["params"]
+        .as_object_mut()
+        .expect("request params")
+        .remove("packageSha256");
+    let legacy_request: forged_types::OperationRequest =
+        serde_json::from_value(payload["request"].clone()).expect("legacy request");
+    let legacy_hash = forged_types::request_sha256(&legacy_request).expect("legacy request hash");
+    connection
+        .execute(
+            "UPDATE operations SET request_sha256 = ?1 \
+             WHERE name = 'run_start' AND idempotency_key = ?2",
+            rusqlite::params![legacy_hash, legacy_request.idempotency_key],
+        )
+        .expect("install legacy operation hash");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("legacy request event"),
+                event_id
+            ],
+        )
+        .expect("install legacy request event");
+    drop(connection);
+
+    let (code, replayed) = env.forged(&args);
+    assert_eq!(code, 0, "legacy terminal operation replays: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(replayed["result"], started["result"]);
+}
+
+#[test]
 fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
     let env = TestEnv::new("forged-legacy-epic-package");
     env.seed_epic(
