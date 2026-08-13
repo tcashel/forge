@@ -68,6 +68,32 @@ pub fn sha256_file(path: &Path) -> Result<String, Failure> {
     Ok(hex)
 }
 
+/// The herdr workspace forged places this run's seats in: `forged-<repo>`,
+/// where `<repo>` is the final component of the run's repo path.
+///
+/// The `forged-` prefix is the contract, not decoration. Operators label
+/// their own herdr workspaces after the projects they work in, so a bare repo
+/// name would resolve to the very workspace the run is being led FROM and
+/// split the panes in use there. Only a workspace inside this namespace is
+/// ever targeted.
+///
+/// `None` whenever the repo path names nothing usable, which leaves placement
+/// untargeted rather than failing the spawn.
+pub fn workspace_label_for_repo(repo: &str) -> Option<String> {
+    let name = Path::new(repo).file_name()?.to_str()?;
+    (!name.is_empty()).then(|| format!("forged-{name}"))
+}
+
+/// [`workspace_label_for_repo`] for a run whose repo must be read from the
+/// ledger. `None` also when the run row cannot be read.
+async fn workspace_label(ctx: &Ctx, run_id: &str) -> Option<String> {
+    let run_id = run_id.to_owned();
+    let run = on_ledger(&ctx.ledger, move |l| l.get_run(&run_id))
+        .await
+        .ok()?;
+    workspace_label_for_repo(&run.repo)
+}
+
 /// Fill every `WorkPacket` field the intent does not carry.
 pub fn build_packet(
     ctx: &Ctx,
@@ -457,7 +483,10 @@ async fn run_attempt(
                 }
                 Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
                     Ok(herdr) => (
-                        Arc::new(herdr),
+                        Arc::new(match workspace_label(ctx, &run_id).await {
+                            Some(label) => herdr.with_workspace(label),
+                            None => herdr,
+                        }),
                         "herdr",
                         Some(sock.to_string_lossy().into_owned()),
                     ),
@@ -817,4 +846,57 @@ async fn fail_and_grant_retry(
         .await?;
     }
     Ok(PacketOutcome::Transport(note))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::workspace_label_for_repo;
+
+    #[test]
+    fn the_label_namespaces_the_repo_name_under_forged() {
+        assert_eq!(
+            workspace_label_for_repo("/Users/x/repositories/forge").as_deref(),
+            Some("forged-forge")
+        );
+        assert_eq!(
+            workspace_label_for_repo("/Users/x/repositories/drover").as_deref(),
+            Some("forged-drover")
+        );
+    }
+
+    #[test]
+    fn the_label_never_collides_with_the_operators_own_workspace() {
+        // The whole point: an operator labels their workspace after the
+        // project (`forge`), leads the run from it, and forged must NOT
+        // target it. Every derived label is prefixed, so no repo name can
+        // ever produce the bare name the operator uses.
+        for repo in [
+            "/Users/x/repositories/forge",
+            "/Users/x/drover",
+            "/forged-forge",
+            "relative/path/anvil",
+        ] {
+            let label = workspace_label_for_repo(repo).expect("a label");
+            assert!(
+                label.starts_with("forged-"),
+                "{repo} produced an unprefixed label {label}"
+            );
+            assert_ne!(
+                label,
+                std::path::Path::new(repo)
+                    .file_name()
+                    .expect("a name")
+                    .to_string_lossy(),
+                "{repo} produced the operator's own workspace name"
+            );
+        }
+    }
+
+    #[test]
+    fn a_repo_path_naming_nothing_leaves_placement_untargeted() {
+        // `None` degrades to an untargeted split rather than failing a spawn.
+        assert_eq!(workspace_label_for_repo("/"), None);
+        assert_eq!(workspace_label_for_repo(""), None);
+        assert_eq!(workspace_label_for_repo(".."), None);
+    }
 }

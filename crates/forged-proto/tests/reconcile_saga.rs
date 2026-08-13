@@ -9,7 +9,9 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun};
-use forged_proto::{land_packet_result, reconcile, widen_rfc3339, LandOutcome, ReconcileConfig};
+use forged_proto::{
+    land_packet_result, reconcile, widen_rfc3339, LandOutcome, LeaseReclaim, ReconcileConfig,
+};
 use forged_types::{RunId, Stage};
 use support::*;
 
@@ -274,5 +276,52 @@ async fn crash_resume_completes_the_saga_from_the_revoking_marker() {
     assert!(calls
         .iter()
         .any(|c| matches!(c, PortCall::KillConfirmed { .. })));
+    ledger.close().expect("close");
+}
+
+#[tokio::test]
+async fn an_already_released_lease_completes_the_saga_instead_of_deferring() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let pid = seed_run(&ledger);
+    let claim = ledger
+        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .expect("claim");
+    ledger
+        .revoke_attempt(claim.attempt_id, "operator stop")
+        .expect("revoke");
+
+    // bd reports a scoped reclaim that took the lease from NOBODY — the
+    // shape returned when the lease is already gone: its TTL expired, an
+    // operator reclaimed it by hand, or an earlier pass took it before
+    // crashing. Death is confirmed by step 2 either way, so "process dead,
+    // lease unheld" is the goal state and the saga must finish.
+    let ports = FakePorts::new();
+    ports
+        .reclaim_script
+        .lock()
+        .expect("lock")
+        .push_back(LeaseReclaim {
+            scoped: true,
+            previous_owner: None,
+        });
+
+    let report = reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
+        .await
+        .expect("reconcile");
+    assert_eq!(
+        report.reclaimed,
+        vec![claim.attempt_id],
+        "an absent lease is the goal state, not a refusal"
+    );
+    assert!(
+        report.deferred.is_empty(),
+        "deferring here strands the attempt in revoking forever: no later \
+         pass can make an absent lease reappear"
+    );
+    assert_eq!(
+        ledger.get_attempt(claim.attempt_id).expect("get").state,
+        AttemptState::Reclaimed
+    );
     ledger.close().expect("close");
 }

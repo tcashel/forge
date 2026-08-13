@@ -312,12 +312,24 @@ async fn revoke_order(
         .reclaim_lease(&run.bead_id, &attempt.claimant, older_than_s)
         .await
         .map_err(|source| port_failure(attempt_id, "reclaim_lease", source))?;
-    let scoped_to_holder =
-        outcome.scoped && outcome.previous_owner.as_deref() == Some(attempt.claimant.as_str());
+    // A scoped reclaim that reports NO previous owner is the goal state, not
+    // a refusal: bd verified the lease is held by nobody. Reaching step 4
+    // from here is safe because step 2 already confirmed this attempt's
+    // death — the pair "process dead, lease unheld" is exactly what the
+    // reclaim exists to establish, however it came to be true (an expired
+    // TTL, an operator's own `bd reclaim`, a partially-completed earlier
+    // pass). Treating it as a refusal instead strands the attempt in
+    // `revoking` forever, because no later pass can make an absent lease
+    // reappear for this holder to reclaim.
+    let scoped_to_holder = outcome.scoped
+        && match outcome.previous_owner.as_deref() {
+            None => true,
+            Some(owner) => owner == attempt.claimant.as_str(),
+        };
     if !scoped_to_holder {
-        // A refusal shape (empty, unscoped, or another owner) is not an
-        // error. A racing reconciler may already have finished the saga;
-        // otherwise leave the durable `revoking` marker for the next pass.
+        // A refusal shape (unscoped, or another owner) is not an error. A
+        // racing reconciler may already have finished the saga; otherwise
+        // leave the durable `revoking` marker for the next pass.
         let current = get_attempt(ledger, attempt_id).await?;
         if current.state == AttemptState::Reclaimed {
             report.reclaimed.push(attempt_id);
