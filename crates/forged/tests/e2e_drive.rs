@@ -179,6 +179,46 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         "every row names the attempt that spent it: {rows:?}"
     );
 
+    // The epic carries the same usage shape a slice does: per-seat rows,
+    // stamped with the child that spent them, and the rate card behind
+    // them. Its totals stay the sum across children.
+    let epic_usage = &overview["result"]["usage"];
+    let epic_rows = epic_usage["rows"].as_array().expect("epic usage rows");
+    assert_eq!(
+        epic_rows.len(),
+        rows.len(),
+        "the epic hoists its children's rows: {epic_usage}"
+    );
+    assert!(
+        epic_rows
+            .iter()
+            .all(|row| row["runId"] == json!("child-one")),
+        "every hoisted row names the child run it came from: {epic_rows:?}"
+    );
+    assert!(
+        epic_usage["pricing"]["ratesAsOf"].is_string(),
+        "the epic reports the rate card its children read: {epic_usage}"
+    );
+    assert_eq!(
+        epic_usage["totals"]["outputTokens"].as_f64(),
+        totals["outputTokens"].as_f64(),
+        "hoisting rows left the totals alone: {epic_usage}"
+    );
+
+    // A codex seat is priced from the operator's rate card, never billed by
+    // the provider. The App's spend header calls an epic "provider-billed"
+    // exactly when no hoisted row is imputed, so that row has to survive the
+    // hoist with its cost intact.
+    let imputed: f64 = epic_rows
+        .iter()
+        .filter(|row| row["pricingBasis"] == json!("imputed_api_rate"))
+        .filter_map(|row| row["costUsd"].as_f64())
+        .sum();
+    assert!(
+        imputed > 0.0,
+        "an epic whose child ran a codex seat does not read as fully billed: {epic_rows:?}"
+    );
+
     let gh = env.gh_calls();
     assert!(gh.iter().any(|args| args.starts_with(&[
         "pr".to_owned(),
