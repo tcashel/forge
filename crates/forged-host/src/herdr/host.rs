@@ -294,8 +294,11 @@ impl HerdrHost {
         }
     }
 
-    /// Best-effort `pane.close`, ignoring the result entirely — used only
-    /// for rollback after a partially failed spawn.
+    /// Best-effort `pane.close`, ignoring the result entirely — rollback
+    /// after a partially failed spawn, and release of a settled session.
+    /// Every error response is equally uninteresting here: pane-not-found is
+    /// the goal state already reached (ids are never reused), and anything
+    /// else leaves a pane whose fate no caller of this helper depends on.
     async fn best_effort_close(&self, pane_id: &str) {
         let _ = self
             .conn
@@ -562,6 +565,14 @@ impl SessionHost for HerdrHost {
             return Ok(Confirmed::Killed);
         }
         Err(HostError::KillVerifyTimeout)
+    }
+
+    /// Close the pane once and forget the session. Deliberately NOT
+    /// `kill_confirmed`'s close: no probe, no verification, no re-check
+    /// budget — settling an attempt must never wait on herdr answering.
+    async fn release(&self, id: &HostSessionId) {
+        self.best_effort_close(id.as_str()).await;
+        self.sessions.lock().expect("sessions lock").remove(id);
     }
 
     fn attach_hint(&self, id: &HostSessionId) -> Option<String> {

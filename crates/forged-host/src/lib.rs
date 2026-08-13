@@ -165,6 +165,16 @@ pub trait SessionHost: Send + Sync {
     /// Kill the session and VERIFY death before reporting success.
     async fn kill_confirmed(&self, id: &HostSessionId) -> Result<Confirmed, HostError>;
 
+    /// Give up the terminal of a session that has ALREADY SETTLED.
+    ///
+    /// This is not a kill and never a fence: it verifies nothing, gates no
+    /// external effect, and returns `()` precisely so no failure of it can
+    /// reach a caller that has already settled an attempt. A backend with
+    /// nothing to give up does nothing. Callers that need verified death
+    /// call [`SessionHost::kill_confirmed`] instead, which releases the
+    /// terminal itself — the two are never issued for the same session.
+    async fn release(&self, id: &HostSessionId);
+
     /// A stable locator string a UI can render to attach to the session, if
     /// the backend has one. Non-blocking; no I/O.
     fn attach_hint(&self, id: &HostSessionId) -> Option<String>;

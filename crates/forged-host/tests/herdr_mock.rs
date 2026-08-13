@@ -564,6 +564,87 @@ async fn bare_close_acknowledgement_is_never_confirmation() {
 }
 
 // ---------------------------------------------------------------------------
+// Release: a settled seat gives its pane back, and cannot fail doing so.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn release_closes_the_spawned_pane_and_forgets_the_session() {
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    // The line finished on its own: the sentinel is the settle signal.
+    std::fs::write(only_status_path(base.path()), "0\n").expect("write sentinel");
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
+
+    host.release(&id).await;
+
+    // Exactly one close, aimed at the pane this host spawned, with no probe
+    // or verification traffic around it.
+    assert_eq!(
+        mock.methods(),
+        vec![
+            "ping",
+            "events.subscribe",
+            "pane.split",
+            "pane.process_info",
+            "pane.send_input",
+            "pane.close",
+        ]
+    );
+    assert_eq!(
+        mock.params_of("pane.close"),
+        json!({"pane_id": TEST_PANE_ID})
+    );
+    // The session is gone from the host's map, so it holds nothing for it.
+    assert_eq!(host.attach_hint(&id), None);
+}
+
+#[tokio::test]
+async fn release_of_a_refused_or_forgotten_pane_is_silent() {
+    // First release: herdr refuses the close outright. Second: it answers
+    // pane-not-found, which is proof the goal state already holds. Neither
+    // may surface anything a settled attempt could trip over.
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.close", 1) => vec![Action::RespondErr {
+                code: "INTERNAL",
+                message: "close refused",
+            }],
+            ("pane.close", 2) => vec![PANE_NOT_FOUND],
+            ("pane.close", _) => vec![Action::Hangup],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    std::fs::write(only_status_path(base.path()), "0\n").expect("write sentinel");
+
+    // `release` returns `()`: the refusal has nowhere to go, by construction.
+    host.release(&id).await;
+    // Repeat over a forgotten pane, and again over a dropped connection.
+    host.release(&id).await;
+    host.release(&id).await;
+
+    assert_eq!(
+        mock.methods().iter().filter(|m| *m == "pane.close").count(),
+        3
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Placement: seats land in a forged-owned workspace, never the focused one.
 // ---------------------------------------------------------------------------
 
