@@ -199,11 +199,35 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         epic_usage["pricing"]["ratesAsOf"].is_string(),
         "the epic reports the rate card its children read: {epic_usage}"
     );
+    // Totals are the sum across children and this epic has exactly one, so
+    // every field must survive hoisting identically — not just the one a spot
+    // check would notice. Comparing the key SET as well as each value is what
+    // catches a field silently dropped from the sum: an assertion naming only
+    // `outputTokens` passes while the other five are mangled.
+    let epic_totals = epic_usage["totals"]
+        .as_object()
+        .expect("the epic reports totals");
+    let child_totals = totals.as_object().expect("the child reports totals");
+    let mut epic_keys: Vec<&String> = epic_totals.keys().collect();
+    let mut child_keys: Vec<&String> = child_totals.keys().collect();
+    epic_keys.sort();
+    child_keys.sort();
     assert_eq!(
-        epic_usage["totals"]["outputTokens"].as_f64(),
-        totals["outputTokens"].as_f64(),
-        "hoisting rows left the totals alone: {epic_usage}"
+        epic_keys, child_keys,
+        "the epic reports the same totals shape a slice does: {epic_usage}"
     );
+    for (key, child_value) in child_totals {
+        let epic_value = epic_totals.get(key).and_then(Value::as_f64);
+        assert!(
+            epic_value.is_some(),
+            "the epic total {key} is numeric: {epic_usage}"
+        );
+        assert_eq!(
+            epic_value,
+            child_value.as_f64(),
+            "hoisting rows left {key} alone: {epic_usage}"
+        );
+    }
 
     // A codex seat is priced from the operator's rate card, never billed by
     // the provider. Rendered through the App's own Cost tab — this real

@@ -187,12 +187,18 @@ fn totals(value: &Value) -> BTreeMap<&'static str, f64> {
 
 /// Fold one child's usage report into the epic's.
 ///
-/// Rows pass through verbatim but for the `runId` stamp: a row names the
-/// packet and attempt that spent it, never the child run, and an epic's rows
-/// come from several. `pricing` is the one operator rate card every child
-/// reads, so the first block supplied stands for the epic; a child that
-/// disagrees (an older `ratesAsOf`) is a divergence to report, never a
-/// reason to fail the projection.
+/// Rows pass through verbatim under an idempotent `runId` stamp. A row
+/// already carries the run that spent it (`usage_row_json`), and for a child's
+/// own rows the stamp rewrites that field with the value it already held; it
+/// is applied unconditionally so a row reaching the epic by any other path
+/// still names its child, which is what the App's by-seat table labels from.
+///
+/// `pricing` is the one operator rate card every child reads, so the FIRST
+/// block supplied stands for the whole epic and later children are ignored —
+/// including a child whose `ratesAsOf` disagrees. That divergence is not
+/// surfaced anywhere today; it is deliberately not a reason to fail the
+/// projection, and a caller needing to detect it must compare the children's
+/// own blocks.
 fn absorb_usage(
     overview: &Value,
     run_id: &str,
