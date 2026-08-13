@@ -1003,6 +1003,16 @@ fn usage_row_json(row: &forged_ledger::UsageRecord) -> Value {
     })
 }
 
+/// The operator's rate card, as every usage report states it. One card is
+/// read per process, so a run and the epic above it report the same block.
+pub(crate) fn pricing_json(config: &crate::config::ForgedConfig) -> Value {
+    json!({
+        "ratesAsOf": config.pricing.rates_as_of,
+        "source": config.pricing.source,
+        "webSearchPer1k": config.pricing.tools.web_search_per_1k,
+    })
+}
+
 /// Bare `usage` — the read-only summary report.
 ///
 /// Totals say what a run cost; `rows` say which seat spent it. The row list
@@ -1046,11 +1056,7 @@ pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
         Ok(json!({
             "rows": rows,
             "totals": totals_json(&totals),
-            "pricing": {
-                "ratesAsOf": ctx.config.pricing.rates_as_of,
-                "source": ctx.config.pricing.source,
-                "webSearchPer1k": ctx.config.pricing.tools.web_search_per_1k,
-            },
+            "pricing": pricing_json(&ctx.config),
         }))
     })
     .await

@@ -1147,6 +1147,98 @@ pub fn assert_no_overlap_after_kills(log: &[String], packet_id: &str, killed_pid
     }
 }
 
+// ------------------------------------------------------- App render harness
+
+/// The App's Cost tab as an operator reads it: every rendered node that
+/// carries text, in document order, plus those texts joined by newlines.
+pub struct RenderedCost {
+    pub nodes: Vec<Value>,
+    pub text: String,
+}
+
+impl RenderedCost {
+    /// The spend header's cost subtitle — the line that either splits billed
+    /// from imputed spend or claims the provider billed all of it.
+    pub fn spend_subtitle(&self) -> String {
+        let cost = self
+            .nodes
+            .iter()
+            .position(|node| node["class"] == json!("spend__k") && node["text"] == json!("cost"))
+            .expect("the spend header renders a cost stat");
+        self.nodes
+            .get(cost + 1)
+            .filter(|node| node["class"] == json!("spend__sub"))
+            .and_then(|node| node["text"].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    }
+
+    /// The value under one `spend__k` key, e.g. `"priced attempts"`.
+    pub fn stat(&self, key: &str) -> String {
+        let at = self
+            .nodes
+            .iter()
+            .position(|node| node["class"] == json!("spend__k") && node["text"] == json!(key));
+        at.and_then(|at| at.checked_sub(1))
+            .and_then(|at| self.nodes.get(at))
+            .and_then(|node| node["text"].as_str())
+            .unwrap_or_default()
+            .to_owned()
+    }
+}
+
+/// Resolve a `node` able to run the render harness, or SKIP loudly.
+///
+/// The Cost tab lives in `assets/overview.html`, which ships no JS
+/// toolchain and no module boundary; the harness lifts `viewCost` out of it
+/// and runs it against a DOM shim. Without a node on PATH the App's own
+/// render cannot be exercised, so the test says so rather than passing on a
+/// re-implementation of the same arithmetic.
+pub fn require_node() -> Option<String> {
+    let ok = Command::new("node")
+        .arg("--version")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .is_ok_and(|status| status.success());
+    if ok {
+        return Some("node".to_owned());
+    }
+    eprintln!("SKIP: no `node` on PATH; the App render-level test was not run");
+    None
+}
+
+/// Render `data`'s Cost tab through `assets/overview.html` itself.
+pub fn render_cost(node: &str, data: &Value) -> RenderedCost {
+    let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/render_cost.mjs");
+    let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/overview.html");
+    let mut child = Command::new(node)
+        .args([harness, asset])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the render harness");
+    child
+        .stdin
+        .take()
+        .expect("harness stdin")
+        .write_all(data.to_string().as_bytes())
+        .expect("write the projection to the harness");
+    let out = child.wait_with_output().expect("render harness output");
+    assert!(
+        out.status.success(),
+        "the App render harness failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let rendered: Value =
+        serde_json::from_slice(&out.stdout).expect("the harness prints one JSON object");
+    RenderedCost {
+        nodes: rendered["nodes"].as_array().cloned().unwrap_or_default(),
+        text: rendered["text"].as_str().unwrap_or_default().to_owned(),
+    }
+}
+
 // ------------------------------------------------------------- MCP client
 
 /// A minimal MCP stdio client speaking newline-delimited JSON-RPC to a

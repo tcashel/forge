@@ -185,6 +185,48 @@ fn totals(value: &Value) -> BTreeMap<&'static str, f64> {
     out
 }
 
+/// Fold one child's usage report into the epic's.
+///
+/// Rows pass through verbatim under an idempotent `runId` stamp. A row
+/// already carries the run that spent it (`usage_row_json`), and for a child's
+/// own rows the stamp rewrites that field with the value it already held; it
+/// is applied unconditionally so a row reaching the epic by any other path
+/// still names its child, which is what the App's by-seat table labels from.
+///
+/// `pricing` is the one operator rate card every child reads, so the FIRST
+/// block supplied stands for the whole epic and later children are ignored —
+/// including a child whose `ratesAsOf` disagrees. That divergence is not
+/// surfaced anywhere today; it is deliberately not a reason to fail the
+/// projection, and a caller needing to detect it must compare the children's
+/// own blocks.
+fn absorb_usage(
+    overview: &Value,
+    run_id: &str,
+    rows: &mut Vec<Value>,
+    pricing: &mut Option<Value>,
+) {
+    rows.extend(
+        overview
+            .pointer("/usage/rows")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .map(|row| {
+                let mut row = row.clone();
+                if let Some(object) = row.as_object_mut() {
+                    object.insert("runId".to_owned(), json!(run_id));
+                }
+                row
+            }),
+    );
+    if pricing.is_none() {
+        *pricing = overview
+            .pointer("/usage/pricing")
+            .filter(|block| !block.is_null())
+            .cloned();
+    }
+}
+
 async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Result<Value, Failure> {
     let status =
         result(super::epic::epic_status(ctx, &request(epic_id, json!({"epic": epic_id}))).await)?;
@@ -197,6 +239,8 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     let mut artifacts = Vec::new();
     let mut interventions = Vec::new();
     let mut usage = BTreeMap::<&'static str, f64>::new();
+    let mut usage_rows = Vec::new();
+    let mut usage_pricing = None;
     for child in status
         .get("children")
         .and_then(Value::as_array)
@@ -251,6 +295,7 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
                 for (key, value) in totals(&overview) {
                     *usage.entry(key).or_default() += value;
                 }
+                absorb_usage(&overview, run_id, &mut usage_rows, &mut usage_pricing);
                 overview.as_object_mut().map(|value| value.remove("events"));
                 child_runs.push(overview);
             }
@@ -274,7 +319,13 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         "artifacts": artifacts,
         "interventions": interventions,
         "schedulerEvents": event_payloads(&all_events, |kind| kind.starts_with("forged.epic.")),
-        "usage": {"totals": usage},
+        "usage": {
+            "rows": usage_rows,
+            "totals": usage,
+            // An epic with no children that reported usage still states the
+            // card its spend would be priced against: absent usage is data.
+            "pricing": usage_pricing.unwrap_or_else(|| super::ops::pricing_json(&ctx.config)),
+        },
         "events": event_page,
         "inputRequired": status.get("inputRequired"),
         "paused": status.get("paused"),
@@ -312,4 +363,116 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         }
     })
     .await
+}
+
+#[cfg(test)]
+mod usage_tests {
+    use serde_json::{json, Value};
+
+    use super::absorb_usage;
+
+    fn child(run_id: &str, basis: &str, cost: f64, rates_as_of: &str) -> Value {
+        json!({
+            "kind": "slice",
+            "id": run_id,
+            "usage": {
+                "rows": [{
+                    "runId": run_id,
+                    "packetId": format!("{run_id}/implementation/0"),
+                    "attemptId": 1,
+                    "provider": "codex",
+                    "model": "gpt-5.6-sol",
+                    "costUsd": cost,
+                    "pricingBasis": basis,
+                    "webSearchRequests": 2,
+                }],
+                "totals": {"costUsdKnown": cost},
+                "pricing": {
+                    "ratesAsOf": rates_as_of,
+                    "source": "operator rate card",
+                    "webSearchPer1k": 10.0,
+                },
+            },
+        })
+    }
+
+    #[test]
+    fn hoisted_rows_carry_their_child_run_and_are_otherwise_verbatim() {
+        let mut rows = Vec::new();
+        let mut pricing = None;
+        absorb_usage(
+            &child("child-one", "billed", 0.25, "2026-05-01"),
+            "child-one",
+            &mut rows,
+            &mut pricing,
+        );
+        absorb_usage(
+            &child("child-two", "billed", 0.50, "2026-05-01"),
+            "child-two",
+            &mut rows,
+            &mut pricing,
+        );
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0]["runId"], json!("child-one"));
+        assert_eq!(rows[1]["runId"], json!("child-two"));
+        assert_eq!(rows[1]["packetId"], json!("child-two/implementation/0"));
+        assert_eq!(rows[1]["webSearchRequests"], json!(2));
+    }
+
+    #[test]
+    fn diverging_rate_cards_report_the_first_child_and_do_not_fail() {
+        let mut rows = Vec::new();
+        let mut pricing = None;
+        absorb_usage(
+            &child("child-one", "billed", 0.25, "2026-05-01"),
+            "child-one",
+            &mut rows,
+            &mut pricing,
+        );
+        absorb_usage(
+            &child("child-two", "billed", 0.50, "2026-01-01"),
+            "child-two",
+            &mut rows,
+            &mut pricing,
+        );
+        assert_eq!(pricing.expect("pricing")["ratesAsOf"], json!("2026-05-01"));
+    }
+
+    #[test]
+    fn a_failed_child_contributes_no_rows_and_no_pricing() {
+        let mut rows = Vec::new();
+        let mut pricing = None;
+        absorb_usage(
+            &json!({"kind": "slice", "id": "child-one", "error": {"code": "internal"}}),
+            "child-one",
+            &mut rows,
+            &mut pricing,
+        );
+        assert!(rows.is_empty());
+        assert!(pricing.is_none());
+    }
+
+    /// The App's spend header calls an epic "provider-billed" exactly when
+    /// no hoisted row is imputed; a codex child priced from the rate card
+    /// must therefore reach it as an `imputed_api_rate` row with a cost.
+    #[test]
+    fn an_imputed_child_row_keeps_the_epic_from_reading_as_fully_billed() {
+        let mut rows = Vec::new();
+        let mut pricing = None;
+        absorb_usage(
+            &child("child-one", "imputed_api_rate", 0.25, "2026-05-01"),
+            "child-one",
+            &mut rows,
+            &mut pricing,
+        );
+        let imputed: f64 = rows
+            .iter()
+            .filter(|row| row["pricingBasis"] == json!("imputed_api_rate"))
+            .filter_map(|row| row["costUsd"].as_f64())
+            .sum();
+        assert!(
+            imputed > 0.0,
+            "imputed spend is visible on the epic: {rows:?}"
+        );
+    }
 }

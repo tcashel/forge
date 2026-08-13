@@ -1495,7 +1495,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     if (!usageRows.length) {
       const box = panel("By seat", "");
       box.flush().append(el("div", "empty", data.kind === "epic"
-        ? "Per-seat rows live on each child run."
+        ? "No usage recorded on any child run."
         : "No usage recorded. `forged usage ingest --run " + (data.id || "<run>")
           + "` backfills a run that settled before capture."));
       out.push(box);
@@ -1530,10 +1530,16 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     table.append(thead);
     const tbody = el("tbody");
     for (const row of usageRows) {
-      const seat = seatFor.get(row.packetId);
+      // An epic's rows come from its children, so `seatFor` — built from
+      // this run's own packets — never holds them. The packet id names the
+      // seat either way; the run stamped on the row says whose it was.
+      const seat = seatFor.get(row.packetId) || (row.packetId ? seatOf(row.packetId) : null);
       const tr = el("tr");
       const who = el("td");
-      who.append(el("div", "", seat ? seat.seat + " · R" + seat.round : (row.packetId || "—")));
+      who.append(el("div", "", seat ? seat.seat + " · R" + seat.round : "—"));
+      if (row.runId && row.runId !== data.id) {
+        who.append(el("div", "basis", row.runId));
+      }
       if (superseded.has(row)) {
         who.append(el("div", "basis basis--imputed", "superseded · rework"));
       }
