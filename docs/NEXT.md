@@ -109,9 +109,30 @@ forged events --run <id> --limit 200
 ```
 
 The overview aggregates status/topology, controller and provider sessions,
-Herdr attach state, gates, findings, artifacts, interventions, roster
-revisions, usage, and events. The MCP `overview` tool returns the identical
-structured projection and renders it through `ui://forged/overview.html`.
+Herdr attach state, gates, findings, per-packet attempt history with the
+outcome each seat landed, artifacts, interventions, roster revisions, usage,
+and events. The MCP `overview` tool returns the identical structured
+projection and renders it through `ui://forged/overview.html`.
+
+That MCP App draws one projection five ways, and never invents a state the
+ledger did not record:
+
+| View | What it answers |
+| --- | --- |
+| Flow | Where every seat stands. A seats × rounds matrix — rows are the profile's seats, columns are protocol rounds — with each cell carrying its provider/model, verdict, and a duration bar scaled to the run's longest attempt. |
+| Timeline | Where the wall clock went. Attempt spans reconstructed from `attempt.state`, with gate, PR, and escalation milestones ticked above them. |
+| Evidence | What the reviewers actually said. Findings carried into the fix round, or every seat's own list; each seat's report; gate rows with exit codes; artifact paths. |
+| Workers | What to attach to. Sessions with claimants and copyable Herdr attach hints, the controller row, queued interventions, roster revisions. |
+| Ledger | The raw event stream, filterable by kind and payload text, with payloads on demand. |
+
+Epics swap Flow's matrix for a **Waves** board: every frozen child bead by
+wave, with its bd status, run, merge state, and the child that is holding
+for input.
+
+Above every view sits an attention rail that fires only on things that need
+the operator — a terminal block verdict, a failed attempt and its note, a
+gate that did not pass, host fallback off Herdr, reviewer dissent, a
+controller that died with work outstanding — ordered blockers first.
 
 For a Herdr-backed attempt:
 

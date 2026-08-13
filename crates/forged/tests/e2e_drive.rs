@@ -145,6 +145,24 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert!(!overview["result"]["gates"].as_array().unwrap().is_empty());
     assert!(overview["result"]["cursor"].as_i64().is_some());
 
+    // packetHistory carries what every settled attempt landed — the only
+    // place a seat's own verdict or failure note is readable without
+    // re-reading the ledger.
+    let history = overview["result"]["childRuns"][0]["packetHistory"]
+        .as_object()
+        .expect("child run packet history");
+    assert!(!history.is_empty(), "settled packets: {overview}");
+    let implement = history
+        .iter()
+        .find(|(packet_id, _)| packet_id.contains("implement"))
+        .map(|(_, attempts)| attempts)
+        .expect("an implement packet settled");
+    assert_eq!(implement[0]["state"], json!("completed"));
+    assert!(
+        implement[0]["outcome"]["implement"]["implemented"].is_boolean(),
+        "the landed outcome is projected verbatim: {implement}"
+    );
+
     let gh = env.gh_calls();
     assert!(gh.iter().any(|args| args.starts_with(&[
         "pr".to_owned(),
