@@ -10,6 +10,8 @@
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::{internal, LedgerError};
+use crate::ledger::Ledger;
+use crate::time::now_iso;
 
 /// How long a connection waits on a lock before erroring, in milliseconds.
 pub(crate) const BUSY_TIMEOUT_MS: i64 = 5000;
@@ -143,8 +145,25 @@ CREATE UNIQUE INDEX roster_revision_operation
   ON roster_revisions(operation_id) WHERE operation_id IS NOT NULL;
 ";
 
+/// Migration 004: append-only overlays for execution packages written before
+/// policy became part of the hashed package schema.
+const MIGRATION_004: &str = "
+CREATE TABLE run_package_migrations (
+  run_id                 TEXT PRIMARY KEY REFERENCES run_definitions(run_id),
+  previous_package_sha256 TEXT NOT NULL,
+  package_sha256         TEXT NOT NULL,
+  package_json           TEXT NOT NULL,
+  created_at             TEXT NOT NULL
+);
+CREATE TABLE runtime_migrations (
+  name         TEXT PRIMARY KEY,
+  completed_at TEXT NOT NULL
+);
+CREATE INDEX events_kind_run ON events(kind, run_id, event_id);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
-const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003];
+const MIGRATIONS: &[&str] = &[MIGRATION_001, MIGRATION_002, MIGRATION_003, MIGRATION_004];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
 pub(crate) fn configure_connection(conn: &mut Connection) -> Result<(), LedgerError> {
@@ -217,6 +236,35 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), LedgerError> {
     Ok(())
 }
 
+impl Ledger {
+    /// Whether a config-aware runtime migration has completed.
+    pub fn runtime_migration_completed(&self, name: &str) -> Result<bool, LedgerError> {
+        let name = name.to_owned();
+        self.submit(move |conn| {
+            conn.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_migrations WHERE name = ?1)",
+                [name],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+        })
+    }
+
+    /// Mark a config-aware runtime migration complete, idempotently.
+    pub fn mark_runtime_migration_completed(&self, name: &str) -> Result<bool, LedgerError> {
+        let name = name.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = tx.execute(
+                "INSERT OR IGNORE INTO runtime_migrations (name, completed_at) VALUES (?1, ?2)",
+                rusqlite::params![name, now_iso()],
+            )?;
+            tx.commit()?;
+            Ok(inserted == 1)
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::MIGRATION_001;
@@ -234,7 +282,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 3);
+        assert_eq!(pragmas.user_version, 4);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -249,7 +297,9 @@ mod tests {
             "events",
             "usage",
             "run_definitions",
+            "run_package_migrations",
             "roster_revisions",
+            "runtime_migrations",
         ] {
             let found: String = conn
                 .query_row(
@@ -279,7 +329,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 4);
         ledger.close().expect("close");
     }
 
@@ -300,7 +350,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 3);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 4);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"

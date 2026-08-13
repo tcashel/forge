@@ -29,6 +29,26 @@ pub struct Ctx {
     pub ledger: Ledger,
 }
 
+/// Upgrade durable state that predates frozen execution policy.
+///
+/// This is the sole compatibility boundary for definition-backed runs and
+/// epics: once it returns, their projections consume only complete packages.
+/// Definition-less v0 runs retain their older compatibility projection.
+pub async fn migrate_legacy_state(ctx: &Ctx) -> Result<(), Failure> {
+    let policy = ctx.config.execution_policy().map_err(|errors| {
+        Failure::invalid(format!(
+            "execution policy is invalid: {}",
+            serde_json::to_string(&errors).unwrap_or_default()
+        ))
+    })?;
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.migrate_legacy_execution_packages(policy)
+    })
+    .await?;
+    epic::migrate_legacy_epics(ctx).await?;
+    Ok(())
+}
+
 /// A core failure, carrying the closed wire code.
 #[derive(Debug, thiserror::Error)]
 #[error("{message}")]

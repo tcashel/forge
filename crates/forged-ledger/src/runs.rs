@@ -3,7 +3,8 @@
 use std::fmt::Write as _;
 
 use forged_types::{
-    canonical_json_bytes, ErrorCode, ResolvedRosterV1, EXECUTION_PACKAGE_SCHEMA_V1,
+    canonical_json_bytes, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1, ResolvedRosterV1,
+    EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -40,8 +41,11 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
 const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
                            stop_reason, created_at, updated_at";
 
-const DEFINITION_COLUMNS: &str = "run_id, protocol_ref_json, profile_ref_json, roster_ref_json, \
-    package_sha256, profile_sha256, roster_sha256, package_json, compatibility_roster_json, created_at";
+const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.profile_ref_json, \
+    d.roster_ref_json, COALESCE(m.package_sha256, d.package_sha256), d.profile_sha256, \
+    d.roster_sha256, COALESCE(m.package_json, d.package_json), d.compatibility_roster_json, \
+    d.created_at";
+const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
 
 fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
     Ok(RunDefinitionRow {
@@ -149,6 +153,122 @@ pub(crate) fn require_run(conn: &Connection, run_id: &str) -> Result<(), LedgerE
 }
 
 impl Ledger {
+    /// Freeze the supplied policy into every definition written before policy
+    /// joined the execution-package schema.
+    ///
+    /// Original definition rows remain untouched. Each legacy row receives at
+    /// most one append-only overlay, and readers project that overlay as the
+    /// effective package. The whole upgrade is one immediate transaction, so
+    /// a crash exposes either all overlays or none of them.
+    pub fn migrate_legacy_execution_packages(
+        &self,
+        policy: ExecutionPolicyV1,
+    ) -> Result<usize, LedgerError> {
+        self.submit(move |conn| {
+            let policy_errors = policy.validate();
+            if !policy_errors.is_empty() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("execution policy is invalid: {policy_errors:?}"),
+                ));
+            }
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let completed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM runtime_migrations WHERE name = ?1)",
+                [EXECUTION_POLICY_MIGRATION],
+                |row| row.get(0),
+            )?;
+            if completed {
+                tx.commit()?;
+                return Ok(0);
+            }
+            let candidates = {
+                let mut statement = tx.prepare(
+                    "SELECT d.run_id, d.package_sha256, d.package_json \
+                     FROM run_definitions d \
+                     LEFT JOIN run_package_migrations m ON m.run_id = d.run_id \
+                     WHERE m.run_id IS NULL ORDER BY d.run_id",
+                )?;
+                let rows = statement
+                    .query_map([], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()?;
+                rows
+            };
+            let mut migrated = 0;
+            for (run_id, previous_package_sha256, package_json) in candidates {
+                let mut value: serde_json::Value = serde_json::from_str(&package_json)?;
+                if value.get("policy").is_some() {
+                    continue;
+                }
+                let (_, verified_previous_sha256) = canonical(&value)?;
+                if verified_previous_sha256 != previous_package_sha256 {
+                    return Err(refused(
+                        ErrorCode::Internal,
+                        format!("legacy execution package digest mismatch for run {run_id:?}"),
+                    ));
+                }
+                let object = value.as_object_mut().ok_or_else(|| {
+                    crate::error::internal(format!(
+                        "legacy execution package for run {run_id:?} is not an object"
+                    ))
+                })?;
+                object.insert("policy".to_owned(), serde_json::to_value(&policy)?);
+                let package: ExecutionPackageV1 = serde_json::from_value(value)?;
+                if package.schema != EXECUTION_PACKAGE_SCHEMA_V1 {
+                    return Err(refused(
+                        ErrorCode::Internal,
+                        format!(
+                            "unsupported legacy execution package schema {:?} for run {run_id:?}",
+                            package.schema
+                        ),
+                    ));
+                }
+                if package.roster_ref != package.roster.roster_ref {
+                    return Err(refused(
+                        ErrorCode::Internal,
+                        format!("legacy execution package roster ref mismatch for run {run_id:?}"),
+                    ));
+                }
+                let (_, profile_sha256) = canonical(&package.profile)?;
+                let (_, roster_sha256) = canonical(&package.roster)?;
+                if profile_sha256 != package.profile_sha256
+                    || roster_sha256 != package.roster_sha256
+                {
+                    return Err(refused(
+                        ErrorCode::Internal,
+                        format!("legacy execution package content mismatch for run {run_id:?}"),
+                    ));
+                }
+                let (migrated_package_json, package_sha256) = canonical(&package)?;
+                tx.execute(
+                    "INSERT INTO run_package_migrations \
+                     (run_id, previous_package_sha256, package_sha256, package_json, created_at) \
+                     VALUES (?1, ?2, ?3, ?4, ?5)",
+                    rusqlite::params![
+                        run_id,
+                        previous_package_sha256,
+                        package_sha256,
+                        migrated_package_json,
+                        now_iso(),
+                    ],
+                )?;
+                migrated += 1;
+            }
+            tx.execute(
+                "INSERT INTO runtime_migrations (name, completed_at) VALUES (?1, ?2)",
+                rusqlite::params![EXECUTION_POLICY_MIGRATION, now_iso()],
+            )?;
+            tx.commit()?;
+            Ok(migrated)
+        })
+    }
+
     /// Create a run in state `active`. A duplicate id refuses with
     /// `InvalidRequest`. Creation appends no event — a run's initial
     /// `active` state is a creation, not a transition.
@@ -252,7 +372,10 @@ impl Ledger {
         let run_id = run_id.to_owned();
         self.submit(move |conn| {
             require_run(conn, &run_id)?;
-            let sql = format!("SELECT {DEFINITION_COLUMNS} FROM run_definitions WHERE run_id = ?1");
+            let sql = format!(
+                "SELECT {EFFECTIVE_DEFINITION_COLUMNS} FROM run_definitions d \
+                 LEFT JOIN run_package_migrations m ON m.run_id = d.run_id WHERE d.run_id = ?1"
+            );
             Ok(conn.query_row(&sql, [&run_id], definition_row).optional()?)
         })
     }

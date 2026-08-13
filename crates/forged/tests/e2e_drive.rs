@@ -3,12 +3,26 @@
 //! shim call log shows exactly one draft PR creation and zero merge or
 //! ready-for-review calls; the origin repo holds the real commits.
 
+use std::fmt::Write as _;
 use std::process::Stdio;
 
 mod support;
 
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use support::{assert_no_overlap, rev_parse, TestEnv};
+
+fn canonical_json_and_sha(value: &Value) -> (String, String) {
+    let bytes = forged_types::canonical_json_bytes(value).expect("canonical fixture JSON");
+    let mut sha256 = String::with_capacity(64);
+    for byte in Sha256::digest(&bytes) {
+        write!(&mut sha256, "{byte:02x}").expect("digest formatting");
+    }
+    (
+        String::from_utf8(bytes).expect("canonical JSON is UTF-8"),
+        sha256,
+    )
+}
 
 fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Value {
     let mut last = Value::Null;
@@ -1199,6 +1213,229 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
     assert!(log
         .iter()
         .any(|line| line.starts_with("bead-conflict-edge/synthesis/0")));
+}
+
+#[test]
+fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
+    let env = TestEnv::new("forged-legacy-run-policy");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "legacy-policy-run",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    // Recreate the exact pre-policy durable shape: package JSON and its hash
+    // both omit `policy`, with no migration overlay yet.
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open legacy run fixture");
+    let package_json: String = connection
+        .query_row(
+            "SELECT package_json FROM run_definitions WHERE run_id = ?1",
+            ["legacy-policy-run"],
+            |row| row.get(0),
+        )
+        .expect("stored package");
+    let mut legacy_package: Value = serde_json::from_str(&package_json).expect("package JSON");
+    legacy_package
+        .as_object_mut()
+        .expect("package object")
+        .remove("policy");
+    let (legacy_json, legacy_sha256) = canonical_json_and_sha(&legacy_package);
+    connection
+        .execute(
+            "UPDATE run_definitions SET package_json = ?1, package_sha256 = ?2 WHERE run_id = ?3",
+            rusqlite::params![legacy_json, legacy_sha256, "legacy-policy-run"],
+        )
+        .expect("install legacy package");
+    connection
+        .execute(
+            "DELETE FROM runtime_migrations WHERE name = 'forged.run.execution-policy/1'",
+            [],
+        )
+        .expect("restore pre-upgrade migration state");
+    drop(connection);
+
+    let (code, migrated) = env.forged(&["run", "status", "--run", "legacy-policy-run"]);
+    assert_eq!(code, 0, "legacy status migrates: {migrated}");
+    assert_eq!(
+        migrated["result"]["run"]["definition"]["policy"]["gateCommands"],
+        json!(["true"])
+    );
+    let migrated_sha256 = migrated["result"]["run"]["definition"]["packageSha256"]
+        .as_str()
+        .expect("migrated digest")
+        .to_owned();
+
+    // A later authoring change must not leak through the compatibility seam.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["gate_commands"] = json!(["false"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("rewrite config");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "legacy-policy-run"]);
+    assert_eq!(code, 0, "drive uses the migrated true gate: {driven}");
+    let (_, repeated) = env.forged(&["run", "status", "--run", "legacy-policy-run"]);
+    assert_eq!(
+        repeated["result"]["run"]["definition"]["packageSha256"],
+        json!(migrated_sha256)
+    );
+    assert_eq!(
+        repeated["result"]["run"]["definition"]["policy"]["gateCommands"],
+        json!(["true"])
+    );
+
+    let connection = rusqlite::Connection::open(&db).expect("inspect migration overlay");
+    let overlays: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM run_package_migrations WHERE run_id = ?1",
+            ["legacy-policy-run"],
+            |row| row.get(0),
+        )
+        .expect("overlay count");
+    assert_eq!(
+        overlays, 1,
+        "repeat process starts never duplicate overlays"
+    );
+    let original_json: String = connection
+        .query_row(
+            "SELECT package_json FROM run_definitions WHERE run_id = ?1",
+            ["legacy-policy-run"],
+            |row| row.get(0),
+        )
+        .expect("original package");
+    assert!(
+        serde_json::from_str::<Value>(&original_json).expect("original JSON")["policy"].is_null(),
+        "the original immutable definition row remains untouched"
+    );
+}
+
+#[test]
+fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
+    let env = TestEnv::new("forged-legacy-epic-package");
+    env.seed_epic(
+        "legacy-package-epic",
+        &[("legacy-package-child", &env.spec, true)],
+    );
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "legacy-package-epic",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+
+    // Recreate a pre-snapshot forged.epic/1 start event. Its legacy profile,
+    // roster, and package digest remain, but the full package is absent.
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open legacy epic fixture");
+    let (event_id, payload_json): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events \
+             WHERE run_id = ?1 AND kind = 'forged.epic.started'",
+            ["legacy-package-epic"],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("epic start event");
+    let mut legacy_start: Value = serde_json::from_str(&payload_json).expect("start JSON");
+    legacy_start
+        .as_object_mut()
+        .expect("start object")
+        .remove("executionPackage");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&legacy_start).expect("legacy start JSON"),
+                event_id
+            ],
+        )
+        .expect("install legacy start event");
+    connection
+        .execute(
+            "DELETE FROM runtime_migrations WHERE name = 'forged.epic.execution-package/1'",
+            [],
+        )
+        .expect("restore pre-upgrade migration state");
+    drop(connection);
+
+    let (code, migrated) = env.forged(&["epic", "status", "--epic", "legacy-package-epic"]);
+    assert_eq!(code, 0, "legacy epic status migrates: {migrated}");
+
+    // Once frozen, later config changes do not affect either projection or
+    // child creation from the epic package.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["gate_commands"] = json!(["false"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("serialize config"),
+    )
+    .expect("rewrite config");
+    for _ in 0..2 {
+        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "legacy-package-epic"]);
+        assert_eq!(code, 0, "legacy epic lifecycle advances: {advanced}");
+    }
+    let ledger = env.ledger();
+    let child_definition = ledger
+        .get_run_definition("legacy-package-child")
+        .expect("child definition query")
+        .expect("child definition");
+    ledger.close().expect("close ledger");
+    let child_package: forged_types::ExecutionPackageV1 =
+        serde_json::from_str(&child_definition.package_json).expect("child package");
+    assert_eq!(child_package.policy.gate_commands, ["true"]);
+
+    let connection = rusqlite::Connection::open(&db).expect("inspect epic migration");
+    let migrations: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM events WHERE run_id = ?1 \
+             AND kind = 'forged.epic.execution-package.migrated'",
+            ["legacy-package-epic"],
+            |row| row.get(0),
+        )
+        .expect("epic migration count");
+    assert_eq!(migrations, 1, "repeat process starts append one migration");
+    let migration_json: String = connection
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 \
+             AND kind = 'forged.epic.execution-package.migrated'",
+            ["legacy-package-epic"],
+            |row| row.get(0),
+        )
+        .expect("epic migration payload");
+    let migration: Value = serde_json::from_str(&migration_json).expect("migration JSON");
+    assert_eq!(migration["source"], json!("upgrade-config"));
+    assert_eq!(
+        migration["executionPackage"]["policy"]["gateCommands"],
+        json!(["true"])
+    );
 }
 
 #[test]

@@ -288,6 +288,29 @@ fn config_path(anvil_home: &std::path::Path) -> PathBuf {
 }
 
 impl ForgedConfig {
+    /// Resolve and validate the non-cognitive policy frozen into every new
+    /// package. Upgrade code uses the same boundary to snapshot policy for
+    /// packages written before policy became part of the schema.
+    pub fn execution_policy(&self) -> Result<ExecutionPolicyV1, Vec<DefinitionError>> {
+        let policy = ExecutionPolicyV1 {
+            gate_commands: self.gate_commands.clone(),
+            stage_budget_s: self
+                .stage_budget_s
+                .iter()
+                .map(|(stage, budget)| (*stage, *budget))
+                .collect(),
+            transport_retry_budget: self.transport_retry_budget,
+            host_policy: self.host_policy,
+            herdr_socket: self.herdr_sock.clone(),
+        };
+        let errors = policy.validate();
+        if errors.is_empty() {
+            Ok(policy)
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Load and resolve the single config snapshot for this process.
     pub fn load() -> Result<ForgedConfig, String> {
         let anvil_home = anvil_home();
@@ -445,21 +468,7 @@ impl ForgedConfig {
             return Err(errors);
         }
         let resolved = roster.resolve();
-        let policy = ExecutionPolicyV1 {
-            gate_commands: self.gate_commands.clone(),
-            stage_budget_s: self
-                .stage_budget_s
-                .iter()
-                .map(|(stage, budget)| (*stage, *budget))
-                .collect(),
-            transport_retry_budget: self.transport_retry_budget,
-            host_policy: self.host_policy,
-            herdr_socket: self.herdr_sock.clone(),
-        };
-        errors.extend(policy.validate());
-        if !errors.is_empty() {
-            return Err(errors);
-        }
+        let policy = self.execution_policy()?;
         let profile_sha256 = digest_of(&profile).map_err(|message| {
             vec![DefinitionError {
                 path: "$.profile".to_owned(),

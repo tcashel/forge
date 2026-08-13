@@ -30,6 +30,8 @@ const PAUSED: &str = "forged.epic.paused";
 const RESUMED: &str = "forged.epic.resumed";
 const EPIC_PR: &str = "forged.epic.pr";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
+const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
+const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 
 #[derive(Debug, Clone)]
 struct FrozenChild {
@@ -86,7 +88,7 @@ fn string(value: &Value, key: &str) -> Result<String, Failure> {
         .ok_or_else(|| Failure::internal(format!("epic event has no {key:?}")))
 }
 
-fn parse_config(value: &Value) -> Result<EpicConfig, Failure> {
+fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, Failure> {
     let children = value
         .get("children")
         .and_then(Value::as_array)
@@ -114,14 +116,159 @@ fn parse_config(value: &Value) -> Result<EpicConfig, Failure> {
         execution_package: serde_json::from_value(
             value
                 .get("executionPackage")
+                .or_else(|| migration.and_then(|event| event.get("executionPackage")))
                 .cloned()
-                .ok_or_else(|| Failure::internal("epic start event has no executionPackage"))?,
+                .ok_or_else(|| {
+                    Failure::internal("epic has no durable execution package or migration")
+                })?,
         )
         .map_err(|error| {
             Failure::internal(format!("epic execution package is invalid: {error}"))
         })?,
         children,
     })
+}
+
+/// Append a frozen package for every epic created before start events carried
+/// the package itself. An existing child definition is the strongest durable
+/// source; an epic with no child yet freezes its named authoring definition at
+/// this explicit upgrade boundary. Repeated starts append nothing.
+pub(crate) async fn migrate_legacy_epics(ctx: &Ctx) -> Result<usize, Failure> {
+    let migration_complete = on_ledger(&ctx.ledger, |ledger| {
+        ledger.runtime_migration_completed(PACKAGE_MIGRATION)
+    })
+    .await?;
+    if migration_complete {
+        return Ok(0);
+    }
+    let started = on_ledger(&ctx.ledger, |ledger| ledger.list_events_by_kind(STARTED)).await?;
+    let migrated = on_ledger(&ctx.ledger, |ledger| {
+        ledger.list_events_by_kind(PACKAGE_MIGRATED)
+    })
+    .await?;
+    let completed = migrated
+        .iter()
+        .filter_map(|row| row.run_id.clone())
+        .collect::<BTreeSet<_>>();
+    let candidates = started
+        .into_iter()
+        .map(|row| {
+            let event_id = row.event_id;
+            let epic_id = row.run_id.clone().ok_or_else(|| {
+                Failure::internal(format!("epic start event {event_id} has no epic id"))
+            })?;
+            if completed.contains(&epic_id) {
+                return Ok(None);
+            }
+            let event = payload(&row)?;
+            Ok((event.get("executionPackage").is_none()).then_some((epic_id, event)))
+        })
+        .collect::<Result<Vec<_>, Failure>>()?
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let candidate_ids = candidates
+        .iter()
+        .map(|(epic_id, _)| epic_id.clone())
+        .collect::<BTreeSet<_>>();
+    let child_started = if candidate_ids.is_empty() {
+        Vec::new()
+    } else {
+        on_ledger(&ctx.ledger, |ledger| {
+            ledger.list_events_by_kind(CHILD_STARTED)
+        })
+        .await?
+    };
+    let first_child = child_started.into_iter().try_fold(
+        BTreeMap::<String, String>::new(),
+        |mut index, row| {
+            let Some(epic_id) = row
+                .run_id
+                .clone()
+                .filter(|epic_id| candidate_ids.contains(epic_id))
+            else {
+                return Ok::<_, Failure>(index);
+            };
+            let event = payload(&row)?;
+            let run_id = string(&event, "runId")?;
+            index.entry(epic_id).or_insert(run_id);
+            Ok(index)
+        },
+    )?;
+    let mut migration_count = 0;
+    for (epic_id, event) in candidates {
+        let profile = string(&event, "profile")?;
+        let roster = string(&event, "roster")?;
+        let legacy_package_sha256 = string(&event, "packageSha256")?;
+        let child_run_id = first_child.get(&epic_id).cloned();
+        let child_definition = match child_run_id.clone() {
+            Some(run_id) => {
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_run_definition(&run_id)
+                })
+                .await?
+            }
+            None => None,
+        };
+        let child_package = child_definition
+            .map(|definition| {
+                serde_json::from_str::<ExecutionPackageV1>(&definition.package_json).map_err(
+                    |error| {
+                        Failure::internal(format!(
+                            "legacy epic {epic_id:?} child package is invalid: {error}"
+                        ))
+                    },
+                )
+            })
+            .transpose()?
+            .filter(|package| {
+                package.profile_ref.name == profile && package.roster_ref.name == roster
+            });
+        let (compiled, source, source_run_id) = match child_package {
+            Some(package) => (
+                crate::config::compile_frozen_package(package).map_err(|errors| {
+                    Failure::internal(format!(
+                        "legacy epic {epic_id:?} child definition is invalid: {}",
+                        serde_json::to_string(&errors).unwrap_or_default()
+                    ))
+                })?,
+                "child-definition",
+                child_run_id,
+            ),
+            None => (
+                ctx.config
+                    .compile_definition(Some(&profile), Some(&roster))
+                    .map_err(|errors| {
+                        Failure::invalid(format!(
+                            "cannot freeze legacy epic {epic_id:?}; restore its profile and roster: {}",
+                            serde_json::to_string(&errors).unwrap_or_default()
+                        ))
+                    })?,
+                "upgrade-config",
+                None,
+            ),
+        };
+        let migration = json!({
+            "schema": "forged.epic.execution-package-migration/1",
+            "epicId": epic_id,
+            "legacyPackageSha256": legacy_package_sha256,
+            "packageSha256": compiled.package_sha256,
+            "source": source,
+            "sourceRunId": source_run_id,
+            "executionPackage": compiled.package,
+        });
+        let epic_for_store = epic_id.clone();
+        let inserted = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.append_event_kind_once(&epic_for_store, PACKAGE_MIGRATED, migration)
+        })
+        .await?;
+        migration_count += usize::from(inserted);
+    }
+    on_ledger(&ctx.ledger, |ledger| {
+        ledger.mark_runtime_migration_completed(PACKAGE_MIGRATION)
+    })
+    .await?;
+    Ok(migration_count)
 }
 
 async fn epic_events(ctx: &Ctx, epic: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
@@ -138,7 +285,12 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         .iter()
         .find(|row| row.kind == STARTED)
         .ok_or_else(|| Failure::invalid(format!("epic {epic:?} has not been started")))?;
-    let config = parse_config(&payload(started)?)?;
+    let migration = events
+        .iter()
+        .find(|row| row.kind == PACKAGE_MIGRATED)
+        .map(payload)
+        .transpose()?;
+    let config = parse_config(&payload(started)?, migration.as_ref())?;
     let mut view = EpicView {
         config,
         integration: None,

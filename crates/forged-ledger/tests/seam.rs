@@ -30,7 +30,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 3);
+        assert_eq!(handle.join().expect("thread"), 4);
     }
 }
 
@@ -299,6 +299,16 @@ fn every_seam_member_is_consumable() {
     ledger
         .append_event(Some(&run), "seam.event", json!({"k": 1}))
         .expect("append_event");
+    assert!(ledger
+        .append_event_kind_once(&run, "seam.once", json!({"k": 1}))
+        .expect("append_event_kind_once"));
+    assert_eq!(
+        ledger
+            .list_events_by_kind("seam.once")
+            .expect("list_events_by_kind")
+            .len(),
+        1
+    );
     let events = ledger.list_events(None, 0, 100).expect("list_events");
     let event = events.last().expect("at least one event");
     let _: (i64, &String, &Option<String>, &String, &String) = (
@@ -308,6 +318,15 @@ fn every_seam_member_is_consumable() {
         &event.kind,
         &event.payload_json,
     );
+    assert!(!ledger
+        .runtime_migration_completed("seam.migration")
+        .expect("runtime_migration_completed"));
+    assert!(ledger
+        .mark_runtime_migration_completed("seam.migration")
+        .expect("mark_runtime_migration_completed"));
+    assert!(ledger
+        .runtime_migration_completed("seam.migration")
+        .expect("runtime migration completed"));
 
     // Usage.
     ledger
