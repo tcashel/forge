@@ -90,5 +90,6 @@ pub fn to_new_usage(
         cost_usd: row.cost_usd,
         pricing_basis: Some(row.pricing_basis.as_str().to_owned()),
         rate_limit_used_percent: row.rate_limit_used_percent,
+        web_search_requests: row.web_search_requests,
     }
 }

@@ -425,6 +425,8 @@ pub struct NewUsage {
     pub pricing_basis: Option<String>,
     /// Rate-limit consumption, when reported.
     pub rate_limit_used_percent: Option<f64>,
+    /// Server-side web searches, billed per call rather than per token.
+    pub web_search_requests: Option<u64>,
 }
 
 /// One stored usage row, as [`crate::Ledger::list_usage`] returns it.
@@ -454,6 +456,8 @@ pub struct UsageRecord {
     pub pricing_basis: Option<String>,
     /// Rate-limit consumption, when reported.
     pub rate_limit_used_percent: Option<f64>,
+    /// Server-side web searches, billed per call rather than per token.
+    pub web_search_requests: Option<u64>,
     /// When the row was recorded.
     pub ts: String,
 }

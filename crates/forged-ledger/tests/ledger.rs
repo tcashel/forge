@@ -516,6 +516,7 @@ fn re_recording_one_attempt_overwrites_instead_of_doubling() {
         cost_usd: Some(cost),
         pricing_basis: Some("imputed_api_rate".to_owned()),
         rate_limit_used_percent: None,
+        web_search_requests: None,
     };
     ledger.record_usage(row(200, 0.25)).expect("first record");
     ledger.record_usage(row(250, 0.30)).expect("second record");
@@ -558,6 +559,7 @@ fn usage_totals_report_missing_costs_honestly() {
             cost_usd: Some(0.25),
             pricing_basis: Some("list".to_owned()),
             rate_limit_used_percent: Some(3.5),
+            web_search_requests: Some(4),
         })
         .expect("record");
     ledger
@@ -574,6 +576,7 @@ fn usage_totals_report_missing_costs_honestly() {
             cost_usd: None,
             pricing_basis: None,
             rate_limit_used_percent: None,
+            web_search_requests: None,
         })
         .expect("record");
     // Another run's rows never leak into this run's totals.
@@ -592,6 +595,7 @@ fn usage_totals_report_missing_costs_honestly() {
             cost_usd: None,
             pricing_basis: None,
             rate_limit_used_percent: None,
+            web_search_requests: None,
         })
         .expect("record");
 

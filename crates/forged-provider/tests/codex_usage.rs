@@ -140,3 +140,39 @@ fn non_json_lines_are_skipped_never_an_error() {
     let capture = CodexDriver.parse_usage(&stdout, "m").expect("parses");
     assert_eq!(capture.rows.len(), 1);
 }
+
+#[test]
+fn web_search_items_are_counted_off_the_stream() {
+    let stdout = concat!(
+        r#"{"type":"thread.started","thread_id":"t"}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"i0","type":"web_search_call"}}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"i1","type":"command_execution"}}"#,
+        "\n",
+        r#"{"type":"item.completed","item":{"id":"i2","type":"web_search"}}"#,
+        "\n",
+        r#"{"type":"turn.completed","usage":{"input_tokens":9,"cached_input_tokens":8,"output_tokens":1}}"#,
+        "\n",
+    );
+    let capture = CodexDriver
+        .parse_usage(stdout, "gpt-5.6-sol")
+        .expect("parses");
+    assert_eq!(
+        capture.rows[0].web_search_requests,
+        Some(2),
+        "both spellings count; a command execution does not"
+    );
+}
+
+#[test]
+fn a_turn_without_searches_reports_zero_searches() {
+    let capture = CodexDriver
+        .parse_usage(TURN_COMPLETED, "gpt-5.6-sol")
+        .expect("parses");
+    assert_eq!(
+        capture.rows[0].web_search_requests,
+        Some(0),
+        "codex streams every item, so nothing seen means none happened"
+    );
+}

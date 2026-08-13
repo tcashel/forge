@@ -106,6 +106,7 @@ impl ClaudeDriver {
             rows.push(UsageRow {
                 provider: "claude".to_owned(),
                 model: model_name.clone(),
+                web_search_requests: optional_token(entry, "webSearchRequests", &context)?,
                 input_tokens: required_token(entry, "inputTokens", &context)?,
                 output_tokens: required_token(entry, "outputTokens", &context)?,
                 cache_read_tokens: Some(required_token(entry, "cacheReadInputTokens", &context)?),
@@ -141,9 +142,20 @@ impl ClaudeDriver {
             }
         };
         let cost_usd = optional_cost(result, "total_cost_usd");
+        // `server_tool_use` is the single-row branch's only web-search
+        // counter; the per-model branch reads `webSearchRequests` instead.
+        let web_search_requests = match usage.get("server_tool_use") {
+            Some(Value::Object(tools)) => optional_token(
+                tools,
+                "web_search_requests",
+                "claude result server_tool_use",
+            )?,
+            _ => None,
+        };
         Ok(vec![UsageRow {
             provider: "claude".to_owned(),
             model: model.to_owned(),
+            web_search_requests,
             input_tokens: required_token(usage, "input_tokens", context)?,
             output_tokens: required_token(usage, "output_tokens", context)?,
             cache_read_tokens: Some(required_token(usage, "cache_read_input_tokens", context)?),

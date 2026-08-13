@@ -172,17 +172,25 @@ fn parse_rollout(
 ) -> Result<UsageCapture, ProviderError> {
     let mut usage_info: Option<Value> = None;
     let mut used_percent: Option<f64> = None;
+    let mut web_searches = 0u64;
     for line in content.lines() {
         let Some(obj) = object_line(line) else {
             continue;
         };
-        if obj.get("type").and_then(Value::as_str) != Some("event_msg") {
-            continue;
-        }
+        let envelope = obj.get("type").and_then(Value::as_str);
         let Some(Value::Object(payload)) = obj.get("payload") else {
             continue;
         };
-        if payload.get("type").and_then(Value::as_str) != Some("token_count") {
+        let kind = payload.get("type").and_then(Value::as_str);
+        // A rollout records one `web_search_call` response item per billed
+        // search. `web_search_end` is the streaming companion and fires
+        // repeatedly for a single call, so counting it would multiply the
+        // bill severalfold.
+        if envelope == Some("response_item") && kind == Some("web_search_call") {
+            web_searches += 1;
+            continue;
+        }
+        if envelope != Some("event_msg") || kind != Some("token_count") {
             continue;
         }
         if let Some(percent) = payload
@@ -227,6 +235,7 @@ fn parse_rollout(
         cost_usd: None,
         pricing_basis: PricingBasis::None,
         rate_limit_used_percent: used_percent,
+        web_search_requests: Some(web_searches),
     }];
     Ok(UsageCapture { session_ref, rows })
 }

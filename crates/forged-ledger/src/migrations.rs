@@ -179,6 +179,13 @@ CREATE UNIQUE INDEX usage_natural_key ON usage(
 );
 ";
 
+/// Migration 006: server-side tool calls, billed per call rather than per
+/// token. Kept out of the token columns because it is a different unit and
+/// a different rate; folding it in would corrupt every token aggregate.
+const MIGRATION_006: &str = "
+ALTER TABLE usage ADD COLUMN web_search_requests INTEGER;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -186,6 +193,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_003,
     MIGRATION_004,
     MIGRATION_005,
+    MIGRATION_006,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -305,7 +313,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 5);
+        assert_eq!(pragmas.user_version, 6);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -352,7 +360,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 5);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
         ledger.close().expect("close");
     }
 
@@ -373,7 +381,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 5);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"

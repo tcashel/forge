@@ -1477,6 +1477,12 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     stats.append(stat(toks(prompt), "prompt tokens", prompt
       ? Math.round((cacheRead / prompt) * 100) + "% served from cache" : null));
     stats.append(stat(toks(totals.outputTokens), "output tokens"));
+    const searches = usageRows.reduce((n, r) => n + num(r.webSearchRequests), 0);
+    if (searches) {
+      const rate = usage.pricing && usage.pricing.webSearchPer1k;
+      stats.append(stat(String(searches), "web searches",
+        rate ? "$" + (rate / 1000).toFixed(3) + " per call" : null));
+    }
     stats.append(stat(String(usageRows.length || "—"), "priced attempts",
       missing ? missing + " without a rate" : null, !usageRows.length));
     head.body.append(stats);
@@ -1529,8 +1535,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       const who = el("td");
       who.append(el("div", "", seat ? seat.seat + " · R" + seat.round : (row.packetId || "—")));
       if (superseded.has(row)) {
-        const tag = el("div", "basis basis--imputed", "superseded · rework");
-        who.append(tag);
+        who.append(el("div", "basis basis--imputed", "superseded · rework"));
+      }
+      if (num(row.webSearchRequests)) {
+        const n = num(row.webSearchRequests);
+        who.append(el("div", "basis", n + (n === 1 ? " web search" : " web searches")));
       }
       tr.append(who);
       const model = el("td");

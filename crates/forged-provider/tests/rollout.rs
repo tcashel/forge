@@ -189,3 +189,42 @@ async fn traversal_shaped_thread_id_is_rejected_before_searching() {
         "{err}"
     );
 }
+
+#[tokio::test]
+async fn rollout_counts_search_calls_and_ignores_their_stream_events() {
+    // `web_search_end` fires repeatedly for one `web_search_call`; counting
+    // it would multiply the bill severalfold.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let home = dir.path();
+    let day = home.join("sessions/2026/08/13");
+    std::fs::create_dir_all(&day).expect("mkdir");
+    let thread = "019ffa30-ffdd-7e51-a31c-ff34d12718a1";
+    let content = format!(
+        concat!(
+            r#"{{"type":"session_meta","payload":{{"session_id":"{t}"}}}}"#,
+            "\n",
+            r#"{{"type":"response_item","payload":{{"type":"web_search_call","status":"completed"}}}}"#,
+            "\n",
+            r#"{{"type":"event_msg","payload":{{"type":"web_search_end","call_id":"c1"}}}}"#,
+            "\n",
+            r#"{{"type":"event_msg","payload":{{"type":"web_search_end","call_id":"c1"}}}}"#,
+            "\n",
+            r#"{{"type":"response_item","payload":{{"type":"web_search_call","status":"completed"}}}}"#,
+            "\n",
+            r#"{{"type":"event_msg","payload":{{"type":"token_count","info":{{"total_token_usage":"#,
+            r#"{{"input_tokens":100,"cached_input_tokens":40,"cache_write_input_tokens":0,"output_tokens":7}}}}}}}}"#,
+            "\n",
+        ),
+        t = thread
+    );
+    std::fs::write(
+        day.join(format!("rollout-2026-08-13T04-15-43-{thread}.jsonl")),
+        content,
+    )
+    .expect("write");
+
+    let capture = forged_provider::recover_usage_from_rollout(home, thread, "gpt-5.6-sol")
+        .await
+        .expect("recovers");
+    assert_eq!(capture.rows[0].web_search_requests, Some(2));
+}

@@ -39,12 +39,14 @@ impl Ledger {
             let output_tokens = as_i64(usage.output_tokens, "output_tokens")?;
             let cache_read = opt_as_i64(usage.cache_read_tokens, "cache_read_tokens")?;
             let cache_write = opt_as_i64(usage.cache_write_tokens, "cache_write_tokens")?;
+            let web_searches = opt_as_i64(usage.web_search_requests, "web_search_requests")?;
             let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
             tx.execute(
                 "INSERT INTO usage (run_id, packet_id, attempt_id, provider, model, \
                  input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, \
-                 cost_usd, pricing_basis, rate_limit_used_percent, ts) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13) \
+                 cost_usd, pricing_basis, rate_limit_used_percent, ts, \
+                 web_search_requests) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14) \
                  ON CONFLICT (run_id, COALESCE(packet_id, ''), COALESCE(attempt_id, -1), \
                  provider, model) DO UPDATE SET \
                  input_tokens = excluded.input_tokens, \
@@ -54,6 +56,7 @@ impl Ledger {
                  cost_usd = excluded.cost_usd, \
                  pricing_basis = excluded.pricing_basis, \
                  rate_limit_used_percent = excluded.rate_limit_used_percent, \
+                 web_search_requests = excluded.web_search_requests, \
                  ts = excluded.ts",
                 rusqlite::params![
                     usage.run_id,
@@ -69,6 +72,7 @@ impl Ledger {
                     usage.pricing_basis,
                     usage.rate_limit_used_percent,
                     now_iso(),
+                    web_searches,
                 ],
             )?;
             tx.commit()?;
@@ -134,7 +138,7 @@ impl Ledger {
                 "SELECT run_id, packet_id, attempt_id, provider, model, \
                         input_tokens, output_tokens, cache_read_tokens, \
                         cache_write_tokens, cost_usd, pricing_basis, \
-                        rate_limit_used_percent, ts \
+                        rate_limit_used_percent, ts, web_search_requests \
                  FROM usage WHERE run_id = ?1 ORDER BY usage_id",
             )?;
             let rows = stmt
@@ -153,6 +157,7 @@ impl Ledger {
                         row.get::<_, Option<String>>(10)?,
                         row.get::<_, Option<f64>>(11)?,
                         row.get::<_, String>(12)?,
+                        row.get::<_, Option<i64>>(13)?,
                     ))
                 })?
                 .collect::<Result<Vec<_>, _>>()?;
@@ -178,6 +183,10 @@ impl Ledger {
                         pricing_basis: r.10,
                         rate_limit_used_percent: r.11,
                         ts: r.12,
+                        web_search_requests: r
+                            .13
+                            .map(|v| as_u64(v, "web_search_requests"))
+                            .transpose()?,
                     })
                 })
                 .collect()

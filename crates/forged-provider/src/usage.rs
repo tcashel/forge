@@ -53,6 +53,11 @@ pub struct UsageRow {
     /// Primary rate-limit consumption percentage — only ever present on
     /// rows recovered from a codex rollout.
     pub rate_limit_used_percent: Option<f64>,
+    /// Server-side web searches the turn performed, when the capture
+    /// counted them. Billed per call rather than per token, so it is
+    /// carried alongside the token buckets and never folded into them.
+    /// `None` means the capture never said; `Some(0)` means it said zero.
+    pub web_search_requests: Option<u64>,
 }
 
 /// Where a row's `cost_usd` came from. Field-for-field alignable with
@@ -187,6 +192,7 @@ mod tests {
         let row = UsageRow {
             provider: "codex".to_owned(),
             model: "gpt".to_owned(),
+            web_search_requests: Some(2),
             input_tokens: 10,
             output_tokens: 2,
             cache_read_tokens: Some(4),

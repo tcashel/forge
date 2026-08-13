@@ -123,7 +123,7 @@ ledger did not record:
 | Timeline | Where the wall clock went. Attempt spans reconstructed from `attempt.state`, with gate, PR, and escalation milestones ticked above them. |
 | Evidence | What the reviewers actually said. Findings carried into the fix round, or every seat's own list; each seat's report; gate rows with exit codes; artifact paths. |
 | Workers | What to attach to. Sessions with claimants and copyable Herdr attach hints, the controller row, queued interventions, roster revisions. |
-| Cost | What the run spent. Per-seat tokens and money, with each cost labelled `billed` (the provider charged it) or `imputed` (derived from the rate card), and superseded attempts marked as rework. |
+| Cost | What the run spent. Per-seat tokens, web-search calls, and money, with each cost labelled `billed` (the provider charged it) or `imputed` (derived from the rate card), and superseded attempts marked as rework. |
 | Ledger | The raw event stream, filterable by kind and payload text, with payloads on demand. |
 
 Epics swap Flow's matrix for a **Waves** board: every frozen child bead by
@@ -157,6 +157,12 @@ rate card in `$ANVIL_HOME/config.yaml` (`imputed_api_rate`); it ships seeded
 with OpenAI's published rates and a `rates_as_of` date the Cost view shows, so
 a stale card is visible rather than silent. A model with no card entry keeps a
 null cost and counts in `rowsMissingCost`.
+
+Server-side web searches are billed per call, not per token, so their count
+rides beside the token buckets rather than inside them and is priced from the
+card's `tools.web_search_per_1k`. It is added only to rows forged is already
+imputing: a provider that billed the turn billed its searches in that same
+figure, and estimating on top would charge one search twice.
 
 The long-context tier is decided provably, never guessed. OpenAI prices a
 prompt above the threshold at the long-context rates, and the threshold is

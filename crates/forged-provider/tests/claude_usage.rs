@@ -172,3 +172,26 @@ fn empty_model_usage_falls_back_to_the_single_row_branch() {
     assert_eq!(capture.rows[0].model, "fallback");
     assert_eq!(capture.rows[0].cost_usd, Some(0.7));
 }
+
+#[test]
+fn server_tool_use_supplies_the_single_row_web_search_count() {
+    // Web search is billed per call, not per token, so the count rides
+    // beside the token buckets rather than inside them.
+    let stdout = concat!(
+        r#"{"type":"result","subtype":"success","session_id":"s","total_cost_usd":0.5,"#,
+        r#""usage":{"input_tokens":5,"cache_read_input_tokens":1,"output_tokens":2,"#,
+        r#""server_tool_use":{"web_search_requests":7,"web_fetch_requests":3}}}"#,
+        "\n",
+    );
+    let capture = ClaudeDriver.parse_usage(stdout, "opus").expect("parses");
+    assert_eq!(capture.rows[0].web_search_requests, Some(7));
+}
+
+#[test]
+fn a_capture_that_never_counted_searches_reports_none_not_zero() {
+    let capture = ClaudeDriver.parse_usage(BASIC, "opus").expect("parses");
+    assert_eq!(
+        capture.rows[0].web_search_requests, None,
+        "absence is data: the capture did not say zero, it said nothing"
+    );
+}

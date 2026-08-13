@@ -9,6 +9,12 @@
 //! `cost_usd: None` and counts in `rowsMissingCost` — forged never invents
 //! a price it was not given.
 //!
+//! Server-side tool calls are billed per call rather than per token and add
+//! to the turn's token cost. They are only ever imputed onto a row forged
+//! is already pricing: a provider that billed the turn billed its tool
+//! calls inside that same figure, so adding an estimate there would charge
+//! one search twice.
+//!
 //! ## Why the tier decision is not a guess
 //!
 //! OpenAI prices a prompt above `long_context_threshold` input tokens at
@@ -71,6 +77,22 @@ pub struct ModelRates {
     pub long: Option<TierRates>,
 }
 
+/// Per-call rates for server-side tools, in USD per thousand calls.
+///
+/// Tool calls are billed per call, not per token, and are additive to the
+/// token cost of the turn that made them. The tokens a search feeds back
+/// into the prompt are already counted in the row's input buckets and are
+/// not re-priced here.
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", deny_unknown_fields)]
+pub struct ToolRates {
+    /// Server-side web search. OpenAI publishes one rate for reasoning
+    /// models and a higher one for the non-reasoning preview tool; forged
+    /// rosters name reasoning models, so the card carries the one rate and
+    /// an operator who needs the other edits it.
+    pub web_search_per_1k: f64,
+}
+
 /// The operator's resolved rate card.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", deny_unknown_fields)]
@@ -84,6 +106,8 @@ pub struct RateCard {
     pub long_context_threshold: u64,
     /// Keyed by the model string the roster names.
     pub models: BTreeMap<String, ModelRates>,
+    /// Per-call rates for server-side tools.
+    pub tools: ToolRates,
 }
 
 /// The seeded default card: OpenAI's published standard API rates.
@@ -125,6 +149,9 @@ pub fn default_rate_card() -> RateCard {
         rates_as_of: "2026-08-13".to_owned(),
         source: "https://developers.openai.com/api/docs/pricing".to_owned(),
         long_context_threshold: 272_000,
+        tools: ToolRates {
+            web_search_per_1k: 10.00,
+        },
         models: BTreeMap::from([
             ("gpt-5.6-sol".to_owned(), sol.clone()),
             ("daybreak-blue-latest".to_owned(), sol),
@@ -196,6 +223,9 @@ impl RateCard {
     /// total. Every one of them leaves the row counting in
     /// `rowsMissingCost`.
     pub fn cost_of(&self, row: &UsageRow) -> Option<(f64, PricingBasis)> {
+        // A provider that billed the turn already billed its tool calls
+        // inside that figure. Adding an imputed search charge on top would charge
+        // the operator twice for one search.
         if row.cost_usd.is_some() {
             return None;
         }
@@ -210,7 +240,16 @@ impl RateCard {
             // request was priced. Refuse rather than guess.
             Some(_) => return None,
         };
-        Some((tier.cost(row), PricingBasis::ImputedApiRate))
+        Some((
+            tier.cost(row) + self.tool_cost(row),
+            PricingBasis::ImputedApiRate,
+        ))
+    }
+
+    /// Per-call charges for the server-side tools a row reported. Additive
+    /// to token cost, and zero when the capture counted no calls.
+    fn tool_cost(&self, row: &UsageRow) -> f64 {
+        (row.web_search_requests.unwrap_or(0) as f64) * self.tools.web_search_per_1k / 1_000.0
     }
 }
 
@@ -229,6 +268,7 @@ mod tests {
             cost_usd: None,
             pricing_basis: PricingBasis::None,
             rate_limit_used_percent: None,
+            web_search_requests: None,
         }
     }
 
@@ -275,6 +315,34 @@ mod tests {
             card.cost_of(&row("gpt-5.6-cyber", 10, 0, 10)).is_some(),
             "no long tier means the short rates are unconditional"
         );
+    }
+
+    #[test]
+    fn web_searches_are_charged_per_call_on_top_of_tokens() {
+        let card = default_rate_card();
+        let mut searched = row("gpt-5.6-sol", 1_000_000, 0, 0);
+        searched.web_search_requests = Some(40);
+        let base = card
+            .cost_of(&row("gpt-5.6-sol", 1_000_000, 0, 0))
+            .expect("prices")
+            .0;
+        let with_tools = card.cost_of(&searched).expect("prices").0;
+        // 40 calls at $10.00/1k.
+        assert!(
+            (with_tools - base - 0.40).abs() < 1e-9,
+            "{with_tools} vs {base}"
+        );
+    }
+
+    #[test]
+    fn a_billed_row_is_not_charged_again_for_its_searches() {
+        // Claude reports a billed cost that already covers its server-side
+        // tools. Imputing a search charge on top would bill twice for one
+        // search.
+        let mut billed = row("gpt-5.6-sol", 10, 0, 10);
+        billed.cost_usd = Some(0.5);
+        billed.web_search_requests = Some(500);
+        assert!(default_rate_card().cost_of(&billed).is_none());
     }
 
     #[test]

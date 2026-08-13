@@ -998,6 +998,7 @@ fn usage_row_json(row: &forged_ledger::UsageRecord) -> Value {
         "costUsd": row.cost_usd,
         "pricingBasis": row.pricing_basis,
         "rateLimitUsedPercent": row.rate_limit_used_percent,
+        "webSearchRequests": row.web_search_requests,
         "ts": row.ts,
     })
 }
@@ -1048,6 +1049,7 @@ pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             "pricing": {
                 "ratesAsOf": ctx.config.pricing.rates_as_of,
                 "source": ctx.config.pricing.source,
+                "webSearchPer1k": ctx.config.pricing.tools.web_search_per_1k,
             },
         }))
     })

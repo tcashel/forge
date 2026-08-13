@@ -30,7 +30,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 5);
+        assert_eq!(handle.join().expect("thread"), 6);
     }
 }
 
@@ -343,6 +343,7 @@ fn every_seam_member_is_consumable() {
             cost_usd: None,
             pricing_basis: None,
             rate_limit_used_percent: None,
+            web_search_requests: None,
         })
         .expect("record_usage");
     let totals = ledger.usage_totals(&run).expect("usage_totals");

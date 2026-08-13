@@ -76,6 +76,7 @@ impl ProviderDriver for CodexDriver {
     fn parse_usage(&self, stdout: &str, model: &str) -> Result<UsageCapture, ProviderError> {
         let mut session_ref: Option<String> = None;
         let mut last_turn: Option<Map<String, Value>> = None;
+        let mut web_searches = 0u64;
         for line in stdout.lines() {
             let Some(obj) = object_line(line) else {
                 continue;
@@ -87,6 +88,7 @@ impl ProviderDriver for CodexDriver {
                     }
                 }
                 Some("turn.completed") => last_turn = Some(obj),
+                Some("item.completed") if is_web_search_item(&obj) => web_searches += 1,
                 _ => {}
             }
         }
@@ -129,7 +131,25 @@ impl ProviderDriver for CodexDriver {
             cost_usd: None,
             pricing_basis: PricingBasis::None,
             rate_limit_used_percent: None,
+            web_search_requests: Some(web_searches),
         }];
         Ok(UsageCapture { session_ref, rows })
     }
+}
+
+/// Does this `item.completed` envelope describe a server-side web search?
+///
+/// Matched on a `web_search` prefix rather than one exact string. The
+/// rollout names the response item `web_search_call`, which is verified
+/// against real captures; the `codex exec --json` stream renames items as
+/// it emits them (`function_call` surfaces as `command_execution`), and no
+/// capture in hand performs a search, so its exact spelling is unverified.
+/// A prefix match counts `web_search` and `web_search_call` alike and
+/// costs nothing when neither appears.
+fn is_web_search_item(obj: &Map<String, Value>) -> bool {
+    obj.get("item")
+        .and_then(Value::as_object)
+        .and_then(|item| item.get("type"))
+        .and_then(Value::as_str)
+        .is_some_and(|kind| kind.starts_with("web_search"))
 }
