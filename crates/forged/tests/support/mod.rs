@@ -1068,6 +1068,23 @@ impl TestEnv {
         std::fs::write(front, existing).expect("seed frontier");
     }
 
+    /// Write one bd shim field for a bead (`description`, `acceptance`,
+    /// `design`, `notes`, `revision`, ...). Every field the shim's
+    /// `issue_json` reads is a file of the same name.
+    pub fn set_bead_field(&self, bead: &str, field: &str, value: &str) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{bead}.{field}")), value).expect("set bead field");
+    }
+
+    /// Seed a bead whose OWN fields are the spec — the supported route.
+    pub fn seed_bead_spec(&self, bead: &str, description: &str, acceptance: &str) {
+        self.set_bead_field(bead, "title", &format!("Bead {bead}"));
+        self.set_bead_field(bead, "description", description);
+        self.set_bead_field(bead, "acceptance", acceptance);
+        self.set_bead_field(bead, "status", "open");
+    }
+
     /// Set a bead's assignee in the bd shim state directly.
     pub fn set_assignee(&self, bead: &str, holder: &str) {
         let state = self.beads_dir.join("shim-state");
