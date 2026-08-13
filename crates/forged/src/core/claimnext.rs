@@ -27,9 +27,9 @@ struct Resumable {
     bead_id: String,
     packet_id: String,
     spec_path: String,
-    stage: forged_types::Stage,
     stage_key: String,
     logical_seq: i64,
+    stage_budget_s: u64,
     /// The packet's own provider hint — the `<provider>` segment of the
     /// attempt claimant this resume mints.
     provider: String,
@@ -138,14 +138,20 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
                 })?
         };
         let (_, stage_key, logical_seq) = crate::core::split_packet_key(&packet_id)?;
+        let stage_budget_s = view
+            .policy
+            .stage_budget_s
+            .get(&packet.stage)
+            .copied()
+            .ok_or_else(|| Failure::internal("run policy has no stage budget"))?;
         resumables.push(Resumable {
             run_id: run.run_id,
             bead_id: run.bead_id,
             packet_id,
             spec_path: packet.spec_path,
-            stage: packet.stage,
             stage_key,
             logical_seq,
+            stage_budget_s,
             provider,
         });
     }
@@ -174,13 +180,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // the bead under, else the derived holder. Never a second, differing
         // identity of our own making.
         let run_holder_id = lease_identity(&bd, &candidate.bead_id, &candidate.run_id).await?;
-        let budget = ctx
-            .config
-            .stage_budget_s
-            .get(&candidate.stage)
-            .copied()
-            .unwrap_or(1800);
-        let older_than = forged_beads::reclaim_older_than(budget);
+        let older_than = forged_beads::reclaim_older_than(candidate.stage_budget_s);
 
         // Scoped reclaim — `--id` and `--assignee` both mandatory; an
         // unscoped reclaim would rob every other worker. The previous holder

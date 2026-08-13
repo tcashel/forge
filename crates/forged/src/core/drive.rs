@@ -13,7 +13,9 @@ use forged_ledger::{EffectClass, OperationState, RunRow};
 use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
-use forged_types::{OperationRequest, OperationResponse, Outcome, Stage, Verdict};
+use forged_types::{
+    ExecutionPolicyV1, OperationRequest, OperationResponse, Outcome, Stage, Verdict,
+};
 use serde_json::{json, Map, Value};
 
 use crate::adapters::execute::{
@@ -30,8 +32,18 @@ use crate::failpoint;
 /// frozen compatibility roster; legacy runs fall back to the once-read config.
 pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
     let legacy_roster = ctx.config.roster.clone();
-    let gate_commands = ctx.config.gate_commands.clone();
-    let budget = ctx.config.transport_retry_budget;
+    let legacy_policy = ExecutionPolicyV1 {
+        gate_commands: ctx.config.gate_commands.clone(),
+        stage_budget_s: ctx
+            .config
+            .stage_budget_s
+            .iter()
+            .map(|(stage, budget)| (*stage, *budget))
+            .collect(),
+        transport_retry_budget: ctx.config.transport_retry_budget,
+        host_policy: ctx.config.host_policy,
+        herdr_socket: ctx.config.herdr_sock.clone(),
+    };
     let run_id = run_id.to_owned();
     let now = now_iso();
     let ledger = ctx.ledger.clone();
@@ -45,7 +57,7 @@ pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
                 })?,
             None => legacy_roster,
         };
-        forged_proto::project_run(&ledger, &run_id, roster, gate_commands, budget, &now)
+        forged_proto::project_run_with_policy(&ledger, &run_id, roster, legacy_policy, &now)
             .map_err(Failure::from)
     })
     .await
@@ -308,7 +320,21 @@ async fn honor(
             let spec_path = spec_path_of(ctx, &view.run.run_id).await?;
             let spec_sha = sha256_file(std::path::Path::new(&spec_path))?;
             for intent in intents {
-                let packet = build_packet(ctx, &view.run, intent, &spec_path, &spec_sha);
+                let budget = view
+                    .policy
+                    .stage_budget_s
+                    .get(&intent.stage)
+                    .copied()
+                    .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+                let packet = build_packet(
+                    ctx,
+                    &view.run,
+                    intent,
+                    &spec_path,
+                    &spec_sha,
+                    &view.policy.gate_commands,
+                    budget,
+                );
                 open_packet_op(ctx, &view.run, &packet).await?;
             }
             Ok(Honored::Progressed)
@@ -401,8 +427,13 @@ async fn honor_await(
             Some(_) => {
                 // A corpse: run one reconcile pass so the saga revokes it.
                 let config = forged_proto::ReconcileConfig {
-                    stage_budget_s: ctx.config.stage_budget_s.clone(),
-                    gate_commands: ctx.config.gate_commands.clone(),
+                    stage_budget_s: view
+                        .policy
+                        .stage_budget_s
+                        .iter()
+                        .map(|(stage, budget)| (*stage, *budget))
+                        .collect(),
+                    gate_commands: view.policy.gate_commands.clone(),
                 };
                 let now = now_iso();
                 forged_proto::reconcile(&ctx.ledger, &view.run.run_id, ports, &config, &now)
@@ -532,6 +563,8 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
         findings: latest_review_findings(view),
         review_evidence: latest_review_evidence(view),
         push_url: push_url_of(&view.run.repo).await,
+        host_policy: view.policy.host_policy,
+        herdr_socket: view.policy.herdr_socket.clone(),
     })
 }
 
@@ -569,15 +602,19 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         params,
     };
     let run = run.clone();
-    let resp = fenced(
-        ctx,
-        step.as_str(),
-        class,
-        &req,
-        None,
-        move |op_id| async move { machine_effect(ctx, &run, step, round, &op_id).await },
-    )
-    .await;
+    let gate_commands = view.policy.gate_commands.clone();
+    let resp =
+        fenced(
+            ctx,
+            step.as_str(),
+            class,
+            &req,
+            None,
+            move |op_id| async move {
+                machine_effect(ctx, &run, step, round, &op_id, &gate_commands).await
+            },
+        )
+        .await;
     if resp.ok {
         Ok(())
     } else {
@@ -627,6 +664,7 @@ async fn machine_effect(
     step: MachineStage,
     round: u32,
     op_id: &str,
+    gate_commands: &[String],
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
@@ -670,7 +708,7 @@ async fn machine_effect(
                 .join("artifacts")
                 .join(format!("{}-{op_id}", step.as_str()));
             let request = GateRequest::new(
-                ctx.config.gate_commands.clone(),
+                gate_commands.to_vec(),
                 ctx.config.worktree(&run.run_id),
                 artifacts,
             );

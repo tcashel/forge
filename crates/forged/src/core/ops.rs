@@ -4,9 +4,11 @@
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, RunState};
+use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, OperationState, RunState};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
-use forged_types::{ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket};
+use forged_types::{
+    request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
+};
 use serde_json::{json, Value};
 
 use crate::adapters::execute::sha256_file;
@@ -178,6 +180,33 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 /// explicit child generation id) and fill `NewRun` from the config plus the
 /// `--repo`, `--spec`, and `--base-ref` arguments.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let compiled = match ctx.config.compile_definition(
+        param_opt_str(&req.params, "profile"),
+        param_opt_str(&req.params, "roster"),
+    ) {
+        Ok(compiled) => compiled,
+        Err(errors) => {
+            return err_response(
+                &derive_key("run_start", None, None, None),
+                &Failure::invalid(format!(
+                    "execution definition is invalid: {}",
+                    serde_json::to_string(&errors)
+                        .unwrap_or_else(|_| "validation failed".to_owned())
+                )),
+            )
+        }
+    };
+    run_start_with_definition(ctx, req, compiled).await
+}
+
+/// Start a run from an owned, already-compiled definition. This is the
+/// epic scheduler boundary: child creation never resolves mutable authoring
+/// names again.
+pub(crate) async fn run_start_with_definition(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    compiled: crate::config::CompiledDefinition,
+) -> OperationResponse {
     let bead = match param_str(&req.params, "bead") {
         Ok(v) => v.to_owned(),
         Err(f) => return err_response(&derive_key("run_start", None, None, None), &f),
@@ -199,6 +228,51 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     if req.run_id.is_none() {
         req.run_id = Some(run_id.as_str().to_owned());
     }
+    // Pre-policy binaries fenced run_start before packageSha256 joined the
+    // request. A terminal row with that exact legacy hash must replay its
+    // stored response verbatim; only new/current operations use the augmented
+    // request identity below.
+    let legacy_hash = match request_sha256(req) {
+        Ok(hash) => hash,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+            )
+        }
+    };
+    let existing = {
+        let key = req.idempotency_key.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation("run_start", &key)
+        })
+        .await
+    };
+    match existing {
+        Ok(Some(row))
+            if row.state == OperationState::Terminal && row.request_sha256 == legacy_hash =>
+        {
+            return fenced(
+                ctx,
+                "run_start",
+                EffectClass::SafeRetry,
+                req,
+                None,
+                |_operation| async {
+                    Err(Failure::internal(
+                        "terminal legacy run_start replay unexpectedly executed",
+                    ))
+                },
+            )
+            .await;
+        }
+        Ok(_) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+    req.params.insert(
+        "packageSha256".to_owned(),
+        Value::String(compiled.package_sha256.clone()),
+    );
     let params = req.params.clone();
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |_op| async move {
@@ -216,19 +290,6 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 Some(base) => base.to_owned(),
                 None => default_branch_of(&repo).await,
             };
-            let compiled = ctx
-                .config
-                .compile_definition(
-                    param_opt_str(&params, "profile"),
-                    param_opt_str(&params, "roster"),
-                )
-                .map_err(|errors| {
-                    Failure::invalid(format!(
-                        "execution definition is invalid: {}",
-                        serde_json::to_string(&errors)
-                            .unwrap_or_else(|_| "validation failed".to_owned())
-                    ))
-                })?;
             let branch = format!("forged/{run_id}");
             let new_run = NewRun {
                 run_id: run_id.clone(),
@@ -314,7 +375,10 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let definition = match definition {
-            Some(row) => json!({
+            Some(row) => {
+                let package: forged_types::ExecutionPackageV1 = serde_json::from_str(&row.package_json)
+                    .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
+                json!({
                 "protocolRef": serde_json::from_str::<Value>(&row.protocol_ref_json)
                     .map_err(|error| Failure::internal(format!("stored protocol ref: {error}")))?,
                 "profileRef": serde_json::from_str::<Value>(&row.profile_ref_json)
@@ -330,7 +394,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     .transpose()
                     .map_err(|error| Failure::internal(format!("stored roster ref: {error}")))?,
                 "activeRosterSha256": revision.as_ref().map(|value| &value.roster_sha256),
-            }),
+                "policy": package.policy,
+            })},
             None => Value::Null,
         };
         let execution = view.execution_package.as_ref().map(|package| {
@@ -466,6 +531,7 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
                     "rosterSha256": package.roster_sha256,
                     "roles": package.roster.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
                     "seats": package.profile.seats,
+                    "policy": package.policy,
                 }))
             }
             Err(errors) => Ok(json!({"valid": false, "errors": errors})),
@@ -841,6 +907,11 @@ pub async fn gate_run(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
     if req.run_id.is_none() {
         req.run_id = Some(run_id.clone());
     }
+    let view = match crate::core::drive::project(ctx, &run_id).await {
+        Ok(view) => view,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    let gate_commands = view.policy.gate_commands;
     fenced(ctx, "gate_run", EffectClass::SafeRetry, req, None, {
         move |op_id| async move {
             let artifacts = ctx
@@ -848,11 +919,7 @@ pub async fn gate_run(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
                 .run_dir(&run_id)
                 .join("artifacts")
                 .join(format!("gate_run-{op_id}"));
-            let request = GateRequest::new(
-                ctx.config.gate_commands.clone(),
-                ctx.config.worktree(&run_id),
-                artifacts,
-            );
+            let request = GateRequest::new(gate_commands, ctx.config.worktree(&run_id), artifacts);
             let outcome = forged_gate::run_gates(&request).await?;
             Ok(json!({
                 "gates": serde_json::to_value(&outcome.rows)
@@ -887,9 +954,10 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
     fenced(ctx, "reconcile", EffectClass::SafeRetry, req, None, {
         move |_op| async move {
             let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+            let view = crate::core::drive::project(ctx, &run_id).await?;
             let config = forged_proto::ReconcileConfig {
-                stage_budget_s: ctx.config.stage_budget_s.clone(),
-                gate_commands: ctx.config.gate_commands.clone(),
+                stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
+                gate_commands: view.policy.gate_commands,
             };
             let now = now_iso();
             let report =

@@ -127,6 +127,28 @@ fn duplicate_run_and_missing_run_refuse() {
 }
 
 #[test]
+fn event_kind_once_rejects_a_competing_payload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-kind-once");
+    assert!(ledger
+        .append_event_kind_once(&run, "upgrade.once", json!({"snapshot": 1}))
+        .expect("first append"));
+    assert!(!ledger
+        .append_event_kind_once(&run, "upgrade.once", json!({"snapshot": 2}))
+        .expect("competing append"));
+    let events = ledger
+        .list_events_by_kind("upgrade.once")
+        .expect("events by kind");
+    assert_eq!(events.len(), 1);
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&events[0].payload_json).expect("event payload"),
+        json!({"snapshot": 1})
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
 fn idempotency_replays_byte_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

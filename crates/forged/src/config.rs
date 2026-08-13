@@ -11,9 +11,10 @@ use std::path::PathBuf;
 
 use forged_types::{
     canonical_json_bytes, Capability, DefinitionError, EscalationTrigger, ExecutionPackageV1,
-    ProfileDefinitionV1, ProfileRef, ProtocolRef, ProviderCandidateV1, ProviderHints,
-    RosterDefinitionV1, RosterRef, Sandbox, SeatDefinitionV1, SeatId, SeatPurpose, Stage,
-    EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1, ROSTER_SCHEMA_V1,
+    ExecutionPolicyV1, HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef,
+    ProviderCandidateV1, ProviderHints, ResolvedRosterV1, RosterDefinitionV1, RosterRef, Sandbox,
+    SeatDefinitionV1, SeatId, SeatPurpose, Stage, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1,
+    ROSTER_SCHEMA_V1,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -46,21 +47,11 @@ pub struct ForgedConfig {
     pub bd_path: PathBuf,
     pub beads_dir: PathBuf,
     pub codex_home: PathBuf,
-    pub host_policy: HostPolicy,
+    pub host_policy: HostPolicyV1,
     pub herdr_sock: Option<PathBuf>,
 }
 
-/// How provider sessions use Herdr.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase")]
-pub enum HostPolicy {
-    /// Prefer Herdr and visibly fall back to a plain process when unavailable.
-    Preferred,
-    /// Require Herdr; unavailability refuses execution.
-    Required,
-    /// Never contact Herdr.
-    Off,
-}
+pub use forged_types::HostPolicyV1 as HostPolicy;
 
 /// On-disk authoring shape. Definition values themselves deny unknown fields.
 /// Unknown top-level `_comment_*` keys from v0 JSON are intentionally ignored.
@@ -88,7 +79,7 @@ struct ConfigFile {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     codex_home: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
-    host_policy: Option<HostPolicy>,
+    host_policy: Option<HostPolicyV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr_sock: Option<String>,
 }
@@ -269,6 +260,14 @@ fn default_stage_budget_s() -> HashMap<Stage, u64> {
     ])
 }
 
+fn resolve_stage_budget_s(overrides: Option<HashMap<Stage, u64>>) -> HashMap<Stage, u64> {
+    let mut budgets = default_stage_budget_s();
+    if let Some(overrides) = overrides {
+        budgets.extend(overrides);
+    }
+    budgets
+}
+
 const DEFAULT_TRANSPORT_RETRY_BUDGET: u32 = 3;
 
 fn anvil_home() -> PathBuf {
@@ -297,6 +296,29 @@ fn config_path(anvil_home: &std::path::Path) -> PathBuf {
 }
 
 impl ForgedConfig {
+    /// Resolve and validate the non-cognitive policy frozen into every new
+    /// package. Upgrade code uses the same boundary to snapshot policy for
+    /// packages written before policy became part of the schema.
+    pub fn execution_policy(&self) -> Result<ExecutionPolicyV1, Vec<DefinitionError>> {
+        let policy = ExecutionPolicyV1 {
+            gate_commands: self.gate_commands.clone(),
+            stage_budget_s: self
+                .stage_budget_s
+                .iter()
+                .map(|(stage, budget)| (*stage, *budget))
+                .collect(),
+            transport_retry_budget: self.transport_retry_budget,
+            host_policy: self.host_policy,
+            herdr_socket: self.herdr_sock.clone(),
+        };
+        let errors = policy.validate();
+        if errors.is_empty() {
+            Ok(policy)
+        } else {
+            Err(errors)
+        }
+    }
+
     /// Load and resolve the single config snapshot for this process.
     pub fn load() -> Result<ForgedConfig, String> {
         let anvil_home = anvil_home();
@@ -361,14 +383,14 @@ impl ForgedConfig {
                 .unwrap_or_else(|| "standard".to_owned()),
             default_roster: file.default_roster.unwrap_or_else(|| "default".to_owned()),
             gate_commands: file.gate_commands.unwrap_or_else(default_gate_commands),
-            stage_budget_s: file.stage_budget_s.unwrap_or_else(default_stage_budget_s),
+            stage_budget_s: resolve_stage_budget_s(file.stage_budget_s),
             transport_retry_budget: file
                 .transport_retry_budget
                 .unwrap_or(DEFAULT_TRANSPORT_RETRY_BUDGET),
             bd_path,
             beads_dir,
             codex_home,
-            host_policy: file.host_policy.unwrap_or(HostPolicy::Preferred),
+            host_policy: file.host_policy.unwrap_or(HostPolicyV1::Preferred),
             herdr_sock,
             anvil_home,
         })
@@ -454,6 +476,7 @@ impl ForgedConfig {
             return Err(errors);
         }
         let resolved = roster.resolve();
+        let policy = self.execution_policy()?;
         let profile_sha256 = digest_of(&profile).map_err(|message| {
             vec![DefinitionError {
                 path: "$.profile".to_owned(),
@@ -482,6 +505,7 @@ impl ForgedConfig {
             profile,
             profile_catalog,
             roster: resolved,
+            policy,
         };
         let package_sha256 = digest_of(&package).map_err(|message| {
             vec![DefinitionError {
@@ -565,7 +589,7 @@ impl ForgedConfig {
                     .to_string_lossy()
                     .into_owned(),
             ),
-            host_policy: Some(HostPolicy::Preferred),
+            host_policy: Some(HostPolicyV1::Preferred),
             herdr_sock: self
                 .herdr_sock
                 .as_ref()
@@ -604,6 +628,95 @@ impl ForgedConfig {
             .join(stage_key)
             .join(seq.to_string())
     }
+}
+
+/// Validate and hash an already-resolved package without consulting
+/// authoring configuration. Epic children use this after overlaying an
+/// explicit roster revision on their frozen template.
+pub fn compile_frozen_package(
+    package: ExecutionPackageV1,
+) -> Result<CompiledDefinition, Vec<DefinitionError>> {
+    let mut errors = Vec::new();
+    if package.schema != EXECUTION_PACKAGE_SCHEMA_V1 {
+        errors.push(DefinitionError {
+            path: "$.schema".to_owned(),
+            message: format!("unsupported schema {:?}", package.schema),
+        });
+    }
+    errors.extend(package.profile.validate());
+    errors.extend(package.policy.validate());
+    if package.profile_ref.name != package.profile.name || package.profile_ref.version != 1 {
+        errors.push(DefinitionError {
+            path: "$.profileRef".to_owned(),
+            message: "profile ref does not match frozen profile".to_owned(),
+        });
+    }
+    if package.roster_ref != package.roster.roster_ref {
+        errors.push(DefinitionError {
+            path: "$.rosterRef".to_owned(),
+            message: "roster ref does not match resolved roster".to_owned(),
+        });
+    }
+    let roster = RosterDefinitionV1 {
+        schema: ROSTER_SCHEMA_V1.to_owned(),
+        name: package.roster_ref.name.clone(),
+        roles: package.roster.roles.clone(),
+    };
+    let profiles = if package.profile_catalog.is_empty() {
+        vec![&package.profile]
+    } else {
+        package.profile_catalog.values().collect()
+    };
+    for profile in profiles {
+        errors.extend(profile.validate());
+        errors.extend(roster.validate_for(profile));
+    }
+    let compatibility_roster =
+        match compatibility_projection_resolved(&package.profile, &package.roster) {
+            Ok(value) => value,
+            Err(error) => {
+                errors.push(error);
+                HashMap::new()
+            }
+        };
+    let profile_sha256 = digest_of(&package.profile).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.profile".to_owned(),
+            message,
+        }]
+    })?;
+    if profile_sha256 != package.profile_sha256 {
+        errors.push(DefinitionError {
+            path: "$.profileSha256".to_owned(),
+            message: "profile digest mismatch".to_owned(),
+        });
+    }
+    let roster_sha256 = digest_of(&package.roster).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.roster".to_owned(),
+            message,
+        }]
+    })?;
+    if roster_sha256 != package.roster_sha256 {
+        errors.push(DefinitionError {
+            path: "$.rosterSha256".to_owned(),
+            message: "roster digest mismatch".to_owned(),
+        });
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    let package_sha256 = digest_of(&package).map_err(|message| {
+        vec![DefinitionError {
+            path: "$".to_owned(),
+            message,
+        }]
+    })?;
+    Ok(CompiledDefinition {
+        package,
+        package_sha256,
+        compatibility_roster,
+    })
 }
 
 fn compatibility_projection(
@@ -651,6 +764,20 @@ fn compatibility_projection(
         ),
         (Stage::Fix, candidate(fixes[0])?),
     ]))
+}
+
+fn compatibility_projection_resolved(
+    profile: &ProfileDefinitionV1,
+    roster: &ResolvedRosterV1,
+) -> Result<HashMap<Stage, ProviderHints>, DefinitionError> {
+    compatibility_projection(
+        profile,
+        &RosterDefinitionV1 {
+            schema: ROSTER_SCHEMA_V1.to_owned(),
+            name: roster.roster_ref.name.clone(),
+            roles: roster.roles.clone(),
+        },
+    )
 }
 
 fn digest_of<T: Serialize>(value: &T) -> Result<String, String> {
@@ -757,6 +884,40 @@ mod tests {
     }
 
     #[test]
+    fn execution_policy_change_changes_package_digest() {
+        let cfg = config();
+        let first = cfg.compile_definition(None, None).expect("compile");
+        let mut changed = cfg.clone();
+        changed.gate_commands = vec!["just ci".to_owned()];
+        changed.stage_budget_s.insert(Stage::Implement, 42);
+        changed.transport_retry_budget = 7;
+        changed.host_policy = HostPolicy::Off;
+        changed.herdr_sock = None;
+        let second = changed.compile_definition(None, None).expect("compile");
+        assert_ne!(first.package_sha256, second.package_sha256);
+        assert_eq!(second.package.policy.gate_commands, ["just ci"]);
+        assert_eq!(second.package.policy.stage_budget_s[&Stage::Implement], 42);
+        assert_eq!(second.package.policy.transport_retry_budget, 7);
+        assert_eq!(second.package.policy.host_policy, HostPolicy::Off);
+    }
+
+    #[test]
+    fn frozen_package_recompiles_without_authoring_config() {
+        let cfg = config();
+        let original = cfg.compile_definition(Some("lean"), None).expect("compile");
+        let (roster, roster_sha256) = cfg
+            .compile_roster_revision(&original.package, "default")
+            .expect("revision");
+        let mut package = original.package;
+        package.roster_ref = roster.roster_ref.clone();
+        package.roster_sha256 = roster_sha256;
+        package.roster = roster;
+        let recompiled = compile_frozen_package(package).expect("frozen compile");
+        assert_eq!(recompiled.package.profile_ref.name, "lean");
+        assert_eq!(recompiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
     fn ledger_inserts_definition_and_revision_atomically_and_checks_digest() {
         let cfg = config();
         let compiled = cfg.compile_definition(None, None).expect("compile");
@@ -814,6 +975,59 @@ mod tests {
     }
 
     #[test]
+    fn epic_roster_batch_rolls_back_every_child_and_event_on_refusal() {
+        let cfg = config();
+        let compiled = cfg.compile_definition(None, None).expect("compile");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = forged_ledger::Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        ledger
+            .create_run_with_definition(
+                forged_ledger::NewRun {
+                    run_id: forged_types::RunId::new("child-a").expect("run id"),
+                    bead_id: "child-a".to_owned(),
+                    repo: "/tmp/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: "forged/child-a".to_owned(),
+                },
+                forged_ledger::NewRunDefinition {
+                    package: compiled.package.clone(),
+                    package_sha256: compiled.package_sha256,
+                    compatibility_roster: compiled.compatibility_roster,
+                },
+            )
+            .expect("create child");
+        let error = ledger
+            .append_roster_revisions_with_event(forged_ledger::RosterRevisionBatch {
+                epic_id: "epic-a".to_owned(),
+                event_kind: "forged.epic.roster.revised".to_owned(),
+                event_payload: serde_json::json!({"revision": 2}),
+                run_ids: vec!["child-a".to_owned(), "missing-child".to_owned()],
+                roster: compiled.package.roster.clone(),
+                roster_sha256: compiled.package.roster_sha256,
+                reason: "provider outage".to_owned(),
+                operation_prefix: "epic-roster:epic-a:2".to_owned(),
+            })
+            .expect_err("missing child refuses the transaction");
+        assert_eq!(error.code(), forged_types::ErrorCode::RunNotFound);
+        assert_eq!(
+            ledger
+                .latest_roster_revision("child-a")
+                .expect("revision")
+                .expect("initial revision")
+                .revision,
+            1,
+            "the earlier child insert rolled back"
+        );
+        assert!(
+            ledger
+                .list_events(Some("epic-a"), 0, 100)
+                .expect("events")
+                .is_empty(),
+            "the governing event rolled back with its child rows"
+        );
+    }
+
+    #[test]
     fn every_default_topology_has_a_storage_projection() {
         let cfg = config();
         for profile in ["lean", "standard", "high"] {
@@ -852,5 +1066,14 @@ mod tests {
         let stamp = now_iso();
         assert_eq!(stamp.len(), 30, "{stamp}");
         assert!(stamp.ends_with('Z'));
+    }
+
+    #[test]
+    fn partial_stage_budgets_overlay_the_legacy_defaults() {
+        let budgets = resolve_stage_budget_s(Some(HashMap::from([(Stage::Implement, 42)])));
+        assert_eq!(budgets[&Stage::Implement], 42);
+        for stage in [Stage::ReviewClaude, Stage::ReviewCodex, Stage::Fix] {
+            assert_eq!(budgets[&stage], 1800, "missing {stage:?} keeps its default");
+        }
     }
 }

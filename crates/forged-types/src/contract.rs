@@ -6,10 +6,11 @@
 //! canonical JSON form is durable runtime truth.
 
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
-use crate::Sandbox;
+use crate::{Sandbox, Stage};
 
 /// The only execution-package schema understood by this binary.
 pub const EXECUTION_PACKAGE_SCHEMA_V1: &str = "forged.execution-package/1";
@@ -213,6 +214,32 @@ pub struct SeatExecutionV1 {
     pub round: u8,
 }
 
+/// How a run's controller and provider attempts use Herdr.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum HostPolicyV1 {
+    /// Prefer an observable Herdr pane and record a process fallback.
+    Preferred,
+    /// Refuse execution when the configured Herdr endpoint is unavailable.
+    Required,
+    /// Use a plain owned process without contacting Herdr.
+    Off,
+}
+
+/// Immutable non-cognitive policy resolved when a run starts.
+///
+/// Authoring configuration may change later; execution, recovery, and
+/// detached controllers consume only this snapshot from the hashed package.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionPolicyV1 {
+    pub gate_commands: Vec<String>,
+    pub stage_budget_s: BTreeMap<Stage, u64>,
+    pub transport_retry_budget: u32,
+    pub host_policy: HostPolicyV1,
+    pub herdr_socket: Option<PathBuf>,
+}
+
 /// Durable runtime truth for one run.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -228,6 +255,7 @@ pub struct ExecutionPackageV1 {
     #[serde(default)]
     pub profile_catalog: BTreeMap<String, ProfileDefinitionV1>,
     pub roster: ResolvedRosterV1,
+    pub policy: ExecutionPolicyV1,
 }
 
 /// One explicit, append-only roster change for an existing run.
@@ -330,6 +358,46 @@ impl ProfileDefinitionV1 {
             errors.push(DefinitionError::at(
                 "$.profile.escalateOn",
                 "escalation triggers must be unique",
+            ));
+        }
+        errors
+    }
+}
+
+impl ExecutionPolicyV1 {
+    /// Validate the complete policy snapshot before it becomes durable.
+    pub fn validate(&self) -> Vec<DefinitionError> {
+        let mut errors = Vec::new();
+        for stage in [
+            Stage::Implement,
+            Stage::ReviewClaude,
+            Stage::ReviewCodex,
+            Stage::Fix,
+        ] {
+            match self.stage_budget_s.get(&stage) {
+                Some(0) => errors.push(DefinitionError::at(
+                    format!("$.policy.stageBudgetS.{stage:?}"),
+                    "stage budget must be greater than zero",
+                )),
+                Some(_) => {}
+                None => errors.push(DefinitionError::at(
+                    format!("$.policy.stageBudgetS.{stage:?}"),
+                    "stage budget is missing",
+                )),
+            }
+        }
+        for (index, command) in self.gate_commands.iter().enumerate() {
+            if command.trim().is_empty() {
+                errors.push(DefinitionError::at(
+                    format!("$.policy.gateCommands[{index}]"),
+                    "gate command must not be empty",
+                ));
+            }
+        }
+        if self.host_policy == HostPolicyV1::Required && self.herdr_socket.is_none() {
+            errors.push(DefinitionError::at(
+                "$.policy.herdrSocket",
+                "required Herdr policy needs an explicit socket",
             ));
         }
         errors

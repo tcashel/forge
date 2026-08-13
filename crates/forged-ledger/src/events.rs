@@ -72,6 +72,35 @@ impl Ledger {
         })
     }
 
+    /// Append one event only when that run has no event of the same kind.
+    ///
+    /// Unlike [`Ledger::append_event_once`], payload differences do not make
+    /// a second insert eligible. Upgrade boundaries use this form so two
+    /// concurrent binaries with different authoring config cannot record two
+    /// competing snapshots.
+    pub fn append_event_kind_once(
+        &self,
+        run_id: &str,
+        kind: &str,
+        payload: serde_json::Value,
+    ) -> Result<bool, LedgerError> {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let exists: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2)",
+                rusqlite::params![run_id, kind],
+                |row| row.get(0),
+            )?;
+            if !exists {
+                append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            }
+            tx.commit()?;
+            Ok(!exists)
+        })
+    }
+
     /// Rows with `event_id > after_event_id` (exclusive), ordered by
     /// `event_id` ascending, at most `limit` rows; `limit == 0` returns an
     /// empty vec. `run_id: None` returns all rows including NULL-run rows;
@@ -106,6 +135,30 @@ impl Ledger {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    /// All rows of one event kind, ordered by append position.
+    ///
+    /// Upgrade projectors use this indexed seam instead of rescanning the
+    /// complete event history on every process start.
+    pub fn list_events_by_kind(&self, kind: &str) -> Result<Vec<EventRow>, LedgerError> {
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                 WHERE kind = ?1 ORDER BY event_id ASC",
+            )?;
+            let rows = statement.query_map([kind], |row| {
+                Ok(EventRow {
+                    event_id: row.get(0)?,
+                    ts: row.get(1)?,
+                    run_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload_json: row.get(4)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 }

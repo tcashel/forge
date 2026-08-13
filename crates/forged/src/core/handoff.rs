@@ -324,6 +324,8 @@ async fn spawn(
     repo: &str,
     scope: Scope,
     generation: u32,
+    host_policy: HostPolicy,
+    herdr_socket: Option<PathBuf>,
 ) -> Result<Value, Failure> {
     let dir = controller_dir(ctx, id);
     std::fs::create_dir_all(&dir)
@@ -337,10 +339,10 @@ async fn spawn(
     let status_base = dir.join("status").join(generation.to_string());
 
     let (host, host_kind, socket_path): (Box<dyn SessionHost>, &str, Option<String>) =
-        match ctx.config.host_policy {
+        match host_policy {
             HostPolicy::Off => (Box::new(ProcessHost::new(&status_base)), "process", None),
-            HostPolicy::Preferred | HostPolicy::Required => match ctx.config.herdr_sock.as_ref() {
-                None if ctx.config.host_policy == HostPolicy::Required => {
+            HostPolicy::Preferred | HostPolicy::Required => match herdr_socket.as_ref() {
+                None if host_policy == HostPolicy::Required => {
                     return Err(Failure::refused(
                         ErrorCode::HostUnavailable,
                         "Herdr is required but no socket is configured",
@@ -357,7 +359,7 @@ async fn spawn(
                         "herdr",
                         Some(socket.to_string_lossy().into_owned()),
                     ),
-                    Err(error) if ctx.config.host_policy == HostPolicy::Preferred => {
+                    Err(error) if host_policy == HostPolicy::Preferred => {
                         record_fallback(ctx, id, scope, generation, &error.to_string()).await?;
                         (Box::new(ProcessHost::new(&status_base)), "process", None)
                     }
@@ -653,6 +655,16 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     }
 
     let next_generation = max_generation.saturating_add(1);
+    let (host_policy, herdr_socket) = match scope {
+        Scope::Run => match super::drive::project(ctx, &id).await {
+            Ok(view) => (view.policy.host_policy, view.policy.herdr_socket),
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        },
+        Scope::Epic => match super::epic::epic_host_policy(ctx, &id).await {
+            Ok(policy) => policy,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        },
+    };
     default_key(
         req,
         derive_key(
@@ -664,7 +676,16 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     );
     fenced(ctx, scope.operation(), EffectClass::SafeRetry, req, None, {
         move |_operation| async move {
-            let controller = spawn(ctx, &id, &repo, scope, next_generation).await?;
+            let controller = spawn(
+                ctx,
+                &id,
+                &repo,
+                scope,
+                next_generation,
+                host_policy,
+                herdr_socket,
+            )
+            .await?;
             Ok(json!({"submitted": true, "alreadyRunning": false, "controller": controller}))
         }
     })

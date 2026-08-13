@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twenty-seven public core functions, the CLI path and the MCP tool path produce
+//! the twenty-eight public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twenty_seven_tools_match_their_cli_counterparts() {
+fn all_twenty_eight_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -52,6 +52,7 @@ fn all_twenty_seven_tools_match_their_cli_counterparts() {
         "epic_pause",
         "epic_resolve",
         "epic_resume",
+        "epic_revise_roster",
         "epic_start",
         "epic_status",
         "epic_submit",
@@ -71,7 +72,7 @@ fn all_twenty_seven_tools_match_their_cli_counterparts() {
         "usage_report",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-seven tools, exactly");
+    assert_eq!(tools, expected, "the twenty-eight tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -258,6 +259,34 @@ fn all_twenty_seven_tools_match_their_cli_counterparts() {
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "epic_resolve parity");
+
+    let cli = env
+        .forged(&[
+            "epic",
+            "revise-roster",
+            "--epic",
+            "absent-epic",
+            "--roster",
+            "default",
+            "--reason",
+            "provider access changed",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "epic_revise_roster",
+        json!({
+            "schemaVersion": 1, "runId": "absent-epic",
+            "params": {
+                "epic": "absent-epic", "roster": "default",
+                "reason": "provider access changed"
+            }
+        }),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "epic_revise_roster parity"
+    );
 
     // packet_claim: an absent packet refuses identically.
     let cli = env

@@ -80,6 +80,11 @@ async fn run(args: cli::Cli) -> i32 {
         }
     };
     let ctx = Arc::new(Ctx { config, ledger });
+    if let Err(failure) = core::migrate_legacy_state(&ctx).await {
+        let code = pre_dispatch_failure(name, failure.code, failure.message);
+        close(&ctx);
+        return code;
+    }
 
     if matches!(args.command, cli::Command::Mcp) {
         let result = mcp::serve(Arc::clone(&ctx)).await;

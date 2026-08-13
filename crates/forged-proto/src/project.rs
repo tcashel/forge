@@ -13,7 +13,8 @@ use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{AttemptState, EventRow, Ledger, OperationRow, OperationState};
 use forged_types::{
-    EscalationTrigger, ExecutionPackageV1, PacketResult, ProviderHints, ResolvedRosterV1, Stage,
+    EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, HostPolicyV1, PacketResult,
+    ProviderHints, ResolvedRosterV1, Stage,
 };
 use serde_json::Value;
 
@@ -44,15 +45,47 @@ pub(crate) fn fetch_all_events(ledger: &Ledger, run_id: &str) -> Result<Vec<Even
     }
 }
 
-/// Project one run into the engine's input. The roster, gate commands, and
-/// transport-retry budget are caller-supplied and threaded through
-/// unchanged, as is `now` — time is an input, never a read.
+/// Project one run into the engine's input. Definition-backed runs take
+/// execution policy from their stored package; caller values are only the
+/// compatibility defaults for legacy rows. Time remains an explicit input.
 pub fn project_run(
     ledger: &Ledger,
     run_id: &str,
     roster: HashMap<Stage, ProviderHints>,
     gate_commands: Vec<String>,
     transport_retry_budget: u32,
+    now: &str,
+) -> Result<RunView, ProtoError> {
+    project_run_with_policy(
+        ledger,
+        run_id,
+        roster,
+        ExecutionPolicyV1 {
+            gate_commands,
+            stage_budget_s: [
+                Stage::Implement,
+                Stage::ReviewClaude,
+                Stage::ReviewCodex,
+                Stage::Fix,
+            ]
+            .into_iter()
+            .map(|stage| (stage, 1_800))
+            .collect(),
+            transport_retry_budget,
+            host_policy: HostPolicyV1::Off,
+            herdr_socket: None,
+        },
+        now,
+    )
+}
+
+/// Project a run while supplying the legacy policy used only when the run
+/// predates durable execution packages.
+pub fn project_run_with_policy(
+    ledger: &Ledger,
+    run_id: &str,
+    roster: HashMap<Stage, ProviderHints>,
+    legacy_policy: ExecutionPolicyV1,
     now: &str,
 ) -> Result<RunView, ProtoError> {
     let run = ledger.get_run(run_id)?;
@@ -89,6 +122,10 @@ pub fn project_run(
         }
         None => None,
     };
+    let policy = execution_package
+        .as_ref()
+        .map(|package| package.policy.clone())
+        .unwrap_or(legacy_policy);
     Ok(RunView {
         run,
         packets,
@@ -98,8 +135,7 @@ pub fn project_run(
         settled_operations,
         proto_events,
         roster,
-        gate_commands,
-        transport_retry_budget,
+        policy,
         now: now.to_owned(),
         execution_package,
         active_roster_revision,

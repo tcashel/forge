@@ -122,6 +122,8 @@ pub enum EpicCmd {
     Resume(EpicReasonArgs),
     /// Resolve a held child after its spec/input was adjudicated.
     Resolve(EpicResolveArgs),
+    /// Append a roster revision for current and future child runs.
+    ReviseRoster(EpicReviseRosterArgs),
 }
 
 /// `epic start` flags.
@@ -187,6 +189,23 @@ pub struct EpicResolveArgs {
     /// Resolution note recorded in the epic stream.
     #[arg(long)]
     pub note: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `epic revise-roster` flags.
+#[derive(Debug, Args)]
+pub struct EpicReviseRosterArgs {
+    /// Durable epic id.
+    #[arg(long)]
+    pub epic: String,
+    /// Named roster from authoring config, resolved once for this revision.
+    #[arg(long)]
+    pub roster: String,
+    /// Human-readable reason recorded with the revision.
+    #[arg(long)]
+    pub reason: String,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -577,6 +596,7 @@ pub fn command_name(command: &Command) -> &'static str {
             EpicCmd::Pause(_) => "epic_pause",
             EpicCmd::Resume(_) => "epic_resume",
             EpicCmd::Resolve(_) => "epic_resolve",
+            EpicCmd::ReviseRoster(_) => "epic_revise_roster",
         },
         Command::Packet { command } => match command {
             PacketCmd::Show(_) => "packet_show",
@@ -752,6 +772,14 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.epic.clone()),
                     json!({"epic": a.epic, "child": a.child, "note": a.note}),
+                ),
+            ),
+            EpicCmd::ReviseRoster(a) => (
+                "epic_revise_roster",
+                request(
+                    a.idempotency_key,
+                    Some(a.epic.clone()),
+                    json!({"epic": a.epic, "roster": a.roster, "reason": a.reason}),
                 ),
             ),
         },

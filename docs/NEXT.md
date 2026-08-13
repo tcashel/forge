@@ -28,12 +28,26 @@ forged definition validate --profile standard --roster default
 `$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
 `standard`, `high`) and named ordered provider/model rosters. Change a roster
 when model or provider availability changes; do not rewrite topology or skills.
-Run start freezes the resolved package and hashes. A live slice changes roster
-only at a durable boundary:
+Run start freezes the resolved package and hashes, including gate commands,
+stage and transport budgets, and Herdr host policy. Editing authoring YAML
+affects later runs only; recovery and detached controllers continue from the
+stored policy. A live slice changes roster only at a durable boundary:
 
 ```sh
 forged run revise-roster --run <run-id> --roster <name> --reason '<reason>'
 ```
+
+For an epic, revise once at the parent. The append-only event and all current
+unmerged child revisions commit atomically; future children inherit the same
+resolved snapshot without looking the roster name up again:
+
+```sh
+forged epic revise-roster --epic <epic-id> --roster <name> --reason '<reason>'
+```
+
+If a detached epic controller is active, pause it first and wait for status to
+show the durable pause. Revise the roster, then resume and submit again; this
+keeps child binding and roster revision under one scheduler authority.
 
 Herdr defaults to `preferred`: unavailability is recorded and falls back to a
 plain detached process. Use `required` only when execution must refuse without
