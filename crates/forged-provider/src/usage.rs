@@ -29,7 +29,15 @@ pub struct UsageRow {
     /// everywhere except the claude `modelUsage` branch, whose keys name
     /// each row's model.
     pub model: String,
-    /// Input tokens consumed.
+    /// Input tokens billed at the *uncached* rate — never a total.
+    ///
+    /// The three input buckets on this row are DISJOINT for every
+    /// provider: `input_tokens + cache_read_tokens + cache_write_tokens`
+    /// is the prompt size. Claude reports them that way natively; codex
+    /// reports a total with the cache buckets as subsets of it, so its
+    /// parsers subtract them back out through [`disjoint_input`]. Storing
+    /// two conventions in one field would make any cross-provider sum —
+    /// and every cost computed from one — silently wrong.
     pub input_tokens: u64,
     /// Output tokens produced.
     pub output_tokens: u64,
@@ -109,6 +117,32 @@ pub(crate) fn optional_token(
                 ),
             }),
     }
+}
+
+/// Convert a codex-style input total into the disjoint uncached count
+/// [`UsageRow::input_tokens`] stores.
+///
+/// OpenAI's prompt-caching contract makes `cached_input_tokens` and
+/// `cache_write_input_tokens` subsets of `input_tokens`; the three
+/// categories partition the prompt and are billed at 0.1x, 1.25x, and 1x
+/// the uncached rate respectively. Subsets that exceed their total are
+/// `Malformed` — a clamp here would understate the uncached tokens, which
+/// are the most expensive of the three.
+pub(crate) fn disjoint_input(
+    total: u64,
+    cache_read: u64,
+    cache_write: u64,
+    context: &str,
+) -> Result<u64, ProviderError> {
+    total
+        .checked_sub(cache_read)
+        .and_then(|rest| rest.checked_sub(cache_write))
+        .ok_or_else(|| ProviderError::Malformed {
+            message: format!(
+                "{context}: cached ({cache_read}) plus cache-write ({cache_write}) \
+                 tokens exceed input_tokens ({total})"
+            ),
+        })
 }
 
 /// Read an optional cost field: only a JSON number counts; null, absence,

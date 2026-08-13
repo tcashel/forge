@@ -1,10 +1,11 @@
 //! The non-drive core functions: doctor, init, run start/status, packet
 //! lifecycle, gate run, reconcile, usage, events, worktree retire.
 
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewRunDefinition, NewUsage, OperationState, RunState};
+use forged_ledger::{EffectClass, NewRun, NewRunDefinition, OperationState, RunState};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
 use forged_types::{
     request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
@@ -981,7 +982,33 @@ fn totals_json(t: &forged_ledger::UsageTotals) -> Value {
     })
 }
 
+/// One stored usage row, projected. Token counts are disjoint buckets:
+/// `inputTokens` is what was billed at the uncached rate, never a total.
+fn usage_row_json(row: &forged_ledger::UsageRecord) -> Value {
+    json!({
+        "runId": row.run_id,
+        "packetId": row.packet_id,
+        "attemptId": row.attempt_id,
+        "provider": row.provider,
+        "model": row.model,
+        "inputTokens": row.input_tokens,
+        "outputTokens": row.output_tokens,
+        "cacheReadTokens": row.cache_read_tokens,
+        "cacheWriteTokens": row.cache_write_tokens,
+        "costUsd": row.cost_usd,
+        "pricingBasis": row.pricing_basis,
+        "rateLimitUsedPercent": row.rate_limit_used_percent,
+        "ts": row.ts,
+    })
+}
+
 /// Bare `usage` — the read-only summary report.
+///
+/// Totals say what a run cost; `rows` say which seat spent it. The row list
+/// is the only place a cost's provenance is visible: a claude row carries
+/// the money the provider billed, a codex row carries a cost imputed from
+/// the operator's rate card, and a row with neither is honestly null and
+/// counted in `rowsMissingCost`.
 pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("usage_report", req, || async {
         let run_ids: Vec<String> = match param_opt_str(&req.params, "run") {
@@ -1000,22 +1027,42 @@ pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             cost_usd_known: 0.0,
             rows_missing_cost: 0,
         };
+        let mut rows = Vec::new();
         for run_id in run_ids {
-            let t = on_ledger(&ctx.ledger, move |l| l.usage_totals(&run_id)).await?;
+            let t = {
+                let run_id = run_id.clone();
+                on_ledger(&ctx.ledger, move |l| l.usage_totals(&run_id)).await?
+            };
             totals.input_tokens += t.input_tokens;
             totals.output_tokens += t.output_tokens;
             totals.cache_read_tokens += t.cache_read_tokens;
             totals.cache_write_tokens += t.cache_write_tokens;
             totals.cost_usd_known += t.cost_usd_known;
             totals.rows_missing_cost += t.rows_missing_cost;
+            let stored = on_ledger(&ctx.ledger, move |l| l.list_usage(&run_id)).await?;
+            rows.extend(stored.iter().map(usage_row_json));
         }
-        Ok(json!({"rows": [], "totals": totals_json(&totals)}))
+        Ok(json!({
+            "rows": rows,
+            "totals": totals_json(&totals),
+            "pricing": {
+                "ratesAsOf": ctx.config.pricing.rates_as_of,
+                "source": ctx.config.pricing.source,
+            },
+        }))
     })
     .await
 }
 
-/// `usage ingest` — fenced SafeRetry mapping of captured provider usage
-/// into ledger rows. Zero rows is `Ok` — absent usage is data.
+/// `usage ingest` — reconciliation: re-derive usage from packet directories
+/// and record what capture missed. Zero rows is `Ok` — absent usage is data.
+///
+/// Deliberately unfenced. Every row it writes carries the natural key
+/// `(run, packet, attempt, provider, model)`, so re-recording is a no-op at
+/// the storage layer and the operation fence has no dedup work left to do.
+/// It used to be fenced, and that was the bug: one key per run meant the
+/// second ingest replayed the first's stored response without re-reading
+/// disk, so a run ingested at round 0 could never count its later rounds.
 pub async fn usage_ingest(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let run = param_opt_str(&req.params, "run").map(str::to_owned);
     let all = req.params.get("all").and_then(Value::as_bool) == Some(true);
@@ -1025,35 +1072,37 @@ pub async fn usage_ingest(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             &Failure::invalid("usage ingest takes --run <id> or --all"),
         );
     }
-    default_key(req, derive_key("usage_ingest", run.as_deref(), None, None));
-    if req.run_id.is_none() {
-        req.run_id = run.clone();
-    }
-    fenced(ctx, "usage_ingest", EffectClass::SafeRetry, req, None, {
-        move |_op| async move {
-            let run_ids: Vec<String> = match run {
-                Some(run) => vec![run],
-                None => on_ledger(&ctx.ledger, |l| l.list_runs())
-                    .await?
-                    .into_iter()
-                    .map(|r| r.run_id)
-                    .collect(),
-            };
-            let mut ingested = 0u64;
-            for run_id in run_ids {
-                ingested += ingest_run(ctx, &run_id).await?;
-            }
-            Ok(json!({"ingested": ingested}))
+    read_only("usage_ingest", req, || async {
+        let run_ids: Vec<String> = match run {
+            Some(run) => vec![run],
+            None => on_ledger(&ctx.ledger, |l| l.list_runs())
+                .await?
+                .into_iter()
+                .map(|r| r.run_id)
+                .collect(),
+        };
+        let mut ingested = 0u64;
+        for run_id in run_ids {
+            ingested += ingest_run(ctx, &run_id).await?;
         }
+        Ok(json!({"ingested": ingested}))
     })
     .await
 }
 
+/// Re-derive one run's usage from its packet directories.
+///
+/// Attribution matches [`crate::core::usage::capture_attempt`] exactly:
+/// each packet directory holds the output of that packet's LATEST attempt,
+/// so the row is keyed to that attempt's id. Recording `attempt_id: NULL`
+/// here instead would miss the natural key that capture already wrote and
+/// double the run's spend on every ingest.
 async fn ingest_run(ctx: &Ctx, run_id: &str) -> Result<u64, Failure> {
     let packets = {
         let run_id = run_id.to_owned();
         on_ledger(&ctx.ledger, move |l| l.list_packets(&run_id)).await?
     };
+    let latest_attempt = latest_attempt_per_packet(ctx, run_id).await;
     let mut ingested = 0u64;
     for row in packets {
         let packet: WorkPacket = match serde_json::from_str(&row.body_json) {
@@ -1092,26 +1141,40 @@ async fn ingest_run(ctx: &Ctx, run_id: &str) -> Result<u64, Failure> {
                 }
             }
         }
+        crate::core::usage::price(ctx, &mut rows);
+        let attempt_id = latest_attempt.get(&row.packet_id).copied();
         for usage in rows {
-            let new_usage = NewUsage {
-                run_id: run_id.to_owned(),
-                packet_id: Some(row.packet_id.clone()),
-                attempt_id: None,
-                provider: usage.provider,
-                model: usage.model,
-                input_tokens: usage.input_tokens,
-                output_tokens: usage.output_tokens,
-                cache_read_tokens: usage.cache_read_tokens,
-                cache_write_tokens: usage.cache_write_tokens,
-                cost_usd: usage.cost_usd,
-                pricing_basis: Some(usage.pricing_basis.as_str().to_owned()),
-                rate_limit_used_percent: usage.rate_limit_used_percent,
-            };
+            let new_usage =
+                crate::core::usage::to_new_usage(run_id, &row.packet_id, attempt_id, usage);
             on_ledger(&ctx.ledger, move |l| l.record_usage(new_usage)).await?;
             ingested += 1;
         }
     }
     Ok(ingested)
+}
+
+/// The highest attempt id seen per packet — the one whose output the packet
+/// directory currently holds. A run that cannot be projected yields an
+/// empty map and the rows fall back to no attribution, which is still
+/// stable across repeat ingests.
+async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, i64> {
+    let Ok(view) = crate::core::drive::project(ctx, run_id).await else {
+        return BTreeMap::new();
+    };
+    let mut latest = BTreeMap::<String, i64>::new();
+    let mut note = |packet_id: &str, attempt_id: i64| {
+        let slot = latest.entry(packet_id.to_owned()).or_insert(attempt_id);
+        *slot = (*slot).max(attempt_id);
+    };
+    for (packet_id, attempts) in &view.terminal_attempts {
+        for attempt in attempts {
+            note(packet_id, attempt.attempt_id);
+        }
+    }
+    for attempt in &view.live_attempts {
+        note(&attempt.packet_id, attempt.attempt_id);
+    }
+    latest
 }
 
 // ---------------------------------------------------------------- events

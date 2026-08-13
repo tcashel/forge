@@ -163,6 +163,22 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         "the landed outcome is projected verbatim: {implement}"
     );
 
+    // Usage is recorded by the attempt that spent it, with no operator
+    // step in between. Nothing in this test runs `usage ingest`.
+    let usage = &overview["result"]["childRuns"][0]["usage"];
+    let totals = &usage["totals"];
+    assert!(
+        totals["outputTokens"].as_u64().unwrap_or(0) > 0,
+        "capture recorded tokens without an ingest pass: {usage}"
+    );
+    let rows = usage["rows"].as_array().expect("usage rows");
+    assert!(!rows.is_empty(), "the report carries its rows: {usage}");
+    assert!(
+        rows.iter()
+            .all(|row| row["attemptId"].is_i64() && row["packetId"].is_string()),
+        "every row names the attempt that spent it: {rows:?}"
+    );
+
     let gh = env.gh_calls();
     assert!(gh.iter().any(|args| args.starts_with(&[
         "pr".to_owned(),

@@ -496,6 +496,49 @@ fn merge_slots_hold_release_and_force_release() {
 }
 
 #[test]
+fn re_recording_one_attempt_overwrites_instead_of_doubling() {
+    // Usage is captured when an attempt settles and can be re-derived from
+    // the same packet directory afterwards by `usage ingest`. Without the
+    // natural key the second read would double the run's spend.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-usage-upsert");
+    let row = |output: u64, cost: f64| NewUsage {
+        run_id: run.clone(),
+        packet_id: Some("run/implementation/0".to_owned()),
+        attempt_id: Some(7),
+        provider: "codex".to_owned(),
+        model: "gpt-5.6-sol".to_owned(),
+        input_tokens: 100,
+        output_tokens: output,
+        cache_read_tokens: Some(10),
+        cache_write_tokens: None,
+        cost_usd: Some(cost),
+        pricing_basis: Some("imputed_api_rate".to_owned()),
+        rate_limit_used_percent: None,
+    };
+    ledger.record_usage(row(200, 0.25)).expect("first record");
+    ledger.record_usage(row(250, 0.30)).expect("second record");
+
+    let rows = ledger.list_usage(&run).expect("list");
+    assert_eq!(rows.len(), 1, "one attempt is one row: {rows:?}");
+    assert_eq!(rows[0].output_tokens, 250, "the newest read wins");
+    let totals = ledger.usage_totals(&run).expect("totals");
+    assert_eq!(totals.input_tokens, 100, "not doubled");
+    assert!((totals.cost_usd_known - 0.30).abs() < f64::EPSILON);
+
+    // A different attempt of the same packet is a different row: tokens
+    // burned on a failed attempt are the run's rework cost, not a
+    // duplicate of the attempt that replaced it.
+    let mut retry = row(400, 0.50);
+    retry.attempt_id = Some(8);
+    ledger.record_usage(retry).expect("retry record");
+    assert_eq!(ledger.list_usage(&run).expect("list").len(), 2);
+
+    ledger.close().expect("close");
+}
+
+#[test]
 fn usage_totals_report_missing_costs_honestly() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

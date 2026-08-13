@@ -276,6 +276,17 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 .tbl tr:first-child td { border-top: 0; }
 .tbl .num { text-align: right; }
 
+/* ------------------------------------------------------------------ cost */
+.spend { display: grid; grid-template-columns: repeat(auto-fit, minmax(128px, 1fr)); gap: calc(var(--u) * 3); }
+.spend__n { font: 300 21px/1.1 var(--font-sans); font-variant-numeric: tabular-nums; letter-spacing: -.01em; }
+.spend__n--soft { color: var(--color-text-tertiary); }
+.spend__k { font: 500 9.5px/1 var(--font-sans); letter-spacing: .11em; text-transform: uppercase; color: var(--color-text-tertiary); margin-top: calc(var(--u) * 1.5); }
+.spend__sub { font: 400 10.5px/1.4 var(--font-mono); color: var(--color-text-tertiary); margin-top: calc(var(--u) * 1); }
+.cost__bar { height: 3px; border-radius: 2px; background: currentColor; opacity: .34; margin-top: 4px; min-width: 1px; margin-left: auto; }
+.basis { font: 400 9.5px/1 var(--font-mono); letter-spacing: .04em; color: var(--color-text-tertiary); }
+.basis--imputed { color: var(--color-text-warning, var(--color-text-secondary)); }
+.provenance { padding: calc(var(--u) * 2.5) calc(var(--u) * 3); font: 400 10.5px/1.5 var(--font-mono); color: var(--color-text-tertiary); border-top: var(--hair); }
+
 /* ---------------------------------------------------------------- ledger */
 .filters { display: flex; gap: var(--u); flex-wrap: wrap; padding: calc(var(--u) * 2.5) calc(var(--u) * 3); border-bottom: var(--hair); align-items: center; }
 .filters input {
@@ -1424,6 +1435,131 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
   }
 
+  // Money is never invented here. A cost the provider billed and a cost
+  // imputed from the operator's rate card render differently, and a row
+  // with neither reads as unknown rather than as zero.
+  function viewCost(data, rows) {
+    const out = [];
+    const usage = data.usage || {};
+    const totals = usage.totals || {};
+    const usageRows = arr(usage.rows);
+    const seatFor = new Map(arr(rows).map((r) => [r.packetId, r]));
+
+    const money = (v) => (typeof v === "number" && Number.isFinite(v)
+      ? (v >= 0.01 ? "$" + v.toFixed(2) : "$" + v.toFixed(4)) : null);
+    const toks = (v) => {
+      const n = num(v);
+      if (n >= 1e6) return (n / 1e6).toFixed(n >= 1e7 ? 0 : 1) + "M";
+      if (n >= 1e3) return (n / 1e3).toFixed(n >= 1e5 ? 0 : 1) + "K";
+      return String(n);
+    };
+
+    const prompt = num(totals.inputTokens) + num(totals.cacheReadTokens) + num(totals.cacheWriteTokens);
+    const cacheRead = num(totals.cacheReadTokens);
+    const missing = num(totals.rowsMissingCost);
+    const known = num(totals.costUsdKnown);
+    const imputed = usageRows
+      .filter((r) => r.pricingBasis === "imputed_api_rate")
+      .reduce((sum, r) => sum + num(r.costUsd), 0);
+
+    const head = panel("Spend", missing ? missing + " unpriced" : "fully priced");
+    const stats = el("div", "spend");
+    const stat = (value, key, sub, soft) => {
+      const cell = el("div");
+      cell.append(el("div", "spend__n" + (soft ? " spend__n--soft" : ""), value));
+      cell.append(el("div", "spend__k", key));
+      if (sub) cell.append(el("div", "spend__sub", sub));
+      return cell;
+    };
+    stats.append(stat(money(known) || "—", "cost", imputed > 0
+      ? money(known - imputed) + " billed · " + money(imputed) + " imputed"
+      : "provider-billed"));
+    stats.append(stat(toks(prompt), "prompt tokens", prompt
+      ? Math.round((cacheRead / prompt) * 100) + "% served from cache" : null));
+    stats.append(stat(toks(totals.outputTokens), "output tokens"));
+    stats.append(stat(String(usageRows.length || "—"), "priced attempts",
+      missing ? missing + " without a rate" : null, !usageRows.length));
+    head.body.append(stats);
+    if (usage.pricing) {
+      head.append(el("div", "provenance",
+        "imputed rates as of " + usage.pricing.ratesAsOf + " — " + usage.pricing.source));
+    }
+    out.push(head);
+
+    if (!usageRows.length) {
+      const box = panel("By seat", "");
+      box.flush().append(el("div", "empty", data.kind === "epic"
+        ? "Per-seat rows live on each child run."
+        : "No usage recorded. `forged usage ingest --run " + (data.id || "<run>")
+          + "` backfills a run that settled before capture."));
+      out.push(box);
+      return out;
+    }
+
+    // Two rows for one packet mean an attempt was superseded: its tokens
+    // are the run's rework cost, not a duplicate of the attempt that
+    // replaced it.
+    const perPacket = new Map();
+    for (const row of usageRows) {
+      if (!perPacket.has(row.packetId)) perPacket.set(row.packetId, []);
+      perPacket.get(row.packetId).push(row);
+    }
+    const superseded = new Set();
+    for (const [, group] of perPacket) {
+      if (group.length < 2) continue;
+      const landed = Math.max.apply(null, group.map((r) => num(r.attemptId)));
+      for (const row of group) if (num(row.attemptId) !== landed) superseded.add(row);
+    }
+
+    const peak = Math.max.apply(null, usageRows.map((r) => num(r.costUsd)).concat([0]));
+    const box = panel("By seat", usageRows.length + (usageRows.length === 1 ? " attempt" : " attempts"));
+    const body = box.flush();
+    const table = el("table", "tbl");
+    const thead = el("thead");
+    const hr = el("tr");
+    const cols = [["seat", ""], ["model", ""], ["uncached", "num"],
+                  ["cache read", "num"], ["output", "num"], ["cost", "num"]];
+    for (const [label, cls] of cols) hr.append(el("th", cls, label));
+    thead.append(hr);
+    table.append(thead);
+    const tbody = el("tbody");
+    for (const row of usageRows) {
+      const seat = seatFor.get(row.packetId);
+      const tr = el("tr");
+      const who = el("td");
+      who.append(el("div", "", seat ? seat.seat + " · R" + seat.round : (row.packetId || "—")));
+      if (superseded.has(row)) {
+        const tag = el("div", "basis basis--imputed", "superseded · rework");
+        who.append(tag);
+      }
+      tr.append(who);
+      const model = el("td");
+      model.append(el("div", "", row.model || "—"));
+      model.append(el("div", "basis", row.provider || ""));
+      tr.append(model);
+      tr.append(el("td", "num", toks(row.inputTokens)));
+      tr.append(el("td", "num", toks(row.cacheReadTokens)));
+      tr.append(el("td", "num", toks(row.outputTokens)));
+      const cost = el("td", "num");
+      const value = money(row.costUsd);
+      cost.append(el("div", "", value || "unknown"));
+      cost.append(el("div", "basis" + (row.pricingBasis === "imputed_api_rate" ? " basis--imputed" : ""),
+        row.pricingBasis === "imputed_api_rate" ? "imputed"
+          : row.pricingBasis === "billed" ? "billed" : "no rate"));
+      if (value && peak > 0) {
+        const fill = el("div", "cost__bar");
+        fill.style.width = Math.max(2, (num(row.costUsd) / peak) * 100) + "%";
+        cost.append(fill);
+      }
+      tr.append(cost);
+      tbody.append(tr);
+    }
+    table.append(tbody);
+    body.append(table);
+    out.push(box);
+    return out;
+  }
+
   function viewLedger(data) {
     const events = arr(at(data, "events.events"));
     const kinds = [...new Set(events.map((e) => e.kind))].sort();
@@ -1573,10 +1709,12 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const tabs = data.kind === "epic"
       ? [["flow", "Overview", null], ["waves", "Waves", arr(at(data, "status.children")).length],
          ["evidence", "Evidence", arr(data.reviews).length], ["workers", "Workers", arr(data.workers).length],
+         ["cost", "Cost", null],
          ["ledger", "Ledger", arr(at(data, "events.events")).length]]
       : [["flow", "Flow", rows.length], ["timeline", "Timeline", null],
          ["evidence", "Evidence", arr(at(data, "reviews.latestFindings")).length],
          ["workers", "Workers", arr(at(data, "workers.sessions")).length],
+         ["cost", "Cost", arr(at(data, "usage.rows")).length],
          ["ledger", "Ledger", arr(at(data, "events.events")).length]];
     if (!tabs.some(([key]) => key === state.view)) state.view = "flow";
 
@@ -1609,6 +1747,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       evidence: () => viewEvidence(data, rows),
       workers: () => viewWorkers(data, rows),
       waves: () => viewWaves(data),
+      cost: () => viewCost(data, rows),
       ledger: () => viewLedger(data),
     }[state.view];
     for (const node of panels()) nodes.view.append(node);

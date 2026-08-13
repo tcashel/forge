@@ -19,6 +19,8 @@ use forged_types::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::pricing::RateCard;
+
 /// A compiled execution definition plus the temporary v0 stage projection.
 #[derive(Debug, Clone)]
 pub struct CompiledDefinition {
@@ -49,6 +51,9 @@ pub struct ForgedConfig {
     pub codex_home: PathBuf,
     pub host_policy: HostPolicyV1,
     pub herdr_sock: Option<PathBuf>,
+    /// Published API rates used to impute cost for providers that report
+    /// tokens but not money. Seeded when the file omits it.
+    pub pricing: RateCard,
 }
 
 pub use forged_types::HostPolicyV1 as HostPolicy;
@@ -82,6 +87,8 @@ struct ConfigFile {
     host_policy: Option<HostPolicyV1>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     herdr_sock: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pricing: Option<RateCard>,
 }
 
 fn hints(provider: &str, model: &str, effort: Option<&str>, sandbox: Sandbox) -> ProviderHints {
@@ -392,6 +399,9 @@ impl ForgedConfig {
             codex_home,
             host_policy: file.host_policy.unwrap_or(HostPolicyV1::Preferred),
             herdr_sock,
+            pricing: file
+                .pricing
+                .unwrap_or_else(crate::pricing::default_rate_card),
             anvil_home,
         })
     }
@@ -594,6 +604,7 @@ impl ForgedConfig {
                 .herdr_sock
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
+            pricing: Some(self.pricing.clone()),
         };
         if self
             .config_path
@@ -838,6 +849,7 @@ mod tests {
             codex_home: PathBuf::from("/tmp/home/.codex"),
             host_policy: HostPolicy::Preferred,
             herdr_sock: None,
+            pricing: crate::pricing::default_rate_card(),
         }
     }
 

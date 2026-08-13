@@ -584,11 +584,24 @@ async fn run_attempt(
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
                     if renewed.is_err() {
                         // Our attempt was revoked out from under us: stop the
-                        // provider and report.
+                        // provider and report. Its tokens were still spent,
+                        // and the successor attempt is about to overwrite
+                        // the capture, so read it before killing the shell.
                         let _ = host.kill_confirmed(&session).await;
                         if let Some(handle) = guardian.take() {
                             handle.abort();
                         }
+                        let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+                        crate::core::usage::capture_attempt(
+                            ctx,
+                            &run_id,
+                            &packet_id,
+                            Some(attempt_id),
+                            &packet.provider_hints.provider,
+                            &packet.provider_hints.model,
+                            &out,
+                        )
+                        .await;
                         return Ok(PacketOutcome::Revoked);
                     }
                 }
@@ -607,27 +620,44 @@ async fn run_attempt(
         handle.abort();
     }
 
-    // 5. Harvest per the extraction contract.
+    // 5. Record what this attempt spent, before deciding what it produced.
+    //
+    // Here and nowhere else: the capture is complete, the attempt id is in
+    // hand, and the outcome has not yet branched. A batch pass over packet
+    // directories cannot reach this point — the packet directory is keyed
+    // by stage and round, so the next attempt overwrites `out.jsonl` and
+    // the tokens this one burned become unrecoverable. Rework spend is
+    // only ever visible from inside the attempt that spent it.
+    let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+    crate::core::usage::capture_attempt(
+        ctx,
+        &run_id,
+        &packet_id,
+        Some(attempt_id),
+        &packet.provider_hints.provider,
+        &packet.provider_hints.model,
+        &out,
+    )
+    .await;
+
+    // 6. Harvest per the extraction contract.
     let harvest = match liveness {
         forged_host::Liveness::Vanished => {
             Harvest::Transport("transport: session vanished".to_owned())
         }
-        forged_host::Liveness::Exited(_code) => {
-            let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
-            match packet.provider_hints.provider.as_str() {
-                "codex" => {
-                    let last = std::fs::read_to_string(dirs.last_message()).ok();
-                    harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
-                }
-                _ => harvest_claude(&out, &packet.result_schema, &packet_id),
+        forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
+            "codex" => {
+                let last = std::fs::read_to_string(dirs.last_message()).ok();
+                harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
             }
-        }
+            _ => harvest_claude(&out, &packet.result_schema, &packet_id),
+        },
         forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
     };
 
     match harvest {
         Harvest::Result(result) => {
-            // 6. Land through the seam that turns a stale-token refusal into
+            // 7. Land through the seam that turns a stale-token refusal into
             // a quarantine — never Ledger::complete_packet directly. The
             // landing is itself a fenced HumanAmbiguous operation whose key
             // carries the attempt (an explicit key: attempts of one packet

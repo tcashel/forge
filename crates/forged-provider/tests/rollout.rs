@@ -24,7 +24,7 @@ fn assert_canonical_row(capture: &forged_provider::UsageCapture, model: &str) {
     let row = &capture.rows[0];
     assert_eq!(row.provider, "codex");
     assert_eq!(row.model, model);
-    assert_eq!(row.input_tokens, 22170);
+    assert_eq!(row.input_tokens, 15258, "22170 total less 6912 cache reads");
     assert_eq!(row.cache_read_tokens, Some(6912));
     assert_eq!(row.cache_write_tokens, Some(0));
     assert_eq!(row.output_tokens, 5);
@@ -175,7 +175,7 @@ async fn null_info_final_line_does_not_shadow_earlier_usage() {
         .await
         .expect("recovers");
     assert_eq!(capture.rows.len(), 1);
-    assert_eq!(capture.rows[0].input_tokens, 22170);
+    assert_eq!(capture.rows[0].input_tokens, 15258);
     assert_eq!(capture.rows[0].rate_limit_used_percent, Some(33.0));
 }
 

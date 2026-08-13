@@ -7,7 +7,8 @@ use serde_json::{Map, Value};
 
 use crate::error::ProviderError;
 use crate::usage::{
-    object_line, optional_token, required_token, PricingBasis, UsageCapture, UsageRow,
+    disjoint_input, object_line, optional_token, required_token, PricingBasis, UsageCapture,
+    UsageRow,
 };
 
 /// Directory recursion cap below each search root (`sessions/` nests
@@ -213,13 +214,16 @@ fn parse_rollout(
             })
         }
     };
+    let total_input = required_token(usage, "input_tokens", context)?;
+    let cache_read = required_token(usage, "cached_input_tokens", context)?;
+    let cache_write = optional_token(usage, "cache_write_input_tokens", context)?;
     let rows = vec![UsageRow {
         provider: "codex".to_owned(),
         model: model.to_owned(),
-        input_tokens: required_token(usage, "input_tokens", context)?,
+        input_tokens: disjoint_input(total_input, cache_read, cache_write.unwrap_or(0), context)?,
         output_tokens: required_token(usage, "output_tokens", context)?,
-        cache_read_tokens: Some(required_token(usage, "cached_input_tokens", context)?),
-        cache_write_tokens: optional_token(usage, "cache_write_input_tokens", context)?,
+        cache_read_tokens: Some(cache_read),
+        cache_write_tokens: cache_write,
         cost_usd: None,
         pricing_basis: PricingBasis::None,
         rate_limit_used_percent: used_percent,

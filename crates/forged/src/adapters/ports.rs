@@ -721,6 +721,7 @@ mod tests {
             codex_home: root.join("codex"),
             host_policy: crate::config::HostPolicy::Off,
             herdr_sock: None,
+            pricing: crate::pricing::default_rate_card(),
         };
         (config, ledger, attempt)
     }

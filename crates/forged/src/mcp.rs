@@ -314,6 +314,15 @@ impl ForgedServer {
         self.call("usage_report", args.0).await
     }
 
+    /// Backfill usage for runs that settled before capture recorded it.
+    #[tool(
+        name = "usage_ingest",
+        description = "Re-derive usage from packet captures; idempotent."
+    )]
+    pub async fn usage_ingest(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("usage_ingest", args.0).await
+    }
+
     /// Paged event listing (the `_tail` name is historical).
     #[tool(name = "events_tail", description = "List ledger events, paged.")]
     pub async fn events_tail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {

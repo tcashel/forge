@@ -110,7 +110,7 @@ forged events --run <id> --limit 200
 
 The overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the
-outcome each seat landed, artifacts, interventions, roster revisions, usage,
+outcome each seat landed, artifacts, interventions, roster revisions, per-seat priced usage,
 and events. The MCP `overview` tool returns the identical structured
 projection and renders it through `ui://forged/overview.html`.
 
@@ -123,6 +123,7 @@ ledger did not record:
 | Timeline | Where the wall clock went. Attempt spans reconstructed from `attempt.state`, with gate, PR, and escalation milestones ticked above them. |
 | Evidence | What the reviewers actually said. Findings carried into the fix round, or every seat's own list; each seat's report; gate rows with exit codes; artifact paths. |
 | Workers | What to attach to. Sessions with claimants and copyable Herdr attach hints, the controller row, queued interventions, roster revisions. |
+| Cost | What the run spent. Per-seat tokens and money, with each cost labelled `billed` (the provider charged it) or `imputed` (derived from the rate card), and superseded attempts marked as rework. |
 | Ledger | The raw event stream, filterable by kind and payload text, with payloads on demand. |
 
 Epics swap Flow's matrix for a **Waves** board: every frozen child bead by
@@ -133,6 +134,47 @@ Above every view sits an attention rail that fires only on things that need
 the operator — a terminal block verdict, a failed attempt and its note, a
 gate that did not pass, host fallback off Herdr, reviewer dissent, a
 controller that died with work outstanding — ordered blockers first.
+
+## Usage and cost
+
+Usage is recorded by the attempt that spends it — no operator step, no batch
+pass. When an attempt settles, forged parses the capture it just wrote and
+records one row per model, keyed
+`(run, packet, attempt, provider, model)`. The key is what makes the record
+idempotent, so re-reading a capture never doubles a run's spend, and it is
+also why rework is visible: a superseded attempt keeps its own row instead of
+being overwritten by the attempt that replaced it.
+
+Token buckets are disjoint on every provider: `input + cacheRead + cacheWrite`
+is the prompt. Claude reports them that way; codex reports a total with the
+cache buckets nested inside it, so its parsers subtract them back out. Without
+that normalization a cross-provider sum — and every cost derived from one —
+is silently wrong.
+
+Cost is reported, not invented. Claude bills a cost and forged stores it
+verbatim (`billed`). Codex reports tokens only, so cost is imputed from the
+rate card in `$ANVIL_HOME/config.yaml` (`imputed_api_rate`); it ships seeded
+with OpenAI's published rates and a `rates_as_of` date the Cost view shows, so
+a stale card is visible rather than silent. A model with no card entry keeps a
+null cost and counts in `rowsMissingCost`.
+
+The long-context tier is decided provably, never guessed. OpenAI prices a
+prompt above the threshold at the long-context rates, and the threshold is
+per request — but a provider capture reports the sum over every request in a
+turn, and a 1.4M-token turn is routinely 27 requests of 50K. Tiering off that
+total would overcharge roughly twofold. The card carries each model's
+`context_window`: when the window cannot exceed the threshold, the short-context
+rates are correct for the whole turn whatever the total says. When it can,
+forged declines to price the row rather than pick a tier.
+
+Runs that settled before capture existed are backfilled with:
+
+```sh
+forged usage ingest --run <run-id>     # or --all
+```
+
+Ingest is reconciliation and safe to repeat: it attributes to the same
+attempt the capture would have, so repeat runs upsert rather than accumulate.
 
 For a Herdr-backed attempt:
 
