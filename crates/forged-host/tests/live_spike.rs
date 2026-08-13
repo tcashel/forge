@@ -101,9 +101,12 @@ fn live_spike_claude_p_through_herdr() {
                 // Timed out. A status file that exists but does not parse
                 // is a forged-host contract break — the one hard failure
                 // left; a merely absent file is an environment problem.
-                let status_path = base_dir.join(id.as_str()).join("status");
+                let status_file_exists = std::fs::read_dir(&base_dir)
+                    .expect("read live status base")
+                    .map(|entry| entry.expect("status directory entry").path().join("status"))
+                    .any(|path| path.exists());
                 assert!(
-                    !status_path.exists(),
+                    !status_file_exists,
                     "status file exists but never parsed: contract break"
                 );
                 eprintln!("live spike SKIPPED: 120 s timeout elapsed without an exit");

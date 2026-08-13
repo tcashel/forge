@@ -74,7 +74,13 @@ pub(crate) struct PaneReadResult {
     pub(crate) truncated: bool,
 }
 
-/// `pane.process_info` result.
+/// `pane.process_info` result wrapper.
+#[derive(Debug, Deserialize)]
+pub(crate) struct ProcessInfoResponse {
+    pub(crate) process_info: ProcessInfo,
+}
+
+/// Stable process details nested under `process_info`.
 #[derive(Debug, Deserialize)]
 pub(crate) struct ProcessInfo {
     #[serde(default)]
@@ -90,12 +96,27 @@ pub(crate) struct ForegroundProcess {
     pub(crate) pid: u32,
 }
 
-/// Event payload shared by the three pane events: `{pane_id, workspace_id}`.
-/// No exit code exists on the wire — which is exactly why the sentinel file
-/// is the truth path.
+/// Pane events use two wire shapes: `pane_created` carries a full `pane`,
+/// while `pane_exited` and `pane_closed` carry `pane_id` directly. No exit
+/// code exists on the wire — which is exactly why the sentinel file is the
+/// truth path.
 #[derive(Debug, Clone, Deserialize)]
 pub(crate) struct PaneEventData {
-    pub(crate) pane_id: String,
+    #[serde(default)]
+    pane_id: Option<String>,
+    #[serde(default)]
+    pane: Option<PaneEventPane>,
+}
+
+impl PaneEventData {
+    pub(crate) fn pane_id(self) -> Option<String> {
+        self.pane_id.or_else(|| self.pane.map(|pane| pane.pane_id))
+    }
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PaneEventPane {
+    pane_id: String,
 }
 
 /// The delivered (snake_case) pane event kinds forged-host subscribes to.

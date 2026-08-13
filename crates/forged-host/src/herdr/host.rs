@@ -3,6 +3,7 @@
 //! consulted).
 
 use std::collections::HashMap;
+use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
@@ -12,7 +13,7 @@ use nix::unistd::Pid;
 use serde_json::json;
 use tokio::time::Instant;
 
-use super::wire::{PaneInfoResult, PaneReadResponse, Pong, ProcessInfo};
+use super::wire::{PaneInfoResult, PaneReadResponse, Pong, ProcessInfo, ProcessInfoResponse};
 use super::{CallError, Connection};
 use crate::identity::ProcessIdentity;
 use crate::{sentinel, Confirmed, HostError, HostSessionId, Liveness, SessionHost};
@@ -37,6 +38,18 @@ enum PaneProbe {
     Gone,
 }
 
+/// Map Herdr's opaque pane id to a collision-free shell-safe directory name.
+/// Real ids contain `:`, and the sentinel path deliberately remains unquoted,
+/// so the transport id itself must never become a path component.
+fn status_dir_key(pane_id: &str) -> String {
+    let mut key = String::with_capacity(5 + pane_id.len() * 2);
+    key.push_str("pane-");
+    for byte in pane_id.bytes() {
+        write!(&mut key, "{byte:02x}").expect("writing to a String cannot fail");
+    }
+    key
+}
+
 /// A [`SessionHost`] backend that runs each session's shell line inside a
 /// herdr pane, typed into the pane's existing interactive shell.
 ///
@@ -47,8 +60,8 @@ enum PaneProbe {
 ///
 /// The pane inherits herdr's environment; the caller's `env` map is passed
 /// through `pane.split`'s additive `env` param, never interpolated into the
-/// line. On connection loss the host becomes permanently unavailable and
-/// never reconnects.
+/// line. Ordinary RPCs use fresh one-shot connections; a separate event
+/// subscription supplies closure observations as a best-effort accelerator.
 pub struct HerdrHost {
     conn: Arc<Connection>,
     base_status_dir: PathBuf,
@@ -155,16 +168,13 @@ impl HerdrHost {
         base_status_dir: impl Into<PathBuf>,
     ) -> Result<Self, HostError> {
         let conn = connect_pinned(socket_path.as_ref()).await?;
-        conn.call(
-            "events.subscribe",
-            json!({
-                "subscriptions": [
-                    {"type": "pane.created"},
-                    {"type": "pane.exited"},
-                    {"type": "pane.closed"},
-                ],
-            }),
-        )
+        conn.subscribe(json!({
+            "subscriptions": [
+                {"type": "pane.created"},
+                {"type": "pane.exited"},
+                {"type": "pane.closed"},
+            ],
+        }))
         .await
         .map_err(CallError::into_host_error)?;
         Ok(HerdrHost {
@@ -200,10 +210,11 @@ impl HerdrHost {
             .await
         {
             Ok(value) => {
-                let info: ProcessInfo = serde_json::from_value(value).map_err(|_| {
-                    HostError::unavailable("malformed pane.process_info result from herdr")
-                })?;
-                Ok(PaneProbe::Info(info))
+                let response: ProcessInfoResponse =
+                    serde_json::from_value(value).map_err(|_| {
+                        HostError::unavailable("malformed pane.process_info result from herdr")
+                    })?;
+                Ok(PaneProbe::Info(response.process_info))
             }
             Err(CallError::Rpc(e)) if e.is_pane_not_found() => Ok(PaneProbe::Gone),
             Err(other) => Err(other.into_host_error()),
@@ -245,10 +256,11 @@ impl HerdrHost {
             tokio::time::sleep(READINESS_INTERVAL.min(deadline - now)).await;
         }
 
-        // Reserve <base>/<pane-id>/ exclusively; pane ids are never reused,
-        // so an existing dir means something is wrong — never reuse a
-        // status file.
-        let session_dir = self.base_status_dir.join(pane_id);
+        // Reserve <base>/<encoded-pane-id>/ exclusively. Pane ids are opaque
+        // transport identifiers (and contain shell-unsafe `:`), so encode
+        // their bytes rather than weakening sentinel-path validation. Herdr
+        // never reuses pane ids, so an existing dir is always an error.
+        let session_dir = self.base_status_dir.join(status_dir_key(pane_id));
         let status_path = session_dir.join("status");
         sentinel::validate_status_path(&status_path)?;
         std::fs::create_dir_all(&self.base_status_dir)
@@ -312,9 +324,6 @@ impl SessionHost for HerdrHost {
         shell_line: &str,
         env: &HashMap<String, String>,
     ) -> Result<HostSessionId, HostError> {
-        if self.conn.is_unavailable() {
-            return Err(HostError::unavailable("herdr connection is gone"));
-        }
         sentinel::validate_shell_line(shell_line)?;
         let cwd = cwd
             .to_str()
@@ -356,9 +365,6 @@ impl SessionHost for HerdrHost {
     }
 
     async fn alive(&self, id: &HostSessionId) -> Result<Liveness, HostError> {
-        if self.conn.is_unavailable() {
-            return Err(HostError::unavailable("herdr connection is gone"));
-        }
         let status_path = self.session_status_path(id)?;
         // Status file first: the only exit-code truth.
         if let Some(code) = sentinel::read_status(&status_path)? {
@@ -384,9 +390,6 @@ impl SessionHost for HerdrHost {
     }
 
     async fn kill_confirmed(&self, id: &HostSessionId) -> Result<Confirmed, HostError> {
-        if self.conn.is_unavailable() {
-            return Err(HostError::unavailable("herdr connection is gone"));
-        }
         let status_path = self.session_status_path(id)?;
         let pane_id = id.as_str().to_string();
 
