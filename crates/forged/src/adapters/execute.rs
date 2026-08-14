@@ -470,8 +470,8 @@ pub async fn execute_packet(
 /// a fence keyed on an idempotency key refuses to do: encode the spec in the
 /// key and a bead edited A -> B -> A reproduces the key its first open at A
 /// already stored, replaying that response over a row still pinned at B.
-/// `PacketStore::open`'s own `Immediate` transaction is the right fence and
-/// the only one needed — it is atomic, it re-reads current state on every
+/// `Ledger::open_packet_with_id`'s own `Immediate` transaction is the right
+/// fence and the only one needed — atomic, re-reading current state on every
 /// call, and its refusals (a live attempt, a moved definition) still stand.
 ///
 /// The write carries the row's OWN stored body, never one re-serialized
@@ -524,8 +524,7 @@ async fn grant_pre_claim_retry(
     note: String,
 ) -> Result<PacketOutcome, Failure> {
     let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
-    let packet_id = packet_id.to_owned();
-    charge_retry(ctx, &run_id, &packet_id, now_iso()).await?;
+    charge_retry(ctx, &run_id, packet_id, now_iso()).await?;
     Ok(PacketOutcome::Transport(note))
 }
 

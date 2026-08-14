@@ -592,9 +592,9 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
 
 #[test]
 fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
-    // The guards live in `PacketStore::open`'s own transaction, which is the
-    // whole reason the re-pin may leave the operation layer: dropping the
-    // fence must not drop a refusal with it.
+    // The guards live in `Ledger::open_packet_with_id`'s own transaction,
+    // which is the whole reason the re-pin may leave the operation layer:
+    // dropping the fence must not drop a refusal with it.
     let env = TestEnv::new("forged-bead-spec-guards");
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_bead_spec("bead-guarded", DESCRIPTION, ACCEPTANCE);
