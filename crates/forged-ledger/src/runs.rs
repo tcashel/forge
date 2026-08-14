@@ -16,8 +16,8 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
-    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
-    RunRow, RunSettlement, RunState,
+    DesiredReconcileOutcome, DesiredSubjectKind, NewRun, NewRunDefinition, RosterRevisionBatch,
+    RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement, RunState,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -922,6 +922,12 @@ impl Ledger {
                     if let Some(generation) = controller_generation {
                         append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
                     }
+                    crate::desired::stop_desired_work_tx(
+                        &tx,
+                        DesiredSubjectKind::Run,
+                        &run_id,
+                        DesiredReconcileOutcome::Terminal,
+                    )?;
                     tx.commit()?;
                     return Ok(current);
                 }
@@ -990,6 +996,12 @@ impl Ledger {
             if let Some(generation) = controller_generation {
                 append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
             }
+            crate::desired::stop_desired_work_tx(
+                &tx,
+                DesiredSubjectKind::Run,
+                &run_id,
+                DesiredReconcileOutcome::Terminal,
+            )?;
             let row = get_run_tx(&tx, &run_id)?;
             tx.commit()?;
             Ok(row)

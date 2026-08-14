@@ -1,0 +1,283 @@
+//! Real-process desired-work supervisor coverage. These tests use the same
+//! detached controller path as production and inspect effects, not labels.
+
+mod support;
+
+use std::process::Stdio;
+use std::time::{Duration, Instant};
+
+use forged_ledger::{DesiredReconcileOutcome, DesiredState, DesiredSubjectKind};
+use nix::errno::Errno;
+use nix::sys::signal::{kill, killpg, Signal};
+use nix::unistd::Pid;
+use serde_json::{json, Value};
+use support::TestEnv;
+
+const WAIT: Duration = Duration::from_secs(30);
+
+fn start_run(env: &TestEnv, run: &str) {
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, response) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        run,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {response}");
+}
+
+fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
+    let started = Instant::now();
+    while !predicate() {
+        assert!(started.elapsed() < WAIT, "timed out waiting for {what}");
+        std::thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn process_group_alive(group: i32) -> bool {
+    matches!(
+        kill(Pid::from_raw(-group), None),
+        Ok(()) | Err(Errno::EPERM)
+    )
+}
+
+fn controller_pid(response: &Value) -> i32 {
+    response["result"]["controller"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("controller pid")
+}
+
+fn implementation_starts(env: &TestEnv, run: &str) -> usize {
+    let prefix = format!("{run}/implementation/0");
+    env.provider_log()
+        .iter()
+        .filter(|line| line.starts_with(&prefix) && line.contains(" start "))
+        .count()
+}
+
+#[test]
+fn never_submitted_and_failed_submissions_never_become_desired() {
+    let env = TestEnv::new("supervise-authorization-boundary");
+    start_run(&env, "run-never-submitted");
+    let (code, report) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "empty tick: {report}");
+    assert_eq!(
+        report["result"]["schema"],
+        json!("forged.supervise.report/1")
+    );
+    assert_eq!(report["result"]["considered"], json!(0));
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-never-submitted")
+        .expect("desired query")
+        .is_none());
+    ledger.close().expect("close");
+
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config JSON");
+    config["host_policy"] = json!("required");
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("config JSON"),
+    )
+    .expect("write config");
+    start_run(&env, "run-failed-submit");
+    let (code, failed) = env.forged(&["run", "submit", "--run", "run-failed-submit"]);
+    assert_ne!(code, 0, "required absent Herdr must fail: {failed}");
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-failed-submit")
+        .expect("desired query")
+        .is_none());
+    ledger.close().expect("close");
+}
+
+#[test]
+fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
+    let env = TestEnv::new("supervise-restart-singleton");
+    start_run(&env, "run-supervised");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-supervised"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let first_pid = controller_pid(&submitted);
+
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-supervised")
+        .expect("desired query")
+        .expect("successful submit authorizes");
+    assert_eq!(desired.desired_state, DesiredState::Running);
+    assert_eq!(desired.controller_generation, 1);
+    ledger.close().expect("close");
+
+    let (code, adopted) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "adopt tick: {adopted}");
+    assert_eq!(adopted["result"]["subjects"][0]["action"], json!("adopted"));
+    assert_eq!(
+        adopted["result"]["subjects"][0]["desiredWork"]["controllerGeneration"],
+        json!(1)
+    );
+
+    killpg(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill first controller group");
+    wait_until("first controller group death", || {
+        !process_group_alive(first_pid)
+    });
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            "run-supervised",
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make killed controller immediately due");
+    ledger.close().expect("close");
+
+    let spawn_tick = || {
+        env.forged_cmd(&["supervise", "--once"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("supervisor tick spawns")
+    };
+    let first = spawn_tick();
+    let second = spawn_tick();
+    let outputs = [
+        first.wait_with_output().expect("first tick exits"),
+        second.wait_with_output().expect("second tick exits"),
+    ];
+    for output in &outputs {
+        assert!(
+            output.status.success(),
+            "tick failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-supervised")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.controller_generation, 2);
+    assert_eq!(desired.restart_used, 1);
+    let starts = ledger
+        .list_events(Some("run-supervised"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.controller.started")
+        .count();
+    assert_eq!(starts, 2, "one initial generation plus one restart");
+    let restarted = ledger
+        .list_events(Some("run-supervised"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.supervisor.restarted")
+        .count();
+    assert_eq!(restarted, 1, "predecessor evidence is singleton");
+    ledger.close().expect("close");
+
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join("runs/run-supervised/controller/controller.json"),
+        )
+        .expect("controller record"),
+    )
+    .expect("controller JSON");
+    assert_eq!(record["generation"], json!(2));
+    let second_pid = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("second controller pid");
+    let _ = killpg(Pid::from_raw(second_pid), Signal::SIGKILL);
+}
+
+#[test]
+fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
+    let env = TestEnv::new("supervise-foreground-signal");
+    start_run(&env, "run-foreground");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-foreground"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+
+    let supervisor = env
+        .forged_cmd(&["supervise"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("foreground supervisor spawns");
+    let supervisor_pid = i32::try_from(supervisor.id()).expect("supervisor pid fits i32");
+
+    wait_until("foreground adoption without a duplicate effect", || {
+        let ledger = env.ledger();
+        let adopted = ledger
+            .get_desired_work(DesiredSubjectKind::Run, "run-foreground")
+            .expect("desired query")
+            .is_some_and(|row| {
+                row.last_outcome == Some(DesiredReconcileOutcome::Adopted)
+                    && row.controller_generation == 1
+                    && row.restart_used == 0
+            });
+        ledger.close().expect("close");
+        adopted && implementation_starts(&env, "run-foreground") == 1
+    });
+
+    kill(Pid::from_raw(supervisor_pid), Signal::SIGINT).expect("signal foreground supervisor");
+    let output = supervisor
+        .wait_with_output()
+        .expect("foreground supervisor exits");
+    assert!(
+        output.status.success(),
+        "supervisor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("supervisor response JSON");
+    assert_eq!(
+        response["result"]["schema"],
+        json!("forged.supervise.session/1")
+    );
+    assert_eq!(response["result"]["reason"], json!("signal"));
+    assert!(response["result"]["ticks"]
+        .as_u64()
+        .is_some_and(|ticks| ticks >= 1));
+    assert_eq!(
+        response["result"]["lastReport"]["schema"],
+        json!("forged.supervise.report/1")
+    );
+
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-foreground")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.controller_generation, 1);
+    assert_eq!(desired.restart_used, 0);
+    let starts = ledger
+        .list_events(Some("run-foreground"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.controller.started")
+        .count();
+    assert_eq!(starts, 1, "foreground reconciliation only adopted");
+    ledger.close().expect("close");
+    assert_eq!(implementation_starts(&env, "run-foreground"), 1);
+
+    let _ = killpg(Pid::from_raw(controller), Signal::SIGKILL);
+}

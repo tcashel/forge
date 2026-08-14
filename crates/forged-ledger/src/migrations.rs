@@ -259,6 +259,40 @@ ALTER TABLE runs ADD COLUMN delivery_sha TEXT;
 ALTER TABLE runs ADD COLUMN superseded_by TEXT;
 ";
 
+/// Migration 011: operator-authorized desired work and its reconciliation
+/// fence. A row exists only after a successful submit; the supervisor never
+/// infers authorization from a runnable Bead or an existing run row.
+const MIGRATION_011: &str = "
+CREATE TABLE desired_work (
+  subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id            TEXT NOT NULL,
+  desired_state         TEXT NOT NULL CHECK (desired_state IN
+                        ('running','paused','stopped')),
+  control_revision      INTEGER NOT NULL CHECK (control_revision > 0),
+  controller_generation INTEGER NOT NULL DEFAULT 0 CHECK (controller_generation >= 0),
+  predecessor_generation INTEGER CHECK (predecessor_generation >= 0),
+  restart_budget        INTEGER NOT NULL CHECK (restart_budget > 0),
+  restart_used          INTEGER NOT NULL DEFAULT 0 CHECK
+                        (restart_used >= 0 AND restart_used <= restart_budget),
+  next_wake_at          TEXT,
+  last_progress_at      TEXT,
+  last_outcome          TEXT CHECK (last_outcome IN
+                        ('authorized','adopted','restarting','restarted',
+                         'backoff','attention','exhausted','paused','stopped',
+                         'terminal')),
+  last_error            TEXT,
+  exhausted_at          TEXT,
+  reconcile_token       TEXT,
+  reconcile_lease_until TEXT,
+  created_at            TEXT NOT NULL,
+  updated_at            TEXT NOT NULL,
+  PRIMARY KEY (subject_kind, subject_id)
+);
+CREATE INDEX desired_work_wake
+  ON desired_work(desired_state, next_wake_at)
+  WHERE desired_state = 'running' AND exhausted_at IS NULL;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -271,6 +305,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_008,
     MIGRATION_009,
     MIGRATION_010,
+    MIGRATION_011,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -390,7 +425,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 10);
+        assert_eq!(pragmas.user_version, 11);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -408,6 +443,7 @@ mod tests {
             "run_package_migrations",
             "roster_revisions",
             "runtime_migrations",
+            "desired_work",
         ] {
             let found: String = conn
                 .query_row(
@@ -437,7 +473,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
         ledger.close().expect("close");
     }
 
@@ -460,7 +496,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -503,7 +539,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

@@ -11,15 +11,15 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
-use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
+use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, OperationState, SlotOutcome};
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::config::{now_iso, HostPolicy};
 use crate::core::{
-    default_key, derive_key, err_response, fenced, key_absent, ok_response, on_ledger, param_str,
-    Ctx, Failure,
+    default_key, derive_key, err_response, fenced_authorizing_desired, key_absent, ok_response,
+    on_ledger, param_str, Ctx, DesiredAuthorization, Failure,
 };
 
 const CONTROLLER_STARTED: &str = "forged.controller.started";
@@ -34,13 +34,13 @@ const CONTROLLER_ID_ENV: &str = "FORGED_CONTROLLER_ID";
 const CONTROLLER_GENERATION_ENV: &str = "FORGED_CONTROLLER_GENERATION";
 
 #[derive(Debug, Clone, Copy)]
-enum Scope {
+pub(super) enum Scope {
     Run,
     Epic,
 }
 
 impl Scope {
-    fn noun(self) -> &'static str {
+    pub(super) fn noun(self) -> &'static str {
         match self {
             Scope::Run => "run",
             Scope::Epic => "epic",
@@ -51,6 +51,13 @@ impl Scope {
         match self {
             Scope::Run => "run_submit",
             Scope::Epic => "epic_submit",
+        }
+    }
+
+    pub(super) fn desired_kind(self) -> DesiredSubjectKind {
+        match self {
+            Scope::Run => DesiredSubjectKind::Run,
+            Scope::Epic => DesiredSubjectKind::Epic,
         }
     }
 }
@@ -212,7 +219,11 @@ impl Drop for SubmitGuard {
 /// Serialize generation allocation and controller spawning per logical id.
 /// Request idempotency keys remain replay identities; they are deliberately
 /// not the singleton boundary.
-async fn acquire_submit(ctx: &Ctx, id: &str, scope: Scope) -> Result<SubmitGuard, Failure> {
+pub(super) async fn acquire_submit(
+    ctx: &Ctx,
+    id: &str,
+    scope: Scope,
+) -> Result<SubmitGuard, Failure> {
     let slot = format!("controller-submit:{}:{id}", scope.noun());
     let pid = std::process::id() as i32;
     let identity = crate::adapters::ports::lstart_of(pid)
@@ -436,7 +447,7 @@ pub(super) async fn kill_controller_confirmed(
     Ok(true)
 }
 
-async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
+pub(super) async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
     let id = id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.list_events(Some(&id), 0, 65_536)
@@ -444,7 +455,7 @@ async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Fai
     .await
 }
 
-fn generation(record: &Value) -> u32 {
+pub(super) fn generation(record: &Value) -> u32 {
     record
         .get("generation")
         .and_then(Value::as_u64)
@@ -452,7 +463,7 @@ fn generation(record: &Value) -> u32 {
         .unwrap_or(0)
 }
 
-async fn latest_record(ctx: &Ctx, id: &str) -> Result<Option<Value>, Failure> {
+pub(super) async fn latest_record(ctx: &Ctx, id: &str) -> Result<Option<Value>, Failure> {
     let event_record = events(ctx, id)
         .await?
         .into_iter()
@@ -469,6 +480,85 @@ async fn latest_record(ctx: &Ctx, id: &str) -> Result<Option<Value>, Failure> {
     })
 }
 
+/// Recover the minimum verifiable identity for a supervisor generation whose
+/// host spawn succeeded but whose process crashed before `controller.json`
+/// or its event was durable. PID publication follows lstart publication, so
+/// their matching pair is sufficient to adopt without a duplicate spawn.
+pub(super) async fn recover_reserved_record(
+    ctx: &Ctx,
+    id: &str,
+    scope: Scope,
+    reserved_generation: u32,
+) -> Result<Option<Value>, Failure> {
+    if reserved_generation == 0 {
+        return Ok(None);
+    }
+    if let Some(record) = latest_record(ctx, id).await? {
+        if generation(&record) >= reserved_generation {
+            return Ok(Some(record));
+        }
+    }
+    let dir = controller_dir(ctx, id);
+    let pid_path = dir.join(format!("controller-{reserved_generation}.pid"));
+    let lstart_path = dir.join(format!("controller-{reserved_generation}.lstart"));
+    let Some(pid) = read_pid(&pid_path) else {
+        return Ok(None);
+    };
+    let expected = std::fs::read_to_string(&lstart_path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    if !pid_alive(pid) {
+        return Ok(None);
+    }
+    let current = crate::adapters::ports::lstart_of(pid).await;
+    match (expected.as_deref(), current.as_deref()) {
+        (Some(expected), Some(current)) if expected == current => {}
+        (Some(_), Some(_)) => return Ok(None), // PID reuse proves the controller dead.
+        _ => {
+            return Err(Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                    "{} {id} generation {reserved_generation} has an unverifiable pending identity",
+                    scope.noun()
+                ),
+                recoverable: true,
+            })
+        }
+    }
+    let record = json!({
+        "schemaVersion": 1,
+        "scope": scope.noun(),
+        "id": id,
+        "generation": reserved_generation,
+        "host": "recovered",
+        "sessionId": Value::Null,
+        "attachHint": Value::Null,
+        "driver": {"pid": pid, "lstart": expected},
+        // The spawned binary identity was not durably recorded before the
+        // crash. Never attribute this live predecessor to the binary doing
+        // recovery; an upgrade may have happened in between.
+        "binary": Value::Null,
+        "pidPath": pid_path,
+        "lstartPath": lstart_path,
+        "statusPath": dir.join(format!("controller-{reserved_generation}.drive-exit")),
+        "outputPath": dir.join(format!("controller-{reserved_generation}.log")),
+        "submittedAt": now_iso(),
+        "recoveredAfterSpawnCrash": true,
+    });
+    std::fs::write(
+        dir.join(RECORD_FILE),
+        serde_json::to_vec_pretty(&record).map_err(|error| {
+            Failure::internal(format!("serializing recovered controller: {error}"))
+        })?,
+    )
+    .map_err(|error| Failure::internal(format!("writing recovered controller record: {error}")))?;
+    crate::failpoint::hit("controller.record.after");
+    append_once(ctx, id, CONTROLLER_STARTED, record.clone()).await?;
+    crate::failpoint::hit("controller.event.after");
+    Ok(Some(record))
+}
+
 fn controller_state(
     exit_code: Option<i32>,
     pid: Option<i32>,
@@ -480,6 +570,9 @@ fn controller_state(
         return "exited";
     }
     match (pid, expected, current) {
+        // A record with no driver identity is not evidence of death and can
+        // never authorize a replacement.
+        (None, _, _) => "unknown",
         (Some(_), Some(expected), Some(current)) if expected == current && pid_is_alive => {
             "running"
         }
@@ -491,7 +584,7 @@ fn controller_state(
     }
 }
 
-async fn status_for(record: &Value) -> Value {
+pub(super) async fn status_for(record: &Value) -> Value {
     let pid_path = record
         .get("pidPath")
         .and_then(Value::as_str)
@@ -596,11 +689,11 @@ pub(super) async fn controller_status_from_snapshot(
     status
 }
 
-fn is_active(status: &Value) -> bool {
+pub(super) fn is_active(status: &Value) -> bool {
     status.get("state").and_then(Value::as_str) == Some("running")
 }
 
-fn is_unknown(status: &Value) -> bool {
+pub(super) fn is_unknown(status: &Value) -> bool {
     status.get("state").and_then(Value::as_str) == Some("unknown")
 }
 
@@ -648,7 +741,7 @@ async fn record_fallback(
 /// interrupted effects are attributable to that predecessor. Run recovery
 /// uses the full reconciler (including observe-before-redo effects); epic
 /// effects are all SafeRetry and can be handed back directly.
-async fn recover_abandoned(
+pub(super) async fn recover_abandoned(
     ctx: &Ctx,
     id: &str,
     scope: Scope,
@@ -715,7 +808,7 @@ async fn await_pid(path: &Path) -> Option<i32> {
     None
 }
 
-async fn spawn(
+pub(super) async fn spawn(
     ctx: &Ctx,
     id: &str,
     repo: &str,
@@ -827,6 +920,7 @@ async fn spawn(
     }
 
     let session = host.spawn(Path::new(repo), &shell_line, &env).await?;
+    crate::failpoint::hit("controller.spawn.after");
     let Some(pid) = await_pid(&pid_path).await else {
         let _ = host.kill_confirmed(&session).await;
         return Err(Failure::refused(
@@ -873,6 +967,7 @@ async fn spawn(
     .map_err(|error| Failure::internal(format!("writing controller record: {error}")))?;
     crate::failpoint::hit("controller.record.after");
     append_once(ctx, id, CONTROLLER_STARTED, record.clone()).await?;
+    crate::failpoint::hit("controller.event.after");
     Ok(status_for(&record).await)
 }
 
@@ -1007,6 +1102,21 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     };
                     return match serde_json::from_str::<OperationResponse>(&stored) {
                         Ok(mut response) => {
+                            let kind = scope.desired_kind();
+                            let desired_id = id.clone();
+                            let desired_generation = generation(&status);
+                            if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
+                                ledger.ensure_desired_work(
+                                    kind,
+                                    &desired_id,
+                                    desired_generation,
+                                )?;
+                                Ok(())
+                            })
+                            .await
+                            {
+                                return err_response(&key, &error);
+                            }
                             response.reused = true;
                             response
                         }
@@ -1025,14 +1135,36 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 );
                 let operation_id = row.operation_id;
                 let response_for_store = response.clone();
+                let kind = scope.desired_kind();
+                let desired_id = id.clone();
+                let desired_generation = generation(&status);
+                crate::failpoint::hit("submit.desired.before");
                 if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.resolve_interrupted_operation(&operation_id, &response_for_store)
+                    ledger.resolve_interrupted_operation_authorizing_desired(
+                        &operation_id,
+                        &response_for_store,
+                        kind,
+                        &desired_id,
+                        desired_generation,
+                    )
                 })
                 .await
                 {
                     return err_response(&key, &error);
                 }
+                crate::failpoint::hit("submit.desired.after");
                 return response;
+            }
+            let kind = scope.desired_kind();
+            let desired_id = id.clone();
+            let desired_generation = generation(&status);
+            if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.authorize_desired_work(kind, &desired_id, desired_generation)?;
+                Ok(())
+            })
+            .await
+            {
+                return err_response(&key, &error);
             }
             return ok_response(
                 &key,
@@ -1149,21 +1281,32 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             Some(i64::from(next_generation)),
         ),
     );
-    fenced(ctx, scope.operation(), EffectClass::SafeRetry, req, None, {
-        move |_operation| async move {
-            let controller = spawn(
-                ctx,
-                &id,
-                &repo,
-                scope,
-                next_generation,
-                host_policy,
-                herdr_socket,
-            )
-            .await?;
-            Ok(json!({"submitted": true, "alreadyRunning": false, "controller": controller}))
-        }
-    })
+    fenced_authorizing_desired(
+        ctx,
+        scope.operation(),
+        EffectClass::SafeRetry,
+        req,
+        DesiredAuthorization {
+            kind: scope.desired_kind(),
+            id: id.clone(),
+            generation: next_generation,
+        },
+        {
+            move |_operation| async move {
+                let controller = spawn(
+                    ctx,
+                    &id,
+                    &repo,
+                    scope,
+                    next_generation,
+                    host_policy,
+                    herdr_socket,
+                )
+                .await?;
+                Ok(json!({"submitted": true, "alreadyRunning": false, "controller": controller}))
+            }
+        },
+    )
     .await
 }
 
@@ -1180,7 +1323,7 @@ pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 #[cfg(test)]
 mod tests {
     use super::{controller_shell_line, controller_state, shell_quote, status_for};
-    use serde_json::json;
+    use serde_json::{json, Value};
     use std::path::Path;
 
     #[test]
@@ -1244,5 +1387,26 @@ mod tests {
         let record = json!({"driver": {"pid": std::process::id()}});
         let status = status_for(&record).await;
         assert_eq!(status["state"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn missing_pid_is_unknown_not_confirmed_dead() {
+        let record = json!({"generation": 1, "driver": {}});
+        let status = status_for(&record).await;
+        assert_eq!(status["state"], json!("unknown"));
+    }
+
+    #[tokio::test]
+    async fn recovered_identity_never_invents_binary_provenance() {
+        let record = json!({
+            "generation": 2,
+            "driver": {
+                "pid": std::process::id(),
+                "lstart": "Thu Jan  1 00:00:00 1970",
+            },
+            "binary": Value::Null,
+        });
+        let status = status_for(&record).await;
+        assert_eq!(status["binaryMismatch"], Value::Null);
     }
 }

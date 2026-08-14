@@ -11,6 +11,186 @@ use forged_types::{ErrorCode, ExecutionPackageV1, ProviderHints, RunId, Stage};
 
 use crate::error::{refused, LedgerError};
 
+/// The canonical kind of one operator-authorized supervisor subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredSubjectKind {
+    /// A slice run driven by `run drive`.
+    Run,
+    /// An epic driven by `epic drive`.
+    Epic,
+}
+
+impl DesiredSubjectKind {
+    /// The closed SQLite and wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+impl TryFrom<&str> for DesiredSubjectKind {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "run" => Ok(Self::Run),
+            "epic" => Ok(Self::Epic),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown desired-work subject kind: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// The operator's durable intent for one submitted subject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredState {
+    /// Keep a controller present until the subject reaches a durable stop.
+    Running,
+    /// Retain authorization but do not start a controller.
+    Paused,
+    /// Never start another controller for this subject.
+    Stopped,
+}
+
+impl DesiredState {
+    /// The closed SQLite and wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+impl TryFrom<&str> for DesiredState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "running" => Ok(Self::Running),
+            "paused" => Ok(Self::Paused),
+            "stopped" => Ok(Self::Stopped),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown desired state: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// The last durable result of reconciling one desired-work row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DesiredReconcileOutcome {
+    Authorized,
+    Adopted,
+    Restarting,
+    Restarted,
+    Backoff,
+    Attention,
+    Exhausted,
+    Paused,
+    Stopped,
+    Terminal,
+}
+
+impl DesiredReconcileOutcome {
+    /// The closed SQLite and wire spelling.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Authorized => "authorized",
+            Self::Adopted => "adopted",
+            Self::Restarting => "restarting",
+            Self::Restarted => "restarted",
+            Self::Backoff => "backoff",
+            Self::Attention => "attention",
+            Self::Exhausted => "exhausted",
+            Self::Paused => "paused",
+            Self::Stopped => "stopped",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+impl TryFrom<&str> for DesiredReconcileOutcome {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "authorized" => Ok(Self::Authorized),
+            "adopted" => Ok(Self::Adopted),
+            "restarting" => Ok(Self::Restarting),
+            "restarted" => Ok(Self::Restarted),
+            "backoff" => Ok(Self::Backoff),
+            "attention" => Ok(Self::Attention),
+            "exhausted" => Ok(Self::Exhausted),
+            "paused" => Ok(Self::Paused),
+            "stopped" => Ok(Self::Stopped),
+            "terminal" => Ok(Self::Terminal),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown desired-work reconciliation outcome: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// One durable supervisor authorization and reconciliation record.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredWorkRow {
+    pub subject_kind: DesiredSubjectKind,
+    pub subject_id: String,
+    pub desired_state: DesiredState,
+    pub control_revision: u64,
+    pub controller_generation: u32,
+    pub predecessor_generation: Option<u32>,
+    pub restart_budget: u32,
+    pub restart_used: u32,
+    pub next_wake_at: Option<String>,
+    pub last_progress_at: Option<String>,
+    pub last_outcome: Option<DesiredReconcileOutcome>,
+    pub last_error: Option<String>,
+    pub exhausted_at: Option<String>,
+    pub reconcile_token: Option<String>,
+    pub reconcile_lease_until: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// A restart generation reserved under a desired-work reconciliation token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredRestartReservation {
+    /// The finite restart budget admitted this generation.
+    Reserved(DesiredWorkRow),
+    /// No restart was admitted; the row is durably exhausted.
+    Exhausted(DesiredWorkRow),
+}
+
+/// The terminal write for one claimed supervisor reconciliation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DesiredReconcileUpdate {
+    /// Optional control-state transition discovered from landed reality.
+    pub desired_state: Option<DesiredState>,
+    /// Durable classification reported to the operator.
+    pub outcome: DesiredReconcileOutcome,
+    /// Latest controller generation, when observation advanced it.
+    pub controller_generation: Option<u32>,
+    /// Generation proven dead before a replacement was admitted.
+    pub predecessor_generation: Option<u32>,
+    /// Exact persisted deadline; `None` parks the row until explicit control.
+    pub next_wake_at: Option<String>,
+    /// Latest observed progress evidence.
+    pub last_progress_at: Option<String>,
+    /// Durable diagnostic for backoff or attention.
+    pub last_error: Option<String>,
+    /// Whether this outcome is an explicit operator-attention condition.
+    pub attention: bool,
+}
+
 /// A run's lifecycle state (`runs.state`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunState {

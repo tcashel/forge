@@ -123,7 +123,7 @@ fn controller_generation_revoked_tx(
 /// Store the terminal envelope for a row that must match `operation_id` and
 /// must not already be terminal. Shared by `complete_operation` (with the
 /// fence) and `resolve_interrupted_operation` (without it).
-fn settle_operation(
+pub(crate) fn settle_operation(
     tx: &Connection,
     operation_id: &str,
     response: &OperationResponse,

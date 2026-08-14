@@ -768,6 +768,12 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
             .expect("submit operation probe")
             .expect("submit operation survives");
         assert_eq!(operation.state, forged_ledger::OperationState::Terminal);
+        let desired = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "bead-khandoff")
+            .expect("desired-work probe")
+            .expect("recovered submit authorizes desired work");
+        assert_eq!(desired.controller_generation, 1);
+        assert_eq!(desired.desired_state, forged_ledger::DesiredState::Running);
         let controller_events = ledger
             .list_events(Some("bead-khandoff"), 0, 65_536)
             .expect("controller events")

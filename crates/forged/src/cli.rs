@@ -68,6 +68,8 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Reconcile operator-authorized desired work.
+    Supervise(SuperviseArgs),
     /// Work inventory.
     Work {
         /// The work subcommand.
@@ -88,6 +90,17 @@ pub enum Command {
 #[derive(Debug, Args)]
 pub struct KeyOnly {
     /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Desired-work supervisor flags.
+#[derive(Debug, Args)]
+pub struct SuperviseArgs {
+    /// Perform exactly one bounded reconciliation tick and return.
+    #[arg(long)]
+    pub once: bool,
+    /// Override the report operation identity.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -729,6 +742,7 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Supervise(_) => "supervise",
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
         },
@@ -1100,6 +1114,10 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
+        Command::Supervise(a) => (
+            "supervise",
+            request(a.idempotency_key, None, json!({"once": a.once})),
+        ),
         Command::Work { command } => match command {
             WorkCmd::List(a) => ("work_list", request(a.idempotency_key, None, json!({}))),
         },

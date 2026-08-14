@@ -1,0 +1,631 @@
+//! Deterministic reconciliation of operator-authorized desired work.
+//!
+//! The long-running mode is only a scheduler around [`tick`]. Every effect,
+//! budget decision, and singleton fence is persisted by the same tick used
+//! by `forged supervise --once`; no transaction is held while sleeping.
+
+use std::path::PathBuf;
+use std::time::Duration;
+
+use forged_ledger::{
+    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
+    DesiredSubjectKind, DesiredWorkRow, RunState,
+};
+use forged_types::{OperationRequest, OperationResponse};
+use serde_json::{json, Value};
+
+use crate::config::{now_iso, HostPolicy};
+use crate::core::{derive_key, err_response, ok_response, on_ledger, Ctx, Failure};
+
+use super::handoff::{self, Scope};
+
+const REPORT_SCHEMA: &str = "forged.supervise.report/1";
+const LOOP_SCHEMA: &str = "forged.supervise.session/1";
+const POLL_SECONDS: u64 = 5;
+const CLAIM_LEASE_SECONDS: u64 = 60;
+const MAX_BACKOFF_SECONDS: u64 = 300;
+
+fn scope(kind: DesiredSubjectKind) -> Scope {
+    match kind {
+        DesiredSubjectKind::Run => Scope::Run,
+        DesiredSubjectKind::Epic => Scope::Epic,
+    }
+}
+
+fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
+    let timestamp: jiff::Timestamp = anchor.parse().map_err(|error| {
+        Failure::internal(format!(
+            "cannot parse supervisor timestamp {anchor:?}: {error}"
+        ))
+    })?;
+    let nanos = i128::from(seconds).saturating_mul(1_000_000_000);
+    let deadline = jiff::Timestamp::from_nanosecond(
+        timestamp.as_nanosecond().saturating_add(nanos),
+    )
+    .map_err(|error| Failure::internal(format!("supervisor deadline out of range: {error}")))?;
+    Ok(forged_proto::widen_rfc3339(&deadline.to_string()))
+}
+
+fn row_json(row: &DesiredWorkRow) -> Value {
+    json!({
+        "subject": {"kind": row.subject_kind.as_str(), "id": row.subject_id},
+        "desiredState": row.desired_state.as_str(),
+        "controlRevision": row.control_revision,
+        "controllerGeneration": row.controller_generation,
+        "predecessorGeneration": row.predecessor_generation,
+        "restartBudget": row.restart_budget,
+        "restartUsed": row.restart_used,
+        "nextWakeAt": row.next_wake_at,
+        "lastProgressAt": row.last_progress_at,
+        "lastOutcome": row.last_outcome.map(DesiredReconcileOutcome::as_str),
+        "lastError": row.last_error,
+        "exhaustedAt": row.exhausted_at,
+    })
+}
+
+async fn finish(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    update: DesiredReconcileUpdate,
+) -> Result<DesiredWorkRow, Failure> {
+    let kind = row.subject_kind;
+    let id = row.subject_id.clone();
+    let token = token.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.finish_desired_reconciliation(kind, &id, &token, update)
+    })
+    .await
+}
+
+async fn finish_action(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    action: &str,
+    update: DesiredReconcileUpdate,
+) -> Result<Value, Failure> {
+    let row = finish(ctx, row, token, update).await?;
+    Ok(json!({"action": action, "desiredWork": row_json(&row)}))
+}
+
+async fn finish_attention(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    detail: String,
+) -> Result<Value, Failure> {
+    finish_action(
+        ctx,
+        row,
+        token,
+        "attention",
+        DesiredReconcileUpdate {
+            desired_state: None,
+            outcome: DesiredReconcileOutcome::Attention,
+            controller_generation: None,
+            predecessor_generation: row.predecessor_generation,
+            next_wake_at: None,
+            last_progress_at: None,
+            last_error: Some(detail),
+            attention: true,
+        },
+    )
+    .await
+}
+
+async fn finish_retryable(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    detail: String,
+) -> Result<Value, Failure> {
+    let now = now_iso();
+    finish_action(
+        ctx,
+        row,
+        token,
+        "backoff",
+        DesiredReconcileUpdate {
+            desired_state: None,
+            outcome: DesiredReconcileOutcome::Backoff,
+            controller_generation: None,
+            predecessor_generation: row.predecessor_generation,
+            next_wake_at: Some(deadline_after(&now, POLL_SECONDS)?),
+            last_progress_at: None,
+            last_error: Some(detail),
+            attention: false,
+        },
+    )
+    .await
+}
+
+async fn last_progress(ctx: &Ctx, id: &str) -> Result<Option<String>, Failure> {
+    Ok(handoff::events(ctx, id)
+        .await?
+        .last()
+        .map(|event| event.ts.clone()))
+}
+
+/// Return a durable stop action before controller observation. Input-required
+/// parks an authorized epic but deliberately keeps desired state `running`:
+/// `epic resume` makes it due again, and the unresolved input still prevents
+/// a spawn until `epic resolve` actually clears it.
+async fn settle_landed_reality(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+) -> Result<Option<Value>, Failure> {
+    match row.subject_kind {
+        DesiredSubjectKind::Run => {
+            let id = row.subject_id.clone();
+            let run = on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await?;
+            if run.state == RunState::Stopped {
+                return finish_action(
+                    ctx,
+                    row,
+                    token,
+                    "terminal",
+                    DesiredReconcileUpdate {
+                        desired_state: Some(DesiredState::Stopped),
+                        outcome: DesiredReconcileOutcome::Terminal,
+                        controller_generation: None,
+                        predecessor_generation: row.predecessor_generation,
+                        next_wake_at: None,
+                        last_progress_at: Some(run.updated_at),
+                        last_error: None,
+                        attention: false,
+                    },
+                )
+                .await
+                .map(Some);
+            }
+        }
+        DesiredSubjectKind::Epic => {
+            if let Some(stop) = super::epic::epic_submission_stop(ctx, &row.subject_id).await? {
+                if stop.get("finalPr").is_some() {
+                    return finish_action(
+                        ctx,
+                        row,
+                        token,
+                        "terminal",
+                        DesiredReconcileUpdate {
+                            desired_state: Some(DesiredState::Stopped),
+                            outcome: DesiredReconcileOutcome::Terminal,
+                            controller_generation: None,
+                            predecessor_generation: row.predecessor_generation,
+                            next_wake_at: None,
+                            last_progress_at: last_progress(ctx, &row.subject_id).await?,
+                            last_error: None,
+                            attention: false,
+                        },
+                    )
+                    .await
+                    .map(Some);
+                }
+                if stop.get("paused").is_some() {
+                    return finish_action(
+                        ctx,
+                        row,
+                        token,
+                        "paused",
+                        DesiredReconcileUpdate {
+                            desired_state: Some(DesiredState::Paused),
+                            outcome: DesiredReconcileOutcome::Paused,
+                            controller_generation: None,
+                            predecessor_generation: row.predecessor_generation,
+                            next_wake_at: None,
+                            last_progress_at: last_progress(ctx, &row.subject_id).await?,
+                            last_error: None,
+                            attention: false,
+                        },
+                    )
+                    .await
+                    .map(Some);
+                }
+                if stop.get("inputRequired").is_some() {
+                    return finish_attention(
+                        ctx,
+                        row,
+                        token,
+                        format!(
+                            "epic {} still requires explicit input resolution",
+                            row.subject_id
+                        ),
+                    )
+                    .await
+                    .map(Some);
+                }
+            }
+        }
+    }
+    Ok(None)
+}
+
+async fn subject_runtime(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+) -> Result<(String, HostPolicy, Option<PathBuf>), Failure> {
+    match row.subject_kind {
+        DesiredSubjectKind::Run => {
+            let id = row.subject_id.clone();
+            let run = on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&id)).await?;
+            let view = super::drive::project(ctx, &row.subject_id).await?;
+            Ok((run.repo, view.policy.host_policy, view.policy.herdr_socket))
+        }
+        DesiredSubjectKind::Epic => {
+            let repo = super::epic::epic_repo(ctx, &row.subject_id).await?;
+            let (policy, socket) = super::epic::epic_host_policy(ctx, &row.subject_id).await?;
+            Ok((repo, policy, socket))
+        }
+    }
+}
+
+async fn reconcile_claimed(
+    ctx: &Ctx,
+    row: DesiredWorkRow,
+    token: String,
+) -> Result<Value, Failure> {
+    if let Some(stop) = settle_landed_reality(ctx, &row, &token).await? {
+        return Ok(stop);
+    }
+
+    // Serialize with manual submit and terminal run settlement. A control
+    // transition may clear our token while we wait; the reservation write
+    // below re-checks it before any spawn.
+    let subject_scope = scope(row.subject_kind);
+    let _submit_guard = handoff::acquire_submit(ctx, &row.subject_id, subject_scope).await?;
+
+    let mut record = handoff::latest_record(ctx, &row.subject_id).await?;
+    let recorded_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
+    if row.controller_generation > recorded_generation {
+        record = match handoff::recover_reserved_record(
+            ctx,
+            &row.subject_id,
+            subject_scope,
+            row.controller_generation,
+        )
+        .await
+        {
+            Ok(record) => record,
+            Err(error) => {
+                return finish_attention(ctx, &row, &token, error.to_string()).await;
+            }
+        };
+    }
+    let status = match record.as_ref() {
+        Some(record) => handoff::status_for(record).await,
+        None => Value::Null,
+    };
+    crate::failpoint::hit("supervisor.observe.after");
+
+    if handoff::is_active(&status) {
+        let generation = handoff::generation(&status);
+        let progress = last_progress(ctx, &row.subject_id).await?;
+        return finish_action(
+            ctx,
+            &row,
+            &token,
+            "adopted",
+            DesiredReconcileUpdate {
+                desired_state: None,
+                outcome: DesiredReconcileOutcome::Adopted,
+                controller_generation: Some(generation),
+                predecessor_generation: row.predecessor_generation,
+                next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+                last_progress_at: progress,
+                last_error: None,
+                attention: false,
+            },
+        )
+        .await;
+    }
+    if handoff::is_unknown(&status) {
+        return finish_attention(
+            ctx,
+            &row,
+            &token,
+            format!(
+                "{} {} controller identity is unverifiable; no replacement was spawned",
+                subject_scope.noun(),
+                row.subject_id
+            ),
+        )
+        .await;
+    }
+
+    let observed_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
+    if record.is_some() {
+        let target = match handoff::controller_fence_target(ctx, &row.subject_id).await {
+            Ok(target) => target,
+            Err(error) => return finish_attention(ctx, &row, &token, error.to_string()).await,
+        };
+        if let Some(target) = target {
+            // `false` is the ordinary already-dead result. Any surviving
+            // group without the recorded leader identity refuses closed.
+            if let Err(error) = handoff::kill_controller_confirmed(&target).await {
+                return finish_attention(ctx, &row, &token, error.to_string()).await;
+            }
+        }
+    }
+    handoff::recover_abandoned(ctx, &row.subject_id, subject_scope, observed_generation).await?;
+    crate::failpoint::hit("supervisor.recover.after");
+
+    let kind = row.subject_kind;
+    let id = row.subject_id.clone();
+    let reserve_token = token.clone();
+    let reservation = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.reserve_desired_restart(kind, &id, &reserve_token, observed_generation)
+    })
+    .await?;
+    let reserved = match reservation {
+        DesiredRestartReservation::Exhausted(exhausted) => {
+            return Ok(json!({
+                "action": "exhausted",
+                "desiredWork": row_json(&exhausted),
+            }))
+        }
+        DesiredRestartReservation::Reserved(reserved) => reserved,
+    };
+    crate::failpoint::hit("supervisor.restart.reserved.after");
+
+    let (repo, host_policy, herdr_socket) = match subject_runtime(ctx, &reserved).await {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            return finish_spawn_failure(ctx, &reserved, &token, error.to_string()).await;
+        }
+    };
+    let generation = reserved.controller_generation;
+    let predecessor = reserved.predecessor_generation;
+    match handoff::spawn(
+        ctx,
+        &reserved.subject_id,
+        &repo,
+        subject_scope,
+        generation,
+        host_policy,
+        herdr_socket,
+    )
+    .await
+    {
+        Ok(controller) => {
+            crate::failpoint::hit("supervisor.spawn.after");
+            let reconciled = finish(
+                ctx,
+                &reserved,
+                &token,
+                DesiredReconcileUpdate {
+                    desired_state: None,
+                    outcome: DesiredReconcileOutcome::Restarted,
+                    controller_generation: Some(generation),
+                    predecessor_generation: predecessor,
+                    next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+                    last_progress_at: last_progress(ctx, &reserved.subject_id).await?,
+                    last_error: None,
+                    attention: false,
+                },
+            )
+            .await?;
+            crate::failpoint::hit("supervisor.reconcile.after");
+            Ok(json!({
+                "action": "restarted",
+                "predecessorGeneration": predecessor,
+                "controller": controller,
+                "desiredWork": row_json(&reconciled),
+            }))
+        }
+        Err(error) => finish_spawn_failure(ctx, &reserved, &token, error.to_string()).await,
+    }
+}
+
+async fn finish_spawn_failure(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    detail: String,
+) -> Result<Value, Failure> {
+    let exhausted = row.restart_used >= row.restart_budget;
+    let seconds = POLL_SECONDS
+        .saturating_mul(2u64.saturating_pow(row.restart_used.saturating_sub(1)))
+        .min(MAX_BACKOFF_SECONDS);
+    finish_action(
+        ctx,
+        row,
+        token,
+        if exhausted { "exhausted" } else { "backoff" },
+        DesiredReconcileUpdate {
+            desired_state: None,
+            outcome: if exhausted {
+                DesiredReconcileOutcome::Exhausted
+            } else {
+                DesiredReconcileOutcome::Backoff
+            },
+            controller_generation: None,
+            predecessor_generation: row.predecessor_generation,
+            next_wake_at: if exhausted {
+                None
+            } else {
+                Some(deadline_after(&now_iso(), seconds)?)
+            },
+            last_progress_at: None,
+            last_error: Some(detail),
+            attention: exhausted,
+        },
+    )
+    .await
+}
+
+async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
+    let started_at = now_iso();
+    let due = {
+        let now = started_at.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.list_due_desired_work(&now)
+        })
+        .await?
+    };
+    let tick_id = uuid::Uuid::now_v7().to_string();
+    let mut subjects = Vec::new();
+    let mut contended = 0u64;
+    for candidate in due {
+        let token = format!("supervise:{tick_id}:{}", uuid::Uuid::now_v7());
+        let now = now_iso();
+        let lease = deadline_after(&now, CLAIM_LEASE_SECONDS)?;
+        let kind = candidate.subject_kind;
+        let id = candidate.subject_id.clone();
+        let claim_token = token.clone();
+        let claimed = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.claim_desired_work(kind, &id, &claim_token, &now, &lease)
+        })
+        .await?;
+        let Some(claimed) = claimed else {
+            contended = contended.saturating_add(1);
+            continue;
+        };
+        match reconcile_claimed(ctx, claimed.clone(), token.clone()).await {
+            Ok(report) => subjects.push(report),
+            Err(error) => {
+                // Ordinary failures back off and release the claim. A crash
+                // bypasses this code, leaving the lease deadline as recovery
+                // evidence for the next process.
+                match finish_retryable(ctx, &claimed, &token, error.to_string()).await {
+                    Ok(report) => subjects.push(report),
+                    Err(finish_error) => subjects.push(json!({
+                        "action": "claim-retained",
+                        "subject": {"kind": claimed.subject_kind.as_str(), "id": claimed.subject_id},
+                        "error": error.to_string(),
+                        "finishError": finish_error.to_string(),
+                        "leaseUntil": claimed.reconcile_lease_until,
+                    })),
+                }
+            }
+        }
+    }
+    let wake_now = now_iso();
+    let next_wake_at = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.earliest_desired_wake(&wake_now)
+    })
+    .await?;
+    Ok(json!({
+        "schema": REPORT_SCHEMA,
+        "tickId": tick_id,
+        "startedAt": started_at,
+        "finishedAt": now_iso(),
+        "considered": subjects.len() + usize::try_from(contended).unwrap_or(usize::MAX),
+        "contended": contended,
+        "subjects": subjects,
+        "nextWakeAt": next_wake_at,
+    }))
+}
+
+fn sleep_until(next_wake: Option<&str>) -> Duration {
+    let bounded = Duration::from_secs(POLL_SECONDS);
+    let Some(next_wake) = next_wake else {
+        return bounded;
+    };
+    let Ok(deadline) = next_wake.parse::<jiff::Timestamp>() else {
+        return bounded;
+    };
+    let now = jiff::Timestamp::now();
+    let nanos = deadline.as_nanosecond().saturating_sub(now.as_nanosecond());
+    let millis = u64::try_from(nanos / 1_000_000).unwrap_or(u64::MAX);
+    bounded.min(Duration::from_millis(millis.max(10)))
+}
+
+/// `forged supervise [--once]` through the shared CLI/core dispatch seam.
+pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    let key = if req.idempotency_key.is_empty() {
+        format!(
+            "{}:{}",
+            derive_key("supervise", None, None, None),
+            uuid::Uuid::now_v7()
+        )
+    } else {
+        req.idempotency_key.clone()
+    };
+    if req.schema_version != 1 {
+        return err_response(
+            &key,
+            &Failure::invalid(format!("unsupported schemaVersion {}", req.schema_version)),
+        );
+    }
+    let once = req
+        .params
+        .get("once")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if once {
+        return match tick(ctx).await {
+            Ok(report) => ok_response(&key, false, report),
+            Err(error) => err_response(&key, &error),
+        };
+    }
+
+    let started_at = now_iso();
+    let mut ticks = 0u64;
+    let mut last_report = Value::Null;
+    loop {
+        match tick(ctx).await {
+            Ok(report) => {
+                ticks = ticks.saturating_add(1);
+                let delay = sleep_until(report.get("nextWakeAt").and_then(Value::as_str));
+                last_report = report;
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        return ok_response(&key, false, json!({
+                            "schema": LOOP_SCHEMA,
+                            "startedAt": started_at,
+                            "stoppedAt": now_iso(),
+                            "reason": "signal",
+                            "ticks": ticks,
+                            "lastReport": last_report,
+                        }));
+                    }
+                    _ = tokio::time::sleep(delay) => {}
+                }
+            }
+            Err(error) if error.recoverable => {
+                tokio::select! {
+                    _ = tokio::signal::ctrl_c() => {
+                        return ok_response(&key, false, json!({
+                            "schema": LOOP_SCHEMA,
+                            "startedAt": started_at,
+                            "stoppedAt": now_iso(),
+                            "reason": "signal-after-recoverable-error",
+                            "ticks": ticks,
+                            "lastReport": last_report,
+                            "lastError": error.to_string(),
+                        }));
+                    }
+                    _ = tokio::time::sleep(Duration::from_secs(POLL_SECONDS)) => {}
+                }
+            }
+            Err(error) => return err_response(&key, &error),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backoff_is_bounded_and_wake_sleep_is_bounded() {
+        assert_eq!(
+            deadline_after("2030-01-01T00:00:00.000000000Z", 5).expect("deadline"),
+            "2030-01-01T00:00:05.000000000Z"
+        );
+        assert!(
+            sleep_until(Some("9999-01-01T00:00:00.000000000Z"))
+                <= Duration::from_secs(POLL_SECONDS)
+        );
+    }
+
+    #[test]
+    fn wire_vocabulary_is_versioned_and_closed() {
+        assert_eq!(REPORT_SCHEMA, "forged.supervise.report/1");
+        assert_eq!(LOOP_SCHEMA, "forged.supervise.session/1");
+        assert_eq!(DesiredState::Running.as_str(), "running");
+        assert_eq!(DesiredReconcileOutcome::Exhausted.as_str(), "exhausted");
+    }
+}

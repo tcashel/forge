@@ -5,7 +5,10 @@ use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
-use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
+use forged_ledger::{
+    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState,
+    SlotOutcome,
+};
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
     ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
@@ -1453,6 +1456,39 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
     ))
 }
 
+async fn record_desired_stop(ctx: &Ctx, epic: &str, stop: &Value) -> Result<(), Failure> {
+    let (state, outcome, detail) = if stop.get("finalPr").is_some() {
+        (
+            DesiredState::Stopped,
+            DesiredReconcileOutcome::Terminal,
+            None,
+        )
+    } else if stop.get("paused").is_some() {
+        (DesiredState::Paused, DesiredReconcileOutcome::Paused, None)
+    } else {
+        // Input-required remains a separate explicit resolution rail. Keep
+        // authorization, but park it with no wake until resume/resolve makes
+        // the subject due again.
+        (
+            DesiredState::Running,
+            DesiredReconcileOutcome::Attention,
+            Some(format!("epic {epic} requires explicit input resolution")),
+        )
+    };
+    let epic = epic.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.record_desired_outcome(
+            DesiredSubjectKind::Epic,
+            &epic,
+            state,
+            outcome,
+            None,
+            detail,
+        )
+    })
+    .await
+}
+
 /// One epic scheduler action.
 pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
@@ -1466,7 +1502,10 @@ pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
     };
     match advance_once(ctx, &epic, false).await {
         Ok(Step::Progress(value)) => ok_response(&key, false, json!({"progress": value})),
-        Ok(Step::Stop(value)) => ok_response(&key, false, json!({"stopped": value})),
+        Ok(Step::Stop(value)) => match record_desired_stop(ctx, &epic, &value).await {
+            Ok(()) => ok_response(&key, false, json!({"stopped": value})),
+            Err(error) => err_response(&key, &error),
+        },
         Err(error) => err_response(&key, &error),
     }
 }
@@ -1485,7 +1524,12 @@ pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
     loop {
         match advance_once(ctx, &epic, true).await {
             Ok(Step::Progress(_)) => continue,
-            Ok(Step::Stop(value)) => return ok_response(&key, false, json!({"stopped": value})),
+            Ok(Step::Stop(value)) => {
+                if let Err(error) = record_desired_stop(ctx, &epic, &value).await {
+                    return err_response(&key, &error);
+                }
+                return ok_response(&key, false, json!({"stopped": value}));
+            }
             Err(error) => return err_response(&key, &error),
         }
     }
@@ -1538,8 +1582,22 @@ async fn control_event(
         },
         false => None,
     };
+    // Serialize the desired-state transition with manual submit and
+    // supervisor restart. Pause remains out-of-band with respect to the
+    // long-lived epic driver, but it cannot race a new controller spawn.
+    let _submit_guard =
+        match super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await {
+            Ok(guard) => guard,
+            Err(error) => return err_response(&key, &error),
+        };
     let event = json!({"reason": reason});
     let event_epic = epic.clone();
+    let desired_state = if kind == PAUSED {
+        DesiredState::Paused
+    } else {
+        DesiredState::Running
+    };
+    let control_kind = kind.to_owned();
     match safe_effect(
         ctx,
         name,
@@ -1548,7 +1606,18 @@ async fn control_event(
         event.clone(),
         move |_operation| async move {
             project(ctx, &event_epic).await?;
-            append(ctx, &event_epic, kind, event.clone()).await?;
+            let desired_epic = event_epic.clone();
+            let desired_event = event.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.append_event_controlling_desired(
+                    DesiredSubjectKind::Epic,
+                    &desired_epic,
+                    &control_kind,
+                    desired_event,
+                    desired_state,
+                )
+            })
+            .await?;
             Ok(event)
         },
     )

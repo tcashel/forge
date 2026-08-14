@@ -13,9 +13,10 @@ mod ops;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
 pub(crate) mod spec;
+mod supervise;
 pub(crate) mod usage;
 
-use forged_ledger::{EffectClass, Ledger, LedgerError, OperationOutcome};
+use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
 use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse};
 use serde_json::{Map, Value};
@@ -469,6 +470,15 @@ enum FenceAdmission<'a> {
     Machine(Option<u32>),
 }
 
+/// A successful effect whose operation response and desired-work
+/// authorization must commit in one ledger transaction.
+#[derive(Clone)]
+pub(crate) struct DesiredAuthorization {
+    pub(crate) kind: DesiredSubjectKind,
+    pub(crate) id: String,
+    pub(crate) generation: u32,
+}
+
 impl OnEffectError {
     fn for_class(class: EffectClass) -> Self {
         match class {
@@ -503,6 +513,7 @@ where
         class,
         req,
         FenceAdmission::Ordinary(assert_token),
+        None,
         effect,
     )
     .await
@@ -529,6 +540,34 @@ where
         class,
         req,
         FenceAdmission::Machine(generation),
+        None,
+        effect,
+    )
+    .await
+}
+
+/// Fence one submit effect and atomically authorize the spawned controller
+/// when its successful response is sealed. A failed effect never creates a
+/// runnable desired-work record.
+pub(crate) async fn fenced_authorizing_desired<F, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    class: EffectClass,
+    req: &OperationRequest,
+    authorization: DesiredAuthorization,
+    effect: F,
+) -> OperationResponse
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = CoreResult>,
+{
+    fenced_inner(
+        ctx,
+        name,
+        class,
+        req,
+        FenceAdmission::Ordinary(None),
+        Some(authorization),
         effect,
     )
     .await
@@ -540,6 +579,7 @@ async fn fenced_inner<F, Fut>(
     class: EffectClass,
     req: &OperationRequest,
     admission: FenceAdmission<'_>,
+    desired_authorization: Option<DesiredAuthorization>,
     effect: F,
 ) -> OperationResponse
 where
@@ -646,14 +686,28 @@ where
     match effect(operation_id.clone()).await {
         Ok(result) => {
             let resp = ok_response(&operation_id, false, result);
+            if desired_authorization.is_some() {
+                failpoint::hit("submit.desired.before");
+            }
             let store = {
                 let operation_id = operation_id.clone();
                 let resp = resp.clone();
-                on_ledger(&ctx.ledger, move |l| {
-                    l.complete_operation(&operation_id, &resp)
+                let authorization = desired_authorization.clone();
+                on_ledger(&ctx.ledger, move |l| match authorization {
+                    Some(authorization) => l.complete_operation_authorizing_desired(
+                        &operation_id,
+                        &resp,
+                        authorization.kind,
+                        &authorization.id,
+                        authorization.generation,
+                    ),
+                    None => l.complete_operation(&operation_id, &resp),
                 })
                 .await
             };
+            if desired_authorization.is_some() {
+                failpoint::hit("submit.desired.after");
+            }
             match store {
                 Ok(()) => resp,
                 Err(f) => err_response(&operation_id, &f),
@@ -710,6 +764,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
         "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
+        "supervise" => supervise::supervise(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,
