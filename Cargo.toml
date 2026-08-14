@@ -27,7 +27,7 @@ clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 jiff = "0.2"
 minijinja = "2"
-nix = { version = "0.31", features = ["process", "signal"] }
+nix = { version = "0.31", features = ["fs", "process", "signal"] }
 proptest = "1"
 rmcp = { version = "3.1", features = ["server", "transport-io"] }
 rusqlite = { version = "0.40", features = ["bundled"] }

@@ -606,10 +606,12 @@ pub async fn execute_adopted(
     let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
     {
         Ok(spec) => spec,
-        Err(failure) => return settle_adoption(ctx, packet, claim_token, failure).await,
+        Err(failure) => {
+            return settle_adoption(ctx, packet, attempt_id, claim_token, failure).await
+        }
     };
     if let Err(failure) = crate::core::spec::assert_pinned(&packet.spec, &spec) {
-        return settle_adoption(ctx, packet, claim_token, failure).await;
+        return settle_adoption(ctx, packet, attempt_id, claim_token, failure).await;
     }
     run_attempt(ctx, ports, exec, packet, &spec, attempt_id, claim_token).await
 }
@@ -619,16 +621,21 @@ pub async fn execute_adopted(
 async fn settle_adoption(
     ctx: &Ctx,
     packet: &WorkPacket,
+    attempt_id: i64,
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
     settle_unspawned(
         ctx,
-        &packet.packet_id,
+        packet,
+        attempt_id,
         claim_token,
-        format!("transport: adoption could not read the spec: {failure}"),
-        format!("unspawned: adoption refused: {failure}"),
-        failure,
+        PreSpawnFailure {
+            transport_note: format!("transport: adoption could not read the spec: {failure}"),
+            refusal_note: format!("unspawned: adoption refused: {failure}"),
+            failure,
+            phase: "adoption",
+        },
     )
     .await
 }
@@ -640,7 +647,8 @@ async fn settle_adoption(
 /// row is already `running` with no process behind it.
 async fn settle_host_fallback(
     ctx: &Ctx,
-    packet_id: &str,
+    packet: &WorkPacket,
+    attempt_id: i64,
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
@@ -649,11 +657,17 @@ async fn settle_host_fallback(
     // pre-spawn refusal.
     settle_unspawned(
         ctx,
-        packet_id,
+        packet,
+        attempt_id,
         claim_token,
-        format!("transport: the host fallback could not be recorded: {failure}"),
-        format!("unspawned: the host fallback could not be recorded: {failure}"),
-        failure,
+        PreSpawnFailure {
+            transport_note: format!(
+                "transport: the host fallback could not be recorded: {failure}"
+            ),
+            refusal_note: format!("unspawned: the host fallback could not be recorded: {failure}"),
+            failure,
+            phase: "host-selection",
+        },
     )
     .await
 }
@@ -680,19 +694,86 @@ async fn settle_host_fallback(
 /// re-pinnable; the budget is what bounds a cause that will not clear. An
 /// unrecoverable failure still surfaces to the caller rather than being
 /// swallowed into the retry.
-async fn settle_unspawned(
-    ctx: &Ctx,
-    packet_id: &str,
-    claim_token: &str,
+struct PreSpawnFailure<'a> {
     transport_note: String,
     refusal_note: String,
     failure: Failure,
+    phase: &'a str,
+}
+
+async fn settle_unspawned(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    claim_token: &str,
+    settlement: PreSpawnFailure<'_>,
 ) -> Result<PacketOutcome, Failure> {
+    let PreSpawnFailure {
+        transport_note,
+        refusal_note,
+        failure,
+        phase,
+    } = settlement;
+    let note = if failure.recoverable {
+        &transport_note
+    } else {
+        &refusal_note
+    };
+    let evidence = preserve_pre_spawn_failure(ctx, packet, attempt_id, note, phase).await;
+    let settled = fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note.clone()).await;
+    let outcome = settled?;
+    evidence?;
     if failure.recoverable {
-        return fail_and_grant_retry(ctx, packet_id, claim_token, transport_note).await;
+        Ok(outcome)
+    } else {
+        Err(failure)
     }
-    fail_and_grant_retry(ctx, packet_id, claim_token, refusal_note).await?;
-    Err(failure)
+}
+
+async fn preserve_pre_spawn_failure(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    note: &str,
+    phase: &str,
+) -> Result<(), Failure> {
+    let (run_id, stage, seq) = crate::core::split_packet_key(&packet.packet_id)?;
+    let run_root = ctx.config.run_dir(&run_id);
+    let packet_dir = ctx.config.packet_dir_key(&run_id, &stage, seq);
+    let dirs = PacketDirs::new(&packet_dir, attempt_id);
+    crate::core::artifacts::prepare_attempt(&run_root, &dirs)?;
+    if !crate::core::artifacts::prompt_exists(&run_root, &dirs)? {
+        let prompt = format!(
+            "Forged did not start a provider for this attempt.\nPhase: {phase}\nFailure: {note}\n"
+        );
+        crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
+    }
+    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+    crate::core::artifacts::materialize_and_join(
+        ctx,
+        packet,
+        attempt_id,
+        "transport",
+        &json!({"note": note, "providerStarted": false}),
+        &json!({"host": null, "spawned": false, "phase": phase}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn fail_pre_spawn_transport(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    claim_token: &str,
+    note: String,
+    phase: &str,
+) -> Result<PacketOutcome, Failure> {
+    let evidence = preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, phase).await;
+    let settled = fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note).await;
+    let outcome = settled?;
+    evidence?;
+    Ok(outcome)
 }
 
 /// The shared attempt pipeline: render, spawn, await, harvest, settle.
@@ -708,6 +789,7 @@ async fn run_attempt(
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
     let claim_token = claim_token.to_owned();
+    let run_root = ctx.config.run_dir(&run_id);
 
     // 1. Everything between the claim and the spawn. The attempt is already
     // `running` with no process behind it, so NOTHING in here may propagate
@@ -718,6 +800,7 @@ async fn run_attempt(
     // prompt are materialized here. The spec bytes are written from the read
     // this attempt was fenced on, so every seat of this packet reads the
     // same bytes.
+    let unprepared_packet = packet.clone();
     let packet = packet.clone();
     let prepared = async {
         let mut packet = packet;
@@ -746,14 +829,13 @@ async fn run_attempt(
         let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
         failpoint::hit("packet.materialize.before");
         let dirs = PacketDirs::new(&packet_dir, attempt_id);
-        std::fs::create_dir_all(dirs.path())
-            .map_err(|e| Failure::internal(format!("creating {}: {e}", dirs.path().display())))?;
+        crate::core::artifacts::prepare_attempt(&run_root, &dirs)?;
         crate::core::spec::assert_pinned(&packet.spec, spec)?;
         crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
         let templates = PromptTemplates::load()?;
         let context = render_context(exec, &packet, seq)?;
         let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
-        crate::core::artifacts::atomic_write_once(&dirs.prompt(), prompt.as_bytes())?;
+        crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
         Ok::<_, Failure>((packet, interventions, holder, packet_dir))
     }
     .await;
@@ -762,8 +844,19 @@ async fn run_attempt(
         Err(failure) => {
             let transport = format!("transport: the attempt could not be prepared: {failure}");
             let refusal = format!("unspawned: attempt refused before spawn: {failure}");
-            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
-                .await;
+            return settle_unspawned(
+                ctx,
+                &unprepared_packet,
+                attempt_id,
+                &claim_token,
+                PreSpawnFailure {
+                    transport_note: transport,
+                    refusal_note: refusal,
+                    failure,
+                    phase: "preparation",
+                },
+            )
+            .await;
         }
     };
     let dirs = PacketDirs::new(&packet_dir, attempt_id);
@@ -773,7 +866,15 @@ async fn run_attempt(
         Ok(driver) => driver,
         Err(error) => {
             let note = format!("transport: provider adapter unavailable: {}", error.message);
-            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "adapter-selection",
+            )
+            .await;
         }
     };
     let invocation = match driver
@@ -784,8 +885,19 @@ async fn run_attempt(
         Err(failure) => {
             let transport = format!("transport: the provider invocation failed: {failure}");
             let refusal = format!("unspawned: attempt refused before spawn: {failure}");
-            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
-                .await;
+            return settle_unspawned(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                PreSpawnFailure {
+                    transport_note: transport,
+                    refusal_note: refusal,
+                    failure,
+                    phase: "invocation",
+                },
+            )
+            .await;
         }
     };
 
@@ -813,11 +925,13 @@ async fn run_attempt(
         HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
             None => {
                 if exec.host_policy == HostPolicy::Required {
-                    return fail_and_grant_retry(
+                    return fail_pre_spawn_transport(
                         ctx,
-                        &packet_id,
+                        &packet,
+                        attempt_id,
                         &claim_token,
                         "transport: Herdr is required but no socket is configured".to_owned(),
+                        "host-selection",
                     )
                     .await;
                 }
@@ -830,7 +944,8 @@ async fn run_attempt(
                 )
                 .await
                 {
-                    return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                    return settle_host_fallback(ctx, &packet, attempt_id, &claim_token, failure)
+                        .await;
                 }
                 (Arc::new(ProcessHost::new(&status_base)), "process", None)
             }
@@ -853,16 +968,25 @@ async fn run_attempt(
                     )
                     .await
                     {
-                        return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                        return settle_host_fallback(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            &claim_token,
+                            failure,
+                        )
+                        .await;
                     }
                     (Arc::new(ProcessHost::new(&status_base)), "process", None)
                 }
                 Err(error) => {
-                    return fail_and_grant_retry(
+                    return fail_pre_spawn_transport(
                         ctx,
-                        &packet_id,
+                        &packet,
+                        attempt_id,
                         &claim_token,
                         format!("transport: required Herdr host unavailable: {error}"),
+                        "host-selection",
                     )
                     .await;
                 }
@@ -997,8 +1121,8 @@ async fn run_attempt(
                         if let Some(handle) = guardian.take() {
                             handle.abort();
                         }
-                        crate::core::artifacts::finalize_provider_files(&dirs)?;
-                        let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+                        crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+                        let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
                         crate::core::usage::capture_attempt(
                             ctx,
                             &run_id,
@@ -1039,7 +1163,7 @@ async fn run_attempt(
     // Provider output was streamed to private names. Publish those names
     // only after the provider is terminal; no successor shares this attempt
     // directory, and the manifest written below is the completion marker.
-    crate::core::artifacts::finalize_provider_files(&dirs)?;
+    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
 
     // 5. Record what this attempt spent, before deciding what it produced.
     //
@@ -1047,7 +1171,7 @@ async fn run_attempt(
     // hand, and the outcome has not yet branched. The attempt-addressed
     // capture makes later reconciliation possible too, but the live path
     // still records spend immediately rather than depending on a backfill.
-    let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
     crate::core::usage::capture_attempt(
         ctx,
         &run_id,
@@ -1066,7 +1190,7 @@ async fn run_attempt(
         }
         forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
             "codex" => {
-                let last = std::fs::read_to_string(dirs.last_message()).ok();
+                let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
                 harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
             }
             _ => harvest_claude(&out, &packet.result_schema, &packet_id),

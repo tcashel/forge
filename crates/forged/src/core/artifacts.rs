@@ -1,12 +1,18 @@
 //! Immutable, attempt-addressed provider evidence and read-only attestation.
 
-use std::fs::{File, OpenOptions};
+use std::ffi::{OsStr, OsString};
+use std::fs::File;
 use std::io::{Read, Write};
+use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 
 use forged_ledger::{AttemptArtifactRow, NewAttemptArtifact};
 use forged_provider::PacketDirs;
 use forged_types::{OperationRequest, OperationResponse, WorkPacket};
+use nix::errno::Errno;
+use nix::fcntl::{open, openat, AtFlags, OFlag};
+use nix::sys::stat::{fstat, mkdirat, Mode, SFlag};
+use nix::unistd::{fsync, linkat, unlinkat, UnlinkatFlags};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -74,21 +80,21 @@ pub struct AttemptArtifactManifestV1 {
     pub files: ManifestFilesV1,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct ResultEvidence<'a> {
-    schema: &'static str,
-    outcome: &'a str,
-    detail: &'a Value,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct ResultEvidenceV1 {
+    schema: String,
+    outcome: String,
+    detail: Value,
 }
 
-#[derive(Debug, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SessionEvidence<'a> {
-    schema: &'static str,
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct SessionEvidenceV1 {
+    schema: String,
     attempt_id: i64,
-    provider_claimant: &'a str,
-    metadata: &'a Value,
+    provider_claimant: String,
+    metadata: Value,
 }
 
 /// Inputs already fenced to one claimed attempt.
@@ -101,7 +107,6 @@ pub struct MaterializeAttempt<'a> {
     pub outcome: &'a str,
     pub detail: &'a Value,
     pub session: &'a Value,
-    pub retention_class: RetentionClass,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -127,114 +132,354 @@ fn digest(bytes: &[u8]) -> String {
         .collect()
 }
 
+#[cfg(test)]
 fn read(path: &Path) -> Result<Vec<u8>, Failure> {
     std::fs::read(path).map_err(|error| failure("reading artifact", path, error))
 }
 
-fn sync_dir(path: &Path) -> Result<(), Failure> {
-    File::open(path)
-        .and_then(|file| file.sync_all())
-        .map_err(|error| failure("syncing artifact directory", path, error))
+fn safe_relative(path: &str) -> Result<&Path, Failure> {
+    let relative = Path::new(path);
+    let safe = !path.is_empty()
+        && !relative.is_absolute()
+        && relative.components().all(|component| match component {
+            Component::Normal(value) => value.to_str().is_some_and(|value| {
+                !value.is_empty()
+                    && value
+                        .chars()
+                        .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
+            }),
+            _ => false,
+        });
+    if !safe {
+        return Err(Failure::invalid(format!(
+            "artifact path {path:?} is not a safe run-relative path"
+        )));
+    }
+    Ok(relative)
 }
 
-/// Publish without replacing an existing immutable name. The temporary file
-/// is fsynced and hard-linked in the same directory; the link is an atomic
-/// no-clobber publish.
-pub(crate) fn atomic_write_once(path: &Path, bytes: &[u8]) -> Result<(), Failure> {
-    let parent = path.parent().ok_or_else(|| {
-        Failure::internal(format!("artifact path {} has no parent", path.display()))
-    })?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| failure("creating artifact directory", parent, error))?;
-    if path.exists() {
-        return if read(path)? == bytes {
-            Ok(())
-        } else {
-            Err(Failure::internal(format!(
-                "immutable artifact {} already contains different bytes",
-                path.display()
-            )))
-        };
-    }
-    let name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .ok_or_else(|| {
-            Failure::internal(format!(
-                "artifact path {} has no UTF-8 name",
-                path.display()
-            ))
-        })?;
-    let temporary = parent.join(format!(".{name}.tmp-{}", uuid::Uuid::now_v7()));
-    let mut file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&temporary)
-        .map_err(|error| failure("creating temporary artifact", &temporary, error))?;
-    file.write_all(bytes)
-        .map_err(|error| failure("writing temporary artifact", &temporary, error))?;
-    file.sync_all()
-        .map_err(|error| failure("syncing temporary artifact", &temporary, error))?;
-    drop(file);
-    match std::fs::hard_link(&temporary, path) {
-        Ok(()) => {}
-        Err(_error) if path.exists() && read(path)? == bytes => {}
-        Err(error) => {
-            let _ = std::fs::remove_file(&temporary);
-            return Err(failure("publishing immutable artifact", path, error));
-        }
-    }
-    std::fs::remove_file(&temporary)
-        .map_err(|error| failure("removing temporary artifact", &temporary, error))?;
-    sync_dir(parent)
+fn nix_failure(action: &str, path: &Path, error: Errno) -> Failure {
+    Failure::invalid(format!(
+        "{action} {} without following symlinks: {error}",
+        path.display()
+    ))
 }
 
-/// Promote a provider's private streaming target after it is terminal.
-fn promote_stream(working: &Path, final_path: &Path) -> Result<(), Failure> {
-    if !working.exists() {
-        return if final_path.exists() {
-            Ok(())
-        } else {
-            atomic_write_once(final_path, b"")
+fn open_root(run_root: &Path) -> Result<OwnedFd, Failure> {
+    open(
+        run_root,
+        OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| nix_failure("opening run root", run_root, error))
+}
+
+/// Hold the parent directory descriptor for a safe relative leaf. Each parent
+/// is opened with `O_NOFOLLOW`; later reads/unlinks stay anchored even if a
+/// pathname is concurrently replaced with a symlink.
+fn anchored_parent(
+    run_root: &Path,
+    relative: &str,
+    create_parents: bool,
+) -> Result<(OwnedFd, OsString), Failure> {
+    let relative = safe_relative(relative)?;
+    let mut components = relative
+        .components()
+        .map(|component| match component {
+            Component::Normal(value) => value.to_owned(),
+            _ => unreachable!("safe_relative admitted only normal components"),
+        })
+        .collect::<Vec<_>>();
+    let leaf = components
+        .pop()
+        .ok_or_else(|| Failure::invalid("artifact path has no leaf"))?;
+    let mut directory = open_root(run_root)?;
+    let mut display = run_root.to_path_buf();
+    for component in components {
+        display.push(&component);
+        let flags = OFlag::O_RDONLY | OFlag::O_DIRECTORY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC;
+        directory = match openat(&directory, Path::new(&component), flags, Mode::empty()) {
+            Ok(next) => next,
+            Err(Errno::ENOENT) if create_parents => {
+                match mkdirat(
+                    &directory,
+                    Path::new(&component),
+                    Mode::from_bits_truncate(0o700),
+                ) {
+                    Ok(()) | Err(Errno::EEXIST) => {}
+                    Err(error) => {
+                        return Err(nix_failure("creating artifact directory", &display, error))
+                    }
+                }
+                openat(&directory, Path::new(&component), flags, Mode::empty())
+                    .map_err(|error| nix_failure("opening artifact directory", &display, error))?
+            }
+            Err(error) => return Err(nix_failure("opening artifact directory", &display, error)),
         };
     }
-    let mut file = match OpenOptions::new().read(true).open(working) {
-        Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound && final_path.exists() => {
-            return Ok(())
-        }
-        Err(error) => return Err(failure("opening provider capture", working, error)),
-    };
-    file.sync_all()
-        .map_err(|error| failure("syncing provider capture", working, error))?;
+    Ok((directory, leaf))
+}
+
+fn read_regular_fd(fd: OwnedFd, display: &Path) -> Result<Vec<u8>, Failure> {
+    let stat = fstat(&fd).map_err(|error| nix_failure("inspecting artifact", display, error))?;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+        return Err(Failure::invalid(format!(
+            "artifact {} is not a regular file",
+            display.display()
+        )));
+    }
+    let mut file = File::from(fd);
     let mut bytes = Vec::new();
     file.read_to_end(&mut bytes)
-        .map_err(|error| failure("reading provider capture", working, error))?;
-    drop(file);
-    // Recovery may race another reconciler preserving the same dead attempt.
-    // Reuse the no-clobber idempotent publisher so both processes converge on
-    // the same immutable bytes instead of treating `AlreadyExists` as loss.
-    atomic_write_once(final_path, &bytes)?;
-    match std::fs::remove_file(working) {
-        Ok(()) => {}
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-        Err(error) => return Err(failure("removing unfinished capture", working, error)),
-    }
-    sync_dir(
-        final_path
-            .parent()
-            .ok_or_else(|| Failure::internal("capture has no parent"))?,
+        .map_err(|error| failure("reading artifact", display, error))?;
+    Ok(bytes)
+}
+
+fn read_run_file(run_root: &Path, relative: &str) -> Result<Vec<u8>, Failure> {
+    let (parent, leaf) = anchored_parent(run_root, relative, false)?;
+    let display = run_root.join(safe_relative(relative)?);
+    let fd = openat(
+        &parent,
+        Path::new(&leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
     )
+    .map_err(|error| nix_failure("opening artifact", &display, error))?;
+    read_regular_fd(fd, &display)
+}
+
+fn read_optional_run_file(run_root: &Path, relative: &str) -> Result<Option<Vec<u8>>, Failure> {
+    let (parent, leaf) = anchored_parent(run_root, relative, false)?;
+    let display = run_root.join(safe_relative(relative)?);
+    match openat(
+        &parent,
+        Path::new(&leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => read_regular_fd(fd, &display).map(Some),
+        Err(Errno::ENOENT) => Ok(None),
+        Err(error) => Err(nix_failure("opening artifact", &display, error)),
+    }
+}
+
+fn read_leaf(parent: &OwnedFd, leaf: &OsStr, display: &Path) -> Result<Vec<u8>, Failure> {
+    let fd = openat(
+        parent,
+        Path::new(leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    )
+    .map_err(|error| nix_failure("opening artifact", display, error))?;
+    read_regular_fd(fd, display)
+}
+
+fn run_file_exists(run_root: &Path, relative: &str) -> Result<bool, Failure> {
+    read_optional_run_file(run_root, relative).map(|bytes| bytes.is_some())
+}
+
+/// Run-root-anchored counterpart to `atomic_write_once`. Parent traversal,
+/// temporary creation, publish, and cleanup all stay relative to held
+/// directory descriptors and cannot be redirected by symlink replacement.
+fn atomic_write_once_run(run_root: &Path, relative: &str, bytes: &[u8]) -> Result<(), Failure> {
+    let (parent, leaf) = anchored_parent(run_root, relative, true)?;
+    let display = run_root.join(safe_relative(relative)?);
+    match openat(
+        &parent,
+        Path::new(&leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => {
+            return if read_regular_fd(fd, &display)? == bytes {
+                fsync(&parent)
+                    .map_err(|error| nix_failure("syncing artifact directory", &display, error))
+            } else {
+                Err(Failure::internal(format!(
+                    "immutable artifact {} already contains different bytes",
+                    display.display()
+                )))
+            };
+        }
+        Err(Errno::ENOENT) => {}
+        Err(error) => return Err(nix_failure("opening immutable artifact", &display, error)),
+    }
+
+    let leaf_text = leaf
+        .to_str()
+        .ok_or_else(|| Failure::invalid(format!("artifact leaf {:?} is not UTF-8", leaf)))?;
+    let temporary = OsString::from(format!(".{leaf_text}.tmp-{}", uuid::Uuid::now_v7()));
+    let temporary_path = display.with_file_name(&temporary);
+    let fd = openat(
+        &parent,
+        Path::new(&temporary),
+        OFlag::O_CREAT | OFlag::O_EXCL | OFlag::O_WRONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::from_bits_truncate(0o600),
+    )
+    .map_err(|error| nix_failure("creating temporary artifact", &temporary_path, error))?;
+    let mut file = File::from(fd);
+    let write_result = file
+        .write_all(bytes)
+        .map_err(|error| failure("writing temporary artifact", &temporary_path, error))
+        .and_then(|()| {
+            file.sync_all()
+                .map_err(|error| failure("syncing temporary artifact", &temporary_path, error))
+        });
+    drop(file);
+    let publish_result = write_result.and_then(|()| {
+        match linkat(
+            &parent,
+            Path::new(&temporary),
+            &parent,
+            Path::new(&leaf),
+            AtFlags::empty(),
+        ) {
+            Ok(()) => Ok(()),
+            Err(Errno::EEXIST) => {
+                let existing = read_leaf(&parent, &leaf, &display)?;
+                if existing == bytes {
+                    Ok(())
+                } else {
+                    Err(Failure::internal(format!(
+                        "immutable artifact {} already contains different bytes",
+                        display.display()
+                    )))
+                }
+            }
+            Err(error) => Err(nix_failure(
+                "publishing immutable artifact",
+                &display,
+                error,
+            )),
+        }
+    });
+    let cleanup_result = unlinkat(&parent, Path::new(&temporary), UnlinkatFlags::NoRemoveDir)
+        .map_err(|error| nix_failure("removing temporary artifact", &temporary_path, error));
+    let sync_result =
+        fsync(&parent).map_err(|error| nix_failure("syncing artifact directory", &display, error));
+    publish_result.and(cleanup_result).and(sync_result)
+}
+
+fn remove_run_file(run_root: &Path, relative: &str) -> Result<bool, Failure> {
+    let (parent, leaf) = anchored_parent(run_root, relative, false)?;
+    let display = run_root.join(safe_relative(relative)?);
+    let fd = match openat(
+        &parent,
+        Path::new(&leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => fd,
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(nix_failure("opening artifact for removal", &display, error)),
+    };
+    let stat = fstat(&fd).map_err(|error| nix_failure("inspecting artifact", &display, error))?;
+    if SFlag::from_bits_truncate(stat.st_mode) & SFlag::S_IFMT != SFlag::S_IFREG {
+        return Err(Failure::invalid(format!(
+            "artifact {} is not a regular file",
+            display.display()
+        )));
+    }
+    unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir)
+        .map_err(|error| nix_failure("removing artifact", &display, error))?;
+    fsync(&parent).map_err(|error| nix_failure("syncing artifact directory", &display, error))?;
+    Ok(true)
+}
+
+fn remove_manifest_file(run_root: &Path, file: &ManifestFileV1) -> Result<bool, Failure> {
+    let (parent, leaf) = anchored_parent(run_root, &file.path, false)?;
+    let display = run_root.join(safe_relative(&file.path)?);
+    let bytes = match openat(
+        &parent,
+        Path::new(&leaf),
+        OFlag::O_RDONLY | OFlag::O_NOFOLLOW | OFlag::O_CLOEXEC,
+        Mode::empty(),
+    ) {
+        Ok(fd) => read_regular_fd(fd, &display)?,
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(nix_failure("opening compactable artifact", &display, error)),
+    };
+    if digest(&bytes) != file.sha256 || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes
+    {
+        return Err(Failure::invalid(format!(
+            "refusing to compact changed artifact {}",
+            file.path
+        )));
+    }
+    unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir)
+        .map_err(|error| nix_failure("removing compacted artifact", &display, error))?;
+    fsync(&parent).map_err(|error| nix_failure("syncing artifact directory", &display, error))?;
+    Ok(true)
+}
+
+/// Create the closed attempt directory exclusively through a held run-root
+/// capability. No ambient `create_dir_all` is allowed on packet paths.
+pub(crate) fn prepare_attempt(run_root: &Path, dirs: &PacketDirs) -> Result<(), Failure> {
+    let prompt = relative(run_root, &dirs.prompt())?;
+    let _ = anchored_parent(run_root, &prompt, true)?;
+    Ok(())
+}
+
+pub(crate) fn materialize_prompt(
+    run_root: &Path,
+    dirs: &PacketDirs,
+    bytes: &[u8],
+) -> Result<(), Failure> {
+    let prompt = relative(run_root, &dirs.prompt())?;
+    atomic_write_once_run(run_root, &prompt, bytes)
+}
+
+/// Promote a provider's private streaming target after it is terminal. Every
+/// read, publication, and unlink stays relative to a held run-root directory.
+fn promote_stream(run_root: &Path, working: &Path, final_path: &Path) -> Result<(), Failure> {
+    let working = relative(run_root, working)?;
+    let final_path = relative(run_root, final_path)?;
+    let Some(bytes) = read_optional_run_file(run_root, &working)? else {
+        return if run_file_exists(run_root, &final_path)? {
+            Ok(())
+        } else {
+            atomic_write_once_run(run_root, &final_path, b"")
+        };
+    };
+    atomic_write_once_run(run_root, &final_path, &bytes)?;
+    remove_run_file(run_root, &working)?;
+    Ok(())
 }
 
 /// Freeze provider-owned streaming targets before usage or result harvest.
 /// A missing stream becomes an honest zero-byte capture.
-pub(crate) fn finalize_provider_files(dirs: &PacketDirs) -> Result<(), Failure> {
-    promote_stream(&dirs.stdout_working(), &dirs.stdout())?;
-    if dirs.last_message_working().exists() || dirs.last_message().exists() {
-        promote_stream(&dirs.last_message_working(), &dirs.last_message())?;
+pub(crate) fn finalize_provider_files(run_root: &Path, dirs: &PacketDirs) -> Result<(), Failure> {
+    promote_stream(run_root, &dirs.stdout_working(), &dirs.stdout())?;
+    let last_working = relative(run_root, &dirs.last_message_working())?;
+    let last_final = relative(run_root, &dirs.last_message())?;
+    if run_file_exists(run_root, &last_working)? || run_file_exists(run_root, &last_final)? {
+        promote_stream(run_root, &dirs.last_message_working(), &dirs.last_message())?;
     }
     Ok(())
+}
+
+pub(crate) fn prompt_exists(run_root: &Path, dirs: &PacketDirs) -> Result<bool, Failure> {
+    run_file_exists(run_root, &relative(run_root, &dirs.prompt())?)
+}
+
+pub(crate) fn read_output_text(run_root: &Path, dirs: &PacketDirs) -> Result<String, Failure> {
+    let output = read_run_file(run_root, &relative(run_root, &dirs.stdout())?)?;
+    String::from_utf8(output)
+        .map_err(|error| Failure::invalid(format!("provider output is not UTF-8: {error}")))
+}
+
+pub(crate) fn read_final_message_text(
+    run_root: &Path,
+    dirs: &PacketDirs,
+) -> Result<Option<String>, Failure> {
+    let path = relative(run_root, &dirs.last_message())?;
+    read_optional_run_file(run_root, &path)?
+        .map(|bytes| {
+            String::from_utf8(bytes).map_err(|error| {
+                Failure::invalid(format!("provider final message is not UTF-8: {error}"))
+            })
+        })
+        .transpose()
 }
 
 fn relative(run_root: &Path, path: &Path) -> Result<String, Failure> {
@@ -245,28 +490,16 @@ fn relative(run_root: &Path, path: &Path) -> Result<String, Failure> {
             run_root.display()
         ))
     })?;
-    let safe = relative.components().all(|component| match component {
-        Component::Normal(value) => value.to_str().is_some_and(|value| {
-            !value.is_empty()
-                && value
-                    .chars()
-                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '.' | '_' | '-'))
-        }),
-        _ => false,
-    });
-    if !safe {
-        return Err(Failure::invalid(format!(
-            "artifact path {} contains characters outside [A-Za-z0-9/._-]",
-            relative.display()
-        )));
-    }
-    Ok(relative.to_string_lossy().into_owned())
+    let encoded = relative.to_string_lossy().into_owned();
+    safe_relative(&encoded)?;
+    Ok(encoded)
 }
 
 fn entry(run_root: &Path, path: &Path) -> Result<ManifestFileV1, Failure> {
-    let bytes = read(path)?;
+    let relative = relative(run_root, path)?;
+    let bytes = read_run_file(run_root, &relative)?;
     Ok(ManifestFileV1 {
-        path: relative(run_root, path)?,
+        path: relative,
         bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         sha256: digest(&bytes),
     })
@@ -297,6 +530,190 @@ fn check_identity(
     Ok(())
 }
 
+fn valid_sha256(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte))
+}
+
+fn expected_manifest_path(packet_id: &str, attempt_id: i64) -> Result<String, Failure> {
+    let (_, stage, seq) = super::split_packet_key(packet_id)?;
+    let expected = format!("packets/{stage}/{seq}/attempts/{attempt_id}/manifest.json");
+    safe_relative(&expected)?;
+    Ok(expected)
+}
+
+/// A manifest may name only the five closed file slots immediately beside
+/// itself in `attempts/<attempt-id>`. This is checked before any embedded path
+/// is read or removed.
+fn validate_manifest_layout(
+    manifest_path: &str,
+    attempt_id: i64,
+    manifest: &AttemptArtifactManifestV1,
+) -> Result<(), Failure> {
+    let manifest_relative = safe_relative(manifest_path)?;
+    let expected_manifest = expected_manifest_path(&manifest.packet_id, attempt_id)?;
+    if manifest_path != expected_manifest {
+        return Err(Failure::invalid(format!(
+            "attempt {attempt_id} manifest path {manifest_path:?} does not match {expected_manifest:?}"
+        )));
+    }
+    let attempt_dir = manifest_relative
+        .parent()
+        .ok_or_else(|| Failure::invalid("attempt manifest has no parent directory"))?;
+    let expected = |name: &str| attempt_dir.join(name);
+    let slots = [
+        (&manifest.files.prompt, expected("prompt.md")),
+        (&manifest.files.output, expected("out.jsonl")),
+        (&manifest.files.result, expected("result.json")),
+        (&manifest.files.session, expected("session.json")),
+    ];
+    for (file, expected) in slots {
+        safe_relative(&file.path)?;
+        if Path::new(&file.path) != expected {
+            return Err(Failure::invalid(format!(
+                "manifest file path {:?} is outside its closed attempt slot {}",
+                file.path,
+                expected.display()
+            )));
+        }
+        if !valid_sha256(&file.sha256) {
+            return Err(Failure::invalid(format!(
+                "manifest file {:?} has an invalid sha256",
+                file.path
+            )));
+        }
+    }
+    if let Some(file) = &manifest.files.final_message {
+        let expected = expected("last.txt");
+        safe_relative(&file.path)?;
+        if Path::new(&file.path) != expected || !valid_sha256(&file.sha256) {
+            return Err(Failure::invalid(format!(
+                "manifest final-message path {:?} is outside its closed attempt slot",
+                file.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn expected_retention(outcome: &str) -> RetentionClass {
+    if outcome == "result" {
+        RetentionClass::CompactableSuccess
+    } else {
+        RetentionClass::Retain
+    }
+}
+
+fn validate_manifest_evidence(
+    run_root: &Path,
+    manifest: &AttemptArtifactManifestV1,
+    expected: Option<&MaterializeAttempt<'_>>,
+) -> Result<(ResultEvidenceV1, SessionEvidenceV1), Failure> {
+    let result = parse_result(&read_run_file(run_root, &manifest.files.result.path)?)?;
+    let session = parse_session(
+        &read_run_file(run_root, &manifest.files.session.path)?,
+        manifest.attempt_id,
+    )?;
+    if manifest.retention_class != expected_retention(&result.outcome) {
+        return Err(Failure::invalid(format!(
+            "attempt {} retention does not match immutable result outcome",
+            manifest.attempt_id
+        )));
+    }
+    if let Some(expected) = expected {
+        if manifest.provider != expected.packet.provider_hints.provider
+            || manifest.model != expected.packet.provider_hints.model
+            || manifest.started_at != expected.started_at
+            || session.provider_claimant != expected.claimant
+        {
+            return Err(Failure::invalid(format!(
+                "attempt {} manifest provenance does not match the claimed attempt",
+                manifest.attempt_id
+            )));
+        }
+    }
+    Ok((result, session))
+}
+
+fn verify_manifest_inventory(
+    run_root: &Path,
+    manifest: &AttemptArtifactManifestV1,
+) -> Result<(), Failure> {
+    let mut files = vec![
+        &manifest.files.prompt,
+        &manifest.files.output,
+        &manifest.files.result,
+        &manifest.files.session,
+    ];
+    if let Some(final_message) = &manifest.files.final_message {
+        files.push(final_message);
+    }
+    for file in files {
+        let bytes = read_run_file(run_root, &file.path)?;
+        if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes
+            || digest(&bytes) != file.sha256
+        {
+            return Err(Failure::invalid(format!(
+                "manifest content does not match artifact {}",
+                file.path
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn parse_result(bytes: &[u8]) -> Result<ResultEvidenceV1, Failure> {
+    let evidence: ResultEvidenceV1 = serde_json::from_slice(bytes)
+        .map_err(|error| Failure::invalid(format!("invalid result evidence: {error}")))?;
+    if evidence.schema != RESULT_SCHEMA || evidence.outcome.is_empty() {
+        return Err(Failure::invalid(
+            "result evidence has an invalid schema or outcome",
+        ));
+    }
+    Ok(evidence)
+}
+
+fn parse_session(bytes: &[u8], attempt_id: i64) -> Result<SessionEvidenceV1, Failure> {
+    let evidence: SessionEvidenceV1 = serde_json::from_slice(bytes)
+        .map_err(|error| Failure::invalid(format!("invalid session evidence: {error}")))?;
+    if evidence.schema != SESSION_SCHEMA || evidence.attempt_id != attempt_id {
+        return Err(Failure::invalid(format!(
+            "session evidence identity does not match attempt {attempt_id}"
+        )));
+    }
+    Ok(evidence)
+}
+
+fn publish_or_adopt_result(
+    run_root: &Path,
+    relative: &str,
+    candidate: ResultEvidenceV1,
+) -> Result<ResultEvidenceV1, Failure> {
+    let candidate_bytes = json_bytes(&candidate)?;
+    match atomic_write_once_run(run_root, relative, &candidate_bytes) {
+        Ok(()) => Ok(candidate),
+        Err(error) => read_run_file(run_root, relative)
+            .and_then(|bytes| parse_result(&bytes))
+            .map_err(|_| error),
+    }
+}
+
+fn publish_or_adopt_session(
+    run_root: &Path,
+    relative: &str,
+    candidate: SessionEvidenceV1,
+) -> Result<SessionEvidenceV1, Failure> {
+    let candidate_bytes = json_bytes(&candidate)?;
+    match atomic_write_once_run(run_root, relative, &candidate_bytes) {
+        Ok(()) => Ok(candidate),
+        Err(error) => read_run_file(run_root, relative)
+            .and_then(|bytes| parse_session(&bytes, candidate.attempt_id))
+            .map_err(|_| error),
+    }
+}
+
 fn same_materialization(
     left: &AttemptArtifactManifestV1,
     right: &AttemptArtifactManifestV1,
@@ -318,12 +735,14 @@ fn join_candidate(
     manifest: &AttemptArtifactManifestV1,
     bytes: &[u8],
 ) -> Result<NewAttemptArtifact, Failure> {
+    let manifest_path = relative(run_root, &dirs.manifest())?;
+    validate_manifest_layout(&manifest_path, manifest.attempt_id, manifest)?;
     Ok(NewAttemptArtifact {
         attempt_id: manifest.attempt_id,
         run_id: manifest.run_id.clone(),
         packet_id: manifest.packet_id.clone(),
         manifest_schema: manifest.schema.clone(),
-        manifest_path: relative(run_root, &dirs.manifest())?,
+        manifest_path,
         manifest_sha256: digest(bytes),
         retention_class: manifest.retention_class.as_str().to_owned(),
     })
@@ -336,11 +755,10 @@ pub fn materialize(
     input: &MaterializeAttempt<'_>,
 ) -> Result<(AttemptArtifactManifestV1, NewAttemptArtifact), Failure> {
     let dirs = PacketDirs::new(packet_dir, input.attempt_id);
-    std::fs::create_dir_all(dirs.path())
-        .map_err(|error| failure("creating attempt directory", dirs.path(), error))?;
+    prepare_attempt(run_root, &dirs)?;
+    let manifest_path = relative(run_root, &dirs.manifest())?;
 
-    if dirs.manifest().exists() {
-        let bytes = read(&dirs.manifest())?;
+    if let Some(bytes) = read_optional_run_file(run_root, &manifest_path)? {
         let manifest: AttemptArtifactManifestV1 = serde_json::from_slice(&bytes)
             .map_err(|error| Failure::internal(format!("parsing immutable manifest: {error}")))?;
         check_identity(
@@ -349,27 +767,34 @@ pub fn materialize(
             &input.packet.packet_id,
             input.attempt_id,
         )?;
+        validate_manifest_layout(&manifest_path, input.attempt_id, &manifest)?;
+        verify_manifest_inventory(run_root, &manifest)?;
+        validate_manifest_evidence(run_root, &manifest, Some(input))?;
         let join = join_candidate(run_root, &dirs, &manifest, &bytes)?;
         return Ok((manifest, join));
     }
 
-    finalize_provider_files(&dirs)?;
-    atomic_write_once(
-        &dirs.result(),
-        &json_bytes(&ResultEvidence {
-            schema: RESULT_SCHEMA,
-            outcome: input.outcome,
-            detail: input.detail,
-        })?,
+    finalize_provider_files(run_root, &dirs)?;
+    let result_path = relative(run_root, &dirs.result())?;
+    let result = publish_or_adopt_result(
+        run_root,
+        &result_path,
+        ResultEvidenceV1 {
+            schema: RESULT_SCHEMA.to_owned(),
+            outcome: input.outcome.to_owned(),
+            detail: input.detail.clone(),
+        },
     )?;
-    atomic_write_once(
-        &dirs.session(),
-        &json_bytes(&SessionEvidence {
-            schema: SESSION_SCHEMA,
+    let session_path = relative(run_root, &dirs.session())?;
+    publish_or_adopt_session(
+        run_root,
+        &session_path,
+        SessionEvidenceV1 {
+            schema: SESSION_SCHEMA.to_owned(),
             attempt_id: input.attempt_id,
-            provider_claimant: input.claimant,
-            metadata: input.session,
-        })?,
+            provider_claimant: input.claimant.to_owned(),
+            metadata: input.session.clone(),
+        },
     )?;
 
     let manifest = AttemptArtifactManifestV1 {
@@ -381,30 +806,44 @@ pub fn materialize(
         model: input.packet.provider_hints.model.clone(),
         started_at: input.started_at.to_owned(),
         materialized_at: now_iso(),
-        retention_class: input.retention_class,
+        // The immutable result evidence wins a crash/recovery race. Deriving
+        // retention from the adopted outcome makes manifest replay
+        // deterministic even when recovery arrived with a revoked outcome.
+        retention_class: expected_retention(&result.outcome),
         files: ManifestFilesV1 {
             prompt: entry(run_root, &dirs.prompt())?,
             output: entry(run_root, &dirs.stdout())?,
             result: entry(run_root, &dirs.result())?,
             session: entry(run_root, &dirs.session())?,
-            final_message: dirs
-                .last_message()
-                .exists()
-                .then(|| entry(run_root, &dirs.last_message()))
-                .transpose()?,
+            final_message: {
+                let path = relative(run_root, &dirs.last_message())?;
+                read_optional_run_file(run_root, &path)?.map(|bytes| ManifestFileV1 {
+                    path,
+                    bytes: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                    sha256: digest(&bytes),
+                })
+            },
         },
     };
+    validate_manifest_layout(
+        &relative(run_root, &dirs.manifest())?,
+        input.attempt_id,
+        &manifest,
+    )?;
     let bytes = json_bytes(&manifest)?;
-    match atomic_write_once(&dirs.manifest(), &bytes) {
+    match atomic_write_once_run(run_root, &manifest_path, &bytes) {
         Ok(()) => {
             let join = join_candidate(run_root, &dirs, &manifest, &bytes)?;
             Ok((manifest, join))
         }
-        Err(error) if dirs.manifest().exists() => {
+        Err(error) => {
             // Two reconcilers may finish the same dead attempt concurrently.
             // The winner's timestamp is authoritative; every stable field and
             // content digest must still match before the loser converges.
-            let existing_bytes = read(&dirs.manifest())?;
+            let existing_bytes = match read_run_file(run_root, &manifest_path) {
+                Ok(bytes) => bytes,
+                Err(_) => return Err(error),
+            };
             let existing: AttemptArtifactManifestV1 = serde_json::from_slice(&existing_bytes)
                 .map_err(|parse| Failure::internal(format!("parsing raced manifest: {parse}")))?;
             check_identity(
@@ -416,10 +855,12 @@ pub fn materialize(
             if !same_materialization(&existing, &manifest) {
                 return Err(error);
             }
+            validate_manifest_layout(&manifest_path, input.attempt_id, &existing)?;
+            verify_manifest_inventory(run_root, &existing)?;
+            validate_manifest_evidence(run_root, &existing, Some(input))?;
             let join = join_candidate(run_root, &dirs, &existing, &existing_bytes)?;
             Ok((existing, join))
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -451,11 +892,6 @@ pub async fn materialize_and_join(
         outcome,
         detail,
         session,
-        retention_class: if outcome == "result" {
-            RetentionClass::CompactableSuccess
-        } else {
-            RetentionClass::Retain
-        },
     };
     let (manifest, join) = materialize(&run_root, &packet_dir, &input)?;
     on_ledger(&ctx.ledger, move |ledger| {
@@ -466,17 +902,11 @@ pub async fn materialize_and_join(
 }
 
 fn verify_file(run_root: &Path, file: &ManifestFileV1, issues: &mut Vec<String>) {
-    let relative = Path::new(&file.path);
-    if relative.is_absolute()
-        || relative
-            .components()
-            .any(|part| !matches!(part, Component::Normal(_)))
-    {
-        issues.push(format!("unsafe artifact-relative path {:?}", file.path));
-        return;
-    }
-    match std::fs::read(run_root.join(relative)) {
-        Err(error) => issues.push(format!("missing artifact {}: {error}", file.path)),
+    match read_run_file(run_root, &file.path) {
+        Err(error) => issues.push(format!(
+            "invalid or missing artifact {}: {error}",
+            file.path
+        )),
         Ok(bytes) => {
             if u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes {
                 issues.push(format!("byte-size mismatch for {}", file.path));
@@ -490,45 +920,27 @@ fn verify_file(run_root: &Path, file: &ManifestFileV1, issues: &mut Vec<String>)
 
 /// Verify a joined manifest without modifying any bytes or ledger row.
 pub fn verify_joined(run_root: &Path, row: &AttemptArtifactRow) -> Value {
-    let path = run_root.join(&row.manifest_path);
-    let bytes = match std::fs::read(&path) {
-        Ok(bytes) => bytes,
+    let (manifest, _) = match load_manifest(run_root, row) {
+        Ok(value) => value,
         Err(error) => {
             return json!({"attemptId": row.attempt_id, "verified": false, "legacy": false,
-                "manifestPath": row.manifest_path, "issues": [format!("missing manifest: {error}")]});
+                "manifestPath": row.manifest_path, "issues": [error.to_string()]});
         }
     };
     let mut issues = Vec::new();
-    if digest(&bytes) != row.manifest_sha256 {
-        issues.push("manifest sha256 does not match ledger".to_owned());
+    if let Err(error) = validate_manifest_evidence(run_root, &manifest, None) {
+        issues.push(error.to_string());
     }
-    let manifest = match serde_json::from_slice::<AttemptArtifactManifestV1>(&bytes) {
-        Ok(manifest) => Some(manifest),
-        Err(error) => {
-            issues.push(format!("manifest schema is invalid: {error}"));
-            None
-        }
-    };
-    if let Some(manifest) = &manifest {
-        if manifest.schema != row.manifest_schema
-            || manifest.run_id != row.run_id
-            || manifest.packet_id != row.packet_id
-            || manifest.attempt_id != row.attempt_id
-            || manifest.retention_class.as_str() != row.retention_class
-        {
-            issues.push("manifest identity does not match ledger join".to_owned());
-        }
-        for file in [
-            &manifest.files.prompt,
-            &manifest.files.output,
-            &manifest.files.result,
-            &manifest.files.session,
-        ] {
-            verify_file(run_root, file, &mut issues);
-        }
-        if let Some(file) = &manifest.files.final_message {
-            verify_file(run_root, file, &mut issues);
-        }
+    for file in [
+        &manifest.files.prompt,
+        &manifest.files.output,
+        &manifest.files.result,
+        &manifest.files.session,
+    ] {
+        verify_file(run_root, file, &mut issues);
+    }
+    if let Some(file) = &manifest.files.final_message {
+        verify_file(run_root, file, &mut issues);
     }
     json!({"attemptId": row.attempt_id, "verified": issues.is_empty(), "legacy": false,
         "manifestPath": row.manifest_path, "manifestSha256": row.manifest_sha256,
@@ -572,7 +984,7 @@ fn verify_compacted(
     let manifest = load_manifest(run_root, row)
         .map_err(|error| issues.push(error.to_string()))
         .ok();
-    let tombstone_bytes = read(&run_root.join(&compaction.tombstone_path))
+    let tombstone_bytes = read_run_file(run_root, &compaction.tombstone_path)
         .map_err(|error| issues.push(error.to_string()))
         .ok();
     let tombstone = tombstone_bytes.as_deref().and_then(|bytes| {
@@ -585,12 +997,32 @@ fn verify_compacted(
             .ok()
     });
     if let Some((manifest, _)) = &manifest {
+        if let Err(error) = validate_manifest_evidence(run_root, manifest, None) {
+            issues.push(error.to_string());
+        }
         verify_file(run_root, &manifest.files.result, &mut issues);
         verify_file(run_root, &manifest.files.session, &mut issues);
+        let expected = self::tombstone(row, manifest);
+        let expected_bytes_removed = expected.removed.iter().try_fold(0i64, |sum, file| {
+            i64::try_from(file.bytes)
+                .ok()
+                .and_then(|bytes| sum.checked_add(bytes))
+        });
+        if compaction.bytes_removed != expected_bytes_removed {
+            issues.push("compaction byte count does not match manifest".to_owned());
+        }
         if let Some(tombstone) = &tombstone {
-            let expected = self::tombstone(row, manifest);
             if tombstone.removed != expected.removed {
                 issues.push("compaction tombstone removal set does not match manifest".to_owned());
+            }
+        }
+        for removed in &expected.removed {
+            match run_file_exists(run_root, &removed.path) {
+                Ok(true) => {
+                    issues.push(format!("compacted artifact still exists: {}", removed.path));
+                }
+                Ok(false) => {}
+                Err(error) => issues.push(error.to_string()),
             }
         }
     }
@@ -603,11 +1035,6 @@ fn verify_compacted(
             || tombstone.manifest_sha256 != row.manifest_sha256
         {
             issues.push("compaction tombstone identity does not match ledger".to_owned());
-        }
-        for removed in &tombstone.removed {
-            if run_root.join(&removed.path).exists() {
-                issues.push(format!("compacted artifact still exists: {}", removed.path));
-            }
         }
     }
     json!({
@@ -674,17 +1101,8 @@ pub fn manifest_output(
     run_root: &Path,
     row: &AttemptArtifactRow,
 ) -> Result<(String, String, String), Failure> {
-    let bytes = read(&run_root.join(&row.manifest_path))?;
-    if digest(&bytes) != row.manifest_sha256 {
-        return Err(Failure::invalid(format!(
-            "manifest digest mismatch for attempt {}",
-            row.attempt_id
-        )));
-    }
-    let manifest: AttemptArtifactManifestV1 = serde_json::from_slice(&bytes)
-        .map_err(|error| Failure::invalid(format!("invalid attempt manifest: {error}")))?;
-    check_identity(&manifest, &row.run_id, &row.packet_id, row.attempt_id)?;
-    let output = read(&run_root.join(&manifest.files.output.path))?;
+    let (manifest, _) = load_manifest(run_root, row)?;
+    let output = read_run_file(run_root, &manifest.files.output.path)?;
     if digest(&output) != manifest.files.output.sha256 {
         return Err(Failure::invalid(format!(
             "output digest mismatch for attempt {}",
@@ -700,7 +1118,7 @@ fn load_manifest(
     run_root: &Path,
     row: &AttemptArtifactRow,
 ) -> Result<(AttemptArtifactManifestV1, Vec<u8>), Failure> {
-    let bytes = read(&run_root.join(&row.manifest_path))?;
+    let bytes = read_run_file(run_root, &row.manifest_path)?;
     if digest(&bytes) != row.manifest_sha256 {
         return Err(Failure::invalid(format!(
             "manifest digest mismatch for attempt {}",
@@ -710,6 +1128,16 @@ fn load_manifest(
     let manifest: AttemptArtifactManifestV1 = serde_json::from_slice(&bytes)
         .map_err(|error| Failure::invalid(format!("invalid attempt manifest: {error}")))?;
     check_identity(&manifest, &row.run_id, &row.packet_id, row.attempt_id)?;
+    validate_manifest_layout(&row.manifest_path, row.attempt_id, &manifest)?;
+    if row.manifest_schema != MANIFEST_SCHEMA
+        || row.manifest_schema != manifest.schema
+        || row.retention_class != manifest.retention_class.as_str()
+    {
+        return Err(Failure::invalid(format!(
+            "attempt {} manifest metadata does not match ledger join",
+            row.attempt_id
+        )));
+    }
     Ok((manifest, bytes))
 }
 
@@ -805,10 +1233,22 @@ pub async fn artifact_compact(ctx: &Ctx, req: &mut OperationRequest) -> Operatio
                 }
             }
             let (manifest, _) = load_manifest(&run_root, &row)?;
+            validate_manifest_evidence(&run_root, &manifest, None)?;
             let tombstone = tombstone(&row, &manifest);
             let tombstone_bytes = json_bytes(&tombstone)?;
             let tombstone_path = format!("compactions/{attempt_id}/tombstone.json");
             let tombstone_sha = digest(&tombstone_bytes);
+            for file in [&manifest.files.result, &manifest.files.session] {
+                let bytes = read_run_file(&run_root, &file.path)?;
+                if digest(&bytes) != file.sha256
+                    || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes
+                {
+                    return Err(Failure::invalid(format!(
+                        "refusing to compact changed artifact {}",
+                        file.path
+                    )));
+                }
+            }
             if existing.is_none() {
                 // Prove the entire source set before committing an intent;
                 // otherwise a first refusal followed by a retry could
@@ -823,7 +1263,7 @@ pub async fn artifact_compact(ctx: &Ctx, req: &mut OperationRequest) -> Operatio
                     source_files.push(final_message);
                 }
                 for file in source_files {
-                    let bytes = read(&run_root.join(&file.path))?;
+                    let bytes = read_run_file(&run_root, &file.path)?;
                     if digest(&bytes) != file.sha256
                         || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes
                     {
@@ -846,25 +1286,9 @@ pub async fn artifact_compact(ctx: &Ctx, req: &mut OperationRequest) -> Operatio
                 )
             })
             .await?;
-            atomic_write_once(&run_root.join(&tombstone_path), &tombstone_bytes)?;
+            atomic_write_once_run(&run_root, &tombstone_path, &tombstone_bytes)?;
             for file in &tombstone.removed {
-                let path = run_root.join(&file.path);
-                if path.exists() {
-                    let bytes = read(&path)?;
-                    if digest(&bytes) != file.sha256
-                        || u64::try_from(bytes.len()).unwrap_or(u64::MAX) != file.bytes
-                    {
-                        return Err(Failure::invalid(format!(
-                            "refusing to compact changed artifact {}",
-                            file.path
-                        )));
-                    }
-                    std::fs::remove_file(&path)
-                        .map_err(|error| failure("removing compacted artifact", &path, error))?;
-                    if let Some(parent) = path.parent() {
-                        sync_dir(parent)?;
-                    }
-                }
+                remove_manifest_file(&run_root, file)?;
             }
             let bytes_removed = tombstone
                 .removed
@@ -894,6 +1318,8 @@ pub async fn artifact_compact(ctx: &Ctx, req: &mut OperationRequest) -> Operatio
 #[cfg(test)]
 mod tests {
     use std::collections::{BTreeMap, HashMap};
+    #[cfg(unix)]
+    use std::os::unix::fs::symlink;
 
     use forged_ledger::{Ledger, NewPacket, NewRun, RunOutcome, SpecFence};
     use forged_types::{Deliverable, ProviderHints, Sandbox, SpecRef, Stage, StageContract};
@@ -943,7 +1369,7 @@ mod tests {
     ) -> (AttemptArtifactManifestV1, NewAttemptArtifact) {
         let dirs = PacketDirs::new(packet_dir, id);
         std::fs::create_dir_all(dirs.path()).unwrap();
-        atomic_write_once(&dirs.prompt(), format!("prompt {id}").as_bytes()).unwrap();
+        materialize_prompt(run_root, &dirs, format!("prompt {id}").as_bytes()).unwrap();
         std::fs::write(dirs.stdout_working(), output).unwrap();
         materialize(
             run_root,
@@ -957,10 +1383,22 @@ mod tests {
                 outcome: "revoked",
                 detail: &json!({"note":"done"}),
                 session: &json!({"host":"process"}),
-                retention_class: RetentionClass::Retain,
             },
         )
         .unwrap()
+    }
+
+    fn row(join: NewAttemptArtifact) -> AttemptArtifactRow {
+        AttemptArtifactRow {
+            attempt_id: join.attempt_id,
+            run_id: join.run_id,
+            packet_id: join.packet_id,
+            manifest_schema: join.manifest_schema,
+            manifest_path: join.manifest_path,
+            manifest_sha256: join.manifest_sha256,
+            retention_class: join.retention_class,
+            created_at: "now".to_owned(),
+        }
     }
 
     #[test]
@@ -992,7 +1430,7 @@ mod tests {
         let packet_dir = root.path().join("runs/run-safe/packets/implement/1");
         let dirs = PacketDirs::new(&packet_dir, 3);
         std::fs::create_dir_all(dirs.path()).unwrap();
-        atomic_write_once(&dirs.prompt(), b"prompt").unwrap();
+        std::fs::write(dirs.prompt(), b"prompt").unwrap();
         std::fs::write(dirs.stdout_working(), "partial").unwrap();
         let report = legacy_projection(&packet_dir, 3);
         assert_eq!(report["verified"], false);
@@ -1007,21 +1445,191 @@ mod tests {
         let packet_dir = run_root.join("packets/implement/1");
         let packet = packet(root.path(), "run-safe", 1);
         let (_, join) = one(&run_root, &packet_dir, &packet, 4, "raw");
-        let row = AttemptArtifactRow {
-            attempt_id: join.attempt_id,
-            run_id: join.run_id,
-            packet_id: join.packet_id,
-            manifest_schema: join.manifest_schema,
-            manifest_path: join.manifest_path,
-            manifest_sha256: join.manifest_sha256,
-            retention_class: join.retention_class,
-            created_at: "now".to_owned(),
-        };
+        let row = row(join);
         let output = PacketDirs::new(&packet_dir, 4).stdout();
         std::fs::write(&output, "tampered").unwrap();
         let before = read(&output).unwrap();
         assert_eq!(verify_joined(&run_root, &row)["verified"], false);
         assert_eq!(read(&output).unwrap(), before);
+    }
+
+    #[test]
+    fn recovery_adopts_result_and_session_published_before_the_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("runs/run-replay");
+        std::fs::create_dir_all(&run_root).unwrap();
+        let packet_dir = run_root.join("packets/implement/1");
+        let packet = packet(root.path(), "run-replay", 1);
+        let dirs = PacketDirs::new(&packet_dir, 7);
+        prepare_attempt(&run_root, &dirs).unwrap();
+        materialize_prompt(&run_root, &dirs, b"original prompt").unwrap();
+        std::fs::write(dirs.stdout_working(), b"original output").unwrap();
+        finalize_provider_files(&run_root, &dirs).unwrap();
+
+        let original_result = ResultEvidenceV1 {
+            schema: RESULT_SCHEMA.to_owned(),
+            outcome: "result".to_owned(),
+            detail: json!({"answer":"landed before crash"}),
+        };
+        let original_session = SessionEvidenceV1 {
+            schema: SESSION_SCHEMA.to_owned(),
+            attempt_id: 7,
+            provider_claimant: "claude:session:1".to_owned(),
+            metadata: json!({"host":"process", "session":"original"}),
+        };
+        atomic_write_once_run(
+            &run_root,
+            &relative(&run_root, &dirs.result()).unwrap(),
+            &json_bytes(&original_result).unwrap(),
+        )
+        .unwrap();
+        atomic_write_once_run(
+            &run_root,
+            &relative(&run_root, &dirs.session()).unwrap(),
+            &json_bytes(&original_session).unwrap(),
+        )
+        .unwrap();
+        assert!(
+            !dirs.manifest().exists(),
+            "the simulated crash precedes manifest publish"
+        );
+
+        let (manifest, _) = materialize(
+            &run_root,
+            &packet_dir,
+            &MaterializeAttempt {
+                run_id: &packet.run_id,
+                packet: &packet,
+                attempt_id: 7,
+                claimant: "claude:session:1",
+                started_at: "2026-08-14T00:00:00Z",
+                outcome: "revoked",
+                detail: &json!({"reason":"reconciler arrived after crash"}),
+                session: &json!({"recovered":true}),
+            },
+        )
+        .unwrap();
+        assert_eq!(manifest.retention_class, RetentionClass::CompactableSuccess);
+        assert_eq!(
+            parse_result(&read_run_file(&run_root, &manifest.files.result.path).unwrap()).unwrap(),
+            original_result
+        );
+        assert_eq!(
+            parse_session(
+                &read_run_file(&run_root, &manifest.files.session.path).unwrap(),
+                7,
+            )
+            .unwrap(),
+            original_session
+        );
+
+        // Replaying the same recovery converges on the manifest instead of
+        // conflicting with the already-published original result/session.
+        materialize(
+            &run_root,
+            &packet_dir,
+            &MaterializeAttempt {
+                run_id: &packet.run_id,
+                packet: &packet,
+                attempt_id: 7,
+                claimant: "claude:session:1",
+                started_at: "2026-08-14T00:00:00Z",
+                outcome: "revoked",
+                detail: &json!({"reason":"replay"}),
+                session: &json!({"recovered":true}),
+            },
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn existing_manifest_rejects_absolute_parent_and_wrong_slot_paths() {
+        let root = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("runs/run-hostile");
+        let packet_dir = run_root.join("packets/implement/1");
+        let packet = packet(root.path(), "run-hostile", 1);
+        let (valid, join) = one(&run_root, &packet_dir, &packet, 8, "captured");
+        let dirs = PacketDirs::new(&packet_dir, 8);
+        let victim = root.path().join("victim");
+        std::fs::write(&victim, b"outside must remain untouched").unwrap();
+        let input = MaterializeAttempt {
+            run_id: &packet.run_id,
+            packet: &packet,
+            attempt_id: 8,
+            claimant: "claude:session:1",
+            started_at: "2026-08-14T00:00:00Z",
+            outcome: "revoked",
+            detail: &json!({}),
+            session: &json!({}),
+        };
+
+        for hostile in [
+            victim.to_string_lossy().into_owned(),
+            "../victim".to_owned(),
+        ] {
+            let mut manifest = valid.clone();
+            manifest.files.output.path = hostile;
+            std::fs::write(dirs.manifest(), json_bytes(&manifest).unwrap()).unwrap();
+            assert!(materialize(&run_root, &packet_dir, &input).is_err());
+            assert_eq!(
+                std::fs::read(&victim).unwrap(),
+                b"outside must remain untouched"
+            );
+        }
+
+        let mut hostile_row = row(join);
+        hostile_row.manifest_path = victim.to_string_lossy().into_owned();
+        assert_eq!(verify_joined(&run_root, &hostile_row)["verified"], false);
+        hostile_row.manifest_path = "../manifest.json".to_owned();
+        assert_eq!(verify_joined(&run_root, &hostile_row)["verified"], false);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_artifact_and_attempt_parent_are_never_followed() {
+        let root = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("runs/run-links");
+        let packet_dir = run_root.join("packets/implement/1");
+        let packet = packet(root.path(), "run-links", 1);
+        let (_, join) = one(&run_root, &packet_dir, &packet, 9, "captured");
+        let row = row(join);
+        let dirs = PacketDirs::new(&packet_dir, 9);
+        let victim = root.path().join("outside-output");
+        std::fs::write(&victim, b"captured").unwrap();
+        std::fs::remove_file(dirs.stdout()).unwrap();
+        symlink(&victim, dirs.stdout()).unwrap();
+
+        assert_eq!(verify_joined(&run_root, &row)["verified"], false);
+        assert!(manifest_output(&run_root, &row).is_err());
+        assert_eq!(std::fs::read(&victim).unwrap(), b"captured");
+
+        std::fs::remove_file(dirs.stdout()).unwrap();
+        let moved = root.path().join("moved-attempt");
+        std::fs::rename(dirs.path(), &moved).unwrap();
+        symlink(&moved, dirs.path()).unwrap();
+        assert_eq!(verify_joined(&run_root, &row)["verified"], false);
+        assert!(moved.join("manifest.json").exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn held_parent_fd_cannot_be_redirected_by_path_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let run_root = root.path().join("run");
+        let inside = run_root.join("inside");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&inside).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(inside.join("file"), b"inside").unwrap();
+        std::fs::write(outside.join("file"), b"outside").unwrap();
+        let (held, leaf) = anchored_parent(&run_root, "inside/file", false).unwrap();
+        let renamed = run_root.join("renamed");
+        std::fs::rename(&inside, &renamed).unwrap();
+        symlink(&outside, &inside).unwrap();
+
+        unlinkat(&held, Path::new(&leaf), UnlinkatFlags::NoRemoveDir).unwrap();
+        assert!(!renamed.join("file").exists());
+        assert_eq!(std::fs::read(outside.join("file")).unwrap(), b"outside");
     }
 
     #[test]
@@ -1032,7 +1640,7 @@ mod tests {
         let packet = packet(root.path(), "run-safe", 1);
         let dirs = PacketDirs::new(&packet_dir, 5);
         std::fs::create_dir_all(dirs.path()).unwrap();
-        atomic_write_once(&dirs.prompt(), b"prompt").unwrap();
+        std::fs::write(dirs.prompt(), b"prompt").unwrap();
         std::fs::write(dirs.stdout_working(), "raw").unwrap();
         let result = materialize(
             &run_root,
@@ -1046,7 +1654,6 @@ mod tests {
                 outcome: "revoked",
                 detail: &json!({}),
                 session: &json!({}),
-                retention_class: RetentionClass::Retain,
             },
         );
         assert!(result.is_err());
@@ -1132,7 +1739,12 @@ mod tests {
         let packet_dir = ctx.config.packet_dir_key(run_id, "implement", seq);
         let dirs = PacketDirs::new(&packet_dir, claimed.attempt_id);
         std::fs::create_dir_all(dirs.path()).unwrap();
-        atomic_write_once(&dirs.prompt(), format!("prompt {seq}").as_bytes()).unwrap();
+        materialize_prompt(
+            &ctx.config.run_dir(run_id),
+            &dirs,
+            format!("prompt {seq}").as_bytes(),
+        )
+        .unwrap();
         std::fs::write(dirs.stdout_working(), format!("output {seq}")).unwrap();
         let result = forged_types::PacketResult {
             schema: "forged.result.implement/1".to_owned(),
@@ -1161,28 +1773,26 @@ mod tests {
         claimed.attempt_id
     }
 
-    #[tokio::test]
-    async fn explicit_compaction_removes_only_an_intermediate_success() {
-        let root = tempfile::tempdir().unwrap();
-        let ledger = Ledger::open(&root.path().join("state.db")).unwrap();
+    async fn compactable_context(root: &Path, run_id: &str) -> (Ctx, i64, i64) {
+        let ledger = Ledger::open(&root.join("state.db")).unwrap();
         ledger
             .create_run(NewRun {
-                run_id: forged_types::RunId::new("run-compact").unwrap(),
-                bead_id: "bead-compact".to_owned(),
+                run_id: forged_types::RunId::new(run_id).unwrap(),
+                bead_id: format!("bead-{run_id}"),
                 repo: "/repo".to_owned(),
                 base_ref: "main".to_owned(),
-                branch: "forged/compact".to_owned(),
+                branch: format!("forged/{run_id}"),
             })
             .unwrap();
         let ctx = Ctx {
-            config: config(root.path()),
+            config: config(root),
             ledger,
         };
-        let first = successful_attempt(&ctx, "run-compact", 1).await;
-        let final_attempt = successful_attempt(&ctx, "run-compact", 2).await;
+        let first = successful_attempt(&ctx, run_id, 1).await;
+        let final_attempt = successful_attempt(&ctx, run_id, 2).await;
         ctx.ledger
             .settle_run(
-                "run-compact",
+                run_id,
                 RunOutcome::Clean,
                 "test completed".to_owned(),
                 None,
@@ -1190,6 +1800,13 @@ mod tests {
                 None,
             )
             .unwrap();
+        (ctx, first, final_attempt)
+    }
+
+    #[tokio::test]
+    async fn explicit_compaction_removes_only_an_intermediate_success() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, first, final_attempt) = compactable_context(root.path(), "run-compact").await;
 
         let mut request = OperationRequest {
             schema_version: 1,
@@ -1220,6 +1837,39 @@ mod tests {
         assert_eq!(verified.result.as_ref().unwrap()["verified"], true);
         assert_eq!(verified.result.as_ref().unwrap()["compacted"], true);
 
+        let row = ctx.ledger.get_attempt_artifact(first).unwrap().unwrap();
+        let compaction = ctx
+            .ledger
+            .get_attempt_artifact_compaction(first)
+            .unwrap()
+            .unwrap();
+        let mut wrong_bytes = compaction.clone();
+        wrong_bytes.bytes_removed = wrong_bytes.bytes_removed.map(|bytes| bytes + 1);
+        assert_eq!(
+            verify_compacted(&ctx.config.run_dir("run-compact"), &row, &wrong_bytes)["verified"],
+            false
+        );
+        let mut wrong_retention = row.clone();
+        wrong_retention.retention_class = "retain".to_owned();
+        assert_eq!(
+            verify_compacted(
+                &ctx.config.run_dir("run-compact"),
+                &wrong_retention,
+                &compaction,
+            )["verified"],
+            false
+        );
+
+        #[cfg(unix)]
+        {
+            let victim = root.path().join("compacted-victim");
+            std::fs::write(&victim, b"outside").unwrap();
+            symlink(&victim, first_dirs.prompt()).unwrap();
+            let linked = artifact_verify(&ctx, &verify_request).await;
+            assert_eq!(linked.result.as_ref().unwrap()["verified"], false);
+            assert_eq!(std::fs::read(&victim).unwrap(), b"outside");
+        }
+
         let mut replay = OperationRequest {
             schema_version: 1,
             idempotency_key: "compact:first:replay".to_owned(),
@@ -1249,5 +1899,112 @@ mod tests {
         );
         assert!(final_dirs.prompt().exists());
         assert!(final_dirs.stdout().exists());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compaction_refuses_symlinked_sources_before_intent() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, first, _) = compactable_context(root.path(), "run-source-link").await;
+        let dirs = PacketDirs::new(
+            ctx.config.packet_dir_key("run-source-link", "implement", 1),
+            first,
+        );
+        let original_prompt = std::fs::read(dirs.prompt()).unwrap();
+        let victim = root.path().join("source-victim");
+        std::fs::write(&victim, &original_prompt).unwrap();
+        std::fs::remove_file(dirs.prompt()).unwrap();
+        symlink(&victim, dirs.prompt()).unwrap();
+
+        let mut request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "compact:source-link".to_owned(),
+            run_id: None,
+            params: json!({"attempt": first}).as_object().unwrap().clone(),
+        };
+        let refused = artifact_compact(&ctx, &mut request).await;
+        assert!(
+            !refused.ok,
+            "symlinked source must fail closed: {refused:?}"
+        );
+        assert!(ctx
+            .ledger
+            .get_attempt_artifact_compaction(first)
+            .unwrap()
+            .is_none());
+        assert_eq!(std::fs::read(&victim).unwrap(), original_prompt);
+        assert!(std::fs::symlink_metadata(dirs.prompt())
+            .unwrap()
+            .file_type()
+            .is_symlink());
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn compaction_tombstone_cannot_escape_through_a_symlinked_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, first, _) = compactable_context(root.path(), "run-tombstone-link").await;
+        let outside = root.path().join("outside-compactions");
+        std::fs::create_dir_all(&outside).unwrap();
+        symlink(
+            &outside,
+            ctx.config.run_dir("run-tombstone-link").join("compactions"),
+        )
+        .unwrap();
+
+        let mut request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "compact:tombstone-link".to_owned(),
+            run_id: None,
+            params: json!({"attempt": first}).as_object().unwrap().clone(),
+        };
+        let refused = artifact_compact(&ctx, &mut request).await;
+        assert!(
+            !refused.ok,
+            "symlinked tombstone parent must fail: {refused:?}"
+        );
+        assert!(!outside
+            .join(first.to_string())
+            .join("tombstone.json")
+            .exists());
+        let intent = ctx
+            .ledger
+            .get_attempt_artifact_compaction(first)
+            .unwrap()
+            .expect("source validation completed before durable intent");
+        assert_eq!(intent.state, "in-progress");
+    }
+
+    #[tokio::test]
+    async fn compaction_resumes_after_intent_and_partial_removal() {
+        let root = tempfile::tempdir().unwrap();
+        let (ctx, first, _) = compactable_context(root.path(), "run-compact-resume").await;
+        let row = ctx.ledger.get_attempt_artifact(first).unwrap().unwrap();
+        let run_root = ctx.config.run_dir("run-compact-resume");
+        let (manifest, _) = load_manifest(&run_root, &row).unwrap();
+        let evidence = tombstone(&row, &manifest);
+        let bytes = json_bytes(&evidence).unwrap();
+        let path = format!("compactions/{first}/tombstone.json");
+        ctx.ledger
+            .begin_attempt_artifact_compaction(first, "op:interrupted", &path, &digest(&bytes))
+            .unwrap();
+        std::fs::remove_file(run_root.join(&manifest.files.prompt.path)).unwrap();
+
+        let mut request = OperationRequest {
+            schema_version: 1,
+            idempotency_key: "compact:resume".to_owned(),
+            run_id: None,
+            params: json!({"attempt": first}).as_object().unwrap().clone(),
+        };
+        let resumed = artifact_compact(&ctx, &mut request).await;
+        assert!(resumed.ok, "partial compaction should resume: {resumed:?}");
+        let verify = OperationRequest {
+            schema_version: 1,
+            idempotency_key: String::new(),
+            run_id: None,
+            params: json!({"attempt": first}).as_object().unwrap().clone(),
+        };
+        let verified = artifact_verify(&ctx, &verify).await;
+        assert_eq!(verified.result.as_ref().unwrap()["verified"], true);
     }
 }

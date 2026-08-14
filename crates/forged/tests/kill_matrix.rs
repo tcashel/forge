@@ -1620,6 +1620,70 @@ fn assert_retired_unspawned(env: &TestEnv, run: &str) -> forged_ledger::AttemptR
     attempt
 }
 
+/// Every post-claim failure owns a complete immutable attempt record even
+/// when no provider process was started.
+fn assert_pre_spawn_evidence(env: &TestEnv, run: &str, attempt_id: i64, phase: &str) {
+    let ledger = env.ledger();
+    let joined = ledger
+        .get_attempt_artifact(attempt_id)
+        .expect("artifact lookup")
+        .expect("pre-spawn attempt joined an immutable manifest");
+    ledger.close().expect("close");
+    let run_root = env.anvil.join("runs").join(run);
+    let manifest_bytes = std::fs::read(run_root.join(&joined.manifest_path)).expect("manifest");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    assert_eq!(manifest["attemptId"], attempt_id);
+    assert_eq!(manifest["retentionClass"], "retain");
+    assert_eq!(manifest["files"]["output"]["bytes"], 0);
+    let output = manifest["files"]["output"]["path"]
+        .as_str()
+        .expect("output path");
+    assert_eq!(std::fs::read(run_root.join(output)).unwrap(), b"");
+    let prompt = manifest["files"]["prompt"]["path"]
+        .as_str()
+        .expect("prompt path");
+    assert!(!std::fs::read(run_root.join(prompt)).unwrap().is_empty());
+    let result = manifest["files"]["result"]["path"]
+        .as_str()
+        .expect("result path");
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(run_root.join(result)).unwrap()).unwrap();
+    assert_eq!(result["outcome"], "transport");
+    assert_eq!(result["detail"]["providerStarted"], false);
+    let session = manifest["files"]["session"]["path"]
+        .as_str()
+        .expect("session path");
+    let session: Value =
+        serde_json::from_slice(&std::fs::read(run_root.join(session)).unwrap()).unwrap();
+    assert_eq!(session["metadata"]["spawned"], false);
+    assert_eq!(session["metadata"]["phase"], phase);
+}
+
+fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: &str, model: &str) {
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    env.write_config(None);
+    let path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("config json");
+    config["roster"]["implement"]["provider"] = json!(provider);
+    config["roster"]["implement"]["model"] = json!(model);
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    env.seed_bead_spec(bead, r"## Context\n\nthe bead is the spec.", "- ship it");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        bead,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+}
+
 #[test]
 fn an_external_packet_claim_retires_its_own_unspawned_attempt() {
     // `packet claim` -> `packet complete` never enters `run_attempt`, so the
@@ -1774,6 +1838,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
         Some(json!(packet.packet_id)),
         "the attempt is charged to its packet's bounded budget: {grants:?}"
     );
+    assert_pre_spawn_evidence(&env, "bead-k9c", attempt.attempt_id, "host-selection");
 
     // And nothing was spawned: no provider ever ran for this packet.
     assert!(
@@ -1820,6 +1885,7 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
         note.contains("host fallback"),
         "the note names the cause it settled for: {note}"
     );
+    assert_pre_spawn_evidence(&env, "bead-k9d", attempt.attempt_id, "host-selection");
 
     // Charged to the packet's bounded budget, exactly as every other
     // pre-spawn settlement is: the cause is unrecoverable, so the budget is
@@ -1873,6 +1939,51 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
         states.len(),
         1,
         "the backoff is honored rather than re-entered: {states:?}"
+    );
+}
+
+#[test]
+fn a_missing_adapter_settles_with_complete_zero_byte_evidence() {
+    let env = TestEnv::new("km9e");
+    start_bead_run_with_implementation_hint(&env, "bead-k9e", "missing-provider", "model-1");
+    advance_to_open_packet(&env, "bead-k9e");
+    let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9e"]);
+    assert_eq!(
+        code, 0,
+        "unknown adapter is a recorded transport: {refused}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the claimed attempt");
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    assert_eq!(
+        forged_proto::classify_failure(attempt.fail_note.as_deref().unwrap_or_default()),
+        forged_proto::FailureKind::Transport
+    );
+    assert_pre_spawn_evidence(&env, "bead-k9e", attempt.attempt_id, "adapter-selection");
+    assert!(
+        env.provider_log().is_empty(),
+        "no provider may have spawned"
+    );
+}
+
+#[test]
+fn an_invalid_invocation_settles_with_complete_zero_byte_evidence() {
+    let env = TestEnv::new("km9f");
+    // The authoring contract permits provider-defined model identifiers;
+    // the shell adapter applies the stricter first-character rule.
+    start_bead_run_with_implementation_hint(&env, "bead-k9f", "claude", "_invalid-model");
+    advance_to_open_packet(&env, "bead-k9f");
+    let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9f"]);
+    assert_ne!(
+        code, 0,
+        "unsafe invocation is an explicit refusal: {refused}"
+    );
+    let attempt = assert_retired_unspawned(&env, "bead-k9f");
+    assert_pre_spawn_evidence(&env, "bead-k9f", attempt.attempt_id, "invocation");
+    assert!(
+        env.provider_log().is_empty(),
+        "no provider may have spawned"
     );
 }
 
