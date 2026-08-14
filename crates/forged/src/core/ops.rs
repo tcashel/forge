@@ -1336,10 +1336,10 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
 
 /// Whether inventory entries carry per-run spend.
 ///
-/// Spend is the one field costing a `usage_totals` query per entry; a caller
-/// resolving an id against the inventory reads no spend and must not pay for
-/// it, so `Omit` leaves both spend keys off the entry rather than reporting a
-/// zero it did not measure.
+/// Spend is read from the SAME snapshot the entries are projected from, so
+/// `Include` costs no extra query; a caller resolving an id against the
+/// inventory has no use for it, and `Omit` leaves both spend keys off the
+/// entry rather than reporting a zero it did not measure.
 pub enum Spend {
     Include,
     Omit,
@@ -1368,16 +1368,16 @@ pub enum Spend {
 /// on the child slice rows that own the packets, so an epic reports its own
 /// (zero) counts rather than double-counting its children.
 ///
-/// Live seats come from ONE `list_live_attempts(None)` scan grouped by run,
-/// never a per-run query. Absent usage is data: an entry with no usage rows
-/// reports zero spend rather than failing.
+/// Live seats and spend both come from the snapshot's own whole-ledger
+/// scans grouped by run, never a per-run query. Absent usage is data: an
+/// entry with no usage rows reports zero spend rather than failing.
 pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
     // ONE snapshot, not a read per source: runs, live attempts, usage and
     // the lifecycle kinds are folded into a single entry each, and reading
     // them across separate transactions would let an epic's start event and
     // its pause land on opposite sides of a concurrent write.
     let snapshot = on_ledger(&ctx.ledger, |l| l.inventory_snapshot(&LIFECYCLE_KINDS)).await?;
-    project_entries(ctx, &snapshot, spend).await
+    project_entries(&snapshot, spend)
 }
 
 /// Project one snapshot into inventory entries, oldest first.
@@ -1385,11 +1385,7 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
 /// The projection, separated from the read so the portfolio derives its
 /// entries and its attention rail from the SAME snapshot: two reads would
 /// let an attempt land between them and describe a run the entries do not.
-async fn project_entries(
-    ctx: &Ctx,
-    snapshot: &InventorySnapshot,
-    spend: Spend,
-) -> Result<Vec<Value>, Failure> {
+fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Value>, Failure> {
     let lifecycles = epic_lifecycles(snapshot);
     // First start event per epic id; a payload that will not parse still
     // yields a discoverable id rather than hiding the epic.
@@ -1431,7 +1427,7 @@ async fn project_entries(
             "updatedAt": run.updated_at.clone(),
             "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
         });
-        add_spend(ctx, &spend, &run.run_id, &mut entry).await?;
+        add_spend(snapshot, &spend, &run.run_id, &mut entry);
         inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
     }
     // Whatever is left has a start event and no run row: a real epic.
@@ -1464,7 +1460,7 @@ async fn project_entries(
             "updatedAt": updated_at,
             "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
         });
-        add_spend(ctx, &spend, &epic_id, &mut entry).await?;
+        add_spend(snapshot, &spend, &epic_id, &mut entry);
         inventory.push((ts, epic_id, entry));
     }
     inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
@@ -1472,22 +1468,26 @@ async fn project_entries(
 }
 
 /// Stamp one entry's spend, when the caller asked for it.
-async fn add_spend(ctx: &Ctx, spend: &Spend, id: &str, entry: &mut Value) -> Result<(), Failure> {
+///
+/// Read from the snapshot's own `usage_totals` — the single grouped scan
+/// taken inside the snapshot transaction — never a `usage_totals` query per
+/// entry: an uncapped inventory would otherwise put one job per row through
+/// the single ledger writer, and a figure read after the snapshot could
+/// describe a state the entries and the rail never jointly held.
+///
+/// A run with no usage rows is ABSENT from that map, and absent is zero:
+/// spend not incurred, not spend unmeasured.
+fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut Value) {
     let Spend::Include = spend else {
-        return Ok(());
+        return;
     };
-    let totals = {
-        let id = id.to_owned();
-        on_ledger(&ctx.ledger, move |l| l.usage_totals(&id)).await?
-    };
+    let totals = snapshot.usage_totals.get(id);
+    let cost_usd_known = totals.map_or(0.0, |t| t.cost_usd_known);
+    let rows_missing_cost = totals.map_or(0, |t| t.rows_missing_cost);
     if let Some(object) = entry.as_object_mut() {
-        object.insert("costUsdKnown".to_owned(), json!(totals.cost_usd_known));
-        object.insert(
-            "rowsMissingCost".to_owned(),
-            json!(totals.rows_missing_cost),
-        );
+        object.insert("costUsdKnown".to_owned(), json!(cost_usd_known));
+        object.insert("rowsMissingCost".to_owned(), json!(rows_missing_cost));
     }
-    Ok(())
 }
 
 /// The durable kinds the attention rail is folded from, on top of
@@ -1518,11 +1518,12 @@ pub struct Portfolio {
 /// The portfolio: [`inventory`] with spend, plus the attention rail folded
 /// from the same snapshot.
 ///
-/// Costs ONE snapshot, exactly as `inventory` does: every condition the rail
-/// reports has a durable source already inside it — the epic input events,
-/// `proto.quarantine`, `attempts.state = 'revoking'` via `live_attempts`,
-/// and the `usage_totals` the entries already carry. No condition adds a
-/// query.
+/// Costs ONE ledger job, exactly as `inventory` does: every condition the
+/// rail reports has a durable source already inside the snapshot — the epic
+/// input events, `proto.quarantine`, `attempts.state = 'revoking'` via
+/// `live_attempts`, and the `usage_totals` map the entries are stamped from.
+/// Neither spend nor any condition adds a query, so the entries, the spend
+/// and the rail describe ONE ledger rather than a state that never held.
 pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS
         .iter()
@@ -1530,7 +1531,7 @@ pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
         .copied()
         .collect();
     let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
-    let entries = project_entries(ctx, &snapshot, Spend::Include).await?;
+    let entries = project_entries(&snapshot, Spend::Include)?;
     let attention = attention_rail(&snapshot, &entries);
     Ok(Portfolio { entries, attention })
 }

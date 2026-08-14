@@ -469,11 +469,26 @@ async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
 /// kind and an `id` are different requests — an assertion about a kind versus
 /// a question about one — so passing both is refused rather than silently
 /// preferring one, which would hide a caller's bug; so is naming both kinds.
+///
+/// The portfolio is the answer to OMITTING every scope key, never to sending
+/// one that names nothing: `param_opt_str` reads `""`, `null` and a non-string
+/// alike as absent, so a scope key present and unusable is refused up front.
+/// Without that, `{"run": ""}` — a caller whose id interpolation produced
+/// nothing — would silently widen from the one run it meant to the whole
+/// ledger, and the refusal this tool has always given for it would be lost.
 pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("overview", req, || async {
         let run = param_opt_str(&req.params, "run");
         let epic = param_opt_str(&req.params, "epic");
         let id = param_opt_str(&req.params, "id");
+        for key in ["run", "epic", "id"] {
+            if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
+                return Err(Failure::invalid(format!(
+                    "overview param {key:?} must name a subject; omit it entirely \
+                     to project the portfolio"
+                )));
+            }
+        }
         if id.is_some() && (run.is_some() || epic.is_some()) {
             return Err(Failure::invalid(
                 "overview takes param \"id\" or an explicit \"run\"/\"epic\", never both",

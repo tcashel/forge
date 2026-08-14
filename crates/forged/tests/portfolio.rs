@@ -57,11 +57,16 @@ fn fabricate_revoking(env: &TestEnv, run_id: &str, reason: &str) {
             seq: 0,
             spec_path: env.spec.to_string_lossy().into_owned(),
             spec_sha256: sha.clone(),
+            spec_revision: None,
             body_json: json!({"fabricated": true}).to_string(),
         })
         .expect("open packet");
     let attempt = ledger
-        .claim_packet(&packet_id, &format!("forged:{packet_id}:0"), &sha)
+        .claim_packet(
+            &packet_id,
+            &format!("forged:{packet_id}:0"),
+            &forged_ledger::SpecFence::Sha256(sha),
+        )
         .expect("claim packet");
     ledger
         .revoke_attempt(attempt.attempt_id, reason)
@@ -148,15 +153,41 @@ fn no_scope_projects_the_portfolio_and_every_combination_stays_refused() {
         json!({"run": "pf-slice", "id": "pf-slice"}),
         json!({"epic": "pf-epic", "id": "pf-epic"}),
         json!({"run": "pf-slice", "epic": "pf-epic", "id": "pf-slice"}),
+        // The portfolio is addressed by ABSENCE, so a scope key PRESENT and
+        // naming nothing keeps the refusal it has always drawn. Without
+        // this, a caller whose id interpolation produced "" would silently
+        // widen from the one subject it meant to the whole ledger.
+        json!({"run": ""}),
+        json!({"epic": ""}),
+        json!({"id": ""}),
     ] {
         let refused = mcp.call_tool("overview", json!({"schemaVersion": 1, "params": params}));
         assert_eq!(
             refused["ok"],
             json!(false),
-            "two scopes are still refused: {refused}"
+            "a scope that names nothing is still refused: {refused}"
         );
-        assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+        assert_eq!(
+            refused["error"]["code"],
+            json!("INVALID_REQUEST"),
+            "{refused}"
+        );
     }
+
+    // Same guard over the CLI: `forged overview` with no flags is the
+    // portfolio, and a flag passed with an empty value is refused rather
+    // than widening to it. The CLI omits an unpassed flag instead of
+    // sending null, so the two surfaces send the same request.
+    let (code, cli_bare) = env.forged(&["overview"]);
+    assert_eq!(code, 0, "{cli_bare}");
+    assert_eq!(cli_bare["result"]["kind"], json!("portfolio"), "{cli_bare}");
+    let (_, cli_empty) = env.forged(&["overview", "--run", ""]);
+    assert_eq!(cli_empty["ok"], json!(false), "{cli_empty}");
+    assert_eq!(
+        cli_empty["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{cli_empty}"
+    );
 }
 
 /// The payload's two pinned strings, and the entry keys it carries: the

@@ -954,19 +954,28 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 .clone()
                 .or_else(|| a.epic.clone())
                 .or_else(|| a.id.clone());
+            // An unpassed flag is OMITTED, never sent as null — the same
+            // shape `OverviewArgs::into_envelope` sends from the MCP
+            // surface, so the core sees exactly one request for "no scope".
+            // The core reads a scope key that is PRESENT and names nothing
+            // as a caller's bug; only omitting all three asks for the
+            // portfolio, and a null would otherwise smuggle a bare
+            // `--run ""` past that guard.
+            let mut params = Map::new();
+            for (key, value) in [("run", &a.run), ("epic", &a.epic), ("id", &a.id)] {
+                if let Some(value) = value {
+                    params.insert(key.to_owned(), json!(value));
+                }
+            }
+            if let Some(after) = a.after {
+                params.insert("after".to_owned(), json!(after));
+            }
+            if let Some(limit) = a.limit {
+                params.insert("limit".to_owned(), json!(limit));
+            }
             (
                 "overview",
-                request(
-                    a.idempotency_key,
-                    scope,
-                    json!({
-                        "run": a.run,
-                        "epic": a.epic,
-                        "id": a.id,
-                        "after": a.after,
-                        "limit": a.limit,
-                    }),
-                ),
+                request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
         Command::Work { command } => match command {
