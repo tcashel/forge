@@ -1,6 +1,8 @@
 //! The append-only event stream. There are no UPDATE or DELETE code paths
 //! for `events` — append-only, with `event_id` monotonic.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::LedgerError;
@@ -135,6 +137,41 @@ impl Ledger {
                 out.push(row?);
             }
             Ok(out)
+        })
+    }
+
+    /// The newest event per run, keyed by `run_id`; rows with a NULL
+    /// `run_id` are excluded — they belong to no unit of work.
+    ///
+    /// Newest is the greatest `event_id`, the append position, never the
+    /// `ts` string: two events written in the same second must not resolve
+    /// by luck. One aggregate answers every run, so a caller projecting the
+    /// whole inventory never queries per run.
+    pub fn latest_event_per_run(&self) -> Result<BTreeMap<String, EventRow>, LedgerError> {
+        self.submit(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                 WHERE event_id IN \
+                   (SELECT MAX(event_id) FROM events WHERE run_id IS NOT NULL GROUP BY run_id) \
+                 ORDER BY event_id ASC",
+            )?;
+            let rows = statement.query_map([], |row| {
+                Ok(EventRow {
+                    event_id: row.get(0)?,
+                    ts: row.get(1)?,
+                    run_id: row.get(2)?,
+                    kind: row.get(3)?,
+                    payload_json: row.get(4)?,
+                })
+            })?;
+            let mut latest = BTreeMap::new();
+            for row in rows {
+                let row = row?;
+                if let Some(run_id) = row.run_id.clone() {
+                    latest.insert(run_id, row);
+                }
+            }
+            Ok(latest)
         })
     }
 

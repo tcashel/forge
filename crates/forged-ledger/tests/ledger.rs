@@ -149,6 +149,41 @@ fn event_kind_once_rejects_a_competing_payload() {
 }
 
 #[test]
+fn latest_event_per_run_reports_the_newest_append_per_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let quiet = make_run(&ledger, "run-quiet");
+    let busy = make_run(&ledger, "run-busy");
+    // A run-less event belongs to no unit of work and is excluded.
+    ledger
+        .append_event(None, "global.note", json!({"n": 0}))
+        .expect("run-less event");
+    ledger
+        .append_event(Some(&quiet), "run.note", json!({"n": 1}))
+        .expect("quiet event");
+    for n in 1..=3 {
+        ledger
+            .append_event(Some(&busy), "run.note", json!({"n": n}))
+            .expect("busy event");
+    }
+
+    let latest = ledger.latest_event_per_run().expect("latest per run");
+    assert_eq!(
+        latest.len(),
+        2,
+        "one row per run, none run-less: {latest:?}"
+    );
+    let newest = latest.get(&busy).expect("busy run");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&newest.payload_json).expect("payload"),
+        json!({"n": 3}),
+        "the greatest event_id wins"
+    );
+    assert!(newest.event_id > latest[&quiet].event_id);
+    ledger.close().expect("close");
+}
+
+#[test]
 fn idempotency_replays_byte_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
