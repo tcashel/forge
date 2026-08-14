@@ -68,6 +68,12 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Work inventory.
+    Work {
+        /// The work subcommand.
+        #[command(subcommand)]
+        command: WorkCmd,
+    },
     /// Worktree lifecycle.
     Worktree {
         /// The worktree subcommand.
@@ -513,7 +519,7 @@ pub struct EventsArgs {
 
 /// `overview` flags. Exactly one scope is required.
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["run", "epic"])]
+#[group(required = true, multiple = false, args = ["run", "epic", "id"])]
 pub struct OverviewArgs {
     /// Project one slice run.
     #[arg(long)]
@@ -521,6 +527,9 @@ pub struct OverviewArgs {
     /// Project one epic and its child runs.
     #[arg(long)]
     pub epic: Option<String>,
+    /// Project whichever of the two this id names, or list the candidates.
+    #[arg(long)]
+    pub id: Option<String>,
     /// Return event rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
@@ -530,6 +539,13 @@ pub struct OverviewArgs {
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+/// `work` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WorkCmd {
+    /// List every slice run and started epic, with no id (read-only).
+    List(KeyOnly),
 }
 
 /// `worktree` subcommands.
@@ -623,6 +639,9 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Work { command } => match command {
+            WorkCmd::List(_) => "work_list",
+        },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
@@ -930,7 +949,11 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         ),
         Command::Overview(a) => {
-            let scope = a.run.clone().or_else(|| a.epic.clone());
+            let scope = a
+                .run
+                .clone()
+                .or_else(|| a.epic.clone())
+                .or_else(|| a.id.clone());
             (
                 "overview",
                 request(
@@ -939,12 +962,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({
                         "run": a.run,
                         "epic": a.epic,
+                        "id": a.id,
                         "after": a.after,
                         "limit": a.limit,
                     }),
                 ),
             )
         }
+        Command::Work { command } => match command {
+            WorkCmd::List(a) => ("work_list", request(a.idempotency_key, None, json!({}))),
+        },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (
                 "worktree_retire",

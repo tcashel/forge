@@ -650,6 +650,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "usage_report" => ops::usage_report(ctx, &req).await,
         "usage_ingest" => ops::usage_ingest(ctx, &mut req).await,
         "events_tail" => ops::events_tail(ctx, &req).await,
+        "work_list" => ops::work_list(ctx, &req).await,
         "worktree_retire" => ops::worktree_retire(ctx, &req).await,
         other => err_response(
             &read_key(other),

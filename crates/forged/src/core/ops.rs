@@ -1,11 +1,14 @@
 //! The non-drive core functions: doctor, init, run start/status, packet
-//! lifecycle, gate run, reconcile, usage, events, worktree retire.
+//! lifecycle, gate run, reconcile, usage, work list, events, worktree
+//! retire.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewRunDefinition, OperationState, RunState};
+use forged_ledger::{
+    EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState, RunState,
+};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
 use forged_types::{
     request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
@@ -15,8 +18,8 @@ use serde_json::{json, Value};
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
-    default_key, derive_key, err_response, fenced, key_absent, on_ledger, param_opt_str, param_str,
-    read_only, session_claimant, Ctx, Failure,
+    default_key, derive_key, epic, err_response, fenced, key_absent, on_ledger, param_opt_str,
+    param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -1067,6 +1070,16 @@ fn usage_row_json(row: &forged_ledger::UsageRecord) -> Value {
     })
 }
 
+/// The operator's rate card, as every usage report states it. One card is
+/// read per process, so a run and the epic above it report the same block.
+pub(crate) fn pricing_json(config: &crate::config::ForgedConfig) -> Value {
+    json!({
+        "ratesAsOf": config.pricing.rates_as_of,
+        "source": config.pricing.source,
+        "webSearchPer1k": config.pricing.tools.web_search_per_1k,
+    })
+}
+
 /// Bare `usage` — the read-only summary report.
 ///
 /// Totals say what a run cost; `rows` say which seat spent it. The row list
@@ -1110,11 +1123,7 @@ pub async fn usage_report(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
         Ok(json!({
             "rows": rows,
             "totals": totals_json(&totals),
-            "pricing": {
-                "ratesAsOf": ctx.config.pricing.rates_as_of,
-                "source": ctx.config.pricing.source,
-                "webSearchPer1k": ctx.config.pricing.tools.web_search_per_1k,
-            },
+            "pricing": pricing_json(&ctx.config),
         }))
     })
     .await
@@ -1241,6 +1250,241 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
         note(&attempt.packet_id, attempt.attempt_id);
     }
     latest
+}
+
+// ------------------------------------------------------------- inventory
+
+/// A synthesized epic entry's derived lifecycle columns.
+struct EpicLifecycle {
+    /// `active`, `paused`, or `submitted`.
+    state: &'static str,
+    /// The reason the events name, or `Value::Null` when they name none.
+    stop_reason: Value,
+}
+
+/// Every epic's lifecycle, folded from the three durable kinds that
+/// describe one, keyed by epic id; an epic with no lifecycle event yet is
+/// absent and its entry reports `active`.
+///
+/// A pure fold over one snapshot — never its own reads. Three indexed kind
+/// scans already sit in that snapshot, so the fold costs the same whether
+/// the ledger holds one epic or a hundred.
+///
+/// Between `paused` and `resumed` the greater `event_id` wins — the append
+/// position, never the `ts` string, so two control events written in the
+/// same second do not resolve by luck. A `forged.epic.pr` is terminal over
+/// both: it is the precedence `epic_advance` applies when it stops, and an
+/// epic that ended at its draft PR is not reopened by a later control
+/// event. A payload that will not parse still yields the state its kind
+/// implies, with no reason — the same degradation an unparseable start
+/// event gets.
+fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecycle> {
+    let reason_of = |payload_json: &str| {
+        let payload: Value = serde_json::from_str(payload_json).unwrap_or(Value::Null);
+        match payload.get("reason") {
+            Some(reason @ Value::String(_)) => reason.clone(),
+            _ => Value::Null,
+        }
+    };
+    let mut control: BTreeMap<String, (i64, EpicLifecycle)> = BTreeMap::new();
+    for kind in [epic::PAUSED, epic::RESUMED] {
+        for event in snapshot.events(kind) {
+            let Some(epic_id) = event.run_id.clone() else {
+                continue;
+            };
+            let lifecycle = if kind == epic::PAUSED {
+                EpicLifecycle {
+                    state: "paused",
+                    stop_reason: reason_of(&event.payload_json),
+                }
+            } else {
+                EpicLifecycle {
+                    state: "active",
+                    stop_reason: Value::Null,
+                }
+            };
+            let superseded = control
+                .get(&epic_id)
+                .is_none_or(|(seen, _)| *seen < event.event_id);
+            if superseded {
+                control.insert(epic_id, (event.event_id, lifecycle));
+            }
+        }
+    }
+    let mut lifecycles: BTreeMap<String, EpicLifecycle> = control
+        .into_iter()
+        .map(|(epic_id, (_, lifecycle))| (epic_id, lifecycle))
+        .collect();
+    for event in snapshot.events(epic::EPIC_PR) {
+        let Some(epic_id) = event.run_id.clone() else {
+            continue;
+        };
+        lifecycles.insert(
+            epic_id,
+            EpicLifecycle {
+                state: "submitted",
+                stop_reason: Value::Null,
+            },
+        );
+    }
+    lifecycles
+}
+
+/// Whether inventory entries carry per-run spend.
+///
+/// Spend is the one field costing a `usage_totals` query per entry; a caller
+/// resolving an id against the inventory reads no spend and must not pay for
+/// it, so `Omit` leaves both spend keys off the entry rather than reporting a
+/// zero it did not measure.
+pub enum Spend {
+    Include,
+    Omit,
+}
+
+/// The inventory: every unit of work the ledger holds, live or historical,
+/// each labelled `slice` or `epic`. `work_list` serves it whole; `overview`
+/// resolves a bare id against it.
+///
+/// Two sources, deliberately: a slice owns a `runs` row, but an epic never
+/// does — `epic_start` only appends `forged.epic.started` under the epic
+/// bead id, and the sole production writer of `runs` is `run_start`, called
+/// per child. An inventory built from `list_runs()` alone therefore lists no
+/// epic at all, so every started epic id with no `runs` row is synthesized
+/// from its start event. `kind` stays derived from that event — the only
+/// signal separating an epic from a slice; there is no column for it. One
+/// construction, because a second implementation of that rule would drift
+/// from the first.
+///
+/// A synthesized epic entry carries the same keys as a run entry so one
+/// shape describes the whole inventory, with the values an epic actually
+/// has: `branch` is the integration branch, `state` is `active` with no
+/// stop reason (an epic has no ledger state to stop), and `createdAt` /
+/// `updatedAt` are both the start ts — the entry projects that one event,
+/// and epic lifecycle detail lives behind `epic_status`. Seats and spend sit
+/// on the child slice rows that own the packets, so an epic reports its own
+/// (zero) counts rather than double-counting its children.
+///
+/// Live seats come from ONE `list_live_attempts(None)` scan grouped by run,
+/// never a per-run query. Absent usage is data: an entry with no usage rows
+/// reports zero spend rather than failing.
+pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
+    // ONE snapshot, not a read per source: runs, live attempts, usage and
+    // the lifecycle kinds are folded into a single entry each, and reading
+    // them across separate transactions would let an epic's start event and
+    // its pause land on opposite sides of a concurrent write.
+    let snapshot = on_ledger(&ctx.ledger, |l| {
+        l.inventory_snapshot(&[epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR])
+    })
+    .await?;
+    let lifecycles = epic_lifecycles(&snapshot);
+    // First start event per epic id; a payload that will not parse still
+    // yields a discoverable id rather than hiding the epic.
+    let mut epics: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    for event in snapshot.events(epic::STARTED) {
+        let Some(epic_id) = event.run_id.clone() else {
+            continue;
+        };
+        epics.entry(epic_id).or_insert_with(|| {
+            (
+                event.ts.clone(),
+                serde_json::from_str(&event.payload_json).unwrap_or(Value::Null),
+            )
+        });
+    }
+    let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
+    for attempt in &snapshot.live_attempts {
+        let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
+        *live_seats.entry(run_id).or_default() += 1;
+    }
+    // (createdAt, id, entry) — one ordering over both sources, keeping
+    // `list_runs`'s chronological shape now that epics interleave.
+    let mut inventory: Vec<(String, String, Value)> =
+        Vec::with_capacity(snapshot.runs.len() + epics.len());
+    for run in &snapshot.runs {
+        let epic = epics.remove(&run.run_id).is_some();
+        let mut entry = json!({
+            "id": run.run_id.clone(),
+            "kind": if epic { "epic" } else { "slice" },
+            "beadId": run.bead_id.clone(),
+            "repo": run.repo.clone(),
+            "branch": run.branch.clone(),
+            "state": match run.state {
+                RunState::Active => "active",
+                RunState::Stopped => "stopped",
+            },
+            "stopReason": run.stop_reason.clone(),
+            "createdAt": run.created_at.clone(),
+            "updatedAt": run.updated_at.clone(),
+            "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
+        });
+        add_spend(ctx, &spend, &run.run_id, &mut entry).await?;
+        inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
+    }
+    // Whatever is left has a start event and no run row: a real epic.
+    for (epic_id, (ts, payload)) in epics {
+        let field = |name: &str| match payload.get(name) {
+            Some(value @ Value::String(_)) => value.clone(),
+            _ => Value::Null,
+        };
+        let bead_id = match field("epicId") {
+            Value::Null => Value::from(epic_id.clone()),
+            value => value,
+        };
+        let lifecycle = lifecycles.get(&epic_id);
+        let updated_at = snapshot
+            .latest_event
+            .get(&epic_id)
+            .map(|event| event.ts.clone())
+            .unwrap_or_else(|| ts.clone());
+        let mut entry = json!({
+            "id": epic_id,
+            "kind": "epic",
+            "beadId": bead_id,
+            "repo": field("repo"),
+            "branch": field("integrationBranch"),
+            "state": lifecycle.map(|l| l.state).unwrap_or("active"),
+            "stopReason": lifecycle
+                .map(|l| l.stop_reason.clone())
+                .unwrap_or(Value::Null),
+            "createdAt": ts,
+            "updatedAt": updated_at,
+            "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
+        });
+        add_spend(ctx, &spend, &epic_id, &mut entry).await?;
+        inventory.push((ts, epic_id, entry));
+    }
+    inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    Ok(inventory.into_iter().map(|(_, _, entry)| entry).collect())
+}
+
+/// Stamp one entry's spend, when the caller asked for it.
+async fn add_spend(ctx: &Ctx, spend: &Spend, id: &str, entry: &mut Value) -> Result<(), Failure> {
+    let Spend::Include = spend else {
+        return Ok(());
+    };
+    let totals = {
+        let id = id.to_owned();
+        on_ledger(&ctx.ledger, move |l| l.usage_totals(&id)).await?
+    };
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("costUsdKnown".to_owned(), json!(totals.cost_usd_known));
+        object.insert(
+            "rowsMissingCost".to_owned(),
+            json!(totals.rows_missing_cost),
+        );
+    }
+    Ok(())
+}
+
+/// `work list` — the discovery surface, serving [`inventory`] whole.
+///
+/// The one entry point that takes no id, so a caller with no prior knowledge
+/// can enumerate the inventory and then address any entry.
+pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("work_list", req, || async {
+        Ok(json!({"runs": inventory(ctx, Spend::Include).await?}))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- events

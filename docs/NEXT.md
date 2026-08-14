@@ -111,12 +111,24 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
+Start with `work list`: it is the one command that takes no id, so it is
+where the ids every other command needs come from.
+
 ```sh
+forged work list
 forged overview --run <run-id>
 forged overview --epic <epic-id>
+forged overview --id <id>          # kind-blind: resolves either, or lists candidates
 forged session list --run <run-id>
 forged events --run <id> --limit 200
 ```
+
+Each `work list` entry carries its `kind` (`slice` or `epic`), lifecycle
+(`state`, `stopReason`, `createdAt`, `updatedAt`), live seat count, and
+spend, so an inventory can be drawn without a second call per entry. An
+epic's lifecycle is derived from its durable events — `active` until
+`forged.epic.paused`, `active` again after `forged.epic.resumed`,
+`submitted` once its final PR exists.
 
 The overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the

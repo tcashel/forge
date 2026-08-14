@@ -119,7 +119,7 @@ pub fn enter_non_git_cwd() {
     std::env::set_current_dir(dir).expect("chdir to non-git temp dir");
 }
 
-const SHIM_SCRIPT: &str = r#"#!/bin/sh
+pub const SHIM_SCRIPT: &str = r#"#!/bin/sh
 {
   printf '%s\037' "$@"
   printf '\036'
@@ -155,6 +155,9 @@ pub struct Shim {
     pub bin_dir: PathBuf,
     /// The scenario directory: `<key>.stdout` / `<key>.stderr` / `<key>.exit`.
     pub scenario_dir: PathBuf,
+    /// The inert data file the script is written to. Nothing ever execs it,
+    /// and it is deliberately NOT the inode published as `bin/gh`.
+    pub script_source: PathBuf,
     log: PathBuf,
     program: PathBuf,
 }
@@ -170,14 +173,37 @@ impl Shim {
         std::fs::create_dir(&bin_dir).expect("mkdir bin");
         std::fs::create_dir(&scenario_dir).expect("mkdir scenarios");
         let program = bin_dir.join("gh");
-        std::fs::write(&program, SHIM_SCRIPT).expect("write shim");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        // ETXTBSY is inode-scoped: the kernel refuses to exec any inode a
+        // process holds a writable descriptor to, and rename preserves the
+        // inode -- so staging plus rename would still publish the very inode
+        // this process wrote. The test binary is multithreaded and forks
+        // constantly, so a sibling spawning inside that write would inherit
+        // the descriptor and make `bin/gh` briefly unexecutable.
+        //
+        // So this process never opens the exec'd inode for writing at all.
+        // The script lands in an inert data file that nothing execs, and the
+        // published inode is created by a child `cp` -- single-threaded,
+        // never forks, and exited before `new` returns, so no descriptor to
+        // it can outlive the copy or be inherited by anything. Mode is set on
+        // the staging name, so `gh` is never observable without it.
+        let script_source = root.join("gh.script");
+        std::fs::write(&script_source, SHIM_SCRIPT).expect("write shim source");
+        let staging = bin_dir.join("gh.staging");
+        let copied = Command::new("cp")
+            .arg(&script_source)
+            .arg(&staging)
+            .status()
+            .expect("cp spawns");
+        assert!(copied.success(), "cp published the shim: {copied}");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
             .expect("chmod shim");
+        std::fs::rename(&staging, &program).expect("publish shim");
         let log = root.join("calls.log");
         Self {
             tmp,
             bin_dir,
             scenario_dir,
+            script_source,
             log,
             program,
         }

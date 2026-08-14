@@ -1,5 +1,5 @@
-//! `forged mcp` — the rmcp stdio server. Twenty-seven tools, each taking the
-//! same operation envelope in and returning the same envelope out; every
+//! `forged mcp` — the rmcp stdio server. Thirty tools, each taking the same
+//! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
 //!
@@ -20,7 +20,7 @@ use rmcp::model::{
 use rmcp::schemars::JsonSchema;
 use rmcp::service::{RequestContext, RoleServer};
 use rmcp::{tool, tool_handler, tool_router, ServerHandler, ServiceExt};
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use forged_types::OperationRequest;
@@ -79,6 +79,81 @@ impl EnvelopeArgs {
             idempotency_key: self.idempotency_key.unwrap_or_default(),
             run_id: self.run_id,
             params: self.params,
+        }
+    }
+}
+
+/// The `overview` envelope: the shared envelope shape with a TYPED
+/// `params`, so the one tool a host renders advertises the scopes it
+/// accepts instead of a free-form map. [`EnvelopeArgs`] itself is
+/// unchanged — every other tool still takes it.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct OverviewArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:overview:read` when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// The run the operation addresses, when any.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Projection parameters.
+    #[serde(default)]
+    pub params: OverviewParams,
+}
+
+/// `overview` parameters. Exactly one of `run`, `epic`, or `id` is required;
+/// `after` and `limit` page the event tail.
+///
+/// Typing these MOVED one boundary, deliberately. A wrong-TYPED `after` or
+/// `limit` (`"5"`, `1.5`, a negative `limit`) is refused as `invalid_params`
+/// before dispatch and reaches the host as an `isError` result carrying a
+/// deserialization message, NOT an operation envelope; the free-form map used
+/// to drop it silently and answer with a default page. That is the intended
+/// surface — a host is told its call was malformed instead of being handed a
+/// projection of something it did not ask for, and the CLI's own parser has
+/// always refused a non-integer `--after` the same way. A value of the right
+/// type but the wrong RANGE (`after: -1`, `limit: 0`, `limit: 1001`) still
+/// reaches the core and comes back as an ordinary `InvalidRequest` envelope,
+/// so domain questions keep their domain answers.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+pub struct OverviewParams {
+    /// Project one slice run, by run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    /// Project one epic and its child runs, by epic run id.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
+    /// Project whichever of the two this id names, without saying which;
+    /// an id that resolves to no single subject returns candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
+    /// Return only event rows with an eventId greater than this
+    /// (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    /// Maximum event rows in the polling page, 1..=1000 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl OverviewArgs {
+    /// Project onto the shared envelope. Absent params are OMITTED rather
+    /// than sent as null, so the core sees exactly what the CLI sends.
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
         }
     }
 }
@@ -235,11 +310,15 @@ impl ForgedServer {
     /// Unified reconnect projection, rendered by the optional MCP App.
     #[tool(
         name = "overview",
-        description = "Project one slice or epic with workers, evidence, usage, and events.",
+        description = "Project one slice or epic with workers, evidence, usage, and events. \
+                       Exactly one of params.run, params.epic, or params.id is required; \
+                       params.id resolves either kind and answers with candidates when it \
+                       cannot; use work_list to enumerate every id.",
         meta = overview_tool_meta()
     )]
-    pub async fn overview(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call_structured("overview", args.0).await
+    pub async fn overview(&self, args: Parameters<OverviewArgs>) -> CallToolResult {
+        self.call_structured("overview", args.0.into_envelope())
+            .await
     }
 
     /// Claim one packet.
@@ -327,6 +406,17 @@ impl ForgedServer {
     #[tool(name = "events_tail", description = "List ledger events, paged.")]
     pub async fn events_tail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("events_tail", args.0).await
+    }
+
+    /// The discovery surface — the one tool that needs no id.
+    #[tool(
+        name = "work_list",
+        description = "List all forged work — every slice run and every started epic, live and \
+                       historical, each labelled slice or epic. Takes no id: this is how a \
+                       caller with no prior knowledge discovers the ids the other tools require."
+    )]
+    pub async fn work_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("work_list", args.0).await
     }
 }
 

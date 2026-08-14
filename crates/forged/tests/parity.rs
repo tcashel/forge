@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twenty-eight public core functions, the CLI path and the MCP tool path produce
+//! the thirty public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twenty_eight_tools_match_their_cli_counterparts() {
+fn all_thirty_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -71,15 +71,50 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
         "session_stop",
         "usage_ingest",
         "usage_report",
+        "work_list",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-nine tools, exactly");
+    assert_eq!(tools, expected, "the thirty tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
         overview_tool.pointer("/_meta/ui/resourceUri"),
         Some(&json!("ui://forged/overview.html"))
     );
+    // The one tool a host renders advertises its params concretely, and
+    // says which of them is required.
+    let properties = overview_tool
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for (param, ty) in [
+        ("run", "string"),
+        ("epic", "string"),
+        ("id", "string"),
+        ("after", "integer"),
+        ("limit", "integer"),
+    ] {
+        let schema = properties
+            .get(param)
+            .unwrap_or_else(|| panic!("overview advertises {param}: {properties}"));
+        let text = schema.to_string();
+        assert!(
+            text.contains(ty),
+            "overview param {param} must advertise type {ty}: {schema}"
+        );
+    }
+    let description = overview_tool["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("Exactly one of params.run, params.epic, or params.id is required"),
+        "overview must state its one-of rule: {description}"
+    );
+    let work_list = mcp.tool("work_list");
+    let description = work_list["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("Takes no id"),
+        "work_list must state that it takes no id: {description}"
+    );
+
     assert_eq!(
         mcp.list_resources(),
         vec!["ui://forged/overview.html".to_owned()]
@@ -471,6 +506,12 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("events_tail", envelope(json!({})));
     assert_eq!(normalized(cli), normalized(tool), "events_tail parity");
 
+    // work_list: the discovery surface takes no id on either surface.
+    let cli = env.forged(&["work", "list"]).1;
+    let tool = mcp.call_tool("work_list", envelope(json!({})));
+    assert_eq!(tool["operationId"], json!("op:work_list:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_list parity");
+
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.
     let cli = env.forged(&["doctor"]).1;
@@ -478,4 +519,69 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
     assert_eq!(doctor_shape(&cli), doctor_shape(&tool), "doctor parity");
     assert_eq!(cli["operationId"], json!("op:doctor:read"));
     assert_eq!(tool["operationId"], json!("op:doctor:read"));
+}
+
+/// The typed `overview` params moved one boundary and this pins it: a
+/// wrong-TYPED `after`/`limit` is refused as `invalid_params` before
+/// dispatch and never becomes an operation envelope, while a right-typed
+/// out-of-RANGE one still reaches the core and comes back as an ordinary
+/// `InvalidRequest` envelope.
+#[test]
+fn overview_refuses_wrong_typed_paging_at_the_transport() {
+    let env = TestEnv::new("forged-overview-params");
+    env.forged(&["init"]);
+    let mut mcp = McpClient::new(&env);
+
+    for params in [
+        json!({"run": "absent", "after": "5"}),
+        json!({"run": "absent", "after": 1.5}),
+        json!({"run": "absent", "limit": -1}),
+    ] {
+        let refusal = mcp.call_tool_error_result(
+            "overview",
+            json!({"schemaVersion": 1, "runId": "absent", "params": params.clone()}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "{params} is refused by the schema the tool advertises: {refusal}"
+        );
+        // The refusal is NOT an operation envelope: dispatch never ran, so
+        // no idempotency key was minted and no operation row exists.
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "{params} earns a message, not an envelope: {text}"
+        );
+    }
+
+    // Right type, wrong RANGE: the core still answers, as an ordinary
+    // operation envelope with its own message. (The CLI cannot be compared
+    // here: its clap group has refused `--run` together with `--after` /
+    // `--limit` since #105, which is a defect in that group, not in this
+    // boundary.)
+    for (params, message) in [
+        (
+            json!({"run": "absent", "after": -1}),
+            "overview after must be non-negative",
+        ),
+        (
+            json!({"run": "absent", "limit": 0}),
+            "overview limit must be between 1 and 1000",
+        ),
+        (
+            json!({"run": "absent", "limit": 1001}),
+            "overview limit must be between 1 and 1000",
+        ),
+    ] {
+        let tool = mcp.call_tool(
+            "overview",
+            json!({"schemaVersion": 1, "runId": "absent", "params": params.clone()}),
+        );
+        assert_eq!(tool["ok"], json!(false), "{params}: {tool}");
+        assert_eq!(tool["error"]["code"], json!("INVALID_REQUEST"), "{tool}");
+        assert_eq!(tool["error"]["message"], json!(message), "{tool}");
+    }
 }
