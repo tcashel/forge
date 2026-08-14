@@ -16,6 +16,9 @@ fn normalized(mut envelope: Value) -> Value {
     if minted {
         envelope["operationId"] = json!("<minted>");
     }
+    if envelope["result"]["queue"]["asOf"].is_string() {
+        envelope["result"]["queue"]["asOf"] = json!("<sampled>");
+    }
     envelope
 }
 
