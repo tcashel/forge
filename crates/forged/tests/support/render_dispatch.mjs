@@ -157,29 +157,46 @@ process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) stdin += chunk;
 ingest(JSON.parse(stdin));
 
-const view = [];
 // Firing a card's click to record what it would ask for WRITES `state.args`,
 // which is also one of the things being reported. Snapshot it before the
 // walk and restore it after, or the report shows whichever candidate was
 // clicked last instead of what ingest left behind.
 const ingested = state.args;
-const walk = (node) => {
-  if (node.textContent !== undefined && node.textContent !== null && node.textContent !== "") {
-    view.push({ class: node.className, text: String(node.textContent) });
-  }
-  if (node.handler) {
-    state.args = null;
-    node.handler();
-    view.push({ class: node.className, text: "", picks: state.args });
-  }
-  for (const kid of node.kids) walk(kid);
+const report = (root) => {
+  const out = [];
+  const walk = (node) => {
+    if (node.textContent !== undefined && node.textContent !== null && node.textContent !== "") {
+      out.push({ class: node.className, text: String(node.textContent) });
+    }
+    if (node.handler) {
+      state.args = null;
+      node.handler();
+      out.push({
+        class: node.className,
+        text: "",
+        picks: state.args,
+        // JSON.stringify drops an `undefined` value but Object.keys does
+        // not: `{run: undefined}` must not masquerade as the portfolio's
+        // genuinely empty params object in this harness.
+        paramKeys: Object.keys(state.args?.params || {}),
+      });
+    }
+    for (const kid of node.kids) walk(kid);
+  };
+  walk(root);
+  return out;
 };
-walk(nodes.view);
+// Navigation lives under the identity strip, outside #view. Report it
+// separately so its click contract is exercised without changing `view`'s
+// card-only `picks` contract.
+const subident = report(nodes.subident);
+const view = report(nodes.view);
 state.args = ingested;
 
 process.stdout.write(
   JSON.stringify({
     view,
+    subident,
     text: view.map((n) => n.text).filter(Boolean).join("\n"),
     ident: nodes.identText.textContent ?? "",
     chips: nodes.ident.kids.filter((k) => k.className.includes("chip")).map((k) => k.textContent),

@@ -1710,7 +1710,12 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       const foot = el("div", "bead__foot");
       foot.append(el("span", "", entry.state || "unknown"));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
-      if (num(entry.costUsdKnown)) foot.append(el("span", "", `$${num(entry.costUsdKnown).toFixed(2)}`));
+      // Key PRESENCE, not truthiness: a measured $0.00 is a fact, and
+      // hiding it exactly like an absent key would tell the operator the
+      // same thing about two different states.
+      if (entry.costUsdKnown !== undefined && entry.costUsdKnown !== null) {
+        foot.append(el("span", "", `$${num(entry.costUsdKnown).toFixed(2)}`));
+      }
       if (entry.branch) foot.append(el("span", "trunc", entry.branch));
       card.append(foot);
       if (canPick) card.addEventListener("click", () => choose(entry));
@@ -1852,6 +1857,10 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.subident.textContent = "the operation was refused";
       nodes.controls.hidden = false;
       nodes.tabs.hidden = true;
+      // The one view with no subject and no way out: Refresh repeats the
+      // very request that failed. Offer the way back up, so a refusal is a
+      // detour rather than a dead end.
+      nodes.subident.append(upToPortfolio());
       const box = panel("Refused", state.error.code || "");
       box.body.append(el("p", "", state.error.message || "The overview call returned an error envelope."));
       box.body.firstChild.style.margin = "0";
@@ -1894,7 +1903,15 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
       const held = num(data.attentionTotal);
       nodes.ident.append(chip(`${int(data.total)} in the ledger`, num(data.liveSeats) ? "live" : "idle"));
-      if (held) nodes.ident.append(chip(`${int(held)} need${held === 1 ? "s" : ""} a human`, "block"));
+      // `attentionTotal` counts CONDITIONS, and one run can raise several —
+      // "3 need a human" over two runs would be a lie about how many things
+      // are waiting.
+      if (held) {
+        nodes.ident.append(chip(
+          `${int(held)} condition${held === 1 ? "" : "s"} need${held === 1 ? "s" : ""} a human`,
+          "block",
+        ));
+      }
       nodes.subident.textContent = "";
       const scope = el("span", "trunc");
       scope.append(el("b", "", "scope "), document.createTextNode("every run and epic"));

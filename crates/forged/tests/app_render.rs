@@ -403,10 +403,17 @@ fn the_portfolio_draws_every_attention_entry_it_was_given() {
         "every condition reaches the rail: {:?}",
         dispatched.rail
     );
+    // The count is of CONDITIONS, and it says so. These two sit on two
+    // different subjects here, but one run can raise several at once —
+    // "2 need a human" would then claim two subjects are waiting when one
+    // is, which is a lie about the size of the queue.
     assert_eq!(
         dispatched.chips,
-        vec!["1 in the ledger".to_owned(), "2 need a human".to_owned()],
-        "the identity strip counts the ledger and what is waiting"
+        vec![
+            "1 in the ledger".to_owned(),
+            "2 conditions need a human".to_owned()
+        ],
+        "the identity strip counts the ledger and the conditions waiting"
     );
 }
 
@@ -474,6 +481,16 @@ fn an_unknown_schema_is_still_refused_by_ingest() {
         json!("unexpected"),
         "an unknown schema is refused: {}",
         dispatched.error
+    );
+    assert_eq!(
+        dispatched.navigation_picks(),
+        vec![json!({"schemaVersion": 1, "params": {}})],
+        "the refusal can return to the portfolio instead of repeating itself"
+    );
+    assert_eq!(
+        dispatched.navigation_param_keys(),
+        vec![json!([])],
+        "portfolio navigation means no scope key, not an undefined scoped id"
     );
 }
 

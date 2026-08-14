@@ -514,6 +514,22 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "overview limit must be between 1 and 1000",
             ));
         }
+        // `after`/`limit` page ONE subject's event tail. The portfolio has no
+        // tail — it is an inventory, and it states its own bound through
+        // `cap` and `total`. Accepting these and discarding them would answer
+        // a paging request with an unpaged body and call it success, so a
+        // caller that passed them is told they do not apply here rather than
+        // being quietly given something else.
+        if run.is_none() && epic.is_none() && id.is_none() {
+            for name in ["after", "limit"] {
+                if req.params.contains_key(name) {
+                    return Err(Failure::invalid(format!(
+                        "overview {name:?} pages one subject's events and does not apply to \
+                         the portfolio; name a \"run\", \"epic\", or \"id\""
+                    )));
+                }
+            }
+        }
         match (run, epic, id) {
             (None, None, None) => portfolio_overview(ctx).await,
             (Some(run), None, None) => run_overview(ctx, run, after, limit).await,

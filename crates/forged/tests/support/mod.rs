@@ -1361,6 +1361,9 @@ pub fn render_cost(node: &str, data: &Value) -> Rendered {
 /// chips, chrome and `state.args` it left behind on the way.
 pub struct Dispatched {
     pub view: Vec<Value>,
+    /// Identity-strip navigation lives outside `#view`; report it separately
+    /// so return-to-portfolio clicks are part of the dispatch contract.
+    pub subident: Vec<Value>,
     pub text: String,
     pub ident: String,
     pub chips: Vec<String>,
@@ -1381,6 +1384,23 @@ impl Dispatched {
             .iter()
             .filter_map(|node| node.get("picks").cloned())
             .filter(|picks| !picks.is_null())
+            .collect()
+    }
+
+    /// What clicking identity-strip navigation would ask the host for.
+    pub fn navigation_picks(&self) -> Vec<Value> {
+        self.subident
+            .iter()
+            .filter_map(|node| node.get("picks").cloned())
+            .filter(|picks| !picks.is_null())
+            .collect()
+    }
+
+    /// Parameter keys present before JSON serialization of navigation calls.
+    pub fn navigation_param_keys(&self) -> Vec<Value> {
+        self.subident
+            .iter()
+            .filter_map(|node| node.get("paramKeys").cloned())
             .collect()
     }
 
@@ -1407,6 +1427,7 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
     );
     Dispatched {
         view: out["view"].as_array().cloned().unwrap_or_default(),
+        subident: out["subident"].as_array().cloned().unwrap_or_default(),
         text: out["text"].as_str().unwrap_or_default().to_owned(),
         ident: out["ident"].as_str().unwrap_or_default().to_owned(),
         chips: out["chips"]

@@ -124,14 +124,26 @@ pub struct OverviewArgs {
 #[schemars(crate = "rmcp::schemars", inline)]
 pub struct OverviewParams {
     /// Project one slice run, by run id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub run: Option<String>,
     /// Project one epic and its child runs, by epic run id.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub epic: Option<String>,
     /// Project whichever of the two this id names, without saying which;
     /// an id that resolves to no single subject returns candidates.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
     pub id: Option<String>,
     /// Return only event rows with an eventId greater than this
     /// (default 0).
@@ -140,6 +152,26 @@ pub struct OverviewParams {
     /// Maximum event rows in the polling page, 1..=1000 (default 100).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub limit: Option<u64>,
+}
+
+/// A scope key that is PRESENT must name something.
+///
+/// `#[serde(default)]` alone maps both an absent key and an explicit `null`
+/// to `None`, and `into_envelope` then omits it — so `{"run": null}` reaches
+/// the core as `{}`. Before the portfolio existed that was harmless, because
+/// the core refused a scopeless request outright. It is not harmless now: the
+/// same call silently WIDENS from one run to the entire inventory, which is
+/// the last thing a caller who wrote a scope key wants.
+///
+/// serde only calls this when the key is present, so an absent key still
+/// defaults to `None` and a null one is refused as `invalid_params` before
+/// dispatch — the same typed boundary `after` and `limit` already sit on.
+fn present_means_named<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: rmcp::serde::Deserializer<'de>,
+{
+    use rmcp::serde::Deserialize as _;
+    String::deserialize(deserializer).map(Some)
 }
 
 impl OverviewArgs {

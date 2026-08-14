@@ -111,8 +111,9 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
-Start with `work list`: it is the one command that takes no id, so it is
-where the ids every other command needs come from.
+Start with `overview` for the operator-facing portfolio, or `work list` for
+the raw inventory. Both take no id and are the discovery surfaces for the ids
+the scoped commands need.
 
 ```sh
 forged work list
