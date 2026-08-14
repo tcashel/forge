@@ -344,7 +344,7 @@ async fn honor(
                     &view.policy.gate_commands,
                     budget,
                 )?;
-                open_packet_op(ctx, &view.run, &packet).await?;
+                open_packet_op(ctx, &packet).await?;
             }
             Ok(Honored::Progressed)
         }
@@ -463,6 +463,11 @@ async fn honor_await(
         }
         let exec = execution_context(ctx, view).await?;
         let packet = stored_packet_for_attempt(view, packet_id)?;
+        // `execute_packet` owns everything that happens before an attempt
+        // row exists on this path: it re-pins the packet to the spec it just
+        // read (a bead edited underneath an open packet would otherwise
+        // refuse `SpecDrift` on every retry, forever) and charges a
+        // pre-claim bd outage to the packet's bounded retry budget.
         let outcome = execute_packet(ctx, ports, &exec, &packet).await?;
         after_outcome(outcome);
         Ok(Honored::Progressed)

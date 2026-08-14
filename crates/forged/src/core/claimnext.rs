@@ -235,8 +235,26 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // The claim fenced these bytes; write them where the packet contract
         // already tells the resuming seat to read them. An external seat
         // never enters `run_attempt`, so nothing else would.
-        crate::core::spec::assert_pinned(&candidate.spec, &resolved)?;
-        crate::core::spec::materialize(&resolved, std::path::Path::new(&candidate.spec.path))?;
+        //
+        // Post-claim and pre-spawn: a failure here settles the attempt under
+        // its own token before it propagates (`abandon_claim`), never leaving
+        // a `running` row with no process behind it.
+        if let Err(failure) =
+            crate::core::spec::assert_pinned(&candidate.spec, &resolved).and_then(|()| {
+                crate::core::spec::materialize(
+                    &resolved,
+                    std::path::Path::new(&candidate.spec.path),
+                )
+            })
+        {
+            return Err(crate::core::abandon_claim(
+                ctx,
+                &candidate.packet_id,
+                &claimed.claim_token,
+                failure,
+            )
+            .await);
+        }
         // The packet directory belongs to the new attempt now: a stale pid
         // file (and its start-time stamp) from the dead attempt must not
         // read as this session.

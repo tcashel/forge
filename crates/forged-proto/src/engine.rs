@@ -947,25 +947,17 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
         };
     }
     let Some(last) = history.last() else {
-        // Open and never attempted: claim it.
-        return LegState::Pending {
-            packet_id,
-            not_before: None,
-        };
+        // Open and never attempted — but "never attempted" is not "never
+        // failed". A PRE-CLAIM transport failure (bd unreachable when the
+        // claim went to re-read the spec) records no attempt row, because
+        // there is no claim token to fail one under; its `proto.retry` grant
+        // is the whole record of it, and the budget is read from there. With
+        // no grant this is the ordinary first claim.
+        return transport_leg(view, packet_id, history);
     };
     match last.state {
         AttemptState::Failed => match classify_failure(last.fail_note.as_deref().unwrap_or("")) {
-            FailureKind::Transport => {
-                let (attempts, not_before) = transport_retry_state(view, packet_id, history);
-                if attempts > view.policy.transport_retry_budget {
-                    LegState::Exhausted { attempts }
-                } else {
-                    LegState::Pending {
-                        packet_id,
-                        not_before,
-                    }
-                }
-            }
+            FailureKind::Transport => transport_leg(view, packet_id, history),
             FailureKind::Semantic => LegState::FailedSemantic,
         },
         // A reclaimed attempt leaves the packet open for a successor.
@@ -973,6 +965,24 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             packet_id,
             not_before: None,
         },
+    }
+}
+
+/// A packet standing on its transport-retry budget: claimable again after
+/// the granted deadline, or exhausted once the budget is past.
+fn transport_leg<'v>(
+    view: &'v RunView,
+    packet_id: &'v str,
+    history: &[TerminalAttempt],
+) -> LegState<'v> {
+    let (attempts, not_before) = transport_retry_state(view, packet_id, history);
+    if attempts > view.policy.transport_retry_budget {
+        LegState::Exhausted { attempts }
+    } else {
+        LegState::Pending {
+            packet_id,
+            not_before,
+        }
     }
 }
 

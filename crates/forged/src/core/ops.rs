@@ -807,8 +807,21 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             // `packet claim` -> `packet complete` path never enters
             // `run_attempt`, so this is the only thing that puts the spec
             // where its own packet contract says it is.
-            super::spec::assert_pinned(&spec_ref, &resolved)?;
-            super::spec::materialize(&resolved, std::path::Path::new(&spec_ref.path))?;
+            //
+            // Post-claim and pre-spawn: a failure here settles the attempt
+            // under its own token before it propagates (`abandon_claim`),
+            // never leaving a `running` row with no process behind it.
+            if let Err(failure) = super::spec::assert_pinned(&spec_ref, &resolved)
+                .and_then(|()| super::spec::materialize(&resolved, Path::new(&spec_ref.path)))
+            {
+                return Err(crate::core::abandon_claim(
+                    ctx,
+                    &packet_id,
+                    &claimed.claim_token,
+                    failure,
+                )
+                .await);
+            }
             Ok(json!({
                 "attempt_id": claimed.attempt_id,
                 "claim_token": claimed.claim_token,

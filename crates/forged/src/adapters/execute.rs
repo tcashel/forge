@@ -190,10 +190,22 @@ pub fn build_packet(
 /// bd mints a revision on every write to the bead, so a revision-keyed open
 /// would mint a fresh key — and attempt a re-pin the ledger rightly refuses
 /// while a seat is live — every time the run touched its own lease.
-pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Result<(), Failure> {
+pub async fn open_packet_op(ctx: &Ctx, packet: &WorkPacket) -> Result<(), Failure> {
     let body_json = packet
         .stored_body()
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
+    open_packet_body_op(ctx, packet, body_json).await
+}
+
+/// The shared body of [`open_packet_op`], taking the stored definition
+/// verbatim so a re-pin can carry the row's OWN body rather than one
+/// re-serialized from an in-memory packet the caller may have adjusted.
+async fn open_packet_body_op(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    body_json: String,
+) -> Result<(), Failure> {
+    let run_id = packet.run_id.clone();
     let (stage_key, logical_seq, lane_seq) = match &packet.execution {
         Some(execution) => (
             execution.stage_id.clone(),
@@ -212,7 +224,7 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
         "{}:{fence}",
         crate::core::derive_key(
             "packet_open",
-            Some(&run.run_id),
+            Some(&run_id),
             Some(&stage_key),
             Some(logical_seq),
         )
@@ -220,14 +232,14 @@ pub async fn open_packet_op(ctx: &Ctx, run: &RunRow, packet: &WorkPacket) -> Res
     let req = OperationRequest {
         schema_version: 1,
         idempotency_key: key,
-        run_id: Some(run.run_id.clone()),
+        run_id: Some(run_id.clone()),
         params: match json!({"stage": stage_key, "seq": logical_seq, "specFence": fence}) {
             Value::Object(map) => map,
             _ => unreachable!("literal is an object"),
         },
     };
     let new_packet = forged_ledger::NewPacket {
-        run_id: run.run_id.clone(),
+        run_id,
         stage: packet.stage,
         seq: lane_seq,
         spec_path: packet.spec.path.clone(),
@@ -383,8 +395,12 @@ async fn prior_transport_failures(ctx: &Ctx, run_id: &str, packet_id: &str) -> u
         .unwrap_or(0)
 }
 
-/// Execute one open packet end to end: claim, render, spawn, await,
+/// Execute one open packet end to end: re-pin, claim, render, spawn, await,
 /// harvest, land or fail. Follows the section-(d) order exactly.
+///
+/// This is the claim-again path — the only caller is `honor_await` with the
+/// packet open and no live attempt — so it is also the one home for
+/// everything that can go wrong BEFORE an attempt row exists.
 pub async fn execute_packet(
     ctx: &Ctx,
     ports: &ForgedPorts,
@@ -396,7 +412,26 @@ pub async fn execute_packet(
     // ONE spec read for this claim: it answers both the fence the ledger
     // compares and the bytes the seat will read, so the seat can never work
     // from a body the claim did not fence.
-    let spec = crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await?;
+    //
+    // A failure here is PRE-CLAIM: there is no attempt row and no claim
+    // token to fail one under, so a transport failure is charged to the
+    // packet's bounded budget through its grant alone. Untracked, an
+    // unreachable bd would refuse here for free, forever.
+    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    {
+        Ok(spec) => spec,
+        Err(failure) if failure.recoverable => {
+            let note = format!("transport: the claim could not read the spec: {failure}");
+            return grant_pre_claim_retry(ctx, &packet_id, note).await;
+        }
+        Err(failure) => return Err(failure),
+    };
+
+    // RE-PIN BEFORE THE CLAIM. The claim fences on the rendered body, so a
+    // bead edited under an already-open packet refuses `SpecDrift` — and
+    // nothing else on this path re-opens the packet, so the run would retry
+    // the identical refusal until a human intervened.
+    let packet = &repin_packet(ctx, packet, &spec).await?;
 
     // Claim under the PER-ATTEMPT session identity (the bd lease stays the
     // run's, held by the driver): the ledger re-checks the stored fence
@@ -421,6 +456,76 @@ pub async fn execute_packet(
         &claimed.claim_token,
     )
     .await
+}
+
+/// Re-pin an open packet to the spec just resolved, returning the packet the
+/// claim should fence on.
+///
+/// A no-op unless the rendered body moved: the claim itself re-pins a moved
+/// REVISION over an unchanged body, and re-opening for that would only mint
+/// the same idempotency key.
+///
+/// The re-open carries the row's OWN stored body, never one re-serialized
+/// from the caller's packet. A re-pin revises the spec and nothing else —
+/// the ledger refuses any re-open that would move the definition too — and
+/// the caller's packet may legitimately differ from the stored definition
+/// (`stored_packet_for_attempt` rebinds provider hints to the active roster
+/// revision).
+async fn repin_packet(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    spec: &ResolvedSpec,
+) -> Result<WorkPacket, Failure> {
+    if spec.sha256 == packet.spec.sha256 {
+        return Ok(packet.clone());
+    }
+    let body_json = {
+        let packet_id = packet.packet_id.clone();
+        on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id))
+            .await?
+            .body_json
+    };
+    let mut repinned = packet.clone();
+    repinned.spec.sha256 = spec.sha256.clone();
+    repinned.spec.revision = spec.revision();
+    open_packet_body_op(ctx, &repinned, body_json).await?;
+    Ok(repinned)
+}
+
+/// Charge a PRE-CLAIM transport failure to the packet's bounded budget.
+///
+/// No attempt row is written: there is no claim token to fence one with, and
+/// inventing a terminal attempt for work no seat ever held would falsify the
+/// packet's history. The `proto.retry` grant carries both the count and the
+/// deadline, which is exactly what `advance` reads for a packet with no
+/// terminal attempts of its own.
+async fn grant_pre_claim_retry(
+    ctx: &Ctx,
+    packet_id: &str,
+    note: String,
+) -> Result<PacketOutcome, Failure> {
+    let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
+    let count = prior_transport_failures(ctx, &run_id, packet_id).await + 1;
+    let now = now_iso();
+    let deadline = forged_proto::backoff_deadline(&now, count.saturating_sub(1)).unwrap_or(now);
+    let event = ProtoEvent::Retry {
+        packet_id: packet_id.to_owned(),
+        transport_failures: count,
+        retry_after: deadline,
+    };
+    {
+        let run_id = run_id.clone();
+        on_ledger(&ctx.ledger, move |l| {
+            forged_proto::record(l, &run_id, event).map_err(|e| match e {
+                forged_proto::ProtoError::Ledger(inner) => inner,
+                other => forged_ledger::LedgerError::Internal {
+                    message: other.to_string(),
+                },
+            })
+        })
+        .await?;
+    }
+    Ok(PacketOutcome::Transport(note))
 }
 
 /// Adopt an already-claimed attempt whose provider was never spawned (the
@@ -457,28 +562,52 @@ pub async fn execute_adopted(
 
 /// Retire an adopted attempt whose spec could not be resolved or no longer
 /// matches what the packet pins.
-///
-/// A TRANSPORT failure (bd unreachable) goes onto the packet's existing
-/// bounded-retry budget — the same budget a provider transport failure uses.
-/// A refusal (drift) is terminal for this attempt: the row is failed so the
-/// packet becomes re-claimable and re-pinnable, and the refusal still
-/// surfaces to the caller rather than being swallowed into a retry.
 async fn settle_adoption(
     ctx: &Ctx,
     packet: &WorkPacket,
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
+    settle_unspawned(
+        ctx,
+        &packet.packet_id,
+        claim_token,
+        format!("transport: adoption could not read the spec: {failure}"),
+        format!("adoption refused: {failure}"),
+        failure,
+    )
+    .await
+}
+
+/// Retire a claimed attempt that will never reach a provider, under its own
+/// claim token, BEFORE the failure propagates to the caller.
+///
+/// The row is `running` with no process behind it. Left that way it blocks
+/// both the re-claim and the re-pin that would clear the cause, `honor_await`
+/// re-enters the identical failure forever, and the reclaim saga has to time
+/// out a lease that no process is renewing.
+///
+/// A TRANSPORT failure goes onto the packet's existing bounded-retry budget —
+/// the same budget a provider transport failure uses. Anything else is
+/// terminal for this attempt: the row is failed so the packet becomes
+/// re-claimable and re-pinnable, and the failure still surfaces to the caller
+/// rather than being swallowed into a retry.
+async fn settle_unspawned(
+    ctx: &Ctx,
+    packet_id: &str,
+    claim_token: &str,
+    transport_note: String,
+    refusal_note: String,
+    failure: Failure,
+) -> Result<PacketOutcome, Failure> {
     if failure.recoverable {
-        let note = format!("transport: adoption could not read the spec: {failure}");
-        return fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note).await;
+        return fail_and_grant_retry(ctx, packet_id, claim_token, transport_note).await;
     }
-    let note = format!("adoption refused: {failure}");
     {
-        let packet_id = packet.packet_id.clone();
+        let packet_id = packet_id.to_owned();
         let token = claim_token.to_owned();
         on_ledger(&ctx.ledger, move |l| {
-            l.fail_packet(&packet_id, &token, &note)
+            l.fail_packet(&packet_id, &token, &refusal_note)
         })
         .await?;
     }
@@ -495,46 +624,69 @@ async fn run_attempt(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
-    let mut packet = packet.clone();
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
-    let interventions = crate::core::sessions::pending_interventions(ctx, &run_id).await?;
-    packet
-        .field_notes
-        .extend(interventions.iter().map(|intervention| {
-            format!(
-                "Intervention {} from {}: {}",
-                intervention.id, intervention.requested_by, intervention.message
-            )
-        }));
-    // The guardian heartbeats the lease that is actually held — bd's
-    // heartbeat is owner-only, and a heartbeat under a second, derived
-    // identity would be refused and let the run's own lease lapse under it.
-    let holder =
-        crate::core::lease_identity(&ctx.config.bd_config(), &packet.bead_id, &run_id).await?;
-    let (stage_key, seq) = match &packet.execution {
-        Some(execution) => (execution.stage_id.as_str(), i64::from(execution.round)),
-        None => {
-            let (_, stage, seq) = crate::core::split_packet_id(&packet_id)?;
-            (stage_str(stage), seq)
-        }
-    };
     let claim_token = claim_token.to_owned();
 
-    // 1. Materialize the packet directory, the spec the seat reads, and the
-    // rendered prompt. The spec bytes are written from the read this attempt
-    // was fenced on, so every seat of this packet reads the same bytes.
-    let packet_dir = ctx.config.packet_dir_key(&run_id, stage_key, seq);
-    std::fs::create_dir_all(&packet_dir)
-        .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
-    crate::core::spec::assert_pinned(&packet.spec, spec)?;
-    crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
+    // 1. Everything between the claim and the spawn. The attempt is already
+    // `running` with no process behind it, so NOTHING in here may propagate
+    // on its own: every exit settles the row under its own claim token
+    // first (`settle_unspawned`).
+    //
+    // The packet directory, the spec the seat reads, and the rendered
+    // prompt are materialized here. The spec bytes are written from the read
+    // this attempt was fenced on, so every seat of this packet reads the
+    // same bytes.
+    let packet = packet.clone();
+    let prepared = async {
+        let mut packet = packet;
+        let interventions = crate::core::sessions::pending_interventions(ctx, &run_id).await?;
+        packet
+            .field_notes
+            .extend(interventions.iter().map(|intervention| {
+                format!(
+                    "Intervention {} from {}: {}",
+                    intervention.id, intervention.requested_by, intervention.message
+                )
+            }));
+        // The guardian heartbeats the lease that is actually held — bd's
+        // heartbeat is owner-only, and a heartbeat under a second, derived
+        // identity would be refused and let the run's own lease lapse under
+        // it.
+        let holder =
+            crate::core::lease_identity(&ctx.config.bd_config(), &packet.bead_id, &run_id).await?;
+        let (stage_key, seq) = match &packet.execution {
+            Some(execution) => (execution.stage_id.clone(), i64::from(execution.round)),
+            None => {
+                let (_, stage, seq) = crate::core::split_packet_id(&packet_id)?;
+                (stage_str(stage).to_owned(), seq)
+            }
+        };
+        let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
+        failpoint::hit("packet.materialize.before");
+        std::fs::create_dir_all(&packet_dir)
+            .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
+        crate::core::spec::assert_pinned(&packet.spec, spec)?;
+        crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
+        let dirs = PacketDirs::new(&packet_dir);
+        let templates = PromptTemplates::load()?;
+        let context = render_context(exec, &packet, seq)?;
+        let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
+        std::fs::write(dirs.prompt(), prompt)
+            .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
+        Ok::<_, Failure>((packet, interventions, holder, packet_dir))
+    }
+    .await;
+    let (packet, interventions, holder, packet_dir) = match prepared {
+        Ok(prepared) => prepared,
+        Err(failure) => {
+            let transport = format!("transport: the attempt could not be prepared: {failure}");
+            let refusal = format!("attempt refused before spawn: {failure}");
+            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
+                .await;
+        }
+    };
     let dirs = PacketDirs::new(&packet_dir);
-    let templates = PromptTemplates::load()?;
-    let context = render_context(exec, &packet, seq)?;
-    let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
-    std::fs::write(dirs.prompt(), prompt)
-        .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
 
     // 2. The sentinel-free shell line.
     let driver = match driver_for(&packet.provider_hints.provider) {
@@ -544,7 +696,18 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
-    let invocation = driver.invocation(&packet, &dirs, &claim_token)?;
+    let invocation = match driver
+        .invocation(&packet, &dirs, &claim_token)
+        .map_err(Failure::from)
+    {
+        Ok(invocation) => invocation,
+        Err(failure) => {
+            let transport = format!("transport: the provider invocation failed: {failure}");
+            let refusal = format!("attempt refused before spawn: {failure}");
+            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
+                .await;
+        }
+    };
 
     // 3. Prefix the pid capture (no exec — the host appends the sentinel to
     // the same shell, and `$$` is that shell's pid either way) and spawn

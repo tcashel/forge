@@ -10,10 +10,15 @@
 //! `std::process::abort()` at the site.
 //!
 //! Sites are fixed strings at forged-owned boundaries only:
-//! `op.begin.before`, `op.begin.after`, `provider.spawn.before`,
-//! `provider.spawn.after`, `bd.claim.before`, `bd.claim.after`,
-//! `bd.reclaim.before`, `bd.reclaim.after`, `guardian.start`,
-//! `git.push.before`, `git.push.after`, `gh.call.before`, `gh.call.after`.
+//! `op.begin.before`, `op.begin.after`, `packet.materialize.before`,
+//! `provider.spawn.before`, `provider.spawn.after`, `bd.claim.before`,
+//! `bd.claim.after`, `bd.reclaim.before`, `bd.reclaim.after`,
+//! `guardian.start`, `git.push.before`, `git.push.after`, `gh.call.before`,
+//! `gh.call.after`.
+//! `packet.materialize.before` is the post-claim, pre-spawn boundary: the
+//! attempt row is `running` and nothing has been written to the packet
+//! directory yet, so a test paused there can make the materialization fail
+//! for real.
 //! `epic.child.merge.after` is the scheduler's applied-but-response-lost
 //! boundary: GitHub accepted the integration merge, but the operation and
 //! epic journal have not yet been completed.
