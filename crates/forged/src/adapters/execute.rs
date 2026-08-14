@@ -180,27 +180,81 @@ pub fn build_packet(
 
 /// Open a packet through the fence (`packet_open`, SafeRetry, ledger-local).
 ///
-/// The idempotency key carries the spec fence. That is the fix for the
-/// defect this file used to have: keyed on (run, stage, seq) alone, a
-/// re-open after a spec revision replayed its stored response verbatim and
-/// left the packet pinned to bytes nobody could reach any more. A revised
-/// spec now mints a fresh key, so the re-open genuinely re-pins.
+/// THE FIRST OPEN IS AN OPERATION AND A RE-PIN IS NOT ([`repin_packet`]),
+/// and the two differ because of what each one is. This is the packet's
+/// CREATION: it runs inside the advance that opens a whole stage's packets
+/// together, and replaying its stored response after a crash is exactly
+/// right, because the row it would create already exists. A re-pin is a pure
+/// row update whose result must CHANGE when the bead does — fence that on a
+/// key and the key has to carry the world's state, and a content address is
+/// not injective over time (a bead edited A -> B -> A mints the key A
+/// already stored, and the replay writes nothing). The ledger's own
+/// `Immediate` transaction is the re-pin's fence instead: atomic, re-read
+/// every time, with no memory of an earlier call to replay.
 ///
-/// The fence in the key is the CONTENT digest, never the bead revision:
-/// bd mints a revision on every write to the bead, so a revision-keyed open
-/// would mint a fresh key — and attempt a re-pin the ledger rightly refuses
-/// while a seat is live — every time the run touched its own lease.
+/// So the key is (run, stage, seq) — the packet's identity, and nothing
+/// about its spec.
 pub async fn open_packet_op(ctx: &Ctx, packet: &WorkPacket) -> Result<(), Failure> {
     let body_json = packet
         .stored_body()
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
-    open_packet_body_op(ctx, packet, body_json).await
+    let run_id = packet.run_id.clone();
+    let target = open_target(packet, body_json)?;
+    let key = crate::core::derive_key(
+        "packet_open",
+        Some(&run_id),
+        Some(&target.stage_key),
+        Some(target.logical_seq),
+    );
+    let req = OperationRequest {
+        schema_version: 1,
+        idempotency_key: key,
+        run_id: Some(run_id.clone()),
+        params: match json!({
+            "stage": target.stage_key,
+            "seq": target.logical_seq,
+        }) {
+            Value::Object(map) => map,
+            _ => unreachable!("literal is an object"),
+        },
+    };
+    let OpenTarget {
+        new_packet,
+        semantic_id,
+        ..
+    } = target;
+    let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
+        let ledger = ctx.ledger.clone();
+        move |_op_id| async move {
+            let packet_id =
+                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
+                    .await
+                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
+            Ok(json!({"packetId": packet_id}))
+        }
+    })
+    .await;
+    if resp.ok {
+        Ok(())
+    } else {
+        let err = resp.error.unwrap_or(forged_types::OpError {
+            code: forged_types::ErrorCode::Internal,
+            message: "packet open failed".to_owned(),
+            recoverable: false,
+            detail: None,
+        });
+        Err(Failure {
+            code: err.code,
+            message: err.message,
+            recoverable: err.recoverable,
+        })
+    }
 }
 
 /// The ledger write one packet open performs, plus the key segments the
 /// operation envelope derives from the same packet.
 ///
-/// Shared by the fenced open and the direct re-pin so both write the
+/// Shared by the fenced first open and the direct re-pin so both write the
 /// identical row: a re-pin that built its row differently would be a second
 /// definition of the packet.
 struct OpenTarget {
@@ -250,72 +304,6 @@ fn apply_open(
     match semantic_id {
         Some(packet_id) => ledger.open_packet_with_id(new_packet, packet_id),
         None => ledger.open_packet(new_packet),
-    }
-}
-
-/// The shared body of [`open_packet_op`], taking the stored definition
-/// verbatim so a re-pin can carry the row's OWN body rather than one
-/// re-serialized from an in-memory packet the caller may have adjusted.
-async fn open_packet_body_op(
-    ctx: &Ctx,
-    packet: &WorkPacket,
-    body_json: String,
-) -> Result<(), Failure> {
-    let run_id = packet.run_id.clone();
-    let target = open_target(packet, body_json)?;
-    let fence = packet.spec.sha256.clone();
-    let key = format!(
-        "{}:{fence}",
-        crate::core::derive_key(
-            "packet_open",
-            Some(&run_id),
-            Some(&target.stage_key),
-            Some(target.logical_seq),
-        )
-    );
-    let req = OperationRequest {
-        schema_version: 1,
-        idempotency_key: key,
-        run_id: Some(run_id.clone()),
-        params: match json!({
-            "stage": target.stage_key,
-            "seq": target.logical_seq,
-            "specFence": fence,
-        }) {
-            Value::Object(map) => map,
-            _ => unreachable!("literal is an object"),
-        },
-    };
-    let OpenTarget {
-        new_packet,
-        semantic_id,
-        ..
-    } = target;
-    let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
-        let ledger = ctx.ledger.clone();
-        move |_op_id| async move {
-            let packet_id =
-                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
-                    .await
-                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
-            Ok(json!({"packetId": packet_id}))
-        }
-    })
-    .await;
-    if resp.ok {
-        Ok(())
-    } else {
-        let err = resp.error.unwrap_or(forged_types::OpError {
-            code: forged_types::ErrorCode::Internal,
-            message: "packet open failed".to_owned(),
-            recoverable: false,
-            detail: None,
-        });
-        Err(Failure {
-            code: err.code,
-            message: err.message,
-            recoverable: err.recoverable,
-        })
     }
 }
 
@@ -510,25 +498,25 @@ pub async fn execute_packet(
 /// is the same one `resolve_for_packet` branches on.
 ///
 /// Otherwise a no-op unless the rendered body moved: the claim itself
-/// re-pins a moved REVISION over an unchanged body, and re-opening for that
-/// would only mint the same idempotency key.
+/// re-pins a moved REVISION over an unchanged body.
 ///
-/// The re-open carries the row's OWN stored body, never one re-serialized
+/// NOT AN OPERATION. A re-pin writes three spec columns and nothing else —
+/// no bd call, no GitHub call, no spawn — so there is no external effect to
+/// deduplicate, and the operation layer exists for external effects. Its
+/// result must also change whenever the bead does, which is precisely what
+/// a fence keyed on an idempotency key refuses to do: encode the spec in the
+/// key and a bead edited A -> B -> A reproduces the key its first open at A
+/// already stored, replaying that response over a row still pinned at B.
+/// `PacketStore::open`'s own `Immediate` transaction is the right fence and
+/// the only one needed — it is atomic, it re-reads current state on every
+/// call, and its refusals (a live attempt, a moved definition) still stand.
+///
+/// The write carries the row's OWN stored body, never one re-serialized
 /// from the caller's packet. A re-pin revises the spec and nothing else —
 /// the ledger refuses any re-open that would move the definition too — and
 /// the caller's packet may legitimately differ from the stored definition
 /// (`stored_packet_for_attempt` rebinds provider hints to the active roster
 /// revision).
-///
-/// THE RE-OPEN ALONE IS NOT ENOUGH, and this is the whole reason for the
-/// re-read below. `packet_open` is keyed on the TARGET fence, so a bead
-/// edited A → B → A re-opens under the key the first open at A already
-/// stored: the operation replays its recorded response, the ledger UPDATE
-/// never runs, and the row stays pinned at B while this returns `Ok`. Every
-/// later claim then refuses `SpecDrift` forever — exactly the wedge this
-/// function exists to close. When the replay leaves the row behind, the
-/// re-pin is driven straight at the ledger, whose own refusals (a live
-/// attempt, a moved definition) still stand.
 async fn repin_packet(
     ctx: &Ctx,
     packet: &WorkPacket,
@@ -537,23 +525,21 @@ async fn repin_packet(
     if packet.spec.revision.is_none() || spec.sha256 == packet.spec.sha256 {
         return Ok(packet.clone());
     }
-    let read_row = || {
+    let body_json = {
         let packet_id = packet.packet_id.clone();
         on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id))
+            .await?
+            .body_json
     };
-    let body_json = read_row().await?.body_json;
     let mut repinned = packet.clone();
     repinned.spec.sha256 = spec.sha256.clone();
     repinned.spec.revision = spec.revision();
-    open_packet_body_op(ctx, &repinned, body_json.clone()).await?;
-    if read_row().await?.spec_sha256 != repinned.spec.sha256 {
-        let OpenTarget {
-            new_packet,
-            semantic_id,
-            ..
-        } = open_target(&repinned, body_json)?;
-        on_ledger(&ctx.ledger, move |l| apply_open(l, new_packet, semantic_id)).await?;
-    }
+    let OpenTarget {
+        new_packet,
+        semantic_id,
+        ..
+    } = open_target(&repinned, body_json)?;
+    on_ledger(&ctx.ledger, move |l| apply_open(l, new_packet, semantic_id)).await?;
     Ok(repinned)
 }
 
