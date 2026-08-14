@@ -2061,11 +2061,13 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.refresh.disabled = true;
       nodes.poll.disabled = true;
       nodes.refresh.title = "This host does not proxy tool calls.";
-      // A chooser rendered before the handshake finished is still on screen
-      // and still looks pickable; re-render so its cards say why they are
-      // not, instead of failing silently under the pointer.
-      if (state.data?.resolution) render();
     }
+    // A chooser drawn BEFORE this handshake resolved saw an empty
+    // `capabilities` and rendered its cards unpickable. Re-render whatever
+    // the answer turned out to be: gating this on the incapable branch would
+    // leave a capable host's cards permanently dead, which is the same bug
+    // in the other direction.
+    if (state.data?.resolution) render();
     reportSize();
     const observer = new ResizeObserver(reportSize);
     observer.observe(document.documentElement);
