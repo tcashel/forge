@@ -269,12 +269,33 @@ async fn reconcile_claimed(
     if let Some(stop) = settle_landed_reality(ctx, &row, &token).await? {
         return Ok(stop);
     }
+    crate::failpoint::hit("supervisor.stop-check.after");
 
     // Serialize with manual submit and terminal run settlement. A control
     // transition may clear our token while we wait; the reservation write
     // below re-checks it before any spawn.
     let subject_scope = scope(row.subject_kind);
     let _submit_guard = handoff::acquire_submit(ctx, &row.subject_id, subject_scope).await?;
+    let kind = row.subject_kind;
+    let id = row.subject_id.clone();
+    let lookup_id = id.clone();
+    let current = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.get_desired_work(kind, &lookup_id)
+    })
+    .await?;
+    let Some(row) = current else {
+        return Ok(json!({
+            "action": "superseded",
+            "subject": {"kind": kind.as_str(), "id": id},
+            "detail": "desired authorization was removed while waiting for the submit fence",
+        }));
+    };
+    if row.reconcile_token.as_deref() != Some(token.as_str()) {
+        return Ok(json!({
+            "action": "superseded",
+            "desiredWork": row_json(&row),
+        }));
+    }
 
     let mut record = handoff::latest_record(ctx, &row.subject_id).await?;
     let recorded_generation = record.as_ref().map(handoff::generation).unwrap_or(0);

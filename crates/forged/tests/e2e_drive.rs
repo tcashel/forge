@@ -653,10 +653,10 @@ fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
 
     let mut ids = Vec::new();
     for (command, reason) in [
-        ("pause", "first checkpoint"),
-        ("resume", "first continuation"),
-        ("pause", "second checkpoint"),
-        ("resume", "second continuation"),
+        ("pause", "same checkpoint"),
+        ("resume", "same continuation"),
+        ("pause", "same checkpoint"),
+        ("resume", "same continuation"),
     ] {
         let (code, response) = env.forged(&[
             "epic",
@@ -668,6 +668,14 @@ fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
         ]);
         assert_eq!(code, 0, "{command}: {response}");
         ids.push(response["operationId"].as_str().unwrap().to_owned());
+        if ids.len() == 3 {
+            let (code, status) = env.forged(&["epic", "status", "--epic", "epic-controls"]);
+            assert_eq!(code, 0, "status after repeated-reason pause: {status}");
+            assert!(
+                status["result"]["paused"].is_object(),
+                "the second same-reason pause must remain in event projection: {status}"
+            );
+        }
     }
     assert_ne!(ids[0], ids[2], "pause epochs differ");
     assert_ne!(ids[1], ids[3], "resume epochs differ");

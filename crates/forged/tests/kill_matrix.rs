@@ -731,6 +731,316 @@ fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
 // -------------------------------------------------- detached handoff recovery
 
 #[test]
+fn epic_terminal_and_input_stops_serialize_with_supervisor_spawn() {
+    let cases = [
+        (
+            "input",
+            forged_ledger::DesiredState::Running,
+            forged_ledger::DesiredReconcileOutcome::Attention,
+        ),
+        (
+            "final",
+            forged_ledger::DesiredState::Stopped,
+            forged_ledger::DesiredReconcileOutcome::Terminal,
+        ),
+    ];
+
+    for (case, expected_state, expected_outcome) in cases {
+        let env = TestEnv::new(&format!("km-epic-desired-stop-{case}"));
+        let epic = format!("epic-stop-{case}");
+        env.enable_dynamic_gh();
+        if case == "input" {
+            env.seed_epic(&epic, &[("direct-decision", &env.spec, true)]);
+            env.set_bead_field("direct-decision", "type", "decision");
+        } else {
+            env.seed_epic(&epic, &[("already-landed", &env.spec, true)]);
+            env.set_bead_field("already-landed", "status", "closed");
+        }
+        assert_eq!(env.forged(&["init"]).0, 0);
+        let repo = env.repos.repo.to_string_lossy().into_owned();
+        let spec = env.spec.to_string_lossy().into_owned();
+        let (code, started) = env.forged(&[
+            "epic",
+            "start",
+            "--epic",
+            &epic,
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ]);
+        assert_eq!(code, 0, "epic start: {started}");
+        let (code, prepared) = env.forged(&["epic", "advance", "--epic", &epic]);
+        assert_eq!(code, 0, "prepare integration: {prepared}");
+        assert!(prepared["result"]["progress"].is_object());
+        let ledger = env.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic, 0)
+            .expect("authorize desired epic");
+        ledger.close().expect("close");
+
+        // The stop transition wins the shared fence but pauses before its
+        // atomic event+desired commit, so the supervisor can complete its
+        // earlier landed-stop observation without seeing a partial stop.
+        let stop_fp = env.root.join(format!("fp-stop-{case}"));
+        std::fs::create_dir_all(&stop_fp).expect("stop failpoint dir");
+        let stop_reached = stop_fp.join("epic.stop.guarded.before-commit.reached");
+        let advance = env
+            .forged_cmd(&["epic", "advance", "--epic", &epic])
+            .env("FORGED_FAILPOINT", "epic.stop.guarded.before-commit")
+            .env("FORGED_FAILPOINT_MODE", "pause")
+            .env("FORGED_FAILPOINT_DIR", &stop_fp)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("manual epic advance spawns");
+        wait_until("guarded stop commit boundary", || stop_reached.exists());
+
+        let supervisor_fp = env.root.join(format!("fp-supervisor-{case}"));
+        std::fs::create_dir_all(&supervisor_fp).expect("supervisor failpoint dir");
+        let supervisor_reached = supervisor_fp.join("supervisor.stop-check.after.reached");
+        let supervisor = env
+            .forged_cmd(&["supervise", "--once"])
+            .env("FORGED_FAILPOINT", "supervisor.stop-check.after")
+            .env("FORGED_FAILPOINT_MODE", "pause")
+            .env("FORGED_FAILPOINT_DIR", &supervisor_fp)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("supervisor tick spawns");
+        wait_until("supervisor post-stop-check boundary", || {
+            supervisor_reached.exists()
+        });
+
+        let ledger = env.ledger();
+        let before_release = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic)
+            .expect("desired query")
+            .expect("desired row");
+        let starts_before = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count();
+        let stop_events_before = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| {
+                event.kind == "forged.epic.input.required" || event.kind == "forged.epic.pr"
+            })
+            .count();
+        ledger.close().expect("close");
+
+        std::fs::write(
+            supervisor_fp.join("supervisor.stop-check.after.release"),
+            b"",
+        )
+        .expect("release supervisor");
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(stop_fp.join("epic.stop.guarded.before-commit.release"), b"")
+            .expect("commit guarded stop");
+        let advance_output = advance.wait_with_output().expect("manual advance exits");
+        let supervisor_output = supervisor
+            .wait_with_output()
+            .expect("supervisor tick exits");
+
+        assert!(before_release.reconcile_token.is_some());
+        assert_ne!(before_release.last_outcome, Some(expected_outcome));
+        assert_eq!(starts_before, 0, "spawn remained behind the held fence");
+        assert_eq!(stop_events_before, 0, "event and intent commit together");
+        assert!(
+            supervisor_output.status.success(),
+            "supervisor failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&supervisor_output.stdout),
+            String::from_utf8_lossy(&supervisor_output.stderr)
+        );
+        let supervisor_json: Value =
+            serde_json::from_slice(&supervisor_output.stdout).expect("supervisor JSON");
+        assert_eq!(
+            supervisor_json["result"]["subjects"][0]["action"],
+            json!("superseded"),
+            "the winning stop transition must invalidate the stale claim"
+        );
+        assert!(
+            advance_output.status.success(),
+            "manual advance failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&advance_output.stdout),
+            String::from_utf8_lossy(&advance_output.stderr)
+        );
+
+        let ledger = env.ledger();
+        let desired = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic)
+            .expect("desired query")
+            .expect("desired row");
+        let starts = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count();
+        ledger.close().expect("close");
+        assert_eq!(desired.desired_state, expected_state);
+        assert_eq!(desired.last_outcome, Some(expected_outcome));
+        assert!(desired.next_wake_at.is_none());
+        assert_eq!(desired.controller_generation, 0);
+        assert_eq!(desired.restart_used, 0);
+        assert_eq!(starts, 0, "no controller spawned after the stop won");
+    }
+}
+
+#[test]
+fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
+    let env = TestEnv::new("km-epic-resolution-identity");
+    env.seed_epic(
+        "epic-resolve-crash",
+        &[("resolve-decision", &env.spec, true)],
+    );
+    env.set_bead_field("resolve-decision", "type", "decision");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-resolve-crash",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(
+        env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"])
+            .0,
+        0
+    );
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-resolve-crash",
+            0,
+        )
+        .expect("authorize desired epic");
+    ledger.close().expect("close");
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "input stop: {held}");
+    assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));
+
+    env.set_bead_field("resolve-decision", "type", "task");
+    let fp = env.root.join("fp-resolve-identity");
+    std::fs::create_dir_all(&fp).expect("failpoint dir");
+    let mut crashed = env
+        .forged_cmd(&[
+            "epic",
+            "resolve",
+            "--epic",
+            "epic-resolve-crash",
+            "--child",
+            "resolve-decision",
+            "--note",
+            "convert to executable work",
+        ])
+        .env("FORGED_FAILPOINT", "epic.resolve.desired.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("resolve process spawns");
+    assert!(!crashed.wait().expect("resolve crashes").success());
+
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_events.len(), 1);
+    let first_payload: Value =
+        serde_json::from_str(&resolved_events[0].payload_json).expect("resolution payload");
+    assert!(first_payload["resolutionId"].as_str().is_some());
+    let due = ledger
+        .get_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-resolve-crash",
+        )
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(
+        due.last_outcome,
+        Some(forged_ledger::DesiredReconcileOutcome::Authorized)
+    );
+    assert!(due.next_wake_at.is_some());
+    ledger.close().expect("close");
+
+    let (code, replayed) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-resolve-crash",
+        "--child",
+        "resolve-decision",
+        "--note",
+        "convert to executable work",
+    ]);
+    assert_eq!(code, 0, "resolution replay: {replayed}");
+    assert_eq!(
+        replayed["result"]["resolutionId"],
+        first_payload["resolutionId"]
+    );
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .count();
+    assert_eq!(resolved_events, 1, "replay never duplicates resolution");
+    ledger.close().expect("close");
+
+    let (code, held_again) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "repeat input stop: {held_again}");
+    assert_eq!(
+        held_again["result"]["stopped"]["code"],
+        json!("non-code-child")
+    );
+    let (code, resolved_again) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-resolve-crash",
+        "--child",
+        "resolve-decision",
+        "--note",
+        "convert to executable work",
+    ]);
+    assert_eq!(code, 0, "later same-note resolution: {resolved_again}");
+    assert_ne!(
+        resolved_again["result"]["resolutionId"],
+        first_payload["resolutionId"]
+    );
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .count();
+    assert_eq!(resolved_events, 2, "later resolution has a new identity");
+    ledger.close().expect("close");
+}
+
+#[test]
 fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
     let env = TestEnv::new("km-controller-handoff");
     start_run(&env, "bead-khandoff");

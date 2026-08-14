@@ -166,6 +166,81 @@ fn authorize_tx(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn append_event_transitioning_desired_tx(
+    conn: &Connection,
+    kind: DesiredSubjectKind,
+    id: &str,
+    event_kind: &str,
+    payload: &serde_json::Value,
+    state: DesiredState,
+    outcome: DesiredReconcileOutcome,
+    wake: bool,
+    error: Option<&str>,
+    identity_field: Option<&str>,
+) -> Result<(), LedgerError> {
+    let append = match identity_field {
+        None => true,
+        Some(field) => {
+            let identity = payload
+                .get(field)
+                .and_then(serde_json::Value::as_str)
+                .filter(|value| !value.is_empty())
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("event {event_kind:?} requires non-empty {field:?}"),
+                    )
+                })?;
+            let mut statement = conn.prepare(
+                "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+            )?;
+            let rows = statement.query_map(rusqlite::params![id, event_kind], |row| {
+                row.get::<_, String>(0)
+            })?;
+            let mut found = false;
+            for raw in rows {
+                let existing: serde_json::Value = serde_json::from_str(&raw?)?;
+                if existing.get(field).and_then(serde_json::Value::as_str) == Some(identity) {
+                    if existing != *payload {
+                        return Err(refused(
+                            ErrorCode::IdempotencyConflict,
+                            format!(
+                                "event {event_kind:?} identity {identity:?} has a different payload"
+                            ),
+                        ));
+                    }
+                    found = true;
+                    break;
+                }
+            }
+            !found
+        }
+    };
+    if append {
+        append_event_tx(conn, Some(id), event_kind, payload)?;
+    }
+    let now = now_iso();
+    let next_wake = (wake && state == DesiredState::Running).then_some(now.clone());
+    conn.execute(
+        "UPDATE desired_work SET desired_state = ?1,
+           control_revision = control_revision + CASE WHEN desired_state = ?1 THEN 0 ELSE 1 END,
+           next_wake_at = ?2, last_outcome = ?3, last_error = ?4,
+           reconcile_token = NULL, reconcile_lease_until = NULL, updated_at = ?5
+         WHERE subject_kind = ?6 AND subject_id = ?7",
+        rusqlite::params![
+            state.as_str(),
+            next_wake,
+            outcome.as_str(),
+            error,
+            now,
+            kind.as_str(),
+            id,
+        ],
+    )?;
+    Ok(())
+}
+
 /// Mark an existing authorization stopped without creating authorization for
 /// legacy or never-submitted work. Used inside run settlement transactions.
 pub(crate) fn stop_desired_work_tx(
@@ -337,36 +412,61 @@ impl Ledger {
         let event_kind = event_kind.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let payload_json = serde_json::to_string(&payload)?;
-            let exists: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM events WHERE run_id = ?1 AND kind = ?2 AND payload_json = ?3)",
-                rusqlite::params![id, event_kind, payload_json],
-                |row| row.get(0),
-            )?;
-            if !exists {
-                append_event_tx(&tx, Some(&id), &event_kind, &payload)?;
-            }
-            let now = now_iso();
             let outcome = match state {
                 DesiredState::Running => DesiredReconcileOutcome::Authorized,
                 DesiredState::Paused => DesiredReconcileOutcome::Paused,
                 DesiredState::Stopped => DesiredReconcileOutcome::Stopped,
             };
-            let next_wake = (state == DesiredState::Running).then_some(now.clone());
-            tx.execute(
-                "UPDATE desired_work SET desired_state = ?1,
-                   control_revision = control_revision + CASE WHEN desired_state = ?1 THEN 0 ELSE 1 END,
-                   next_wake_at = ?2, last_outcome = ?3, last_error = NULL,
-                   reconcile_token = NULL, reconcile_lease_until = NULL, updated_at = ?4
-                 WHERE subject_kind = ?5 AND subject_id = ?6",
-                rusqlite::params![
-                    state.as_str(),
-                    next_wake,
-                    outcome.as_str(),
-                    now,
-                    kind.as_str(),
-                    id,
-                ],
+            append_event_transitioning_desired_tx(
+                &tx,
+                kind,
+                &id,
+                &event_kind,
+                &payload,
+                state,
+                outcome,
+                state == DesiredState::Running,
+                None,
+                Some("controlId"),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Atomically append a scheduler stop/resolution event and update any
+    /// existing desired authorization. Unlike control transitions, repeated
+    /// payloads are legitimate after an intervening resolution and are never
+    /// globally deduplicated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn append_event_settling_desired(
+        &self,
+        kind: DesiredSubjectKind,
+        id: &str,
+        event_kind: &str,
+        payload: serde_json::Value,
+        state: DesiredState,
+        outcome: DesiredReconcileOutcome,
+        wake: bool,
+        error: Option<String>,
+        identity_field: Option<&str>,
+    ) -> Result<(), LedgerError> {
+        let id = id.to_owned();
+        let event_kind = event_kind.to_owned();
+        let identity_field = identity_field.map(str::to_owned);
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            append_event_transitioning_desired_tx(
+                &tx,
+                kind,
+                &id,
+                &event_kind,
+                &payload,
+                state,
+                outcome,
+                wake,
+                error.as_deref(),
+                identity_field.as_deref(),
             )?;
             tx.commit()?;
             Ok(())
@@ -797,7 +897,7 @@ mod tests {
                 DesiredSubjectKind::Epic,
                 "never-submitted",
                 "forged.epic.paused",
-                json!({"reason": "hold"}),
+                json!({"reason": "hold", "controlId": "pause-never-1"}),
                 DesiredState::Paused,
             )
             .expect("unsubmitted pause still records its epic event");
@@ -814,7 +914,7 @@ mod tests {
                 DesiredSubjectKind::Epic,
                 "epic-controls",
                 "forged.epic.paused",
-                json!({"reason": "checkpoint"}),
+                json!({"reason": "checkpoint", "controlId": "pause-1"}),
                 DesiredState::Paused,
             )
             .expect("pause");
@@ -831,7 +931,7 @@ mod tests {
                 DesiredSubjectKind::Epic,
                 "epic-controls",
                 "forged.epic.resumed",
-                json!({"reason": "continue"}),
+                json!({"reason": "continue", "controlId": "resume-1"}),
                 DesiredState::Running,
             )
             .expect("resume");
@@ -867,7 +967,10 @@ mod tests {
                 DesiredSubjectKind::Epic,
                 "epic-controls",
                 "forged.epic.resumed",
-                json!({"reason": "retry while input remains"}),
+                json!({
+                    "reason": "retry while input remains",
+                    "controlId": "resume-2",
+                }),
                 DesiredState::Running,
             )
             .expect("resume reconsiders");
@@ -877,6 +980,106 @@ mod tests {
             .expect("desired")
             .next_wake_at
             .is_some());
+
+        let claimed = ledger
+            .claim_desired_work(
+                DesiredSubjectKind::Epic,
+                "epic-controls",
+                "stale-input-observer",
+                "9999-01-01T00:00:00.000000000Z",
+                "9999-01-01T00:01:00.000000000Z",
+            )
+            .expect("claim due unresolved input")
+            .expect("claim");
+        assert_eq!(
+            claimed.reconcile_token.as_deref(),
+            Some("stale-input-observer")
+        );
+        ledger
+            .append_event_settling_desired(
+                DesiredSubjectKind::Epic,
+                "epic-controls",
+                "forged.epic.input.resolved",
+                json!({
+                    "childId": "child-1",
+                    "note": "resolved",
+                    "resolutionId": "resolve-op-1",
+                }),
+                DesiredState::Running,
+                DesiredReconcileOutcome::Authorized,
+                true,
+                None,
+                Some("resolutionId"),
+            )
+            .expect("resolution event and wake commit together");
+        assert!(ledger
+            .finish_desired_reconciliation(
+                DesiredSubjectKind::Epic,
+                "epic-controls",
+                "stale-input-observer",
+                DesiredReconcileUpdate {
+                    desired_state: None,
+                    outcome: DesiredReconcileOutcome::Attention,
+                    controller_generation: None,
+                    predecessor_generation: None,
+                    next_wake_at: None,
+                    last_progress_at: None,
+                    last_error: Some("stale input observation".to_owned()),
+                    attention: true,
+                },
+            )
+            .is_err());
+        let resolved = ledger
+            .get_desired_work(DesiredSubjectKind::Epic, "epic-controls")
+            .expect("query")
+            .expect("desired");
+        assert_eq!(
+            resolved.last_outcome,
+            Some(DesiredReconcileOutcome::Authorized)
+        );
+        assert!(resolved.next_wake_at.is_some());
+        let replay = json!({
+            "childId": "child-1",
+            "note": "resolved",
+            "resolutionId": "resolve-op-1",
+        });
+        ledger
+            .append_event_settling_desired(
+                DesiredSubjectKind::Epic,
+                "epic-controls",
+                "forged.epic.input.resolved",
+                replay,
+                DesiredState::Running,
+                DesiredReconcileOutcome::Authorized,
+                true,
+                None,
+                Some("resolutionId"),
+            )
+            .expect("same resolution identity replays");
+        ledger
+            .append_event_settling_desired(
+                DesiredSubjectKind::Epic,
+                "epic-controls",
+                "forged.epic.input.resolved",
+                json!({
+                    "childId": "child-1",
+                    "note": "resolved",
+                    "resolutionId": "resolve-op-2",
+                }),
+                DesiredState::Running,
+                DesiredReconcileOutcome::Authorized,
+                true,
+                None,
+                Some("resolutionId"),
+            )
+            .expect("later same-note resolution has a distinct identity");
+        let resolution_events = ledger
+            .list_events(Some("epic-controls"), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.epic.input.resolved")
+            .count();
+        assert_eq!(resolution_events, 2);
     }
 
     #[test]
