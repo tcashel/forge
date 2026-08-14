@@ -155,6 +155,9 @@ pub struct Shim {
     pub bin_dir: PathBuf,
     /// The scenario directory: `<key>.stdout` / `<key>.stderr` / `<key>.exit`.
     pub scenario_dir: PathBuf,
+    /// The inert data file the script is written to. Nothing ever execs it,
+    /// and it is deliberately NOT the inode published as `bin/gh`.
+    pub script_source: PathBuf,
     log: PathBuf,
     program: PathBuf,
 }
@@ -170,14 +173,28 @@ impl Shim {
         std::fs::create_dir(&bin_dir).expect("mkdir bin");
         std::fs::create_dir(&scenario_dir).expect("mkdir scenarios");
         let program = bin_dir.join("gh");
-        // The exec'd path is published by rename and is never itself opened
-        // for writing. A sibling test forking inside a write to `gh` would
-        // inherit a writable descriptor to it and the kernel would refuse to
-        // exec it (ETXTBSY); it can only ever inherit one to the staging
-        // name, which nothing execs. Mode is set before the rename, so the
-        // file is never observable at its final path without it.
+        // ETXTBSY is inode-scoped: the kernel refuses to exec any inode a
+        // process holds a writable descriptor to, and rename preserves the
+        // inode -- so staging plus rename would still publish the very inode
+        // this process wrote. The test binary is multithreaded and forks
+        // constantly, so a sibling spawning inside that write would inherit
+        // the descriptor and make `bin/gh` briefly unexecutable.
+        //
+        // So this process never opens the exec'd inode for writing at all.
+        // The script lands in an inert data file that nothing execs, and the
+        // published inode is created by a child `cp` -- single-threaded,
+        // never forks, and exited before `new` returns, so no descriptor to
+        // it can outlive the copy or be inherited by anything. Mode is set on
+        // the staging name, so `gh` is never observable without it.
+        let script_source = root.join("gh.script");
+        std::fs::write(&script_source, SHIM_SCRIPT).expect("write shim source");
         let staging = bin_dir.join("gh.staging");
-        std::fs::write(&staging, SHIM_SCRIPT).expect("write shim");
+        let copied = Command::new("cp")
+            .arg(&script_source)
+            .arg(&staging)
+            .status()
+            .expect("cp spawns");
+        assert!(copied.success(), "cp published the shim: {copied}");
         std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
             .expect("chmod shim");
         std::fs::rename(&staging, &program).expect("publish shim");
@@ -186,6 +203,7 @@ impl Shim {
             tmp,
             bin_dir,
             scenario_dir,
+            script_source,
             log,
             program,
         }

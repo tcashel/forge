@@ -403,12 +403,13 @@ async fn live_gh_api_smoke() {
     assert!(!branch.is_empty());
 }
 
-/// The shim's exec'd path is published, not written: once `new` returns,
-/// `bin/gh` is the only entry there, carries its mode, and holds exactly the
-/// script. A surviving staging entry means the rename did not happen and the
-/// path the tests exec was opened for writing.
+/// `bin/gh` is the only entry the PATH-prepend tests can resolve, and it is
+/// published complete: mode already set, holding exactly the script. A
+/// surviving `gh.staging` entry means the publish aborted midway. This pins
+/// the layout only -- the ETXTBSY property is covered below, and this
+/// assertion cannot detect a regression in it.
 #[test]
-fn shim_publishes_gh_by_rename_leaving_no_staging_entry() {
+fn shim_publishes_only_a_complete_gh_into_bin_dir() {
     use std::os::unix::fs::PermissionsExt;
 
     let shim = Shim::new();
@@ -436,4 +437,50 @@ fn shim_publishes_gh_by_rename_leaving_no_staging_entry() {
         std::fs::read_to_string(&program).expect("read gh"),
         SHIM_SCRIPT
     );
+}
+
+/// ETXTBSY is inode-scoped, so it is not enough for the publish to move the
+/// written file into place -- rename preserves the inode. The inode the tests
+/// exec must be one this process never opened for writing, because a sibling
+/// test forking mid-write inherits that descriptor and the kernel then
+/// refuses the exec.
+///
+/// The inode inequality is the portable guard: it fails on every platform the
+/// moment publishing routes the script back through the exec'd inode. The
+/// held descriptor then reproduces the hazardous state itself -- exactly what
+/// a forked sibling would hold, open across a real exec of `bin/gh`. Only
+/// Linux enforces the refusal (`deny_write_access` on the inode), so that
+/// half bites on CI and is inert on darwin; it is deliberately not the only
+/// assertion here.
+#[tokio::test]
+async fn shim_execs_while_a_writable_descriptor_to_its_source_is_open() {
+    use std::os::unix::fs::MetadataExt;
+
+    enter_non_git_cwd();
+    let shim = Shim::new();
+
+    let source = std::fs::metadata(&shim.script_source).expect("script source exists");
+    let program = std::fs::metadata(shim.bin_dir.join("gh")).expect("gh exists");
+    assert_ne!(
+        source.ino(),
+        program.ino(),
+        "the exec'd inode must not be the one this process wrote"
+    );
+
+    let _held = std::fs::OpenOptions::new()
+        .write(true)
+        .open(&shim.script_source)
+        .expect("hold a writable descriptor to the written inode");
+
+    shim.set(
+        "pr_view",
+        "stdout",
+        &pr_json(3, "OPEN", false, "main", "feat/x", "https://x/3"),
+    );
+    let pr = shim
+        .client()
+        .pr_view(REPO, 3)
+        .await
+        .expect("exec is not refused with ETXTBSY");
+    assert_eq!(pr.number, 3);
 }
