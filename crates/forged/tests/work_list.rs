@@ -315,6 +315,59 @@ fn a_timestamp_tie_resolves_by_event_id() {
     assert_eq!(epic["updatedAt"], json!(tie));
 }
 
+/// The discriminating tie: pause, resume, pause, all stamped identically.
+///
+/// `a_timestamp_tie_resolves_by_event_id` above ends on a resume, so it
+/// passes under a fold that simply lets the LAST KIND ITERATED win — the
+/// resume scan runs after the pause scan either way. Ending on a pause
+/// separates the two: append position says `paused` with the second pause's
+/// reason, kind-major iteration says `active`.
+#[test]
+fn a_tie_ending_on_a_pause_still_resolves_by_append_position() {
+    let (env, _repo, _spec) = started_epic(
+        "forged-work-list-epic-tie-pause",
+        "epic-tie-pause",
+        "child-tie-pause",
+    );
+    for (command, reason) in [
+        ("pause", "first hold"),
+        ("resume", "continue"),
+        ("pause", "second hold"),
+    ] {
+        let (code, response) = env.forged(&[
+            "epic",
+            command,
+            "--epic",
+            "epic-tie-pause",
+            "--reason",
+            reason,
+        ]);
+        assert_eq!(code, 0, "epic {command}: {response}");
+    }
+    let tie = "2026-01-01T00:00:00.000000000Z";
+    let touched = sqlite(&env)
+        .execute(
+            "UPDATE events SET ts = ?1 WHERE run_id = 'epic-tie-pause' \
+             AND kind IN ('forged.epic.paused', 'forged.epic.resumed')",
+            [tie],
+        )
+        .expect("stamp the control events identically");
+    assert_eq!(touched, 3, "two pauses and one resume");
+
+    let epic = epic_entry(&env, "epic-tie-pause");
+    assert_eq!(
+        epic["state"],
+        json!("paused"),
+        "the LAST APPENDED control event was a pause: {epic}"
+    );
+    assert_eq!(
+        epic["stopReason"],
+        json!("second hold"),
+        "and it carries that pause's reason, not the first's: {epic}"
+    );
+    assert_eq!(epic["updatedAt"], json!(tie));
+}
+
 /// A lifecycle payload that will not parse degrades exactly like an
 /// unparseable start event: the epic stays discoverable and reports the
 /// state its kind implies, with no reason invented.
