@@ -1188,11 +1188,20 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 
 // ------------------------------------------------------------- inventory
 
-/// `work list` — the discovery surface: every unit of work the ledger holds,
-/// live or historical, each labelled `slice` or `epic`.
+/// Whether inventory entries carry per-run spend.
 ///
-/// The one entry point that takes no id, so a caller with no prior knowledge
-/// can enumerate the inventory and then address any entry.
+/// Spend is the one field costing a `usage_totals` query per entry; a caller
+/// resolving an id against the inventory reads no spend and must not pay for
+/// it, so `Omit` leaves both spend keys off the entry rather than reporting a
+/// zero it did not measure.
+pub enum Spend {
+    Include,
+    Omit,
+}
+
+/// The inventory: every unit of work the ledger holds, live or historical,
+/// each labelled `slice` or `epic`. `work_list` serves it whole; `overview`
+/// resolves a bare id against it.
 ///
 /// Two sources, deliberately: a slice owns a `runs` row, but an epic never
 /// does — `epic_start` only appends `forged.epic.started` under the epic
@@ -1200,7 +1209,9 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 /// per child. An inventory built from `list_runs()` alone therefore lists no
 /// epic at all, so every started epic id with no `runs` row is synthesized
 /// from its start event. `kind` stays derived from that event — the only
-/// signal separating an epic from a slice; there is no column for it.
+/// signal separating an epic from a slice; there is no column for it. One
+/// construction, because a second implementation of that rule would drift
+/// from the first.
 ///
 /// A synthesized epic entry carries the same keys as a run entry so one
 /// shape describes the whole inventory, with the values an epic actually
@@ -1214,100 +1225,109 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 /// Live seats come from ONE `list_live_attempts(None)` scan grouped by run,
 /// never a per-run query. Absent usage is data: an entry with no usage rows
 /// reports zero spend rather than failing.
+pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
+    let runs = on_ledger(&ctx.ledger, |l| l.list_runs()).await?;
+    let started = on_ledger(&ctx.ledger, |l| {
+        l.list_events_by_kind("forged.epic.started")
+    })
+    .await?;
+    // First start event per epic id; a payload that will not parse still
+    // yields a discoverable id rather than hiding the epic.
+    let mut epics: BTreeMap<String, (String, Value)> = BTreeMap::new();
+    for event in started {
+        let Some(epic_id) = event.run_id else {
+            continue;
+        };
+        epics.entry(epic_id).or_insert_with(|| {
+            (
+                event.ts,
+                serde_json::from_str(&event.payload_json).unwrap_or(Value::Null),
+            )
+        });
+    }
+    let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
+    for attempt in on_ledger(&ctx.ledger, |l| l.list_live_attempts(None)).await? {
+        let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
+        *live_seats.entry(run_id).or_default() += 1;
+    }
+    // (createdAt, id, entry) — one ordering over both sources, keeping
+    // `list_runs`'s chronological shape now that epics interleave.
+    let mut inventory: Vec<(String, String, Value)> = Vec::with_capacity(runs.len() + epics.len());
+    for run in runs {
+        let epic = epics.remove(&run.run_id).is_some();
+        let mut entry = json!({
+            "id": run.run_id,
+            "kind": if epic { "epic" } else { "slice" },
+            "beadId": run.bead_id,
+            "repo": run.repo,
+            "branch": run.branch,
+            "state": match run.state {
+                RunState::Active => "active",
+                RunState::Stopped => "stopped",
+            },
+            "stopReason": run.stop_reason,
+            "createdAt": run.created_at,
+            "updatedAt": run.updated_at,
+            "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
+        });
+        add_spend(ctx, &spend, &run.run_id, &mut entry).await?;
+        inventory.push((run.created_at, run.run_id, entry));
+    }
+    // Whatever is left has a start event and no run row: a real epic.
+    for (epic_id, (ts, payload)) in epics {
+        let field = |name: &str| match payload.get(name) {
+            Some(value @ Value::String(_)) => value.clone(),
+            _ => Value::Null,
+        };
+        let bead_id = match field("epicId") {
+            Value::Null => Value::from(epic_id.clone()),
+            value => value,
+        };
+        let mut entry = json!({
+            "id": epic_id,
+            "kind": "epic",
+            "beadId": bead_id,
+            "repo": field("repo"),
+            "branch": field("integrationBranch"),
+            "state": "active",
+            "stopReason": Value::Null,
+            "createdAt": ts,
+            "updatedAt": ts,
+            "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
+        });
+        add_spend(ctx, &spend, &epic_id, &mut entry).await?;
+        inventory.push((ts, epic_id, entry));
+    }
+    inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
+    Ok(inventory.into_iter().map(|(_, _, entry)| entry).collect())
+}
+
+/// Stamp one entry's spend, when the caller asked for it.
+async fn add_spend(ctx: &Ctx, spend: &Spend, id: &str, entry: &mut Value) -> Result<(), Failure> {
+    let Spend::Include = spend else {
+        return Ok(());
+    };
+    let totals = {
+        let id = id.to_owned();
+        on_ledger(&ctx.ledger, move |l| l.usage_totals(&id)).await?
+    };
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("costUsdKnown".to_owned(), json!(totals.cost_usd_known));
+        object.insert(
+            "rowsMissingCost".to_owned(),
+            json!(totals.rows_missing_cost),
+        );
+    }
+    Ok(())
+}
+
+/// `work list` — the discovery surface, serving [`inventory`] whole.
+///
+/// The one entry point that takes no id, so a caller with no prior knowledge
+/// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let runs = on_ledger(&ctx.ledger, |l| l.list_runs()).await?;
-        let started = on_ledger(&ctx.ledger, |l| {
-            l.list_events_by_kind("forged.epic.started")
-        })
-        .await?;
-        // First start event per epic id; a payload that will not parse still
-        // yields a discoverable id rather than hiding the epic.
-        let mut epics: BTreeMap<String, (String, Value)> = BTreeMap::new();
-        for event in started {
-            let Some(epic_id) = event.run_id else {
-                continue;
-            };
-            epics.entry(epic_id).or_insert_with(|| {
-                (
-                    event.ts,
-                    serde_json::from_str(&event.payload_json).unwrap_or(Value::Null),
-                )
-            });
-        }
-        let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
-        for attempt in on_ledger(&ctx.ledger, |l| l.list_live_attempts(None)).await? {
-            let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
-            *live_seats.entry(run_id).or_default() += 1;
-        }
-        // (createdAt, id, entry) — one ordering over both sources, keeping
-        // `list_runs`'s chronological shape now that epics interleave.
-        let mut inventory: Vec<(String, String, Value)> =
-            Vec::with_capacity(runs.len() + epics.len());
-        for run in runs {
-            let totals = {
-                let run_id = run.run_id.clone();
-                on_ledger(&ctx.ledger, move |l| l.usage_totals(&run_id)).await?
-            };
-            let epic = epics.remove(&run.run_id).is_some();
-            inventory.push((
-                run.created_at.clone(),
-                run.run_id.clone(),
-                json!({
-                    "id": run.run_id,
-                    "kind": if epic { "epic" } else { "slice" },
-                    "beadId": run.bead_id,
-                    "repo": run.repo,
-                    "branch": run.branch,
-                    "state": match run.state {
-                        RunState::Active => "active",
-                        RunState::Stopped => "stopped",
-                    },
-                    "stopReason": run.stop_reason,
-                    "createdAt": run.created_at,
-                    "updatedAt": run.updated_at,
-                    "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
-                    "costUsdKnown": totals.cost_usd_known,
-                    "rowsMissingCost": totals.rows_missing_cost,
-                }),
-            ));
-        }
-        // Whatever is left has a start event and no run row: a real epic.
-        for (epic_id, (ts, payload)) in epics {
-            let totals = {
-                let epic_id = epic_id.clone();
-                on_ledger(&ctx.ledger, move |l| l.usage_totals(&epic_id)).await?
-            };
-            let field = |name: &str| match payload.get(name) {
-                Some(value @ Value::String(_)) => value.clone(),
-                _ => Value::Null,
-            };
-            let bead_id = match field("epicId") {
-                Value::Null => Value::from(epic_id.clone()),
-                value => value,
-            };
-            inventory.push((
-                ts.clone(),
-                epic_id.clone(),
-                json!({
-                    "id": epic_id,
-                    "kind": "epic",
-                    "beadId": bead_id,
-                    "repo": field("repo"),
-                    "branch": field("integrationBranch"),
-                    "state": "active",
-                    "stopReason": Value::Null,
-                    "createdAt": ts,
-                    "updatedAt": ts,
-                    "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
-                    "costUsdKnown": totals.cost_usd_known,
-                    "rowsMissingCost": totals.rows_missing_cost,
-                }),
-            ));
-        }
-        inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
-        let entries: Vec<Value> = inventory.into_iter().map(|(_, _, entry)| entry).collect();
-        Ok(json!({"runs": entries}))
+        Ok(json!({"runs": inventory(ctx, Spend::Include).await?}))
     })
     .await
 }

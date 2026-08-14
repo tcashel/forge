@@ -518,7 +518,7 @@ pub struct EventsArgs {
 
 /// `overview` flags. Exactly one scope is required.
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["run", "epic"])]
+#[group(required = true, multiple = false, args = ["run", "epic", "id"])]
 pub struct OverviewArgs {
     /// Project one slice run.
     #[arg(long)]
@@ -526,6 +526,9 @@ pub struct OverviewArgs {
     /// Project one epic and its child runs.
     #[arg(long)]
     pub epic: Option<String>,
+    /// Project whichever of the two this id names, or list the candidates.
+    #[arg(long)]
+    pub id: Option<String>,
     /// Return event rows with event_id greater than this.
     #[arg(long)]
     pub after: Option<i64>,
@@ -945,7 +948,11 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         ),
         Command::Overview(a) => {
-            let scope = a.run.clone().or_else(|| a.epic.clone());
+            let scope = a
+                .run
+                .clone()
+                .or_else(|| a.epic.clone())
+                .or_else(|| a.id.clone());
             (
                 "overview",
                 request(
@@ -954,6 +961,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({
                         "run": a.run,
                         "epic": a.epic,
+                        "id": a.id,
                         "after": a.after,
                         "limit": a.limit,
                     }),

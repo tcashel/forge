@@ -332,14 +332,81 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     }))
 }
 
+/// What a bare `id` resolved to.
+enum Resolved {
+    /// The id names one slice run.
+    Slice(String),
+    /// The id names one epic.
+    Epic(String),
+    /// The id named no single subject; the caller gets a chooser instead of
+    /// a refusal, already shaped as a `forged.overview/1` payload.
+    Candidates(Value),
+}
+
+/// Resolve a bare `id` to a kind through ONE inventory scan.
+///
+/// The inventory `work_list` serves is the resolution index — the only place
+/// an epic with no `runs` row is discoverable — so resolution reads it whole
+/// and matches in memory rather than issuing a lookup per candidate.
+///
+/// An exact id always wins over any prefix interpretation of the same
+/// string, so a shorter id that prefixes a longer one is never shadowed by
+/// it. A prefix resolves only when exactly one entry matches; zero is
+/// `unknown` with an empty candidate list and two or more is `ambiguous`
+/// with those entries. Neither is an error: a wrong guess degrades into a
+/// menu, and "nothing could have been meant" is a successful answer.
+async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
+    let entries = super::ops::inventory(ctx, super::ops::Spend::Omit).await?;
+    let resolved = |entry: &Value| {
+        let entry_id = entry["id"].as_str().unwrap_or_default().to_owned();
+        match entry["kind"].as_str() {
+            Some("epic") => Resolved::Epic(entry_id),
+            _ => Resolved::Slice(entry_id),
+        }
+    };
+    if let Some(entry) = entries.iter().find(|entry| entry["id"] == json!(id)) {
+        return Ok(resolved(entry));
+    }
+    let candidates: Vec<Value> = entries
+        .into_iter()
+        .filter(|entry| {
+            entry["id"]
+                .as_str()
+                .is_some_and(|entry_id| entry_id.starts_with(id))
+        })
+        .collect();
+    if candidates.len() == 1 {
+        return Ok(resolved(&candidates[0]));
+    }
+    Ok(Resolved::Candidates(json!({
+        "schema": "forged.overview/1",
+        "resolution": {
+            "query": id,
+            "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
+            "candidates": candidates,
+        },
+    })))
+}
+
 /// Read-only aggregate used by reconnecting agents and the MCP App.
+///
+/// Takes an explicit `run` or `epic`, or a bare `id` resolved against the
+/// inventory. The two are different requests — an assertion about a kind
+/// versus a question about one — so passing both is refused rather than
+/// silently preferring one, which would hide a caller's bug.
 pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("overview", req, || async {
         let run = param_opt_str(&req.params, "run");
         let epic = param_opt_str(&req.params, "epic");
-        if run.is_some() == epic.is_some() {
+        let id = param_opt_str(&req.params, "id");
+        if id.is_some() && (run.is_some() || epic.is_some()) {
             return Err(Failure::invalid(
-                "overview takes exactly one of params \"run\" or \"epic\"",
+                "overview takes param \"id\" or an explicit \"run\"/\"epic\", never both",
+            ));
+        }
+        if id.is_none() && run.is_some() == epic.is_some() {
+            return Err(Failure::invalid(
+                "overview takes exactly one of params \"run\", \"epic\", or \"id\"",
             ));
         }
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
@@ -356,9 +423,16 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "overview limit must be between 1 and 1000",
             ));
         }
-        match (run, epic) {
-            (Some(run), None) => run_overview(ctx, run, after, limit).await,
-            (None, Some(epic)) => epic_overview(ctx, epic, after, limit).await,
+        match (run, epic, id) {
+            (Some(run), None, None) => run_overview(ctx, run, after, limit).await,
+            (None, Some(epic), None) => epic_overview(ctx, epic, after, limit).await,
+            // A resolved id projects through the SAME call the explicit
+            // param makes, so the two answers cannot drift.
+            (None, None, Some(id)) => match resolve(ctx, id).await? {
+                Resolved::Slice(run) => run_overview(ctx, &run, after, limit).await,
+                Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit).await,
+                Resolved::Candidates(payload) => Ok(payload),
+            },
             _ => unreachable!(),
         }
     })

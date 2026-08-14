@@ -331,6 +331,8 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 .bead__id { font: 500 11px/1 var(--font-mono); }
 .bead__title { font-size: 12px; line-height: 1.4; }
 .bead__foot { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; }
+/* A candidate is a bead card the operator can pick. */
+.bead--pick { text-align: left; width: 100%; }
 
 /* ------------------------------------------------------------- utilities */
 .empty { padding: calc(var(--u) * 8) calc(var(--u) * 3); text-align: center; color: var(--color-text-tertiary); font-size: 12px; }
@@ -1647,6 +1649,51 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
   }
 
+  // ------------------------------------------------------------- resolution
+  /**
+   * The chooser an unresolvable `id` answers with: the inventory entries
+   * that could have been meant, each carrying the explicit param it would
+   * be re-asked with. A wrong guess is a menu, not a dead end.
+   */
+  function viewResolution(resolution) {
+    const candidates = arr(resolution.candidates);
+    const box = panel("Which one", resolution.reason === "ambiguous"
+      ? `${candidates.length} ids start with this one`
+      : "no run or epic goes by this id");
+    const body = box.flush();
+    if (!candidates.length) {
+      body.append(el("div", "empty", "Nothing in the ledger matches. Ask work_list for the whole inventory."));
+      return [box];
+    }
+    const grid = el("div", "beads");
+    for (const candidate of candidates) {
+      const card = el("button", "bead bead--pick");
+      card.type = "button";
+      const top = el("div", "bead__top");
+      top.append(el("span", "bead__id", candidate.id));
+      top.append(chip(candidate.kind || "unknown", candidate.kind === "epic" ? "warn" : "idle"));
+      card.append(top);
+      card.append(el("div", "bead__title", candidate.beadId || ""));
+      const foot = el("div", "bead__foot");
+      foot.append(el("span", "", candidate.state || "unknown"));
+      if (candidate.branch) foot.append(el("span", "trunc", candidate.branch));
+      card.append(foot);
+      card.addEventListener("click", () => choose(candidate));
+      grid.append(card);
+    }
+    body.append(grid);
+    return [box];
+  }
+
+  /** Re-ask about one candidate under the explicit param its kind implies. */
+  function choose(candidate) {
+    state.args = {
+      schemaVersion: 1,
+      params: candidate.kind === "epic" ? { epic: candidate.id } : { run: candidate.id },
+    };
+    refresh();
+  }
+
   // ------------------------------------------------------------------ shell
   const nodes = {
     ident: document.getElementById("ident"),
@@ -1685,6 +1732,26 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       return;
     }
     if (!data) return;
+
+    // A resolution payload has no single subject: no chips, no tabs, no
+    // seats — one chooser, and the id the caller asked about.
+    if (data.resolution) {
+      nodes.identText.textContent = data.resolution.query || "";
+      nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
+      nodes.ident.append(chip(data.resolution.reason || "unresolved", "warn"));
+      nodes.subident.textContent = "";
+      const hint = el("span", "trunc");
+      hint.append(el("b", "", "id "), document.createTextNode("names no single run or epic"));
+      nodes.subident.append(hint);
+      nodes.controls.hidden = false;
+      nodes.tabs.hidden = true;
+      nodes.view.className = "view view--enter";
+      for (const node of viewResolution(data.resolution)) nodes.view.append(node);
+      nodes.foot.append(el("span", "", `schema ${data.schema}`));
+      reportSize();
+      setTimeout(reportSize, 250);
+      return;
+    }
 
     const rows = data.kind === "epic" ? [] : packetRows(data);
     const head = headline(data);
@@ -1817,7 +1884,13 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     state.error = null;
     state.data = data;
     if (!state.args) {
-      state.args = { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
+      // A resolution has no single subject, but it does have the id the
+      // caller asked about — so Refresh re-asks the SAME question rather
+      // than no-opping against a null `state.args`. Candidates are live
+      // work: one that was ambiguous a minute ago can resolve on its own.
+      state.args = data.resolution
+        ? { schemaVersion: 1, params: { id: data.resolution.query || "" } }
+        : { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
     }
     render();
   }
@@ -1833,7 +1906,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
   async function refresh() {
     if (state.loading || !host.connected) return;
-    const args = state.args || (state.data
+    const args = state.args || (state.data?.id
       ? { schemaVersion: 1, params: state.data.kind === "epic" ? { epic: state.data.id } : { run: state.data.id } }
       : null);
     if (!args) return;

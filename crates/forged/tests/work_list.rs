@@ -7,7 +7,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::TestEnv;
+use support::{fabricate_epic, fabricate_run, TestEnv};
 
 /// Hash a file the way `claim_packet` demands the caller hash it.
 fn sha256_hex(path: &std::path::Path) -> String {
@@ -17,46 +17,6 @@ fn sha256_hex(path: &std::path::Path) -> String {
         .iter()
         .map(|b| format!("{b:02x}"))
         .collect()
-}
-
-/// Create a bare run row — what `run_start` writes for a slice.
-fn fabricate_run(env: &TestEnv, run_id: &str) {
-    let ledger = env.ledger();
-    ledger
-        .create_run(forged_ledger::NewRun {
-            run_id: forged_types::RunId::new(run_id).expect("run id"),
-            bead_id: format!("bead-{run_id}"),
-            repo: env.repos.repo.to_string_lossy().into_owned(),
-            base_ref: env.repos.base.clone(),
-            branch: format!("forged/{run_id}"),
-        })
-        .expect("create run");
-    ledger.close().expect("close");
-}
-
-/// Start an epic the way `epic_start` does: ONE `forged.epic.started` event
-/// under the epic bead id and NO run row — the combination production
-/// actually produces. A fixture that also created a run row would prove
-/// nothing about epic discovery.
-fn fabricate_epic(env: &TestEnv, epic_id: &str) {
-    let ledger = env.ledger();
-    ledger
-        .append_event(
-            Some(epic_id),
-            "forged.epic.started",
-            json!({
-                "schema": "forged.epic/1",
-                "epicId": epic_id,
-                "title": format!("Epic {epic_id}"),
-                "repo": env.repos.repo.to_string_lossy(),
-                "specPath": env.spec.to_string_lossy(),
-                "baseRef": env.repos.base,
-                "integrationBranch": format!("forged/epic-{epic_id}"),
-                "children": [],
-            }),
-        )
-        .expect("epic started event");
-    ledger.close().expect("close");
 }
 
 /// Open `count` packets on `run_id` and leave each with a live attempt.

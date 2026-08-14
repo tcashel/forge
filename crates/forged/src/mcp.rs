@@ -105,8 +105,8 @@ pub struct OverviewArgs {
     pub params: OverviewParams,
 }
 
-/// `overview` parameters. Exactly one of `run` or `epic` is required; the
-/// other two page the event tail.
+/// `overview` parameters. Exactly one of `run`, `epic`, or `id` is required;
+/// the other two page the event tail.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 pub struct OverviewParams {
@@ -116,6 +116,10 @@ pub struct OverviewParams {
     /// Project one epic and its child runs, by epic run id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epic: Option<String>,
+    /// Project whichever of the two this id names, without saying which;
+    /// an id that resolves to no single subject returns candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Return only event rows with an eventId greater than this
     /// (default 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -295,8 +299,9 @@ impl ForgedServer {
     #[tool(
         name = "overview",
         description = "Project one slice or epic with workers, evidence, usage, and events. \
-                       Exactly one of params.run or params.epic is required; use work_list to \
-                       discover ids.",
+                       Exactly one of params.run, params.epic, or params.id is required; \
+                       params.id resolves either kind and answers with candidates when it \
+                       cannot; use work_list to enumerate every id.",
         meta = overview_tool_meta()
     )]
     pub async fn overview(&self, args: Parameters<OverviewArgs>) -> CallToolResult {
