@@ -1419,6 +1419,38 @@ fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
     ]);
     assert_eq!(code, 0, "accept-risk replay: {replayed}");
     assert_eq!(replayed["reused"], json!(true));
+    let (code, exact_new_operation) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+        "--idempotency-key",
+        "risk-exact-replay-new-operation",
+    ]);
+    assert_eq!(code, 0, "exact ledger replay: {exact_new_operation}");
+    assert_eq!(exact_new_operation["reused"], json!(false));
+    let (code, competing) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "another-operator",
+        "--rationale",
+        "different acceptance evidence",
+        "--idempotency-key",
+        "risk-competing-evidence",
+    ]);
+    assert_ne!(code, 0, "competing evidence must be refused: {competing}");
+    assert_eq!(
+        competing["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "competing singleton payload is not an idempotent replay"
+    );
     let (_, status) = env.forged(&["run", "status", "--run", "bead-round-budget"]);
     assert_eq!(status["result"]["run"]["outcome"], json!("accepted-risk"));
     assert_eq!(

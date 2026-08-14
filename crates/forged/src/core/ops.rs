@@ -1001,15 +1001,11 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         req,
         None,
         move |_operation| async move {
-            let payload = json!({
-                "schemaVersion": 1,
-                "reviewRounds": review_rounds,
-                "acceptance": acceptance.clone(),
-            });
             {
                 let run_id = run_id.clone();
+                let acceptance = acceptance.clone();
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_event_kind_once(&run_id, "forged.review.risk_accepted", payload)
+                    ledger.accept_review_risk(&run_id, review_rounds, acceptance)
                 })
                 .await?;
             }

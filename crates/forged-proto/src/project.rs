@@ -11,7 +11,9 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use forged_ledger::{AttemptState, EventRow, Ledger, OperationRow, OperationState, PacketRow};
+use forged_ledger::{
+    AttemptState, EventRow, Ledger, OperationRow, OperationState, PacketRow, RunOutcome, RunRow,
+};
 use forged_types::{
     AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, HostPolicyV1,
     PacketResult, ProviderHints, ResolvedRosterV1, Stage,
@@ -130,7 +132,7 @@ pub fn project_run_with_policy(
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
     let profile_escalations = parse_profile_escalations(&events)?;
-    let accepted_risk = parse_accepted_risk(&events)?;
+    let accepted_risk = parse_accepted_risk(&run, &events)?;
     let settled_operations = settled_machine_operations(ledger, run_id, &packets)?;
     let mut active_roster_revision = None;
     let execution_package = match ledger.get_run_definition(run_id)? {
@@ -179,8 +181,17 @@ pub fn project_run_with_policy(
     })
 }
 
-fn parse_accepted_risk(events: &[EventRow]) -> Result<Option<AcceptedRisk>, ProtoError> {
-    events
+fn parse_accepted_risk(
+    run: &RunRow,
+    events: &[EventRow],
+) -> Result<Option<AcceptedRisk>, ProtoError> {
+    // Acceptance is audit history after a later terminal transition. Only
+    // the durable run outcome can make it the standing protocol terminal;
+    // otherwise a stale event could mask cancellation or supersession.
+    if run.terminal_outcome != Some(RunOutcome::AcceptedRisk) {
+        return Ok(None);
+    }
+    let acceptance = events
         .iter()
         .rev()
         .find(|event| event.kind == "forged.review.risk_accepted")
@@ -202,7 +213,13 @@ fn parse_accepted_risk(events: &[EventRow]) -> Result<Option<AcceptedRisk>, Prot
                 detail: format!("accepted-risk contract is invalid: {error}"),
             })
         })
-        .transpose()
+        .transpose()?;
+    acceptance.map(Some).ok_or_else(|| {
+        ProtoError::Projection(format!(
+            "run {:?} has accepted-risk outcome without acceptance evidence",
+            run.run_id
+        ))
+    })
 }
 
 fn parse_profile_escalations(events: &[EventRow]) -> Result<Vec<ProfileEscalation>, ProtoError> {

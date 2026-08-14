@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use forged_types::{
-    canonical_json_bytes, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1, ResolvedRosterV1,
-    EXECUTION_PACKAGE_SCHEMA_V1,
+    canonical_json_bytes, AcceptedRisk, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1,
+    ResolvedRosterV1, EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -908,6 +908,185 @@ impl Ledger {
                         "sha": delivery_sha,
                     },
                     "supersededBy": superseded_by,
+                }),
+            )?;
+            let row = get_run_tx(&tx, &run_id)?;
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    /// Atomically accept the residual findings from an exhausted review run.
+    ///
+    /// The exhaustion evidence, singleton acceptance event, and durable
+    /// `blocked -> accepted-risk` transition are one immediate transaction.
+    /// Exact replay returns the standing row. A competing payload or terminal
+    /// transition is refused, so the event stream can never disagree with the
+    /// run's outcome or reason.
+    pub fn accept_review_risk(
+        &self,
+        run_id: &str,
+        review_rounds: u8,
+        acceptance: AcceptedRisk,
+    ) -> Result<RunRow, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if review_rounds == 0 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "accepted risk requires at least one completed review round",
+                ));
+            }
+            if acceptance.accepted_by.trim().is_empty() || acceptance.rationale.trim().is_empty() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "accepted risk requires non-empty acceptedBy and rationale evidence",
+                ));
+            }
+
+            let payload = json!({
+                "schemaVersion": 1,
+                "reviewRounds": review_rounds,
+                "acceptance": acceptance,
+            });
+            let payload_json = serde_json::to_string(&payload)?;
+            let accepted_reason = format!(
+                "review risk accepted by {}: {}",
+                acceptance.accepted_by, acceptance.rationale
+            );
+            let current = get_run_tx(&tx, &run_id)?;
+
+            let standing_payloads = {
+                let mut statement = tx.prepare(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = \
+                     'forged.review.risk_accepted' ORDER BY event_id ASC LIMIT 2",
+                )?;
+                let rows = statement.query_map([&run_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if standing_payloads.len() > 1 {
+                return Err(crate::error::internal(format!(
+                    "run {run_id:?} has multiple accepted-risk singleton events"
+                )));
+            }
+            let standing_payload = standing_payloads.first();
+
+            if current.terminal_outcome == Some(RunOutcome::AcceptedRisk) {
+                if standing_payload == Some(&payload_json)
+                    && current.stop_reason.as_deref() == Some(accepted_reason.as_str())
+                    && current.delivery_pr.is_none()
+                    && current.delivery_sha.is_none()
+                    && current.superseded_by.is_none()
+                {
+                    tx.commit()?;
+                    return Ok(current);
+                }
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} already accepted risk with different evidence or reason"
+                    ),
+                ));
+            }
+            if current.state != RunState::Stopped
+                || current.terminal_outcome != Some(RunOutcome::Blocked)
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} must be stopped with outcome blocked before accepting risk"
+                    ),
+                ));
+            }
+            if standing_payload.is_some_and(|stored| stored != &payload_json) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("run {run_id:?} already has different accepted-risk evidence"),
+                ));
+            }
+
+            let terminal_payload: String = tx
+                .query_row(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = \
+                     'run.protocol-terminal' ORDER BY event_id ASC LIMIT 1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} has no persisted review-exhaustion evidence"),
+                    )
+                })?;
+            let terminal: serde_json::Value = serde_json::from_str(&terminal_payload)?;
+            let exhausted = terminal
+                .pointer("/terminal/reviewBudgetExhausted")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} did not stop for review-budget exhaustion"),
+                    )
+                })?;
+            let stored_rounds = exhausted
+                .get("reviewRounds")
+                .and_then(serde_json::Value::as_u64);
+            if stored_rounds != Some(u64::from(review_rounds)) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "accepted-risk review rounds {review_rounds} do not match persisted exhaustion evidence {stored_rounds:?}"
+                    ),
+                ));
+            }
+            let final_verdict = exhausted
+                .get("finalVerdict")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unavailable");
+            let blocked_reason = format!(
+                "review budget exhausted after {review_rounds} rounds with verdict {final_verdict}"
+            );
+            if current.stop_reason.as_deref() != Some(blocked_reason.as_str()) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} blocked reason does not match its review-exhaustion evidence"
+                    ),
+                ));
+            }
+
+            let now = now_iso();
+            tx.execute(
+                "UPDATE runs SET terminal_outcome = 'accepted-risk', stop_reason = ?1, \
+                 delivery_pr = NULL, delivery_sha = NULL, superseded_by = NULL, updated_at = ?2 \
+                 WHERE run_id = ?3 AND state = 'stopped' AND terminal_outcome = 'blocked'",
+                rusqlite::params![accepted_reason, now, run_id],
+            )?;
+            if standing_payload.is_none() {
+                append_event_tx(
+                    &tx,
+                    Some(&run_id),
+                    "forged.review.risk_accepted",
+                    &payload,
+                )?;
+            }
+            append_event_tx(
+                &tx,
+                Some(&run_id),
+                "run.settled",
+                &json!({
+                    "schemaVersion": 1,
+                    "runId": run_id,
+                    "previousOutcome": RunOutcome::Blocked.as_str(),
+                    "outcome": RunOutcome::AcceptedRisk.as_str(),
+                    "reason": accepted_reason,
+                    "delivery": {
+                        "pr": serde_json::Value::Null,
+                        "sha": serde_json::Value::Null,
+                    },
+                    "supersededBy": serde_json::Value::Null,
                 }),
             )?;
             let row = get_run_tx(&tx, &run_id)?;

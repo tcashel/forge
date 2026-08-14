@@ -11,8 +11,8 @@
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{
-    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow, RunRow,
-    RunState,
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow,
+    RunOutcome, RunRow, RunState,
 };
 use forged_types::{
     AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome,
@@ -361,10 +361,12 @@ enum LegState<'v> {
 /// `Stop(Terminal::ExternallyStopped { reason: "roster missing stage
 /// <stage>" })` — loud, inspectable, and never a panic in the orchestrator.
 pub fn advance(view: &RunView) -> NextAction {
-    if let Some(acceptance) = &view.accepted_risk {
-        return NextAction::Stop(Terminal::AcceptedRisk {
-            acceptance: acceptance.clone(),
-        });
+    if view.run.terminal_outcome == Some(RunOutcome::AcceptedRisk) {
+        if let Some(acceptance) = &view.accepted_risk {
+            return NextAction::Stop(Terminal::AcceptedRisk {
+                acceptance: acceptance.clone(),
+            });
+        }
     }
     if let Some(package) = &view.execution_package {
         return advance_adaptive(view, package);

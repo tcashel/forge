@@ -5,14 +5,15 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use forged_ledger::{
     AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
     RunOutcome, RunState, SpecFence,
 };
 use forged_types::{
-    ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
+    AcceptedRisk, ErrorCode, Finding, OperationRequest, OperationResponse, Outcome, PacketResult,
+    RunId, Severity, Stage,
 };
 use serde_json::json;
 
@@ -78,6 +79,47 @@ fn fresh(outcome: OperationOutcome) -> String {
         OperationOutcome::Fresh(ticket) => ticket.operation_id,
         other => panic!("expected Fresh, got {other:?}"),
     }
+}
+
+fn acceptance(actor: &str, rationale: &str) -> AcceptedRisk {
+    AcceptedRisk {
+        accepted_by: actor.to_owned(),
+        rationale: rationale.to_owned(),
+        findings: vec![Finding {
+            severity: Severity::High,
+            file: Some("src/lib.rs".to_owned()),
+            line: Some(17),
+            message: "known residual risk".to_owned(),
+        }],
+    }
+}
+
+fn block_after_review_exhaustion(ledger: &Ledger, run_id: &str, rounds: u8) {
+    ledger
+        .append_event_kind_once(
+            run_id,
+            "run.protocol-terminal",
+            json!({
+                "schemaVersion": 1,
+                "terminal": {
+                    "reviewBudgetExhausted": {
+                        "reviewRounds": rounds,
+                        "finalVerdict": "requestChanges",
+                    }
+                }
+            }),
+        )
+        .expect("review terminal");
+    ledger
+        .settle_run(
+            run_id,
+            RunOutcome::Blocked,
+            format!("review budget exhausted after {rounds} rounds with verdict requestChanges"),
+            None,
+            None,
+            None,
+        )
+        .expect("blocked settlement");
 }
 
 /// Shim variant 1: revoked mid-flight. The durable `revoking` marker lands
@@ -778,4 +820,244 @@ fn settlement_requires_outcome_specific_evidence() {
         .expect_err("a successor is required");
     assert_eq!(unnamed.code(), ErrorCode::InvalidRequest);
     ledger.close().expect("close");
+}
+
+#[test]
+fn accepted_risk_settlement_replays_exactly_and_compares_singleton_payload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-risk-replay");
+    block_after_review_exhaustion(&ledger, &run, 3);
+    let evidence = acceptance("lead-agent", "feature is disabled in production");
+
+    let mismatched = ledger
+        .accept_review_risk(&run, 2, evidence.clone())
+        .expect_err("caller evidence must match persisted exhaustion");
+    assert_eq!(mismatched.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger
+            .get_run(&run)
+            .expect("still blocked")
+            .terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+    assert!(ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .iter()
+        .all(|event| event.kind != "forged.review.risk_accepted"));
+
+    let settled = ledger
+        .accept_review_risk(&run, 3, evidence.clone())
+        .expect("accept risk");
+    assert_eq!(settled.terminal_outcome, Some(RunOutcome::AcceptedRisk));
+    assert_eq!(
+        settled.stop_reason.as_deref(),
+        Some("review risk accepted by lead-agent: feature is disabled in production")
+    );
+    assert_eq!(
+        ledger
+            .accept_review_risk(&run, 3, evidence.clone())
+            .expect("exact replay"),
+        settled
+    );
+
+    let competing = ledger
+        .accept_review_risk(&run, 3, acceptance("lead-agent", "a different rationale"))
+        .expect_err("competing evidence must not replay");
+    assert_eq!(competing.code(), ErrorCode::InvalidRequest);
+    let events = ledger.list_events(Some(&run), 0, 100).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.review.risk_accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "run.settled")
+            .count(),
+        2,
+        "blocked and accepted-risk each settle exactly once"
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn accepted_risk_repairs_only_an_exact_legacy_torn_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let exact_run = make_run(&ledger, "run-risk-torn-exact");
+    let conflict_run = make_run(&ledger, "run-risk-torn-conflict");
+    let evidence = acceptance("lead-agent", "known containment");
+    for run in [&exact_run, &conflict_run] {
+        block_after_review_exhaustion(&ledger, run, 2);
+    }
+    ledger
+        .append_event_kind_once(
+            &exact_run,
+            "forged.review.risk_accepted",
+            json!({
+                "schemaVersion": 1,
+                "reviewRounds": 2,
+                "acceptance": evidence,
+            }),
+        )
+        .expect("legacy exact event");
+    ledger
+        .accept_review_risk(&exact_run, 2, evidence.clone())
+        .expect("exact torn write can finish atomically");
+    assert_eq!(
+        ledger
+            .list_events(Some(&exact_run), 0, 100)
+            .expect("events")
+            .iter()
+            .filter(|event| event.kind == "forged.review.risk_accepted")
+            .count(),
+        1
+    );
+
+    ledger
+        .append_event_kind_once(
+            &conflict_run,
+            "forged.review.risk_accepted",
+            json!({
+                "schemaVersion": 1,
+                "reviewRounds": 2,
+                "acceptance": acceptance("another-operator", "different evidence"),
+            }),
+        )
+        .expect("legacy competing event");
+    let conflict = ledger
+        .accept_review_risk(&conflict_run, 2, evidence)
+        .expect_err("different singleton payload must be refused");
+    assert_eq!(conflict.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_run(&conflict_run).expect("run").terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn competing_acceptances_leave_one_matching_event_outcome_and_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Arc::new(Ledger::open(&dir.path().join("state.db")).expect("open"));
+    let run = make_run(&ledger, "run-risk-race");
+    block_after_review_exhaustion(&ledger, &run, 2);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let handles: Vec<_> = [
+        ("operator-a", "containment a"),
+        ("operator-b", "containment b"),
+    ]
+    .into_iter()
+    .map(|(actor, rationale)| {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.accept_review_risk(&run, 2, acceptance(actor, rationale))
+        })
+    })
+    .collect();
+    barrier.wait();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+    let row = ledger.get_run(&run).expect("run");
+    let event = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.kind == "forged.review.risk_accepted")
+        .expect("acceptance event");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_json).expect("payload");
+    let actor = payload
+        .pointer("/acceptance/acceptedBy")
+        .and_then(serde_json::Value::as_str)
+        .expect("actor");
+    let rationale = payload
+        .pointer("/acceptance/rationale")
+        .and_then(serde_json::Value::as_str)
+        .expect("rationale");
+    let expected_reason = format!("review risk accepted by {actor}: {rationale}");
+    assert_eq!(row.terminal_outcome, Some(RunOutcome::AcceptedRisk));
+    assert_eq!(row.stop_reason.as_deref(), Some(expected_reason.as_str()));
+    drop(ledger);
+}
+
+#[test]
+fn acceptance_and_supersede_race_has_one_self_consistent_winner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Arc::new(Ledger::open(&dir.path().join("state.db")).expect("open"));
+    let run = make_run(&ledger, "run-risk-supersede-race");
+    block_after_review_exhaustion(&ledger, &run, 2);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let accept = {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.accept_review_risk(&run, 2, acceptance("lead", "known containment"))
+        })
+    };
+    let supersede = {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.settle_run(
+                &run,
+                RunOutcome::Superseded,
+                "replaced by corrected run".to_owned(),
+                None,
+                None,
+                Some("successor-run".to_owned()),
+            )
+        })
+    };
+    barrier.wait();
+    let accepted = accept.join().expect("accept join");
+    let superseded = supersede.join().expect("supersede join");
+    assert_ne!(
+        accepted.is_ok(),
+        superseded.is_ok(),
+        "exactly one transition wins"
+    );
+
+    let row = ledger.get_run(&run).expect("run");
+    let accepted_events = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.review.risk_accepted")
+        .count();
+    match row.terminal_outcome {
+        Some(RunOutcome::AcceptedRisk) => {
+            assert!(accepted.is_ok());
+            assert_eq!(accepted_events, 1);
+            assert_eq!(
+                row.stop_reason.as_deref(),
+                Some("review risk accepted by lead: known containment")
+            );
+        }
+        Some(RunOutcome::Superseded) => {
+            assert!(superseded.is_ok());
+            assert_eq!(accepted_events, 0);
+            assert_eq!(row.superseded_by.as_deref(), Some("successor-run"));
+        }
+        other => panic!("unexpected terminal outcome: {other:?}"),
+    }
+    drop(ledger);
 }
