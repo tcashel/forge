@@ -182,6 +182,26 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
     let all_events = events(ctx, run_id, 0, None).await?;
     let event_page = events(ctx, run_id, after, Some(limit)).await?;
     let view = super::drive::project(ctx, run_id).await?;
+    let packet_ids = view
+        .packets
+        .iter()
+        .map(|packet| packet.packet_id.as_str())
+        .collect::<std::collections::BTreeSet<_>>();
+    let run_admission = {
+        let decisions = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_admission_decisions(None, None)
+        })
+        .await?;
+        decisions
+            .into_iter()
+            .filter(|decision| {
+                (decision.subject_kind == forged_types::AdmissionSubjectKind::Run
+                    && decision.subject_id == run_id)
+                    || (decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
+                        && packet_ids.contains(decision.subject_id.as_str()))
+            })
+            .collect::<Vec<_>>()
+    };
     let findings = super::drive::latest_review_findings(&view);
     let roster_revisions = roster_revisions(ctx, run_id).await?;
     Ok(json!({
@@ -200,6 +220,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
         "artifacts": packet_artifacts(ctx, &view).await?,
         "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
         "rosterRevisions": roster_revisions,
+        "admission": run_admission,
         "usage": usage,
         "events": event_page,
     }))
@@ -268,6 +289,16 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         result(super::epic::epic_status(ctx, &request(epic_id, json!({"epic": epic_id}))).await)?;
     let all_events = events(ctx, epic_id, 0, None).await?;
     let event_page = events(ctx, epic_id, after, Some(limit)).await?;
+    let epic_admission = {
+        let epic_id = epic_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.latest_admission_decisions(
+                Some(forged_types::AdmissionSubjectKind::Epic),
+                Some(&epic_id),
+            )
+        })
+        .await?
+    };
     let mut child_runs = Vec::new();
     let mut workers = Vec::new();
     let mut gates = Vec::new();
@@ -354,6 +385,7 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
         "reviews": reviews,
         "artifacts": artifacts,
         "interventions": interventions,
+        "admission": epic_admission,
         "schedulerEvents": event_payloads(&all_events, |kind| kind.starts_with("forged.epic.")),
         "usage": {
             "rows": usage_rows,
@@ -394,6 +426,10 @@ const PORTFOLIO_CAP: usize = 200;
 /// the portfolio is the level above any subject.
 async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
     let portfolio = super::ops::portfolio(ctx).await?;
+    let admission = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_admission_decisions(None, None)
+    })
+    .await?;
     let total = portfolio.entries.len();
     let attention_total = portfolio.attention.len();
     let cost_usd_known: f64 = portfolio
@@ -457,6 +493,7 @@ async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
         "attention": attention,
         "attentionTotal": attention_total,
         "queue": queue,
+        "admission": admission,
         "spend": {
             "costUsdKnown": cost_usd_known,
             "rowsMissingCost": rows_missing_cost,

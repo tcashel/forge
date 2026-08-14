@@ -798,6 +798,7 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
         None,
         {
             move |operation| async move {
+                let _submit_guard = super::handoff::acquire_run_submit(ctx, &run_id).await?;
                 let definition = {
                     let run_id = run_id.clone();
                     on_ledger(&ctx.ledger, move |ledger| {
@@ -1102,38 +1103,54 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
             };
             // The claimant is the PACKET-scoped session identity, not the
-            // run's bd lease holder — see `core::session_claimant`. The
-            // stored body carries the hints the packet was opened with.
+            // run's bd lease holder — see `core::session_claimant`.
             let view = super::drive::project(ctx, &row.run_id).await?;
+            let packet_admission = super::admission::PacketAdmission {
+                packet_id: packet_id.clone(),
+                run_id: row.run_id.clone(),
+                bead_id: view.run.bead_id.clone(),
+            };
+            let admission_guard = super::handoff::acquire_packet_submit(
+                ctx,
+                &packet_admission.packet_id,
+                &packet_admission.run_id,
+            )
+            .await?;
+            let admission = super::admission::admit_packet_facts(ctx, &packet_admission).await?;
+            if admission.decision.outcome != forged_types::AdmissionOutcome::Admitted {
+                return Err(Failure {
+                    code: ErrorCode::OperationInProgress,
+                    message: format!(
+                        "packet {packet_id} deferred by admission: {:?}",
+                        admission.decision.reason
+                    ),
+                    recoverable: true,
+                });
+            }
+            let reservation_id = admission
+                .reservation
+                .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
+                .reservation_id;
             // ONE spec read for this claim: it answers both the fence the
             // ledger compares and the bytes the seat will read.
             let spec_ref = forged_proto::packet_spec(&row);
             let resolved =
                 super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
             let fence = resolved.fence.clone();
-            let provider = if view.execution_package.is_some() {
-                super::drive::stored_packet_for_attempt(&view, &packet_id)?
-                    .provider_hints
-                    .provider
-            } else {
-                view.roster
-                    .get(&row.stage)
-                    .map(|hints| hints.provider.clone())
-                    .ok_or_else(|| {
-                        Failure::invalid(format!(
-                            "legacy roster has no provider for {:?}",
-                            row.stage
-                        ))
-                    })?
-            };
+            let provider = admission
+                .packet_provider_hints
+                .as_ref()
+                .map(|hints| hints.provider.clone())
+                .ok_or_else(|| Failure::internal("packet admission omitted provider facts"))?;
             let claimant = session_claimant(&packet_id, &provider);
             let claimed = {
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| {
-                    l.claim_packet(&packet_id, &claimant, &fence)
+                    l.claim_packet_with_admission(&packet_id, &claimant, &fence, &reservation_id)
                 })
                 .await?
             };
+            drop(admission_guard);
             // The claim is what fenced these bytes, so the body is written
             // only once it has succeeded. An external seat on the
             // `packet claim` -> `packet complete` path never enters

@@ -2,6 +2,7 @@
 //! against: operation envelopes, error codes, canonical JSON, identifier
 //! newtypes, and the work-packet schema.
 
+pub mod admission;
 pub mod canonical;
 pub mod contract;
 pub mod envelope;
@@ -9,6 +10,12 @@ pub mod error;
 pub mod ids;
 pub mod packet;
 
+pub use admission::{
+    AdmissionCandidateV1, AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1,
+    AdmissionOutcome, AdmissionRateLimitV1, AdmissionReason, AdmissionResourceClass,
+    AdmissionSpendV1, AdmissionSubjectKind, ADMISSION_DECISION_SCHEMA_V1,
+    ADMISSION_INPUTS_SCHEMA_V1,
+};
 pub use canonical::{canonical_json_bytes, parse_canonical, request_sha256, CanonicalError};
 pub use contract::{
     Capability, DefinitionError, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1,

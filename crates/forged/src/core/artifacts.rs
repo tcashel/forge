@@ -1711,6 +1711,7 @@ mod tests {
             host_policy: crate::config::HostPolicy::Off,
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
+            admission: crate::config::AdmissionPolicy::default(),
         }
     }
 

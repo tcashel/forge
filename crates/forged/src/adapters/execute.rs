@@ -14,7 +14,9 @@ use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
 };
-use forged_types::{Deliverable, OperationRequest, Outcome, Stage, StageContract, WorkPacket};
+use forged_types::{
+    Deliverable, ErrorCode, OperationRequest, Outcome, Stage, StageContract, WorkPacket,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -413,6 +415,36 @@ pub async fn execute_packet(
     packet: &WorkPacket,
 ) -> Result<PacketOutcome, Failure> {
     let packet_id = packet.packet_id.clone();
+    // Keep reservation creation and attempt ownership transfer under one
+    // cross-process singleton. Without this, a concurrent claimant could
+    // mistake our newly committed ownerless reservation for crash debris.
+    let admission_guard =
+        crate::core::handoff::acquire_packet_submit(ctx, &packet.packet_id, &packet.run_id).await?;
+
+    // Admission precedes every provider-facing read or spawn. A deferred
+    // packet has no attempt row and therefore cannot masquerade as active.
+    let admission = crate::core::admission::admit_packet(ctx, packet).await?;
+    if admission.decision.outcome != forged_types::AdmissionOutcome::Admitted {
+        return Err(Failure {
+            code: ErrorCode::OperationInProgress,
+            message: format!(
+                "packet {packet_id} deferred by admission: {:?}",
+                admission.decision.reason
+            ),
+            recoverable: true,
+        });
+    }
+    let admitted_hints = admission
+        .packet_provider_hints
+        .clone()
+        .ok_or_else(|| Failure::internal("packet admission omitted provider launch facts"))?;
+    let reservation_id = admission
+        .reservation
+        .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
+        .reservation_id;
+    let mut admitted_packet = packet.clone();
+    admitted_packet.provider_hints = admitted_hints;
+    let packet = &admitted_packet;
 
     // ONE spec read for this claim: it answers both the fence the ledger
     // compares and the bytes the seat will read, so the seat can never work
@@ -447,10 +479,11 @@ pub async fn execute_packet(
         let packet_id = packet_id.clone();
         let claimant = session_claimant(&packet_id, &packet.provider_hints.provider);
         on_ledger(&ctx.ledger, move |l| {
-            l.claim_packet(&packet_id, &claimant, &fence)
+            l.claim_packet_with_admission(&packet_id, &claimant, &fence, &reservation_id)
         })
         .await?
     };
+    drop(admission_guard);
     run_attempt(
         ctx,
         ports,
@@ -1011,6 +1044,19 @@ async fn run_attempt(
     // `adapters::ports`: an attempt whose identity never materialized past
     // the grace window is failed as a transport failure, never an
     // unavailable port.
+    // Serialize the final authorization check and spawn publication against
+    // pause/stop/settlement. A control transition that wins this fence makes
+    // the reservation stale; one that follows waits until session identity
+    // is durable and then uses the existing confirmed-death path.
+    let submit_guard =
+        crate::core::handoff::acquire_packet_submit(ctx, &packet_id, &run_id).await?;
+    {
+        let claim_token = claim_token.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.assert_admitted_attempt_live(&claim_token)
+        })
+        .await?;
+    }
     failpoint::hit("provider.spawn.before");
     let spawned = host.spawn(&packet.worktree, &shell_line, &env).await;
     failpoint::hit("provider.spawn.after");
@@ -1044,6 +1090,7 @@ async fn run_attempt(
         },
     )
     .await?;
+    drop(submit_guard);
     crate::core::sessions::record_interventions_delivered(
         ctx,
         &run_id,
@@ -1572,16 +1619,24 @@ mod settle_tests {
         }
     }
 
-    /// The one bd call this path makes is the lease-holder READ. A stub
-    /// answering an empty envelope keeps the test off the operator's pinned
-    /// bd, and the run never reaches a bd WRITE — those take a lock under
-    /// the machine's real anvil home.
-    fn write_bd_stub(path: &Path) {
-        std::fs::write(
-            path,
-            "#!/bin/sh\nprintf '{\"schema_version\":1,\"data\":[]}\\n'\n",
-        )
-        .expect("bd stub");
+    /// The one bd call this path makes is admission's exact-id READ. A stub
+    /// answering the run's native scheduling fields keeps the test off the
+    /// operator's pinned bd, and the run never reaches a bd WRITE — those
+    /// take a lock under the machine's real anvil home.
+    fn write_bd_stub(path: &Path, repository: &Path) {
+        let response = json!({
+            "schema_version": 1,
+            "data": [{
+                "id": RUN_ID,
+                "title": "settlement test",
+                "status": "open",
+                "priority": 2,
+                "revision": 1,
+                "metadata": {"repository": repository.to_string_lossy()},
+            }],
+        });
+        let response = response.to_string().replace('\'', "'\"'\"'");
+        std::fs::write(path, format!("#!/bin/sh\nprintf '%s\\n' '{response}'\n")).expect("bd stub");
         std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
             .expect("bd stub mode");
     }
@@ -1672,6 +1727,7 @@ mod settle_tests {
             host_policy: HostPolicy::Required,
             herdr_sock: Some(socket.to_path_buf()),
             pricing: crate::pricing::default_rate_card(),
+            admission: crate::config::AdmissionPolicy::default(),
         }
     }
 
@@ -1680,7 +1736,7 @@ mod settle_tests {
         let root = tempfile::tempdir().expect("tempdir");
         let socket = root.path().join("herdr.sock");
         let seen = start_refusing_herdr(&socket);
-        write_bd_stub(&root.path().join("bd"));
+        write_bd_stub(&root.path().join("bd"), root.path());
         std::fs::create_dir_all(root.path().join("beads")).expect("beads dir");
 
         let ledger = Ledger::open(&root.path().join("state.db")).expect("open ledger");
@@ -1752,11 +1808,21 @@ mod settle_tests {
             })
             .expect("open packet");
         assert_eq!(packet_id, packet.packet_id);
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Run, RUN_ID, 1)
+            .expect("authorize run");
+        let reservation_id = crate::core::admission::admit_packet(&ctx, &packet)
+            .await
+            .expect("admit packet")
+            .reservation
+            .expect("admission reservation")
+            .reservation_id;
         let claimed = ledger
-            .claim_packet(
+            .claim_packet_with_admission(
                 &packet_id,
                 &session_claimant(&packet_id, "claude"),
                 &forged_ledger::SpecFence::Sha256(spec_sha.clone()),
+                &reservation_id,
             )
             .expect("claim packet");
 

@@ -79,7 +79,15 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
             spec_path: env.spec.to_string_lossy().into_owned(),
             spec_sha256: sha.clone(),
             spec_revision: None,
-            body_json: json!({"fabricated": true}).to_string(),
+            body_json: json!({
+                "fabricated": true,
+                "providerHints": {
+                    "provider": "claude",
+                    "model": "opus",
+                    "sandbox": "workspaceWrite",
+                },
+            })
+            .to_string(),
         })
         .expect("open packet");
     let claimed = ledger
@@ -98,6 +106,9 @@ fn fabricate_resumable(env: &TestEnv, run_id: &str) {
             "transport: session vanished",
         )
         .expect("fail packet");
+    ledger
+        .authorize_desired_work(forged_ledger::DesiredSubjectKind::Run, run_id, 0)
+        .expect("authorize resumable test run");
     ledger.close().expect("close");
 }
 
@@ -429,6 +440,7 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-composed");
 
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-composed"]);
     assert_eq!(code, 0, "run drive: {driven}");
@@ -483,6 +495,7 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-resume");
 
     // Advance to an open packet, then leave the shape a crashed driver
     // leaves: one transport-failed attempt, no live attempt.
@@ -594,6 +607,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-repin");
 
     // Advance to an open packet, then leave the shape a crashed driver
     // leaves: one transport-failed attempt, no live attempt.

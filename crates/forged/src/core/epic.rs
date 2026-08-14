@@ -1449,6 +1449,21 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
             super::drive::run_advance(ctx, &request).await
         };
         if !result.ok {
+            // A concurrent epic pause may win admission's pre-spawn fence
+            // while the child driver is between packets. That is a clean
+            // control stop, not child failure requiring new operator input.
+            // Re-project after the failed child action so the winning
+            // durable transition determines the epic result.
+            let current = project(ctx, epic).await?;
+            if let Some(paused) = current.paused {
+                return Ok(Step::Stop(json!({"paused": paused})));
+            }
+            if let Some(input) = current.input {
+                return Ok(Step::Stop(json!({"inputRequired": input})));
+            }
+            if let Some(pr) = current.pr {
+                return Ok(Step::Stop(json!({"finalPr": pr})));
+            }
             let detail = result
                 .error
                 .as_ref()

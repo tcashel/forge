@@ -8,10 +8,10 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
-    DesiredSubjectKind, DesiredWorkRow, RunState,
+    AdmissionReservationRow, DesiredReconcileOutcome, DesiredReconcileUpdate,
+    DesiredRestartReservation, DesiredState, DesiredSubjectKind, DesiredWorkRow, RunState,
 };
-use forged_types::{OperationRequest, OperationResponse};
+use forged_types::{AdmissionOutcome, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
 use crate::config::{now_iso, HostPolicy};
@@ -265,8 +265,15 @@ async fn reconcile_claimed(
     ctx: &Ctx,
     row: DesiredWorkRow,
     token: String,
+    admission_reservation: AdmissionReservationRow,
 ) -> Result<Value, Failure> {
     if let Some(stop) = settle_landed_reality(ctx, &row, &token).await? {
+        let reservation_id = admission_reservation.reservation_id;
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.release_admission_reservation(&reservation_id, Some("subject settled"))?;
+            Ok(())
+        })
+        .await?;
         return Ok(stop);
     }
     crate::failpoint::hit("supervisor.stop-check.after");
@@ -297,6 +304,53 @@ async fn reconcile_claimed(
         }));
     }
 
+    // A newly committed reservation is deliberately ownerless until this
+    // tick transfers it to a concrete controller generation. An older owned
+    // reservation is recovery authority only for its exact durable identity;
+    // malformed or mismatched ownership is never permission to spawn.
+    let recovery_generation = match (
+        admission_reservation.owner_kind.as_deref(),
+        admission_reservation.owner_id.as_deref(),
+    ) {
+        (None, None) => None,
+        (Some("controller"), Some(owner)) => {
+            let Some((owner_scope, owner_id, generation)) =
+                handoff::admission_controller_owner(owner)
+            else {
+                return finish_attention(
+                    ctx,
+                    &row,
+                    &token,
+                    "admission reservation has malformed controller identity".to_owned(),
+                )
+                .await;
+            };
+            if owner_scope != subject_scope.noun()
+                || owner_id != row.subject_id
+                || generation != row.controller_generation
+            {
+                return finish_attention(
+                    ctx,
+                    &row,
+                    &token,
+                    "admission reservation does not match the desired controller generation"
+                        .to_owned(),
+                )
+                .await;
+            }
+            Some(generation)
+        }
+        _ => {
+            return finish_attention(
+                ctx,
+                &row,
+                &token,
+                "admission reservation has an unverifiable effect owner".to_owned(),
+            )
+            .await;
+        }
+    };
+
     let mut record = handoff::latest_record(ctx, &row.subject_id).await?;
     if let Some(value) = record.as_ref() {
         crate::runtime::complete_recovered_controller_admission(
@@ -306,12 +360,13 @@ async fn reconcile_claimed(
         )?;
     }
     let recorded_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
-    if row.controller_generation > recorded_generation {
+    let recovery_target = recovery_generation.unwrap_or(row.controller_generation);
+    if recovery_target > recorded_generation {
         record = match handoff::recover_reserved_record(
             ctx,
             &row.subject_id,
             subject_scope,
-            row.controller_generation,
+            recovery_target,
         )
         .await
         {
@@ -329,8 +384,20 @@ async fn reconcile_claimed(
 
     if handoff::is_active(&status) {
         let generation = handoff::generation(&status);
+        if recovery_generation.is_some_and(|expected| expected != generation) {
+            return finish_attention(
+                ctx,
+                &row,
+                &token,
+                format!(
+                    "owned admission generation {} does not match live controller generation {generation}",
+                    recovery_generation.unwrap_or_default()
+                ),
+            )
+            .await;
+        }
         let progress = last_progress(ctx, &row.subject_id).await?;
-        return finish_action(
+        let report = finish_action(
             ctx,
             &row,
             &token,
@@ -346,7 +413,15 @@ async fn reconcile_claimed(
                 attention: false,
             },
         )
-        .await;
+        .await?;
+        let reservation_id = admission_reservation.reservation_id;
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger
+                .release_admission_reservation(&reservation_id, Some("live controller adopted"))?;
+            Ok(())
+        })
+        .await?;
+        return Ok(report);
     }
     if handoff::is_unknown(&status) {
         return finish_attention(
@@ -379,14 +454,49 @@ async fn reconcile_claimed(
     handoff::recover_abandoned(ctx, &row.subject_id, subject_scope, observed_generation).await?;
     crate::failpoint::hit("supervisor.recover.after");
 
+    if recovery_generation.is_some() {
+        // The exact owned effect is confirmed absent. Its old decision is no
+        // longer launch authority: release capacity and make the subject due
+        // so the next tick re-reads current Beads and policy before spawning.
+        let reservation_id = admission_reservation.reservation_id;
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.release_admission_reservation(
+                &reservation_id,
+                Some("owned controller confirmed absent; fresh admission required"),
+            )?;
+            Ok(())
+        })
+        .await?;
+        return finish_action(
+            ctx,
+            &row,
+            &token,
+            "re-admit",
+            DesiredReconcileUpdate {
+                desired_state: None,
+                outcome: DesiredReconcileOutcome::Backoff,
+                controller_generation: None,
+                predecessor_generation: Some(observed_generation),
+                next_wake_at: Some(now_iso()),
+                last_progress_at: None,
+                last_error: Some(
+                    "controller absence confirmed; current admission inputs must be re-evaluated"
+                        .to_owned(),
+                ),
+                attention: false,
+            },
+        )
+        .await;
+    }
+
     let kind = row.subject_kind;
     let id = row.subject_id.clone();
     let reserve_token = token.clone();
-    let reservation = on_ledger(&ctx.ledger, move |ledger| {
+    let restart_reservation = on_ledger(&ctx.ledger, move |ledger| {
         ledger.reserve_desired_restart(kind, &id, &reserve_token, observed_generation)
     })
     .await?;
-    let reserved = match reservation {
+    let reserved = match restart_reservation {
         DesiredRestartReservation::Exhausted(exhausted) => {
             return Ok(json!({
                 "action": "exhausted",
@@ -405,6 +515,17 @@ async fn reconcile_claimed(
     };
     let generation = reserved.controller_generation;
     let predecessor = reserved.predecessor_generation;
+    let reservation_id = admission_reservation.reservation_id.clone();
+    let owner_id = format!(
+        "{}:{}:{generation}",
+        subject_scope.noun(),
+        reserved.subject_id
+    );
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)?;
+        Ok(())
+    })
+    .await?;
     match handoff::spawn(
         ctx,
         &reserved.subject_id,
@@ -435,6 +556,15 @@ async fn reconcile_claimed(
             )
             .await?;
             crate::failpoint::hit("supervisor.reconcile.after");
+            let reservation_id = admission_reservation.reservation_id;
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.release_admission_reservation(
+                    &reservation_id,
+                    Some("controller identity persisted"),
+                )?;
+                Ok(())
+            })
+            .await?;
             Ok(json!({
                 "action": "restarted",
                 "predecessorGeneration": predecessor,
@@ -485,6 +615,13 @@ async fn finish_spawn_failure(
 
 async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     let started_at = now_iso();
+    let orphaned = {
+        let now = started_at.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.mark_expired_admission_orphaned(&now)
+        })
+        .await?
+    };
     let due = {
         let now = started_at.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -493,7 +630,7 @@ async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         .await?
     };
     let tick_id = uuid::Uuid::now_v7().to_string();
-    let mut subjects = Vec::new();
+    let mut claimed_rows = Vec::new();
     let mut contended = 0u64;
     for candidate in due {
         let token = format!("supervise:{tick_id}:{}", uuid::Uuid::now_v7());
@@ -506,24 +643,114 @@ async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
             ledger.claim_desired_work(kind, &id, &claim_token, &now, &lease)
         })
         .await?;
-        let Some(claimed) = claimed else {
-            contended = contended.saturating_add(1);
+        match claimed {
+            Some(row) => claimed_rows.push((row, token)),
+            None => contended = contended.saturating_add(1),
+        }
+    }
+    let admissions = super::admission::admit(
+        ctx,
+        claimed_rows
+            .iter()
+            .map(|(row, _)| (row.subject_kind, row.subject_id.clone()))
+            .collect(),
+        None,
+    )
+    .await?;
+    let admissions = admissions
+        .into_iter()
+        .map(|result| {
+            (
+                (
+                    result.decision.subject_kind,
+                    result.decision.subject_id.clone(),
+                ),
+                result,
+            )
+        })
+        .collect::<std::collections::BTreeMap<_, _>>();
+    let mut subjects = Vec::new();
+    for (candidate, token) in claimed_rows {
+        let admission_kind = match candidate.subject_kind {
+            DesiredSubjectKind::Run => forged_types::AdmissionSubjectKind::Run,
+            DesiredSubjectKind::Epic => forged_types::AdmissionSubjectKind::Epic,
+        };
+        let Some(admission) = admissions.get(&(admission_kind, candidate.subject_id.clone()))
+        else {
+            let reconciled = finish(
+                ctx,
+                &candidate,
+                &token,
+                DesiredReconcileUpdate {
+                    desired_state: None,
+                    outcome: DesiredReconcileOutcome::Attention,
+                    controller_generation: None,
+                    predecessor_generation: candidate.predecessor_generation,
+                    next_wake_at: None,
+                    last_progress_at: None,
+                    last_error: Some("no admission candidate was projected".to_owned()),
+                    attention: true,
+                },
+            )
+            .await?;
+            subjects.push(json!({
+                "action": "ineligible",
+                "subject": {"kind": candidate.subject_kind.as_str(), "id": candidate.subject_id},
+                "detail": "no admission candidate was projected",
+                "desiredWork": row_json(&reconciled),
+            }));
             continue;
         };
-        match reconcile_claimed(ctx, claimed.clone(), token.clone()).await {
+        if admission.decision.outcome != AdmissionOutcome::Admitted {
+            let outcome = if admission.decision.outcome == AdmissionOutcome::Deferred {
+                DesiredReconcileOutcome::Backoff
+            } else {
+                DesiredReconcileOutcome::Attention
+            };
+            let next_wake_at = admission.decision.next_eligible_wake_at.clone();
+            let reason = format!("admission: {:?}", admission.decision.reason);
+            let reconciled = finish(
+                ctx,
+                &candidate,
+                &token,
+                DesiredReconcileUpdate {
+                    desired_state: None,
+                    outcome,
+                    controller_generation: None,
+                    predecessor_generation: candidate.predecessor_generation,
+                    next_wake_at,
+                    last_progress_at: None,
+                    last_error: Some(reason),
+                    attention: admission.decision.outcome == AdmissionOutcome::Ineligible,
+                },
+            )
+            .await?;
+            subjects.push(json!({
+                "action": if admission.decision.outcome == AdmissionOutcome::Deferred { "deferred" } else { "ineligible" },
+                "admission": admission.decision,
+                "desiredWork": row_json(&reconciled),
+            }));
+            continue;
+        }
+        let Some(reservation) = admission.reservation.clone() else {
+            return Err(Failure::internal(
+                "admitted decision has no capacity reservation",
+            ));
+        };
+        match reconcile_claimed(ctx, candidate.clone(), token.clone(), reservation).await {
             Ok(report) => subjects.push(report),
             Err(error) => {
                 // Ordinary failures back off and release the claim. A crash
                 // bypasses this code, leaving the lease deadline as recovery
                 // evidence for the next process.
-                match finish_retryable(ctx, &claimed, &token, error.to_string()).await {
+                match finish_retryable(ctx, &candidate, &token, error.to_string()).await {
                     Ok(report) => subjects.push(report),
                     Err(finish_error) => subjects.push(json!({
                         "action": "claim-retained",
-                        "subject": {"kind": claimed.subject_kind.as_str(), "id": claimed.subject_id},
+                        "subject": {"kind": candidate.subject_kind.as_str(), "id": candidate.subject_id},
                         "error": error.to_string(),
                         "finishError": finish_error.to_string(),
-                        "leaseUntil": claimed.reconcile_lease_until,
+                        "leaseUntil": candidate.reconcile_lease_until,
                     })),
                 }
             }
@@ -541,6 +768,7 @@ async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "finishedAt": now_iso(),
         "considered": subjects.len() + usize::try_from(contended).unwrap_or(usize::MAX),
         "contended": contended,
+        "orphanedReservations": orphaned.iter().map(|row| &row.reservation_id).collect::<Vec<_>>(),
         "subjects": subjects,
         "nextWakeAt": next_wake_at,
     }))

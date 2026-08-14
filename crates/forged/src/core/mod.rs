@@ -4,11 +4,12 @@
 //! that is what makes the CLI/MCP parity criterion achievable rather than a
 //! coincidence.
 
+pub(crate) mod admission;
 pub(crate) mod artifacts;
 mod claimnext;
 mod drive;
 mod epic;
-mod handoff;
+pub(crate) mod handoff;
 mod observe;
 mod ops;
 pub(crate) mod sessions;
@@ -478,6 +479,8 @@ pub(crate) struct DesiredAuthorization {
     pub(crate) kind: DesiredSubjectKind,
     pub(crate) id: String,
     pub(crate) generation: u32,
+    pub(crate) queued_until: Option<String>,
+    pub(crate) admission_reason: Option<String>,
 }
 
 impl OnEffectError {
@@ -695,12 +698,14 @@ where
                 let resp = resp.clone();
                 let authorization = desired_authorization.clone();
                 on_ledger(&ctx.ledger, move |l| match authorization {
-                    Some(authorization) => l.complete_operation_authorizing_desired(
+                    Some(authorization) => l.complete_operation_authorizing_desired_with_admission(
                         &operation_id,
                         &resp,
                         authorization.kind,
                         &authorization.id,
                         authorization.generation,
+                        authorization.queued_until,
+                        authorization.admission_reason,
                     ),
                     None => l.complete_operation(&operation_id, &resp),
                 })

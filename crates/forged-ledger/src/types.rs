@@ -7,12 +7,16 @@
 
 use std::collections::HashMap;
 
-use forged_types::{ErrorCode, ExecutionPackageV1, ProviderHints, RunId, Stage};
+use forged_types::{
+    AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionRateLimitV1,
+    AdmissionResourceClass, AdmissionSpendV1, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
+    ProviderHints, RunId, Stage,
+};
 
 use crate::error::{refused, LedgerError};
 
 /// The canonical kind of one operator-authorized supervisor subject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DesiredSubjectKind {
     /// A slice run driven by `run drive`.
     Run,
@@ -189,6 +193,128 @@ pub struct DesiredReconcileUpdate {
     pub last_error: Option<String>,
     /// Whether this outcome is an explicit operator-attention condition.
     pub attention: bool,
+}
+
+/// Closed lifecycle of one durable capacity reservation. Expiry moves a row
+/// to `Orphaned`; it never frees capacity by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionReservationState {
+    Reserved,
+    Active,
+    Orphaned,
+    Released,
+}
+
+impl AdmissionReservationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Active => "active",
+            Self::Orphaned => "orphaned",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for AdmissionReservationState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "active" => Ok(Self::Active),
+            "orphaned" => Ok(Self::Orphaned),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown admission reservation state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionReservationRow {
+    pub reservation_id: String,
+    pub decision_id: String,
+    pub work_key: String,
+    pub subject_kind: AdmissionSubjectKind,
+    pub subject_id: String,
+    pub control_revision: u64,
+    pub repository: String,
+    pub provider: String,
+    pub model: String,
+    pub resource_class: AdmissionResourceClass,
+    pub state: AdmissionReservationState,
+    pub owner_kind: Option<String>,
+    pub owner_id: Option<String>,
+    pub recovery_deadline: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub released_at: Option<String>,
+}
+
+/// Durable fields needed to project one scheduler candidate. The packet and
+/// package JSON are frozen ledger bytes, not filesystem reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionDurableCandidate {
+    pub subject_kind: DesiredSubjectKind,
+    pub subject_id: String,
+    pub desired_state: DesiredState,
+    pub control_revision: u64,
+    pub next_wake_at: Option<String>,
+    pub authorized_at: String,
+    pub exhausted: bool,
+    pub repository: Option<String>,
+    pub bead_id: Option<String>,
+    pub packet_id: Option<String>,
+    pub packet_body_json: Option<String>,
+    pub package_json: Option<String>,
+    pub epic_started_json: Option<String>,
+    pub epic_package_json: Option<String>,
+    /// When an epic controller launches a child packet, the child's run is
+    /// authorized by the parent epic's desired-work epoch rather than by an
+    /// independently supervised run controller.
+    pub delegated_run_id: Option<String>,
+    pub delegated_repository: Option<String>,
+}
+
+/// Exact durable launch facts for one packet requested by an admission
+/// snapshot. Provider fallback is already resolved against the active roster
+/// revision and terminal attempt history inside the snapshot transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionPacketFacts {
+    pub packet_id: String,
+    pub run_id: String,
+    pub bead_id: String,
+    pub repository: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+    pub resource_class: AdmissionResourceClass,
+}
+
+/// One transaction-consistent ledger read for the admission projector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionLedgerSnapshot {
+    pub as_of: String,
+    pub ledger_revision: String,
+    pub candidates: Vec<AdmissionDurableCandidate>,
+    pub packet_facts: Vec<AdmissionPacketFacts>,
+    pub capacity: AdmissionCapacityV1,
+    pub spend: Vec<AdmissionSpendV1>,
+    pub latest_rate_limits: Vec<AdmissionRateLimitV1>,
+    pub reservations: Vec<AdmissionReservationRow>,
+    pub reservation_decisions: Vec<AdmissionDecisionV1>,
+}
+
+/// Atomic batch write requested after pure policy evaluation.
+#[derive(Debug, Clone)]
+pub struct AdmissionBatchWrite {
+    pub inputs: AdmissionInputsV1,
+    pub decisions: Vec<AdmissionDecisionV1>,
+    pub recovery_deadline: String,
 }
 
 /// A run's lifecycle state (`runs.state`).

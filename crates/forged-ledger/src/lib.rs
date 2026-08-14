@@ -16,6 +16,7 @@
 //! and no transaction can ever span an `.await` by construction. Callers in
 //! async contexts wrap calls in `spawn_blocking` at their own layer.
 
+mod admission;
 mod artifacts;
 mod attempts;
 mod desired;
@@ -36,11 +37,12 @@ pub use error::LedgerError;
 pub use inventory::InventorySnapshot;
 pub use ledger::{default_db_path, Ledger};
 pub use types::{
-    AttemptArtifactCompactionRow, AttemptArtifactRow, AttemptRow, AttemptState, ClaimedAttempt,
-    DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation, DesiredState,
-    DesiredSubjectKind, DesiredWorkRow, EffectClass, EventRow, MergeSlotRow, NewAttemptArtifact,
-    NewPacket, NewRun, NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState,
-    OperationTicket, PacketRow, Pragmas, RevokeScope, RosterRevisionBatch, RosterRevisionRow,
-    RunDefinitionRow, RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence,
-    UsageRecord, UsageTotals,
+    AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
+    AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
+    AttemptArtifactRow, AttemptRow, AttemptState, ClaimedAttempt, DesiredReconcileOutcome,
+    DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
+    DesiredWorkRow, EffectClass, EventRow, MergeSlotRow, NewAttemptArtifact, NewPacket, NewRun,
+    NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState, OperationTicket,
+    PacketRow, Pragmas, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
+    RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };

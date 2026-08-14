@@ -50,6 +50,10 @@ fn start_run(env: &TestEnv, bead: &str) {
 
 /// Spawn `run drive` as a real child, optionally armed with a failpoint.
 fn spawn_drive(env: &TestEnv, run: &str, failpoint: Option<(&str, &str, &Path)>) -> Child {
+    // These schedules intentionally exercise the controller body directly.
+    // Establish the operator authorization that production obtains through
+    // `run submit`; ready-but-unsubmitted work must otherwise stay inert.
+    env.authorize_run(run);
     let mut cmd = env.forged_cmd(&["run", "drive", "--run", run]);
     if let Some((site, mode, dir)) = failpoint {
         cmd.env("FORGED_FAILPOINT", site)
@@ -118,6 +122,7 @@ fn start_epic(env: &TestEnv, epic: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic(epic);
 }
 
 fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -> Child {
@@ -1403,6 +1408,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
     let env = TestEnv::new("km7");
     env.write_config(Some("codex"));
     start_run(&env, "bead-k7");
+    env.authorize_run("bead-k7");
     env.set_scenario("fix", "rate-limit", 1);
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k7"]);
     assert_eq!(code, 0, "drive: {driven}");
@@ -1457,6 +1463,7 @@ fn a_crashed_reconcile_never_wedges_the_next_one() {
     let env = TestEnv::new("km8");
     env.write_config(None);
     start_run(&env, "bead-k8");
+    env.authorize_run("bead-k8");
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k8"]);
     assert_eq!(code, 0, "drive: {driven}");
 
@@ -1576,6 +1583,7 @@ fn start_bead_run(env: &TestEnv, bead: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run(bead);
 }
 
 /// Advance until the run's first packet row exists and no further.
@@ -1693,6 +1701,7 @@ fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: 
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run(bead);
 }
 
 #[test]
@@ -1814,6 +1823,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-k9c");
 
     let packet = advance_to_open_packet(&env, "bead-k9c");
     let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-k9c"]);

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, OperationState, SlotOutcome};
-use forged_types::{ErrorCode, OperationRequest, OperationResponse};
+use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
 use crate::config::{now_iso, HostPolicy};
@@ -168,7 +168,13 @@ fn submit_holder_identity(holder: &str) -> Option<(i32, Option<u64>)> {
     Some((pid, identity))
 }
 
-pub(super) struct SubmitGuard {
+pub(super) fn admission_controller_owner(owner: &str) -> Option<(&str, &str, u32)> {
+    let (prefix, generation) = owner.rsplit_once(':')?;
+    let (scope, id) = prefix.split_once(':')?;
+    Some((scope, id, generation.parse().ok()?))
+}
+
+pub(crate) struct SubmitGuard {
     ledger: Ledger,
     slot: String,
     holder: String,
@@ -258,8 +264,44 @@ pub(super) async fn acquire_submit(
     }
 }
 
-pub(super) async fn acquire_run_submit(ctx: &Ctx, id: &str) -> Result<SubmitGuard, Failure> {
+pub(crate) async fn acquire_run_submit(ctx: &Ctx, id: &str) -> Result<SubmitGuard, Failure> {
     acquire_submit(ctx, id, Scope::Run).await
+}
+
+/// Serialize packet reservation/claim/spawn against both its concrete run
+/// and, for an epic child, the parent desired-work controller. The parent
+/// fence is acquired first everywhere, so an epic submit or pause that wins
+/// cannot be bypassed by a child racing on a different run-scoped slot.
+pub(crate) struct PacketSubmitGuard {
+    _control: SubmitGuard,
+    _run: Option<SubmitGuard>,
+}
+
+pub(crate) async fn acquire_packet_submit(
+    ctx: &Ctx,
+    packet_id: &str,
+    run_id: &str,
+) -> Result<PacketSubmitGuard, Failure> {
+    let packet_id = packet_id.to_owned();
+    let subject = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.packet_authorization_subject(&packet_id)
+    })
+    .await?
+    .unwrap_or((DesiredSubjectKind::Run, run_id.to_owned()));
+    let scope = match subject.0 {
+        DesiredSubjectKind::Run => Scope::Run,
+        DesiredSubjectKind::Epic => Scope::Epic,
+    };
+    let control = acquire_submit(ctx, &subject.1, scope).await?;
+    let run = if subject.0 == DesiredSubjectKind::Epic {
+        Some(acquire_submit(ctx, run_id, Scope::Run).await?)
+    } else {
+        None
+    };
+    Ok(PacketSubmitGuard {
+        _control: control,
+        _run: run,
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -1235,6 +1277,54 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         .await
         {
             Ok(Some(row)) if row.state == OperationState::Terminal => {
+                let request_hash = match forged_types::request_sha256(req) {
+                    Ok(hash) => hash,
+                    Err(error) => {
+                        return err_response(
+                            &key,
+                            &Failure::invalid(format!("params cannot be canonicalized: {error}")),
+                        )
+                    }
+                };
+                if request_hash != row.request_sha256 {
+                    return err_response(
+                        &key,
+                        &Failure::refused(
+                            ErrorCode::IdempotencyConflict,
+                            format!(
+                                "operation {:?} key {:?} was stored with a different request",
+                                scope.operation(),
+                                key
+                            ),
+                        ),
+                    );
+                }
+                let Some(stored) = row.response_json else {
+                    return err_response(
+                        &key,
+                        &Failure::internal("terminal submit operation has no response"),
+                    );
+                };
+                let mut response = match serde_json::from_str::<OperationResponse>(&stored) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        return err_response(
+                            &key,
+                            &Failure::internal(format!(
+                                "stored submit response is malformed: {error}"
+                            )),
+                        )
+                    }
+                };
+                let queued_without_controller = response.ok
+                    && response.result.as_ref().is_some_and(|result| {
+                        result.get("queued").and_then(Value::as_bool) == Some(true)
+                            && result.get("controller").is_none_or(Value::is_null)
+                    });
+                if queued_without_controller {
+                    response.reused = true;
+                    return response;
+                }
                 return err_response(
                     &key,
                     &Failure::refused(
@@ -1269,7 +1359,172 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             Some(i64::from(next_generation)),
         ),
     );
-    fenced_authorizing_desired(
+    let mut fresh_generation = next_generation;
+    let (reservation_id, spawn_generation, recovered_controller) = loop {
+        let admission = match super::admission::admit(
+            ctx,
+            vec![(scope.desired_kind(), id.clone())],
+            Some((scope.desired_kind(), id.clone())),
+        )
+        .await
+        {
+            Ok(mut rows) if rows.len() == 1 => rows.remove(0),
+            Ok(rows) => {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure::internal(format!(
+                        "submit admission projected {} decisions, expected one",
+                        rows.len()
+                    )),
+                )
+            }
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        };
+        let reason = serde_json::to_value(admission.decision.reason)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| "admission-deferred".to_owned());
+        if admission.decision.outcome != AdmissionOutcome::Admitted {
+            let queued_until = admission.decision.next_eligible_wake_at.clone();
+            let decision = admission.decision;
+            return fenced_authorizing_desired(
+                ctx,
+                scope.operation(),
+                EffectClass::SafeRetry,
+                req,
+                DesiredAuthorization {
+                    kind: scope.desired_kind(),
+                    id,
+                    generation: max_generation,
+                    queued_until,
+                    admission_reason: Some(reason),
+                },
+                move |_operation| async move {
+                    Ok(json!({
+                        "submitted": true,
+                        "queued": true,
+                        "alreadyRunning": false,
+                        "controller": Value::Null,
+                        "admission": decision,
+                    }))
+                },
+            )
+            .await;
+        }
+        let Some(reservation) = admission.reservation else {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::internal("admitted submit has no capacity reservation"),
+            );
+        };
+        let reservation_id = reservation.reservation_id.clone();
+        match (
+            reservation.owner_kind.as_deref(),
+            reservation.owner_id.as_deref(),
+        ) {
+            (None, None) => break (reservation_id, fresh_generation, None),
+            (Some("controller"), Some(owner)) => {
+                let Some((owner_scope, owner_id, owner_generation)) =
+                    admission_controller_owner(owner)
+                else {
+                    return err_response(
+                        &req.idempotency_key,
+                        &Failure::internal("controller reservation has malformed owner identity"),
+                    );
+                };
+                if owner_scope != scope.noun() || owner_id != id {
+                    return err_response(
+                        &req.idempotency_key,
+                        &Failure::refused(
+                            ErrorCode::IdempotencyConflict,
+                            "controller reservation belongs to a different subject",
+                        ),
+                    );
+                }
+                match recover_reserved_record(ctx, &id, scope, owner_generation).await {
+                    Ok(Some(record)) if generation(&record) == owner_generation => {
+                        let status = status_for(&record).await;
+                        if is_active(&status) {
+                            break (reservation_id, owner_generation, Some(status));
+                        }
+                        if is_unknown(&status) {
+                            return err_response(
+                                &req.idempotency_key,
+                                &Failure {
+                                    code: ErrorCode::HostUnavailable,
+                                    message: format!(
+                                        "{} {id} admission owner is unverifiable; refusing a duplicate spawn",
+                                        scope.noun()
+                                    ),
+                                    recoverable: true,
+                                },
+                            );
+                        }
+                    }
+                    Ok(Some(_)) => {
+                        return err_response(
+                            &req.idempotency_key,
+                            &Failure {
+                                code: ErrorCode::HostUnavailable,
+                                message: format!(
+                                    "{} {id} admission owner does not match the durable controller generation",
+                                    scope.noun()
+                                ),
+                                recoverable: true,
+                            },
+                        )
+                    }
+                    Ok(None) => {}
+                    Err(error) => return err_response(&req.idempotency_key, &error),
+                }
+                // The exact effect identity is confirmed absent. Release its
+                // old authority and loop through a current Beads/policy read;
+                // never turn a stale admitted decision directly into a spawn.
+                if let Err(error) = on_ledger(&ctx.ledger, {
+                    let reservation_id = reservation_id.clone();
+                    move |ledger| {
+                        ledger.release_admission_reservation(
+                            &reservation_id,
+                            Some("owned controller confirmed absent; fresh admission required"),
+                        )
+                    }
+                })
+                .await
+                {
+                    return err_response(&req.idempotency_key, &error);
+                }
+                fresh_generation = fresh_generation.max(owner_generation.saturating_add(1));
+            }
+            _ => {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure {
+                        code: ErrorCode::HostUnavailable,
+                        message: format!(
+                            "{} {id} admission reservation has an unverifiable owner",
+                            scope.noun()
+                        ),
+                        recoverable: true,
+                    },
+                )
+            }
+        }
+    };
+    if recovered_controller.is_none() {
+        let owner_id = format!("{}:{id}:{spawn_generation}", scope.noun());
+        if let Err(error) = on_ledger(&ctx.ledger, {
+            let reservation_id = reservation_id.clone();
+            move |ledger| {
+                ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)?;
+                Ok(())
+            }
+        })
+        .await
+        {
+            return err_response(&req.idempotency_key, &error);
+        }
+    }
+    let response = fenced_authorizing_desired(
         ctx,
         scope.operation(),
         EffectClass::SafeRetry,
@@ -1277,16 +1532,26 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         DesiredAuthorization {
             kind: scope.desired_kind(),
             id: id.clone(),
-            generation: next_generation,
+            generation: spawn_generation,
+            queued_until: None,
+            admission_reason: None,
         },
         {
             move |_operation| async move {
+                if let Some(controller) = recovered_controller {
+                    return Ok(json!({
+                        "submitted": true,
+                        "recovered": true,
+                        "alreadyRunning": false,
+                        "controller": controller,
+                    }));
+                }
                 let controller = spawn(
                     ctx,
                     &id,
                     &repo,
                     scope,
-                    next_generation,
+                    spawn_generation,
                     host_policy,
                     herdr_socket,
                 )
@@ -1295,7 +1560,18 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             }
         },
     )
-    .await
+    .await;
+    if response.ok {
+        let _ = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.release_admission_reservation(
+                &reservation_id,
+                Some("controller identity persisted"),
+            )?;
+            Ok(())
+        })
+        .await;
+    }
+    response
 }
 
 /// Detach a slice driver and return its durable controller identity.

@@ -59,6 +59,7 @@ fn push_transport_retries_are_bounded_then_stop_as_input_required() {
         "lean",
     ]);
     assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-push-retry");
     let (code, resolved) = env.forged(&["run", "advance", "--run", "bead-push-retry"]);
     assert_eq!(code, 0, "resolve: {resolved}");
     assert_eq!(resolved["result"]["action"]["runMachine"], json!("resolve"));
@@ -363,6 +364,7 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
         "lean",
     ]);
     assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-session");
 
     let (code, queued) = env.forged(&[
         "session",
@@ -445,6 +447,7 @@ fn a_rejected_cross_run_intervention_never_enters_the_target_queue() {
             "lean",
         ]);
         assert_eq!(code, 0, "start {bead}: {started}");
+        env.authorize_run(bead);
     }
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-message-owner"]);
     assert_eq!(code, 0, "owner drive: {driven}");
@@ -593,6 +596,7 @@ fn resolving_an_unclean_child_starts_a_fresh_generation() {
         "lean",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic("epic-retry");
     env.set_scenario("implement", "no-block", 1);
     let (code, stopped) = env.forged(&["epic", "drive", "--epic", "epic-retry"]);
     assert_eq!(code, 0, "first drive reaches input: {stopped}");
@@ -1044,6 +1048,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
         "all-claude",
     ]);
     assert_eq!(code, 0, "lean start: {started}");
+    lean.authorize_run("bead-lean");
     let (code, driven) = lean.forged(&["run", "drive", "--run", "bead-lean"]);
     assert_eq!(code, 0, "lean drive: {driven}");
     assert_eq!(
@@ -1086,6 +1091,7 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
         "main",
     ]);
     assert_eq!(code, 0, "switch start: {started}");
+    switched.authorize_run("bead-switch");
     let original = started["result"]["roster_sha256"].clone();
     let (code, revised) = switched.forged(&[
         "run",
@@ -1159,6 +1165,7 @@ fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
         "fallback",
     ]);
     assert_eq!(code, 0, "fallback start: {started}");
+    env.authorize_run("bead-fallback");
     // Resolve, open, and execute candidate 1. Advance the durable retry
     // clock in the test database instead of sleeping through the production
     // 30-second backoff; the next projection still reads the real event.
@@ -1234,6 +1241,7 @@ fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
         "lean",
     ]);
     assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-revision-fallback");
     env.set_scenario("implement", "rate-limit", 1);
     for _ in 0..3 {
         let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-revision-fallback"]);
@@ -1310,6 +1318,7 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
         "high",
     ]);
     assert_eq!(code, 0, "high start: {started}");
+    env.authorize_run("bead-high");
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-high"]);
     assert_eq!(code, 0, "high drive: {driven}");
     let log = env.provider_log();
@@ -1369,6 +1378,7 @@ fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
         .0,
         0
     );
+    env.authorize_run("bead-round-budget");
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-round-budget"]);
     assert_eq!(code, 0, "drive: {driven}");
     assert_eq!(
@@ -1501,6 +1511,7 @@ fn implementer_spec_amendment_stops_before_gate_or_review() {
         .0,
         0
     );
+    env.authorize_run("bead-amendment");
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-amendment"]);
     assert_eq!(code, 0, "drive: {driven}");
     assert_eq!(
@@ -1557,6 +1568,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
         .0,
         0
     );
+    gate.authorize_run("bead-gate-edge");
     assert_eq!(
         gate.forged(&["run", "drive", "--run", "bead-gate-edge"]).0,
         0
@@ -1600,6 +1612,7 @@ fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
             .0,
         0
     );
+    conflict.authorize_run("bead-conflict-edge");
     assert_eq!(
         conflict
             .forged(&["run", "drive", "--run", "bead-conflict-edge"])
@@ -1645,6 +1658,7 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
         "main",
     ]);
     assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("legacy-policy-run");
 
     // Recreate the exact pre-policy durable shape: package JSON and its hash
     // both omit `policy`, with no migration overlay yet.
@@ -1824,6 +1838,7 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic("legacy-package-epic");
 
     // Recreate a pre-snapshot forged.epic/1 start event. Its legacy profile,
     // roster, and package digest remain, but the full package is absent.
@@ -1933,6 +1948,7 @@ fn run_uses_its_frozen_roster_after_the_authoring_config_changes() {
         "main",
     ]);
     assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-frozen");
     assert_eq!(started["result"]["profile_ref"]["name"], json!("standard"));
     assert_eq!(started["result"]["roster_ref"]["name"], json!("default"));
     let original_digest = started["result"]["package_sha256"]
@@ -2011,6 +2027,7 @@ fn epic_roster_revision_updates_current_and_future_children() {
         "lean",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic("epic-roster");
     assert!(started["result"]["executionPackage"].is_object());
 
     for _ in 0..2 {
@@ -2125,6 +2142,7 @@ fn semantic_failure_consumes_no_transport_budget_and_reclaims() {
         "--base-ref",
         "main",
     ]);
+    env.authorize_run("bead-sem");
     env.set_scenario("implement", "no-block", 1);
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-sem"]);
     assert_eq!(code, 0, "drive after semantic retry: {driven}");
@@ -2180,6 +2198,7 @@ fn claude_rate_limit_is_a_free_transport_retry() {
         "--base-ref",
         "main",
     ]);
+    env.authorize_run("bead-tr");
     env.set_scenario("implement", "rate-limit", 1);
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-tr"]);
     assert_eq!(code, 0, "drive after transport retry: {driven}");
@@ -2231,6 +2250,7 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
         "--base-ref",
         "main",
     ]);
+    env.authorize_run("bead-nopid");
 
     // This fresh ledger's first claim has attempt id 1. Occupy that
     // attempt-scoped pid path with a DIRECTORY: the spawned shell's
@@ -2318,6 +2338,7 @@ fn reconcile_runs_the_ports_end_to_end_on_a_live_run() {
         "--base-ref",
         "main",
     ]);
+    env.authorize_run("bead-rec");
     let (code, _) = env.forged(&["run", "drive", "--run", "bead-rec"]);
     assert_eq!(code, 0);
     let (code, reconciled) = env.forged(&["reconcile", "--run", "bead-rec"]);

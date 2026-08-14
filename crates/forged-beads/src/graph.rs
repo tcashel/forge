@@ -23,6 +23,9 @@ pub struct IssueSummary {
     pub description: String,
     /// Current Beads status.
     pub status: String,
+    /// Native numeric scheduling priority. Missing or non-integral values
+    /// remain `None` so admission can defer fail-closed.
+    pub priority: Option<i64>,
     /// Current Beads assignee/lease holder, when any.
     pub assignee: Option<String>,
     /// Beads issue type (`task`, `epic`, ...).
@@ -96,6 +99,7 @@ fn issue(value: &Value) -> Option<IssueSummary> {
             .and_then(Value::as_str)
             .unwrap_or("open")
             .to_owned(),
+        priority: value.get("priority").and_then(Value::as_i64),
         assignee: value
             .get("assignee")
             .and_then(Value::as_str)
@@ -445,6 +449,7 @@ mod tests {
                 title: String::new(),
                 description: String::new(),
                 status: "open".to_owned(),
+                priority: None,
                 assignee: None,
                 issue_type: "task".to_owned(),
                 acceptance_criteria: String::new(),
@@ -461,6 +466,7 @@ mod tests {
     fn issue_projection_carries_every_spec_field() {
         let projected = issue(&json!({
             "id": "b-2",
+            "priority": 2,
             "description": "## Context\nwhy",
             "acceptance_criteria": "- it works",
             "design": "touch points",
@@ -470,6 +476,7 @@ mod tests {
         }))
         .expect("projects");
         assert_eq!(projected.description, "## Context\nwhy");
+        assert_eq!(projected.priority, Some(2));
         assert_eq!(projected.acceptance_criteria, "- it works");
         assert_eq!(projected.design, "touch points");
         assert_eq!(projected.notes, "commit as you go");

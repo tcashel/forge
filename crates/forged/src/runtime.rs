@@ -2891,6 +2891,7 @@ mod tests {
             host_policy: HostPolicy::Preferred,
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
+            admission: crate::config::AdmissionPolicy::default(),
         }
     }
 

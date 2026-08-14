@@ -646,11 +646,13 @@ issue_json() {
   acceptance=$(cat "$state/$id.acceptance" 2>/dev/null || true)
   design=$(cat "$state/$id.design" 2>/dev/null || true)
   notes=$(cat "$state/$id.notes" 2>/dev/null || true)
-  metadata=$(cat "$state/$id.metadata" 2>/dev/null || echo '{}')
+  repository=$(cat "$state/default-repository" 2>/dev/null || true)
+  metadata=$(cat "$state/$id.metadata" 2>/dev/null || printf '{"repository":"%s"}' "$repository")
+  priority=$(cat "$state/$id.priority" 2>/dev/null || echo 2)
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
 }
 case "$cmd" in
   version)
@@ -882,6 +884,13 @@ impl TestEnv {
         write_shim(&shim_bin, "gh", GH_SHIM);
         let gh_log = root.join("gh-calls.log");
         let repos = setup_repos(&root, "main");
+        let shim_state = beads_dir.join("shim-state");
+        std::fs::create_dir_all(&shim_state).expect("creating bd shim state");
+        std::fs::write(
+            shim_state.join("default-repository"),
+            repos.repo.to_string_lossy().as_bytes(),
+        )
+        .expect("write default Bead repository metadata");
         let spec = root.join("spec.md");
         std::fs::write(&spec, "# test spec\nbuild the thing\n").expect("write spec");
         let env = TestEnv {
@@ -1315,6 +1324,28 @@ impl TestEnv {
     /// Open the environment's ledger (state.db) directly.
     pub fn ledger(&self) -> forged_ledger::Ledger {
         forged_ledger::Ledger::open(&self.anvil.join("state.db")).expect("open test ledger")
+    }
+
+    /// Mark a started run as operator-authorized when an integration test is
+    /// intentionally exercising a provider launch without going through the
+    /// detached `run submit` surface. Production admission must otherwise
+    /// refuse these ready-but-unsubmitted rows.
+    pub fn authorize_run(&self, run_id: &str) {
+        let ledger = self.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Run, run_id, 0)
+            .expect("authorize test run");
+        ledger.close().expect("close test ledger");
+    }
+
+    /// Authorize a directly-driven epic fixture without starting a detached
+    /// controller. Child packet admission delegates to this parent epoch.
+    pub fn authorize_epic(&self, epic_id: &str) {
+        let ledger = self.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, epic_id, 0)
+            .expect("authorize test epic");
+        ledger.close().expect("close test ledger");
     }
 
     /// The run's worktree path.

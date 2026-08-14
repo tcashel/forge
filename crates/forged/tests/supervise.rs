@@ -104,6 +104,110 @@ fn never_submitted_and_failed_submissions_never_become_desired() {
 }
 
 #[test]
+fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
+    let env = TestEnv::new("supervise-queued-submit-replay");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read config for admission limit"),
+    )
+    .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 1,
+        "providerActive": 4,
+        "repositoryWriteActive": 1,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+
+    start_run(&env, "run-capacity-holder");
+    start_run(&env, "run-capacity-queued");
+    env.set_scenario("implement", "hang", 2);
+    let (code, holder) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-holder",
+        "--idempotency-key",
+        "capacity-holder",
+    ]);
+    assert_eq!(code, 0, "holder submit: {holder}");
+    wait_until("holder attempt to consume capacity", || {
+        implementation_starts(&env, "run-capacity-holder") == 1
+    });
+
+    let queued_args = [
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-queued",
+        "--idempotency-key",
+        "capacity-queued",
+    ];
+    let (code, queued) = env.forged(&queued_args);
+    assert_eq!(code, 0, "capacity queue: {queued}");
+    assert_eq!(queued["result"]["queued"], json!(true));
+    assert_eq!(queued["result"]["controller"], Value::Null);
+    assert_eq!(queued["reused"], json!(false));
+
+    let (code, replayed) = env.forged(&queued_args);
+    assert_eq!(code, 0, "queued replay: {replayed}");
+    assert_eq!(replayed["operationId"], queued["operationId"]);
+    assert_eq!(replayed["result"], queued["result"]);
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(implementation_starts(&env, "run-capacity-queued"), 0);
+
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-capacity-holder",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "release admission capacity",
+    ]);
+    assert_eq!(code, 0, "stop holder: {stopped}");
+    wait_until("holder attempt capacity release", || {
+        let ledger = env.ledger();
+        let empty = ledger
+            .list_live_attempts(Some("run-capacity-holder"))
+            .expect("list holder attempts")
+            .is_empty();
+        ledger.close().expect("close holder ledger");
+        empty
+    });
+
+    let (code, retried) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-queued",
+        "--idempotency-key",
+        "capacity-retry",
+    ]);
+    assert_eq!(code, 0, "fresh-key retry: {retried}");
+    assert_eq!(retried["result"]["submitted"], json!(true));
+    assert_ne!(retried["result"]["queued"], json!(true));
+    assert!(retried["result"]["controller"].is_object());
+    assert_ne!(retried["operationId"], queued["operationId"]);
+
+    let _ = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-capacity-queued",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+}
+
+#[test]
 fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
     let env = TestEnv::new("supervise-restart-singleton");
     start_run(&env, "run-supervised");
@@ -279,7 +383,20 @@ fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
     ledger.close().expect("close");
     assert_eq!(implementation_starts(&env, "run-foreground"), 1);
 
-    let _ = killpg(Pid::from_raw(controller), Signal::SIGKILL);
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-foreground",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "foreground signal test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop foreground fixture: {cleanup}");
+    wait_until("foreground controller cleanup", || {
+        !process_group_alive(controller)
+    });
 }
 
 #[test]

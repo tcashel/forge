@@ -327,6 +327,72 @@ CREATE TABLE attempt_artifact_compactions (
 );
 ";
 
+/// Migration 013: deterministic admission evidence and capacity ownership.
+///
+/// A recovery deadline is deliberately not an expiry. `reserved`, `active`,
+/// and `orphaned` rows all consume capacity until an observer either adopts a
+/// matching effect or confirms absence and writes `released`.
+const MIGRATION_013: &str = "
+CREATE TABLE admission_batches (
+  batch_id         TEXT PRIMARY KEY,
+  schema           TEXT NOT NULL CHECK (schema = 'forged.admission-inputs/1'),
+  policy_revision  TEXT NOT NULL,
+  ledger_revision  TEXT NOT NULL,
+  inputs_sha256    TEXT NOT NULL CHECK (length(inputs_sha256) = 64),
+  inputs_json      TEXT NOT NULL,
+  as_of            TEXT NOT NULL,
+  created_at       TEXT NOT NULL
+);
+
+CREATE TABLE admission_decisions (
+  decision_id          TEXT PRIMARY KEY,
+  batch_id             TEXT NOT NULL REFERENCES admission_batches(batch_id),
+  subject_kind         TEXT NOT NULL CHECK (subject_kind IN ('run','epic','packet')),
+  subject_id           TEXT NOT NULL,
+  control_revision     INTEGER NOT NULL CHECK (control_revision >= 0),
+  outcome              TEXT NOT NULL CHECK (outcome IN ('admitted','deferred','ineligible')),
+  reason               TEXT NOT NULL CHECK (reason IN
+                         ('capacity-available','total-capacity','provider-capacity',
+                          'repository-write-capacity','token-ceiling','known-cost-ceiling',
+                          'missing-cost','rate-limit-ceiling','stale-rate-limit',
+                          'bead-unavailable','bead-malformed','bead-not-runnable',
+                          'repository-mismatch','unauthorized','desired-not-running',
+                          'terminal','input-required','exhausted','superseded',
+                          'reservation-recovery')),
+  next_eligible_wake_at TEXT,
+  decision_json         TEXT NOT NULL,
+  created_at            TEXT NOT NULL,
+  UNIQUE (batch_id, subject_kind, subject_id)
+);
+CREATE INDEX admission_decisions_subject
+  ON admission_decisions(subject_kind, subject_id, created_at, decision_id);
+
+CREATE TABLE admission_reservations (
+  reservation_id   TEXT PRIMARY KEY,
+  decision_id      TEXT NOT NULL UNIQUE REFERENCES admission_decisions(decision_id),
+  work_key         TEXT NOT NULL,
+  subject_kind     TEXT NOT NULL CHECK (subject_kind IN ('run','epic','packet')),
+  subject_id       TEXT NOT NULL,
+  control_revision INTEGER NOT NULL CHECK (control_revision >= 0),
+  repository       TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  model            TEXT NOT NULL,
+  resource_class   TEXT NOT NULL CHECK (resource_class IN ('read','repository-write')),
+  state            TEXT NOT NULL CHECK (state IN ('reserved','active','orphaned','released')),
+  owner_kind       TEXT CHECK (owner_kind IN ('controller','attempt')),
+  owner_id         TEXT,
+  recovery_deadline TEXT NOT NULL,
+  last_error       TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  released_at      TEXT
+);
+CREATE UNIQUE INDEX one_live_admission_per_work
+  ON admission_reservations(work_key) WHERE state != 'released';
+CREATE INDEX admission_reservations_capacity
+  ON admission_reservations(state, provider, repository, resource_class);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -341,6 +407,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_010,
     MIGRATION_011,
     MIGRATION_012,
+    MIGRATION_013,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -460,7 +527,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 12);
+        assert_eq!(pragmas.user_version, 13);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -481,6 +548,9 @@ mod tests {
             "desired_work",
             "attempt_artifacts",
             "attempt_artifact_compactions",
+            "admission_batches",
+            "admission_decisions",
+            "admission_reservations",
         ] {
             let found: String = conn
                 .query_row(
@@ -510,7 +580,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
         ledger.close().expect("close");
     }
 
@@ -533,7 +603,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -576,7 +646,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);
