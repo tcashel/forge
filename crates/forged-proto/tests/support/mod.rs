@@ -225,6 +225,7 @@ impl ViewBuilder {
             seq,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
             created_at: T0.to_owned(),
         });

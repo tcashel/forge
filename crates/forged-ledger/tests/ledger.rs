@@ -2,7 +2,7 @@
 //! slots, usage totals, and deterministic close.
 
 use forged_ledger::{
-    EffectClass, Ledger, NewPacket, NewRun, NewUsage, OperationOutcome, SlotOutcome,
+    EffectClass, Ledger, NewPacket, NewRun, NewUsage, OperationOutcome, SlotOutcome, SpecFence,
 };
 use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse, RunId, Stage};
 use serde_json::json;
@@ -27,6 +27,7 @@ fn new_packet(run_id: &str) -> NewPacket {
         seq: 7,
         spec_path: "specs/y.md".to_owned(),
         spec_sha256: "beef".to_owned(),
+        spec_revision: None,
         body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
     }
 }
@@ -82,11 +83,40 @@ fn open_packet_is_idempotent_on_byte_identical_content() {
     assert_eq!(again, id);
     assert_eq!(ledger.list_packets(&run).expect("list").len(), 1);
 
-    // A one-byte change to body_json refuses.
-    let mut drifted = new_packet(&run);
-    drifted.body_json.push(' ');
-    let err = ledger.open_packet(drifted).expect_err("must refuse");
+    // A REVISED SPEC re-pins the unclaimed packet in place: spec columns
+    // only, and the definition the packet was opened with is untouched.
+    let mut revised = new_packet(&run);
+    revised.spec_sha256 = "cafe".to_owned();
+    revised.spec_revision = Some("-6192208415116251521".to_owned());
+    assert_eq!(ledger.open_packet(revised.clone()).expect("re-pin"), id);
+    assert_eq!(ledger.list_packets(&run).expect("list").len(), 1);
+    let repinned = ledger.get_packet(&id).expect("get packet");
+    assert_eq!(repinned.spec_sha256, "cafe");
+    assert_eq!(
+        repinned.spec_revision.as_deref(),
+        Some("-6192208415116251521")
+    );
+    assert_eq!(
+        repinned.body_json,
+        new_packet(&run).body_json,
+        "a re-pin revises the spec and nothing else"
+    );
+
+    // A DIFFERING BODY is a changed definition, not a revised spec, and a
+    // packet's contract is fixed at open.
+    let mut redefined = new_packet(&run);
+    redefined.body_json.push(' ');
+    let err = ledger
+        .open_packet(redefined)
+        .expect_err("a differing definition must be refused");
     assert_eq!(err.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_packet(&id).expect("get packet").body_json,
+        new_packet(&run).body_json,
+        "the refused re-open changed nothing"
+    );
+    // Put the spec back so the rest of this test reads the original pin.
+    ledger.open_packet(new_packet(&run)).expect("restore");
 
     // Unknown run refuses with RunNotFound, explicitly, not via FK.
     let mut orphan = new_packet("run-missing");
@@ -193,7 +223,7 @@ fn inventory_snapshot_agrees_with_the_calls_it_replaces() {
     let bare = make_run(&ledger, "run-snap-bare");
     let packet = ledger.open_packet(new_packet(&run)).expect("open packet");
     ledger
-        .claim_packet(&packet, "codex:1", "beef")
+        .claim_packet(&packet, "codex:1", &SpecFence::Sha256("beef".to_owned()))
         .expect("claim packet");
     ledger
         .record_usage(NewUsage {
@@ -564,11 +594,16 @@ fn idempotency_identity_spans_run_and_effect_class() {
             seq: 1,
             spec_path: "specs/y.md".to_owned(),
             spec_sha256: "beef".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&packet, "claude:sess:9", "beef")
+        .claim_packet(
+            &packet,
+            "claude:sess:9",
+            &SpecFence::Sha256("beef".to_owned()),
+        )
         .expect("claim");
     let wrong_run = request("key-t", Some(&run_b), json!({}));
     let err = ledger

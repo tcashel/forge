@@ -20,8 +20,11 @@ cargo test -p forged --features failpoints
 ```
 
 CI (`.github/workflows/rust.yml`) runs exactly these. The bd-gated tests
-require a sandboxed **bd 1.2.1** binary and SKIP loudly without one; the
-genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
+require a sandboxed **bd 1.2.1** binary and SKIP loudly when the machine has
+none — but they FAIL, never skip, when a bd binary is present at an
+unaccepted version (an upgrade is exactly when the pinned JSON shape must be
+re-checked) or when `FORGED_REQUIRE_BD=1` declares a bd-less run a failed
+one. The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
 deliberately with `FORGED_SLOW_TESTS=1 cargo test -p forged --features
 failpoints -- --ignored --nocapture` when you touch lease code.
 

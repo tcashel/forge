@@ -7,7 +7,7 @@ use std::sync::Arc;
 
 use forged_ledger::{
     default_db_path, AttemptState, ClaimedAttempt, EffectClass, Ledger, LedgerError, NewPacket,
-    NewRun, NewUsage, OperationOutcome, OperationState, RunState, SlotOutcome,
+    NewRun, NewUsage, OperationOutcome, OperationState, RunState, SlotOutcome, SpecFence,
 };
 use forged_types::{
     ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
@@ -30,7 +30,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 6);
+        assert_eq!(handle.join().expect("thread"), 7);
     }
 }
 
@@ -98,6 +98,7 @@ fn every_seam_member_is_consumable() {
             seq: 1,
             spec_path: "specs/seam.md".to_owned(),
             spec_sha256: "abcd".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open_packet");
@@ -128,7 +129,11 @@ fn every_seam_member_is_consumable() {
         attempt_id,
         claim_token,
     } = ledger
-        .claim_packet(&packet_id, "claude:seam:1", "abcd")
+        .claim_packet(
+            &packet_id,
+            "claude:seam:1",
+            &SpecFence::Sha256("abcd".to_owned()),
+        )
         .expect("claim_packet");
     ledger
         .heartbeat_attempt(&claim_token)

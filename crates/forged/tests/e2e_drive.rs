@@ -1764,7 +1764,7 @@ fn epic_roster_revision_updates_current_and_future_children() {
             .expect("packets")
             .into_iter()
             .find(|packet| {
-                serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+                forged_proto::stored_packet(packet)
                     .ok()
                     .and_then(|packet| packet.execution)
                     .is_some_and(|execution| {

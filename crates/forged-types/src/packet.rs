@@ -15,12 +15,20 @@ pub enum Stage {
     Fix,
 }
 
-/// The spec a packet implements, pinned by content hash.
+/// The spec a packet implements, pinned against edits under it.
+///
+/// A bead-sourced spec pins the bead's opaque `revision`; a file-sourced one
+/// — the deprecated `--spec <path>` route — pins the file's content hash.
+/// `path` is where the seat reads the bytes either way.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct SpecRef {
     pub path: String,
     pub sha256: String,
+    /// The bead revision this packet is pinned to; absent on a file-sourced
+    /// spec. OPAQUE: compared for equality only, never ordered or parsed.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub revision: Option<String>,
 }
 
 /// What a stage must hand back to count as done.
@@ -84,6 +92,74 @@ pub struct WorkPacket {
     pub result_schema: String,
     pub provider_hints: ProviderHints,
     pub field_notes: Vec<String>,
+}
+
+/// The wire keys a `packets` row already carries as columns, and which the
+/// stored body therefore omits. A packet row never stores a value twice.
+const COLUMN_BACKED_KEYS: [&str; 5] = ["spec", "packetId", "runId", "stage", "laneSeq"];
+
+/// The `packets` columns a stored body is rehydrated from — the one copy of
+/// every value in [`COLUMN_BACKED_KEYS`].
+#[derive(Debug, Clone, PartialEq)]
+pub struct PacketColumns {
+    pub packet_id: String,
+    pub run_id: String,
+    pub stage: Stage,
+    /// The row's `seq`. It is the packet's `lane_seq` for a semantic packet
+    /// and the final packet-id segment for a legacy one — see
+    /// [`WorkPacket::from_stored_body`] for which of the two the body gets.
+    pub seq: i64,
+    pub spec: SpecRef,
+}
+
+impl WorkPacket {
+    /// The row-storage projection of this packet: the wire form minus every
+    /// field `packets` carries as a column of the same row.
+    pub fn stored_body(&self) -> Result<String, serde_json::Error> {
+        let mut value = serde_json::to_value(self)?;
+        if let serde_json::Value::Object(map) = &mut value {
+            for key in COLUMN_BACKED_KEYS {
+                map.remove(key);
+            }
+        }
+        serde_json::to_string(&value)
+    }
+
+    /// Rebuild a packet from a stored body and the columns of its row.
+    ///
+    /// A body written before the projection still carries the projected-out
+    /// keys; the columns overwrite them, because the columns are what the
+    /// claim fence and the projection read. Legacy rows are therefore
+    /// readable as they stand and are never migrated.
+    ///
+    /// `lane_seq` takes its VALUE from the row and its PRESENCE from
+    /// `execution`: the pair is set together (a semantic packet has both, a
+    /// legacy one neither), and a legacy packet's sequence is the final
+    /// packet-id segment rather than a storage lane.
+    pub fn from_stored_body(
+        body_json: &str,
+        columns: PacketColumns,
+    ) -> Result<Self, serde_json::Error> {
+        let mut value: serde_json::Value = serde_json::from_str(body_json)?;
+        if let serde_json::Value::Object(map) = &mut value {
+            map.insert("spec".to_owned(), serde_json::to_value(columns.spec)?);
+            map.insert(
+                "packetId".to_owned(),
+                serde_json::Value::String(columns.packet_id),
+            );
+            map.insert(
+                "runId".to_owned(),
+                serde_json::Value::String(columns.run_id),
+            );
+            map.insert("stage".to_owned(), serde_json::to_value(columns.stage)?);
+            if map.get("execution").is_some_and(|value| !value.is_null()) {
+                map.insert("laneSeq".to_owned(), serde_json::Value::from(columns.seq));
+            } else {
+                map.remove("laneSeq");
+            }
+        }
+        serde_json::from_value(value)
+    }
 }
 
 /// A reviewer's overall call on a packet.
@@ -187,6 +263,7 @@ mod tests {
             spec: SpecRef {
                 path: "specs/bead-1.md".to_owned(),
                 sha256: "cafe".to_owned(),
+                revision: None,
             },
             worktree: PathBuf::from("/tmp/worktrees/run-1"),
             branch: "feat/bead-1".to_owned(),
@@ -205,6 +282,24 @@ mod tests {
                 sandbox: Sandbox::WorkspaceWrite,
             },
             field_notes: vec!["watch the seam".to_owned()],
+        }
+    }
+
+    /// The definition-backed shape: a semantic execution and the storage
+    /// lane that rides with it.
+    fn semantic_packet() -> WorkPacket {
+        WorkPacket {
+            packet_id: "run-1/review/2".to_owned(),
+            stage: Stage::ReviewCodex,
+            execution: Some(crate::SeatExecutionV1 {
+                stage_id: "review".to_owned(),
+                seat_id: crate::SeatId::new("review-1").expect("seat id"),
+                role_id: crate::RoleId::new("reviewer").expect("role id"),
+                purpose: crate::SeatPurpose::Review,
+                round: 2,
+            }),
+            lane_seq: Some(7),
+            ..sample_packet()
         }
     }
 
@@ -247,6 +342,12 @@ mod tests {
         round_trip(&SpecRef {
             path: "specs/x.md".to_owned(),
             sha256: "beef".to_owned(),
+            revision: None,
+        });
+        round_trip(&SpecRef {
+            path: "specs/x.md".to_owned(),
+            sha256: "beef".to_owned(),
+            revision: Some("-6192208415116251521".to_owned()),
         });
     }
 
@@ -287,6 +388,68 @@ mod tests {
         assert_eq!(value["providerHints"]["sandbox"], json!("workspaceWrite"));
         assert_eq!(value["fieldNotes"][0], json!("watch the seam"));
         assert_eq!(value["spec"]["sha256"], json!("cafe"));
+    }
+
+    /// The columns the row would carry for this packet.
+    fn columns_of(packet: &WorkPacket) -> PacketColumns {
+        PacketColumns {
+            packet_id: packet.packet_id.clone(),
+            run_id: packet.run_id.clone(),
+            stage: packet.stage,
+            seq: packet.lane_seq.unwrap_or(0),
+            spec: packet.spec.clone(),
+        }
+    }
+
+    #[test]
+    fn the_stored_body_omits_every_value_the_row_carries_as_a_column() {
+        let mut packet = sample_packet();
+        packet.spec.revision = Some("-6192208415116251521".to_owned());
+        for shaped in [packet.clone(), semantic_packet()] {
+            let body = shaped.stored_body().expect("stored body");
+            let value: serde_json::Value = serde_json::from_str(&body).expect("parses");
+            for key in COLUMN_BACKED_KEYS {
+                assert!(
+                    value.get(key).is_none(),
+                    "{key:?} lives in the packet row's columns, never in body_json: {body}"
+                );
+            }
+            assert_eq!(
+                WorkPacket::from_stored_body(&body, columns_of(&shaped)).expect("rehydrates"),
+                shaped,
+                "the projection must be lossless against the row it pairs with"
+            );
+        }
+    }
+
+    #[test]
+    fn a_body_written_before_the_projection_still_rehydrates_from_its_columns() {
+        // Legacy rows carry the whole packet, every projected-out key
+        // included. The columns are what the claim fence and the projection
+        // read, so they win and no row is migrated.
+        let packet = sample_packet();
+        let legacy = serde_json::to_string(&packet).expect("legacy body");
+        let columns = PacketColumns {
+            packet_id: "run-9/implementation/2".to_owned(),
+            run_id: "run-9".to_owned(),
+            stage: Stage::Fix,
+            seq: 2,
+            spec: SpecRef {
+                path: "specs/bead-1.md".to_owned(),
+                sha256: "cafe".to_owned(),
+                revision: Some("77".to_owned()),
+            },
+        };
+        let rehydrated =
+            WorkPacket::from_stored_body(&legacy, columns.clone()).expect("rehydrates");
+        assert_eq!(rehydrated.spec, columns.spec);
+        assert_eq!(rehydrated.packet_id, columns.packet_id);
+        assert_eq!(rehydrated.run_id, columns.run_id);
+        assert_eq!(rehydrated.stage, columns.stage);
+        assert_eq!(
+            rehydrated.lane_seq, None,
+            "a legacy packet stores no lane: its sequence is the id's last segment"
+        );
     }
 
     #[test]

@@ -7,7 +7,7 @@ mod support;
 
 use std::collections::HashMap;
 
-use forged_ledger::{Ledger, NewPacket, NewRun};
+use forged_ledger::{Ledger, NewPacket, NewRun, SpecFence};
 use forged_proto::{land_packet_result, reconcile, widen_rfc3339, LandOutcome, ReconcileConfig};
 use forged_types::{RunId, Stage};
 use support::*;
@@ -50,11 +50,16 @@ async fn harvested_implement_claim_is_verified_not_trusted() {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     // Pass 1: the session vanished; the attempt is revoked and reclaimed.
@@ -153,11 +158,16 @@ async fn a_pass_checks_the_history_against_ground_truth_established_once() {
                 seq,
                 spec_path: "spec.md".to_owned(),
                 spec_sha256: "cafe".to_owned(),
+                spec_revision: None,
                 body_json: "{}".to_owned(),
             })
             .expect("open packet");
         let claim = ledger
-            .claim_packet(&pid, &format!("claude:sess-{seq}:1"), "cafe")
+            .claim_packet(
+                &pid,
+                &format!("claude:sess-{seq}:1"),
+                &SpecFence::Sha256("cafe".to_owned()),
+            )
             .expect("claim");
         let ports = FakePorts::new();
         reconcile(&ledger, RUN, &ports, &config(), &now_stamp())
@@ -249,11 +259,16 @@ async fn matching_ground_truth_records_no_mismatch() {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     let ports = FakePorts::new();

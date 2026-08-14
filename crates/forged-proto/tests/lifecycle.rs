@@ -10,7 +10,9 @@ mod support;
 
 use std::collections::HashMap;
 
-use forged_ledger::{EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState};
+use forged_ledger::{
+    EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState, SpecFence,
+};
 use forged_proto::{
     advance, land_packet_result, machine_idempotency_key, parse_proto_events, project_run, record,
     widen_rfc3339, GatePhase, LandOutcome, MachineStage, NextAction, ProtoEvent, Terminal,
@@ -192,6 +194,7 @@ async fn full_slice_v1_lifecycle_in_process() {
                             seq: intent.seq,
                             spec_path: "spec.md".to_owned(),
                             spec_sha256: "cafe".to_owned(),
+                            spec_revision: None,
                             body_json: "{}".to_owned(),
                         })
                         .expect("open packet");
@@ -204,7 +207,11 @@ async fn full_slice_v1_lifecycle_in_process() {
             } => {
                 assert!(not_before.is_none(), "no transport retries in this run");
                 let claim = ledger
-                    .claim_packet(&pid, "claude:sess-1:1", "cafe")
+                    .claim_packet(
+                        &pid,
+                        "claude:sess-1:1",
+                        &SpecFence::Sha256("cafe".to_owned()),
+                    )
                     .expect("claim packet");
                 let outcome = script
                     .remove(&pid)

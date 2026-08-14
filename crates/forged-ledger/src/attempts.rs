@@ -14,7 +14,7 @@ use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{AttemptRow, AttemptState, ClaimedAttempt};
+use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, SpecFence};
 
 const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, fail_note, \
@@ -156,36 +156,52 @@ impl Ledger {
     /// Claim a packet: insert a `running` attempt with a fresh fencing token.
     ///
     /// The packet must exist and have no completed attempt
-    /// (`PacketNotClaimable`); `current_spec_sha256` — the caller re-hashes
-    /// the spec file, the ledger does no file IO — must equal the stored
-    /// hash, else `SpecDrift`. Re-claim is legal after `failed` or
-    /// `reclaimed`, refused while any attempt is `running` or `revoking`
+    /// (`PacketNotClaimable`); `current` — the fence the caller observed
+    /// just now, by re-hashing the spec file or re-rendering the bead's
+    /// body, because the ledger does no file or process IO — must equal the
+    /// stored fence, else `SpecDrift`. Re-claim is legal after `failed`
+    /// or `reclaimed`, refused while any attempt is `running` or `revoking`
     /// (the partial unique index is the race backstop), and refused after
     /// `completed`.
+    ///
+    /// RE-PIN OF THE WRITE TOKEN: for a bead-sourced packet the comparison
+    /// is over `body_sha256` alone. bd mints a fresh `revision` on every
+    /// write to the bead — the lease claim and status change forged itself
+    /// performs before it resumes a packet included — so a moved revision
+    /// over an UNCHANGED body is not drift, and the row's `spec_revision`
+    /// is re-pinned to the observed value in this same transaction. A moved
+    /// body is drift, whatever the revision says.
     pub fn claim_packet(
         &self,
         packet_id: &str,
         claimant: &str,
-        current_spec_sha256: &str,
+        current: &SpecFence,
     ) -> Result<ClaimedAttempt, LedgerError> {
         let packet_id = packet_id.to_owned();
         let claimant = claimant.to_owned();
-        let current_spec_sha256 = current_spec_sha256.to_owned();
+        let current = current.clone();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let stored: Option<String> = tx
+            let stored: Option<(String, Option<String>)> = tx
                 .query_row(
-                    "SELECT spec_sha256 FROM packets WHERE packet_id = ?1",
+                    "SELECT spec_sha256, spec_revision FROM packets WHERE packet_id = ?1",
                     [&packet_id],
-                    |row| row.get(0),
+                    |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            let spec_sha256 = stored.ok_or_else(|| {
+            let (spec_sha256, spec_revision) = stored.ok_or_else(|| {
                 refused(
                     ErrorCode::PacketNotClaimable,
                     format!("no packet {packet_id:?}"),
                 )
             })?;
+            let pinned = match spec_revision {
+                Some(revision) => SpecFence::Revision {
+                    revision,
+                    body_sha256: spec_sha256,
+                },
+                None => SpecFence::Sha256(spec_sha256),
+            };
             let blocking: Option<String> = tx
                 .query_row(
                     "SELECT state FROM attempts WHERE packet_id = ?1 \
@@ -200,11 +216,52 @@ impl Ledger {
                     format!("packet {packet_id:?} has a {state} attempt"),
                 ));
             }
-            if spec_sha256 != current_spec_sha256 {
-                return Err(refused(
-                    ErrorCode::SpecDrift,
-                    format!("stored spec hash differs for packet {packet_id:?}"),
-                ));
+            // THE DRIFT FENCE, and the contract it is deliberately not:
+            //
+            // The fence is the SHA-256 of the rendered spec body, never the
+            // bead's `revision`. A moved revision alone is not drift because
+            // forged's OWN bd writes move it: `bd update --claim --actor
+            // <holder>` takes the run's lease and `bd update --status open`
+            // reopens the bead, and every bd write mints a fresh revision.
+            // Fenced on the revision, the first claim after forged's own
+            // lease acquisition would refuse — on every run, forever — while
+            // the spec had not changed by one byte.
+            //
+            // `spec_revision` is PROVENANCE: which bd revision the packet was
+            // built from. Same arm and same CONTENT claims, and the row is
+            // re-pinned to the observed revision here, in this transaction,
+            // so the next reader compares against a live value rather than a
+            // dead one. The revision is opaque — equality only, never order.
+            //
+            // A moved BODY is drift whatever the revision says.
+            let repin = match (&pinned, &current) {
+                (SpecFence::Sha256(stored), SpecFence::Sha256(observed)) if stored == observed => {
+                    None
+                }
+                (
+                    SpecFence::Revision {
+                        revision: pinned_revision,
+                        body_sha256: pinned_body,
+                    },
+                    SpecFence::Revision {
+                        revision: observed_revision,
+                        body_sha256: observed_body,
+                    },
+                ) if pinned_body == observed_body => {
+                    (pinned_revision != observed_revision).then(|| observed_revision.clone())
+                }
+                _ => {
+                    return Err(refused(
+                        ErrorCode::SpecDrift,
+                        format!("stored spec fence differs for packet {packet_id:?}"),
+                    ))
+                }
+            };
+            if let Some(revision) = repin {
+                tx.execute(
+                    "UPDATE packets SET spec_revision = ?2 WHERE packet_id = ?1",
+                    rusqlite::params![packet_id, revision],
+                )?;
             }
             let claim_token = new_claim_token();
             let now = now_iso();

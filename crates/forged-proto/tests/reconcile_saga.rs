@@ -8,7 +8,7 @@ mod support;
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun};
+use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun, SpecFence};
 use forged_proto::{
     land_packet_result, reconcile, widen_rfc3339, LandOutcome, LeaseReclaim, ReconcileConfig,
 };
@@ -51,6 +51,7 @@ fn seed_run(ledger: &Ledger) -> String {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet")
@@ -62,7 +63,11 @@ async fn kill_mid_implement_revokes_and_the_same_packet_is_reclaimable() {
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     let pid = seed_run(&ledger);
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     // The session is gone: default fake liveness is Vanished, the kill
@@ -91,7 +96,11 @@ async fn kill_mid_implement_revokes_and_the_same_packet_is_reclaimable() {
     // The SAME packet is re-claimable by a successor; the packet id is
     // unchanged.
     let successor = ledger
-        .claim_packet(&pid, "claude:sess-b:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-b:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("successor claim");
     assert_ne!(successor.attempt_id, claim.attempt_id);
     assert_eq!(
@@ -110,7 +119,11 @@ async fn zombie_completion_is_refused_and_quarantined_through_the_seam() {
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     let pid = seed_run(&ledger);
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     let reclaim_ports = FakePorts::new();
@@ -179,7 +192,11 @@ async fn racing_reconcilers_converge() {
     let claim = {
         let pid = seed_run(&ledger_a);
         ledger_a
-            .claim_packet(&pid, "claude:sess-a:1", "cafe")
+            .claim_packet(
+                &pid,
+                "claude:sess-a:1",
+                &SpecFence::Sha256("cafe".to_owned()),
+            )
             .expect("claim")
     };
 
@@ -245,7 +262,11 @@ async fn crash_resume_completes_the_saga_from_the_revoking_marker() {
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     let pid = seed_run(&ledger);
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     // A reconciler crashed immediately after the durable revoke marker.
@@ -285,7 +306,11 @@ async fn an_already_released_lease_completes_the_saga_instead_of_deferring() {
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
     let pid = seed_run(&ledger);
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
     ledger
         .revoke_attempt(claim.attempt_id, "operator stop")

@@ -37,5 +37,5 @@ pub use types::{
     AttemptRow, AttemptState, ClaimedAttempt, EffectClass, EventRow, MergeSlotRow, NewPacket,
     NewRun, NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState,
     OperationTicket, PacketRow, Pragmas, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
-    RunRow, RunState, SlotOutcome, UsageRecord, UsageTotals,
+    RunRow, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };

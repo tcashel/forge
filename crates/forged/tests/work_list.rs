@@ -60,11 +60,16 @@ fn fabricate_live_seats(env: &TestEnv, run_id: &str, count: i64) {
                 seq,
                 spec_path: env.spec.to_string_lossy().into_owned(),
                 spec_sha256: sha.clone(),
+                spec_revision: None,
                 body_json: json!({"fabricated": true}).to_string(),
             })
             .expect("open packet");
         ledger
-            .claim_packet(&packet_id, &format!("forged:{packet_id}:0"), &sha)
+            .claim_packet(
+                &packet_id,
+                &format!("forged:{packet_id}:0"),
+                &forged_ledger::SpecFence::Sha256(sha.clone()),
+            )
             .expect("claim packet");
     }
     ledger.close().expect("close");
