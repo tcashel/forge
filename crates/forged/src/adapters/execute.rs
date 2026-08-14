@@ -14,7 +14,7 @@ use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
 };
-use forged_types::{Deliverable, OperationRequest, Stage, StageContract, WorkPacket};
+use forged_types::{Deliverable, OperationRequest, Outcome, Stage, StageContract, WorkPacket};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -1137,6 +1137,47 @@ pub async fn land_result(
             .and_then(Value::as_str)
             == Some("Landed");
         if landed {
+            if let Outcome::Review {
+                verdict,
+                findings,
+                available,
+                ..
+            } = &result.outcome
+            {
+                let packet_id_for_read = packet_id.to_owned();
+                let packet = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_packet(&packet_id_for_read)
+                })
+                .await?;
+                let stored = forged_proto::stored_packet(&packet).map_err(|error| {
+                    Failure::internal(format!("stored review packet does not parse: {error}"))
+                })?;
+                let execution = stored.execution.as_ref();
+                let event = json!({
+                    "schemaVersion": 1,
+                    "packetId": packet_id,
+                    "attemptId": attempt_id,
+                    "seatId": execution.map(|value| value.seat_id.as_str()),
+                    "roleId": execution.map(|value| value.role_id.as_str()),
+                    "purpose": execution.map(|value| value.purpose),
+                    "round": execution.map(|value| value.round),
+                    "stage": stored.stage,
+                    "seq": packet.seq,
+                    "verdict": verdict,
+                    "available": available,
+                    "findingCount": findings.len(),
+                });
+                let run_for_event = run_id.to_owned();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_event_once(
+                        &run_for_event,
+                        "forged.review.seat.settled",
+                        event,
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            }
             Ok(PacketOutcome::Landed(Box::new(result)))
         } else {
             Ok(PacketOutcome::Quarantined)

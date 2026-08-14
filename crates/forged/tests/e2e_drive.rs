@@ -867,9 +867,48 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         "proto.pr",
         "attempt.state",
         "proto.operation.request",
+        "forged.review.seat.settled",
     ] {
         assert!(kinds.contains(&kind), "{kind} in stream: {kinds:?}");
     }
+    let review_events = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.review.seat.settled"))
+        .collect::<Vec<_>>();
+    assert!(
+        !review_events.is_empty()
+            && review_events
+                .iter()
+                .all(|event| event["payload"]["seatId"].is_string()),
+        "each review verdict is visible as its seat settles: {review_events:?}"
+    );
+
+    let (code, summaries) = env.forged(&[
+        "events",
+        "--run",
+        "bead-e2e",
+        "--summary",
+        "--limit",
+        "1000",
+    ]);
+    assert_eq!(code, 0, "summary events: {summaries}");
+    assert_eq!(summaries["result"]["summary"], json!(true));
+    let gate = summaries["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["kind"] == json!("proto.gate"))
+        .expect("gate summary");
+    assert!(
+        gate["payload"]["rows"].is_null(),
+        "gate logs are omitted: {gate}"
+    );
+    assert!(
+        gate["payload"]["artifactPaths"].is_array(),
+        "gate artifacts remain drill-down pointers: {gate}"
+    );
 
     // run status projects the finished run.
     let (code, status) = env.forged(&["run", "status", "--run", "bead-e2e"]);

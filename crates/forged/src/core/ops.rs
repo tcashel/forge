@@ -1784,6 +1784,85 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 
 // ---------------------------------------------------------------- events
 
+const EVENT_SUMMARY_STRING_MAX: usize = 500;
+const EVENT_SUMMARY_ARRAY_MAX: usize = 8;
+const EVENT_SUMMARY_DEPTH_MAX: usize = 3;
+
+fn bounded_event_value(value: &Value, depth: usize) -> Value {
+    if depth >= EVENT_SUMMARY_DEPTH_MAX {
+        return match value {
+            Value::Array(items) => json!({"omitted": "array", "count": items.len()}),
+            Value::Object(map) => json!({"omitted": "object", "count": map.len()}),
+            other => other.clone(),
+        };
+    }
+    match value {
+        Value::String(text) => {
+            let mut chars = text.chars();
+            let shortened: String = chars.by_ref().take(EVENT_SUMMARY_STRING_MAX).collect();
+            if chars.next().is_some() {
+                json!({"text": shortened, "truncated": true, "charactersAtLeast": EVENT_SUMMARY_STRING_MAX + 1})
+            } else {
+                Value::String(text.clone())
+            }
+        }
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .take(EVENT_SUMMARY_ARRAY_MAX)
+                .map(|item| bounded_event_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > EVENT_SUMMARY_ARRAY_MAX {
+                json!({"items": values, "total": items.len(), "truncated": true})
+            } else {
+                Value::Array(values)
+            }
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), bounded_event_value(item, depth + 1)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn event_summary(kind: &str, payload: &Value) -> Value {
+    if kind != "proto.gate" {
+        return bounded_event_value(payload, 0);
+    }
+    let rows = payload
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let commands = rows
+        .iter()
+        .filter_map(|row| row.get("command").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let failed_commands = rows
+        .iter()
+        .filter(|row| row.get("exitCode").and_then(Value::as_i64) != Some(0))
+        .filter_map(|row| row.get("command").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let artifacts = rows
+        .iter()
+        .filter_map(|row| row.get("artifactPath").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    json!({
+        "schemaVersion": payload.get("schemaVersion"),
+        "phase": payload.get("phase"),
+        "seq": payload.get("seq"),
+        "passed": payload.get("passed"),
+        "commands": commands,
+        "failedCommands": failed_commands,
+        "artifactPaths": artifacts,
+    })
+}
+
 /// `events` — read-only, paginated; proto rows are validated through the
 /// replay parser on the way out.
 pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
@@ -1791,6 +1870,11 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let run = param_opt_str(&req.params, "run").map(str::to_owned);
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
         let limit = req.params.get("limit").and_then(Value::as_u64);
+        let summary = req
+            .params
+            .get("summary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let rows = {
             let run = run.clone();
             on_ledger(&ctx.ledger, move |l| {
@@ -1827,17 +1911,17 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let events: Vec<Value> = rows
             .iter()
             .map(|r| {
+                let payload = serde_json::from_str::<Value>(&r.payload_json).unwrap_or(Value::Null);
                 json!({
                     "eventId": r.event_id,
                     "ts": r.ts,
                     "runId": r.run_id,
                     "kind": r.kind,
-                    "payload": serde_json::from_str::<Value>(&r.payload_json)
-                        .unwrap_or(Value::Null),
+                    "payload": if summary { event_summary(&r.kind, &payload) } else { payload },
                 })
             })
             .collect();
-        Ok(json!({"events": events, "last_event_id": last_event_id}))
+        Ok(json!({"events": events, "last_event_id": last_event_id, "summary": summary}))
     })
     .await
 }

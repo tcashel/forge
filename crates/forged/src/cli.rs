@@ -517,6 +517,9 @@ pub struct EventsArgs {
     /// Maximum rows to return.
     #[arg(long)]
     pub limit: Option<u64>,
+    /// Return bounded payload summaries instead of embedded artifacts/logs.
+    #[arg(long)]
+    pub summary: bool,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -950,7 +953,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             request(
                 a.idempotency_key,
                 a.run.clone(),
-                json!({"run": a.run, "after": a.after, "limit": a.limit}),
+                json!({
+                    "run": a.run,
+                    "after": a.after,
+                    "limit": a.limit,
+                    "summary": a.summary,
+                }),
             ),
         ),
         Command::Overview(a) => {
