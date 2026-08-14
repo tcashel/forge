@@ -910,3 +910,322 @@ mod tests {
         assert_eq!(workspace_label_for_repo(".."), None);
     }
 }
+
+#[cfg(test)]
+mod settle_tests {
+    //! The settle path gives the seat's terminal back on the way out. That
+    //! release is bookkeeping — the ledger already holds the work — so a
+    //! herdr that refuses the close must not reach the settlement.
+
+    use std::collections::BTreeMap;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+
+    use forged_ledger::Ledger;
+    use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+    use tokio::net::UnixListener;
+
+    use super::*;
+    use crate::config::ForgedConfig;
+
+    const RUN_ID: &str = "run-release";
+    const PANE_ID: &str = "w1:p7";
+
+    /// Every method the mock was asked for, in arrival order.
+    type MethodLog = Arc<Mutex<Vec<String>>>;
+
+    /// A protocol-19 herdr that carries one seat's spawn through and REFUSES
+    /// every `pane.close`.
+    fn start_refusing_herdr(socket_path: &Path) -> MethodLog {
+        let listener = UnixListener::bind(socket_path).expect("bind mock herdr socket");
+        let seen: MethodLog = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&seen);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let (read_half, mut write_half) = stream.into_split();
+                    let mut lines = BufReader::new(read_half).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let Ok(frame) = serde_json::from_str::<Value>(&line) else {
+                            continue;
+                        };
+                        let id = frame["id"].as_str().unwrap_or_default().to_owned();
+                        let method = frame["method"].as_str().unwrap_or_default().to_owned();
+                        recorded.lock().expect("method log").push(method.clone());
+                        let frame = match method.as_str() {
+                            "ping" => json!({"id": id, "result": {"type": "pong",
+                                "version": "0.8.0", "protocol": 19, "capabilities": {}}}),
+                            "events.subscribe" | "pane.send_input" => {
+                                json!({"id": id, "result": {"type": "ok"}})
+                            }
+                            "workspace.list" => json!({"id": id, "result": {
+                                "type": "workspace_list", "workspaces": []}}),
+                            "workspace.create" => json!({"id": id, "result": {"workspace": {
+                                "workspace_id": "ws-1", "label": "forged-test"}}}),
+                            "pane.split" => json!({"id": id, "result": {"type": "pane_info",
+                                "pane": {"pane_id": PANE_ID, "workspace_id": "ws-1",
+                                "tab_id": "tab-1", "terminal_id": "term-1", "focused": false,
+                                "agent_status": "idle", "revision": 1}}}),
+                            "pane.process_info" => json!({"id": id, "result": {
+                                "type": "pane_process_info", "process_info": {
+                                "pane_id": PANE_ID, "shell_pid": 4242,
+                                "foreground_process_group_id": 4242,
+                                "foreground_processes": [], "tty": "/dev/ttys001"}}}),
+                            // The defect under test: the seat's terminal
+                            // refuses to go.
+                            "pane.close" => json!({"id": id, "error": {
+                                "code": "INTERNAL", "message": "close refused"}}),
+                            other => panic!("unexpected herdr request {other:?}"),
+                        };
+                        let mut bytes = frame.to_string().into_bytes();
+                        bytes.push(b'\n');
+                        if write_half.write_all(&bytes).await.is_err() {
+                            return;
+                        }
+                        if method != "events.subscribe" {
+                            return;
+                        }
+                    }
+                });
+            }
+        });
+        seen
+    }
+
+    /// Block until the mock has seen `method`; a dispatched request lands
+    /// asynchronously, so asserting on it without waiting would be a race.
+    async fn wait_for(seen: &MethodLog, method: &str) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while !seen.lock().expect("method log").iter().any(|m| m == method) {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "herdr never saw {method}; saw {:?}",
+                seen.lock().expect("method log")
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    }
+
+    /// The one bd call this path makes is the lease-holder READ. A stub
+    /// answering an empty envelope keeps the test off the operator's pinned
+    /// bd, and the run never reaches a bd WRITE — those take a lock under
+    /// the machine's real anvil home.
+    fn write_bd_stub(path: &Path) {
+        std::fs::write(
+            path,
+            "#!/bin/sh\nprintf '{\"schema_version\":1,\"data\":[]}\\n'\n",
+        )
+        .expect("bd stub");
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o755))
+            .expect("bd stub mode");
+    }
+
+    /// A provably dead pid: by the time an attempt settles its provider
+    /// shell has exited, so the guardian's first probe ends the guardian.
+    fn exited_provider_pid() -> u32 {
+        let mut child = std::process::Command::new("/bin/sh")
+            .arg("-c")
+            .arg("exit 0")
+            .spawn()
+            .expect("spawn a throwaway child");
+        let pid = child.id();
+        child.wait().expect("reap the throwaway child");
+        pid
+    }
+
+    /// A claude stream-json capture whose final result carries a landable
+    /// implement block.
+    fn claude_capture(packet_id: &str) -> String {
+        let result = json!({
+            "schema": "forged.result.implement/1",
+            "packetId": packet_id,
+            "outcome": {"implement": {
+                "implemented": true, "commitsAhead": 1,
+                "summary": "the seat did the work", "gateState": "pass", "note": null}},
+        });
+        let text = format!(
+            "done.\n\n```forged-result\n{}\n```\n",
+            serde_json::to_string(&result).expect("result json")
+        );
+        let init = json!({"type": "system", "subtype": "init", "session_id": "test-claude"});
+        let last = json!({"type": "result", "subtype": "success", "is_error": false,
+            "result": text, "session_id": "test-claude", "total_cost_usd": 0.01,
+            "usage": {"input_tokens": 5, "cache_read_input_tokens": 1,
+                      "cache_creation_input_tokens": 1, "output_tokens": 2}});
+        format!("{init}\n{last}\n")
+    }
+
+    /// Stand in for the provider the mock pane never actually runs: the pid
+    /// the shell would have echoed, the stream capture, and finally the
+    /// sentinel that settles the session. The status dir the host reserves
+    /// during spawn is the start signal — writing the pid before that would
+    /// race the removal of the previous attempt's file.
+    async fn play_provider(packet_dir: PathBuf, status_base: PathBuf, capture: String) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(10);
+        let session_dir = loop {
+            if let Some(entry) = std::fs::read_dir(&status_base)
+                .ok()
+                .and_then(|mut entries| entries.next())
+            {
+                break entry.expect("status dir entry").path();
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the host never reserved a status dir under {}",
+                status_base.display()
+            );
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        std::fs::write(packet_dir.join("out.jsonl"), capture).expect("stream capture");
+        std::fs::write(
+            packet_dir.join("provider.pid"),
+            exited_provider_pid().to_string(),
+        )
+        .expect("pid file");
+        std::fs::write(session_dir.join("status"), "0\n").expect("sentinel");
+    }
+
+    fn config_for(root: &Path, socket: &Path) -> ForgedConfig {
+        ForgedConfig {
+            anvil_home: root.to_path_buf(),
+            runs_root: root.join("runs"),
+            db_path: root.join("state.db"),
+            config_path: root.join("config.json"),
+            config_file_read: false,
+            roster: HashMap::new(),
+            profiles: BTreeMap::new(),
+            rosters: BTreeMap::new(),
+            default_profile: "standard".to_owned(),
+            default_roster: "default".to_owned(),
+            gate_commands: Vec::new(),
+            stage_budget_s: HashMap::new(),
+            transport_retry_budget: 3,
+            bd_path: root.join("bd"),
+            beads_dir: root.join("beads"),
+            codex_home: root.join("codex"),
+            host_policy: HostPolicy::Required,
+            herdr_sock: Some(socket.to_path_buf()),
+            pricing: crate::pricing::default_rate_card(),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_pane_close_does_not_change_what_settled() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_refusing_herdr(&socket);
+        write_bd_stub(&root.path().join("bd"));
+        std::fs::create_dir_all(root.path().join("beads")).expect("beads dir");
+
+        let ledger = Ledger::open(&root.path().join("state.db")).expect("open ledger");
+        ledger
+            .create_run(forged_ledger::NewRun {
+                run_id: forged_types::RunId::new(RUN_ID).expect("run id"),
+                bead_id: RUN_ID.to_owned(),
+                repo: root.path().to_string_lossy().into_owned(),
+                base_ref: "main".to_owned(),
+                branch: format!("forged/{RUN_ID}"),
+            })
+            .expect("create run");
+        let run = ledger.get_run(RUN_ID).expect("run row");
+
+        let spec_path = root.path().join("spec.md");
+        std::fs::write(&spec_path, "# spec\n").expect("spec");
+        let spec_sha = sha256_file(&spec_path).expect("spec sha");
+
+        let ctx = Ctx {
+            config: config_for(root.path(), &socket),
+            ledger: ledger.clone(),
+        };
+        let ports = ForgedPorts::new(ledger.clone(), ctx.config.clone());
+        // Required, not Preferred: a fallback to the process host would
+        // silently skip the very release this test is about.
+        let exec = ExecutionContext {
+            pr_number: None,
+            findings: Vec::new(),
+            review_evidence: Vec::new(),
+            push_url: String::new(),
+            host_policy: HostPolicy::Required,
+            herdr_socket: Some(socket.clone()),
+        };
+        let intent = PacketIntent {
+            stage: Stage::Implement,
+            seq: 1,
+            hints: forged_types::ProviderHints {
+                provider: "claude".to_owned(),
+                model: "claude-test".to_owned(),
+                effort: None,
+                sandbox: forged_types::Sandbox::WorkspaceWrite,
+            },
+            execution: None,
+            packet_id: None,
+        };
+        let packet = build_packet(
+            &ctx,
+            &run,
+            &intent,
+            &spec_path.to_string_lossy(),
+            &spec_sha,
+            &[],
+            600,
+        );
+        std::fs::create_dir_all(&packet.worktree).expect("worktree");
+        let packet_id = ledger
+            .open_packet(forged_ledger::NewPacket {
+                run_id: RUN_ID.to_owned(),
+                stage: Stage::Implement,
+                seq: 1,
+                spec_path: packet.spec.path.clone(),
+                spec_sha256: spec_sha.clone(),
+                body_json: serde_json::to_string(&packet).expect("packet json"),
+            })
+            .expect("open packet");
+        assert_eq!(packet_id, packet.packet_id);
+        let claimed = ledger
+            .claim_packet(
+                &packet_id,
+                &session_claimant(&packet_id, "claude"),
+                &spec_sha,
+            )
+            .expect("claim packet");
+
+        let packet_dir = ctx.config.packet_dir_key(RUN_ID, "implement", 1);
+        std::fs::create_dir_all(&packet_dir).expect("packet dir");
+        tokio::spawn(play_provider(
+            packet_dir.clone(),
+            packet_dir
+                .join("status")
+                .join(claimed.attempt_id.to_string()),
+            claude_capture(&packet_id),
+        ));
+
+        let outcome = run_attempt(
+            &ctx,
+            &ports,
+            &exec,
+            &packet,
+            claimed.attempt_id,
+            &claimed.claim_token,
+        )
+        .await
+        .expect("the attempt settles");
+
+        // The close really was attempted, and really was refused...
+        wait_for(&seen, "pane.close").await;
+        // ...and the settlement is exactly the one the provider earned.
+        match outcome {
+            PacketOutcome::Landed(result) => assert_eq!(result.packet_id, packet_id),
+            other => panic!("a refused close changed the outcome: {other:?}"),
+        }
+        let attempt = ledger.get_attempt(claimed.attempt_id).expect("attempt row");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Completed);
+        assert!(
+            attempt
+                .result_json
+                .is_some_and(|json| json.contains("the seat did the work")),
+            "the ledger must hold the result the seat reported"
+        );
+    }
+}
