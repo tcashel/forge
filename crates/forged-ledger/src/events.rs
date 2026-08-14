@@ -1,6 +1,8 @@
 //! The append-only event stream. There are no UPDATE or DELETE code paths
 //! for `events` — append-only, with `event_id` monotonic.
 
+use std::collections::BTreeMap;
+
 use rusqlite::{Connection, TransactionBehavior};
 
 use crate::error::LedgerError;
@@ -23,6 +25,52 @@ pub(crate) fn append_event_tx(
         rusqlite::params![now_iso(), run_id, kind, payload_json],
     )?;
     Ok(())
+}
+
+fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
+    Ok(EventRow {
+        event_id: row.get(0)?,
+        ts: row.get(1)?,
+        run_id: row.get(2)?,
+        kind: row.get(3)?,
+        payload_json: row.get(4)?,
+    })
+}
+
+/// The newest event per run inside the caller's transaction — see
+/// [`Ledger::latest_event_per_run`] for the contract.
+pub(crate) fn latest_event_per_run_tx(
+    conn: &Connection,
+) -> Result<BTreeMap<String, EventRow>, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+         WHERE event_id IN \
+           (SELECT MAX(event_id) FROM events WHERE run_id IS NOT NULL GROUP BY run_id) \
+         ORDER BY event_id ASC",
+    )?;
+    let rows = statement.query_map([], event_row)?;
+    let mut latest = BTreeMap::new();
+    for row in rows {
+        let row = row?;
+        if let Some(run_id) = row.run_id.clone() {
+            latest.insert(run_id, row);
+        }
+    }
+    Ok(latest)
+}
+
+/// All rows of one kind inside the caller's transaction — see
+/// [`Ledger::list_events_by_kind`] for the contract.
+pub(crate) fn list_events_by_kind_tx(
+    conn: &Connection,
+    kind: &str,
+) -> Result<Vec<EventRow>, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+         WHERE kind = ?1 ORDER BY event_id ASC",
+    )?;
+    let rows = statement.query_map([kind], event_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 impl Ledger {
@@ -138,27 +186,23 @@ impl Ledger {
         })
     }
 
+    /// The newest event per run, keyed by `run_id`; rows with a NULL
+    /// `run_id` are excluded — they belong to no unit of work.
+    ///
+    /// Newest is the greatest `event_id`, the append position, never the
+    /// `ts` string: two events written in the same second must not resolve
+    /// by luck. One aggregate answers every run, so a caller projecting the
+    /// whole inventory never queries per run.
+    pub fn latest_event_per_run(&self) -> Result<BTreeMap<String, EventRow>, LedgerError> {
+        self.submit(move |conn| latest_event_per_run_tx(conn))
+    }
+
     /// All rows of one event kind, ordered by append position.
     ///
     /// Upgrade projectors use this indexed seam instead of rescanning the
     /// complete event history on every process start.
     pub fn list_events_by_kind(&self, kind: &str) -> Result<Vec<EventRow>, LedgerError> {
         let kind = kind.to_owned();
-        self.submit(move |conn| {
-            let mut statement = conn.prepare(
-                "SELECT event_id, ts, run_id, kind, payload_json FROM events \
-                 WHERE kind = ?1 ORDER BY event_id ASC",
-            )?;
-            let rows = statement.query_map([kind], |row| {
-                Ok(EventRow {
-                    event_id: row.get(0)?,
-                    ts: row.get(1)?,
-                    run_id: row.get(2)?,
-                    kind: row.get(3)?,
-                    payload_json: row.get(4)?,
-                })
-            })?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })
+        self.submit(move |conn| list_events_by_kind_tx(conn, &kind))
     }
 }

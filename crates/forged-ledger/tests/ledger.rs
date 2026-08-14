@@ -149,6 +149,203 @@ fn event_kind_once_rejects_a_competing_payload() {
 }
 
 #[test]
+fn latest_event_per_run_reports_the_newest_append_per_run() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let quiet = make_run(&ledger, "run-quiet");
+    let busy = make_run(&ledger, "run-busy");
+    // A run-less event belongs to no unit of work and is excluded.
+    ledger
+        .append_event(None, "global.note", json!({"n": 0}))
+        .expect("run-less event");
+    ledger
+        .append_event(Some(&quiet), "run.note", json!({"n": 1}))
+        .expect("quiet event");
+    for n in 1..=3 {
+        ledger
+            .append_event(Some(&busy), "run.note", json!({"n": n}))
+            .expect("busy event");
+    }
+
+    let latest = ledger.latest_event_per_run().expect("latest per run");
+    assert_eq!(
+        latest.len(),
+        2,
+        "one row per run, none run-less: {latest:?}"
+    );
+    let newest = latest.get(&busy).expect("busy run");
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&newest.payload_json).expect("payload"),
+        json!({"n": 3}),
+        "the greatest event_id wins"
+    );
+    assert!(newest.event_id > latest[&quiet].event_id);
+    ledger.close().expect("close");
+}
+
+/// The snapshot is the projection's ONLY read, so it must agree — source
+/// for source — with the per-source calls it replaces.
+#[test]
+fn inventory_snapshot_agrees_with_the_calls_it_replaces() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-snap");
+    let bare = make_run(&ledger, "run-snap-bare");
+    let packet = ledger.open_packet(new_packet(&run)).expect("open packet");
+    ledger
+        .claim_packet(&packet, "codex:1", "beef")
+        .expect("claim packet");
+    ledger
+        .record_usage(NewUsage {
+            run_id: run.clone(),
+            packet_id: Some(packet.clone()),
+            attempt_id: Some(1),
+            provider: "codex".to_owned(),
+            model: "gpt".to_owned(),
+            input_tokens: 10,
+            output_tokens: 20,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: Some(0.5),
+            pricing_basis: None,
+            rate_limit_used_percent: None,
+            web_search_requests: None,
+        })
+        .expect("record usage");
+    ledger
+        .append_event(Some(&run), "forged.epic.paused", json!({"reason": "hold"}))
+        .expect("paused");
+
+    let snapshot = ledger
+        .inventory_snapshot(&["forged.epic.paused", "forged.epic.resumed"])
+        .expect("snapshot");
+    assert_eq!(snapshot.runs, ledger.list_runs().expect("runs"));
+    assert_eq!(
+        snapshot.live_attempts,
+        ledger.list_live_attempts(None).expect("live attempts")
+    );
+    assert_eq!(
+        snapshot.latest_event,
+        ledger.latest_event_per_run().expect("latest per run")
+    );
+    assert_eq!(
+        snapshot.events("forged.epic.paused"),
+        ledger
+            .list_events_by_kind("forged.epic.paused")
+            .expect("paused rows")
+    );
+    // A kind with no rows is an empty scan, not a missing key; a kind the
+    // snapshot was never asked for reads the same way.
+    assert!(snapshot.events("forged.epic.resumed").is_empty());
+    assert!(snapshot.events("forged.epic.pr").is_empty());
+    assert_eq!(
+        snapshot.usage_totals.get(&run),
+        Some(&ledger.usage_totals(&run).expect("totals"))
+    );
+    // Absent, not zero-valued: a run with no usage rows has no group.
+    assert_eq!(snapshot.usage_totals.get(&bare), None);
+    assert_eq!(
+        ledger
+            .usage_totals(&bare)
+            .expect("bare totals")
+            .cost_usd_known,
+        0.0
+    );
+    ledger.close().expect("close");
+}
+
+/// The regression the one-transaction snapshot exists to prevent: read as
+/// separate jobs, a lifecycle append landing between two of them leaves the
+/// newest event for a run OUTSIDE the kind scans that derive that run's
+/// state, so the projected `state` contradicts the projected `updatedAt`.
+///
+/// The writer is a second connection on the same file — a second forged
+/// process, which is what actually races the reader — and the assertion is
+/// the snapshot's internal consistency, never a wall-clock ordering, so
+/// this cannot flake on a slow machine.
+#[test]
+fn inventory_snapshot_never_tears_under_a_concurrent_writer() {
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    const KINDS: [&str; 2] = ["forged.epic.paused", "forged.epic.resumed"];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let ledger = Ledger::open(&path).expect("open reader");
+    let run = make_run(&ledger, "run-churn");
+
+    let stop = Arc::new(AtomicBool::new(false));
+    let appended = Arc::new(AtomicUsize::new(0));
+    let writer = {
+        let path = path.clone();
+        let run = run.clone();
+        let stop = Arc::clone(&stop);
+        let appended = Arc::clone(&appended);
+        std::thread::spawn(move || {
+            let writer = Ledger::open(&path).expect("open writer");
+            let mut n = 0usize;
+            while !stop.load(Ordering::Relaxed) {
+                writer
+                    .append_event(Some(&run), KINDS[n % 2], json!({"reason": format!("h{n}")}))
+                    .expect("append lifecycle event");
+                appended.fetch_add(1, Ordering::Relaxed);
+                n += 1;
+            }
+            writer.close().expect("close writer");
+        })
+    };
+
+    // Read until enough snapshots have caught a lifecycle event — the bound
+    // is a backstop, not the target, so a slow writer costs reads, not a
+    // false pass.
+    let mut observed = 0usize;
+    for _ in 0..2_000 {
+        if observed >= 100 {
+            break;
+        }
+        let snapshot = ledger.inventory_snapshot(&KINDS).expect("snapshot");
+        let Some(latest) = snapshot.latest_event.get(&run) else {
+            // `create_run` appends nothing, so the very first reads can
+            // legitimately precede the writer's first append.
+            continue;
+        };
+        let scanned = KINDS
+            .iter()
+            .flat_map(|kind| snapshot.events(kind))
+            .map(|event| event.event_id)
+            .max();
+        // Nothing a kind scan saw may post-date the newest event...
+        assert!(
+            scanned.is_none_or(|id| id <= latest.event_id),
+            "kind scan {scanned:?} ran ahead of latest_event {}",
+            latest.event_id
+        );
+        // ...and once the newest event IS a lifecycle kind, the scans must
+        // contain that very row. A torn read is exactly its absence.
+        if KINDS.contains(&latest.kind.as_str()) {
+            observed += 1;
+            assert_eq!(
+                scanned,
+                Some(latest.event_id),
+                "latest_event {} ({}) is missing from the kind scans",
+                latest.event_id,
+                latest.kind
+            );
+        }
+    }
+    stop.store(true, Ordering::Relaxed);
+    writer.join().expect("writer thread");
+
+    assert!(
+        appended.load(Ordering::Relaxed) > 0,
+        "the writer never raced the reader"
+    );
+    assert!(observed > 0, "no snapshot ever saw a lifecycle event");
+    ledger.close().expect("close");
+}
+
+#[test]
 fn idempotency_replays_byte_identically() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

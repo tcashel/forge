@@ -129,6 +129,19 @@ fn insert_run(
     get_run_tx(tx, run_id)
 }
 
+/// Every run row inside the caller's transaction, ordered by `created_at`
+/// then rowid ascending.
+pub(crate) fn list_runs_tx(conn: &Connection) -> Result<Vec<RunRow>, LedgerError> {
+    let sql = format!("SELECT {RUN_COLUMNS} FROM runs ORDER BY created_at, rowid");
+    let mut stmt = conn.prepare(&sql)?;
+    let rows = stmt.query_map([], run_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn get_run_tx(conn: &Connection, run_id: &str) -> Result<RunRow, LedgerError> {
     let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
     conn.query_row(&sql, [run_id], run_row)
@@ -669,16 +682,7 @@ impl Ledger {
 
     /// All runs, ordered by `created_at` then rowid ascending.
     pub fn list_runs(&self) -> Result<Vec<RunRow>, LedgerError> {
-        self.submit(move |conn| {
-            let sql = format!("SELECT {RUN_COLUMNS} FROM runs ORDER BY created_at, rowid");
-            let mut stmt = conn.prepare(&sql)?;
-            let rows = stmt.query_map([], run_row)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
+        self.submit(move |conn| list_runs_tx(conn))
     }
 
     /// Transition a run between `active` and `stopped`.
