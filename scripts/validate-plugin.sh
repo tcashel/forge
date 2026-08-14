@@ -154,9 +154,9 @@ skill_files=("$plugin"/skills/*/SKILL.md)
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
-rg -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
+grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"
-rg -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md" \
+grep -Fq '../../bootstrap/install-beads.sh' "$plugin/skills/setup/SKILL.md" \
   && pass "setup resolves the shared bootstrap" || fail "setup resolves the shared bootstrap"
 
 legacy=(
@@ -187,7 +187,7 @@ check "epic reconnect and resume command surface" check_reconnect_surface \
   "forged events --run" "forged epic resolve --epic" \
   "forged epic submit --epic"
 
-if rg -n --glob '*.md' --glob '*.sh' \
+if grep -Ern --include='*.md' --include='*.sh' \
   '(\.anvil/specs|--spec([[:space:]]|`)|bd create --repo|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
   "$plugin"; then
   fail "no legacy spec-file, repo-routing, Workflow, or watch contract"
@@ -195,7 +195,7 @@ else
   pass "no legacy spec-file, repo-routing, Workflow, or watch contract"
 fi
 
-if rg -ni --glob '*.md' --glob '*.json' --glob '*.sh' \
+if grep -Erni --include='*.md' --include='*.json' --include='*.sh' \
   '(jira|atlassian)' "$plugin"; then
   fail "no external tracker client, instructions, or credentials"
 else
@@ -203,12 +203,12 @@ else
 fi
 
 for needle in 'metadata.repository' 'description' 'design' 'acceptance_criteria' 'notes' '--parent'; do
-  rg -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
+  grep -Fq -- "$needle" "$plugin/skills/plan/SKILL.md" \
     && pass "native plan contract: $needle" || fail "native plan contract: $needle"
 done
-rg -Fq 'BEADS_DIR' "$plugin/skills/setup/SKILL.md" \
+grep -Fq 'BEADS_DIR' "$plugin/skills/setup/SKILL.md" \
   && pass "setup preserves BEADS_DIR" || fail "setup preserves BEADS_DIR"
-rg -Fq 'ANVIL_HOME' "$plugin/skills/setup/SKILL.md" \
+grep -Fq 'ANVIL_HOME' "$plugin/skills/setup/SKILL.md" \
   && pass "setup preserves ANVIL_HOME" || fail "setup preserves ANVIL_HOME"
 
 if [[ $failures -gt 0 ]]; then exit 1; fi
