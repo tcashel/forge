@@ -612,12 +612,15 @@ async fn settle_host_fallback(
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
+    // Both notes name the seam; the PREFIX carries the recoverable split, so
+    // the row stays diagnosable either way rather than reading as a generic
+    // pre-spawn refusal.
     settle_unspawned(
         ctx,
         packet_id,
         claim_token,
         format!("transport: the host fallback could not be recorded: {failure}"),
-        format!("unspawned: attempt refused before spawn: {failure}"),
+        format!("unspawned: the host fallback could not be recorded: {failure}"),
         failure,
     )
     .await

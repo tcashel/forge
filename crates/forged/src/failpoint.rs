@@ -3,11 +3,13 @@
 //! carries no failpoint code.
 //!
 //! `FORGED_FAILPOINT=<site>` names exactly one site; `FORGED_FAILPOINT_MODE`
-//! is `pause` (default) or `crash`. `pause` requires `FORGED_FAILPOINT_DIR`:
-//! the process creates `<site>.reached` there and blocks until
-//! `<site>.release` exists (polled ~50 ms); the test synchronizes on
-//! `.reached` and releases by creating `.release`. `crash` calls
-//! `std::process::abort()` at the site.
+//! is `pause` (default), `crash`, or `fail`. `pause` requires
+//! `FORGED_FAILPOINT_DIR`: the process creates `<site>.reached` there and
+//! blocks until `<site>.release` exists (polled ~50 ms); the test
+//! synchronizes on `.reached` and releases by creating `.release`. `crash`
+//! calls `std::process::abort()` at the site. `fail` is read by
+//! [`injected`] rather than [`hit`], and makes the site return an error
+//! instead of succeeding.
 //!
 //! Sites are fixed strings at forged-owned boundaries only:
 //! `op.begin.before`, `op.begin.after`, `packet.materialize.before`,
@@ -25,6 +27,12 @@
 //! `controller.record.after` is the handoff equivalent: the detached
 //! controller identity is on disk, but its event and operation response are
 //! not yet durable in the ledger.
+//!
+//! `fail`-mode sites are separate, and exist for the seams whose OWN failure
+//! is the contract and which no external condition can provoke:
+//! `host.fallback.record` is the ledger write that makes a preferred-Herdr
+//! fallback visible, sitting post-claim and pre-spawn where nothing may
+//! propagate over a `running` attempt row.
 
 /// Hit a failpoint site. A no-op unless the `failpoints` feature is on AND
 /// `FORGED_FAILPOINT` names this exact site.
@@ -41,8 +49,25 @@ pub fn hit(site: &str) {
         .unwrap_or_else(|| "pause".to_owned());
     match mode.as_str() {
         "crash" => std::process::abort(),
+        // A `fail`-armed site is consumed by `injected`, never here: the two
+        // read the same variables and must not both act on one arming.
+        "fail" => (),
         _ => pause(site),
     }
+}
+
+/// Whether this site is armed to INJECT A FAILURE: `Some(detail)` when
+/// `FORGED_FAILPOINT` names this exact site and `FORGED_FAILPOINT_MODE` is
+/// `fail`. The caller mints the error, because only the caller knows what
+/// failing there means.
+#[cfg(feature = "failpoints")]
+pub fn injected(site: &str) -> Option<String> {
+    let armed = std::env::var_os("FORGED_FAILPOINT")?;
+    if armed.to_string_lossy() != site {
+        return None;
+    }
+    let mode = std::env::var_os("FORGED_FAILPOINT_MODE")?;
+    (mode.to_string_lossy() == "fail").then(|| format!("failpoint {site}: injected failure"))
 }
 
 #[cfg(feature = "failpoints")]
@@ -71,3 +96,10 @@ fn pause(site: &str) {
 #[cfg(not(feature = "failpoints"))]
 #[inline(always)]
 pub fn hit(_site: &str) {}
+
+/// Whether this site is armed to inject a failure (feature off: never).
+#[cfg(not(feature = "failpoints"))]
+#[inline(always)]
+pub fn injected(_site: &str) -> Option<String> {
+    None
+}

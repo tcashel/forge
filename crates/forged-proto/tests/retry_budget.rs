@@ -62,7 +62,7 @@ fn concurrent_charges_each_land_on_their_own_count() {
     let rows = grants(reader);
     assert_eq!(rows.len(), CHARGERS, "one grant appended per charge");
     assert_eq!(
-        transport_failures_of(&rows, &packet),
+        transport_failures_of(&rows, &packet).expect("replayable"),
         u32::try_from(CHARGERS).expect("small"),
         "the standing count is the number of charges, not fewer"
     );
@@ -70,7 +70,10 @@ fn concurrent_charges_each_land_on_their_own_count() {
     // A packet that was never charged reads zero, and charging one packet
     // never charges another.
     let untouched = format!("{RUN}/fix/1");
-    assert_eq!(transport_failures_of(&rows, &untouched), 0);
+    assert_eq!(
+        transport_failures_of(&rows, &untouched).expect("replayable"),
+        0
+    );
     assert_eq!(
         grant_retry(reader, RUN, &untouched, T0).expect("charge"),
         1,
@@ -113,5 +116,40 @@ fn a_grant_carries_the_backoff_deadline_its_own_count_earns() {
             "the schedule this test pins"
         );
     }
+    ledger.close().expect("close");
+}
+
+#[test]
+fn a_stream_that_will_not_replay_refuses_the_charge_instead_of_restarting_it() {
+    // The pre-fix race is durable: two chargers that both observed `n` wrote
+    // two grants under the logical key `retry/<packet>/<n+1>` carrying
+    // different deadlines, and `parse_proto_events` refuses that pair. Read
+    // as no history, the next charge re-grants count 1 and the budget stops
+    // bounding on exactly the state that proves it was needed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let packet = format!("{RUN}/implement/1");
+
+    let colliding = |retry_after: &str| {
+        serde_json::json!({
+            "schemaVersion": 1,
+            "packetId": packet,
+            "transportFailures": 4,
+            "retryAfter": retry_after,
+        })
+    };
+    for deadline in [
+        "2026-08-12T00:00:30.000000000Z",
+        "2026-08-12T00:01:30.000000000Z",
+    ] {
+        ledger
+            .append_event(Some(RUN), "proto.retry", colliding(deadline))
+            .expect("plant the pre-fix pair");
+    }
+
+    let rows = grants(&ledger);
+    transport_failures_of(&rows, &packet).expect_err("an unreplayable stream is not zero history");
+    grant_retry(&ledger, RUN, &packet, T0).expect_err("and it is never re-granted from zero");
+    assert_eq!(grants(&ledger).len(), 2, "a refused charge appends nothing");
     ledger.close().expect("close");
 }

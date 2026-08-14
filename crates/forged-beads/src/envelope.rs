@@ -38,8 +38,26 @@ pub(crate) struct Lenient {
     pub error: Option<String>,
     /// Whether stdout parsed as JSON at all.
     pub parsed: bool,
+    /// Whether the `schema_version` key was PRESENT at all (only meaningful
+    /// when `parsed`).
+    pub schema_declared: bool,
     /// Whether `schema_version` equalled 1 (only meaningful when `parsed`).
     pub schema_ok: bool,
+}
+
+impl Lenient {
+    /// Whether bd ANSWERED under a `schema_version` this build does not read:
+    /// the key was present and was not 1.
+    ///
+    /// Deliberately narrower than `!schema_ok`, which is also false for
+    /// stdout carrying no envelope at all — bare JSON from a child that never
+    /// saw `BD_JSON_ENVELOPE=1` declares no version and says nothing about
+    /// bd's dialect. Only a DECLARED, unreadable version is bd reporting its
+    /// own upgrade, and only that is terminal no matter what else the payload
+    /// says.
+    pub(crate) fn unsupported_schema(&self) -> bool {
+        self.parsed && self.schema_declared && !self.schema_ok
+    }
 }
 
 /// Parse stdout leniently: a non-JSON or wrong-schema payload is recorded,
@@ -47,13 +65,15 @@ pub(crate) struct Lenient {
 pub(crate) fn parse_lenient(stdout: &str) -> Lenient {
     match serde_json::from_str::<Value>(stdout) {
         Ok(v) => {
-            let schema_ok = v.get("schema_version").and_then(Value::as_i64) == Some(1);
+            let declared = v.get("schema_version");
+            let schema_ok = declared.and_then(Value::as_i64) == Some(1);
             let error = extract_error(&v);
             let data = v.get("data").cloned();
             Lenient {
                 data,
                 error,
                 parsed: true,
+                schema_declared: declared.is_some(),
                 schema_ok,
             }
         }
@@ -61,6 +81,7 @@ pub(crate) fn parse_lenient(stdout: &str) -> Lenient {
             data: None,
             error: None,
             parsed: false,
+            schema_declared: false,
             schema_ok: false,
         },
     }
@@ -130,6 +151,22 @@ mod tests {
         let ok = parse_lenient(r#"{"data": {}, "schema_version": 1}"#);
         assert!(ok.parsed);
         assert!(ok.schema_ok);
+    }
+
+    #[test]
+    fn only_a_declared_version_reports_a_dialect_this_build_cannot_read() {
+        // `!schema_ok` conflates two different worlds and only one of them is
+        // bd answering: an upgraded bd DECLARES its version, and a child that
+        // never saw `BD_JSON_ENVELOPE=1` declares none.
+        assert!(parse_lenient(r#"{"data": {}, "schema_version": 2}"#).unsupported_schema());
+        let bare = parse_lenient(r#"{"id": "beads-1al"}"#);
+        assert!(!bare.schema_ok, "no version key is not version 1");
+        assert!(
+            !bare.unsupported_schema(),
+            "an envelope-less payload says nothing about bd's dialect"
+        );
+        assert!(!parse_lenient("Error: not JSON").unsupported_schema());
+        assert!(!parse_lenient(r#"{"data": {}, "schema_version": 1}"#).unsupported_schema());
     }
 
     #[test]

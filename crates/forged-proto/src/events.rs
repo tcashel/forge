@@ -366,7 +366,11 @@ pub fn record(ledger: &Ledger, run_id: &str, event: ProtoEvent) -> Result<(), Pr
 /// `ended_at` where an attempt row exists, and now where none does (a
 /// pre-claim failure has no claim token to fence an attempt with).
 ///
-/// Returns the count this charge landed on.
+/// Returns the count this charge landed on, and REFUSES — appending nothing,
+/// the transaction rolled back — when the standing grants cannot be replayed.
+/// The alternative is worse than an error: a stream that reads as no history
+/// re-grants count 1 on every charge, so the budget stops bounding exactly
+/// where it is load-bearing.
 pub fn grant_retry(
     ledger: &Ledger,
     run_id: &str,
@@ -376,21 +380,16 @@ pub fn grant_retry(
     let owned_packet = packet_id.to_owned();
     let since = since.to_owned();
     let payload = ledger.append_event_derived(run_id, RETRY_KIND, move |standing| {
-        let count = transport_failures_of(standing, &owned_packet).saturating_add(1);
-        let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(|err| {
-            forged_ledger::LedgerError::Internal {
-                message: err.to_string(),
-            }
-        })?;
+        let standing = transport_failures_of(standing, &owned_packet).map_err(internal)?;
+        let count = standing.saturating_add(1);
+        let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
         ProtoEvent::Retry {
             packet_id: owned_packet.clone(),
             transport_failures: count,
             retry_after,
         }
         .payload()
-        .map_err(|err| forged_ledger::LedgerError::Internal {
-            message: err.to_string(),
-        })
+        .map_err(internal)
     })?;
     payload["transportFailures"]
         .as_u64()
@@ -398,11 +397,30 @@ pub fn grant_retry(
         .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
 }
 
+/// Carry a proto-side refusal out through the derive closure, which owes the
+/// ledger a `LedgerError`.
+fn internal(err: ProtoError) -> forged_ledger::LedgerError {
+    forged_ledger::LedgerError::Internal {
+        message: err.to_string(),
+    }
+}
+
 /// A packet's standing transport-failure count, from the latest `proto.retry`
-/// grant among `rows`. Zero when the packet has never been charged.
-pub fn transport_failures_of(rows: &[EventRow], packet_id: &str) -> u32 {
-    parse_proto_events(rows)
-        .unwrap_or_default()
+/// grant among `rows`. `Ok(0)` when the packet has never been charged.
+///
+/// REFUSES a stream it cannot replay rather than reading it as no history.
+/// [`parse_proto_events`] is all-or-nothing, and the two ways it refuses are
+/// both live in existing `state.db` files: a malformed payload, and two
+/// grants sharing the logical key `retry/<packet>/<count>` with differing
+/// deadlines — exactly what concurrent chargers wrote before [`grant_retry`]
+/// took the count and the append in one transaction. Defaulted to zero, each
+/// such charge would re-grant count 1 and the bounded budget would stop
+/// bounding precisely where it is needed. Every other reader of the stream —
+/// `project_run` above all — already refuses it, so a run this returns an
+/// error for is one that has already stopped advancing; the writer must not
+/// act on a more permissive reading than the reader's.
+pub fn transport_failures_of(rows: &[EventRow], packet_id: &str) -> Result<u32, ProtoError> {
+    Ok(parse_proto_events(rows)?
         .iter()
         .rev()
         .find_map(|event| match event {
@@ -413,7 +431,7 @@ pub fn transport_failures_of(rows: &[EventRow], packet_id: &str) -> u32 {
             } if charged == packet_id => Some(*transport_failures),
             _ => None,
         })
-        .unwrap_or(0)
+        .unwrap_or(0))
 }
 
 /// Normalize an RFC-3339 UTC string (as jiff displays it) to the ledger's

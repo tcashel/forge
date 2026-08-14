@@ -1163,6 +1163,97 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
     );
 }
 
+#[test]
+fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagating() {
+    // The OTHER door onto the same pre-spawn stretch, and the one the
+    // required/no-socket case above never opens. Under the PREFERRED policy a
+    // missing Herdr endpoint is not a failure — it is a fallback, made
+    // visible in the ledger before the plain process starts — so the failure
+    // under test is that write's own, with the attempt already `running` and
+    // no process behind it. Left to propagate, the row outlives the seat it
+    // never got and both the re-claim and the re-pin that would clear the
+    // cause are blocked behind it.
+    let env = TestEnv::new("km9d");
+    start_bead_run(&env, "bead-k9d");
+    let packet = advance_to_open_packet(&env, "bead-k9d");
+
+    // Preferred is the configured default and the socket path is derived, so
+    // an absent Herdr answers by refusing the connection: the fallback arm.
+    let out = env
+        .forged_cmd(&["run", "advance", "--run", "bead-k9d"])
+        .env("FORGED_FAILPOINT", "host.fallback.record")
+        .env("FORGED_FAILPOINT_MODE", "fail")
+        .output()
+        .expect("forged binary spawns");
+    assert_ne!(
+        out.status.code(),
+        Some(0),
+        "an unrecoverable pre-spawn refusal still reaches the caller: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let attempt = assert_retired_unspawned(&env, "bead-k9d");
+    let note = attempt.fail_note.clone().unwrap_or_default();
+    assert!(
+        note.contains("host fallback"),
+        "the note names the cause it settled for: {note}"
+    );
+
+    // Charged to the packet's bounded budget, exactly as every other
+    // pre-spawn settlement is: the cause is unrecoverable, so the budget is
+    // what bounds a run that would otherwise re-enter it forever.
+    let ledger = env.ledger();
+    let grants: Vec<Value> = ledger
+        .list_events(Some("bead-k9d"), 0, 4096)
+        .expect("events")
+        .into_iter()
+        .filter(|row| row.kind == "proto.retry")
+        .map(|row| serde_json::from_str(&row.payload_json).expect("retry payload"))
+        .collect();
+    ledger.close().expect("close");
+    assert_eq!(
+        grants.last().map(|grant| grant["packetId"].clone()),
+        Some(json!(packet.packet_id)),
+        "the attempt is charged to its packet's bounded budget: {grants:?}"
+    );
+
+    // Nothing was spawned, and no fallback was announced that never happened.
+    assert!(
+        !env.provider_log()
+            .iter()
+            .any(|line| line.starts_with(&packet.packet_id)),
+        "the settlement must precede any spawn: {:?}",
+        env.provider_log()
+    );
+
+    // And no fallback was announced: the event is what makes a plain process
+    // legible as a downgrade, so a run whose seat never started must not
+    // carry one. Nor may the packet be wedged — the next advance is a clean
+    // no-op standing on the granted backoff, not a re-entry into the failure.
+    let (_, events) = env.forged(&["events", "--run", "bead-k9d", "--limit", "1000"]);
+    let kinds: Vec<&str> = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter_map(|event| event["kind"].as_str())
+        .collect();
+    assert!(
+        !kinds.contains(&"forged.host.fallback"),
+        "a refused write announces nothing: {kinds:?}"
+    );
+    let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-k9d"]);
+    assert_eq!(
+        code, 0,
+        "the run stands on its budget, not wedged: {advanced}"
+    );
+    let states = attempt_states(&env, "bead-k9d");
+    assert_eq!(
+        states.len(),
+        1,
+        "the backoff is honored rather than re-entered: {states:?}"
+    );
+}
+
 // ---------------------------------------------------- the embedded-bd case
 
 #[test]
