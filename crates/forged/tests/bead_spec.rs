@@ -156,10 +156,44 @@ fn a_bead_with_no_spec_fields_is_refused_by_name_at_run_start() {
             "the refusal must name the empty required field {field:?}: {message}"
         );
     }
+    for commentary in ["design", "notes"] {
+        assert!(
+            !message.contains(commentary),
+            "commentary is not required and must not be named: {message}"
+        );
+    }
+
+    // Half a spec is refused too, and names only the half that is missing.
+    env.set_bead_field("bead-half", "title", "half a bead");
+    env.set_bead_field("bead-half", "status", "open");
+    env.set_bead_field("bead-half", "description", DESCRIPTION);
+    let (code, half) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-half",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(code, 0, "a bead with no acceptance is refused: {half}");
+    let message = half["error"]["message"].as_str().unwrap_or_default();
+    assert!(message.contains("bead-half"), "{message}");
+    assert!(
+        message.contains("acceptance_criteria is empty"),
+        "the one empty required field is named: {message}"
+    );
+    assert!(
+        !message.contains("description"),
+        "a populated field is never named: {message}"
+    );
+
     // And nothing was created: an empty spec never reaches a seat because
     // the run never exists.
     let ledger = env.ledger();
     assert!(ledger.get_run("bead-empty").is_err(), "no run row");
+    assert!(ledger.get_run("bead-half").is_err(), "no run row");
     ledger.close().expect("close");
 }
 
@@ -229,6 +263,62 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
     assert!(
         seat_body.contains("## Acceptance Criteria") && seat_body.contains(ACCEPTANCE),
         "an externally claimed seat must find its rendered spec: {seat_body}"
+    );
+}
+
+#[test]
+fn a_bead_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body() {
+    // The wedge this closes: `honor_await`'s claim-again branch reached
+    // `execute_packet` without ever re-opening the packet, so a packet whose
+    // bead moved underneath it refused `SpecDrift` on the fence and then
+    // retried the identical refusal, forever, with no path back.
+    let env = TestEnv::new("forged-bead-spec-recover");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-recovered", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-recovered",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    let packet = advance_to_open_packet(&env, "bead-recovered");
+    let opened_at = packet.spec_sha256.clone();
+
+    // The operator revises the spec while the packet is open and unclaimed.
+    env.set_bead_field("bead-recovered", "acceptance", "- revised acceptance");
+
+    // One advance: the claim-again branch re-pins the packet and claims it.
+    let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-recovered"]);
+    assert_eq!(
+        code, 0,
+        "an edit under an open packet must not wedge the run: {advanced}"
+    );
+
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    let attempt = ledger.get_attempt(1).expect("the packet was claimed");
+    ledger.close().expect("close");
+    assert_eq!(attempt.packet_id, packet.packet_id);
+    assert_ne!(
+        row.spec_sha256, opened_at,
+        "the packet must be re-pinned to the body its bead carries now: {row:?}"
+    );
+    assert_eq!(
+        row.body_json, packet.body_json,
+        "a re-pin revises the spec and leaves the definition alone"
+    );
+    let body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("seat spec at {}: {e}", row.spec_path));
+    assert!(
+        body.contains("- revised acceptance"),
+        "the claimed seat reads the revised body: {body}"
     );
 }
 
@@ -411,10 +501,60 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
     );
 }
 
+/// The packet's latest `proto.retry` grant: its failure count and deadline.
+fn latest_retry(env: &TestEnv, run: &str) -> Value {
+    let ledger = env.ledger();
+    let events = ledger.list_events(Some(run), 0, 4096).expect("events");
+    ledger.close().expect("close");
+    events
+        .iter()
+        .rev()
+        .find(|row| row.kind == "proto.retry")
+        .map(|row| serde_json::from_str::<Value>(&row.payload_json).expect("retry payload"))
+        .unwrap_or(Value::Null)
+}
+
+/// Bring a granted retry deadline forward so the next advance may claim,
+/// instead of sleeping through the production backoff.
+fn expire_retry_deadline(env: &TestEnv, run: &str) {
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' \
+             ORDER BY event_id DESC LIMIT 1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("a granted retry");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+}
+
 #[test]
-fn an_unreachable_bd_at_claim_time_is_transport_never_drift_and_never_terminal() {
+fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
     let env = TestEnv::new("forged-bead-spec-outage");
     assert_eq!(env.forged(&["init"]).0, 0);
+    // One free retry, so exhaustion is two grants away rather than four.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config json");
+    config["transport_retry_budget"] = json!(1);
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("config json"),
+    )
+    .expect("rewrite config");
     env.seed_bead_spec("bead-outage", DESCRIPTION, ACCEPTANCE);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -446,23 +586,58 @@ fn an_unreachable_bd_at_claim_time_is_transport_never_drift_and_never_terminal()
         "the claim must stay on the bounded-retry budget: {failed}"
     );
 
-    // Nothing terminal was recorded: no attempt row, and the claim operation
-    // was released rather than stored as a terminal failure.
+    // The driver's own claim-again path CHARGES that budget. The failure is
+    // pre-claim — no claim token exists to fence an attempt with — so the
+    // grant is the whole record of it, and no terminal attempt is invented.
+    let (code, first) = env.forged(&["run", "advance", "--run", "bead-outage"]);
+    assert_eq!(
+        code, 0,
+        "a transport failure is recorded, not raised: {first}"
+    );
+    assert_eq!(
+        latest_retry(&env, "bead-outage")["transportFailures"],
+        json!(1),
+        "the first pre-claim outage is charged to the budget"
+    );
     let ledger = env.ledger();
     assert!(
         ledger
             .list_live_attempts(Some("bead-outage"))
             .expect("live attempts")
             .is_empty(),
-        "a failed claim leaves no attempt behind"
+        "a pre-claim failure leaves no attempt behind"
+    );
+    assert!(
+        ledger.get_attempt(1).is_err(),
+        "no attempt row is invented for work no seat ever held"
     );
     ledger.close().expect("close");
 
-    // bd comes back and the same claim succeeds — the failure cost the
-    // packet nothing.
-    env.set_bd_show_unreachable(false);
-    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
-    assert_eq!(code, 0, "the retry must succeed once bd answers: {claimed}");
+    // The grant also holds the packet off until its backoff has passed.
+    let (code, waiting) = env.forged(&["run", "advance", "--run", "bead-outage"]);
+    assert_eq!(code, 0, "advance: {waiting}");
+    assert_eq!(
+        latest_retry(&env, "bead-outage")["transportFailures"],
+        json!(1),
+        "the granted deadline is honored rather than burned instantly"
+    );
+
+    // Past the deadline, the outage costs the second and last retry, and the
+    // budget is then spent.
+    expire_retry_deadline(&env, "bead-outage");
+    let (code, second) = env.forged(&["run", "advance", "--run", "bead-outage"]);
+    assert_eq!(code, 0, "advance: {second}");
+    assert_eq!(
+        latest_retry(&env, "bead-outage")["transportFailures"],
+        json!(2),
+        "an unreachable bd cannot repeat without limit"
+    );
+    let (code, exhausted) = env.forged(&["run", "advance", "--run", "bead-outage"]);
+    assert_eq!(code, 0, "advance: {exhausted}");
+    assert!(
+        exhausted["result"]["action"]["stop"]["providerUnavailable"].is_object(),
+        "a spent budget stops the run instead of retrying forever: {exhausted}"
+    );
 }
 
 #[test]

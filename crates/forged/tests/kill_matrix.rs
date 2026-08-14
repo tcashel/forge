@@ -853,6 +853,74 @@ fn a_crashed_reconcile_never_wedges_the_next_one() {
     }
 }
 
+// ------------------------------------------------------------- schedule 9
+
+#[test]
+fn a_materialization_failure_leaves_no_running_attempt_behind() {
+    // The window this closes: the attempt row goes `running` BEFORE the
+    // packet directory exists, so a materialization failure used to return
+    // to the caller leaving a `running` attempt with no process behind it —
+    // a row that blocks its own re-claim and the re-pin that would clear the
+    // cause, and that the reclaim saga can only retire by timing out a lease
+    // nobody is renewing.
+    let env = TestEnv::new("km9");
+    env.write_config(None);
+    start_run(&env, "bead-k9");
+    let fp = env.root.join("fp9");
+    std::fs::create_dir_all(&fp).expect("failpoint dir");
+    let drive = spawn_drive(
+        &env,
+        "bead-k9",
+        Some(("packet.materialize.before", "pause", &fp)),
+    );
+
+    // Paused at the post-claim, pre-spawn boundary: the attempt is claimed
+    // and the packet directory does not exist yet. Put a FILE where it must
+    // go, so the materialization fails for real.
+    let reached = fp.join("packet.materialize.before.reached");
+    wait_until("the materialization boundary", || reached.exists());
+    let packet_dir = env.packet_dir("bead-k9", "implementation", 0);
+    assert!(
+        !packet_dir.exists(),
+        "the boundary must precede the directory: {}",
+        packet_dir.display()
+    );
+    std::fs::create_dir_all(packet_dir.parent().expect("packet parent"))
+        .expect("packet parent dir");
+    std::fs::write(&packet_dir, b"not a directory").expect("plant the materialization failure");
+    std::fs::write(fp.join("packet.materialize.before.release"), b"").expect("release");
+
+    let out = drive.wait_with_output().expect("drive child exits");
+    assert!(
+        !out.status.success(),
+        "the refusal must reach the caller, not be swallowed"
+    );
+
+    // The row is settled under its own claim token: nothing is left running,
+    // and the packet is re-claimable rather than wedged.
+    let states = attempt_states(&env, "bead-k9");
+    assert!(
+        !states.is_empty(),
+        "the attempt was claimed before the failure"
+    );
+    assert!(
+        states.iter().all(|(_, state)| state != "running"),
+        "no attempt may outlive the process it never got: {states:?}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the claimed attempt");
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    assert!(
+        attempt
+            .fail_note
+            .as_deref()
+            .is_some_and(|note| note.contains("before spawn")),
+        "the note must say the attempt never reached a provider: {attempt:?}"
+    );
+    assert_attempts_serialized(&env, "bead-k9", "bead-k9/implementation/0");
+}
+
 // ---------------------------------------------------- the embedded-bd case
 
 #[test]
