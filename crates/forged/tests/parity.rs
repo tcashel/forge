@@ -65,6 +65,7 @@ fn all_thirty_one_tools_match_their_cli_counterparts() {
         "run_revise_roster",
         "run_start",
         "run_status",
+        "run_stop",
         "run_submit",
         "session_list",
         "session_message",
@@ -173,6 +174,32 @@ fn all_thirty_one_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
+
+    let cli = env
+        .forged(&[
+            "run",
+            "stop",
+            "--run",
+            "absent",
+            "--outcome",
+            "blocked",
+            "--reason",
+            "cannot proceed",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "run_stop",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {
+                "run": "absent",
+                "outcome": "blocked",
+                "reason": "cannot proceed"
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "run_stop parity");
 
     let cli = env.forged(&["overview", "--run", "absent"]).1;
     let tool = mcp.call_tool(
