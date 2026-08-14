@@ -1861,14 +1861,23 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
         .and_then(|value| value.get("delivery"))
         .cloned();
     let pr = latest(epic::EPIC_PR).or_else(|| latest(PROTO_PR));
-    let delivery = settled_delivery.unwrap_or_else(|| {
-        pr.map_or(Value::Null, |pr| {
-            json!({
-                "pr": pr.get("number").cloned().unwrap_or(Value::Null),
-                "sha": Value::Null,
-            })
-        })
+    let pr_number = pr
+        .as_ref()
+        .and_then(|record| record.get("number"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut delivery = settled_delivery.unwrap_or_else(|| {
+        (!pr_number.is_null())
+            .then(|| json!({"pr": pr_number.clone(), "sha": Value::Null}))
+            .unwrap_or(Value::Null)
     });
+    // A clean settlement happens after review and before the human merge,
+    // while the draft PR is recorded independently by the protocol. Merge
+    // those two durable sources instead of letting the settlement's null PR
+    // erase a real delivery candidate.
+    if delivery.get("pr").is_some_and(Value::is_null) && !pr_number.is_null() {
+        delivery["pr"] = pr_number;
+    }
     if let Some(object) = entry.as_object_mut() {
         object.insert("outcome".to_owned(), outcome);
         object.insert("delivery".to_owned(), delivery);
