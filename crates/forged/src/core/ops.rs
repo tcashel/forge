@@ -894,8 +894,10 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
 
 // ----------------------------------------------------------- packet fail
 
-/// `packet fail` — fenced SafeRetry failure report; the note's `transport:`
-/// prefix decides the classification, byte-exact.
+/// `packet fail` — fenced SafeRetry failure report; the note's prefix decides
+/// the classification, byte-exact: `transport:` and `unspawned:` both ride
+/// the packet's bounded budget, anything else is semantic. See
+/// `forged_proto::classify_failure`.
 pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let packet_id = match param_str(&req.params, "packet") {
         Ok(p) => p.to_owned(),

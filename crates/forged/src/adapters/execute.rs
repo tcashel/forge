@@ -50,6 +50,10 @@ pub enum PacketOutcome {
     Quarantined,
     /// A transport failure was recorded (free retry within the budget).
     Transport(String),
+    /// A claimed attempt was retired before any provider ran, and charged to
+    /// the same bounded budget. Distinct from `Transport` because nothing
+    /// was transported: no seat spoke, so there is no stage result to read.
+    Unspawned(String),
     /// A semantic failure was recorded.
     Semantic(String),
     /// Our own attempt was revoked mid-flight; the provider was stopped.
@@ -470,16 +474,16 @@ pub async fn execute_packet(
 /// a fence keyed on an idempotency key refuses to do: encode the spec in the
 /// key and a bead edited A -> B -> A reproduces the key its first open at A
 /// already stored, replaying that response over a row still pinned at B.
-/// `Ledger::open_packet_with_id`'s own `Immediate` transaction is the right
+/// `Ledger::repin_packet_spec`'s own `Immediate` transaction is the right
 /// fence and the only one needed — atomic, re-reading current state on every
-/// call, and its refusals (a live attempt, a moved definition) still stand.
+/// call, and its refusal on a live attempt still stands.
 ///
-/// The write carries the row's OWN stored body, never one re-serialized
-/// from the caller's packet. A re-pin revises the spec and nothing else —
-/// the ledger refuses any re-open that would move the definition too — and
-/// the caller's packet may legitimately differ from the stored definition
-/// (`stored_packet_for_attempt` rebinds provider hints to the active roster
-/// revision).
+/// Nothing is read back out to write it in again. The definition never
+/// becomes a parameter, so this cannot move it and there is no window
+/// between checking it and writing — which also means the caller's packet
+/// may legitimately differ from the stored definition, as it does whenever
+/// `stored_packet_for_attempt` rebinds provider hints to the active roster
+/// revision.
 async fn repin_packet(
     ctx: &Ctx,
     packet: &WorkPacket,
@@ -488,21 +492,17 @@ async fn repin_packet(
     if packet.spec.revision.is_none() || spec.sha256 == packet.spec.sha256 {
         return Ok(packet.clone());
     }
-    let body_json = {
-        let packet_id = packet.packet_id.clone();
-        on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id))
-            .await?
-            .body_json
-    };
     let mut repinned = packet.clone();
     repinned.spec.sha256 = spec.sha256.clone();
     repinned.spec.revision = spec.revision();
-    let OpenTarget {
-        new_packet,
-        semantic_id,
-        ..
-    } = open_target(&repinned, body_json)?;
-    on_ledger(&ctx.ledger, move |l| apply_open(l, new_packet, semantic_id)).await?;
+    let packet_id = packet.packet_id.clone();
+    let spec_path = repinned.spec.path.clone();
+    let spec_sha256 = repinned.spec.sha256.clone();
+    let spec_revision = repinned.spec.revision.clone();
+    on_ledger(&ctx.ledger, move |l| {
+        l.repin_packet_spec(packet_id, spec_path, spec_sha256, spec_revision)
+    })
+    .await?;
     Ok(repinned)
 }
 
@@ -1153,7 +1153,13 @@ pub(crate) async fn fail_and_grant_retry(
         .await?
     };
     charge_retry(ctx, &run_id, packet_id, failed_at).await?;
-    Ok(PacketOutcome::Transport(note))
+    // The note's prefix classified the failure for the ledger; report the
+    // same distinction to the caller rather than calling an unspawned seat
+    // a transport failure.
+    Ok(match forged_proto::classify_failure(&note) {
+        forged_proto::FailureKind::Unspawned => PacketOutcome::Unspawned(note),
+        _ => PacketOutcome::Transport(note),
+    })
 }
 
 #[cfg(test)]

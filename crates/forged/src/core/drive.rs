@@ -479,6 +479,9 @@ fn after_outcome(outcome: PacketOutcome) {
         PacketOutcome::Landed(_) => tracing::info!("packet landed"),
         PacketOutcome::Quarantined => tracing::warn!("packet result quarantined"),
         PacketOutcome::Transport(note) => tracing::warn!(note, "transport failure recorded"),
+        PacketOutcome::Unspawned(note) => {
+            tracing::warn!(note, "attempt retired before any provider ran")
+        }
         PacketOutcome::Semantic(note) => tracing::warn!(note, "semantic failure recorded"),
         PacketOutcome::Revoked => tracing::warn!("attempt revoked mid-flight"),
     }

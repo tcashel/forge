@@ -236,3 +236,134 @@ fn the_fence_arms_are_not_interchangeable() {
         .is_ok());
     ledger.close().expect("close");
 }
+
+// ------------------------------------------------- the driver's own re-pin
+
+/// `repin_packet_spec` is the seam the driver uses, and it keeps the same
+/// contract as a re-open without ever being handed the definition: the spec
+/// columns move, the body does not, and there is no `body_json` parameter
+/// that could move it.
+#[test]
+fn the_driver_repin_moves_the_spec_columns_and_nothing_else() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = ledger(&dir);
+    let run_id = run(&ledger, "run-driver-repin");
+    let opened = packet_at(&run_id, REVISION_N, BODY);
+    let definition = opened.body_json.clone();
+    let packet = ledger.open_packet(opened).expect("open packet");
+
+    ledger
+        .repin_packet_spec(
+            packet.clone(),
+            format!("/runs/{run_id}/packets/implement/0/spec.md"),
+            EDITED_BODY.to_owned(),
+            Some(REVISION_N1.to_owned()),
+        )
+        .expect("a revised spec must re-pin");
+
+    let row = ledger.get_packet(&packet).expect("get packet");
+    assert_eq!(row.spec_sha256, EDITED_BODY);
+    assert_eq!(row.spec_revision.as_deref(), Some(REVISION_N1));
+    assert_eq!(
+        row.body_json, definition,
+        "a re-pin revises the spec columns and leaves the definition alone"
+    );
+    assert_eq!(
+        ledger.list_packets(&run_id).expect("list").len(),
+        1,
+        "re-pinning adds no second packet"
+    );
+
+    // And the seat now claims at the NEW body, which is the whole point.
+    assert!(ledger
+        .claim_packet(
+            &packet,
+            "claude:seat:1",
+            &observed(REVISION_N1, EDITED_BODY)
+        )
+        .is_ok());
+    ledger.close().expect("close");
+}
+
+/// Re-pinning to what is already stored is a no-op, NOT a refusal — the
+/// driver re-pins on every advance that resolves a spec, so the common case
+/// is that nothing moved. It must not have to ask first.
+#[test]
+fn a_driver_repin_to_the_stored_values_is_a_no_op() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = ledger(&dir);
+    let run_id = run(&ledger, "run-repin-noop");
+    let opened = packet_at(&run_id, REVISION_N, BODY);
+    let path = opened.spec_path.clone();
+    let packet = ledger.open_packet(opened).expect("open packet");
+    ledger
+        .claim_packet(&packet, "claude:seat:1", &observed(REVISION_N, BODY))
+        .expect("claim");
+
+    // A live attempt would refuse a MOVING re-pin; this one moves nothing,
+    // so it must be allowed even so.
+    ledger
+        .repin_packet_spec(
+            packet.clone(),
+            path,
+            BODY.to_owned(),
+            Some(REVISION_N.to_owned()),
+        )
+        .expect("re-pinning to the stored values is a no-op");
+    ledger.close().expect("close");
+}
+
+/// A seat is working from the pinned bytes right now; its spec must not move
+/// underneath it, and a refused re-pin writes nothing.
+#[test]
+fn a_live_attempt_refuses_the_driver_repin() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = ledger(&dir);
+    let run_id = run(&ledger, "run-repin-live");
+    let opened = packet_at(&run_id, REVISION_N, BODY);
+    let path = opened.spec_path.clone();
+    let packet = ledger.open_packet(opened).expect("open packet");
+    ledger
+        .claim_packet(&packet, "claude:seat:1", &observed(REVISION_N, BODY))
+        .expect("claim");
+
+    let err = ledger
+        .repin_packet_spec(
+            packet.clone(),
+            path,
+            EDITED_BODY.to_owned(),
+            Some(REVISION_N1.to_owned()),
+        )
+        .expect_err("a live attempt must refuse the re-pin");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+    assert!(
+        err.to_string().contains("running"),
+        "the refusal must name the blocking state: {err}"
+    );
+    assert_eq!(
+        ledger.get_packet(&packet).expect("get packet").spec_sha256,
+        BODY,
+        "the refused re-pin must have written nothing"
+    );
+    ledger.close().expect("close");
+}
+
+/// A packet that was never opened cannot be re-pinned into existence: the
+/// re-pin revises a row, and inventing one would hand a seat a packet no
+/// `packet_open` ever fenced.
+#[test]
+fn an_unopened_packet_cannot_be_repinned() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = ledger(&dir);
+    let run_id = run(&ledger, "run-repin-absent");
+    let err = ledger
+        .repin_packet_spec(
+            format!("{run_id}/implement/0"),
+            "/spec.md".to_owned(),
+            BODY.to_owned(),
+            Some(REVISION_N.to_owned()),
+        )
+        .expect_err("an absent packet must refuse");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+    ledger.close().expect("close");
+}

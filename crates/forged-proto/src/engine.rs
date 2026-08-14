@@ -173,12 +173,15 @@ pub enum Terminal {
         /// The final merged verdict, when any leg ever spoke.
         final_verdict: Option<Verdict>,
     },
-    /// A provider stage exhausted its transport-retry budget without the
-    /// provider ever getting to think.
+    /// A provider stage exhausted its bounded infrastructure-retry budget
+    /// without the provider ever getting to think. Transport failures and
+    /// attempts retired before any spawn share that one budget, so this is
+    /// no longer transport-only.
     ProviderUnavailable {
         /// The packet's stage.
         stage: Stage,
-        /// The number of transport failures observed.
+        /// The number of infrastructure failures observed — transport and
+        /// unspawned together, since they share the budget.
         attempts: u32,
     },
     /// An adaptive semantic seat exhausted its transport policy.

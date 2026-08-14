@@ -350,7 +350,13 @@ fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
             detail: format!("stdout: {}; stderr: {}", out.stdout, out.stderr),
         });
     }
-    if !lenient.schema_ok {
+    // Order matters, and these three are not interchangeable.
+    //
+    // A DECLARED version this build cannot read outranks every cause-text
+    // check: retrying re-reads the identical envelope, so a Dolt-lock marker
+    // inside one would take the contention schedule and burn the whole
+    // bounded budget on an upgrade that outlives it.
+    if lenient.unsupported_schema() {
         return Err(BdError::Envelope {
             context,
             detail: format!(
@@ -359,12 +365,29 @@ fn read_envelope(context: String, out: &RawOutcome) -> Result<Value, BdError> {
             ),
         });
     }
+    // An error is classified on what it SAYS, before the shape is judged —
+    // `!schema_ok` is also true of bare JSON declaring no version at all,
+    // and making that terminal first would strand a genuine outage the write
+    // spine reads as ordinary contention.
     if lenient.error.is_some() {
         return Err(BdError::Beads {
             context,
             exit: out.exit,
             stdout: out.stdout.clone(),
             stderr: out.stderr.clone(),
+        });
+    }
+    // Left over: a payload that parsed, carries no error, and declared no
+    // version forged recognizes. forged sets `BD_JSON_ENVELOPE=1` on every
+    // call, so an undeclared answer means the envelope contract is not being
+    // honoured — terminal, because no retry makes a bd start declaring.
+    if !lenient.schema_ok {
+        return Err(BdError::Envelope {
+            context,
+            detail: format!(
+                "envelope declares no readable schema_version; stdout: {}; stderr: {}",
+                out.stdout, out.stderr
+            ),
         });
     }
     lenient.data.ok_or_else(|| BdError::Envelope {
@@ -491,6 +514,9 @@ mod tests {
         // bd ANSWERED, from a bd upgraded past this build. Retrying re-reads
         // the identical envelope forever — precisely the wrong response to an
         // upgrade, and the failure the bd contract test exists to make loud.
+        // The second shape declares no version at all: forged sets
+        // `BD_JSON_ENVELOPE=1` on every call, so that is the contract not
+        // being honoured, which no retry repairs either.
         for stdout in [
             r#"{"data": {"id": "beads-1al"}, "schema_version": 2}"#,
             r#"{"data": {"id": "beads-1al"}}"#,
@@ -505,6 +531,26 @@ mod tests {
                 "{stdout:?} must never ride the budget: {err}"
             );
         }
+    }
+
+    #[test]
+    fn an_outage_in_an_undeclared_payload_is_still_read_for_what_it_says() {
+        // The shape check must not preempt the cause check. A payload that
+        // declared no version but carries a Dolt lock is the same outage the
+        // write spine rides its budget for; judging it on its shape first
+        // would stand it down as terminal on the read path alone.
+        let outage = read_err(&format!(
+            r#"{{"data":{{"error":"{}"}}}}"#,
+            crate::classify::DOLT_LOCK_REFUSAL
+        ));
+        assert!(
+            matches!(outage, BdError::Beads { .. }),
+            "classified on its text, not its shape: {outage:?}"
+        );
+        assert!(
+            outage.is_transport(),
+            "an outage rides the budget wherever it is declared: {outage}"
+        );
     }
 
     #[test]

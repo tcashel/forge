@@ -659,7 +659,10 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
     ledger.close().expect("close");
 
     // End to end: with that live attempt standing, an operator edit cannot
-    // be adopted under the seat either — the drive path hits the same guard.
+    // be adopted under the seat either. The refusal comes from adoption's
+    // `assert_pinned`, NOT from the re-pin guard above — a live attempt is
+    // adopted rather than re-claimed, so the drive path never reaches the
+    // re-pin. Both doors are shut; they are different doors.
     env.set_bead_field("bead-guarded", "acceptance", "- revised acceptance");
     let (code, drifted) = env.forged(&["run", "advance", "--run", "bead-guarded"]);
     assert_ne!(
