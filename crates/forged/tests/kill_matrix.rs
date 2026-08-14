@@ -921,6 +921,248 @@ fn a_materialization_failure_leaves_no_running_attempt_behind() {
     assert_attempts_serialized(&env, "bead-k9", "bead-k9/implementation/0");
 }
 
+// ------------------------------------------- schedule 9, the other doors
+
+/// Start a BEAD-SOURCED run: `materialize` is a no-op for a file spec (there
+/// is no rendered body to write), so only the bead route reaches the
+/// post-claim, pre-spawn write these cases fail.
+fn start_bead_run(env: &TestEnv, bead: &str) {
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    env.write_config(None);
+    env.seed_bead_spec(bead, "## Context\\n\\nthe bead is the spec.", "- ship it");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        bead,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+}
+
+/// Advance until the run's first packet row exists and no further.
+fn advance_to_open_packet(env: &TestEnv, run: &str) -> forged_ledger::PacketRow {
+    for _ in 0..40 {
+        let ledger = env.ledger();
+        let opened = ledger
+            .list_packets(run)
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        ledger.close().expect("close");
+        if let Some(packet) = opened {
+            return packet;
+        }
+        let (code, advanced) = env.forged(&["run", "advance", "--run", run]);
+        assert_eq!(code, 0, "advance {run}: {advanced}");
+    }
+    panic!("{run} never opened a packet")
+}
+
+/// Make the packet directory unwritable for real: a regular FILE where the
+/// directory has to go, so materializing the seat's spec fails.
+fn block_the_packet_dir(env: &TestEnv, run: &str, stage: &str, seq: i64) {
+    let packet_dir = env.packet_dir(run, stage, seq);
+    std::fs::create_dir_all(packet_dir.parent().expect("packet parent")).expect("packet parent");
+    let _ = std::fs::remove_dir_all(&packet_dir);
+    std::fs::write(&packet_dir, b"not a directory").expect("plant the materialization failure");
+}
+
+/// The settled attempt, asserting nothing was left running and the note says
+/// no seat ever ran.
+fn assert_retired_unspawned(env: &TestEnv, run: &str) -> forged_ledger::AttemptRow {
+    let states = attempt_states(env, run);
+    assert!(
+        !states.is_empty(),
+        "the attempt was claimed before the failure"
+    );
+    assert!(
+        states.iter().all(|(_, state)| state != "running"),
+        "no attempt may outlive the process it never got: {states:?}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the claimed attempt");
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    let note = attempt.fail_note.clone().unwrap_or_default();
+    assert_eq!(
+        forged_proto::classify_failure(&note),
+        forged_proto::FailureKind::Unspawned,
+        "a seat that never spawned must not read as this stage's answer: {note}"
+    );
+    attempt
+}
+
+#[test]
+fn an_external_packet_claim_retires_its_own_unspawned_attempt() {
+    // `packet claim` -> `packet complete` never enters `run_attempt`, so the
+    // in-process pipeline's settlement covers none of it: the claim writes
+    // the seat's spec itself, and a failure there is post-claim and
+    // pre-spawn just the same.
+    let env = TestEnv::new("km9a");
+    start_bead_run(&env, "bead-k9a");
+    let packet = advance_to_open_packet(&env, "bead-k9a");
+    block_the_packet_dir(&env, "bead-k9a", "implementation", 0);
+
+    let (code, refused) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_ne!(code, 0, "the refusal must reach the caller: {refused}");
+    assert_retired_unspawned(&env, "bead-k9a");
+
+    // Re-claimable, not wedged: clear the cause and the next claim takes it.
+    std::fs::remove_file(env.packet_dir("bead-k9a", "implementation", 0)).expect("clear the block");
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "the packet must still be claimable: {claimed}");
+}
+
+#[test]
+fn claim_next_retires_its_own_unspawned_attempt() {
+    // The third door onto the same window. claim-next resumes a ledger run
+    // and writes the seat's spec under the claim it just took; the settlement
+    // has to be there too, or a resumed run wedges on a `running` row with no
+    // process behind it.
+    let env = TestEnv::new("km9b");
+    start_bead_run(&env, "bead-k9b");
+    let packet = advance_to_open_packet(&env, "bead-k9b");
+
+    // Leave the run resumable: one transport-failed attempt, nothing live.
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "packet claim: {claimed}");
+    let token = claimed["result"]["claim_token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let attempt_id = claimed["result"]["attempt_id"]
+        .as_i64()
+        .expect("attempt id")
+        .to_string();
+    let (code, failed) = env.forged(&[
+        "packet",
+        "fail",
+        "--packet",
+        &packet.packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &token,
+        "--note",
+        "transport: session vanished",
+    ]);
+    assert_eq!(code, 0, "packet fail: {failed}");
+    env.set_assignee("bead-k9b", "forged:bead-k9b:0");
+
+    block_the_packet_dir(&env, "bead-k9b", "implementation", 0);
+    let (code, refused) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:k9b",
+    ]);
+    assert_ne!(code, 0, "the refusal must reach the caller: {refused}");
+
+    let states = attempt_states(&env, "bead-k9b");
+    assert!(
+        states.iter().all(|(_, state)| state != "running"),
+        "no attempt may outlive the process it never got: {states:?}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(2).expect("the resumed attempt");
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    let note = attempt.fail_note.clone().unwrap_or_default();
+    assert_eq!(
+        forged_proto::classify_failure(&note),
+        forged_proto::FailureKind::Unspawned,
+        "a resumed seat that never spawned speaks no stage result: {note}"
+    );
+}
+
+#[test]
+fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
+    // The host selection sits between the claim and the spawn, on the same
+    // stretch where nothing may propagate on its own. With Herdr REQUIRED and
+    // no endpoint, the attempt is charged to the packet's bounded budget and
+    // the row is settled — never left running, and never a stage result.
+    let env = TestEnv::new("km9c");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    env.write_config(None);
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read config"))
+            .expect("config json");
+    config["host_policy"] = json!("required");
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("config json"),
+    )
+    .expect("rewrite config");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-k9c",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    let packet = advance_to_open_packet(&env, "bead-k9c");
+    let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-k9c"]);
+    assert_eq!(
+        code, 0,
+        "a transport failure is recorded, not raised: {advanced}"
+    );
+
+    let states = attempt_states(&env, "bead-k9c");
+    assert!(
+        states.iter().all(|(_, state)| state != "running"),
+        "no attempt may outlive the host it never got: {states:?}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the claimed attempt");
+    let grants: Vec<Value> = ledger
+        .list_events(Some("bead-k9c"), 0, 4096)
+        .expect("events")
+        .into_iter()
+        .filter(|row| row.kind == "proto.retry")
+        .map(|row| serde_json::from_str(&row.payload_json).expect("retry payload"))
+        .collect();
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    let note = attempt.fail_note.clone().unwrap_or_default();
+    assert_eq!(
+        forged_proto::classify_failure(&note),
+        forged_proto::FailureKind::Transport,
+        "a missing host is an outage, never the seat's answer: {note}"
+    );
+    assert_eq!(
+        grants.last().map(|grant| grant["packetId"].clone()),
+        Some(json!(packet.packet_id)),
+        "the attempt is charged to its packet's bounded budget: {grants:?}"
+    );
+
+    // And nothing was spawned: no provider ever ran for this packet.
+    assert!(
+        !env.provider_log()
+            .iter()
+            .any(|line| line.starts_with(&packet.packet_id)),
+        "the settlement must precede any spawn: {:?}",
+        env.provider_log()
+    );
+}
+
 // ---------------------------------------------------- the embedded-bd case
 
 #[test]
