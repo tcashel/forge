@@ -1,7 +1,8 @@
 //! `work list` — the discovery surface. An empty ledger enumerates to an
-//! empty list rather than refusing, an epic run is told apart from a slice
-//! run by its `forged.epic.started` event, and live seats are counted per
-//! run from one scan of every live attempt.
+//! empty list rather than refusing, an epic is discoverable from its
+//! `forged.epic.started` event ALONE (no forged path writes a `runs` row for
+//! an epic), and live seats are counted per run from one scan of every live
+//! attempt.
 
 mod support;
 
@@ -18,9 +19,8 @@ fn sha256_hex(path: &std::path::Path) -> String {
         .collect()
 }
 
-/// Create a bare run row. `epic` appends the `forged.epic.started` event
-/// that is the ONLY signal separating an epic run from a slice run.
-fn fabricate_run(env: &TestEnv, run_id: &str, epic: bool) {
+/// Create a bare run row — what `run_start` writes for a slice.
+fn fabricate_run(env: &TestEnv, run_id: &str) {
     let ledger = env.ledger();
     ledger
         .create_run(forged_ledger::NewRun {
@@ -31,15 +31,31 @@ fn fabricate_run(env: &TestEnv, run_id: &str, epic: bool) {
             branch: format!("forged/{run_id}"),
         })
         .expect("create run");
-    if epic {
-        ledger
-            .append_event(
-                Some(run_id),
-                "forged.epic.started",
-                json!({"runId": run_id, "epic": run_id}),
-            )
-            .expect("epic started event");
-    }
+    ledger.close().expect("close");
+}
+
+/// Start an epic the way `epic_start` does: ONE `forged.epic.started` event
+/// under the epic bead id and NO run row — the combination production
+/// actually produces. A fixture that also created a run row would prove
+/// nothing about epic discovery.
+fn fabricate_epic(env: &TestEnv, epic_id: &str) {
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(epic_id),
+            "forged.epic.started",
+            json!({
+                "schema": "forged.epic/1",
+                "epicId": epic_id,
+                "title": format!("Epic {epic_id}"),
+                "repo": env.repos.repo.to_string_lossy(),
+                "specPath": env.spec.to_string_lossy(),
+                "baseRef": env.repos.base,
+                "integrationBranch": format!("forged/epic-{epic_id}"),
+                "children": [],
+            }),
+        )
+        .expect("epic started event");
     ledger.close().expect("close");
 }
 
@@ -97,8 +113,8 @@ fn an_empty_ledger_enumerates_to_an_empty_list() {
 fn a_slice_and_an_epic_are_labelled_by_their_events() {
     let env = TestEnv::new("forged-work-list-kind");
     env.forged(&["init"]);
-    fabricate_run(&env, "wl-slice", false);
-    fabricate_run(&env, "wl-epic", true);
+    fabricate_run(&env, "wl-slice");
+    fabricate_epic(&env, "wl-epic");
 
     let (code, response) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "work list: {response}");
@@ -119,19 +135,69 @@ fn a_slice_and_an_epic_are_labelled_by_their_events() {
     assert_eq!(slice["costUsdKnown"], json!(0.0));
     assert_eq!(slice["rowsMissingCost"], json!(0));
 
-    assert_eq!(entry(&response, "wl-epic")["kind"], json!("epic"));
+    // An epic has no run row at all, so it is listed only if `work list`
+    // reads the start event as a source of inventory, not just as a label.
+    let epic = entry(&response, "wl-epic");
+    assert_eq!(epic["kind"], json!("epic"));
+    assert_eq!(epic["beadId"], json!("wl-epic"));
+    assert_eq!(epic["repo"], json!(env.repos.repo.to_string_lossy()));
+    assert_eq!(epic["branch"], json!("forged/epic-wl-epic"));
+    assert_eq!(epic["state"], json!("active"));
+    assert_eq!(epic["stopReason"], Value::Null);
+    assert!(epic["createdAt"].is_string(), "createdAt: {epic}");
+    assert_eq!(epic["updatedAt"], epic["createdAt"]);
+    assert_eq!(epic["liveSeats"], json!(0));
+    assert_eq!(epic["costUsdKnown"], json!(0.0));
+    assert_eq!(epic["rowsMissingCost"], json!(0));
 }
 
 #[test]
 fn live_seats_are_counted_per_run() {
     let env = TestEnv::new("forged-work-list-seats");
     env.forged(&["init"]);
-    fabricate_run(&env, "wl-busy", false);
-    fabricate_run(&env, "wl-idle", false);
+    fabricate_run(&env, "wl-busy");
+    fabricate_run(&env, "wl-idle");
     fabricate_live_seats(&env, "wl-busy", 2);
 
     let (code, response) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(entry(&response, "wl-busy")["liveSeats"], json!(2));
     assert_eq!(entry(&response, "wl-idle")["liveSeats"], json!(0));
+}
+
+/// The production path, end to end: `epic start` appends
+/// `forged.epic.started` and writes NO run row, so an inventory built from
+/// `list_runs()` alone would list the epic nowhere.
+#[test]
+fn a_started_epic_is_listed_though_it_has_no_run_row() {
+    let env = TestEnv::new("forged-work-list-epic-start");
+    env.seed_epic("epic-list", &[("child-list", &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-list",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+
+    let (code, response) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {response}");
+    // The started epic is the whole inventory: no child has run yet, and the
+    // epic itself never gets a run row.
+    assert_eq!(runs_of(&response).len(), 1);
+    let epic = entry(&response, "epic-list");
+    assert_eq!(epic["kind"], json!("epic"));
+    assert_eq!(epic["beadId"], json!("epic-list"));
+    assert_eq!(epic["repo"], json!(repo));
+    assert_eq!(epic["branch"], json!("forged/epic-epic-list"));
+    assert_eq!(epic["liveSeats"], json!(0));
 }

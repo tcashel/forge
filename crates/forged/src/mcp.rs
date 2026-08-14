@@ -394,9 +394,9 @@ impl ForgedServer {
     /// The discovery surface — the one tool that needs no id.
     #[tool(
         name = "work_list",
-        description = "List every forged run, live and historical, each labelled slice or epic. \
-                       Takes no id: this is how a caller with no prior knowledge discovers the \
-                       ids the other tools require."
+        description = "List all forged work — every slice run and every started epic, live and \
+                       historical, each labelled slice or epic. Takes no id: this is how a \
+                       caller with no prior knowledge discovers the ids the other tools require."
     )]
     pub async fn work_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("work_list", args.0).await

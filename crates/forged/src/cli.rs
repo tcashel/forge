@@ -540,7 +540,7 @@ pub struct OverviewArgs {
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
-    /// List every run, live and historical, with no id (read-only).
+    /// List every slice run and started epic, with no id (read-only).
     List(KeyOnly),
 }
 
