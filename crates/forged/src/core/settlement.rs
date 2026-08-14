@@ -3,7 +3,7 @@
 
 use std::path::Path;
 
-use forged_ledger::{EffectClass, RevokeScope, RunOutcome};
+use forged_ledger::{EffectClass, RevokeScope, RunOutcome, RunSettlement};
 use forged_types::{OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
@@ -169,23 +169,67 @@ pub(crate) async fn settle(
     run_id: &str,
     settlement: Settlement,
 ) -> Result<Value, Failure> {
+    // Serialize generation discovery with detached submit. The ledger write
+    // below revokes that exact generation atomically with the terminal run
+    // projection; confirmed process-group death closes the opposite race,
+    // where a machine effect already received its ticket.
+    let _submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
+    let controller = super::handoff::controller_fence_target(ctx, run_id).await?;
     // Stop the state machine first. A crash after this point cannot open new
     // protocol work; replay resumes the identical terminal settlement.
     let run = {
         let run_id = run_id.to_owned();
         let settlement = settlement.clone();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.settle_run(
+        let generation = controller.as_ref().map(|target| target.generation);
+        on_ledger(&ctx.ledger, move |ledger| match generation {
+            Some(generation) => ledger.settle_run_fencing_controller(
+                &run_id,
+                RunSettlement {
+                    outcome: settlement.outcome,
+                    reason: settlement.reason,
+                    delivery_pr: settlement.delivery_pr,
+                    delivery_sha: settlement.delivery_sha,
+                    superseded_by: settlement.superseded_by,
+                },
+                generation,
+            ),
+            None => ledger.settle_run(
                 &run_id,
                 settlement.outcome,
                 settlement.reason,
                 settlement.delivery_pr,
                 settlement.delivery_sha,
                 settlement.superseded_by,
-            )
+            ),
         })
         .await?
     };
+    crate::failpoint::hit("run.settle.controller-revoked.after");
+    let controller_stopped = match controller.as_ref() {
+        Some(target) => super::handoff::kill_controller_confirmed(target).await?,
+        None => false,
+    };
+    let contained_generation = controller
+        .as_ref()
+        .filter(|target| target.effects_excluded())
+        .map(|target| target.generation);
+    let unsafe_operations = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.uncontained_machine_operations(&run_id, contained_generation)
+        })
+        .await?
+    };
+    if !unsafe_operations.is_empty() {
+        return Err(Failure {
+            code: forged_types::ErrorCode::HostUnavailable,
+            message: format!(
+                "run {run_id:?} is terminal but machine effects lack a confirmed-dead controller: {}",
+                unsafe_operations.join(", ")
+            ),
+            recoverable: true,
+        });
+    }
 
     // Every token is invalidated durably before confirmed death. This loop
     // also catches an attempt that raced the terminal state write.
@@ -251,6 +295,8 @@ pub(crate) async fn settle(
         },
         "supersededBy": settlement.superseded_by,
         "stoppedAttempts": stopped_attempts,
+        "controllerGeneration": controller.as_ref().map(|target| target.generation),
+        "controllerStopped": controller_stopped,
         "bead": bead,
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,

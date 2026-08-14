@@ -14,10 +14,15 @@ use crate::attempts::{find_attempt_by_token_tx, run_of_packet};
 use crate::error::{column_decode_error, internal, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
+use crate::runs::get_run_tx;
 use crate::time::now_iso;
 use crate::types::{
     AttemptState, EffectClass, OperationOutcome, OperationRow, OperationState, OperationTicket,
+    RunState,
 };
+
+const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
+const MACHINE_ADMITTED: &str = "forged.machine.admitted";
 
 const OPERATION_COLUMNS: &str =
     "operation_id, name, idempotency_key, request_sha256, effect_class, run_id, \
@@ -91,6 +96,30 @@ fn stale_token() -> LedgerError {
     refused(ErrorCode::StaleClaimToken, "claim token is not running")
 }
 
+fn controller_generation_revoked_tx(
+    conn: &Connection,
+    run_id: &str,
+    generation: u32,
+) -> Result<bool, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![run_id, CONTROLLER_REVOKED], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for payload in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+        if payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(generation))
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
 /// Store the terminal envelope for a row that must match `operation_id` and
 /// must not already be terminal. Shared by `complete_operation` (with the
 /// fence) and `resolve_interrupted_operation` (without it).
@@ -154,6 +183,47 @@ impl Ledger {
         effect_class: EffectClass,
         claim_token: Option<&str>,
     ) -> Result<OperationOutcome, LedgerError> {
+        self.begin_operation_inner(name, request, effect_class, claim_token, false, None)
+    }
+
+    /// Claim or replay one controller-owned machine operation.
+    ///
+    /// A fresh claim joins the run's durable controller-generation fence in
+    /// the same transaction that reserves its operation row. Once settlement
+    /// has stopped the run or revoked this generation, no new machine effect
+    /// can receive a ticket. Existing terminal rows remain replayable because
+    /// replay performs no external effect.
+    pub fn begin_controller_operation(
+        &self,
+        name: &str,
+        request: &OperationRequest,
+        effect_class: EffectClass,
+        generation: u32,
+    ) -> Result<OperationOutcome, LedgerError> {
+        self.begin_machine_operation(name, request, effect_class, Some(generation))
+    }
+
+    /// Claim or replay a machine operation, always joining the run's active
+    /// state even when a foreground driver has no detached generation.
+    pub fn begin_machine_operation(
+        &self,
+        name: &str,
+        request: &OperationRequest,
+        effect_class: EffectClass,
+        generation: Option<u32>,
+    ) -> Result<OperationOutcome, LedgerError> {
+        self.begin_operation_inner(name, request, effect_class, None, true, generation)
+    }
+
+    fn begin_operation_inner(
+        &self,
+        name: &str,
+        request: &OperationRequest,
+        effect_class: EffectClass,
+        claim_token: Option<&str>,
+        require_active_run: bool,
+        controller_generation: Option<u32>,
+    ) -> Result<OperationOutcome, LedgerError> {
         let name = name.to_owned();
         let request = request.clone();
         let claim_token = claim_token.map(str::to_owned);
@@ -189,6 +259,32 @@ impl Ledger {
             let existing = find_operation_tx(&tx, &name, &request.idempotency_key)?;
             match existing {
                 None => {
+                    if require_active_run {
+                        let run_id = request.run_id.as_deref().ok_or_else(|| {
+                            refused(
+                                ErrorCode::InvalidRequest,
+                                "controller-owned operations require request.run_id",
+                            )
+                        })?;
+                        let run = get_run_tx(&tx, run_id)?;
+                        let revoked = match controller_generation {
+                            Some(generation) => {
+                                controller_generation_revoked_tx(&tx, run_id, generation)?
+                            }
+                            None => false,
+                        };
+                        if run.state != RunState::Active || revoked {
+                            return Err(refused(
+                                ErrorCode::StaleClaimToken,
+                                match controller_generation {
+                                    Some(generation) => format!(
+                                        "controller generation {generation} for run {run_id:?} is fenced"
+                                    ),
+                                    None => format!("run {run_id:?} is stopped"),
+                                },
+                            ));
+                        }
+                    }
                     let operation_id = uuid::Uuid::now_v7().to_string();
                     let now = now_iso();
                     tx.execute(
@@ -207,6 +303,18 @@ impl Ledger {
                             now
                         ],
                     )?;
+                    if require_active_run {
+                        append_event_tx(
+                            &tx,
+                            request.run_id.as_deref(),
+                            MACHINE_ADMITTED,
+                            &json!({
+                                "schemaVersion": 1,
+                                "operationId": operation_id,
+                                "generation": controller_generation,
+                            }),
+                        )?;
+                    }
                     tx.commit()?;
                     Ok(OperationOutcome::Fresh(OperationTicket { operation_id }))
                 }
@@ -246,6 +354,60 @@ impl Ledger {
                     }
                 }
             }
+        })
+    }
+
+    /// In-flight machine tickets not proven contained by one confirmed-dead
+    /// controller generation. Legacy rows without an admission event fail
+    /// closed as uncontained.
+    pub fn uncontained_machine_operations(
+        &self,
+        run_id: &str,
+        contained_generation: Option<u32>,
+    ) -> Result<Vec<String>, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let machine_names = ["resolve", "gate", "regate", "push", "draftpr"];
+            let mut statement = conn.prepare(
+                "SELECT operation_id, name FROM operations \
+                 WHERE run_id = ?1 AND state = 'in_progress' ORDER BY rowid",
+            )?;
+            let rows = statement.query_map([&run_id], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            })?;
+            let rows = rows.collect::<Result<Vec<_>, _>>()?;
+            let mut unsafe_operations = Vec::new();
+            for (operation_id, name) in rows {
+                if !machine_names.contains(&name.as_str()) {
+                    continue;
+                }
+                let mut events = conn.prepare(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+                )?;
+                let payloads = events.query_map(
+                    rusqlite::params![run_id, MACHINE_ADMITTED],
+                    |row| row.get::<_, String>(0),
+                )?;
+                let mut admitted_generation = None;
+                let mut found = false;
+                for payload in payloads {
+                    let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+                    if payload.get("operationId").and_then(serde_json::Value::as_str)
+                        == Some(operation_id.as_str())
+                    {
+                        found = true;
+                        admitted_generation = payload
+                            .get("generation")
+                            .and_then(serde_json::Value::as_u64)
+                            .and_then(|value| u32::try_from(value).ok());
+                        break;
+                    }
+                }
+                if !found || admitted_generation != contained_generation || contained_generation.is_none() {
+                    unsafe_operations.push(operation_id);
+                }
+            }
+            Ok(unsafe_operations)
         })
     }
 

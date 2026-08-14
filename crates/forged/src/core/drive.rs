@@ -25,7 +25,8 @@ use crate::adapters::ports::{repo_slug, ForgedPorts};
 use crate::config::now_iso;
 use crate::core::spec::SpecSource;
 use crate::core::{
-    derive_key, err_response, fenced, ok_response, on_ledger, param_str, run_holder, Ctx, Failure,
+    derive_key, err_response, fenced_machine, ok_response, on_ledger, param_str, run_holder, Ctx,
+    Failure,
 };
 use crate::failpoint;
 
@@ -818,12 +819,13 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
     let run = run.clone();
     let gate_commands = view.policy.gate_commands.clone();
     let transport_retry_budget = view.policy.transport_retry_budget;
-    let resp = fenced(
+    let controller_generation = super::handoff::controller_generation_for_run(run.run_id.as_str());
+    let resp = fenced_machine(
         ctx,
         step.as_str(),
         class,
         &req,
-        None,
+        controller_generation,
         move |op_id| async move {
             machine_effect(
                 ctx,

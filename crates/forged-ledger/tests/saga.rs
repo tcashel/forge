@@ -9,7 +9,7 @@ use std::sync::{Arc, Barrier};
 
 use forged_ledger::{
     AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
-    RunOutcome, RunState, SpecFence,
+    RunOutcome, RunSettlement, RunState, SpecFence,
 };
 use forged_types::{
     AcceptedRisk, ErrorCode, Finding, OperationRequest, OperationResponse, Outcome, PacketResult,
@@ -782,6 +782,118 @@ fn whole_run_settlement_is_immutable_idempotent_and_evented() {
         )
         .expect_err("terminal outcome cannot be rewritten");
     assert_eq!(conflict.code(), ErrorCode::InvalidRequest);
+    ledger.close().expect("close");
+}
+
+#[test]
+fn controller_generation_settlement_fences_new_effects_and_replays_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-controller-fence");
+    let before = request("machine:gate:0", Some(&run));
+    let before_id = match ledger
+        .begin_controller_operation("gate", &before, EffectClass::SafeRetry, 4)
+        .expect("active generation may reserve an effect")
+    {
+        OperationOutcome::Fresh(ticket) => ticket.operation_id,
+        other => panic!("expected fresh operation, got {other:?}"),
+    };
+    ledger
+        .complete_operation(&before_id, &ok_response(&before_id))
+        .expect("complete harmless predecessor");
+
+    ledger
+        .settle_run_fencing_controller(
+            &run,
+            RunSettlement {
+                outcome: RunOutcome::Cancelled,
+                reason: "operator cancelled".to_owned(),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            },
+            4,
+        )
+        .expect("settle and fence generation");
+
+    let late = request("machine:push:0", Some(&run));
+    let error = ledger
+        .begin_controller_operation("push", &late, EffectClass::ObserveOnly, 4)
+        .expect_err("fenced generation cannot receive a machine-effect ticket");
+    assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+    let foreground = request("machine:foreground-push:0", Some(&run));
+    let error = ledger
+        .begin_machine_operation("push", &foreground, EffectClass::ObserveOnly, None)
+        .expect_err("a foreground machine cannot admit work after settlement");
+    assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+
+    let replay = ledger
+        .begin_controller_operation("gate", &before, EffectClass::SafeRetry, 4)
+        .expect("an already-terminal operation remains replayable");
+    assert!(matches!(replay, OperationOutcome::Replayed(_)));
+
+    ledger
+        .settle_run_fencing_controller(
+            &run,
+            RunSettlement {
+                outcome: RunOutcome::Cancelled,
+                reason: "operator cancelled".to_owned(),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            },
+            4,
+        )
+        .expect("identical settlement replay");
+    let revocations: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.controller.revoked")
+        .collect();
+    assert_eq!(
+        revocations.len(),
+        1,
+        "one durable revocation per generation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&revocations[0].payload_json).expect("payload")
+            ["generation"],
+        json!(4)
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn foreground_machine_ticket_is_not_mistaken_for_a_killed_generation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-foreground-fence");
+    let request = request("machine:push:foreground", Some(&run));
+    let operation_id = match ledger
+        .begin_machine_operation("push", &request, EffectClass::ObserveOnly, None)
+        .expect("foreground machine admission")
+    {
+        OperationOutcome::Fresh(ticket) => ticket.operation_id,
+        other => panic!("expected fresh operation, got {other:?}"),
+    };
+    ledger
+        .settle_run(
+            &run,
+            RunOutcome::Cancelled,
+            "operator cancelled".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("terminal projection wins after admission");
+    assert_eq!(
+        ledger
+            .uncontained_machine_operations(&run, None)
+            .expect("unsafe operations"),
+        vec![operation_id],
+        "settlement cannot claim an unidentified foreground effect is dead"
+    );
     ledger.close().expect("close");
 }
 

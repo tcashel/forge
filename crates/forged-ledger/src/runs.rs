@@ -17,7 +17,7 @@ use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
     NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
-    RunRow, RunState,
+    RunRow, RunSettlement, RunState,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -72,6 +72,42 @@ const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.pro
     d.roster_sha256, COALESCE(m.package_json, d.package_json), d.compatibility_roster_json, \
     d.created_at";
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
+const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
+
+fn append_controller_revocation_tx(
+    conn: &Connection,
+    run_id: &str,
+    generation: u32,
+    reason: &str,
+) -> Result<(), LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![run_id, CONTROLLER_REVOKED], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for payload in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+        if payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(generation))
+        {
+            return Ok(());
+        }
+    }
+    append_event_tx(
+        conn,
+        Some(run_id),
+        CONTROLLER_REVOKED,
+        &json!({
+            "schemaVersion": 1,
+            "runId": run_id,
+            "generation": generation,
+            "reason": reason,
+        }),
+    )
+}
 
 fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
     Ok(RunDefinitionRow {
@@ -788,6 +824,44 @@ impl Ledger {
         delivery_sha: Option<String>,
         superseded_by: Option<String>,
     ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(
+            run_id,
+            RunSettlement {
+                outcome,
+                reason,
+                delivery_pr,
+                delivery_sha,
+                superseded_by,
+            },
+            None,
+        )
+    }
+
+    /// Settle a run and durably revoke one detached controller generation in
+    /// the same transaction. Machine-effect admission joins this event via
+    /// [`Ledger::begin_controller_operation`].
+    pub fn settle_run_fencing_controller(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: u32,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(run_id, settlement, Some(controller_generation))
+    }
+
+    fn settle_run_inner(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: Option<u32>,
+    ) -> Result<RunRow, LedgerError> {
+        let RunSettlement {
+            outcome,
+            reason,
+            delivery_pr,
+            delivery_sha,
+            superseded_by,
+        } = settlement;
         if reason.trim().is_empty() {
             return Err(refused(
                 ErrorCode::InvalidRequest,
@@ -845,6 +919,9 @@ impl Ledger {
                     && current.delivery_sha == delivery_sha
                     && current.superseded_by == superseded_by
                 {
+                    if let Some(generation) = controller_generation {
+                        append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
+                    }
                     tx.commit()?;
                     return Ok(current);
                 }
@@ -910,6 +987,9 @@ impl Ledger {
                     "supersededBy": superseded_by,
                 }),
             )?;
+            if let Some(generation) = controller_generation {
+                append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
+            }
             let row = get_run_tx(&tx, &run_id)?;
             tx.commit()?;
             Ok(row)

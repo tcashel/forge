@@ -43,6 +43,21 @@ pub enum RunOutcome {
     Landed,
 }
 
+/// Immutable evidence for one whole-run terminal projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSettlement {
+    /// Operator-visible terminal outcome.
+    pub outcome: RunOutcome,
+    /// Durable explanation for the terminal decision.
+    pub reason: String,
+    /// Landed delivery PR, when applicable.
+    pub delivery_pr: Option<u64>,
+    /// Landed delivery commit, when applicable.
+    pub delivery_sha: Option<String>,
+    /// Successor run for a superseded settlement.
+    pub superseded_by: Option<String>,
+}
+
 impl RunOutcome {
     /// The closed spelling stored in SQLite and exposed on the wire.
     pub fn as_str(self) -> &'static str {

@@ -62,6 +62,42 @@ fn spawn_drive(env: &TestEnv, run: &str, failpoint: Option<(&str, &str, &Path)>)
         .expect("drive child spawns")
 }
 
+fn submit_at_failpoint(env: &TestEnv, run: &str, site: &str, dir: &Path) -> Value {
+    let output = env
+        .forged_cmd(&["run", "submit", "--run", run])
+        .env("FORGED_FAILPOINT", site)
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", dir)
+        .output()
+        .expect("submitter runs");
+    assert!(
+        output.status.success(),
+        "submit failed: stdout={} stderr={} controller={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(
+            env.anvil
+                .join(format!("runs/{run}/controller/controller-1.log"))
+        )
+        .unwrap_or_default(),
+    );
+    serde_json::from_slice(&output.stdout).expect("submit envelope")
+}
+
+fn controller_pid(submitted: &Value) -> i32 {
+    submitted["result"]["controller"]["pid"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("controller pid")
+}
+
+fn process_group_alive(group: i32) -> bool {
+    matches!(
+        kill(Pid::from_raw(-group), None),
+        Ok(()) | Err(Errno::EPERM)
+    )
+}
+
 fn start_epic(env: &TestEnv, epic: &str) {
     env.enable_dynamic_gh();
     env.seed_epic(epic, &[("child-crash", &env.spec, true)]);
@@ -498,6 +534,158 @@ fn applied_then_response_lost_settles_by_observation_without_repeating() {
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k4"]);
     assert_eq!(code, 0, "drive after observation: {driven}");
     assert!(driven["result"]["terminal"]["done"].is_object());
+}
+
+// ------------------------------------------ whole-run controller generation fence
+
+#[test]
+fn settlement_replay_kills_push_generation_before_git_can_fire() {
+    let env = TestEnv::new("km-stop-fence-push");
+    start_run(&env, "bead-stop-push");
+    let fp = env.root.join("fp-stop-fence-push");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let submitted = submit_at_failpoint(&env, "bead-stop-push", "git.push.before", &fp);
+    let pid = controller_pid(&submitted);
+    wait_until("controller at git.push.before", || {
+        fp.join("git.push.before.reached").exists()
+    });
+    assert!(process_group_alive(pid), "controller effect group is live");
+
+    // Crash the first settlement after the run+generation fence committed,
+    // but before it could kill the controller. This is the recovery shape:
+    // the paused generation stays alive yet cannot obtain another ticket.
+    let mut stopper = env
+        .forged_cmd(&[
+            "run",
+            "stop",
+            "--run",
+            "bead-stop-push",
+            "--outcome",
+            "cancelled",
+            "--reason",
+            "operator cancelled",
+        ])
+        .env("FORGED_FAILPOINT", "run.settle.controller-revoked.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("stopper spawns");
+    let status = stopper.wait().expect("stopper crashes");
+    assert!(!status.success(), "settlement crash failpoint fired");
+    assert!(
+        process_group_alive(pid),
+        "the test proves recovery starts from a still-live fenced generation"
+    );
+    {
+        let ledger = env.ledger();
+        let run = ledger.get_run("bead-stop-push").expect("run");
+        assert_eq!(run.state, forged_ledger::RunState::Stopped);
+        assert_eq!(
+            run.terminal_outcome,
+            Some(forged_ledger::RunOutcome::Cancelled)
+        );
+        assert_eq!(
+            ledger
+                .list_events(Some("bead-stop-push"), 0, 65_536)
+                .expect("events")
+                .iter()
+                .filter(|row| row.kind == "forged.controller.revoked")
+                .count(),
+            1
+        );
+        ledger.close().expect("close");
+    }
+
+    // Release the crashed SafeRetry wrapper, then replay the exact durable
+    // settlement. It must confirm generation death before returning.
+    let (code, reconciled) = env.forged(&["reconcile", "--run", "bead-stop-push"]);
+    assert_eq!(code, 0, "reconcile interrupted settlement: {reconciled}");
+    let (code, replay) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "bead-stop-push",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "operator cancelled",
+    ]);
+    assert_eq!(code, 0, "settlement replay: {replay}");
+    assert_eq!(replay["result"]["controllerGeneration"], json!(1));
+    assert_eq!(replay["result"]["controllerStopped"], json!(true));
+    assert!(
+        !process_group_alive(pid),
+        "settlement returned only after the controller group died"
+    );
+    assert!(
+        !support::git_raw(
+            &env.repos.origin,
+            &["show-ref", "--verify", "refs/heads/forged/bead-stop-push"]
+        )
+        .status
+        .success(),
+        "git.push.before never crossed into git push"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("bead-stop-push"), 0, 65_536)
+            .expect("events")
+            .iter()
+            .filter(|row| row.kind == "forged.controller.revoked")
+            .count(),
+        1,
+        "replay does not duplicate the durable generation fence"
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn settlement_kills_draft_pr_generation_before_gh_can_fire() {
+    let env = TestEnv::new("km-stop-fence-pr");
+    start_run(&env, "bead-stop-pr");
+    let fp = env.root.join("fp-stop-fence-pr");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let submitted = submit_at_failpoint(&env, "bead-stop-pr", "gh.call.before", &fp);
+    let pid = controller_pid(&submitted);
+    wait_until("controller at gh.call.before", || {
+        fp.join("gh.call.before.reached").exists()
+    });
+
+    let creates_before = env
+        .gh_calls()
+        .iter()
+        .filter(|argv| {
+            argv.iter().any(|arg| arg.contains("/pulls")) && argv.contains(&"POST".to_owned())
+        })
+        .count();
+    assert_eq!(creates_before, 0, "paused before draft PR creation");
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "bead-stop-pr",
+        "--outcome",
+        "input-required",
+        "--reason",
+        "operator input required",
+    ]);
+    assert_eq!(code, 0, "settle draft PR generation: {stopped}");
+    assert_eq!(stopped["result"]["controllerStopped"], json!(true));
+    assert!(
+        !process_group_alive(pid),
+        "settlement returned only after draft PR controller death"
+    );
+    let creates_after = env
+        .gh_calls()
+        .iter()
+        .filter(|argv| {
+            argv.iter().any(|arg| arg.contains("/pulls")) && argv.contains(&"POST".to_owned())
+        })
+        .count();
+    assert_eq!(creates_after, 0, "gh.call.before never crossed into POST");
 }
 
 // ------------------------------------------------------- epic merge recovery

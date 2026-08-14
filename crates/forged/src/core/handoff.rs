@@ -29,6 +29,9 @@ const RECORD_FILE: &str = "controller.json";
 const SUBMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
 const DRIVER_PID_ENV: &str = "FORGED_CONTROLLER_PID_PATH";
 const DRIVER_LSTART_ENV: &str = "FORGED_CONTROLLER_LSTART_PATH";
+const CONTROLLER_SCOPE_ENV: &str = "FORGED_CONTROLLER_SCOPE";
+const CONTROLLER_ID_ENV: &str = "FORGED_CONTROLLER_ID";
+const CONTROLLER_GENERATION_ENV: &str = "FORGED_CONTROLLER_GENERATION";
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -138,6 +141,16 @@ pub(crate) async fn record_driver_identity_from_env() -> Result<(), String> {
     let lstart = crate::adapters::ports::lstart_of(pid)
         .await
         .ok_or_else(|| format!("cannot verify detached controller pid {pid}"))?;
+    let pid_value = nix::unistd::Pid::from_raw(pid);
+    if let Err(error) = nix::unistd::setpgid(pid_value, pid_value) {
+        let group = nix::unistd::getpgid(Some(pid_value))
+            .map_err(|probe| format!("cannot verify detached controller process group: {probe}"))?;
+        if group != pid_value {
+            return Err(format!(
+                "cannot establish detached controller process group {pid}: {error}"
+            ));
+        }
+    }
     // PID is the publication marker. A submitter that observes it is
     // guaranteed the matching start stamp was durably written first.
     std::fs::write(&lstart_path, format!("{lstart}\n"))
@@ -184,7 +197,7 @@ fn submit_holder_identity(holder: &str) -> Option<(i32, Option<u64>)> {
     Some((pid, identity))
 }
 
-struct SubmitGuard {
+pub(super) struct SubmitGuard {
     ledger: Ledger,
     slot: String,
     holder: String,
@@ -268,6 +281,159 @@ async fn acquire_submit(ctx: &Ctx, id: &str, scope: Scope) -> Result<SubmitGuard
             }
         }
     }
+}
+
+pub(super) async fn acquire_run_submit(ctx: &Ctx, id: &str) -> Result<SubmitGuard, Failure> {
+    acquire_submit(ctx, id, Scope::Run).await
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ControllerFenceTarget {
+    pub(super) generation: u32,
+    pid: i32,
+    lstart: String,
+    owned_by_current_process: bool,
+}
+
+impl ControllerFenceTarget {
+    pub(super) fn effects_excluded(&self) -> bool {
+        !self.owned_by_current_process
+    }
+}
+
+/// The generation this detached run controller must join for machine effects.
+pub(super) fn controller_generation_for_run(run_id: &str) -> Option<u32> {
+    let scope = std::env::var(CONTROLLER_SCOPE_ENV).ok()?;
+    let id = std::env::var(CONTROLLER_ID_ENV).ok()?;
+    let generation = std::env::var(CONTROLLER_GENERATION_ENV)
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    (scope == "run" && id == run_id && generation > 0).then_some(generation)
+}
+
+/// Resolve the latest durable run-controller identity while the caller owns
+/// the submit singleton. A generation remains useful even after its driver
+/// exited because settlement must still confirm its process group is gone.
+pub(super) async fn controller_fence_target(
+    ctx: &Ctx,
+    run_id: &str,
+) -> Result<Option<ControllerFenceTarget>, Failure> {
+    let Some(record) = latest_record(ctx, run_id).await? else {
+        return Ok(None);
+    };
+    let generation = generation(&record);
+    if generation == 0 {
+        return Ok(None);
+    }
+    let pid = record
+        .pointer("/driver/pid")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .or_else(|| {
+            record
+                .get("pidPath")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .and_then(read_pid)
+        })
+        .ok_or_else(|| Failure::internal("controller record has no driver pid"))?;
+    let lstart = record
+        .pointer("/driver/lstart")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            record
+                .get("lstartPath")
+                .and_then(Value::as_str)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| Failure::internal("controller record has no driver start identity"))?;
+    let owned_by_current_process = pid == std::process::id() as i32
+        && controller_generation_for_run(run_id) == Some(generation);
+    Ok(Some(ControllerFenceTarget {
+        generation,
+        pid,
+        lstart,
+        owned_by_current_process,
+    }))
+}
+
+fn process_group_alive(group: i32) -> bool {
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+async fn await_process_group_death(group: i32, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if !process_group_alive(group) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !process_group_alive(group)
+}
+
+/// Confirm a fenced controller cannot retain an effect-capable descendant.
+/// The driver is its generation's process-group leader before its PID is
+/// published, so negative-PID death is the relevant proof, not just parent
+/// process death.
+pub(super) async fn kill_controller_confirmed(
+    target: &ControllerFenceTarget,
+) -> Result<bool, Failure> {
+    if target.owned_by_current_process {
+        return Ok(false);
+    }
+    if !process_group_alive(target.pid) {
+        return Ok(false);
+    }
+    let current = crate::adapters::ports::lstart_of(target.pid).await;
+    if current.as_deref() != Some(target.lstart.as_str()) {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "controller generation {} process group {} is live but its leader identity changed",
+                target.generation, target.pid
+            ),
+            recoverable: true,
+        });
+    }
+    let group = nix::unistd::Pid::from_raw(target.pid);
+    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "stopping controller generation {}: {error}",
+                target.generation
+            )))
+        }
+    }
+    if !await_process_group_death(target.pid, 20).await {
+        match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => {
+                return Err(Failure::internal(format!(
+                    "killing controller generation {}: {error}",
+                    target.generation
+                )))
+            }
+        }
+    }
+    if !await_process_group_death(target.pid, 100).await {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "controller generation {} process group {} did not die",
+                target.generation, target.pid
+            ),
+            recoverable: true,
+        });
+    }
+    Ok(true)
 }
 
 async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
@@ -646,6 +812,19 @@ async fn spawn(
         DRIVER_LSTART_ENV.to_owned(),
         lstart_path.to_string_lossy().into_owned(),
     );
+    env.insert(CONTROLLER_SCOPE_ENV.to_owned(), scope.noun().to_owned());
+    env.insert(CONTROLLER_ID_ENV.to_owned(), id.to_owned());
+    env.insert(CONTROLLER_GENERATION_ENV.to_owned(), generation.to_string());
+    #[cfg(feature = "failpoints")]
+    for key in [
+        "FORGED_FAILPOINT",
+        "FORGED_FAILPOINT_MODE",
+        "FORGED_FAILPOINT_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_owned(), value);
+        }
+    }
 
     let session = host.spawn(Path::new(repo), &shell_line, &env).await?;
     let Some(pid) = await_pid(&pid_path).await else {
