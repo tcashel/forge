@@ -493,6 +493,8 @@ fn observe_event(
 mod tests {
     use super::*;
 
+    use tokio::net::UnixListener;
+
     /// Criterion 6 fixture: the exact event shapes from the wire contract —
     /// stale foreign `pane_created`/`pane_exited` lines, then the
     /// self-triggered `pane_created`, then a genuine `pane_exited`.
@@ -610,5 +612,204 @@ mod tests {
             message: "method not found: pane.fly".to_string(),
         };
         assert!(!method.is_pane_not_found());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch failure logging. Every way a fire-and-forget request can fail
+    // leaves a residual the operator would otherwise meet only as a stray
+    // shell, so the `warn` IS the observable: restoring the original silence
+    // must fail a test rather than merely change one. Each branch below is
+    // driven through the real `dispatch`, never through a stand-in.
+    // -----------------------------------------------------------------------
+
+    /// Every warning this process emits, rendered as `message field=value …`.
+    fn captured() -> &'static Mutex<Vec<String>> {
+        static CAPTURED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        CAPTURED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    struct CaptureLayer;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().level() > &tracing::Level::WARN {
+                return;
+            }
+            let mut rendered = String::new();
+            event.record(&mut RenderFields(&mut rendered));
+            captured().lock().expect("capture lock").push(rendered);
+        }
+    }
+
+    struct RenderFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for RenderFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    /// Route this process's warnings into [`captured`]. Deliberately the
+    /// GLOBAL subscriber: the refusal branch logs from a detached task that
+    /// no thread-local default would ever cover. Tests therefore share one
+    /// buffer and each identifies its own line by its unique method name.
+    fn capture_warnings() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            use tracing_subscriber::util::SubscriberInitExt as _;
+            let _ = tracing_subscriber::registry().with(CaptureLayer).try_init();
+        });
+    }
+
+    /// Wait for a captured warning containing `needle`, failing with
+    /// everything that WAS captured.
+    async fn warning_containing(needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let hit = captured()
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|line| line.contains(needle))
+                .cloned();
+            if let Some(line) = hit {
+                return line;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Cloned out first: a guard alive across the panic would
+                // poison the buffer and fail every other test for the wrong
+                // reason.
+                let seen = captured().lock().expect("capture lock").clone();
+                panic!("no warning mentioning {needle:?}; captured: {seen:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A body far larger than any socket buffer, so a peer that never reads
+    /// necessarily leaves the write unfinished instead of silently absorbing
+    /// it — the stalled and hung-up sockets below both depend on that.
+    fn oversized_params() -> Value {
+        serde_json::json!({ "blob": "x".repeat(4 * 1024 * 1024) })
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_the_socket_cannot_be_reached() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let absent = tmp.path().join("herdr.sock");
+        let connection = Connection::dial(&absent).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.unreachable", Value::Null)
+            .await;
+
+        let line = warning_containing("test.dispatch.unreachable").await;
+        assert!(line.contains("never connected"), "{line}");
+        assert!(
+            line.contains(&absent.display().to_string()),
+            "the unreachable socket must be named: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_the_write_fails() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Accept and hang up at once: the peer is gone long before an
+        // oversized body could drain into the socket.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.hangup", oversized_params())
+            .await;
+
+        let line = warning_containing("test.dispatch.hangup").await;
+        assert!(line.contains("write failed"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_it_exceeds_its_budget() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Accept and never read: the herdr whose backlog is full, on which
+        // the write can only stall.
+        let stalled = tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        let started = std::time::Instant::now();
+        connection
+            .dispatch("test.dispatch.stalled", oversized_params())
+            .await;
+        let elapsed = started.elapsed();
+
+        let line = warning_containing("test.dispatch.stalled").await;
+        assert!(line.contains("exceeded its budget"), "{line}");
+        assert!(
+            line.contains(&format!("budget_ms={}", DISPATCH_BUDGET.as_millis())),
+            "{line}"
+        );
+        // The point of the budget: a settled caller never pays an RPC's wait.
+        assert!(elapsed < RPC_TIMEOUT, "dispatch waited {elapsed:?}");
+        stalled.abort();
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_herdr_refuses_the_request() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Answer with an error object carrying the request's own id: the one
+        // shape the background drain exists to notice.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let request = lines.next_line().await.expect("read").expect("request");
+            let frame: Value = serde_json::from_str(&request).expect("request json");
+            let id = frame["id"].as_str().expect("request id").to_string();
+            let response = serde_json::json!({
+                "id": id,
+                "error": {"code": "INTERNAL", "message": "close refused by the test"},
+            });
+            write_half
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("write response");
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.refused", Value::Null)
+            .await;
+
+        let line = warning_containing("test.dispatch.refused").await;
+        assert!(line.contains("refused the dispatched request"), "{line}");
+        assert!(
+            line.contains("INTERNAL"),
+            "the refusal code is lost: {line}"
+        );
+        assert!(
+            line.contains("close refused by the test"),
+            "the refusal message is lost: {line}"
+        );
     }
 }
