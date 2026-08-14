@@ -119,7 +119,7 @@ pub fn enter_non_git_cwd() {
     std::env::set_current_dir(dir).expect("chdir to non-git temp dir");
 }
 
-const SHIM_SCRIPT: &str = r#"#!/bin/sh
+pub const SHIM_SCRIPT: &str = r#"#!/bin/sh
 {
   printf '%s\037' "$@"
   printf '\036'
@@ -170,9 +170,17 @@ impl Shim {
         std::fs::create_dir(&bin_dir).expect("mkdir bin");
         std::fs::create_dir(&scenario_dir).expect("mkdir scenarios");
         let program = bin_dir.join("gh");
-        std::fs::write(&program, SHIM_SCRIPT).expect("write shim");
-        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o755))
+        // The exec'd path is published by rename and is never itself opened
+        // for writing. A sibling test forking inside a write to `gh` would
+        // inherit a writable descriptor to it and the kernel would refuse to
+        // exec it (ETXTBSY); it can only ever inherit one to the staging
+        // name, which nothing execs. Mode is set before the rename, so the
+        // file is never observable at its final path without it.
+        let staging = bin_dir.join("gh.staging");
+        std::fs::write(&staging, SHIM_SCRIPT).expect("write shim");
+        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(0o755))
             .expect("chmod shim");
+        std::fs::rename(&staging, &program).expect("publish shim");
         let log = root.join("calls.log");
         Self {
             tmp,

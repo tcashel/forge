@@ -5,7 +5,7 @@
 
 mod common;
 
-use common::{enter_non_git_cwd, pr_json, Shim};
+use common::{enter_non_git_cwd, pr_json, Shim, SHIM_SCRIPT};
 use forged_git::{CommentOutcome, GhClient, GhError};
 
 const REPO: &str = "tcashel/forge";
@@ -401,4 +401,39 @@ async fn live_gh_api_smoke() {
         .await
         .expect("live gh api call succeeds");
     assert!(!branch.is_empty());
+}
+
+/// The shim's exec'd path is published, not written: once `new` returns,
+/// `bin/gh` is the only entry there, carries its mode, and holds exactly the
+/// script. A surviving staging entry means the rename did not happen and the
+/// path the tests exec was opened for writing.
+#[test]
+fn shim_publishes_gh_by_rename_leaving_no_staging_entry() {
+    use std::os::unix::fs::PermissionsExt;
+
+    let shim = Shim::new();
+
+    let mut entries: Vec<String> = std::fs::read_dir(&shim.bin_dir)
+        .expect("read bin dir")
+        .map(|entry| {
+            entry
+                .expect("dir entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect();
+    entries.sort();
+    assert_eq!(entries, vec!["gh".to_owned()]);
+
+    let program = shim.bin_dir.join("gh");
+    let mode = std::fs::metadata(&program)
+        .expect("gh exists")
+        .permissions()
+        .mode();
+    assert_eq!(mode & 0o777, 0o755, "published with its mode");
+    assert_eq!(
+        std::fs::read_to_string(&program).expect("read gh"),
+        SHIM_SCRIPT
+    );
 }
