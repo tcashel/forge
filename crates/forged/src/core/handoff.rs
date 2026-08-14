@@ -5,16 +5,13 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
-use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, OperationState, SlotOutcome};
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
-use sha2::{Digest, Sha256};
 
 use crate::config::{now_iso, HostPolicy};
 use crate::core::{
@@ -70,42 +67,9 @@ fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
 }
 
-fn binary_identity(path: &Path) -> Result<Value, Failure> {
-    let mut file = std::fs::File::open(path)
-        .map_err(|error| Failure::internal(format!("opening forged executable: {error}")))?;
-    let mut digest = Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let read = file
-            .read(&mut buf)
-            .map_err(|error| Failure::internal(format!("hashing forged executable: {error}")))?;
-        if read == 0 {
-            break;
-        }
-        digest.update(&buf[..read]);
-    }
-    let sha256 = digest
-        .finalize()
-        .iter()
-        .map(|byte| format!("{byte:02x}"))
-        .collect::<String>();
-    Ok(json!({
-        "path": path,
-        "version": env!("CARGO_PKG_VERSION"),
-        "sha256": sha256,
-    }))
-}
-
 fn current_binary_identity() -> Result<Value, Failure> {
-    static IDENTITY: OnceLock<Result<Value, String>> = OnceLock::new();
-    IDENTITY
-        .get_or_init(|| {
-            let path = std::env::current_exe()
-                .map_err(|error| format!("resolving forged executable: {error}"))?;
-            binary_identity(&path).map_err(|failure| failure.message)
-        })
-        .clone()
-        .map_err(Failure::internal)
+    serde_json::to_value(crate::runtime::current_binary_identity()?)
+        .map_err(|error| Failure::internal(format!("serializing forged binary identity: {error}")))
 }
 
 fn controller_shell_line(
@@ -495,6 +459,13 @@ pub(super) async fn recover_reserved_record(
     }
     if let Some(record) = latest_record(ctx, id).await? {
         if generation(&record) >= reserved_generation {
+            if generation(&record) == reserved_generation {
+                crate::runtime::complete_recovered_controller_admission(
+                    &ctx.config,
+                    id,
+                    reserved_generation,
+                )?;
+            }
             return Ok(Some(record));
         }
     }
@@ -546,15 +517,10 @@ pub(super) async fn recover_reserved_record(
         "submittedAt": now_iso(),
         "recoveredAfterSpawnCrash": true,
     });
-    std::fs::write(
-        dir.join(RECORD_FILE),
-        serde_json::to_vec_pretty(&record).map_err(|error| {
-            Failure::internal(format!("serializing recovered controller: {error}"))
-        })?,
-    )
-    .map_err(|error| Failure::internal(format!("writing recovered controller record: {error}")))?;
+    crate::runtime::write_controller_record(&dir.join(RECORD_FILE), &record)?;
     crate::failpoint::hit("controller.record.after");
     append_once(ctx, id, CONTROLLER_STARTED, record.clone()).await?;
+    crate::runtime::complete_recovered_controller_admission(&ctx.config, id, reserved_generation)?;
     crate::failpoint::hit("controller.event.after");
     Ok(Some(record))
 }
@@ -817,9 +783,9 @@ pub(super) async fn spawn(
     host_policy: HostPolicy,
     herdr_socket: Option<PathBuf>,
 ) -> Result<Value, Failure> {
-    let dir = controller_dir(ctx, id);
-    std::fs::create_dir_all(&dir)
-        .map_err(|error| Failure::internal(format!("creating controller directory: {error}")))?;
+    let mut runtime_admission =
+        crate::runtime::ControllerAdmission::acquire(&ctx.config, id, generation)?;
+    let dir = runtime_admission.controller_dir().to_path_buf();
     let pid_path = dir.join(format!("controller-{generation}.pid"));
     let lstart_path = dir.join(format!("controller-{generation}.lstart"));
     let record_path = dir.join(RECORD_FILE);
@@ -865,9 +831,12 @@ pub(super) async fn spawn(
             },
         };
 
-    let exe = std::env::current_exe()
-        .map_err(|error| Failure::internal(format!("resolving forged executable: {error}")))?;
-    let binary = current_binary_identity()?;
+    let exe = PathBuf::from(&runtime_admission.binary().path);
+    let binary = serde_json::to_value(runtime_admission.binary()).map_err(|error| {
+        Failure::internal(format!(
+            "serializing authorized forged binary identity: {error}"
+        ))
+    })?;
     let command = format!(
         "{} {} drive --{} {}",
         shell_quote(&exe.to_string_lossy()),
@@ -919,10 +888,16 @@ pub(super) async fn spawn(
         }
     }
 
+    // The host effect is not idempotent and an error can be ambiguous (for
+    // example, a transport loss after Herdr created the pane). Preserve the
+    // admission before sending; only verified death may remove it afterwards.
+    runtime_admission.preserve_spawn_attempt();
     let session = host.spawn(Path::new(repo), &shell_line, &env).await?;
     crate::failpoint::hit("controller.spawn.after");
     let Some(pid) = await_pid(&pid_path).await else {
-        let _ = host.kill_confirmed(&session).await;
+        if host.kill_confirmed(&session).await.is_ok() {
+            runtime_admission.cancelled_after_confirmed_death()?;
+        }
         return Err(Failure::refused(
             ErrorCode::ProviderSpawnFailed,
             "detached controller pid never appeared",
@@ -934,12 +909,20 @@ pub(super) async fn spawn(
         .filter(|value| !value.is_empty());
     let current_lstart = crate::adapters::ports::lstart_of(pid).await;
     if lstart.is_none() || lstart != current_lstart {
-        let _ = host.kill_confirmed(&session).await;
+        if host.kill_confirmed(&session).await.is_ok() {
+            runtime_admission.cancelled_after_confirmed_death()?;
+        }
         return Err(Failure::refused(
             ErrorCode::ProviderSpawnFailed,
             "detached controller identity was not verifiable",
         ));
     }
+    runtime_admission.mark_spawned(
+        pid,
+        lstart
+            .clone()
+            .expect("controller process-start identity checked above"),
+    )?;
     let status_path = status_base.join(session.as_str()).join("status");
     let record = json!({
         "schemaVersion": 1,
@@ -958,14 +941,9 @@ pub(super) async fn spawn(
         "outputPath": output_path,
         "submittedAt": now_iso(),
     });
-    std::fs::write(
-        &record_path,
-        serde_json::to_vec_pretty(&record).map_err(|error| {
-            Failure::internal(format!("serializing controller record: {error}"))
-        })?,
-    )
-    .map_err(|error| Failure::internal(format!("writing controller record: {error}")))?;
+    crate::runtime::write_controller_record(&record_path, &record)?;
     crate::failpoint::hit("controller.record.after");
+    runtime_admission.complete()?;
     append_once(ctx, id, CONTROLLER_STARTED, record.clone()).await?;
     crate::failpoint::hit("controller.event.after");
     Ok(status_for(&record).await)
@@ -1039,6 +1017,16 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     let mut latest_status = Value::Null;
     if let Ok(Some(record)) = latest_record(ctx, &id).await {
         max_generation = max_generation.max(generation(&record));
+        if let Err(error) = crate::runtime::complete_recovered_controller_admission(
+            &ctx.config,
+            &id,
+            generation(&record),
+        ) {
+            return err_response(
+                &derive_key(scope.operation(), Some(&id), None, None),
+                &error,
+            );
+        }
         let status = status_for(&record).await;
         latest_status = status.clone();
         if is_active(&status) {

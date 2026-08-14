@@ -56,6 +56,38 @@ forged doctor
 forged definition validate --profile standard --roster default
 ```
 
+### Optional macOS supervisor service
+
+After the CLI has been installed, macOS operators may run the desired-work
+supervisor as a per-user LaunchAgent:
+
+```sh
+forged service install
+forged service status
+forged service stop --drain --timeout-seconds 300
+forged service start
+forged service restart
+forged service uninstall
+```
+
+`install` copies the exact running executable to
+`$ANVIL_HOME/runtime/bin/<sha256>/forged`; launchd invokes that immutable path
+and its exact service generation, never a mutable `PATH` lookup. The manifest,
+transition journal, idempotency receipts, and generation-scoped health files
+are machine-local runtime state. They do not move or migrate the execution
+ledger. Every lifecycle mutation is serialized, repeated explicit
+`--idempotency-key` values replay their durable result, and an upgrade or
+uninstall refuses until incompatible live controllers drain. `status` verifies
+the manifest digest, `current` projection, on-disk plist, loaded launchd
+program/arguments, PID/process-start identity, generation, and fresh tick.
+
+The service passes only the explicit Anvil/Beads configuration and a bounded
+system path to launchd. Install/start/stop/restart/uninstall are typed
+unsupported operations on non-macOS hosts; `status` and `doctor` report that
+portable state without invoking launchctl. Normal tests use an isolated fake
+host. The real macOS smoke is ignored unless explicitly armed with
+`FORGED_SERVICE_SMOKE_TEST=1`.
+
 `BEADS_DIR` may point to an embedded store or to metadata for one central team
 Dolt SQL database. The collaborative setup, credential boundary, connectivity
 check, and the reasons active embedded work need not migrate are documented in

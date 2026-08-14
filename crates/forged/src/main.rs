@@ -13,6 +13,7 @@ mod core;
 mod failpoint;
 mod mcp;
 mod pricing;
+mod runtime;
 
 use std::sync::Arc;
 
@@ -73,6 +74,13 @@ async fn run(args: cli::Cli) -> i32 {
         // internal fault: the operator can fix the file.
         Err(message) => return pre_dispatch_failure(name, ErrorCode::InvalidRequest, message),
     };
+    let cli::Cli { command } = args;
+    let command = match command {
+        cli::Command::Service { command } => {
+            return emit_response(runtime::dispatch_service(&config, command).await)
+        }
+        command => command,
+    };
     let ledger = match forged_ledger::Ledger::open(&config.db_path) {
         Ok(ledger) => ledger,
         Err(e) => {
@@ -90,7 +98,7 @@ async fn run(args: cli::Cli) -> i32 {
         return code;
     }
 
-    if matches!(args.command, cli::Command::Mcp) {
+    if matches!(command, cli::Command::Mcp) {
         let result = mcp::serve(Arc::clone(&ctx)).await;
         let code = match result {
             Ok(()) => 0,
@@ -103,7 +111,7 @@ async fn run(args: cli::Cli) -> i32 {
         return code;
     }
 
-    let (name, request) = match cli::to_request(args.command) {
+    let (name, request) = match cli::to_request(command) {
         Ok(pair) => pair,
         Err(message) => {
             let code = pre_dispatch_failure(name, ErrorCode::InvalidRequest, message);
@@ -112,16 +120,21 @@ async fn run(args: cli::Cli) -> i32 {
         }
     };
     let response = core::dispatch(&ctx, name, request).await;
+    let code = emit_response(response);
+    close(&ctx);
+    code
+}
+
+fn emit_response(response: forged_types::OperationResponse) -> i32 {
+    let ok = response.ok;
     match serde_json::to_string(&response) {
         Ok(text) => println!("{text}"),
-        Err(e) => {
-            eprintln!("forged: cannot serialize response: {e}");
-            close(&ctx);
+        Err(error) => {
+            eprintln!("forged: cannot serialize response: {error}");
             return 1;
         }
     }
-    close(&ctx);
-    i32::from(!response.ok)
+    i32::from(!ok)
 }
 
 /// Close the ledger deliberately on exit paths, so crash cases in the kill

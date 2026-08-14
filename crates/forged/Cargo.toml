@@ -25,6 +25,7 @@ forged-proto = { path = "../forged-proto" }
 
 async-trait.workspace = true
 clap.workspace = true
+fs2.workspace = true
 jiff.workspace = true
 nix.workspace = true
 rmcp.workspace = true

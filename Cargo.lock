@@ -390,6 +390,7 @@ dependencies = [
  "forged-proto",
  "forged-provider",
  "forged-types",
+ "fs2",
  "jiff",
  "nix",
  "rmcp",

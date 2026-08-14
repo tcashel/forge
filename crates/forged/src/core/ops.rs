@@ -85,6 +85,12 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 )
             },
         }));
+        let (service_ok, service_detail) = crate::runtime::doctor_probe(&ctx.config).await;
+        probes.push(json!({
+            "name": "supervisor-service",
+            "ok": service_ok,
+            "detail": service_detail,
+        }));
         Ok(json!({"probes": probes}))
     })
     .await

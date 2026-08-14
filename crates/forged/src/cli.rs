@@ -75,6 +75,12 @@ pub enum Command {
     Overview(OverviewArgs),
     /// Reconcile operator-authorized desired work.
     Supervise(SuperviseArgs),
+    /// Install and operate the operator-scoped supervisor service.
+    Service {
+        /// Service lifecycle command.
+        #[command(subcommand)]
+        command: ServiceCmd,
+    },
     /// Work inventory.
     Work {
         /// The work subcommand.
@@ -106,6 +112,65 @@ pub struct SuperviseArgs {
     #[arg(long)]
     pub once: bool,
     /// Override the report operation identity.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Immutable installed-service generation. Set only by the LaunchAgent.
+    #[arg(long, hide = true)]
+    pub service_generation: Option<String>,
+}
+
+/// Supervisor service lifecycle. Mutations are intentionally CLI-only.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCmd {
+    /// Install this exact executable, or reconcile/upgrade an installation.
+    Install(KeyOnly),
+    /// Start the installed supervisor.
+    Start(KeyOnly),
+    /// Stop the supervisor, optionally waiting for controllers to drain.
+    Stop(ServiceStopArgs),
+    /// Gracefully restart the installed supervisor.
+    Restart(KeyOnly),
+    /// Inspect manifest, launchd, process, binary, and tick identity.
+    Status(KeyOnly),
+    /// Remove the drained LaunchAgent while retaining immutable binaries.
+    Uninstall(KeyOnly),
+}
+
+impl ServiceCmd {
+    pub(crate) fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Install(_) => "service_install",
+            Self::Start(_) => "service_start",
+            Self::Stop(_) => "service_stop",
+            Self::Restart(_) => "service_restart",
+            Self::Status(_) => "service_status",
+            Self::Uninstall(_) => "service_uninstall",
+        }
+    }
+
+    pub(crate) fn idempotency_key(&self) -> Option<&str> {
+        let key = match self {
+            Self::Install(args)
+            | Self::Start(args)
+            | Self::Restart(args)
+            | Self::Status(args)
+            | Self::Uninstall(args) => args.idempotency_key.as_deref(),
+            Self::Stop(args) => args.idempotency_key.as_deref(),
+        };
+        key.filter(|value| !value.is_empty())
+    }
+}
+
+/// `service stop` flags.
+#[derive(Debug, Args)]
+pub struct ServiceStopArgs {
+    /// After stopping scheduling, wait for all live controllers to finish.
+    #[arg(long)]
+    pub drain: bool,
+    /// Maximum drain wait. A timeout reports every remaining controller.
+    #[arg(long, default_value_t = 300)]
+    pub timeout_seconds: u64,
+    /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -783,6 +848,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
         Command::Supervise(_) => "supervise",
+        Command::Service { command } => command.operation_name(),
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
         },
@@ -1166,8 +1232,18 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
         }
         Command::Supervise(a) => (
             "supervise",
-            request(a.idempotency_key, None, json!({"once": a.once})),
+            request(
+                a.idempotency_key,
+                None,
+                json!({
+                    "once": a.once,
+                    "serviceGeneration": a.service_generation,
+                }),
+            ),
         ),
+        Command::Service { .. } => {
+            unreachable!("service commands are handled before ledger initialization")
+        }
         Command::Work { command } => match command {
             WorkCmd::List(a) => {
                 let mut params = Map::new();

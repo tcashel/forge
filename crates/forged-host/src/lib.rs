@@ -20,6 +20,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::path::Path;
 
+/// Read the host sentinel using the same strict parser as every liveness
+/// backend. Only `Some(code)` is verified terminal truth; absent, empty, and
+/// malformed files return `None`, while I/O failures remain errors.
+pub fn read_exit_status(path: &Path) -> Result<Option<i32>, HostError> {
+    sentinel::read_status(path)
+}
+
 /// Host-scoped opaque session handle.
 ///
 /// Ids are valid only within the host instance that issued them; presenting

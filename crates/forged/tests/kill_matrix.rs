@@ -1067,6 +1067,13 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
             .exists(),
         "the detached identity reached disk before the crash"
     );
+    let admission = env
+        .anvil
+        .join("runs/bead-khandoff/controller/runtime-admission.json");
+    assert!(
+        admission.exists(),
+        "the lifecycle fence survives the record-before-completion crash"
+    );
 
     // A new lead session recovers the exact same controller and settles the
     // interrupted submit operation. It never starts a second controller.
@@ -1074,6 +1081,10 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
     assert_eq!(code, 0, "recover submit: {recovered}");
     assert_eq!(recovered["result"]["submitted"], json!(true));
     assert_eq!(recovered["result"]["alreadyRunning"], json!(false));
+    assert!(
+        !admission.exists(),
+        "matching durable controller identity completes the admission"
+    );
     {
         let ledger = env.ledger();
         let operation = ledger

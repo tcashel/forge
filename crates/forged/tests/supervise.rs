@@ -283,6 +283,53 @@ fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
 }
 
 #[test]
+fn foreground_mode_exits_cleanly_on_sigterm() {
+    let env = TestEnv::new("supervise-foreground-sigterm");
+    start_run(&env, "run-sigterm");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-sigterm"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    let supervisor = env
+        .forged_cmd(&["supervise"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("foreground supervisor spawns");
+    let supervisor_pid = i32::try_from(supervisor.id()).expect("supervisor pid fits i32");
+
+    wait_until("SIGTERM handler is active after a completed tick", || {
+        let ledger = env.ledger();
+        let adopted = ledger
+            .get_desired_work(DesiredSubjectKind::Run, "run-sigterm")
+            .expect("desired query")
+            .is_some_and(|row| row.last_outcome == Some(DesiredReconcileOutcome::Adopted));
+        ledger.close().expect("close");
+        adopted
+    });
+    kill(Pid::from_raw(supervisor_pid), Signal::SIGTERM).expect("SIGTERM foreground supervisor");
+    let output = supervisor
+        .wait_with_output()
+        .expect("foreground supervisor exits");
+    assert!(
+        output.status.success(),
+        "supervisor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("supervisor response JSON");
+    assert_eq!(
+        response["result"]["schema"],
+        json!("forged.supervise.session/1")
+    );
+    assert_eq!(response["result"]["reason"], json!("sigterm"));
+    assert!(response["result"]["ticks"]
+        .as_u64()
+        .is_some_and(|ticks| ticks >= 1));
+    let _ = killpg(Pid::from_raw(controller), Signal::SIGKILL);
+}
+
+#[test]
 fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
     let env = TestEnv::new("supervise-input-resolution");
     env.enable_dynamic_gh();

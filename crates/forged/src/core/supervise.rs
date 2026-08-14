@@ -298,6 +298,13 @@ async fn reconcile_claimed(
     }
 
     let mut record = handoff::latest_record(ctx, &row.subject_id).await?;
+    if let Some(value) = record.as_ref() {
+        crate::runtime::complete_recovered_controller_admission(
+            &ctx.config,
+            &row.subject_id,
+            handoff::generation(value),
+        )?;
+    }
     let recorded_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
     if row.controller_generation > recorded_generation {
         record = match handoff::recover_reserved_record(
@@ -553,6 +560,54 @@ fn sleep_until(next_wake: Option<&str>) -> Duration {
     bounded.min(Duration::from_millis(millis.max(10)))
 }
 
+struct ShutdownSignals {
+    #[cfg(unix)]
+    interrupt: tokio::signal::unix::Signal,
+    #[cfg(unix)]
+    terminate: tokio::signal::unix::Signal,
+}
+
+impl ShutdownSignals {
+    fn new() -> Result<Self, Failure> {
+        #[cfg(unix)]
+        {
+            use tokio::signal::unix::{signal, SignalKind};
+            let interrupt = signal(SignalKind::interrupt()).map_err(|error| {
+                Failure::internal(format!("installing supervisor SIGINT handler: {error}"))
+            })?;
+            let terminate = signal(SignalKind::terminate()).map_err(|error| {
+                Failure::internal(format!("installing supervisor SIGTERM handler: {error}"))
+            })?;
+            Ok(Self {
+                interrupt,
+                terminate,
+            })
+        }
+        #[cfg(not(unix))]
+        {
+            Ok(Self {})
+        }
+    }
+
+    async fn wait(&mut self, delay: Duration) -> Option<&'static str> {
+        #[cfg(unix)]
+        {
+            tokio::select! {
+                _ = self.interrupt.recv() => Some("signal"),
+                _ = self.terminate.recv() => Some("sigterm"),
+                _ = tokio::time::sleep(delay) => None,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            tokio::select! {
+                _ = tokio::signal::ctrl_c() => Some("signal"),
+                _ = tokio::time::sleep(delay) => None,
+            }
+        }
+    }
+}
+
 /// `forged supervise [--once]` through the shared CLI/core dispatch seam.
 pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let key = if req.idempotency_key.is_empty() {
@@ -575,6 +630,17 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         .get("once")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let service_generation = req
+        .params
+        .get("serviceGeneration")
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    if once && service_generation.is_some() {
+        return err_response(
+            &key,
+            &Failure::invalid("--once cannot publish a long-running service generation"),
+        );
+    }
     if once {
         return match tick(ctx).await {
             Ok(report) => ok_response(&key, false, report),
@@ -582,6 +648,19 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         };
     }
 
+    let mut observer = match service_generation {
+        Some(generation) => {
+            match crate::runtime::SupervisorObserver::start(&ctx.config, generation).await {
+                Ok(observer) => Some(observer),
+                Err(error) => return err_response(&key, &error),
+            }
+        }
+        None => None,
+    };
+    let mut shutdown = match ShutdownSignals::new() {
+        Ok(signals) => signals,
+        Err(error) => return err_response(&key, &error),
+    };
     let started_at = now_iso();
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
@@ -589,39 +668,71 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         match tick(ctx).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
+                if let Some(observer) = observer.as_mut() {
+                    if let Err(error) = observer.tick_succeeded(&report) {
+                        return err_response(&key, &error);
+                    }
+                }
                 let delay = sleep_until(report.get("nextWakeAt").and_then(Value::as_str));
                 last_report = report;
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        return ok_response(&key, false, json!({
+                if let Some(reason) = shutdown.wait(delay).await {
+                    if let Some(observer) = observer.as_mut() {
+                        if let Err(error) = observer.stopped(reason) {
+                            return err_response(&key, &error);
+                        }
+                    }
+                    return ok_response(
+                        &key,
+                        false,
+                        json!({
                             "schema": LOOP_SCHEMA,
                             "startedAt": started_at,
                             "stoppedAt": now_iso(),
-                            "reason": "signal",
+                            "reason": reason,
                             "ticks": ticks,
                             "lastReport": last_report,
-                        }));
-                    }
-                    _ = tokio::time::sleep(delay) => {}
+                        }),
+                    );
                 }
             }
             Err(error) if error.recoverable => {
-                tokio::select! {
-                    _ = tokio::signal::ctrl_c() => {
-                        return ok_response(&key, false, json!({
+                if let Some(observer) = observer.as_mut() {
+                    if let Err(status_error) = observer.degraded(&error.to_string()) {
+                        return err_response(&key, &status_error);
+                    }
+                }
+                if let Some(signal) = shutdown.wait(Duration::from_secs(POLL_SECONDS)).await {
+                    let reason = if signal == "sigterm" {
+                        "sigterm-after-recoverable-error"
+                    } else {
+                        "signal-after-recoverable-error"
+                    };
+                    if let Some(observer) = observer.as_mut() {
+                        if let Err(status_error) = observer.stopped(reason) {
+                            return err_response(&key, &status_error);
+                        }
+                    }
+                    return ok_response(
+                        &key,
+                        false,
+                        json!({
                             "schema": LOOP_SCHEMA,
                             "startedAt": started_at,
                             "stoppedAt": now_iso(),
-                            "reason": "signal-after-recoverable-error",
+                            "reason": reason,
                             "ticks": ticks,
                             "lastReport": last_report,
                             "lastError": error.to_string(),
-                        }));
-                    }
-                    _ = tokio::time::sleep(Duration::from_secs(POLL_SECONDS)) => {}
+                        }),
+                    );
                 }
             }
-            Err(error) => return err_response(&key, &error),
+            Err(error) => {
+                if let Some(observer) = observer.as_mut() {
+                    let _ = observer.degraded(&error.to_string());
+                }
+                return err_response(&key, &error);
+            }
         }
     }
 }
