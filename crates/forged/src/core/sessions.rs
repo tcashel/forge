@@ -61,6 +61,22 @@ async fn run_events(ctx: &Ctx, run_id: &str) -> Result<Vec<forged_ledger::EventR
     .await
 }
 
+/// The attach hint one attempt's DURABLE record carries, whatever
+/// `session_list` chooses to advertise — for the test that shows the stored
+/// event survives while the listing stops repeating it.
+#[cfg(test)]
+pub(crate) async fn stored_attach_hint_for_test(
+    ctx: &Ctx,
+    run_id: &str,
+    attempt_id: i64,
+) -> Option<String> {
+    let events = run_events(ctx, run_id).await.ok()?;
+    session_records(&events)
+        .into_iter()
+        .find(|record| record.attempt_id == attempt_id)
+        .and_then(|record| record.attach_hint)
+}
+
 fn session_records(events: &[forged_ledger::EventRow]) -> Vec<SessionRecord> {
     events
         .iter()
@@ -229,7 +245,18 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "host": record.host,
                 "sessionId": record.session_id,
                 "socketPath": record.socket_path,
-                "attachHint": record.attach_hint,
+                // The hint is durable; the PANE is not. A settled attempt has
+                // had its terminal released (`SessionHost::release`), so
+                // repeating the stored `forged session read --attempt N` here
+                // would advertise a command that fails BECAUSE the release
+                // worked. `Running` and `Revoking` are the states in which a
+                // pane can still be there to attach to; every other state
+                // reports no hint rather than a broken one.
+                "attachHint": match attempt.state {
+                    forged_ledger::AttemptState::Running
+                    | forged_ledger::AttemptState::Revoking => record.attach_hint.clone(),
+                    _ => None,
+                },
             }));
         }
         let pending = pending_interventions(ctx, run_id).await?;

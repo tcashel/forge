@@ -1284,6 +1284,16 @@ pub struct Rendered {
 }
 
 impl Rendered {
+    /// What clicking each pickable card would ask the host for. Empty when
+    /// nothing is pickable, which is itself an assertion worth making.
+    pub fn picks(&self) -> Vec<Value> {
+        self.nodes
+            .iter()
+            .filter_map(|node| node.get("picks").cloned())
+            .filter(|picks| !picks.is_null())
+            .collect()
+    }
+
     /// The spend header's cost subtitle — the line that either splits billed
     /// from imputed spend or claims the provider billed all of it.
     pub fn spend_subtitle(&self) -> String {
@@ -1416,6 +1426,23 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
     }
 }
 
+/// The chooser as a host that cannot proxy `tools/call` receives it.
+pub fn render_resolution_without_server_tools(node: &str, resolution: &Value) -> Rendered {
+    let out = harness_output_env(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_resolution.mjs"
+        ),
+        resolution,
+        &[("SERVER_TOOLS", "0")],
+    );
+    Rendered {
+        nodes: out["nodes"].as_array().cloned().unwrap_or_default(),
+        text: out["text"].as_str().unwrap_or_default().to_owned(),
+    }
+}
+
 /// Render one `resolution` object's chooser through `assets/overview.html`
 /// itself.
 pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
@@ -1439,8 +1466,19 @@ fn render(node: &str, harness: &str, data: &Value) -> Rendered {
 
 /// Run one render harness against the asset and return the JSON it printed.
 fn harness_output(node: &str, harness: &str, data: &Value) -> Value {
+    harness_output_env(node, harness, data, &[])
+}
+
+/// Run a render harness with extra environment — the App reads the host's
+/// capabilities, so a test has to be able to render against a host that
+/// lacks one.
+fn harness_output_env(node: &str, harness: &str, data: &Value, env: &[(&str, &str)]) -> Value {
     let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/overview.html");
-    let mut child = Command::new(node)
+    let mut command = Command::new(node);
+    for (key, value) in env {
+        command.env(key, value);
+    }
+    let mut child = command
         .args([harness, asset])
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())

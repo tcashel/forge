@@ -489,16 +489,39 @@ async fn repin_packet(
     packet: &WorkPacket,
     spec: &ResolvedSpec,
 ) -> Result<WorkPacket, Failure> {
-    if packet.spec.revision.is_none() || spec.sha256 == packet.spec.sha256 {
-        return Ok(packet.clone());
-    }
     let mut repinned = packet.clone();
-    repinned.spec.sha256 = spec.sha256.clone();
-    repinned.spec.revision = spec.revision();
-    let packet_id = packet.packet_id.clone();
-    let spec_path = repinned.spec.path.clone();
-    let spec_sha256 = repinned.spec.sha256.clone();
-    let spec_revision = repinned.spec.revision.clone();
+    repinned.spec = repin_spec_ref(ctx, &packet.packet_id, &packet.spec, spec).await?;
+    Ok(repinned)
+}
+
+/// The re-pin, over the spec ref alone.
+///
+/// `claim_next` resumes an open packet without ever building a `WorkPacket`,
+/// and it needs this same transition: a bead edited under an open packet
+/// leaves the row pinned to bytes nobody can reach, and a claim against the
+/// current body is refused as drift until something re-pins. Two claim paths
+/// that disagree about that is how the ledger-first resume ended up unable to
+/// recover a spec edit at all, so both call THIS, not a copy of it.
+///
+/// A file-sourced packet (no revision) and an unchanged body are both no-ops:
+/// the deprecated route keeps its own hash fence, and re-pinning to what is
+/// already stored would be a write with nothing to write.
+pub(crate) async fn repin_spec_ref(
+    ctx: &Ctx,
+    packet_id: &str,
+    pinned: &forged_types::SpecRef,
+    spec: &ResolvedSpec,
+) -> Result<forged_types::SpecRef, Failure> {
+    if pinned.revision.is_none() || spec.sha256 == pinned.sha256 {
+        return Ok(pinned.clone());
+    }
+    let mut repinned = pinned.clone();
+    repinned.sha256 = spec.sha256.clone();
+    repinned.revision = spec.revision();
+    let packet_id = packet_id.to_owned();
+    let spec_path = repinned.path.clone();
+    let spec_sha256 = repinned.sha256.clone();
+    let spec_revision = repinned.revision.clone();
     on_ledger(&ctx.ledger, move |l| {
         l.repin_packet_spec(packet_id, spec_path, spec_sha256, spec_revision)
     })
@@ -518,7 +541,7 @@ async fn repin_packet(
 /// the charge is read-and-append inside ONE ledger transaction
 /// (`grant_retry`). Two advances racing the same outage would otherwise read
 /// the same count and both write `n + 1`.
-async fn grant_pre_claim_retry(
+pub(crate) async fn grant_pre_claim_retry(
     ctx: &Ctx,
     packet_id: &str,
     note: String,
@@ -1541,8 +1564,44 @@ mod settle_tests {
         assert!(
             attempt
                 .result_json
+                .clone()
                 .is_some_and(|json| json.contains("the seat did the work")),
             "the ledger must hold the result the seat reported"
+        );
+
+        // The durable record still carries the hint — it is an append-only
+        // event and nothing rewrites it — but the pane it names is released,
+        // so `session list` must stop advertising it. A hint that fails
+        // BECAUSE the release worked is worse than no hint at all.
+        assert!(
+            crate::core::sessions::stored_attach_hint_for_test(&ctx, RUN_ID, claimed.attempt_id)
+                .await
+                .is_some(),
+            "the durable event still names an attach command"
+        );
+        let listed = crate::core::sessions::session_list(
+            &ctx,
+            &forged_types::OperationRequest {
+                schema_version: 1,
+                idempotency_key: "session_list:test".to_owned(),
+                run_id: Some(RUN_ID.to_owned()),
+                params: serde_json::json!({"run": RUN_ID})
+                    .as_object()
+                    .cloned()
+                    .expect("params"),
+            },
+        )
+        .await;
+        let sessions = listed.result.expect("session list result");
+        let settled = sessions["sessions"]
+            .as_array()
+            .expect("sessions array")
+            .iter()
+            .find(|s| s["attemptId"] == serde_json::json!(claimed.attempt_id))
+            .expect("the settled attempt is listed");
+        assert!(
+            settled["attachHint"].is_null(),
+            "a released pane must advertise no attach command: {settled}"
         );
     }
 }

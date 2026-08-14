@@ -137,6 +137,10 @@ const source = [
   .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
 // writes through, and substituting our own would test the substitute.
+const host = {
+  connected: true,
+  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
+};
 const { ingest, state, nodes } = new Function(
   "document",
   "setTimeout",
@@ -144,8 +148,9 @@ const { ingest, state, nodes } = new Function(
   "refresh",
   "packetRows",
   "headline",
+  "host",
   `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { ingest, state, nodes };`,
-)(document, () => {}, () => {}, () => {}, () => [], () => ({}));
+)(document, () => {}, () => {}, () => {}, () => [], () => ({}), host);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");

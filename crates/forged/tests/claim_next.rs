@@ -564,3 +564,109 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
         "the resumed seat must find its spec materialized: {body}"
     );
 }
+
+/// The ledger-first resume must recover a spec edit, exactly as `run advance`
+/// does.
+///
+/// `beads-fbt` taught `execute_packet` to re-pin an edited bead under an open
+/// packet, because a packet pinned to bytes nobody can reach refuses every
+/// claim as drift, forever. `claim-next` is the OTHER claim path and it did
+/// not get that fix — so the recovery workflow an operator reaches for by
+/// hand was the one that could not recover.
+#[test]
+fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
+    let env = TestEnv::new("forged-claim-next-repin");
+    env.forged(&["init"]);
+    env.seed_bead_spec(
+        "bead-repin",
+        "## Context\\n\\nthe bead is the spec.",
+        "- the resume re-pins an edited spec",
+    );
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-repin",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    // Advance to an open packet, then leave the shape a crashed driver
+    // leaves: one transport-failed attempt, no live attempt.
+    let packet = loop {
+        let ledger = env.ledger();
+        let opened = ledger
+            .list_packets("bead-repin")
+            .unwrap_or_default()
+            .into_iter()
+            .next();
+        ledger.close().expect("close");
+        if let Some(packet) = opened {
+            break packet;
+        }
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-repin"]);
+        assert_eq!(code, 0, "advance: {advanced}");
+    };
+    let opened_at_body = packet.spec_sha256.clone();
+    let ledger = env.ledger();
+    let claimed = ledger
+        .claim_packet(
+            &packet.packet_id,
+            &format!("forged:{}:0", packet.packet_id),
+            &forged_ledger::SpecFence::Revision {
+                revision: packet.spec_revision.clone().expect("bead-sourced"),
+                body_sha256: packet.spec_sha256.clone(),
+            },
+        )
+        .expect("claim at the pinned body");
+    ledger
+        .fail_packet(
+            &packet.packet_id,
+            &claimed.claim_token,
+            "transport: session vanished",
+        )
+        .expect("fail packet");
+    ledger.close().expect("close");
+
+    // The operator revises the spec while the packet sits open and unclaimed
+    // — the whole reason the bead is the source of truth.
+    env.set_bead_field("bead-repin", "acceptance", "- revised acceptance");
+
+    let (code, resumed) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-1",
+        "--idempotency-key",
+        "op:claim_next:bead-repin-1",
+    ]);
+    assert_eq!(
+        code, 0,
+        "an edited bead must not wedge the resume: {resumed}"
+    );
+    assert_eq!(
+        resumed["result"]["claimed"]["packet_id"],
+        json!(packet.packet_id)
+    );
+
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    ledger.close().expect("close");
+    assert_ne!(
+        row.spec_sha256, opened_at_body,
+        "the row must be re-pinned to the body the bead carries now: {row:?}"
+    );
+
+    // And the resumed seat reads the REVISED body, not the one the packet
+    // was opened at — a re-pin that left the file behind would hand the
+    // worker bytes the ledger no longer fences.
+    let body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("resumed seat spec at {}: {e}", row.spec_path));
+    assert!(
+        body.contains("revised acceptance"),
+        "the seat reads the revised spec: {body}"
+    );
+}

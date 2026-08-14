@@ -1673,6 +1673,13 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       return [box];
     }
     body.append(pickGrid(candidates));
+    if (!host.capabilities.serverTools) {
+      body.append(el(
+        "div",
+        "empty",
+        "This host does not proxy tool calls, so these cannot be opened from here. Ask overview for one by id.",
+      ));
+    }
     return [box];
   }
 
@@ -1685,10 +1692,16 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    * was never told.
    */
   function pickGrid(entries) {
+    // Pickable only where a pick can be served. This grid draws the
+    // chooser AND the portfolio, so gating it here covers both; gating
+    // only the chooser would leave every portfolio row firing a call
+    // the host refuses.
+    const canPick = !!host.capabilities.serverTools;
     const grid = el("div", "beads");
     for (const entry of entries) {
-      const card = el("button", "bead bead--pick");
+      const card = el("button", canPick ? "bead bead--pick" : "bead");
       card.type = "button";
+      card.disabled = !canPick;
       const top = el("div", "bead__top");
       top.append(el("span", "bead__id", entry.id));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
@@ -1700,7 +1713,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       if (num(entry.costUsdKnown)) foot.append(el("span", "", `$${num(entry.costUsdKnown).toFixed(2)}`));
       if (entry.branch) foot.append(el("span", "trunc", entry.branch));
       card.append(foot);
-      card.addEventListener("click", () => choose(entry));
+      if (canPick) card.addEventListener("click", () => choose(entry));
       grid.append(card);
     }
     return grid;
@@ -1755,6 +1768,13 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    * ABSENCE, so returning to it is this same click with no param at all.
    */
   function choose(entry) {
+    // A host that does not proxy `tools/call` cannot navigate. `refresh`'s
+    // own `!host.connected` guard does NOT cover this: the handshake sets
+    // `connected` true and only afterwards learns the capability, so the
+    // guard passes and the call goes out to a host that will refuse it.
+    // `pickGrid` already declines to bind the click; this is the second
+    // door, for every other caller.
+    if (!host.capabilities.serverTools) return;
     state.args = {
       schemaVersion: 1,
       params: entry.kind === "portfolio"
@@ -2185,6 +2205,12 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.poll.disabled = true;
       nodes.refresh.title = "This host does not proxy tool calls.";
     }
+    // A chooser drawn BEFORE this handshake resolved saw an empty
+    // `capabilities` and rendered its cards unpickable. Re-render whatever
+    // the answer turned out to be: gating this on the incapable branch would
+    // leave a capable host's cards permanently dead, which is the same bug
+    // in the other direction.
+    if (state.data?.resolution || state.data?.kind === "portfolio") render();
     reportSize();
     const observer = new ResizeObserver(reportSize);
     observer.observe(document.documentElement);
