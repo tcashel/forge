@@ -49,9 +49,10 @@ impl Ledger {
     /// id `"<run>/<stage>/<seq>"`.
     ///
     /// Re-opening with byte-identical content adds no row. Re-opening with a
-    /// DIFFERENT spec re-pins the row — see [`Ledger::open_packet_with_id`]
-    /// for the guard that keeps a live seat's spec from moving under it. An
-    /// unknown run refuses with `RunNotFound`.
+    /// DIFFERENT spec re-pins the row's spec columns — see
+    /// [`Ledger::open_packet_with_id`] for the guards that keep a live seat's
+    /// spec, and any packet's definition, from moving under it. An unknown
+    /// run refuses with `RunNotFound`.
     pub fn open_packet(&self, new_packet: NewPacket) -> Result<String, LedgerError> {
         let packet_id = format!(
             "{}/{}/{}",
@@ -62,16 +63,100 @@ impl Ledger {
         self.open_packet_with_id(new_packet, packet_id)
     }
 
+    /// Re-pin an already-open packet's spec, in ONE guarded transaction.
+    ///
+    /// The re-pin exists because a bead's spec can be revised under a packet
+    /// that is already open, and the row must follow. It is deliberately NOT
+    /// an operation: an operation fence stores one response per idempotency
+    /// key and replays it, so a bead edited A -> B -> A reproduces the key
+    /// its first open at A already stored and replays that response over a
+    /// row still pinned at B. This `Immediate` transaction is the right
+    /// fence — atomic, and re-reading current state on every call rather
+    /// than remembering a previous one.
+    ///
+    /// The BODY NEVER LEAVES THE DATABASE. `open_packet_with_id` compares a
+    /// caller-supplied `body_json` to guard the definition, which forces a
+    /// re-pinning caller to read the row first and hand its own body back —
+    /// a read and a write in separate transactions, with a window between
+    /// them in which the definition it just checked can change. Here the
+    /// definition is never a parameter, so there is nothing to check and no
+    /// window: a re-pin revises the spec columns and can touch nothing else.
+    ///
+    /// Refused when the packet does not exist, or the moment it has a
+    /// `running`, `revoking`, or `completed` attempt — a seat's spec must
+    /// never move underneath it, and a settled packet is history. Re-pinning
+    /// to the values already stored is a no-op, not a refusal.
+    pub fn repin_packet_spec(
+        &self,
+        packet_id: String,
+        spec_path: String,
+        spec_sha256: String,
+        spec_revision: Option<String>,
+    ) -> Result<(), LedgerError> {
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let stored: Option<(String, String, Option<String>)> = tx
+                .query_row(
+                    "SELECT spec_path, spec_sha256, spec_revision FROM packets \
+                     WHERE packet_id = ?1",
+                    [&packet_id],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )
+                .optional()?;
+            let Some((stored_path, stored_sha256, stored_revision)) = stored else {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("packet {packet_id:?} is not open and cannot be re-pinned"),
+                ));
+            };
+            if stored_path == spec_path
+                && stored_sha256 == spec_sha256
+                && stored_revision == spec_revision
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            let blocking: Option<String> = tx
+                .query_row(
+                    "SELECT state FROM attempts WHERE packet_id = ?1 \
+                     AND state IN ('running','revoking','completed') LIMIT 1",
+                    [&packet_id],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(state) = blocking {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("packet {packet_id:?} has a {state} attempt and cannot be re-pinned"),
+                ));
+            }
+            tx.execute(
+                "UPDATE packets SET spec_path = ?2, spec_sha256 = ?3, \
+                 spec_revision = ?4 WHERE packet_id = ?1",
+                rusqlite::params![packet_id, spec_path, spec_sha256, spec_revision],
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Open a definition-backed packet under a caller-supplied semantic id.
     /// The id must be `<run>/<safe-stage-id>/<positive-round>` and is checked
     /// against `new_packet.run_id`; storage still carries a temporary v0 lane.
     ///
     /// RE-PIN: a re-open whose spec differs from the stored one rewrites the
-    /// row's spec columns and body — this is how a revised spec reaches an
+    /// row's SPEC COLUMNS — this is how a revised spec reaches an
     /// already-open packet, and the whole reason a run survives an edit. It
     /// is refused the moment the packet has a `running`, `revoking`, or
     /// `completed` attempt: a seat's spec must never move underneath it, and
     /// a settled packet is history.
+    ///
+    /// A differing `body_json` is NOT a re-pin and is refused with
+    /// `InvalidRequest`. The body is the packet's DEFINITION — worktree,
+    /// branch, contract, roster hints — fixed when the packet was opened,
+    /// and it carries no spec and no identity of its own to be revised
+    /// (`WorkPacket::stored_body`). Accepting a differing one would silently
+    /// redefine work the run has already committed to.
     pub fn open_packet_with_id(
         &self,
         new_packet: NewPacket,
@@ -112,10 +197,18 @@ impl Ledger {
                 )
                 .optional()?;
             if let Some((spec_path, spec_sha256, spec_revision, body_json)) = existing {
+                if body_json != new_packet.body_json {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "packet {packet_id:?} is already open with a different definition; \
+                             a re-open may re-pin the spec and nothing else"
+                        ),
+                    ));
+                }
                 if spec_path == new_packet.spec_path
                     && spec_sha256 == new_packet.spec_sha256
                     && spec_revision == new_packet.spec_revision
-                    && body_json == new_packet.body_json
                 {
                     tx.commit()?;
                     return Ok(packet_id);
@@ -138,13 +231,12 @@ impl Ledger {
                 }
                 tx.execute(
                     "UPDATE packets SET spec_path = ?2, spec_sha256 = ?3, \
-                     spec_revision = ?4, body_json = ?5 WHERE packet_id = ?1",
+                     spec_revision = ?4 WHERE packet_id = ?1",
                     rusqlite::params![
                         packet_id,
                         new_packet.spec_path,
                         new_packet.spec_sha256,
                         new_packet.spec_revision,
-                        new_packet.body_json,
                     ],
                 )?;
                 tx.commit()?;

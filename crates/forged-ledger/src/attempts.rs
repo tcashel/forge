@@ -195,9 +195,24 @@ impl Ledger {
                     format!("packet {packet_id:?} has a {state} attempt"),
                 ));
             }
-            // The drift test, and the one place the write token is allowed
-            // to move: same arm and same CONTENT claims, and re-pins the
-            // revision if bd has since minted a new one.
+            // THE DRIFT FENCE, and the contract it is deliberately not:
+            //
+            // The fence is the SHA-256 of the rendered spec body, never the
+            // bead's `revision`. A moved revision alone is not drift because
+            // forged's OWN bd writes move it: `bd update --claim --actor
+            // <holder>` takes the run's lease and `bd update --status open`
+            // reopens the bead, and every bd write mints a fresh revision.
+            // Fenced on the revision, the first claim after forged's own
+            // lease acquisition would refuse — on every run, forever — while
+            // the spec had not changed by one byte.
+            //
+            // `spec_revision` is PROVENANCE: which bd revision the packet was
+            // built from. Same arm and same CONTENT claims, and the row is
+            // re-pinned to the observed revision here, in this transaction,
+            // so the next reader compares against a live value rather than a
+            // dead one. The revision is opaque — equality only, never order.
+            //
+            // A moved BODY is drift whatever the revision says.
             let repin = match (&pinned, &current) {
                 (SpecFence::Sha256(stored), SpecFence::Sha256(observed)) if stored == observed => {
                     None

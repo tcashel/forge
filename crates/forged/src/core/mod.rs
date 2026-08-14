@@ -335,6 +335,39 @@ pub fn session_claimant(packet_id: &str, provider: &str) -> String {
     format!("{provider}:{packet_id}:{}", std::process::id())
 }
 
+/// Fail a just-claimed attempt under its own claim token, then hand its
+/// failure back for the caller to propagate.
+///
+/// The attempt is `running` with no process behind it, and every claim path
+/// that can still fail before it spawns one owes the ledger this. Left
+/// running, the row blocks both the re-claim and the re-pin that would clear
+/// the cause, and the reclaim saga has to time out a lease that no process
+/// is renewing.
+///
+/// The note is classified `unspawned:`, never left to classify as semantic:
+/// no provider existed for this attempt, so it is not the stage's answer.
+/// A plain note would be merged into a review fan-out as `RequestChanges`
+/// and would spend the run's one fix round — see `settle_unspawned`, which
+/// this shares its settlement with.
+///
+/// The ORIGINAL failure is what comes back — a ledger error while settling is
+/// logged, not substituted, because the cause is what the caller needs to
+/// report and the saga remains the backstop for the row.
+pub async fn abandon_claim(
+    ctx: &Ctx,
+    packet_id: &str,
+    claim_token: &str,
+    failure: Failure,
+) -> Failure {
+    let note = format!("unspawned: attempt refused before spawn: {failure}");
+    if let Err(error) =
+        crate::adapters::execute::fail_and_grant_retry(ctx, packet_id, claim_token, note).await
+    {
+        tracing::warn!(packet_id, %error, "could not retire an unspawned attempt");
+    }
+    failure
+}
+
 /// The packet id carried by a [`session_claimant`], when the string is one:
 /// the middle segment of `<provider>:<packet-id>:<pid>`. A run-scoped lease
 /// holder yields its run id here, which is not a packet id — callers that

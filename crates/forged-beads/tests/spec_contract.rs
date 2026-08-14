@@ -163,6 +163,35 @@ async fn a_spec_edit_mints_a_new_revision() {
     assert_eq!(after.notes, NOTES);
 }
 
+/// A bead that does not exist is an ANSWER, not an outage.
+///
+/// bd 1.2.1 refuses an unknown id with exit 1 and its envelope still
+/// delivered. Charging that to a bounded transport-retry budget would spend
+/// every retry and its backoff re-reading the same refusal before the run
+/// reported the one thing an operator can act on — a deleted or mistyped
+/// bead id. If a bd upgrade ever stops emitting the envelope on this path,
+/// this test is what catches the misclassification.
+#[tokio::test]
+async fn a_bead_that_does_not_exist_is_not_a_transport_failure() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("spec-contract-missing");
+    support::init_store(&bd, &s);
+    // A store with a real bead in it, so the refusal is about the id alone.
+    create_spec_bead(&bd, &s);
+    let cfg = support::cfg_for(&bd, &s);
+
+    let err = show_issue(&cfg, "no-such-bead-xyz")
+        .await
+        .expect_err("bd must refuse an unknown id");
+    assert!(
+        !err.is_transport(),
+        "an answered refusal must fail fast, not ride the retry budget: {err}"
+    );
+}
+
 /// The reason the packet fence is the RENDERED BODY and not the revision.
 ///
 /// bd's `revision` is a write token: a lease claim and a status change mint

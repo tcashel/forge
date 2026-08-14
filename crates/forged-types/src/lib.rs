@@ -21,6 +21,6 @@ pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{
-    Deliverable, Finding, GateRow, Outcome, PacketResult, ProviderHints, Sandbox, Severity,
-    SpecRef, Stage, StageContract, Verdict, WorkPacket,
+    Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult, ProviderHints, Sandbox,
+    Severity, SpecRef, Stage, StageContract, Verdict, WorkPacket,
 };

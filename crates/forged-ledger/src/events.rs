@@ -101,6 +101,59 @@ impl Ledger {
         })
     }
 
+    /// Append one event whose payload is DERIVED, inside the same
+    /// transaction, from the run's existing events of that kind.
+    ///
+    /// The read and the append are one atomic step, which is the whole
+    /// point. A counter carried in the stream — a packet's transport-failure
+    /// budget — read in one call and appended in the next lets two concurrent
+    /// advances observe the same `n` and both write `n + 1`: one outage is
+    /// charged once instead of twice and the bounded budget silently stops
+    /// being bounded.
+    ///
+    /// The dumb-durable-store boundary holds: the ledger hands `derive` the
+    /// rows it already stores and stores back whatever `derive` returns,
+    /// parsing neither.
+    pub fn append_event_derived<F>(
+        &self,
+        run_id: &str,
+        kind: &str,
+        derive: F,
+    ) -> Result<serde_json::Value, LedgerError>
+    where
+        F: FnOnce(&[EventRow]) -> Result<serde_json::Value, LedgerError> + Send + 'static,
+    {
+        let run_id = run_id.to_owned();
+        let kind = kind.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let standing = {
+                let mut statement = tx.prepare(
+                    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+                     WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id ASC",
+                )?;
+                let rows = statement.query_map(rusqlite::params![run_id, kind], |row| {
+                    Ok(EventRow {
+                        event_id: row.get(0)?,
+                        ts: row.get(1)?,
+                        run_id: row.get(2)?,
+                        kind: row.get(3)?,
+                        payload_json: row.get(4)?,
+                    })
+                })?;
+                let mut out = Vec::new();
+                for row in rows {
+                    out.push(row?);
+                }
+                out
+            };
+            let payload = derive(&standing)?;
+            append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            tx.commit()?;
+            Ok(payload)
+        })
+    }
+
     /// Rows with `event_id > after_event_id` (exclusive), ordered by
     /// `event_id` ascending, at most `limit` rows; `limit == 0` returns an
     /// empty vec. `run_id: None` returns all rows including NULL-run rows;

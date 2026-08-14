@@ -63,9 +63,13 @@ forged run submit --run <id>
 
 The spec is the bead: its `description`, `acceptance_criteria`, `design`, and
 `notes` fields become the body every seat reads, and the packet is fenced on
-the bead's `revision` instead of a file hash. Revise a spec with `bd update`;
-the next packet opened pins the new revision. `--spec <path>` still names a
-spec file for one release and is recorded as deprecated.
+the SHA-256 of that rendered body instead of a file hash. The bead's
+`revision` is recorded as provenance, not as the fence — bd mints a new one
+on every write to the bead, forged's own lease claim included, so a run
+fenced on it would refuse its own resume. Revise a spec with `bd update`; the
+next packet opened pins the new body, and a packet already open is re-pinned
+before its next claim. `--spec <path>` still names a spec file for one
+release and is recorded as deprecated.
 
 Submit returns a durable controller identity immediately. Retrying while it is
 live adopts the same controller. The run ends at a reviewed draft PR; the
