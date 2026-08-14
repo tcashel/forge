@@ -13,7 +13,9 @@ mod support;
 
 use std::collections::HashMap;
 
-use forged_ledger::{EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState};
+use forged_ledger::{
+    EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState, SpecFence,
+};
 use forged_proto::{
     advance, project_run, reconcile, record, widen_rfc3339, GatePhase, MachineStage, NextAction,
     PrSnapshot, ProtoEvent, ReconcileConfig, SessionLiveness,
@@ -203,11 +205,16 @@ async fn a_released_safe_retry_step_still_has_to_run() {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
     ledger
         .complete_packet(&pid, &claim.claim_token, &result_for(&pid, implement_ok(2)))
@@ -582,11 +589,16 @@ async fn human_ambiguous_is_quarantined_and_left_in_progress() {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
     let claim = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     let key = format!("{RUN}/manual/0");

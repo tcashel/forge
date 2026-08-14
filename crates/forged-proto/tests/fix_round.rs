@@ -160,6 +160,47 @@ fn semantic_failure_consumes_the_round_and_stops_done() {
 }
 
 #[test]
+fn an_unspawned_fix_seat_does_not_consume_the_round() {
+    // A fix seat retired between its claim and a spawn applied nothing, so
+    // the round it never used is still there. Classified semantic, it would
+    // spend the run's ONE fix round and stop the run on a seat that never
+    // ran.
+    let view = at_fix()
+        .failed(
+            Stage::Fix,
+            1,
+            "unspawned: attempt refused before spawn: the host fallback could not be recorded",
+        )
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Fix, 1),
+            not_before: None
+        }
+    );
+}
+
+#[test]
+fn unspawned_and_transport_failures_share_the_one_budget() {
+    // Both mean "no seat spoke", so they charge the same bounded budget —
+    // an alternating outage cannot outlive it by splitting the count.
+    let view = at_fix()
+        .failed(Stage::Fix, 1, "transport: rate limited")
+        .failed(Stage::Fix, 1, "unspawned: attempt refused before spawn: io")
+        .failed(Stage::Fix, 1, "transport: rate limited")
+        .failed(Stage::Fix, 1, "unspawned: attempt refused before spawn: io")
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::Fix,
+            attempts: 4
+        })
+    );
+}
+
+#[test]
 fn empty_and_missing_notes_count_as_semantic() {
     let view = at_fix().failed(Stage::Fix, 1, "").build();
     assert_eq!(

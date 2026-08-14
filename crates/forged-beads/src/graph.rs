@@ -8,7 +8,8 @@ use crate::classify::BdError;
 use crate::config::BdConfig;
 use crate::{envelope, invoke};
 
-/// The Beads fields the epic scheduler consumes.
+/// The Beads fields forged consumes — the epic scheduler's inventory plus
+/// the spec body a run is built from.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct IssueSummary {
@@ -16,27 +17,78 @@ pub struct IssueSummary {
     pub id: String,
     /// Human-readable title.
     pub title: String,
-    /// Markdown-ish issue description carrying `spec:` and `repo:` pointers.
+    /// Markdown-ish issue description: the spec's Context and What We're
+    /// Building sections, and on older beads the `spec:` and `repo:`
+    /// pointers.
     pub description: String,
     /// Current Beads status.
     pub status: String,
     /// Beads issue type (`task`, `epic`, ...).
     pub issue_type: String,
+    /// `acceptance_criteria` — the spec's Acceptance Criteria section.
+    pub acceptance_criteria: String,
+    /// `design` — the spec's Implementation Notes section.
+    pub design: String,
+    /// `notes` — the spec's Agent Instructions section.
+    pub notes: String,
+    /// `spec_id` — the bead's link to an external specification document.
+    pub spec_id: Option<String>,
+    /// `metadata` — the JSON extension point carrying the spec's Quality
+    /// Gates. Non-string values are kept as their compact JSON text: this
+    /// map is transported, never interpreted. Gate commands a run actually
+    /// executes stay frozen in its execution package.
+    pub metadata: BTreeMap<String, String>,
+    /// `revision` — bd's guarded-write optimistic-concurrency token, absent
+    /// from responses that do not carry one (`create`, `update`, `ready`).
+    ///
+    /// OPAQUE, and kept as the response's own digits rather than an integer:
+    /// it is compared for equality and nothing else — never ordered, parsed,
+    /// incremented, or assumed positive (bd 1.2.1 emits negative values).
+    pub revision: Option<String>,
+}
+
+/// A `revision` exactly as bd wrote it. A JSON number is rendered back to its
+/// own digits — never through an integer type, which would invite arithmetic
+/// on a value that has none.
+fn revision(value: &Value) -> Option<String> {
+    match value.get("revision")? {
+        Value::Number(number) => Some(number.to_string()),
+        Value::String(text) if !text.is_empty() => Some(text.clone()),
+        _ => None,
+    }
+}
+
+fn metadata(value: &Value) -> BTreeMap<String, String> {
+    value
+        .get("metadata")
+        .and_then(Value::as_object)
+        .map(|map| {
+            map.iter()
+                .map(|(key, item)| {
+                    let text = match item {
+                        Value::String(text) => text.clone(),
+                        other => other.to_string(),
+                    };
+                    (key.clone(), text)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn text(value: &Value, field: &str) -> String {
+    value
+        .get(field)
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .to_owned()
 }
 
 fn issue(value: &Value) -> Option<IssueSummary> {
     Some(IssueSummary {
         id: value.get("id")?.as_str()?.to_owned(),
-        title: value
-            .get("title")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
-        description: value
-            .get("description")
-            .and_then(Value::as_str)
-            .unwrap_or_default()
-            .to_owned(),
+        title: text(value, "title"),
+        description: text(value, "description"),
         status: value
             .get("status")
             .and_then(Value::as_str)
@@ -47,6 +99,16 @@ fn issue(value: &Value) -> Option<IssueSummary> {
             .and_then(Value::as_str)
             .unwrap_or("task")
             .to_owned(),
+        acceptance_criteria: text(value, "acceptance_criteria"),
+        design: text(value, "design"),
+        notes: text(value, "notes"),
+        spec_id: value
+            .get("spec_id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
+        metadata: metadata(value),
+        revision: revision(value),
     })
 }
 
@@ -153,7 +215,67 @@ mod tests {
                 description: String::new(),
                 status: "open".to_owned(),
                 issue_type: "task".to_owned(),
+                acceptance_criteria: String::new(),
+                design: String::new(),
+                notes: String::new(),
+                spec_id: None,
+                metadata: BTreeMap::new(),
+                revision: None,
             })
+        );
+    }
+
+    #[test]
+    fn issue_projection_carries_every_spec_field() {
+        let projected = issue(&json!({
+            "id": "b-2",
+            "description": "## Context\nwhy",
+            "acceptance_criteria": "- it works",
+            "design": "touch points",
+            "notes": "commit as you go",
+            "spec_id": "spec-42",
+            "metadata": {"gates": "cargo test", "rounds": 2},
+        }))
+        .expect("projects");
+        assert_eq!(projected.description, "## Context\nwhy");
+        assert_eq!(projected.acceptance_criteria, "- it works");
+        assert_eq!(projected.design, "touch points");
+        assert_eq!(projected.notes, "commit as you go");
+        assert_eq!(projected.spec_id.as_deref(), Some("spec-42"));
+        assert_eq!(
+            projected.metadata.get("gates").map(String::as_str),
+            Some("cargo test")
+        );
+        assert_eq!(
+            projected.metadata.get("rounds").map(String::as_str),
+            Some("2")
+        );
+    }
+
+    #[test]
+    fn revision_keeps_bds_own_digits_and_never_becomes_a_number() {
+        // The observed bd 1.2.1 shape: a signed 64-bit value whose sign is
+        // meaningless and whose magnitude exceeds f64's exact range.
+        for raw in [9_146_914_492_635_073_757i64, -6_192_208_415_116_251_521] {
+            let projected = issue(&json!({"id": "b-3", "revision": raw})).expect("projects");
+            assert_eq!(
+                projected.revision.as_deref(),
+                Some(raw.to_string().as_str())
+            );
+        }
+        // Absent, null, and empty-string all mean "this response carries no
+        // revision" — never a fence value of their own.
+        for raw in [json!(null), json!("")] {
+            assert_eq!(
+                issue(&json!({"id": "b-3", "revision": raw}))
+                    .expect("projects")
+                    .revision,
+                None
+            );
+        }
+        assert_eq!(
+            issue(&json!({"id": "b-3"})).expect("projects").revision,
+            None
         );
     }
 }

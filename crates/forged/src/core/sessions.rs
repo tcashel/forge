@@ -109,6 +109,12 @@ pub(crate) async fn record_session_started(
 }
 
 /// Make a preferred-Herdr fallback visible before the plain process starts.
+///
+/// The CALLER settles this write's own failure rather than propagating it:
+/// it runs post-claim and pre-spawn, so the attempt row is `running` with no
+/// process behind it and a failure that escapes leaves it that way. Nothing
+/// but a ledger outage refuses this write, which is why the `fail` failpoint
+/// is the only way to rehearse that settlement.
 pub(crate) async fn record_host_fallback(
     ctx: &Ctx,
     run_id: &str,
@@ -116,6 +122,9 @@ pub(crate) async fn record_host_fallback(
     attempt_id: i64,
     reason: &str,
 ) -> Result<(), Failure> {
+    if let Some(detail) = crate::failpoint::injected("host.fallback.record") {
+        return Err(Failure::internal(detail));
+    }
     let run_id = run_id.to_owned();
     let payload = json!({
         "schemaVersion": 1,

@@ -15,7 +15,6 @@ use forged_types::{
 };
 use serde_json::{json, Value};
 
-use crate::adapters::execute::sha256_file;
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
@@ -182,7 +181,8 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
 /// explicit child generation id) and fill `NewRun` from the config plus the
-/// `--repo`, `--spec`, and `--base-ref` arguments.
+/// `--repo` and `--base-ref` arguments. The spec comes from the bead;
+/// `--spec <path>` is the deprecated file route, honored for one release.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let compiled = match ctx.config.compile_definition(
         param_opt_str(&req.params, "profile"),
@@ -281,15 +281,34 @@ pub(crate) async fn run_start_with_definition(
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |_op| async move {
             let repo = param_str(&params, "repo")?.to_owned();
-            let spec = param_str(&params, "spec")?.to_owned();
+            let spec = param_opt_str(&params, "spec").map(str::to_owned);
             if !Path::new(&repo).is_absolute() {
                 return Err(Failure::invalid(format!(
                     "--repo must be an absolute path, got {repo:?}"
                 )));
             }
-            if !Path::new(&spec).exists() {
-                return Err(Failure::invalid(format!("spec {spec:?} does not exist")));
-            }
+            // The spec source is settled BEFORE the run row exists: a bead
+            // with no spec, or a spec path that is not there, must never
+            // reach a seat as an empty spec.
+            let source = match &spec {
+                Some(path) => {
+                    if !Path::new(path).exists() {
+                        return Err(Failure::invalid(format!("spec {path:?} does not exist")));
+                    }
+                    tracing::warn!(
+                        bead = %bead,
+                        spec = %path,
+                        "--spec is deprecated: the bead's own fields are the spec"
+                    );
+                    super::spec::SpecSource::File(path.clone())
+                }
+                None => {
+                    // Resolving proves the bead carries a spec, and names
+                    // every empty field when it does not.
+                    super::spec::resolve_bead(ctx, &bead).await?;
+                    super::spec::SpecSource::Bead(bead.clone())
+                }
+            };
             let base_ref = match param_opt_str(&params, "baseRef") {
                 Some(base) => base.to_owned(),
                 None => default_branch_of(&repo).await,
@@ -313,10 +332,24 @@ pub(crate) async fn run_start_with_definition(
                 ledger.create_run_with_definition(new_run, definition)
             })
             .await?;
-            // Persist the spec path for packet building — the run row has
+            // Persist the spec SOURCE for packet building — the run row has
             // no spec column, and every process must resolve the same one.
+            // `specPath` stays in the payload for the deprecated file route,
+            // so an in-flight run started by an older binary still reads.
             let run_for_event = row.run_id.clone();
-            let payload = json!({"runId": row.run_id, "specPath": spec});
+            let payload = match &source {
+                super::spec::SpecSource::File(path) => json!({
+                    "runId": row.run_id,
+                    "source": "file",
+                    "specPath": path,
+                    "deprecated": true,
+                }),
+                super::spec::SpecSource::Bead(bead_id) => json!({
+                    "runId": row.run_id,
+                    "source": "bead",
+                    "beadId": bead_id,
+                }),
+            };
             on_ledger(&ctx.ledger, move |l| {
                 l.append_event(Some(&run_for_event), "forged.run.spec", payload)
             })
@@ -427,7 +460,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 .packets
                 .iter()
                 .filter_map(|row| {
-                    let stored: WorkPacket = serde_json::from_str(&row.body_json).ok()?;
+                    let stored: WorkPacket = forged_proto::stored_packet(row).ok()?;
                     let semantic = stored.execution.clone()?;
                     let selected = super::drive::stored_packet_for_attempt(&view, &row.packet_id)
                         .unwrap_or(stored);
@@ -474,7 +507,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "execution": execution,
                 "packets": view.packets.iter().map(|p| json!({
                     "packetId": p.packet_id,
-                    "stage": serde_json::from_str::<WorkPacket>(&p.body_json)
+                    "stage": forged_proto::stored_packet(p)
                         .ok()
                         .and_then(|packet| packet.execution.map(|value| value.stage_id))
                         .unwrap_or_else(|| stage_str(p.stage).to_owned()),
@@ -681,8 +714,11 @@ pub async fn packet_show(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             let packet_id = packet_id.clone();
             on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
         };
-        let packet: Value = serde_json::from_str(&row.body_json)
-            .map_err(|e| Failure::internal(format!("stored packet body does not parse: {e}")))?;
+        let packet =
+            serde_json::to_value(forged_proto::stored_packet(&row).map_err(|e| {
+                Failure::internal(format!("stored packet body does not parse: {e}"))
+            })?)
+            .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
         let view = super::drive::project(ctx, &row.run_id).await?;
         let mut attempts: Vec<Value> = Vec::new();
         if let Some(history) = view.terminal_attempts.get(&packet_id) {
@@ -736,11 +772,16 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
             };
-            let current_sha = sha256_file(Path::new(&row.spec_path))?;
             // The claimant is the PACKET-scoped session identity, not the
             // run's bd lease holder — see `core::session_claimant`. The
             // stored body carries the hints the packet was opened with.
             let view = super::drive::project(ctx, &row.run_id).await?;
+            // ONE spec read for this claim: it answers both the fence the
+            // ledger compares and the bytes the seat will read.
+            let spec_ref = forged_proto::packet_spec(&row);
+            let resolved =
+                super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
+            let fence = resolved.fence.clone();
             let provider = if view.execution_package.is_some() {
                 super::drive::stored_packet_for_attempt(&view, &packet_id)?
                     .provider_hints
@@ -760,10 +801,30 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             let claimed = {
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| {
-                    l.claim_packet(&packet_id, &claimant, &current_sha)
+                    l.claim_packet(&packet_id, &claimant, &fence)
                 })
                 .await?
             };
+            // The claim is what fenced these bytes, so the body is written
+            // only once it has succeeded. An external seat on the
+            // `packet claim` -> `packet complete` path never enters
+            // `run_attempt`, so this is the only thing that puts the spec
+            // where its own packet contract says it is.
+            //
+            // Post-claim and pre-spawn: a failure here settles the attempt
+            // under its own token before it propagates (`abandon_claim`),
+            // never leaving a `running` row with no process behind it.
+            if let Err(failure) = super::spec::assert_pinned(&spec_ref, &resolved)
+                .and_then(|()| super::spec::materialize(&resolved, Path::new(&spec_ref.path)))
+            {
+                return Err(crate::core::abandon_claim(
+                    ctx,
+                    &packet_id,
+                    &claimed.claim_token,
+                    failure,
+                )
+                .await);
+            }
             Ok(json!({
                 "attempt_id": claimed.attempt_id,
                 "claim_token": claimed.claim_token,
@@ -836,8 +897,10 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
 
 // ----------------------------------------------------------- packet fail
 
-/// `packet fail` — fenced SafeRetry failure report; the note's `transport:`
-/// prefix decides the classification, byte-exact.
+/// `packet fail` — fenced SafeRetry failure report; the note's prefix decides
+/// the classification, byte-exact: `transport:` and `unspawned:` both ride
+/// the packet's bounded budget, anything else is semantic. See
+/// `forged_proto::classify_failure`.
 pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let packet_id = match param_str(&req.params, "packet") {
         Ok(p) => p.to_owned(),
@@ -870,6 +933,7 @@ pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             }
             let classification = match forged_proto::classify_failure(&note) {
                 forged_proto::FailureKind::Transport => "transport",
+                forged_proto::FailureKind::Unspawned => "unspawned",
                 forged_proto::FailureKind::Semantic => "semantic",
             };
             Ok(json!({"classification": classification, "note": note}))
@@ -1116,7 +1180,7 @@ async fn ingest_run(ctx: &Ctx, run_id: &str) -> Result<u64, Failure> {
     let latest_attempt = latest_attempt_per_packet(ctx, run_id).await;
     let mut ingested = 0u64;
     for row in packets {
-        let packet: WorkPacket = match serde_json::from_str(&row.body_json) {
+        let packet: WorkPacket = match forged_proto::stored_packet(&row) {
             Ok(p) => p,
             Err(_) => continue,
         };

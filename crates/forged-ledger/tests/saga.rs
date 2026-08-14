@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use forged_ledger::{
     AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
-    RunState,
+    RunState, SpecFence,
 };
 use forged_types::{
     ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
@@ -37,6 +37,7 @@ fn make_packet(ledger: &Ledger, run_id: &str) -> String {
             seq: 1,
             spec_path: "specs/x.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
         })
         .expect("open packet")
@@ -90,7 +91,11 @@ fn shim_revoked_mid_flight_never_fires_the_effect() {
     let run = make_run(&ledger, "run-shim-1");
     let packet = make_packet(&ledger, &run);
     let claim = ledger
-        .claim_packet(&packet, "claude:sess-1:100", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-1:100",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
     let operation_id = fresh(
         ledger
@@ -256,7 +261,11 @@ fn saga_order_is_enforced_mechanically() {
     let run = make_run(&ledger, "run-saga");
     let packet = make_packet(&ledger, &run);
     let claim = ledger
-        .claim_packet(&packet, "claude:sess-2:200", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-2:200",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     // reclaimed is unreachable from running.
@@ -292,7 +301,11 @@ fn saga_order_is_enforced_mechanically() {
         .expect_err("token-bearing begin while revoking");
     assert_eq!(err.code(), ErrorCode::StaleClaimToken);
     let err = ledger
-        .claim_packet(&packet, "claude:sess-3:300", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-3:300",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect_err("claim while revoking");
     assert_eq!(err.code(), ErrorCode::PacketNotClaimable);
 
@@ -312,7 +325,11 @@ fn saga_order_is_enforced_mechanically() {
 
     // A successor claim succeeds with a fresh token only after reclaimed.
     let successor = ledger
-        .claim_packet(&packet, "claude:sess-4:400", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-4:400",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("successor claim");
     assert_ne!(successor.claim_token, claim.claim_token);
     assert_ne!(successor.attempt_id, claim.attempt_id);
@@ -328,7 +345,11 @@ fn fail_packet_note_lands_in_row_and_event() {
     let run = make_run(&ledger, "run-fail");
     let packet = make_packet(&ledger, &run);
     let claim = ledger
-        .claim_packet(&packet, "claude:sess-5:500", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-5:500",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
     let note = "gate exploded: linker OOM";
     ledger
@@ -356,7 +377,11 @@ fn fail_packet_note_lands_in_row_and_event() {
 
     // A failed packet is re-claimable.
     ledger
-        .claim_packet(&packet, "claude:sess-6:600", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-6:600",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("re-claim after failed");
     ledger.close().expect("close");
 }
@@ -369,7 +394,11 @@ fn set_run_state_rules_hold() {
     let run = make_run(&ledger, "run-state");
     let packet = make_packet(&ledger, &run);
     let claim = ledger
-        .claim_packet(&packet, "claude:sess-7:700", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-7:700",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
 
     let err = ledger
@@ -438,7 +467,11 @@ fn events_are_append_only_and_run_attributed() {
     let run = make_run(&ledger, "run-events");
     let packet = make_packet(&ledger, &run);
     let claim = ledger
-        .claim_packet(&packet, "claude:sess-8:800", "cafe")
+        .claim_packet(
+            &packet,
+            "claude:sess-8:800",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim");
     ledger
         .revoke_attempt(claim.attempt_id, "shutting down")

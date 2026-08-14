@@ -4,7 +4,7 @@
 
 use std::sync::{Arc, Barrier};
 
-use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun};
+use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun, SpecFence};
 use forged_types::{ErrorCode, RunId, Stage};
 
 fn seed_packet(ledger: &Ledger, run_id: &str) -> String {
@@ -24,6 +24,7 @@ fn seed_packet(ledger: &Ledger, run_id: &str) -> String {
             seq: 1,
             spec_path: "specs/race.md".to_owned(),
             spec_sha256: "feed".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet")
@@ -49,7 +50,11 @@ fn eight_independent_ledgers_race_one_claim() {
         handles.push(std::thread::spawn(move || {
             let ledger = Ledger::open(&path).expect("independent open");
             barrier.wait();
-            let outcome = ledger.claim_packet(&packet, &format!("claude:racer-{idx}:1"), "feed");
+            let outcome = ledger.claim_packet(
+                &packet,
+                &format!("claude:racer-{idx}:1"),
+                &SpecFence::Sha256("feed".to_owned()),
+            );
             ledger.close().expect("close racer");
             outcome
         }));
@@ -97,7 +102,7 @@ fn eight_concurrent_opens_migrate_once() {
         ledgers.push(handle.join().expect("open thread").expect("open succeeds"));
     }
     for ledger in &ledgers {
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 6);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 7);
     }
     for ledger in ledgers {
         ledger.close().expect("close");
@@ -153,7 +158,11 @@ fn spec_drift_refuses_and_inserts_nothing() {
     let packet = seed_packet(&ledger, "run-drift");
 
     let err = ledger
-        .claim_packet(&packet, "claude:sess:1", "0000")
+        .claim_packet(
+            &packet,
+            "claude:sess:1",
+            &SpecFence::Sha256("0000".to_owned()),
+        )
         .expect_err("drifted hash must refuse");
     assert_eq!(err.code(), ErrorCode::SpecDrift);
     assert!(

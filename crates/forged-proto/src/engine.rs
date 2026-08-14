@@ -173,12 +173,15 @@ pub enum Terminal {
         /// The final merged verdict, when any leg ever spoke.
         final_verdict: Option<Verdict>,
     },
-    /// A provider stage exhausted its transport-retry budget without the
-    /// provider ever getting to think.
+    /// A provider stage exhausted its bounded infrastructure-retry budget
+    /// without the provider ever getting to think. Transport failures and
+    /// attempts retired before any spawn share that one budget, so this is
+    /// no longer transport-only.
     ProviderUnavailable {
         /// The packet's stage.
         stage: Stage,
-        /// The number of transport failures observed.
+        /// The number of infrastructure failures observed — transport and
+        /// unspawned together, since they share the budget.
         attempts: u32,
     },
     /// An adaptive semantic seat exhausted its transport policy.
@@ -254,6 +257,12 @@ pub const MACHINE_STEPS: [(MachineStage, u32); 6] = [
 pub enum FailureKind {
     /// The provider never got to think; retried for free within the budget.
     Transport,
+    /// The attempt was retired between its claim and a spawn, so no provider
+    /// ever existed for it. NOT a stage result — a review seat that never ran
+    /// has no verdict and a fix seat that never ran applied nothing — and it
+    /// stands on the same bounded budget a transport failure uses, which is
+    /// what keeps a permanent one from re-claiming forever.
+    Unspawned,
     /// The provider tried; the failure consumes what the stage's failure
     /// consumes.
     Semantic,
@@ -266,6 +275,8 @@ pub enum FailureKind {
 pub fn classify_failure(fail_note: &str) -> FailureKind {
     if fail_note.starts_with("transport:") {
         FailureKind::Transport
+    } else if fail_note.starts_with("unspawned:") {
+        FailureKind::Unspawned
     } else {
         FailureKind::Semantic
     }
@@ -728,7 +739,7 @@ fn adaptive_packet<'a>(
     round: u8,
 ) -> Option<&'a PacketRow> {
     view.packets.iter().find(|packet| {
-        serde_json::from_str::<forged_types::WorkPacket>(&packet.body_json)
+        crate::project::stored_packet(packet)
             .ok()
             .and_then(|packet| packet.execution)
             .is_some_and(|execution| execution.seat_id == seat.id && execution.round == round)
@@ -947,24 +958,22 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
         };
     }
     let Some(last) = history.last() else {
-        // Open and never attempted: claim it.
-        return LegState::Pending {
-            packet_id,
-            not_before: None,
-        };
+        // Open and never attempted — but "never attempted" is not "never
+        // failed". A PRE-CLAIM transport failure (bd unreachable when the
+        // claim went to re-read the spec) records no attempt row, because
+        // there is no claim token to fail one under; its `proto.retry` grant
+        // is the whole record of it, and the budget is read from there. With
+        // no grant this is the ordinary first claim.
+        return transport_leg(view, packet_id, history);
     };
     match last.state {
         AttemptState::Failed => match classify_failure(last.fail_note.as_deref().unwrap_or("")) {
-            FailureKind::Transport => {
-                let (attempts, not_before) = transport_retry_state(view, packet_id, history);
-                if attempts > view.policy.transport_retry_budget {
-                    LegState::Exhausted { attempts }
-                } else {
-                    LegState::Pending {
-                        packet_id,
-                        not_before,
-                    }
-                }
+            // An attempt retired before it reached a provider stands exactly
+            // where a transport failure does: no seat spoke, so there is no
+            // stage result to read, and the same bounded budget both bounds
+            // the re-claim and stops the run when it is spent.
+            FailureKind::Transport | FailureKind::Unspawned => {
+                transport_leg(view, packet_id, history)
             }
             FailureKind::Semantic => LegState::FailedSemantic,
         },
@@ -973,6 +982,24 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             packet_id,
             not_before: None,
         },
+    }
+}
+
+/// A packet standing on its transport-retry budget: claimable again after
+/// the granted deadline, or exhausted once the budget is past.
+fn transport_leg<'v>(
+    view: &'v RunView,
+    packet_id: &'v str,
+    history: &[TerminalAttempt],
+) -> LegState<'v> {
+    let (attempts, not_before) = transport_retry_state(view, packet_id, history);
+    if attempts > view.policy.transport_retry_budget {
+        LegState::Exhausted { attempts }
+    } else {
+        LegState::Pending {
+            packet_id,
+            not_before,
+        }
     }
 }
 
@@ -1010,14 +1037,18 @@ fn latest_retry(view: &RunView, packet_id: &str) -> Option<(u32, String)> {
     })
 }
 
-/// Transport failures observed for a packet, from its terminal history —
+/// Failures charged to a packet's bounded budget, from its terminal history —
 /// the fallback used only until the packet's first `proto.retry` grant.
+/// Transport and unspawned failures share the budget, so both are counted.
 fn transport_failures(history: &[TerminalAttempt]) -> u32 {
     let count = history
         .iter()
         .filter(|t| {
             t.state == AttemptState::Failed
-                && classify_failure(t.fail_note.as_deref().unwrap_or("")) == FailureKind::Transport
+                && matches!(
+                    classify_failure(t.fail_note.as_deref().unwrap_or("")),
+                    FailureKind::Transport | FailureKind::Unspawned
+                )
         })
         .count();
     u32::try_from(count).unwrap_or(u32::MAX)
@@ -1136,6 +1167,13 @@ mod tests {
         assert_eq!(classify_failure("Transport: x"), FailureKind::Semantic);
         assert_eq!(classify_failure(" transport: x"), FailureKind::Semantic);
         assert_eq!(classify_failure("provider exploded"), FailureKind::Semantic);
+        assert_eq!(
+            classify_failure("unspawned: attempt refused before spawn: io"),
+            FailureKind::Unspawned
+        );
+        assert_eq!(classify_failure("unspawned:"), FailureKind::Unspawned);
+        assert_eq!(classify_failure("Unspawned: x"), FailureKind::Semantic);
+        assert_eq!(classify_failure(" unspawned: x"), FailureKind::Semantic);
     }
 
     #[test]

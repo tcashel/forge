@@ -235,27 +235,30 @@ pub fn create_bead(bd: &Path, s: &Scratch, title: &str) -> String {
         .to_string()
 }
 
-/// Resolve the sandboxed bd 1.2.x binary: `$FORGED_TEST_BD` if set, else
-/// `~/.anvil/tools/bd-1.2.1/bin/bd` (the canonical operator-scoped
-/// location), else `None` — the fallback is NEVER the PATH bd. Each
-/// candidate is verified once per process via `version --json` under a
-/// scratch `HOME`/`BEADS_DIR` (never the real `$HOME`, even for a version
-/// check).
+/// The bd binary this machine offers, version UNVERIFIED: `$FORGED_TEST_BD`
+/// if set, else `~/.anvil/tools/bd-1.2.1/bin/bd` (the canonical
+/// operator-scoped location) — never the PATH bd. `None` means the machine
+/// provisioned no bd at all, which is the only skippable state.
+pub fn bd_candidate() -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(p) = std::env::var_os("FORGED_TEST_BD") {
+        candidates.push(PathBuf::from(p));
+    }
+    if let Some(h) = std::env::var_os("HOME") {
+        candidates.push(PathBuf::from(h).join(".anvil/tools/bd-1.2.1/bin/bd"));
+    }
+    candidates.into_iter().find(|c| c.exists())
+}
+
+/// Resolve the sandboxed bd 1.2.x binary, or `None` when the candidate is
+/// absent OR its version is not accepted. Verified once per process via
+/// `version --json` under a scratch `HOME`/`BEADS_DIR` (never the real
+/// `$HOME`, even for a version check). Callers want [`require_bd`], which
+/// tells those two `None`s apart.
 pub fn sandboxed_bd() -> Option<PathBuf> {
     static BD: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BD.get_or_init(|| {
-        let mut candidates = Vec::new();
-        if let Some(p) = std::env::var_os("FORGED_TEST_BD") {
-            candidates.push(PathBuf::from(p));
-        }
-        if let Some(h) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(h).join(".anvil/tools/bd-1.2.1/bin/bd"));
-        }
-        candidates
-            .into_iter()
-            .find(|c| c.exists() && verify_bd_version(c))
-    })
-    .clone()
+    BD.get_or_init(|| bd_candidate().filter(|c| verify_bd_version(c)))
+        .clone()
 }
 
 fn verify_bd_version(bd: &Path) -> bool {
@@ -284,15 +287,36 @@ fn verify_bd_version(bd: &Path) -> bool {
 /// Resolve the sandboxed bd or SKIP loudly (eprintln + `None` for the
 /// caller's early return) — presence is detected at runtime, never via a
 /// cargo feature.
+///
+/// A skip is legitimate for exactly ONE reason: no bd binary at all, on a
+/// machine that never provisioned one. Two cases that used to skip now FAIL,
+/// because both are the shape of a silent green:
+///
+/// - A candidate binary EXISTS but is not an accepted version. An upgraded
+///   bd is precisely when the JSON-shape contract these tests pin is most
+///   likely to have moved; skipping there hides the one thing worth
+///   checking. See [`bd_candidate`].
+/// - `FORGED_REQUIRE_BD=1` is set. That is the operator's (or a
+///   bd-provisioned CI's) declaration that a run without bd is a failed run,
+///   not a partial one.
 pub fn require_bd() -> Option<PathBuf> {
-    match sandboxed_bd() {
-        Some(bd) => Some(bd),
-        None => {
-            eprintln!(
-                "SKIP: sandboxed bd 1.2.x not found (set FORGED_TEST_BD or install \
-                 ~/.anvil/tools/bd-1.2.1/bin/bd); bd-gated test not run"
-            );
-            None
-        }
+    if let Some(bd) = sandboxed_bd() {
+        return Some(bd);
     }
+    if let Some(candidate) = bd_candidate() {
+        panic!(
+            "bd at {} is not an accepted 1.2.x sandboxed binary: a bd whose version \
+             moved is exactly when the pinned JSON shape must be re-checked, so this \
+             fails rather than skipping",
+            candidate.display()
+        );
+    }
+    let message = "sandboxed bd 1.2.x not found (set FORGED_TEST_BD or install \
+                   ~/.anvil/tools/bd-1.2.1/bin/bd)";
+    assert!(
+        std::env::var_os("FORGED_REQUIRE_BD").is_none_or(|v| v != "1"),
+        "FORGED_REQUIRE_BD=1 and {message}: the bd contract was not checked"
+    );
+    eprintln!("SKIP: {message}; bd-gated test not run");
+    None
 }

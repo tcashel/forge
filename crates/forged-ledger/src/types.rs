@@ -270,6 +270,9 @@ pub struct PacketRow {
     pub spec_path: String,
     /// `packets.spec_sha256`.
     pub spec_sha256: String,
+    /// `packets.spec_revision` — the pinned bead revision, `None` on a
+    /// file-sourced packet.
+    pub spec_revision: Option<String>,
     /// `packets.body_json` — stored verbatim, never parsed by the ledger.
     pub body_json: String,
     /// `packets.created_at`.
@@ -394,8 +397,41 @@ pub struct NewPacket {
     pub spec_path: String,
     /// Content hash of that spec.
     pub spec_sha256: String,
-    /// Caller-serialized `WorkPacket`, stored verbatim.
+    /// The bead revision this packet pins, `None` when the spec came from a
+    /// file. A non-`None` value is the packet's drift fence.
+    pub spec_revision: Option<String>,
+    /// Caller-serialized `WorkPacket` minus the columns above, stored
+    /// verbatim.
     pub body_json: String,
+}
+
+/// What a packet's spec is pinned to — the value `claim_packet` compares.
+///
+/// The two arms are NOT interchangeable: a bead-sourced packet is fenced on
+/// its rendered body, a file-sourced one on the file's content hash, and a
+/// claim presenting the wrong ARM is drift just as surely as one presenting
+/// the wrong value.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SpecFence {
+    /// A file-sourced spec (the deprecated `--spec <path>` route), pinned by
+    /// the file's SHA-256.
+    Sha256(String),
+    /// A bead-sourced spec.
+    ///
+    /// DRIFT IS JUDGED ON `body_sha256`, NEVER on `revision`. bd's revision
+    /// is a WRITE TOKEN, not a spec digest: `bd update --claim`, a status
+    /// change and a reclaim each mint a new one and the old value never
+    /// returns, so a packet fenced on the token alone would call forged's
+    /// own lease write drift the moment it resumed. The token still travels
+    /// so [`crate::Ledger::claim_packet`] can re-pin the row to whatever bd
+    /// reports now. OPAQUE: equality only — never ordered, parsed,
+    /// incremented, or assumed positive.
+    Revision {
+        /// bd's `revision` as observed on this read.
+        revision: String,
+        /// SHA-256 over the rendered body the seat reads.
+        body_sha256: String,
+    },
 }
 
 /// Input to [`crate::Ledger::record_usage`].

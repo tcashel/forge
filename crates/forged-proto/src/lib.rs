@@ -28,9 +28,14 @@ pub use engine::{
     TerminalAttempt, MACHINE_STEPS,
 };
 pub use error::{PortError, ProtoError};
-pub use events::{parse_proto_events, record, widen_rfc3339, GatePhase, ProtoEvent};
+pub use events::{
+    grant_retry, parse_proto_events, record, transport_failures_of, widen_rfc3339, GatePhase,
+    ProtoEvent,
+};
 pub use ports::{
     KillOutcome, LeaseReclaim, PrSnapshot, ReconcilePorts, ResolveState, SessionLiveness,
 };
-pub use project::{project_run, project_run_with_policy};
+pub use project::{
+    packet_columns, packet_spec, project_run, project_run_with_policy, stored_packet,
+};
 pub use reconcile::{land_packet_result, reconcile, LandOutcome, ReconcileConfig, ReconcileReport};

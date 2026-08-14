@@ -5,7 +5,7 @@
 
 mod support;
 
-use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun};
+use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun, SpecFence};
 use forged_proto::{project_run, record, GatePhase, ProtoError, ProtoEvent};
 use forged_types::{Outcome, RunId, Stage, Verdict};
 use support::*;
@@ -32,19 +32,28 @@ fn projection_reconstructs_history_and_threads_inputs() {
             seq: 1,
             spec_path: "spec.md".to_owned(),
             spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
             body_json: "{}".to_owned(),
         })
         .expect("open packet");
 
     // Attempt 1 transport-fails; attempt 2 completes.
     let first = ledger
-        .claim_packet(&pid, "claude:sess-a:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim 1");
     ledger
         .fail_packet(&pid, &first.claim_token, "transport: dropped")
         .expect("fail");
     let second = ledger
-        .claim_packet(&pid, "claude:sess-b:1", "cafe")
+        .claim_packet(
+            &pid,
+            "claude:sess-b:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
         .expect("claim 2");
     ledger
         .complete_packet(

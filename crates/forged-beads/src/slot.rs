@@ -203,7 +203,7 @@ pub async fn slot_check(bd: &BdConfig) -> Result<SlotStatus, BdError> {
             stderr: out.stderr,
         });
     }
-    let raw: Value = serde_json::from_str(&out.stdout).map_err(|e| BdError::Envelope {
+    let raw: Value = serde_json::from_str(&out.stdout).map_err(|e| BdError::Unparseable {
         context: context.to_string(),
         detail: format!("unparseable raw JSON ({e}); stdout: {}", out.stdout),
     })?;
@@ -359,7 +359,7 @@ pub async fn slot_acquire(
             continue;
         }
         if out.exit == Some(0) {
-            return Err(BdError::Envelope {
+            return Err(BdError::Unparseable {
                 context: context.to_string(),
                 detail: format!("stdout: {}; stderr: {}", out.stdout, out.stderr),
             });
