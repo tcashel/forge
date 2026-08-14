@@ -23,6 +23,16 @@ pub(crate) struct Settlement {
     pub(crate) superseded_by: Option<String>,
 }
 
+/// One stable explanation shared by controller settlement and the explicit
+/// acceptance operation. Keeping this byte-for-byte identical makes crash
+/// recovery an idempotent replay instead of a competing terminal decision.
+pub(crate) fn accepted_risk_reason(acceptance: &forged_types::AcceptedRisk) -> String {
+    format!(
+        "review risk accepted by {}: {}",
+        acceptance.accepted_by, acceptance.rationale
+    )
+}
+
 fn outcome(value: &str) -> Result<RunOutcome, Failure> {
     RunOutcome::try_from(value).map_err(Failure::from)
 }

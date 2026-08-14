@@ -396,6 +396,34 @@ fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settle
                 final_verdict.map(verdict_str).unwrap_or("unavailable")
             ),
         ),
+        Terminal::ReviewBudgetExhausted {
+            review_rounds,
+            final_verdict,
+        } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "review budget exhausted after {review_rounds} rounds with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::RemediationFailed {
+            round,
+            final_verdict,
+        } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "remediation failed in round {round} with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::SpecAmendmentProposed { stage_id, .. } => (
+            forged_ledger::RunOutcome::InputRequired,
+            format!("stage {stage_id} proposed a specification amendment"),
+        ),
+        Terminal::AcceptedRisk { acceptance } => (
+            forged_ledger::RunOutcome::AcceptedRisk,
+            super::settlement::accepted_risk_reason(acceptance),
+        ),
         Terminal::ProviderUnavailable { stage, attempts } => (
             forged_ledger::RunOutcome::Blocked,
             format!(

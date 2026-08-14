@@ -624,7 +624,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
-                "nextAction": if let Some(terminal) = protocol_terminal {
+                "nextAction": if view.accepted_risk.is_none() && protocol_terminal.is_some() {
+                    let terminal = protocol_terminal.expect("checked above");
                     json!({"stop": terminal})
                 } else { match &action {
                     forged_proto::NextAction::RunMachine(step) =>
@@ -857,27 +858,65 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
     };
+    // Exhaustion normally settles the run before an operator can accept its
+    // risk. Read the preserved protocol terminal (or an existing acceptance)
+    // so the evidence gate survives the stopped state projection.
+    let persisted_review_rounds = {
+        let event_run = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            let mut accepted = None;
+            let mut exhausted = None;
+            for event in ledger.list_events(Some(&event_run), 0, 4096)? {
+                let payload: Value = serde_json::from_str(&event.payload_json)?;
+                match event.kind.as_str() {
+                    "forged.review.risk_accepted" => {
+                        accepted = payload.get("reviewRounds").and_then(Value::as_u64);
+                    }
+                    "run.protocol-terminal" => {
+                        exhausted = payload
+                            .pointer("/terminal/reviewBudgetExhausted/reviewRounds")
+                            .and_then(Value::as_u64);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(accepted
+                .or(exhausted)
+                .and_then(|rounds| u8::try_from(rounds).ok()))
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                    &error,
+                )
+            }
+        }
+    };
     let (review_rounds, acceptance) = match &view.accepted_risk {
         Some(existing)
             if existing.accepted_by == accepted_by && existing.rationale == rationale =>
         {
-            let rounds = view
-                .execution_package
-                .as_ref()
-                .map(|package| {
-                    let name = view
-                        .profile_escalations
-                        .last()
-                        .map(|event| event.to.as_str())
-                        .unwrap_or(package.profile_ref.name.as_str());
-                    package
-                        .profile_catalog
-                        .get(name)
-                        .unwrap_or(&package.profile)
-                        .fix_round_budget
-                        .saturating_add(1)
-                })
-                .unwrap_or(1);
+            let rounds = persisted_review_rounds.unwrap_or_else(|| {
+                view.execution_package
+                    .as_ref()
+                    .map(|package| {
+                        let name = view
+                            .profile_escalations
+                            .last()
+                            .map(|event| event.to.as_str())
+                            .unwrap_or(package.profile_ref.name.as_str());
+                        package
+                            .profile_catalog
+                            .get(name)
+                            .unwrap_or(&package.profile)
+                            .fix_round_budget
+                            .saturating_add(1)
+                    })
+                    .unwrap_or(1)
+            });
             (rounds, existing.clone())
         }
         Some(_) => {
@@ -887,8 +926,9 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
         None => {
-            let rounds =
-                match forged_proto::advance(&view) {
+            let rounds = match persisted_review_rounds {
+                Some(rounds) => rounds,
+                None => match forged_proto::advance(&view) {
                     forged_proto::NextAction::Stop(
                         forged_proto::Terminal::ReviewBudgetExhausted { review_rounds, .. },
                     ) => review_rounds,
@@ -898,7 +938,8 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                             "risk can be accepted only after the review round budget is exhausted",
                         ),
                     ),
-                };
+                },
+            };
             (
                 rounds,
                 forged_types::AcceptedRisk {
@@ -931,7 +972,7 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             let payload = json!({
                 "schemaVersion": 1,
                 "reviewRounds": review_rounds,
-                "acceptance": acceptance,
+                "acceptance": acceptance.clone(),
             });
             {
                 let run_id = run_id.clone();
@@ -940,6 +981,14 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                 })
                 .await?;
             }
+            let settlement = super::settlement::Settlement {
+                outcome: forged_ledger::RunOutcome::AcceptedRisk,
+                reason: super::settlement::accepted_risk_reason(&acceptance),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            };
+            super::settlement::settle(ctx, &run_id, settlement).await?;
             Ok(json!({
                 "runId": run_id,
                 "reviewRounds": review_rounds,
