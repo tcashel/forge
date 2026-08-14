@@ -655,10 +655,9 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
-                "nextAction": if view.accepted_risk.is_none() && protocol_terminal.is_some() {
-                    let terminal = protocol_terminal.expect("checked above");
-                    json!({"stop": terminal})
-                } else { match &action {
+                "nextAction": match protocol_terminal {
+                    Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
+                    _ => match &action {
                     forged_proto::NextAction::RunMachine(step) =>
                         json!({"runMachine": step.as_str()}),
                     forged_proto::NextAction::OpenPackets(intents) =>
@@ -671,9 +670,10 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                             "to": escalation.to,
                             "trigger": escalation.trigger,
                         }}),
-                    forged_proto::NextAction::Stop(t) =>
-                        json!({"stop": super::drive::terminal_json(t)}),
-                }},
+                        forged_proto::NextAction::Stop(t) =>
+                            json!({"stop": super::drive::terminal_json(t)}),
+                    },
+                },
                 "controller": controller,
                 "claimHealth": claim_health,
             }
@@ -1867,9 +1867,11 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
         .cloned()
         .unwrap_or(Value::Null);
     let mut delivery = settled_delivery.unwrap_or_else(|| {
-        (!pr_number.is_null())
-            .then(|| json!({"pr": pr_number.clone(), "sha": Value::Null}))
-            .unwrap_or(Value::Null)
+        if pr_number.is_null() {
+            Value::Null
+        } else {
+            json!({"pr": pr_number.clone(), "sha": Value::Null})
+        }
     });
     // A clean settlement happens after review and before the human merge,
     // while the draft PR is recorded independently by the protocol. Merge
