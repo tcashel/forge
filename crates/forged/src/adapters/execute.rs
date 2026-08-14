@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use forged_host::{ProcessHost, SessionHost};
 use forged_ledger::{EffectClass, RunRow};
-use forged_proto::{LandOutcome, PacketIntent, ProtoEvent};
+use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
 };
@@ -387,43 +387,6 @@ async fn await_pid(packet_dir: &Path) -> Option<u32> {
     None
 }
 
-/// The packet's transport-failure count so far, from its latest
-/// `proto.retry` grant.
-async fn prior_transport_failures(ctx: &Ctx, run_id: &str, packet_id: &str) -> u32 {
-    let run_id = run_id.to_owned();
-    let packet_id = packet_id.to_owned();
-    let events = on_ledger(&ctx.ledger, move |l| {
-        let mut out = Vec::new();
-        let mut after = 0i64;
-        loop {
-            let page = l.list_events(Some(&run_id), after, 256)?;
-            let full = page.len() == 256;
-            if let Some(last) = page.last() {
-                after = last.event_id;
-            }
-            out.extend(page);
-            if !full {
-                return Ok(out);
-            }
-        }
-    })
-    .await
-    .unwrap_or_default();
-    let parsed = forged_proto::parse_proto_events(&events).unwrap_or_default();
-    parsed
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            ProtoEvent::Retry {
-                packet_id: p,
-                transport_failures,
-                ..
-            } if *p == packet_id => Some(*transport_failures),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
 /// Execute one open packet end to end: re-pin, claim, render, spawn, await,
 /// harvest, land or fail. Follows the section-(d) order exactly.
 ///
@@ -550,33 +513,42 @@ async fn repin_packet(
 /// packet's history. The `proto.retry` grant carries both the count and the
 /// deadline, which is exactly what `advance` reads for a packet with no
 /// terminal attempts of its own.
+///
+/// Nothing fences this path — the failure is pre-claim by definition — so
+/// the charge is read-and-append inside ONE ledger transaction
+/// (`grant_retry`). Two advances racing the same outage would otherwise read
+/// the same count and both write `n + 1`.
 async fn grant_pre_claim_retry(
     ctx: &Ctx,
     packet_id: &str,
     note: String,
 ) -> Result<PacketOutcome, Failure> {
     let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
-    let count = prior_transport_failures(ctx, &run_id, packet_id).await + 1;
-    let now = now_iso();
-    let deadline = forged_proto::backoff_deadline(&now, count.saturating_sub(1)).unwrap_or(now);
-    let event = ProtoEvent::Retry {
-        packet_id: packet_id.to_owned(),
-        transport_failures: count,
-        retry_after: deadline,
-    };
-    {
-        let run_id = run_id.clone();
-        on_ledger(&ctx.ledger, move |l| {
-            forged_proto::record(l, &run_id, event).map_err(|e| match e {
-                forged_proto::ProtoError::Ledger(inner) => inner,
-                other => forged_ledger::LedgerError::Internal {
-                    message: other.to_string(),
-                },
-            })
-        })
-        .await?;
-    }
+    let packet_id = packet_id.to_owned();
+    charge_retry(ctx, &run_id, &packet_id, now_iso()).await?;
     Ok(PacketOutcome::Transport(note))
+}
+
+/// Append one packet's `proto.retry` grant, mapping the proto error onto the
+/// ledger's.
+async fn charge_retry(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    since: String,
+) -> Result<(), Failure> {
+    let run_id = run_id.to_owned();
+    let packet_id = packet_id.to_owned();
+    on_ledger(&ctx.ledger, move |l| {
+        forged_proto::grant_retry(l, &run_id, &packet_id, &since).map_err(|e| match e {
+            forged_proto::ProtoError::Ledger(inner) => inner,
+            other => forged_ledger::LedgerError::Internal {
+                message: other.to_string(),
+            },
+        })
+    })
+    .await?;
+    Ok(())
 }
 
 /// Adopt an already-claimed attempt whose provider was never spawned (the
@@ -1147,12 +1119,14 @@ pub async fn land_result(
     }
 }
 
-/// Record a transport failure and grant the retry: fail the packet with the
-/// `transport:` note, then append the `proto.retry` event carrying the
-/// packet's transport-failure count and the backoff deadline computed from
-/// the failed attempt's `ended_at` — what lets kill-matrix case 7 assert
-/// the fix round is untouched.
-async fn fail_and_grant_retry(
+/// Fail the attempt and charge its packet's bounded budget: store the note,
+/// then append the `proto.retry` grant carrying the packet's failure count
+/// and the backoff deadline computed from the failed attempt's `ended_at` —
+/// what lets kill-matrix case 7 assert the fix round is untouched.
+///
+/// The note's own prefix is what classifies the failure (`transport:` or
+/// `unspawned:`); both stand on this one budget.
+pub(crate) async fn fail_and_grant_retry(
     ctx: &Ctx,
     packet_id: &str,
     claim_token: &str,
@@ -1174,26 +1148,7 @@ async fn fail_and_grant_retry(
         })
         .await?
     };
-    let count = prior_transport_failures(ctx, &run_id, packet_id).await + 1;
-    let deadline = forged_proto::backoff_deadline(&failed_at, count.saturating_sub(1))
-        .unwrap_or_else(|_| now_iso());
-    let event = ProtoEvent::Retry {
-        packet_id: packet_id.to_owned(),
-        transport_failures: count,
-        retry_after: deadline,
-    };
-    {
-        let run_id = run_id.clone();
-        on_ledger(&ctx.ledger, move |l| {
-            forged_proto::record(l, &run_id, event).map_err(|e| match e {
-                forged_proto::ProtoError::Ledger(inner) => inner,
-                other => forged_ledger::LedgerError::Internal {
-                    message: other.to_string(),
-                },
-            })
-        })
-        .await?;
-    }
+    charge_retry(ctx, &run_id, packet_id, failed_at).await?;
     Ok(PacketOutcome::Transport(note))
 }
 

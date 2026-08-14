@@ -35,6 +35,7 @@ use forged_ledger::{EventRow, Ledger};
 use forged_types::{GateRow, OperationRequest, PacketResult, Stage, Verdict};
 use serde_json::{json, Value};
 
+use crate::engine::backoff_deadline;
 use crate::error::ProtoError;
 
 /// Which gate pass a `proto.gate` event reports.
@@ -141,13 +142,16 @@ pub enum ProtoEvent {
     },
 }
 
+/// The kind string a `proto.retry` grant records under.
+const RETRY_KIND: &str = "proto.retry";
+
 impl ProtoEvent {
     /// The event kind string this variant records under.
     pub fn kind(&self) -> &'static str {
         match self {
             ProtoEvent::Gate { .. } => "proto.gate",
             ProtoEvent::Pr { .. } => "proto.pr",
-            ProtoEvent::Retry { .. } => "proto.retry",
+            ProtoEvent::Retry { .. } => RETRY_KIND,
             ProtoEvent::Review { .. } => "proto.review",
             ProtoEvent::OperationRequest { .. } => "proto.operation.request",
             ProtoEvent::Quarantine { .. } => "proto.quarantine",
@@ -345,6 +349,71 @@ pub fn record(ledger: &Ledger, run_id: &str, event: ProtoEvent) -> Result<(), Pr
     let payload = event.payload()?;
     ledger.append_event(Some(run_id), event.kind(), payload)?;
     Ok(())
+}
+
+/// Charge one transport failure to a packet's bounded budget and grant the
+/// retry, in ONE ledger transaction.
+///
+/// The count and the deadline are a paired carrier — `advance` reads both out
+/// of the packet's latest grant so they can never drift apart — and the count
+/// is `standing + 1`. Reading the standing count in one ledger call and
+/// appending the grant in the next therefore lets two concurrent chargers
+/// observe the same `n` and both append `n + 1`: one outage charged once, and
+/// a bounded budget that has silently stopped being bounded. The read and the
+/// append happen inside the ledger's own `Immediate` transaction instead.
+///
+/// `since` is the instant the backoff is measured from: the failed attempt's
+/// `ended_at` where an attempt row exists, and now where none does (a
+/// pre-claim failure has no claim token to fence an attempt with).
+///
+/// Returns the count this charge landed on.
+pub fn grant_retry(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    since: &str,
+) -> Result<u32, ProtoError> {
+    let owned_packet = packet_id.to_owned();
+    let since = since.to_owned();
+    let payload = ledger.append_event_derived(run_id, RETRY_KIND, move |standing| {
+        let count = transport_failures_of(standing, &owned_packet).saturating_add(1);
+        let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(|err| {
+            forged_ledger::LedgerError::Internal {
+                message: err.to_string(),
+            }
+        })?;
+        ProtoEvent::Retry {
+            packet_id: owned_packet.clone(),
+            transport_failures: count,
+            retry_after,
+        }
+        .payload()
+        .map_err(|err| forged_ledger::LedgerError::Internal {
+            message: err.to_string(),
+        })
+    })?;
+    payload["transportFailures"]
+        .as_u64()
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
+}
+
+/// A packet's standing transport-failure count, from the latest `proto.retry`
+/// grant among `rows`. Zero when the packet has never been charged.
+pub fn transport_failures_of(rows: &[EventRow], packet_id: &str) -> u32 {
+    parse_proto_events(rows)
+        .unwrap_or_default()
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Retry {
+                packet_id: charged,
+                transport_failures,
+                ..
+            } if charged == packet_id => Some(*transport_failures),
+            _ => None,
+        })
+        .unwrap_or(0)
 }
 
 /// Normalize an RFC-3339 UTC string (as jiff displays it) to the ledger's
