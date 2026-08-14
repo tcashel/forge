@@ -1,0 +1,12 @@
+{
+  "name": "forged",
+  "version": "0.2.0",
+  "description": "Forge-owned lead-agent planning, critique, adjudication, setup, and typed handoff to Forged.",
+  "author": {
+    "name": "Tripp Cashel"
+  },
+  "homepage": "https://github.com/tcashel/forge",
+  "repository": "https://github.com/tcashel/forge",
+  "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+  "skills": "./skills/"
+}

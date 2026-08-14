@@ -140,3 +140,20 @@ dependencies. Herdr (Apache-2.0) remains an optional vessel behind
 - The build retro's process actions (resumable blocked-state fix rounds,
   deterministic readiness, chunked review coverage, evidence persisted on
   PRs, spec-size enforcement) belong to smithy and are tracked there.
+
+## Clarification — 2026-08-14
+
+The pending thin-client migration described above is complete in the current
+Forge tree, with one distribution correction learned through dogfooding: the
+next containing Forge release owns the dual-host lead-agent plugin in
+`plugins/forged`. Its Claude and Codex manifests point to one shared skill tree
+that plans, critiques, adjudicates, and performs the explicit typed handoff.
+Smithy Anvil 0.3.1 remains historical evidence and is not an installation or
+runtime dependency.
+
+This does not change the ADR's organizing rule. The plugin is a lead-agent
+adapter, not part of the Rust execution kernel: it writes native Bead
+specification fields and uses Forged's public CLI contracts only after
+adjudication. Beads still owns work and readiness; Forged still owns durable
+execution state; provider adapters still perform execution cognition; GitHub
+still owns delivery truth.
