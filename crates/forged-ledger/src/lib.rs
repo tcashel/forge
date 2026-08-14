@@ -19,6 +19,7 @@
 mod attempts;
 mod error;
 mod events;
+mod inventory;
 mod ledger;
 mod migrations;
 mod operations;
@@ -30,6 +31,7 @@ mod types;
 mod usage;
 
 pub use error::LedgerError;
+pub use inventory::InventorySnapshot;
 pub use ledger::{default_db_path, Ledger};
 pub use types::{
     AttemptRow, AttemptState, ClaimedAttempt, EffectClass, EventRow, MergeSlotRow, NewPacket,

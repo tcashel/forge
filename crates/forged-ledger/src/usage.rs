@@ -1,7 +1,10 @@
 //! Usage rows and per-run totals. Token counts are the truth; `cost_usd` is
 //! nullable by design and totals never invent a cost for a null row.
 
+use std::collections::BTreeMap;
+
 use forged_types::ErrorCode;
+use rusqlite::Connection;
 
 use crate::error::{internal, refused, LedgerError};
 use crate::ledger::Ledger;
@@ -23,6 +26,76 @@ fn opt_as_i64(value: Option<u64>, what: &str) -> Result<Option<i64>, LedgerError
 
 fn as_u64(value: i64, what: &str) -> Result<u64, LedgerError> {
     u64::try_from(value).map_err(|_| internal(format!("negative {what} sum {value}")))
+}
+
+/// The six aggregate columns every totals query selects, in the order
+/// [`sum_row`] decodes them.
+const TOTAL_SUMS: &str = "COALESCE(SUM(input_tokens), 0), \
+     COALESCE(SUM(output_tokens), 0), \
+     COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0), \
+     COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0), \
+     COALESCE(SUM(cost_usd), 0.0), \
+     COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0)";
+
+/// The raw sums, still in SQLite's own types.
+type Sums = (i64, i64, i64, i64, f64, i64);
+
+fn sum_row(row: &rusqlite::Row<'_>) -> Result<Sums, rusqlite::Error> {
+    Ok((
+        row.get(0)?,
+        row.get(1)?,
+        row.get(2)?,
+        row.get(3)?,
+        row.get(4)?,
+        row.get(5)?,
+    ))
+}
+
+fn totals_of(sums: Sums) -> Result<UsageTotals, LedgerError> {
+    let (input, output, cache_read, cache_write, cost_known, missing) = sums;
+    Ok(UsageTotals {
+        input_tokens: as_u64(input, "input_tokens")?,
+        output_tokens: as_u64(output, "output_tokens")?,
+        cache_read_tokens: as_u64(cache_read, "cache_read_tokens")?,
+        cache_write_tokens: as_u64(cache_write, "cache_write_tokens")?,
+        cost_usd_known: cost_known,
+        rows_missing_cost: u32::try_from(missing)
+            .map_err(|_| internal("rows_missing_cost overflows u32"))?,
+    })
+}
+
+/// Every run's totals in ONE grouped scan, inside the caller's transaction.
+///
+/// A run with no usage rows is ABSENT from the map rather than zero-valued:
+/// `GROUP BY` emits nothing for it, and callers treat absent as zero the way
+/// [`Ledger::usage_totals`] does. Projecting the whole inventory therefore
+/// costs one query, never one per run.
+pub(crate) fn usage_totals_per_run_tx(
+    conn: &Connection,
+) -> Result<BTreeMap<String, UsageTotals>, LedgerError> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT run_id, {TOTAL_SUMS} FROM usage GROUP BY run_id"
+    ))?;
+    let rows = statement.query_map([], |row| {
+        let run_id: String = row.get(0)?;
+        Ok((
+            run_id,
+            (
+                row.get(1)?,
+                row.get(2)?,
+                row.get(3)?,
+                row.get(4)?,
+                row.get(5)?,
+                row.get(6)?,
+            ),
+        ))
+    })?;
+    let mut totals = BTreeMap::new();
+    for row in rows {
+        let (run_id, sums): (String, Sums) = row?;
+        totals.insert(run_id, totals_of(sums)?);
+    }
+    Ok(totals)
 }
 
 impl Ledger {
@@ -86,42 +159,12 @@ impl Ledger {
     pub fn usage_totals(&self, run_id: &str) -> Result<UsageTotals, LedgerError> {
         let run_id = run_id.to_owned();
         self.submit(move |conn| {
-            let (input, output, cache_read, cache_write, cost_known, missing): (
-                i64,
-                i64,
-                i64,
-                i64,
-                f64,
-                i64,
-            ) = conn.query_row(
-                "SELECT COALESCE(SUM(input_tokens), 0), \
-                        COALESCE(SUM(output_tokens), 0), \
-                        COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0), \
-                        COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0), \
-                        COALESCE(SUM(cost_usd), 0.0), \
-                        COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0) \
-                 FROM usage WHERE run_id = ?1",
+            let sums = conn.query_row(
+                &format!("SELECT {TOTAL_SUMS} FROM usage WHERE run_id = ?1"),
                 [&run_id],
-                |row| {
-                    Ok((
-                        row.get(0)?,
-                        row.get(1)?,
-                        row.get(2)?,
-                        row.get(3)?,
-                        row.get(4)?,
-                        row.get(5)?,
-                    ))
-                },
+                sum_row,
             )?;
-            Ok(UsageTotals {
-                input_tokens: as_u64(input, "input_tokens")?,
-                output_tokens: as_u64(output, "output_tokens")?,
-                cache_read_tokens: as_u64(cache_read, "cache_read_tokens")?,
-                cache_write_tokens: as_u64(cache_write, "cache_write_tokens")?,
-                cost_usd_known: cost_known,
-                rows_missing_cost: u32::try_from(missing)
-                    .map_err(|_| internal("rows_missing_cost overflows u32"))?,
-            })
+            totals_of(sums)
         })
     }
 

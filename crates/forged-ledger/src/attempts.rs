@@ -52,6 +52,27 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
     })
 }
 
+/// Live attempts inside the caller's transaction — see
+/// [`Ledger::list_live_attempts`] for the contract.
+pub(crate) fn list_live_attempts_tx(
+    conn: &Connection,
+    run_id: Option<&str>,
+) -> Result<Vec<AttemptRow>, LedgerError> {
+    let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
+         a.revoke_reason, a.fail_note, a.result_json, a.started_at, a.updated_at, \
+         a.last_heartbeat_at, a.ended_at \
+         FROM attempts a JOIN packets p ON p.packet_id = a.packet_id \
+         WHERE a.state IN ('running','revoking') \
+         AND (?1 IS NULL OR p.run_id = ?1) ORDER BY a.rowid";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([&run_id], attempt_row)?;
+    let mut out = Vec::new();
+    for row in rows {
+        out.push(row?);
+    }
+    Ok(out)
+}
+
 pub(crate) fn find_attempt_by_token_tx(
     conn: &Connection,
     claim_token: &str,
@@ -331,21 +352,7 @@ impl Ledger {
     /// belongs to `r`.
     pub fn list_live_attempts(&self, run_id: Option<&str>) -> Result<Vec<AttemptRow>, LedgerError> {
         let run_id = run_id.map(str::to_owned);
-        self.submit(move |conn| {
-            let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
-                 a.revoke_reason, a.fail_note, a.result_json, a.started_at, a.updated_at, \
-                 a.last_heartbeat_at, a.ended_at \
-                 FROM attempts a JOIN packets p ON p.packet_id = a.packet_id \
-                 WHERE a.state IN ('running','revoking') \
-                 AND (?1 IS NULL OR p.run_id = ?1) ORDER BY a.rowid";
-            let mut stmt = conn.prepare(sql)?;
-            let rows = stmt.query_map([&run_id], attempt_row)?;
-            let mut out = Vec::new();
-            for row in rows {
-                out.push(row?);
-            }
-            Ok(out)
-        })
+        self.submit(move |conn| list_live_attempts_tx(conn, run_id.as_deref()))
     }
 
     /// Durably mark `running → revoking` and COMMIT — this marker lands

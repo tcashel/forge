@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
-use forged_ledger::{EffectClass, NewRun, NewRunDefinition, OperationState, RunState};
+use forged_ledger::{
+    EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState, RunState,
+};
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
 use forged_types::{
     request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
@@ -1200,8 +1202,9 @@ struct EpicLifecycle {
 /// describe one, keyed by epic id; an epic with no lifecycle event yet is
 /// absent and its entry reports `active`.
 ///
-/// Three indexed kind scans, never one pass per epic: the inventory costs
-/// the same whether the ledger holds one epic or a hundred.
+/// A pure fold over one snapshot — never its own reads. Three indexed kind
+/// scans already sit in that snapshot, so the fold costs the same whether
+/// the ledger holds one epic or a hundred.
 ///
 /// Between `paused` and `resumed` the greater `event_id` wins — the append
 /// position, never the `ts` string, so two control events written in the
@@ -1211,7 +1214,7 @@ struct EpicLifecycle {
 /// event. A payload that will not parse still yields the state its kind
 /// implies, with no reason — the same degradation an unparseable start
 /// event gets.
-async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, Failure> {
+fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecycle> {
     let reason_of = |payload_json: &str| {
         let payload: Value = serde_json::from_str(payload_json).unwrap_or(Value::Null);
         match payload.get("reason") {
@@ -1221,8 +1224,8 @@ async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, F
     };
     let mut control: BTreeMap<String, (i64, EpicLifecycle)> = BTreeMap::new();
     for kind in [epic::PAUSED, epic::RESUMED] {
-        for event in on_ledger(&ctx.ledger, move |l| l.list_events_by_kind(kind)).await? {
-            let Some(epic_id) = event.run_id else {
+        for event in snapshot.events(kind) {
+            let Some(epic_id) = event.run_id.clone() else {
                 continue;
             };
             let lifecycle = if kind == epic::PAUSED {
@@ -1248,8 +1251,8 @@ async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, F
         .into_iter()
         .map(|(epic_id, (_, lifecycle))| (epic_id, lifecycle))
         .collect();
-    for event in on_ledger(&ctx.ledger, |l| l.list_events_by_kind(epic::EPIC_PR)).await? {
-        let Some(epic_id) = event.run_id else {
+    for event in snapshot.events(epic::EPIC_PR) {
+        let Some(epic_id) = event.run_id.clone() else {
             continue;
         };
         lifecycles.insert(
@@ -1260,7 +1263,7 @@ async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, F
             },
         );
     }
-    Ok(lifecycles)
+    lifecycles
 }
 
 /// `work list` — the discovery surface: every unit of work the ledger holds,
@@ -1268,6 +1271,15 @@ async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, F
 ///
 /// The one entry point that takes no id, so a caller with no prior knowledge
 /// can enumerate the inventory and then address any entry.
+///
+/// ONE `inventory_snapshot` feeds the whole projection — runs, live
+/// attempts, usage totals, the newest event per run, and the four epic
+/// kinds — because these sources cross-read each other. Fetched as separate
+/// ledger jobs, a lifecycle event landing between two of them yields an
+/// entry whose `state` contradicts its own `updatedAt`: paused according to
+/// the kind scan, resumed according to the newest event. Every read here is
+/// therefore of one ledger at one instant, and no per-run query survives —
+/// seats and spend are grouped from that snapshot, never queried per entry.
 ///
 /// Two sources, deliberately: a slice owns a `runs` row, but an epic never
 /// does — `epic_start` only appends `forged.epic.started` under the epic
@@ -1299,42 +1311,47 @@ async fn epic_lifecycles(ctx: &Ctx) -> Result<BTreeMap<String, EpicLifecycle>, F
 /// and keeps that row's `state`, `stopReason`, and `updatedAt`: where a
 /// column exists it is the durable state, and only a synthesized entry
 /// derives one.
-///
-/// Live seats come from ONE `list_live_attempts(None)` scan grouped by run,
-/// never a per-run query. Absent usage is data: an entry with no usage rows
-/// reports zero spend rather than failing.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let runs = on_ledger(&ctx.ledger, |l| l.list_runs()).await?;
-        let started = on_ledger(&ctx.ledger, |l| l.list_events_by_kind(epic::STARTED)).await?;
+        let snapshot = on_ledger(&ctx.ledger, |l| {
+            l.inventory_snapshot(&[epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR])
+        })
+        .await?;
+        let lifecycles = epic_lifecycles(&snapshot);
         // First start event per epic id; a payload that will not parse still
         // yields a discoverable id rather than hiding the epic.
         let mut epics: BTreeMap<String, (String, Value)> = BTreeMap::new();
-        for event in started {
-            let Some(epic_id) = event.run_id else {
+        for event in snapshot.events(epic::STARTED) {
+            let Some(epic_id) = event.run_id.clone() else {
                 continue;
             };
             epics.entry(epic_id).or_insert_with(|| {
                 (
-                    event.ts,
+                    event.ts.clone(),
                     serde_json::from_str(&event.payload_json).unwrap_or(Value::Null),
                 )
             });
         }
         let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
-        for attempt in on_ledger(&ctx.ledger, |l| l.list_live_attempts(None)).await? {
+        for attempt in &snapshot.live_attempts {
             let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
             *live_seats.entry(run_id).or_default() += 1;
         }
+        // Absent usage is data: an entry with no usage rows reports zero
+        // spend rather than failing.
+        let spend = |id: &str| {
+            let totals = snapshot.usage_totals.get(id);
+            (
+                totals.map_or(0.0, |t| t.cost_usd_known),
+                totals.map_or(0, |t| t.rows_missing_cost),
+            )
+        };
         // (createdAt, id, entry) — one ordering over both sources, keeping
         // `list_runs`'s chronological shape now that epics interleave.
         let mut inventory: Vec<(String, String, Value)> =
-            Vec::with_capacity(runs.len() + epics.len());
-        for run in runs {
-            let totals = {
-                let run_id = run.run_id.clone();
-                on_ledger(&ctx.ledger, move |l| l.usage_totals(&run_id)).await?
-            };
+            Vec::with_capacity(snapshot.runs.len() + epics.len());
+        for run in &snapshot.runs {
+            let (cost_usd_known, rows_missing_cost) = spend(&run.run_id);
             let epic = epics.remove(&run.run_id).is_some();
             inventory.push((
                 run.created_at.clone(),
@@ -1353,26 +1370,14 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     "createdAt": run.created_at,
                     "updatedAt": run.updated_at,
                     "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
-                    "costUsdKnown": totals.cost_usd_known,
-                    "rowsMissingCost": totals.rows_missing_cost,
+                    "costUsdKnown": cost_usd_known,
+                    "rowsMissingCost": rows_missing_cost,
                 }),
             ));
         }
         // Whatever is left has a start event and no run row: a real epic.
-        // The lifecycle scans are paid only when one exists.
-        let (lifecycles, latest_event) = if epics.is_empty() {
-            (BTreeMap::new(), BTreeMap::new())
-        } else {
-            (
-                epic_lifecycles(ctx).await?,
-                on_ledger(&ctx.ledger, |l| l.latest_event_per_run()).await?,
-            )
-        };
         for (epic_id, (ts, payload)) in epics {
-            let totals = {
-                let epic_id = epic_id.clone();
-                on_ledger(&ctx.ledger, move |l| l.usage_totals(&epic_id)).await?
-            };
+            let (cost_usd_known, rows_missing_cost) = spend(&epic_id);
             let field = |name: &str| match payload.get(name) {
                 Some(value @ Value::String(_)) => value.clone(),
                 _ => Value::Null,
@@ -1382,7 +1387,8 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 value => value,
             };
             let lifecycle = lifecycles.get(&epic_id);
-            let updated_at = latest_event
+            let updated_at = snapshot
+                .latest_event
                 .get(&epic_id)
                 .map(|event| event.ts.clone())
                 .unwrap_or_else(|| ts.clone());
@@ -1402,8 +1408,8 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     "createdAt": ts,
                     "updatedAt": updated_at,
                     "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
-                    "costUsdKnown": totals.cost_usd_known,
-                    "rowsMissingCost": totals.rows_missing_cost,
+                    "costUsdKnown": cost_usd_known,
+                    "rowsMissingCost": rows_missing_cost,
                 }),
             ));
         }
