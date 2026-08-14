@@ -46,10 +46,13 @@ const SECTIONS: [Section; 4] = [
 
 /// A description with forged's own LEADING pointer block removed.
 ///
-/// `spec:` and `repo:` are addressing, not prose: a bead whose description
-/// is nothing but pointers carries no spec of its own and still belongs to
-/// the file route, and one that carries both must not hand its seat a stray
-/// pointer line.
+/// `spec:` and `repo:` are addressing, not prose, WHERE FORGED WROTE THEM —
+/// at the top. A bead whose description is nothing but that block carries no
+/// spec of its own and still belongs to the file route, and one that carries
+/// both must not open its seat's spec with a stray addressing line.
+///
+/// Everywhere else a pointer-shaped line is prose and REACHES THE SEAT
+/// verbatim, on purpose.
 ///
 /// The block is only ever the contiguous run of pointer (and blank) lines
 /// the writer put at the TOP, and stripping stops at the first line that is
