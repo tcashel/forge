@@ -132,9 +132,12 @@ fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -
 }
 
 fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
-    std::fs::read_to_string(env.packet_dir(run, stage, seq).join("provider.pid"))
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
+    std::fs::read_to_string(
+        env.latest_attempt_dir(run, stage, seq)?
+            .join("provider.pid"),
+    )
+    .ok()
+    .and_then(|t| t.trim().parse().ok())
 }
 
 fn kill_group(pid: i32) {
@@ -935,7 +938,7 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     let killed_pids = shim_pids(&env, "bead-k5/implementation/0");
 
     // Two INDEPENDENT OS processes reconcile the same run, concurrently.
-    let mut first = env
+    let first = env
         .forged_cmd(&[
             "reconcile",
             "--run",
@@ -944,9 +947,10 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
             "op:reconcile:k5-a",
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("reconciler A");
-    let mut second = env
+    let second = env
         .forged_cmd(&[
             "reconcile",
             "--run",
@@ -955,13 +959,18 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
             "op:reconcile:k5-b",
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("reconciler B");
-    let a = first.wait().expect("A exits");
-    let b = second.wait().expect("B exits");
+    let a = first.wait_with_output().expect("A exits");
+    let b = second.wait_with_output().expect("B exits");
     assert!(
-        a.success() && b.success(),
-        "both reconcilers settle cleanly"
+        a.status.success() && b.status.success(),
+        "both reconcilers settle cleanly\nA stdout: {}\nA stderr: {}\nB stdout: {}\nB stderr: {}",
+        String::from_utf8_lossy(&a.stdout),
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr),
     );
 
     // Convergence: the attempt reached Reclaimed exactly once.

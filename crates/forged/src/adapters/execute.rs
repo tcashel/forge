@@ -387,10 +387,10 @@ fn driver_for(provider: &str) -> Result<Box<dyn ProviderDriver>, Failure> {
     }
 }
 
-/// Poll `<packet_dir>/provider.pid` until the spawned shell writes it.
-async fn await_pid(packet_dir: &Path) -> Option<u32> {
+/// Poll `<attempt_dir>/provider.pid` until the spawned shell writes it.
+async fn await_pid(attempt_dir: &Path) -> Option<u32> {
     for _ in 0..50 {
-        if let Ok(text) = std::fs::read_to_string(packet_dir.join("provider.pid")) {
+        if let Ok(text) = std::fs::read_to_string(attempt_dir.join("provider.pid")) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 return Some(pid);
             }
@@ -745,16 +745,15 @@ async fn run_attempt(
         };
         let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
         failpoint::hit("packet.materialize.before");
-        std::fs::create_dir_all(&packet_dir)
-            .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
+        let dirs = PacketDirs::new(&packet_dir, attempt_id);
+        std::fs::create_dir_all(dirs.path())
+            .map_err(|e| Failure::internal(format!("creating {}: {e}", dirs.path().display())))?;
         crate::core::spec::assert_pinned(&packet.spec, spec)?;
         crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
-        let dirs = PacketDirs::new(&packet_dir);
         let templates = PromptTemplates::load()?;
         let context = render_context(exec, &packet, seq)?;
         let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
-        std::fs::write(dirs.prompt(), prompt)
-            .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
+        crate::core::artifacts::atomic_write_once(&dirs.prompt(), prompt.as_bytes())?;
         Ok::<_, Failure>((packet, interventions, holder, packet_dir))
     }
     .await;
@@ -767,7 +766,7 @@ async fn run_attempt(
                 .await;
         }
     };
-    let dirs = PacketDirs::new(&packet_dir);
+    let dirs = PacketDirs::new(&packet_dir, attempt_id);
 
     // 2. The sentinel-free shell line.
     let driver = match driver_for(&packet.provider_hints.provider) {
@@ -795,15 +794,15 @@ async fn run_attempt(
     // with PATH passed explicitly. A stale pid file from a prior attempt is
     // removed first: absence means "spawn never happened", and only this
     // attempt's shell may write the file back.
-    let pid_path = packet_dir.join("provider.pid");
+    let pid_path = dirs.provider_pid();
     let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(packet_dir.join(crate::adapters::ports::PROVIDER_LSTART));
+    let _ = std::fs::remove_file(dirs.provider_lstart());
     let shell_line = format!(
         "echo $$ > {}; {}",
         pid_path.to_string_lossy(),
         invocation.shell_line
     );
-    let status_base = packet_dir.join("status").join(attempt_id.to_string());
+    let status_base = dirs.status();
     // Herdr is the preferred visibility adapter. The ledger records the
     // actual host selection, so a missing socket can never masquerade as a
     // Herdr-backed session.
@@ -896,6 +895,15 @@ async fn run_attempt(
         Err(e) => {
             // A spawn failure is transport: the provider never got to think.
             let note = format!("transport: provider spawn failed: {e}");
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "transport",
+                &json!({"note": &note}),
+                &json!({"host": host_kind, "spawned": false}),
+            )
+            .await?;
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
@@ -921,6 +929,12 @@ async fn run_attempt(
         "boundary",
     )
     .await?;
+    let session_evidence = json!({
+        "host": host_kind,
+        "sessionId": session.as_str(),
+        "socketPath": socket_path,
+        "attachHint": attach_hint,
+    });
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;
@@ -933,19 +947,25 @@ async fn run_attempt(
     // reclaim its apparently-expired work while it is still writing to the
     // worktree. Stop the session, record a transport failure, and let the
     // transport-retry budget decide whether to try again.
-    let Some(pid) = await_pid(&packet_dir).await else {
+    let Some(pid) = await_pid(dirs.path()).await else {
         let _ = host.kill_confirmed(&session).await;
         let note = "transport: provider pid file never appeared".to_owned();
+        crate::core::artifacts::materialize_and_join(
+            ctx,
+            &packet,
+            attempt_id,
+            "transport",
+            &json!({"note": &note}),
+            &session_evidence,
+        )
+        .await?;
         return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
     };
     // The start-time stamp beside the pid is the pid-reuse guard for every
     // process that did not spawn this attempt (see `adapters::ports`).
     if let Some(lstart) = crate::adapters::ports::lstart_of(i32::try_from(pid).unwrap_or(-1)).await
     {
-        let _ = std::fs::write(
-            packet_dir.join(crate::adapters::ports::PROVIDER_LSTART),
-            lstart,
-        );
+        let _ = std::fs::write(dirs.provider_lstart(), lstart);
     }
     failpoint::hit("guardian.start");
     let gcfg = forged_beads::GuardianConfig::new(
@@ -970,13 +990,14 @@ async fn run_attempt(
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
                     if renewed.is_err() {
                         // Our attempt was revoked out from under us: stop the
-                        // provider and report. Its tokens were still spent,
-                        // and the successor attempt is about to overwrite
-                        // the capture, so read it before killing the shell.
+                        // provider and report. Its tokens were still spent;
+                        // freeze this attempt's private capture before any
+                        // successor is allowed to proceed.
                         let _ = host.kill_confirmed(&session).await;
                         if let Some(handle) = guardian.take() {
                             handle.abort();
                         }
+                        crate::core::artifacts::finalize_provider_files(&dirs)?;
                         let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
                         crate::core::usage::capture_attempt(
                             ctx,
@@ -988,6 +1009,15 @@ async fn run_attempt(
                             &out,
                         )
                         .await;
+                        crate::core::artifacts::materialize_and_join(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            "revoked",
+                            &json!({"note": "attempt claim was revoked while provider was running"}),
+                            &session_evidence,
+                        )
+                        .await?;
                         return Ok(PacketOutcome::Revoked);
                     }
                 }
@@ -1006,14 +1036,17 @@ async fn run_attempt(
         handle.abort();
     }
 
+    // Provider output was streamed to private names. Publish those names
+    // only after the provider is terminal; no successor shares this attempt
+    // directory, and the manifest written below is the completion marker.
+    crate::core::artifacts::finalize_provider_files(&dirs)?;
+
     // 5. Record what this attempt spent, before deciding what it produced.
     //
     // Here and nowhere else: the capture is complete, the attempt id is in
-    // hand, and the outcome has not yet branched. A batch pass over packet
-    // directories cannot reach this point — the packet directory is keyed
-    // by stage and round, so the next attempt overwrites `out.jsonl` and
-    // the tokens this one burned become unrecoverable. Rework spend is
-    // only ever visible from inside the attempt that spent it.
+    // hand, and the outcome has not yet branched. The attempt-addressed
+    // capture makes later reconciliation possible too, but the live path
+    // still records spend immediately rather than depending on a backfill.
     let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
     crate::core::usage::capture_attempt(
         ctx,
@@ -1040,6 +1073,26 @@ async fn run_attempt(
         },
         forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
     };
+
+    let (artifact_outcome, artifact_detail) = match &harvest {
+        Harvest::Result(result) => (
+            "result",
+            serde_json::to_value(result.as_ref()).map_err(|error| {
+                Failure::internal(format!("serializing harvested result evidence: {error}"))
+            })?,
+        ),
+        Harvest::Transport(note) => ("transport", json!({"note": note})),
+        Harvest::Semantic(note) => ("semantic", json!({"note": note})),
+    };
+    crate::core::artifacts::materialize_and_join(
+        ctx,
+        &packet,
+        attempt_id,
+        artifact_outcome,
+        &artifact_detail,
+        &session_evidence,
+    )
+    .await?;
 
     // 7. Settle. Every arm BINDS rather than returns, so the three settle
     // paths share one exit and none of them can skip the release below.
@@ -1585,11 +1638,10 @@ mod settle_tests {
 
         let packet_dir = ctx.config.packet_dir_key(RUN_ID, "implement", 1);
         std::fs::create_dir_all(&packet_dir).expect("packet dir");
+        let attempt_dirs = PacketDirs::new(&packet_dir, claimed.attempt_id);
         tokio::spawn(play_provider(
-            packet_dir.clone(),
-            packet_dir
-                .join("status")
-                .join(claimed.attempt_id.to_string()),
+            attempt_dirs.attempt_path(),
+            attempt_dirs.status(),
             claude_capture(&packet_id),
         ));
 

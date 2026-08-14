@@ -45,6 +45,11 @@ pub enum Command {
         #[command(subcommand)]
         command: PacketCmd,
     },
+    /// Immutable attempt-artifact operations.
+    Artifact {
+        #[command(subcommand)]
+        command: ArtifactCmd,
+    },
     /// Provider-session observation and intervention.
     Session {
         /// The session subcommand.
@@ -466,6 +471,26 @@ pub struct PacketTokenArgs {
     pub claim_token: String,
 }
 
+/// `artifact` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ArtifactCmd {
+    /// Verify one manifest and every named digest without changing them.
+    Verify(AttemptScoped),
+    /// Explicitly compact an eligible successful intermediate attempt.
+    Compact(AttemptScoped),
+}
+
+/// An attempt-scoped read-only command.
+#[derive(Debug, Args)]
+pub struct AttemptScoped {
+    /// Positive ledger attempt identity.
+    #[arg(long)]
+    pub attempt: i64,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `session` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum SessionCmd {
@@ -724,6 +749,10 @@ pub fn command_name(command: &Command) -> &'static str {
             PacketCmd::Complete(_) => "packet_complete",
             PacketCmd::Fail(_) => "packet_fail",
             PacketCmd::Heartbeat(_) => "packet_heartbeat",
+        },
+        Command::Artifact { command } => match command {
+            ArtifactCmd::Verify(_) => "artifact_verify",
+            ArtifactCmd::Compact(_) => "artifact_compact",
         },
         Command::Session { command } => match command {
             SessionCmd::List(_) => "session_list",
@@ -986,6 +1015,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "claimToken": a.claim_token,
                     }),
                 ),
+            ),
+        },
+        Command::Artifact { command } => match command {
+            ArtifactCmd::Verify(a) => (
+                "artifact_verify",
+                request(a.idempotency_key, None, json!({"attempt": a.attempt})),
+            ),
+            ArtifactCmd::Compact(a) => (
+                "artifact_compact",
+                request(a.idempotency_key, None, json!({"attempt": a.attempt})),
             ),
         },
         Command::Session { command } => match command {

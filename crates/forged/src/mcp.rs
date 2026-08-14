@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Thirty tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Thirty-four tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -390,6 +390,24 @@ impl ForgedServer {
     #[tool(name = "packet_fail", description = "Report a packet failure.")]
     pub async fn packet_fail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("packet_fail", args.0).await
+    }
+
+    /// Verify one immutable attempt manifest without repairing it.
+    #[tool(
+        name = "artifact_verify",
+        description = "Verify one attempt manifest and its content digests read-only."
+    )]
+    pub async fn artifact_verify(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("artifact_verify", args.0).await
+    }
+
+    /// Explicitly compact a proven redundant terminal success.
+    #[tool(
+        name = "artifact_compact",
+        description = "Explicitly compact one eligible successful intermediate attempt."
+    )]
+    pub async fn artifact_compact(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("artifact_compact", args.0).await
     }
 
     /// Durable provider-session metadata for a run.

@@ -287,16 +287,16 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             )
             .await);
         }
-        // The packet directory belongs to the new attempt now: a stale pid
-        // file (and its start-time stamp) from the dead attempt must not
-        // read as this session.
+        // Process identity belongs to the new attempt. Clearing within that
+        // fresh namespace never touches predecessor evidence.
         let dir = ctx.config.packet_dir_key(
             &candidate.run_id,
             &candidate.stage_key,
             candidate.logical_seq,
         );
-        let _ = std::fs::remove_file(dir.join("provider.pid"));
-        let _ = std::fs::remove_file(dir.join(crate::adapters::ports::PROVIDER_LSTART));
+        let dirs = forged_provider::PacketDirs::new(&dir, claimed.attempt_id);
+        let _ = std::fs::remove_file(dirs.provider_pid());
+        let _ = std::fs::remove_file(dirs.provider_lstart());
         return Ok(json!({
             "claimed": {
                 "run_id": candidate.run_id,

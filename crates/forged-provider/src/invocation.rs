@@ -40,7 +40,7 @@ pub trait ProviderDriver: Send + Sync {
     fn parse_usage(&self, stdout: &str, model: &str) -> Result<UsageCapture, ProviderError>;
 }
 
-/// One packet directory; these four paths are its only contents.
+/// One immutable provider-attempt directory beneath a packet directory.
 ///
 /// Pure path arithmetic: `PacketDirs` never creates a directory, never
 /// writes `prompt.md`, never reads `out.jsonl`, and never checks existence —
@@ -52,34 +52,89 @@ pub trait ProviderDriver: Send + Sync {
 #[derive(Debug, Clone, PartialEq)]
 pub struct PacketDirs {
     packet_dir: PathBuf,
+    attempt_dir: PathBuf,
 }
 
 impl PacketDirs {
-    /// Wrap the packet directory path.
-    pub fn new(packet_dir: impl Into<PathBuf>) -> Self {
+    /// Address one attempt beneath `packet_dir`.
+    pub fn new(packet_dir: impl Into<PathBuf>, attempt_id: i64) -> Self {
+        let packet_dir = packet_dir.into();
+        let attempt_dir = packet_dir.join("attempts").join(attempt_id.to_string());
         Self {
-            packet_dir: packet_dir.into(),
+            packet_dir,
+            attempt_dir,
         }
     }
 
-    /// The packet directory itself.
-    pub fn path(&self) -> &Path {
+    /// The semantic packet directory shared by all its attempts.
+    pub fn packet_path(&self) -> &Path {
         &self.packet_dir
     }
 
-    /// `<dir>/prompt.md` — the rendered prompt the provider reads on stdin.
+    /// `<packet>/attempts/<attempt-id>` — immutable evidence for one try.
+    pub fn path(&self) -> &Path {
+        &self.attempt_dir
+    }
+
+    /// Owned form of `<packet>/attempts/<attempt-id>`.
+    pub fn attempt_path(&self) -> PathBuf {
+        self.attempt_dir.clone()
+    }
+
+    /// `<attempt>/prompt.md` — the rendered prompt the provider reads.
     pub fn prompt(&self) -> PathBuf {
-        self.packet_dir.join("prompt.md")
+        self.attempt_path().join("prompt.md")
     }
 
-    /// `<dir>/out.jsonl` — the captured provider stdout stream.
+    /// `<attempt>/out.jsonl` — the finalized provider stdout stream.
     pub fn stdout(&self) -> PathBuf {
-        self.packet_dir.join("out.jsonl")
+        self.attempt_path().join("out.jsonl")
     }
 
-    /// `<dir>/last.txt` — codex's `-o` last-message file (codex only).
+    /// The private streaming target, promoted to [`PacketDirs::stdout`]
+    /// only after the provider is terminal.
+    pub fn stdout_working(&self) -> PathBuf {
+        self.attempt_path().join(".out.jsonl.incomplete")
+    }
+
+    /// `<attempt>/last.txt` — finalized codex last-message material.
     pub fn last_message(&self) -> PathBuf {
-        self.packet_dir.join("last.txt")
+        self.attempt_path().join("last.txt")
+    }
+
+    /// The private codex `-o` target, promoted after process exit.
+    pub fn last_message_working(&self) -> PathBuf {
+        self.attempt_path().join(".last.txt.incomplete")
+    }
+
+    /// `<attempt>/result.json` — forged's harvested outcome evidence.
+    pub fn result(&self) -> PathBuf {
+        self.attempt_path().join("result.json")
+    }
+
+    /// `<attempt>/session.json` — bounded session provenance, never env.
+    pub fn session(&self) -> PathBuf {
+        self.attempt_path().join("session.json")
+    }
+
+    /// `<attempt>/manifest.json` — written only after every named artifact.
+    pub fn manifest(&self) -> PathBuf {
+        self.attempt_path().join("manifest.json")
+    }
+
+    /// Process identity is attempt-scoped too; a retry never removes it.
+    pub fn provider_pid(&self) -> PathBuf {
+        self.attempt_path().join("provider.pid")
+    }
+
+    /// Process start stamp paired with [`PacketDirs::provider_pid`].
+    pub fn provider_lstart(&self) -> PathBuf {
+        self.attempt_path().join("provider.lstart")
+    }
+
+    /// Host sentinel root for this attempt.
+    pub fn status(&self) -> PathBuf {
+        self.attempt_path().join("status")
     }
 }
 
@@ -152,19 +207,23 @@ mod tests {
 
     #[test]
     fn packet_dirs_is_pure_path_arithmetic() {
-        let dirs = PacketDirs::new("/tmp/run-1/packets/pkt-1");
-        assert_eq!(dirs.path(), Path::new("/tmp/run-1/packets/pkt-1"));
+        let dirs = PacketDirs::new("/tmp/run-1/packets/pkt-1", 7);
+        assert_eq!(dirs.packet_path(), Path::new("/tmp/run-1/packets/pkt-1"));
+        assert_eq!(
+            dirs.attempt_path(),
+            PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7")
+        );
         assert_eq!(
             dirs.prompt(),
-            PathBuf::from("/tmp/run-1/packets/pkt-1/prompt.md")
+            PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/prompt.md")
         );
         assert_eq!(
             dirs.stdout(),
-            PathBuf::from("/tmp/run-1/packets/pkt-1/out.jsonl")
+            PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/out.jsonl")
         );
         assert_eq!(
             dirs.last_message(),
-            PathBuf::from("/tmp/run-1/packets/pkt-1/last.txt")
+            PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/last.txt")
         );
     }
 

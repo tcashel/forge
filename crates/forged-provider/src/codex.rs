@@ -39,8 +39,8 @@ impl ProviderDriver for CodexDriver {
         _claim_token: &str,
     ) -> Result<Invocation, ProviderError> {
         let prompt_path = dirs.prompt();
-        let stdout_path = dirs.stdout();
-        let last_path = dirs.last_message();
+        let stdout_path = dirs.stdout_working();
+        let last_path = dirs.last_message_working();
         let prompt = validate_embedded_path(&prompt_path)?;
         let stdout = validate_embedded_path(&stdout_path)?;
         let last = validate_embedded_path(&last_path)?;

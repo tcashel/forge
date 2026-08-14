@@ -626,6 +626,52 @@ pub struct AttemptRow {
     pub ended_at: Option<String>,
 }
 
+/// Immutable filesystem evidence joined one-to-one with an attempt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptArtifactRow {
+    /// `attempt_artifacts.attempt_id` — also the table's primary key.
+    pub attempt_id: i64,
+    /// Redundant identity checked against the attempt's packet owner.
+    pub run_id: String,
+    /// Redundant identity checked against `attempts.packet_id`.
+    pub packet_id: String,
+    /// Closed manifest schema identifier.
+    pub manifest_schema: String,
+    /// Manifest path relative to this run's operator-scoped root.
+    pub manifest_path: String,
+    /// SHA-256 of the exact manifest bytes.
+    pub manifest_sha256: String,
+    /// Closed retention-class spelling copied from the manifest.
+    pub retention_class: String,
+    /// Time the join was first recorded.
+    pub created_at: String,
+}
+
+/// Candidate one-to-one manifest join supplied by the artifact boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAttemptArtifact {
+    pub attempt_id: i64,
+    pub run_id: String,
+    pub packet_id: String,
+    pub manifest_schema: String,
+    pub manifest_path: String,
+    pub manifest_sha256: String,
+    pub retention_class: String,
+}
+
+/// Durable intent/result for an explicit attempt-artifact compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AttemptArtifactCompactionRow {
+    pub attempt_id: i64,
+    pub operation_id: String,
+    pub tombstone_path: String,
+    pub tombstone_sha256: String,
+    pub state: String,
+    pub bytes_removed: Option<i64>,
+    pub created_at: String,
+    pub completed_at: Option<String>,
+}
+
 /// One row of `operations`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct OperationRow {

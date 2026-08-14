@@ -13,7 +13,7 @@ const CLAIM_TOKEN: &str = "0198b0d2-0000-7000-8000-000000000000";
 const SESSION_ID: &str = "a070b2df-8ef9-53dc-bdaa-0dc5693905be";
 
 fn dirs() -> PacketDirs {
-    PacketDirs::new("/tmp/run-1/packets/pkt-1")
+    PacketDirs::new("/tmp/run-1/packets/pkt-1", 7)
 }
 
 #[test]
@@ -32,17 +32,18 @@ fn claude_invocation_emits_the_documented_line() {
         format!(
             "claude -p --output-format stream-json --verbose \
              --dangerously-skip-permissions --session-id {SESSION_ID} --model opus \
-             < /tmp/run-1/packets/pkt-1/prompt.md > /tmp/run-1/packets/pkt-1/out.jsonl"
+             < /tmp/run-1/packets/pkt-1/attempts/7/prompt.md > \
+             /tmp/run-1/packets/pkt-1/attempts/7/.out.jsonl.incomplete"
         )
     );
     assert_eq!(invocation.session_hint.as_deref(), Some(SESSION_ID));
     assert_eq!(
         invocation.prompt_path,
-        PathBuf::from("/tmp/run-1/packets/pkt-1/prompt.md")
+        PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/prompt.md")
     );
     assert_eq!(
         invocation.stdout_path,
-        PathBuf::from("/tmp/run-1/packets/pkt-1/out.jsonl")
+        PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/.out.jsonl.incomplete")
     );
 }
 
@@ -69,17 +70,19 @@ fn codex_invocation_emits_the_documented_line() {
     assert_eq!(
         invocation.shell_line,
         "codex exec --json --skip-git-repo-check --sandbox workspace-write -m opus \
-         -c 'model_reasoning_effort=\"high\"' -o /tmp/run-1/packets/pkt-1/last.txt - \
-         < /tmp/run-1/packets/pkt-1/prompt.md > /tmp/run-1/packets/pkt-1/out.jsonl"
+         -c 'model_reasoning_effort=\"high\"' -o \
+         /tmp/run-1/packets/pkt-1/attempts/7/.last.txt.incomplete - \
+         < /tmp/run-1/packets/pkt-1/attempts/7/prompt.md > \
+         /tmp/run-1/packets/pkt-1/attempts/7/.out.jsonl.incomplete"
     );
     assert_eq!(invocation.session_hint, None);
     assert_eq!(
         invocation.prompt_path,
-        PathBuf::from("/tmp/run-1/packets/pkt-1/prompt.md")
+        PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/prompt.md")
     );
     assert_eq!(
         invocation.stdout_path,
-        PathBuf::from("/tmp/run-1/packets/pkt-1/out.jsonl")
+        PathBuf::from("/tmp/run-1/packets/pkt-1/attempts/7/.out.jsonl.incomplete")
     );
 }
 
@@ -161,7 +164,7 @@ fn both_drivers_reject_unsafe_and_empty_models() {
 
 #[test]
 fn both_drivers_reject_unsafe_packet_dirs() {
-    let unsafe_dirs = PacketDirs::new("/tmp/run 1;/pkt");
+    let unsafe_dirs = PacketDirs::new("/tmp/run 1;/pkt", 7);
     let packet = support::sample_packet();
     for driver in [&ClaudeDriver as &dyn ProviderDriver, &CodexDriver] {
         let err = driver

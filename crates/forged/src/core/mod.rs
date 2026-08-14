@@ -4,6 +4,7 @@
 //! that is what makes the CLI/MCP parity criterion achievable rather than a
 //! coincidence.
 
+pub(crate) mod artifacts;
 mod claimnext;
 mod drive;
 mod epic;
@@ -323,7 +324,7 @@ pub async fn lease_identity(
 /// and this driver process's own pid. It is scoped to the packet, not the
 /// run: a packet has at most one live attempt (`claim_packet` refuses a
 /// second), so this string maps one-to-one onto a live attempt and resolves
-/// to exactly one packet directory — which is what makes `liveness` and
+/// to exactly one attempt-addressed runtime directory — which makes `liveness` and
 /// `kill_confirmed` per-attempt instead of an aggregate over every leg
 /// sharing the run's lease. Being stored rather than re-derived is what lets
 /// it carry a real pid: no other process has to reproduce the string, only
@@ -732,7 +733,7 @@ async fn release_if(ctx: &Ctx, on_error: OnEffectError, operation_id: &str) {
 pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> OperationResponse {
     // The two explicit-key commands are refused before any defaulting.
     match name {
-        "claim_next" | "worktree_retire" if key_absent(&req) => {
+        "artifact_compact" | "claim_next" | "worktree_retire" if key_absent(&req) => {
             return err_response(
                 &derive_key(name, req.run_id.as_deref(), None, None),
                 &Failure::invalid(format!(
@@ -770,6 +771,8 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "packet_complete" => ops::packet_complete(ctx, &mut req).await,
         "packet_fail" => ops::packet_fail(ctx, &mut req).await,
         "packet_heartbeat" => ops::packet_heartbeat(ctx, &req).await,
+        "artifact_verify" => artifacts::artifact_verify(ctx, &req).await,
+        "artifact_compact" => artifacts::artifact_compact(ctx, &mut req).await,
         "session_list" => sessions::session_list(ctx, &req).await,
         "session_read" => sessions::session_read(ctx, &req).await,
         "session_message" => sessions::session_message(ctx, &mut req).await,

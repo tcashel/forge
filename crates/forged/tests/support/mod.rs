@@ -1288,6 +1288,20 @@ impl TestEnv {
             .join(stage)
             .join(seq.to_string())
     }
+
+    /// The newest numeric attempt directory for one packet, if execution has
+    /// created one. Provider runtime and immutable evidence are attempt-scoped.
+    pub fn latest_attempt_dir(&self, run_id: &str, stage: &str, seq: i64) -> Option<PathBuf> {
+        std::fs::read_dir(self.packet_dir(run_id, stage, seq).join("attempts"))
+            .ok()?
+            .filter_map(Result::ok)
+            .filter_map(|entry| {
+                let id = entry.file_name().to_str()?.parse::<i64>().ok()?;
+                Some((id, entry.path()))
+            })
+            .max_by_key(|(id, _)| *id)
+            .map(|(_, path)| path)
+    }
 }
 
 /// Whether `pid` names a live process, via `/bin/kill -0` — a probe, no

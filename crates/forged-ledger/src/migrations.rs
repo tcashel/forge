@@ -293,6 +293,40 @@ CREATE INDEX desired_work_wake
   WHERE desired_state = 'running' AND exhausted_at IS NULL;
 ";
 
+/// Migration 012: one immutable artifact manifest identity per attempt.
+///
+/// The redundant run and packet identities are deliberate: the writer
+/// checks them against the attempt join before insert, while readers can
+/// project artifacts without parsing filesystem JSON. Paths remain relative
+/// to the operator run root so relocating an Anvil home preserves identity.
+const MIGRATION_012: &str = "
+CREATE TABLE attempt_artifacts (
+  attempt_id       INTEGER PRIMARY KEY REFERENCES attempts(attempt_id),
+  run_id           TEXT NOT NULL REFERENCES runs(run_id),
+  packet_id        TEXT NOT NULL REFERENCES packets(packet_id),
+  manifest_schema  TEXT NOT NULL CHECK (manifest_schema = 'forged.attempt-artifacts/1'),
+  manifest_path    TEXT NOT NULL,
+  manifest_sha256  TEXT NOT NULL CHECK (length(manifest_sha256) = 64),
+  retention_class  TEXT NOT NULL CHECK (retention_class IN
+                    ('retain','compactable-success')),
+  created_at       TEXT NOT NULL,
+  UNIQUE (run_id, manifest_path)
+);
+CREATE INDEX attempt_artifacts_run_packet
+  ON attempt_artifacts(run_id, packet_id, attempt_id);
+
+CREATE TABLE attempt_artifact_compactions (
+  attempt_id       INTEGER PRIMARY KEY REFERENCES attempt_artifacts(attempt_id),
+  operation_id     TEXT NOT NULL UNIQUE,
+  tombstone_path   TEXT NOT NULL,
+  tombstone_sha256 TEXT NOT NULL CHECK (length(tombstone_sha256) = 64),
+  state            TEXT NOT NULL CHECK (state IN ('in-progress','completed')),
+  bytes_removed    INTEGER,
+  created_at       TEXT NOT NULL,
+  completed_at     TEXT
+);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -306,6 +340,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_009,
     MIGRATION_010,
     MIGRATION_011,
+    MIGRATION_012,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -425,7 +460,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 11);
+        assert_eq!(pragmas.user_version, 12);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -444,6 +479,8 @@ mod tests {
             "roster_revisions",
             "runtime_migrations",
             "desired_work",
+            "attempt_artifacts",
+            "attempt_artifact_compactions",
         ] {
             let found: String = conn
                 .query_row(
@@ -473,7 +510,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
         ledger.close().expect("close");
     }
 
@@ -496,7 +533,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -539,7 +576,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 11);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);
