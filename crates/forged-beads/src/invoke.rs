@@ -329,12 +329,26 @@ pub(crate) async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError
         });
     }
     let lenient = envelope::parse_lenient(&out.stdout);
-    if !lenient.parsed || !lenient.schema_ok {
+    if !lenient.parsed {
         // No envelope at all: bd never answered, so this is the one read
         // failure worth retrying. `Envelope` is reserved for answers.
         return Err(BdError::Unparseable {
             context,
             detail: format!("stdout: {}; stderr: {}", out.stdout, out.stderr),
+        });
+    }
+    if !lenient.schema_ok {
+        // bd DID answer — with an envelope under a schema version this build
+        // does not read. Terminal, never retried: every retry re-reads the
+        // identical envelope, and retrying is the wrong response to a bd
+        // UPGRADE, which is exactly what this shape means. The bd contract
+        // test is what makes that loud.
+        return Err(BdError::Envelope {
+            context,
+            detail: format!(
+                "unsupported schema_version; stdout: {}; stderr: {}",
+                out.stdout, out.stderr
+            ),
         });
     }
     if lenient.error.is_some() {

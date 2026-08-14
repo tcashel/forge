@@ -89,21 +89,24 @@ pub enum BdError {
         /// The child's full stderr.
         stderr: String,
     },
-    /// bd ANSWERED with its schema-1 envelope and the answer was unusable:
-    /// no `data` key at all, or a payload carrying none of what was asked
-    /// for. An outcome, never a transport failure — every retry re-reads the
-    /// same envelope. Wire mapping: `BEADS_ERROR`.
+    /// bd ANSWERED and the answer was unusable: a schema-1 envelope with no
+    /// `data` key or a payload carrying none of what was asked for, or an
+    /// envelope under a `schema_version` this build does not read. An
+    /// outcome, never a transport failure — every retry re-reads the same
+    /// envelope, and a schema this build cannot read means bd was UPGRADED,
+    /// which retrying cannot resolve. Wire mapping: `BEADS_ERROR`.
     Envelope {
         /// What was being run.
         context: String,
         /// Both output streams, for diagnosis.
         detail: String,
     },
-    /// NO envelope: stdout would not parse at all, or carried a
-    /// `schema_version` other than 1. bd never answered, so this rides the
-    /// bounded transport budget exactly like a spawn failure or a timeout.
-    /// Split out of [`BdError::Envelope`] because that variant also carries
-    /// genuine answers and must stay terminal. Wire mapping: `BEADS_ERROR`.
+    /// NO envelope: stdout would not parse at all. bd never answered, so this
+    /// rides the bounded transport budget exactly like a spawn failure or a
+    /// timeout. Split out of [`BdError::Envelope`] because that variant
+    /// carries genuine ANSWERS and must stay terminal — a wrong
+    /// `schema_version` is one of them, not this. Wire mapping:
+    /// `BEADS_ERROR`.
     Unparseable {
         /// What was being run.
         context: String,
@@ -141,13 +144,18 @@ impl BdError {
     /// before it could write, unparseable stdout) says nothing about the
     /// store and is the one thing worth trying again.
     ///
-    /// The Dolt embedded lock is the documented exception, and it is checked
-    /// FIRST, against every variant: bd answered, but with a lock that
-    /// clears on its own. READS need that check here and nowhere else —
-    /// `invoke::read` runs no classifier and no retries, so a `bd show`
-    /// refused by the lock a live run or an epic wave holds arrives as a
-    /// finished error and would otherwise take the run down instead of
-    /// riding the budget.
+    /// AN ANSWER IS CLASSIFIED ON WHAT IT SAYS, never on the fact that it
+    /// parsed. The Dolt embedded lock is the documented case and it is
+    /// checked FIRST, against every variant including the well-formed ones:
+    /// bd answered, but with a lock that clears on its own. READS need that
+    /// check here and nowhere else — `invoke::read` runs no classifier and no
+    /// retries, so a `bd show` refused by the lock a live run or an epic wave
+    /// holds arrives as a finished error and would otherwise take the run
+    /// down instead of riding the budget.
+    ///
+    /// The converse holds too: an envelope that parses under a
+    /// `schema_version` this build does not read is an ANSWER — bd was
+    /// upgraded — and stays terminal.
     pub fn is_transport(&self) -> bool {
         if self.haystack().contains(DOLT_LOCK_REFUSAL) {
             return true;
@@ -162,10 +170,7 @@ impl BdError {
             // `{"data":{"error":"no issues found matching the provided
             // IDs"},"schema_version":1}` — and a transport failure when it
             // did not.
-            BdError::Beads { stdout, .. } => {
-                let lenient = envelope::parse_lenient(stdout);
-                !(lenient.parsed && lenient.schema_ok)
-            }
+            BdError::Beads { stdout, .. } => !envelope::parse_lenient(stdout).parsed,
             BdError::Envelope { .. }
             | BdError::LeaseHeld { .. }
             | BdError::HeartbeatRefused { .. }
@@ -264,15 +269,15 @@ pub(crate) enum Class {
         /// The refusal text (stderr, or the envelope error when stderr empty).
         detail: String,
     },
-    /// Zero exit and a schema-1 envelope that carried no `data` key:
-    /// terminal, because bd answered.
+    /// bd answered and the answer is unusable: a schema-1 envelope carrying
+    /// no `data` key, or an envelope under a `schema_version` this build does
+    /// not read. Terminal either way, because bd answered.
     EnvelopeBad {
         /// Both streams for diagnosis.
         detail: String,
     },
-    /// Zero exit but unparseable stdout or wrong `schema_version`: terminal
-    /// for the write policy, but bd never answered, so the error it mints
-    /// rides the transport budget.
+    /// Zero exit and unparseable stdout: terminal for the write policy, but
+    /// bd never answered, so the error it mints rides the transport budget.
     Unparseable {
         /// Both streams for diagnosis.
         detail: String,
@@ -317,9 +322,14 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
                 },
             };
         }
-        if out.exit == Some(0) && (!lenient.parsed || !lenient.schema_ok) {
+        if out.exit == Some(0) && !lenient.parsed {
             return Class::Unparseable {
                 detail: both_streams(out),
+            };
+        }
+        if out.exit == Some(0) && !lenient.schema_ok {
+            return Class::EnvelopeBad {
+                detail: format!("unsupported schema_version; {}", both_streams(out)),
             };
         }
         let detail = if out.stderr.trim().is_empty() {
@@ -339,9 +349,16 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
                 },
             };
         }
-        if !lenient.parsed || !lenient.schema_ok {
+        if !lenient.parsed {
             return Class::Unparseable {
                 detail: both_streams(out),
+            };
+        }
+        if !lenient.schema_ok {
+            // bd answered under a schema this build does not read. Terminal:
+            // retrying an upgrade forever never resolves it.
+            return Class::EnvelopeBad {
+                detail: format!("unsupported schema_version; {}", both_streams(out)),
             };
         }
         if lenient.error.is_some() {
