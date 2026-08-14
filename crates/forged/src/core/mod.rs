@@ -11,6 +11,7 @@ mod handoff;
 mod observe;
 mod ops;
 pub(crate) mod sessions;
+pub(crate) mod settlement;
 pub(crate) mod spec;
 pub(crate) mod usage;
 
@@ -629,6 +630,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_drive" => drive::run_drive(ctx, &req).await,
         "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
+        "run_stop" => settlement::run_stop(ctx, &mut req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
         "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,

@@ -246,6 +246,19 @@ const MIGRATION_009: &str = "
 ALTER TABLE attempts ADD COLUMN revoke_scope TEXT;
 ";
 
+/// Migration 010: explicit whole-run settlement and delivery evidence.
+///
+/// Existing stopped rows intentionally keep a NULL outcome: they predate the
+/// vocabulary and inventing a classification during migration would turn an
+/// old process exit into a false delivery claim.
+const MIGRATION_010: &str = "
+ALTER TABLE runs ADD COLUMN terminal_outcome TEXT CHECK (terminal_outcome IN
+  ('clean','blocked','input-required','cancelled','accepted-risk','superseded','landed'));
+ALTER TABLE runs ADD COLUMN delivery_pr INTEGER;
+ALTER TABLE runs ADD COLUMN delivery_sha TEXT;
+ALTER TABLE runs ADD COLUMN superseded_by TEXT;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -257,6 +270,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_007,
     MIGRATION_008,
     MIGRATION_009,
+    MIGRATION_010,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -376,7 +390,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 9);
+        assert_eq!(pragmas.user_version, 10);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -423,7 +437,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
         ledger.close().expect("close");
     }
 
@@ -435,8 +449,10 @@ mod tests {
             let conn = rusqlite::Connection::open(&path).expect("raw database");
             conn.execute_batch(MIGRATION_001).expect("v0 schema");
             conn.execute(
-                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, created_at, updated_at) \
-                 VALUES ('old-run', 'old-bead', '/repo', 'main', 'forged/old', 't', 't')",
+                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, stop_reason, \
+                 created_at, updated_at) VALUES \
+                 ('old-run', 'old-bead', '/repo', 'main', 'forged/old', 'stopped', \
+                  'legacy stop', 't', 't')",
                 [],
             )
             .expect("old run");
@@ -444,11 +460,11 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
-        assert_eq!(
-            ledger.get_run("old-run").expect("old run").bead_id,
-            "old-bead"
-        );
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
+        let old = ledger.get_run("old-run").expect("old run");
+        assert_eq!(old.bead_id, "old-bead");
+        assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
+        assert_eq!(old.terminal_outcome, None, "migration invents no outcome");
         assert!(ledger
             .get_run_definition("old-run")
             .expect("legacy definition query")
@@ -487,7 +503,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 10);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

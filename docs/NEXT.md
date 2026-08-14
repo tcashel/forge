@@ -100,6 +100,32 @@ budget. Exhaustion stops the run with an `input-required:` reason while the
 unconfirmed push operation remains reconcilable; it is never recorded as a
 successful push.
 
+Settle that whole run explicitly rather than treating a controller exit as a
+delivery decision:
+
+```sh
+forged run stop --run <run-id> --outcome clean --reason '<ready-to-land reason>'
+forged run stop --run <run-id> --outcome input-required --reason '<question>'
+forged run stop --run <run-id> --outcome superseded \
+  --superseded-by <successor-run> --reason '<replacement reason>'
+forged run stop --run <run-id> --outcome landed --reason '<verification>' \
+  --pr <number> --sha <exact-merge-sha>
+```
+
+The whole-run stop first makes the state machine terminal, then durably
+revokes and confirms death for every live attempt. `blocked` and
+`input-required` return the Bead to blocked/unassigned; `cancelled` and
+`superseded` return it open/unassigned; `clean` preserves its claim while the
+reviewed PR awaits delivery. Only `landed` closes the Bead, clears its
+assignment, and retires a clean worktree. The stored PR and full SHA make a
+clean squash-merged worktree safe to retire without pretending the topic
+branch is an ancestor of the base. Dirty or unresolved worktrees remain for
+inspection and are reported in the settlement result.
+
+`run status` reports the terminal outcome, delivery evidence, successor, and
+`claimHealth`. An `in_progress` Bead with neither a live controller nor a live
+attempt is marked `staleInProgress: true` instead of silently looking active.
+
 ## Submit an epic
 
 ```sh

@@ -211,19 +211,27 @@ impl Ledger {
         let current = current.clone();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
-            let stored: Option<(String, Option<String>)> = tx
+            let stored: Option<(String, Option<String>, String)> = tx
                 .query_row(
-                    "SELECT spec_sha256, spec_revision FROM packets WHERE packet_id = ?1",
+                    "SELECT p.spec_sha256, p.spec_revision, r.state \
+                     FROM packets p JOIN runs r ON r.run_id = p.run_id \
+                     WHERE p.packet_id = ?1",
                     [&packet_id],
-                    |row| Ok((row.get(0)?, row.get(1)?)),
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
                 )
                 .optional()?;
-            let (spec_sha256, spec_revision) = stored.ok_or_else(|| {
+            let (spec_sha256, spec_revision, run_state) = stored.ok_or_else(|| {
                 refused(
                     ErrorCode::PacketNotClaimable,
                     format!("no packet {packet_id:?}"),
                 )
             })?;
+            if run_state != "active" {
+                return Err(refused(
+                    ErrorCode::PacketNotClaimable,
+                    format!("packet {packet_id:?} belongs to a stopped run"),
+                ));
+            }
             let pinned = match spec_revision {
                 Some(revision) => SpecFence::Revision {
                     revision,

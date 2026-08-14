@@ -20,7 +20,7 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, epic, err_response, fenced, key_absent, on_ledger, param_opt_str,
-    param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
+    param_str, read_only, run_holder, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -455,15 +455,54 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision) = on_ledger(&ctx.ledger, move |ledger| {
+        let (definition, revision, protocol_terminal) = on_ledger(&ctx.ledger, move |ledger| {
+            let protocol_terminal = ledger
+                .list_events(Some(&run_id_owned), 0, 4096)?
+                .into_iter()
+                .find(|event| event.kind == "run.protocol-terminal")
+                .map(|event| {
+                    serde_json::from_str::<Value>(&event.payload_json)
+                        .map_err(forged_ledger::LedgerError::from)
+                })
+                .transpose()?
+                .and_then(|payload| payload.get("terminal").cloned());
             Ok((
                 ledger.get_run_definition(&run_id_owned)?,
                 ledger.latest_roster_revision(&run_id_owned)?,
+                protocol_terminal,
             ))
         })
         .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
+        let bead = forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await;
+        let controller_live = matches!(
+            controller.get("state").and_then(Value::as_str),
+            Some("running" | "running-unverified")
+        );
+        let claim_health = match bead {
+            Ok(issue) => {
+                let stale = issue.status == "in_progress"
+                    && view.live_attempts.is_empty()
+                    && !controller_live;
+                json!({
+                    "known": true,
+                    "status": issue.status,
+                    "assignee": issue.assignee,
+                    "expectedAssignee": run_holder(&view.run.bead_id),
+                    "staleInProgress": stale,
+                    "detail": stale.then(|| if view.run.terminal_outcome.is_some() {
+                        "Bead remains in_progress after its run reached a terminal outcome"
+                    } else {
+                        "Bead is in_progress with no live controller or provider attempt"
+                    }),
+                })
+            }
+            Err(error) => json!({
+                "known": false,
+                "error": error.to_string(),
+            }),
+        };
         let definition = match definition {
             Some(row) => {
                 let package: forged_types::ExecutionPackageV1 = serde_json::from_str(&row.package_json)
@@ -556,6 +595,13 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     RunState::Stopped => "stopped",
                 },
                 "stopReason": view.run.stop_reason,
+                "outcome": view.run.terminal_outcome.map(|value| value.as_str()),
+                "delivery": {
+                    "pr": view.run.delivery_pr,
+                    "sha": view.run.delivery_sha,
+                },
+                "supersededBy": view.run.superseded_by,
+                "claimHealth": claim_health,
                 "protocolMode": if view.execution_package.is_some() { "adaptive" } else { "legacy" },
                 "definition": definition,
                 "execution": execution,
@@ -578,7 +624,9 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
-                "nextAction": match &action {
+                "nextAction": if let Some(terminal) = protocol_terminal {
+                    json!({"stop": terminal})
+                } else { match &action {
                     forged_proto::NextAction::RunMachine(step) =>
                         json!({"runMachine": step.as_str()}),
                     forged_proto::NextAction::OpenPackets(intents) =>
@@ -593,7 +641,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         }}),
                     forged_proto::NextAction::Stop(t) =>
                         json!({"stop": super::drive::terminal_json(t)}),
-                },
+                }},
                 "controller": controller,
             }
         }))
@@ -1620,6 +1668,12 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
                 RunState::Stopped => "stopped",
             },
             "stopReason": run.stop_reason.clone(),
+            "outcome": run.terminal_outcome.map(|value| value.as_str()),
+            "delivery": {
+                "pr": run.delivery_pr,
+                "sha": run.delivery_sha.clone(),
+            },
+            "supersededBy": run.superseded_by.clone(),
             "createdAt": run.created_at.clone(),
             "updatedAt": run.updated_at.clone(),
             "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),

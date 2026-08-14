@@ -381,6 +381,72 @@ fn verdict_str(v: Verdict) -> &'static str {
     }
 }
 
+fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settlement> {
+    let (outcome, reason) = match terminal {
+        Terminal::Done {
+            final_verdict: Some(Verdict::Approve),
+        } => (
+            forged_ledger::RunOutcome::Clean,
+            "protocol completed with an approve verdict".to_owned(),
+        ),
+        Terminal::Done { final_verdict } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "protocol exhausted its review rounds with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::ProviderUnavailable { stage, attempts } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "provider unavailable for {} after {attempts} attempts",
+                crate::config::stage_str(*stage)
+            ),
+        ),
+        Terminal::SemanticProviderUnavailable { stage_id, attempts } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!("provider unavailable for {stage_id} after {attempts} attempts"),
+        ),
+        // This is already a ledger stop (including one settled explicitly by
+        // `run stop`), so it must not invent or rewrite an outcome.
+        Terminal::ExternallyStopped { .. } => return None,
+    };
+    Some(super::settlement::Settlement {
+        outcome,
+        reason,
+        delivery_pr: None,
+        delivery_sha: None,
+        superseded_by: None,
+    })
+}
+
+async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result<(), Failure> {
+    if let Some(settlement) = automatic_settlement(terminal) {
+        // `settle_run` deliberately makes the protocol project as externally
+        // stopped. Preserve the terminal that caused automatic settlement so
+        // status remains a faithful (and backwards-compatible) projection of
+        // the completed protocol rather than losing its approve/block/outage
+        // evidence behind that lifecycle guard. Kind-once makes the first
+        // terminal immutable across controller races and crash replay.
+        let event_run = run_id.to_owned();
+        let terminal = terminal_json(terminal);
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.append_event_kind_once(
+                &event_run,
+                "run.protocol-terminal",
+                json!({
+                    "schemaVersion": 1,
+                    "terminal": terminal,
+                }),
+            )?;
+            Ok(())
+        })
+        .await?;
+        super::settlement::settle(ctx, run_id, settlement).await?;
+    }
+    Ok(())
+}
+
 /// What honoring one action produced.
 enum Honored {
     /// The action ran; project again.
@@ -1072,7 +1138,10 @@ async fn advance_once(
         )),
         _ => None,
     };
-    honor(ctx, ports, &view, &action, wait_allowed).await?;
+    let honored = honor(ctx, ports, &view, &action, wait_allowed).await?;
+    if let Honored::Stopped(terminal) = honored {
+        settle_terminal(ctx, run_id, &terminal).await?;
+    }
     Ok((action_json(&action), machine_key))
 }
 
@@ -1103,6 +1172,9 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         }
         match honor(ctx, &ports, &view, &action, true).await {
             Ok(Honored::Stopped(terminal)) => {
+                if let Err(failure) = settle_terminal(ctx, &run_id, &terminal).await {
+                    return err_response(&echo, &failure);
+                }
                 return ok_response(
                     &echo,
                     false,

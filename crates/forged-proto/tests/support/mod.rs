@@ -368,6 +368,10 @@ impl ViewBuilder {
                     RunState::Active
                 },
                 stop_reason: self.stop_reason,
+                terminal_outcome: None,
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
                 created_at: T0.to_owned(),
                 updated_at: T0.to_owned(),
             },

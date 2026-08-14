@@ -16,8 +16,8 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
-    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunRow,
-    RunState,
+    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
+    RunRow, RunState,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -35,11 +35,37 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
         stop_reason: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        terminal_outcome: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .map(RunOutcome::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        delivery_pr: row
+            .get::<_, Option<i64>>(11)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+        delivery_sha: row.get(12)?,
+        superseded_by: row.get(13)?,
     })
 }
 
 const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
-                           stop_reason, created_at, updated_at";
+                           stop_reason, created_at, updated_at, terminal_outcome, delivery_pr, \
+                           delivery_sha, superseded_by";
 
 const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.profile_ref_json, \
     d.roster_ref_json, COALESCE(m.package_sha256, d.package_sha256), d.profile_sha256, \
@@ -727,7 +753,8 @@ impl Ledger {
             }
             let now = now_iso();
             tx.execute(
-                "UPDATE runs SET state = ?1, stop_reason = ?2, updated_at = ?3 \
+                "UPDATE runs SET state = ?1, stop_reason = ?2, terminal_outcome = NULL, \
+                 delivery_pr = NULL, delivery_sha = NULL, superseded_by = NULL, updated_at = ?3 \
                  WHERE run_id = ?4",
                 rusqlite::params![state.as_str(), reason, now, run_id],
             )?;
@@ -744,6 +771,148 @@ impl Ledger {
             )?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Settle a complete run with an explicit outcome and immutable evidence.
+    ///
+    /// The transition and `run.settled` event commit together. Replaying the
+    /// identical settlement is a no-op; a different settlement is refused so
+    /// a late controller cannot rewrite an operator's terminal decision.
+    pub fn settle_run(
+        &self,
+        run_id: &str,
+        outcome: RunOutcome,
+        reason: String,
+        delivery_pr: Option<u64>,
+        delivery_sha: Option<String>,
+        superseded_by: Option<String>,
+    ) -> Result<RunRow, LedgerError> {
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "settling a run requires a reason",
+            ));
+        }
+        match outcome {
+            RunOutcome::Landed => {
+                let valid_sha = delivery_sha.as_deref().is_some_and(|sha| {
+                    matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                if delivery_pr.is_none() || !valid_sha {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "landed requires a PR number and an exact 40- or 64-hex commit SHA",
+                    ));
+                }
+                if superseded_by.is_some() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "landed cannot name a successor run",
+                    ));
+                }
+            }
+            RunOutcome::Superseded => {
+                if superseded_by.as_deref().is_none_or(str::is_empty) {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "superseded requires a successor run id",
+                    ));
+                }
+                if delivery_pr.is_some() || delivery_sha.is_some() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "superseded cannot carry landed delivery evidence",
+                    ));
+                }
+            }
+            _ if delivery_pr.is_some() || delivery_sha.is_some() || superseded_by.is_some() => {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "only landed carries delivery evidence and only superseded names a successor",
+                ));
+            }
+            _ => {}
+        }
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = get_run_tx(&tx, &run_id)?;
+            if current.state == RunState::Stopped {
+                if current.terminal_outcome == Some(outcome)
+                    && current.stop_reason.as_deref() == Some(reason.as_str())
+                    && current.delivery_pr == delivery_pr
+                    && current.delivery_sha == delivery_sha
+                    && current.superseded_by == superseded_by
+                {
+                    tx.commit()?;
+                    return Ok(current);
+                }
+                let advances = matches!(
+                    (current.terminal_outcome, outcome),
+                    (
+                        Some(RunOutcome::Clean | RunOutcome::AcceptedRisk),
+                        RunOutcome::Landed
+                    ) | (Some(RunOutcome::Blocked), RunOutcome::AcceptedRisk)
+                        | (
+                            Some(
+                                RunOutcome::Clean
+                                    | RunOutcome::Blocked
+                                    | RunOutcome::InputRequired
+                                    | RunOutcome::Cancelled
+                            ),
+                            RunOutcome::Superseded
+                        )
+                );
+                if !advances {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "run {run_id:?} is already stopped with outcome {:?}",
+                            current.terminal_outcome
+                        ),
+                    ));
+                }
+            }
+            let now = now_iso();
+            let delivery_pr_i64 = delivery_pr
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| refused(ErrorCode::InvalidRequest, "PR number is too large"))?;
+            tx.execute(
+                "UPDATE runs SET state = 'stopped', stop_reason = ?1, terminal_outcome = ?2, \
+                 delivery_pr = ?3, delivery_sha = ?4, superseded_by = ?5, updated_at = ?6 \
+                 WHERE run_id = ?7",
+                rusqlite::params![
+                    reason,
+                    outcome.as_str(),
+                    delivery_pr_i64,
+                    delivery_sha,
+                    superseded_by,
+                    now,
+                    run_id,
+                ],
+            )?;
+            append_event_tx(
+                &tx,
+                Some(&run_id),
+                "run.settled",
+                &json!({
+                    "schemaVersion": 1,
+                    "runId": run_id,
+                    "previousOutcome": current.terminal_outcome.map(RunOutcome::as_str),
+                    "outcome": outcome.as_str(),
+                    "reason": reason,
+                    "delivery": {
+                        "pr": delivery_pr,
+                        "sha": delivery_sha,
+                    },
+                    "supersededBy": superseded_by,
+                }),
+            )?;
+            let row = get_run_tx(&tx, &run_id)?;
+            tx.commit()?;
+            Ok(row)
         })
     }
 }

@@ -992,12 +992,13 @@ async fn require_input(
 
 fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
     let terminal = forged_proto::advance(view);
-    let approved = matches!(
-        terminal,
-        NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
-        })
-    );
+    let approved = view.run.terminal_outcome == Some(forged_ledger::RunOutcome::Clean)
+        || matches!(
+            terminal,
+            NextAction::Stop(Terminal::Done {
+                final_verdict: Some(Verdict::Approve)
+            })
+        );
     let gate_passed = view
         .proto_events
         .iter()

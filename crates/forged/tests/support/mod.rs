@@ -663,8 +663,20 @@ case "$cmd" in
     id=$2
     actor=$(val --actor "$@")
     new_status=$(val --status "$@")
+    has_assignee=0; prev=""
+    for a in "$@"; do
+      [ "$prev" = "--assignee" ] && has_assignee=1
+      prev=$a
+    done
     if [ -n "$new_status" ]; then
       printf '%s' "$new_status" > "$state/$id.status"
+      [ "$has_assignee" = 1 ] && rm -f "$state/$id.assignee"
+      bump_revision "$id"
+      printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
+      exit 0
+    fi
+    if [ "$has_assignee" = 1 ]; then
+      rm -f "$state/$id.assignee"
       bump_revision "$id"
       printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
       exit 0
@@ -716,6 +728,16 @@ case "$cmd" in
     # competing frontier still seed it and therefore keep exact control.
     : > "$state/$id.seen"
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+  comments)
+    id=$2; text=$(cat "$state/$id.comment" 2>/dev/null || true)
+    if [ -n "$text" ]; then
+      printf '{"schema_version":1,"data":[{"text":"%s"}]}\n' "$text"
+    else
+      printf '{"schema_version":1,"data":[]}\n'
+    fi ;;
+  comment)
+    id=$2; printf '%s' "$3" > "$state/$id.comment"
+    printf '{"schema_version":1,"data":{"id":"%s"}}\n' "$id" ;;
   children)
     epic=$2; first=1
     printf '{"schema_version":1,"data":['

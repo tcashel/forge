@@ -20,6 +20,64 @@ pub enum RunState {
     Stopped,
 }
 
+/// Why a whole run stopped (`runs.terminal_outcome`).
+///
+/// This is deliberately distinct from [`AttemptState::Stopped`]: an attempt
+/// stop only retires one worker, while this value is the operator-visible
+/// settlement of the complete run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Protocol work is clean and ready for delivery.
+    Clean,
+    /// Work cannot continue without resolving a blocker.
+    Blocked,
+    /// The run needs an explicit operator answer.
+    InputRequired,
+    /// The operator cancelled this run without declaring the Bead complete.
+    Cancelled,
+    /// The operator accepted a documented residual risk.
+    AcceptedRisk,
+    /// A named successor run replaced this generation.
+    Superseded,
+    /// Delivery landed and carries immutable PR and commit evidence.
+    Landed,
+}
+
+impl RunOutcome {
+    /// The closed spelling stored in SQLite and exposed on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Clean => "clean",
+            RunOutcome::Blocked => "blocked",
+            RunOutcome::InputRequired => "input-required",
+            RunOutcome::Cancelled => "cancelled",
+            RunOutcome::AcceptedRisk => "accepted-risk",
+            RunOutcome::Superseded => "superseded",
+            RunOutcome::Landed => "landed",
+        }
+    }
+}
+
+impl TryFrom<&str> for RunOutcome {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "clean" => Ok(RunOutcome::Clean),
+            "blocked" => Ok(RunOutcome::Blocked),
+            "input-required" => Ok(RunOutcome::InputRequired),
+            "cancelled" => Ok(RunOutcome::Cancelled),
+            "accepted-risk" => Ok(RunOutcome::AcceptedRisk),
+            "superseded" => Ok(RunOutcome::Superseded),
+            "landed" => Ok(RunOutcome::Landed),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown run outcome: {other:?}"),
+            )),
+        }
+    }
+}
+
 impl RunState {
     /// The DDL CHECK string for this state.
     pub fn as_str(&self) -> &'static str {
@@ -261,6 +319,14 @@ pub struct RunRow {
     pub created_at: String,
     /// `runs.updated_at`.
     pub updated_at: String,
+    /// `runs.terminal_outcome` — absent on active and legacy-stopped runs.
+    pub terminal_outcome: Option<RunOutcome>,
+    /// `runs.delivery_pr` — required for [`RunOutcome::Landed`].
+    pub delivery_pr: Option<u64>,
+    /// `runs.delivery_sha` — required for [`RunOutcome::Landed`].
+    pub delivery_sha: Option<String>,
+    /// `runs.superseded_by` — required for [`RunOutcome::Superseded`].
+    pub superseded_by: Option<String>,
 }
 
 /// One immutable `run_definitions` row.

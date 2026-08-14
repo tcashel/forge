@@ -2,7 +2,7 @@
 //! here — every command routes through the same `core/` function the MCP
 //! tools call.
 
-use clap::{Args, Parser, Subcommand};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use forged_types::OperationRequest;
 use serde_json::{json, Map, Value};
 
@@ -105,10 +105,71 @@ pub enum RunCmd {
     Submit(RunScoped),
     /// Project the run's current state (read-only).
     Status(RunScoped),
+    /// Stop and settle the complete run.
+    Stop(RunStopArgs),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
     /// Accept the final deduplicated findings after review-budget exhaustion.
     AcceptRisk(RunAcceptRiskArgs),
+}
+
+/// Whole-run terminal outcomes owned by `run stop`.
+///
+/// `accepted-risk` deliberately lives on the review acceptance operation,
+/// which owns its evidence contract rather than accepting a bare reason.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunStopOutcome {
+    /// Clean and ready for delivery.
+    Clean,
+    /// Blocked on unresolved work.
+    Blocked,
+    /// Waiting for an operator answer.
+    InputRequired,
+    /// Cancelled without declaring the Bead complete.
+    Cancelled,
+    /// Replaced by a named successor run.
+    Superseded,
+    /// Landed, with PR and exact merge SHA evidence.
+    Landed,
+}
+
+impl RunStopOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Clean => "clean",
+            Self::Blocked => "blocked",
+            Self::InputRequired => "input-required",
+            Self::Cancelled => "cancelled",
+            Self::Superseded => "superseded",
+            Self::Landed => "landed",
+        }
+    }
+}
+
+/// `run stop` flags.
+#[derive(Debug, Args)]
+pub struct RunStopArgs {
+    /// Run id.
+    #[arg(long)]
+    pub run: String,
+    /// Whole-run outcome.
+    #[arg(long, value_enum)]
+    pub outcome: RunStopOutcome,
+    /// Human-readable terminal reason.
+    #[arg(long)]
+    pub reason: String,
+    /// Pull request number; required only for `landed`.
+    #[arg(long)]
+    pub pr: Option<u64>,
+    /// Exact merge commit SHA; required only for `landed`.
+    #[arg(long)]
+    pub sha: Option<String>,
+    /// Successor run id; required only for `superseded`.
+    #[arg(long)]
+    pub superseded_by: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `epic` subcommands.
@@ -629,6 +690,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Drive(_) => "run_drive",
             RunCmd::Submit(_) => "run_submit",
             RunCmd::Status(_) => "run_status",
+            RunCmd::Stop(_) => "run_stop",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
             RunCmd::AcceptRisk(_) => "run_accept_risk",
         },
@@ -739,6 +801,21 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.run.clone()),
                     json!({"run": a.run}),
+                ),
+            ),
+            RunCmd::Stop(a) => (
+                "run_stop",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({
+                        "run": a.run,
+                        "outcome": a.outcome.as_str(),
+                        "reason": a.reason,
+                        "pr": a.pr,
+                        "sha": a.sha,
+                        "supersededBy": a.superseded_by,
+                    }),
                 ),
             ),
             RunCmd::ReviseRoster(a) => (

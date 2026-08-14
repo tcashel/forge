@@ -360,6 +360,7 @@ mod tests {
             title: "a slice".to_owned(),
             description: "## Context\n\nwhy this exists".to_owned(),
             status: "open".to_owned(),
+            assignee: None,
             issue_type: "task".to_owned(),
             acceptance_criteria: "- it works".to_owned(),
             design: "touch `core/spec.rs`".to_owned(),

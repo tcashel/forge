@@ -269,6 +269,15 @@ impl ForgedServer {
         self.call("run_status", args.0).await
     }
 
+    /// Stop and settle a complete run.
+    #[tool(
+        name = "run_stop",
+        description = "Stop every live attempt and settle the run as clean, blocked, input-required, cancelled, superseded, or landed. Landed requires PR and exact SHA evidence."
+    )]
+    pub async fn run_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_stop", args.0).await
+    }
+
     /// Append an explicit roster revision.
     #[tool(
         name = "run_revise_roster",

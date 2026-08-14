@@ -9,7 +9,7 @@ use std::sync::Arc;
 
 use forged_ledger::{
     AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
-    RunState, SpecFence,
+    RunOutcome, RunState, SpecFence,
 };
 use forged_types::{
     ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
@@ -676,5 +676,106 @@ fn a_revoking_marker_records_the_scope_that_placed_it() {
     let row = ledger.get_attempt(stop.attempt_id).expect("get");
     assert_eq!(row.revoke_scope, Some(forged_ledger::RevokeScope::Attempt));
     assert_eq!(row.revoke_reason.as_deref(), Some("operator requested"));
+    ledger.close().expect("close");
+}
+
+#[test]
+fn whole_run_settlement_is_immutable_idempotent_and_evented() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-settlement");
+    let sha = "a".repeat(40);
+    let packet = make_packet(&ledger, &run);
+
+    let landed = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Landed,
+            "merged cleanly".to_owned(),
+            Some(121),
+            Some(sha.clone()),
+            None,
+        )
+        .expect("settle");
+    assert_eq!(landed.state, RunState::Stopped);
+    assert_eq!(landed.terminal_outcome, Some(RunOutcome::Landed));
+    assert_eq!(landed.delivery_pr, Some(121));
+    assert_eq!(landed.delivery_sha.as_deref(), Some(sha.as_str()));
+
+    let replay = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Landed,
+            "merged cleanly".to_owned(),
+            Some(121),
+            Some(sha),
+            None,
+        )
+        .expect("identical replay");
+    assert_eq!(replay, landed);
+    let settlement_events: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "run.settled")
+        .collect();
+    assert_eq!(settlement_events.len(), 1);
+    let claim_after_stop = ledger
+        .claim_packet(
+            &packet,
+            "claude:late:99",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect_err("a terminal run cannot race in a successor attempt");
+    assert_eq!(claim_after_stop.code(), ErrorCode::PacketNotClaimable);
+
+    let conflict = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Cancelled,
+            "changed my mind".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("terminal outcome cannot be rewritten");
+    assert_eq!(conflict.code(), ErrorCode::InvalidRequest);
+    ledger.close().expect("close");
+}
+
+#[test]
+fn settlement_requires_outcome_specific_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let landed = make_run(&ledger, "run-bad-landed");
+    let superseded = make_run(&ledger, "run-bad-superseded");
+
+    let missing = ledger
+        .settle_run(
+            &landed,
+            RunOutcome::Landed,
+            "merged".to_owned(),
+            Some(7),
+            Some("short".to_owned()),
+            None,
+        )
+        .expect_err("abbreviated SHA is not immutable evidence");
+    assert_eq!(missing.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_run(&landed).expect("run").state,
+        RunState::Active
+    );
+
+    let unnamed = ledger
+        .settle_run(
+            &superseded,
+            RunOutcome::Superseded,
+            "replaced".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("a successor is required");
+    assert_eq!(unnamed.code(), ErrorCode::InvalidRequest);
     ledger.close().expect("close");
 }

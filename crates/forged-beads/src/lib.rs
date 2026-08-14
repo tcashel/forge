@@ -31,7 +31,10 @@ pub use audit::{audit_record, AuditEntry};
 pub use classify::BdError;
 pub use config::BdConfig;
 pub use doctor::{run_doctor, DoctorConfig, ProbeResult};
-pub use graph::{close_issue, epic_children, ready_issues, reopen_issue, show_issue, IssueSummary};
+pub use graph::{
+    close_issue, comment_once, epic_children, ready_issues, release_issue,
+    release_unresolved_issue, reopen_issue, show_issue, IssueSummary,
+};
 pub use guardian::{run_guardian, GuardianConfig, GuardianExit};
 pub use lease::{
     claim_ready, claim_specific, heartbeat, lease_holder, reclaim, reclaim_older_than, ClaimedBead,

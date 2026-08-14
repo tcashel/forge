@@ -23,6 +23,8 @@ pub struct IssueSummary {
     pub description: String,
     /// Current Beads status.
     pub status: String,
+    /// Current Beads assignee/lease holder, when any.
+    pub assignee: Option<String>,
     /// Beads issue type (`task`, `epic`, ...).
     pub issue_type: String,
     /// `acceptance_criteria` — the spec's Acceptance Criteria section.
@@ -94,6 +96,11 @@ fn issue(value: &Value) -> Option<IssueSummary> {
             .and_then(Value::as_str)
             .unwrap_or("open")
             .to_owned(),
+        assignee: value
+            .get("assignee")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned),
         issue_type: value
             .get("issue_type")
             .and_then(Value::as_str)
@@ -185,6 +192,126 @@ pub async fn close_issue(
     show_issue(cfg, id).await
 }
 
+/// Append one marker-addressed lifecycle comment, idempotently.
+///
+/// Comments preserve terminal reasons beside the Bead without rewriting the
+/// canonical spec fields. Replay scans the comment JSON for the caller's
+/// deterministic marker before writing.
+pub async fn comment_once(
+    cfg: &BdConfig,
+    id: &str,
+    actor: &str,
+    marker: &str,
+    body: &str,
+) -> Result<bool, BdError> {
+    let current = invoke::read(cfg, &["comments", id, "--json"]).await?;
+    if current.to_string().contains(marker) {
+        return Ok(false);
+    }
+    let text = format!("{marker} {body}");
+    let args = ["comment", id, &text, "--actor", actor, "--json"];
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    Ok(true)
+}
+
+/// Idempotently clear the run holder after terminal settlement.
+///
+/// The guarded write never overwrites a different actor. A close in bd keeps
+/// historical assignment by default, so delivery settlement calls this after
+/// [`close_issue`] to make ownership agree with the absence of live work.
+pub async fn release_issue(cfg: &BdConfig, id: &str, actor: &str) -> Result<IssueSummary, BdError> {
+    let current = show_issue(cfg, id).await?;
+    match current.assignee.as_deref() {
+        None => return Ok(current),
+        Some(holder) if holder != actor => {
+            return Err(BdError::LeaseHeld {
+                bead: id.to_owned(),
+                holder: Some(holder.to_owned()),
+            });
+        }
+        Some(_) => {}
+    }
+    let args = [
+        "update",
+        id,
+        "--assignee",
+        "",
+        "--if-assignee",
+        actor,
+        "--actor",
+        actor,
+        "--json",
+    ];
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    show_issue(cfg, id).await
+}
+
+/// Return unresolved work to an actionable Beads state and clear ownership.
+///
+/// Only `open` and `blocked` are constructible. The assignee guard makes a
+/// late terminalizer unable to release a successor's newer claim.
+pub async fn release_unresolved_issue(
+    cfg: &BdConfig,
+    id: &str,
+    actor: &str,
+    blocked: bool,
+) -> Result<IssueSummary, BdError> {
+    let current = show_issue(cfg, id).await?;
+    if current.status == "closed" {
+        return Err(BdError::Beads {
+            context: format!("bd update {id} (release unresolved)"),
+            exit: None,
+            stdout: String::new(),
+            stderr: "refusing to reopen a closed Bead from terminal run settlement".to_owned(),
+        });
+    }
+    match current.assignee.as_deref() {
+        None if current.status == if blocked { "blocked" } else { "open" } => return Ok(current),
+        None => {}
+        Some(holder) if holder != actor => {
+            return Err(BdError::LeaseHeld {
+                bead: id.to_owned(),
+                holder: Some(holder.to_owned()),
+            });
+        }
+        Some(_) => {}
+    }
+    let status = if blocked { "blocked" } else { "open" };
+    let mut args = vec!["update", id, "--status", status, "--assignee", ""];
+    if current.assignee.is_some() {
+        args.extend(["--if-assignee", actor]);
+    } else {
+        args.extend(["--if-assignee", ""]);
+    }
+    args.extend(["--actor", actor, "--json"]);
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    show_issue(cfg, id).await
+}
+
 /// Set a held child back to `open` after an explicit input resolution.
 pub async fn reopen_issue(cfg: &BdConfig, id: &str, actor: &str) -> Result<IssueSummary, BdError> {
     let args = ["update", id, "--status", "open", "--actor", actor, "--json"];
@@ -214,6 +341,7 @@ mod tests {
                 title: String::new(),
                 description: String::new(),
                 status: "open".to_owned(),
+                assignee: None,
                 issue_type: "task".to_owned(),
                 acceptance_criteria: String::new(),
                 design: String::new(),
