@@ -596,7 +596,7 @@ async fn settle_adoption(
         &packet.packet_id,
         claim_token,
         format!("transport: adoption could not read the spec: {failure}"),
-        format!("adoption refused: {failure}"),
+        format!("unspawned: adoption refused: {failure}"),
         failure,
     )
     .await
@@ -618,7 +618,7 @@ async fn settle_host_fallback(
         packet_id,
         claim_token,
         format!("transport: the host fallback could not be recorded: {failure}"),
-        format!("attempt refused before spawn: {failure}"),
+        format!("unspawned: attempt refused before spawn: {failure}"),
         failure,
     )
     .await
@@ -632,11 +632,20 @@ async fn settle_host_fallback(
 /// re-enters the identical failure forever, and the reclaim saga has to time
 /// out a lease that no process is renewing.
 ///
-/// A TRANSPORT failure goes onto the packet's existing bounded-retry budget —
-/// the same budget a provider transport failure uses. Anything else is
-/// terminal for this attempt: the row is failed so the packet becomes
-/// re-claimable and re-pinnable, and the failure still surfaces to the caller
-/// rather than being swallowed into a retry.
+/// EITHER WAY THE NOTE SAYS NO SEAT RAN, because no seat did. A `transport:`
+/// note carries a recoverable failure and an `unspawned:` note an
+/// unrecoverable one, and `classify_failure` reads both as the packet
+/// standing on its bounded-retry budget rather than as this stage's answer.
+/// That distinction is load-bearing: a plain note classifies SEMANTIC, and a
+/// semantic failure IS a stage result — `contribution` merges it into the
+/// review fan-out as `RequestChanges`, and `advance` spends the run's one fix
+/// round on it — so a review seat that never spawned would speak a verdict it
+/// never had and a fix seat that never spawned would end the run.
+///
+/// The row is failed either way, so the packet is re-claimable and
+/// re-pinnable; the budget is what bounds a cause that will not clear. An
+/// unrecoverable failure still surfaces to the caller rather than being
+/// swallowed into the retry.
 async fn settle_unspawned(
     ctx: &Ctx,
     packet_id: &str,
@@ -648,14 +657,7 @@ async fn settle_unspawned(
     if failure.recoverable {
         return fail_and_grant_retry(ctx, packet_id, claim_token, transport_note).await;
     }
-    {
-        let packet_id = packet_id.to_owned();
-        let token = claim_token.to_owned();
-        on_ledger(&ctx.ledger, move |l| {
-            l.fail_packet(&packet_id, &token, &refusal_note)
-        })
-        .await?;
-    }
+    fail_and_grant_retry(ctx, packet_id, claim_token, refusal_note).await?;
     Err(failure)
 }
 
@@ -726,7 +728,7 @@ async fn run_attempt(
         Ok(prepared) => prepared,
         Err(failure) => {
             let transport = format!("transport: the attempt could not be prepared: {failure}");
-            let refusal = format!("attempt refused before spawn: {failure}");
+            let refusal = format!("unspawned: attempt refused before spawn: {failure}");
             return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
                 .await;
         }
@@ -748,7 +750,7 @@ async fn run_attempt(
         Ok(invocation) => invocation,
         Err(failure) => {
             let transport = format!("transport: the provider invocation failed: {failure}");
-            let refusal = format!("attempt refused before spawn: {failure}");
+            let refusal = format!("unspawned: attempt refused before spawn: {failure}");
             return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
                 .await;
         }

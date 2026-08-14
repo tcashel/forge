@@ -254,6 +254,12 @@ pub const MACHINE_STEPS: [(MachineStage, u32); 6] = [
 pub enum FailureKind {
     /// The provider never got to think; retried for free within the budget.
     Transport,
+    /// The attempt was retired between its claim and a spawn, so no provider
+    /// ever existed for it. NOT a stage result — a review seat that never ran
+    /// has no verdict and a fix seat that never ran applied nothing — and it
+    /// stands on the same bounded budget a transport failure uses, which is
+    /// what keeps a permanent one from re-claiming forever.
+    Unspawned,
     /// The provider tried; the failure consumes what the stage's failure
     /// consumes.
     Semantic,
@@ -266,6 +272,8 @@ pub enum FailureKind {
 pub fn classify_failure(fail_note: &str) -> FailureKind {
     if fail_note.starts_with("transport:") {
         FailureKind::Transport
+    } else if fail_note.starts_with("unspawned:") {
+        FailureKind::Unspawned
     } else {
         FailureKind::Semantic
     }
@@ -957,7 +965,13 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
     };
     match last.state {
         AttemptState::Failed => match classify_failure(last.fail_note.as_deref().unwrap_or("")) {
-            FailureKind::Transport => transport_leg(view, packet_id, history),
+            // An attempt retired before it reached a provider stands exactly
+            // where a transport failure does: no seat spoke, so there is no
+            // stage result to read, and the same bounded budget both bounds
+            // the re-claim and stops the run when it is spent.
+            FailureKind::Transport | FailureKind::Unspawned => {
+                transport_leg(view, packet_id, history)
+            }
             FailureKind::Semantic => LegState::FailedSemantic,
         },
         // A reclaimed attempt leaves the packet open for a successor.
@@ -1020,14 +1034,18 @@ fn latest_retry(view: &RunView, packet_id: &str) -> Option<(u32, String)> {
     })
 }
 
-/// Transport failures observed for a packet, from its terminal history —
+/// Failures charged to a packet's bounded budget, from its terminal history —
 /// the fallback used only until the packet's first `proto.retry` grant.
+/// Transport and unspawned failures share the budget, so both are counted.
 fn transport_failures(history: &[TerminalAttempt]) -> u32 {
     let count = history
         .iter()
         .filter(|t| {
             t.state == AttemptState::Failed
-                && classify_failure(t.fail_note.as_deref().unwrap_or("")) == FailureKind::Transport
+                && matches!(
+                    classify_failure(t.fail_note.as_deref().unwrap_or("")),
+                    FailureKind::Transport | FailureKind::Unspawned
+                )
         })
         .count();
     u32::try_from(count).unwrap_or(u32::MAX)

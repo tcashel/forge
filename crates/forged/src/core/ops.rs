@@ -928,6 +928,7 @@ pub async fn packet_fail(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
             }
             let classification = match forged_proto::classify_failure(&note) {
                 forged_proto::FailureKind::Transport => "transport",
+                forged_proto::FailureKind::Unspawned => "unspawned",
                 forged_proto::FailureKind::Semantic => "semantic",
             };
             Ok(json!({"classification": classification, "note": note}))
