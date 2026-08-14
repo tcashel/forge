@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
 use forged_ledger::{
-    EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState, RunState,
+    AttemptState, EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState,
+    RunState,
 };
 use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
 use forged_types::{
@@ -1190,6 +1191,9 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 
 // ------------------------------------------------------------- inventory
 
+/// The durable kinds an inventory entry's lifecycle is folded from.
+const LIFECYCLE_KINDS: [&str; 4] = [epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR];
+
 /// A synthesized epic entry's derived lifecycle columns.
 struct EpicLifecycle {
     /// `active`, `paused`, or `submitted`.
@@ -1308,11 +1312,21 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
     // the lifecycle kinds are folded into a single entry each, and reading
     // them across separate transactions would let an epic's start event and
     // its pause land on opposite sides of a concurrent write.
-    let snapshot = on_ledger(&ctx.ledger, |l| {
-        l.inventory_snapshot(&[epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR])
-    })
-    .await?;
-    let lifecycles = epic_lifecycles(&snapshot);
+    let snapshot = on_ledger(&ctx.ledger, |l| l.inventory_snapshot(&LIFECYCLE_KINDS)).await?;
+    project_entries(ctx, &snapshot, spend).await
+}
+
+/// Project one snapshot into inventory entries, oldest first.
+///
+/// The projection, separated from the read so the portfolio derives its
+/// entries and its attention rail from the SAME snapshot: two reads would
+/// let an attempt land between them and describe a run the entries do not.
+async fn project_entries(
+    ctx: &Ctx,
+    snapshot: &InventorySnapshot,
+    spend: Spend,
+) -> Result<Vec<Value>, Failure> {
+    let lifecycles = epic_lifecycles(snapshot);
     // First start event per epic id; a payload that will not parse still
     // yields a discoverable id rather than hiding the epic.
     let mut epics: BTreeMap<String, (String, Value)> = BTreeMap::new();
@@ -1410,6 +1424,234 @@ async fn add_spend(ctx: &Ctx, spend: &Spend, id: &str, entry: &mut Value) -> Res
         );
     }
     Ok(())
+}
+
+/// The durable kinds the attention rail is folded from, on top of
+/// [`LIFECYCLE_KINDS`]. `proto.quarantine` is spelled here rather than
+/// imported because the ledger stores kind strings and the proto crate
+/// exposes the vocabulary only through its parsed variants.
+const ATTENTION_KINDS: [&str; 3] = [
+    epic::INPUT_REQUIRED,
+    epic::INPUT_RESOLVED,
+    "proto.quarantine",
+];
+
+/// One condition needing a human, in the order the rail reports them.
+///
+/// Severity, not alphabet: a subject holding for an answer or stuck
+/// mid-reclaim blocks work, custody of a refused result is evidence a human
+/// must adjudicate, and an unpriced usage row only makes a figure partial.
+const CONDITIONS: [&str; 4] = ["input-required", "revoking", "quarantined", "missing-cost"];
+
+/// The whole inventory and what needs a human, from ONE snapshot.
+pub struct Portfolio {
+    /// Every inventory entry, oldest first — [`inventory`]'s own order.
+    pub entries: Vec<Value>,
+    /// One entry per (subject, condition), most severe condition first.
+    pub attention: Vec<Value>,
+}
+
+/// The portfolio: [`inventory`] with spend, plus the attention rail folded
+/// from the same snapshot.
+///
+/// Costs ONE snapshot, exactly as `inventory` does: every condition the rail
+/// reports has a durable source already inside it — the epic input events,
+/// `proto.quarantine`, `attempts.state = 'revoking'` via `live_attempts`,
+/// and the `usage_totals` the entries already carry. No condition adds a
+/// query.
+pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
+    let kinds: Vec<&str> = LIFECYCLE_KINDS
+        .iter()
+        .chain(ATTENTION_KINDS.iter())
+        .copied()
+        .collect();
+    let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
+    let entries = project_entries(ctx, &snapshot, Spend::Include).await?;
+    let attention = attention_rail(&snapshot, &entries);
+    Ok(Portfolio { entries, attention })
+}
+
+/// Fold one snapshot into the attention rail.
+///
+/// Every entry names its subject, its condition, and the durable evidence
+/// for it; a condition with many rows reports the count and the newest row
+/// as its exemplar, so one entry stays one entry however long a run has been
+/// failing. An empty rail means nothing needs attention.
+///
+/// `entries` supplies each subject's `kind` and the spend the rail's last
+/// condition reads, so no id is looked up twice.
+fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value> {
+    let kinds: BTreeMap<&str, &str> = entries
+        .iter()
+        .filter_map(|entry| Some((entry["id"].as_str()?, entry["kind"].as_str()?)))
+        .collect();
+    let item = |id: &str, condition: &str, detail: String, evidence: Value| {
+        json!({
+            "id": id,
+            "kind": kinds.get(id).copied().unwrap_or("unknown"),
+            "condition": condition,
+            "detail": detail,
+            "evidence": evidence,
+        })
+    };
+    let mut rail: BTreeMap<&str, Vec<Value>> =
+        CONDITIONS.iter().map(|c| (*c, Vec::new())).collect();
+    let mut push = |condition: &'static str, entry: Value| {
+        if let Some(items) = rail.get_mut(condition) {
+            items.push(entry);
+        }
+    };
+
+    // An epic holds for an answer until its own `input.resolved` clears it,
+    // so the LATER of the two kinds decides — by append position, never the
+    // `ts` string.
+    let mut holding: BTreeMap<String, (i64, Option<Value>)> = BTreeMap::new();
+    for kind in [epic::INPUT_REQUIRED, epic::INPUT_RESOLVED] {
+        for event in snapshot.events(kind) {
+            let Some(id) = event.run_id.clone() else {
+                continue;
+            };
+            if holding
+                .get(&id)
+                .is_some_and(|(seen, _)| *seen > event.event_id)
+            {
+                continue;
+            }
+            let payload = (kind == epic::INPUT_REQUIRED)
+                .then(|| serde_json::from_str(&event.payload_json).unwrap_or(Value::Null));
+            holding.insert(id, (event.event_id, payload));
+        }
+    }
+    for (id, (_, payload)) in &holding {
+        let Some(payload) = payload else {
+            continue;
+        };
+        let code = payload["code"].as_str().unwrap_or("unstated");
+        let child = payload["childId"].as_str().unwrap_or("the epic");
+        let detail = payload["detail"].as_str().unwrap_or_default();
+        push(
+            "input-required",
+            item(
+                id,
+                "input-required",
+                format!("{child} is holding on {code}: {detail}")
+                    .trim()
+                    .to_owned(),
+                payload.clone(),
+            ),
+        );
+    }
+
+    // `live_attempts` carries `running` and `revoking`; only the second is a
+    // reclaim saga that has not reached its successor.
+    let mut revoking: BTreeMap<String, (u64, Value)> = BTreeMap::new();
+    for attempt in &snapshot.live_attempts {
+        if attempt.state != AttemptState::Revoking {
+            continue;
+        }
+        // `entries` already refused every malformed packet key.
+        let Ok((run_id, _, _)) = split_packet_key(&attempt.packet_id) else {
+            continue;
+        };
+        let seen = revoking.get(&run_id).map_or(0, |(count, _)| *count);
+        revoking.insert(
+            run_id,
+            (
+                seen + 1,
+                json!({
+                    "attemptId": attempt.attempt_id,
+                    "packetId": attempt.packet_id,
+                    "reason": attempt.revoke_reason,
+                    "updatedAt": attempt.updated_at,
+                }),
+            ),
+        );
+    }
+    for (id, (count, newest)) in &revoking {
+        let reason = newest["reason"].as_str().unwrap_or("no reason recorded");
+        push(
+            "revoking",
+            item(
+                id,
+                "revoking",
+                format!(
+                    "{count} attempt{} marked for revocation and not yet reclaimed: {reason}",
+                    if *count == 1 { " is" } else { "s are" }
+                ),
+                json!({"count": count, "newest": newest}),
+            ),
+        );
+    }
+
+    // Custody has no durable release: a quarantine stays on the rail until
+    // a human adjudicates the bytes, which is what the rail is for. The
+    // revoking condition above self-clears, because a reclaimed attempt
+    // leaves `live_attempts`.
+    let mut quarantined: BTreeMap<String, (u64, Value)> = BTreeMap::new();
+    for event in snapshot.events("proto.quarantine") {
+        let Some(id) = event.run_id.clone() else {
+            continue;
+        };
+        let seen = quarantined.get(&id).map_or(0, |(count, _)| *count);
+        let payload: Value = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+        quarantined.insert(
+            id,
+            (
+                seen + 1,
+                json!({
+                    "eventId": event.event_id,
+                    "packetId": payload["packetId"],
+                    "attemptId": payload["attemptId"],
+                    "reason": payload["reason"],
+                }),
+            ),
+        );
+    }
+    for (id, (count, newest)) in &quarantined {
+        let reason = newest["reason"].as_str().unwrap_or("no reason recorded");
+        push(
+            "quarantined",
+            item(
+                id,
+                "quarantined",
+                format!(
+                    "{count} result{} refused at the fence and taken into custody: {reason}",
+                    if *count == 1 { " was" } else { "s were" }
+                ),
+                json!({"count": count, "newest": newest}),
+            ),
+        );
+    }
+
+    // Measured spend, from the totals the entries already carry: a run with
+    // unpriced rows makes every figure over it partial.
+    for entry in entries {
+        let missing = entry["rowsMissingCost"].as_u64().unwrap_or(0);
+        if missing == 0 {
+            continue;
+        }
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        push(
+            "missing-cost",
+            item(
+                id,
+                "missing-cost",
+                format!("{missing} usage rows carry no cost, so the spend shown is partial"),
+                json!({
+                    "rowsMissingCost": missing,
+                    "costUsdKnown": entry["costUsdKnown"],
+                }),
+            ),
+        );
+    }
+
+    CONDITIONS
+        .iter()
+        .filter_map(|condition| rail.remove(condition))
+        .flatten()
+        .collect()
 }
 
 /// `work list` — the discovery surface, serving [`inventory`] whole.

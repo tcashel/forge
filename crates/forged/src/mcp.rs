@@ -105,8 +105,9 @@ pub struct OverviewArgs {
     pub params: OverviewParams,
 }
 
-/// `overview` parameters. Exactly one of `run`, `epic`, or `id` is required;
-/// `after` and `limit` page the event tail.
+/// `overview` parameters. At most one of `run`, `epic`, or `id`; all three
+/// absent projects the portfolio, and `after`/`limit` page the event tail of
+/// whichever subject was named.
 ///
 /// Typing these MOVED one boundary, deliberately. A wrong-TYPED `after` or
 /// `limit` (`"5"`, `1.5`, a negative `limit`) is refused as `invalid_params`
@@ -311,9 +312,11 @@ impl ForgedServer {
     #[tool(
         name = "overview",
         description = "Project one slice or epic with workers, evidence, usage, and events. \
-                       Exactly one of params.run, params.epic, or params.id is required; \
-                       params.id resolves either kind and answers with candidates when it \
-                       cannot; use work_list to enumerate every id.",
+                       At most one of params.run, params.epic, or params.id is accepted, and \
+                       omitting all three projects the portfolio: every run and epic, newest \
+                       first, with an attention rail. params.id resolves either kind and \
+                       answers with candidates when it cannot; use work_list to enumerate \
+                       every id.",
         meta = overview_tool_meta()
     )]
     pub async fn overview(&self, args: Parameters<OverviewArgs>) -> CallToolResult {

@@ -516,9 +516,9 @@ pub struct EventsArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `overview` flags. Exactly one scope is required.
+/// `overview` flags. At most one scope; none projects the portfolio.
 #[derive(Debug, Args)]
-#[group(required = true, multiple = false, args = ["run", "epic", "id"])]
+#[group(required = false, multiple = false, args = ["run", "epic", "id"])]
 pub struct OverviewArgs {
     /// Project one slice run.
     #[arg(long)]

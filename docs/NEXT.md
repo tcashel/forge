@@ -106,12 +106,22 @@ where the ids every other command needs come from.
 
 ```sh
 forged work list
+forged overview                    # no scope: the whole portfolio
 forged overview --run <run-id>
 forged overview --epic <epic-id>
 forged overview --id <id>          # kind-blind: resolves either, or lists candidates
 forged session list --run <run-id>
 forged events --run <id> --limit 200
 ```
+
+`overview` with no scope answers with the portfolio: `kind: "portfolio"` on
+the same `forged.overview/1` schema, carrying the inventory entries newest
+first (capped, with `total` and `cap` stated so a truncated page reads as
+truncated), the portfolio-wide `spend`, and an `attention` rail naming each
+subject that needs a human and the durable evidence for it — an epic holding
+on `input.required`, an attempt marked `revoking` and not yet reclaimed, a
+result taken into custody by `proto.quarantine`, or usage rows carrying no
+cost. An empty rail means nothing needs attention; it is never omitted.
 
 Each `work list` entry carries its `kind` (`slice` or `epic`), lifecycle
 (`state`, `stopReason`, `createdAt`, `updatedAt`), live seat count, and

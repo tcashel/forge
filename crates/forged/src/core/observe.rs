@@ -332,6 +332,79 @@ async fn epic_overview(ctx: &Ctx, epic_id: &str, after: i64, limit: u64) -> Resu
     }))
 }
 
+/// The newest entries a portfolio carries.
+///
+/// The inventory grows for the life of the operator's ledger and is never
+/// pruned, so an uncapped portfolio eventually becomes a payload no host
+/// will carry. Two hundred: an entry is a dozen scalar keys — ~300 bytes —
+/// so a full page is under 100 KB, well below the epic projection this same
+/// tool already returns, which embeds a whole child overview per child. It
+/// is also more concurrent work than an operator runs, so truncation is the
+/// exception `total` exists to announce; `work_list` serves the inventory
+/// whole for a caller that wants the tail.
+const PORTFOLIO_CAP: usize = 200;
+
+/// The portfolio: every unit of work and what needs a human, for a caller
+/// that cannot name a subject yet.
+///
+/// Newest first, capped at [`PORTFOLIO_CAP`] with the totals stated, so a
+/// consumer distinguishes a complete answer from a truncated one. `spend`
+/// and `attentionTotal` cover the WHOLE inventory, never the capped page:
+/// a figure that quietly described only what fit would be read as complete.
+/// `attention` is present and empty when nothing needs a human — an omitted
+/// key is indistinguishable from an unimplemented one.
+///
+/// Carries no event page: `after`/`limit` address one subject's stream, and
+/// the portfolio is the level above any subject.
+async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
+    let portfolio = super::ops::portfolio(ctx).await?;
+    let total = portfolio.entries.len();
+    let attention_total = portfolio.attention.len();
+    let cost_usd_known: f64 = portfolio
+        .entries
+        .iter()
+        .filter_map(|entry| entry["costUsdKnown"].as_f64())
+        .sum();
+    let rows_missing_cost: u64 = portfolio
+        .entries
+        .iter()
+        .filter_map(|entry| entry["rowsMissingCost"].as_u64())
+        .sum();
+    let live_seats: u64 = portfolio
+        .entries
+        .iter()
+        .filter_map(|entry| entry["liveSeats"].as_u64())
+        .sum();
+    // `inventory` orders oldest first; the portfolio answers "what is
+    // running", so the newest entries are the ones that survive the cap.
+    let entries: Vec<Value> = portfolio
+        .entries
+        .into_iter()
+        .rev()
+        .take(PORTFOLIO_CAP)
+        .collect();
+    // The rail is severity-ordered, so its cap drops the least urgent.
+    let attention: Vec<Value> = portfolio
+        .attention
+        .into_iter()
+        .take(PORTFOLIO_CAP)
+        .collect();
+    Ok(json!({
+        "schema": "forged.overview/1",
+        "kind": "portfolio",
+        "entries": entries,
+        "total": total,
+        "cap": PORTFOLIO_CAP,
+        "liveSeats": live_seats,
+        "attention": attention,
+        "attentionTotal": attention_total,
+        "spend": {
+            "costUsdKnown": cost_usd_known,
+            "rowsMissingCost": rows_missing_cost,
+        },
+    }))
+}
+
 /// What a bare `id` resolved to.
 enum Resolved {
     /// The id names one slice run.
@@ -390,10 +463,12 @@ async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
 
 /// Read-only aggregate used by reconnecting agents and the MCP App.
 ///
-/// Takes an explicit `run` or `epic`, or a bare `id` resolved against the
-/// inventory. The two are different requests — an assertion about a kind
-/// versus a question about one — so passing both is refused rather than
-/// silently preferring one, which would hide a caller's bug.
+/// Takes an explicit `run` or `epic`, a bare `id` resolved against the
+/// inventory, or NO scope at all — which projects the portfolio, the one
+/// answer to "what is running" that presumes no prior knowledge. An explicit
+/// kind and an `id` are different requests — an assertion about a kind versus
+/// a question about one — so passing both is refused rather than silently
+/// preferring one, which would hide a caller's bug; so is naming both kinds.
 pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("overview", req, || async {
         let run = param_opt_str(&req.params, "run");
@@ -404,9 +479,10 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 "overview takes param \"id\" or an explicit \"run\"/\"epic\", never both",
             ));
         }
-        if id.is_none() && run.is_some() == epic.is_some() {
+        if run.is_some() && epic.is_some() {
             return Err(Failure::invalid(
-                "overview takes exactly one of params \"run\", \"epic\", or \"id\"",
+                "overview takes at most one of params \"run\", \"epic\", or \"id\"; \
+                 omitting all three projects the portfolio",
             ));
         }
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
@@ -424,6 +500,7 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             ));
         }
         match (run, epic, id) {
+            (None, None, None) => portfolio_overview(ctx).await,
             (Some(run), None, None) => run_overview(ctx, run, after, limit).await,
             (None, Some(epic), None) => epic_overview(ctx, epic, after, limit).await,
             // A resolved id projects through the SAME call the explicit
