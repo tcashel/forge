@@ -202,9 +202,11 @@ order: **Needs me**, **Ready to merge**, **Running**, **Stalled or
 recoverable**, **Planned**. The App renders that same queue; it does not
 derive a second classification. The `attention` rail names each
 subject that needs a human and the durable evidence for it — an epic holding
-on `input.required`, an attempt marked `revoking` and not yet reclaimed, a
-result taken into custody by `proto.quarantine`, or usage rows carrying no
-cost. An empty rail means nothing needs attention; it is never omitted.
+on `input.required`, a blocked/input-required slice, a clean or accepted-risk
+candidate awaiting delivery, a pending Beads settlement, an attempt marked
+`revoking` and not yet reclaimed, a result taken into custody by
+`proto.quarantine`, or usage rows carrying no cost. An empty rail means
+nothing needs attention; it is never omitted.
 
 Each queue/inventory entry carries a live Bead title (with a deterministic
 legacy fallback), repository and base branch, current stage/seat, last
@@ -225,6 +227,8 @@ evidence exists; the queue does not turn an unavailable GitHub lookup into a
 green check. `run status` and queue entries use the same `claimHealth` shape
 (`known`, status, assignee, expected assignee, stale-in-progress flag, and
 detail), so abandoned Bead ownership is visible instead of silently trusted.
+A clean or accepted-risk run deliberately retains its claim while its reviewed
+PR awaits delivery and is reported as awaiting delivery, not as stale.
 
 The overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the
