@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::AbortHandle;
 
@@ -29,6 +29,11 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// the write alone — deliberately a fraction of [`RPC_TIMEOUT`], which is
 /// what a caller that has already settled must never spend.
 pub(crate) const DISPATCH_BUDGET: Duration = Duration::from_millis(250);
+
+/// How much of a dispatched request's answer is read before the drain gives
+/// up. One JSON-RPC response frame is orders of magnitude smaller; the cap
+/// exists so a peer that never terminates a line cannot grow this buffer.
+const DRAIN_READ_CAP: u64 = 64 * 1024;
 
 /// Bound on the pre-synchronization set of retained `pane_created` ids.
 const GATE_RETAIN_CAP: usize = 1024;
@@ -288,20 +293,27 @@ impl Connection {
         }
     }
 
-    /// Fire one request and never read its response.
+    /// Fire one request and never let its response reach the caller.
     ///
-    /// The write IS the whole contract: no answer is awaited, so an
-    /// unresponsive herdr costs the caller one socket write rather than
-    /// [`RPC_TIMEOUT`]. Only for callers that have already settled and whose
-    /// correctness does not depend on the request's outcome — the residual
-    /// is an unclosed pane, never a delayed or altered settlement. Bounded
-    /// by [`DISPATCH_BUDGET`] because reaching a socket whose backlog is
-    /// full can itself block.
+    /// The write IS the whole contract for the CALLER: no answer is awaited
+    /// on their thread, so an unresponsive herdr costs them one socket write
+    /// rather than [`RPC_TIMEOUT`]. Only for callers that have already
+    /// settled and whose correctness does not depend on the request's
+    /// outcome — the residual is an unclosed pane, never a delayed or
+    /// altered settlement. Bounded by [`DISPATCH_BUDGET`] because reaching a
+    /// socket whose backlog is full can itself block.
     ///
-    /// Forgetting the outcome is not the same as never observing it: every
-    /// way this can fail leaves the residual an operator would otherwise
-    /// only meet as a stray shell, so each is logged at `warn`. The caller
-    /// still waits for none of it.
+    /// Forgetting the outcome is not the same as never observing it: a
+    /// failure here leaves a residual an operator would otherwise only meet
+    /// as a stray shell, so a detached task DOES read the response, and a
+    /// refusal that says the request was not honoured is logged at `warn`.
+    /// The caller waits for none of it.
+    ///
+    /// Two outcomes are deliberately silent. A refusal proving the pane is
+    /// ALREADY gone is the goal state reached by another route, not a
+    /// failure. And a drain that cannot read or outlives [`RPC_TIMEOUT`]
+    /// says nothing about whether herdr honoured the request — logging a
+    /// warning there would report a residual that may not exist.
     pub(crate) async fn dispatch(&self, method: &str, params: Value) {
         let request_id = self.next_request_id();
         let frame = serde_json::json!({
@@ -335,10 +347,14 @@ impl Connection {
             Ok(Some(stream)) => stream,
             Ok(None) => return,
             Err(_elapsed) => {
+                // NOT "unsent": the budget can expire after a partial or
+                // even a complete write, so delivery is genuinely unknown
+                // here. Reporting it as unsent would send an operator
+                // looking for a pane that may well have closed.
                 tracing::warn!(
                     method,
                     budget_ms = u64::try_from(DISPATCH_BUDGET.as_millis()).unwrap_or(u64::MAX),
-                    "herdr dispatch exceeded its budget; request unsent"
+                    "herdr dispatch exceeded its budget; delivery unknown"
                 );
                 return;
             }
@@ -351,14 +367,21 @@ impl Connection {
         let method = method.to_owned();
         tokio::spawn(async move {
             let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
-                let mut lines = BufReader::new(stream).lines();
+                // Bounded: this reads a peer's answer into memory with
+                // nothing awaiting it, so an unterminated line must not be
+                // able to grow without limit.
+                let mut lines = BufReader::new(stream.take(DRAIN_READ_CAP)).lines();
                 while let Ok(Some(incoming)) = lines.next_line().await {
                     if let Frame::Response {
                         id,
                         result: Err(error),
                     } = parse_frame(&incoming)
                     {
-                        if id == request_id {
+                        // A pane herdr cannot find is a pane already closed:
+                        // the request's whole purpose is served, so this is
+                        // the one refusal that is not worth an operator's
+                        // attention.
+                        if id == request_id && !error.is_pane_not_found() {
                             tracing::warn!(
                                 method,
                                 code = %error.code,

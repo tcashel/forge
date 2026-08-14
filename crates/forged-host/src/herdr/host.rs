@@ -590,12 +590,14 @@ impl SessionHost for HerdrHost {
     /// session identity: dropping the map entry would make
     /// `session_status_path` — and so `alive` and `kill_confirmed` —
     /// answer [`HostError::SessionNotFound`] for an id this instance
-    /// issued. `ForgedPorts::attempt_liveness` resolves an attempt through
-    /// its owning host and turns any host error into
-    /// `PortError::Unavailable`, which `forged_proto::reconcile` propagates
-    /// with `?`; so a row this process released but left `revoking` — a
-    /// refused settle, still owing a confirmable kill — would abort the very
-    /// reconcile pass that was going to reclaim its packet.
+    /// issued. The saga does not ask about liveness first: step 2 of
+    /// `forged_proto::reconcile`'s revoking path calls `kill_confirmed`
+    /// directly, because the fence is confirmed death and never a liveness
+    /// reading. `ForgedPorts` turns the host's error into
+    /// `PortError::Unavailable` and reconcile propagates it with `?`, so a
+    /// row this process released but left `revoking` — a refused settle,
+    /// still owing a confirmable kill — would abort the very pass that was
+    /// going to reclaim its packet.
     ///
     /// An id absent from the map is NOT this host's pane: herdr closes
     /// whatever pane carries the id it is handed, so the dispatch is fenced
