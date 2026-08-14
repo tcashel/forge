@@ -1269,6 +1269,10 @@ pub struct Dispatched {
     pub text: String,
     pub ident: String,
     pub chips: Vec<String>,
+    /// The attention rail, each item `{label, detail}`. It is drawn outside
+    /// `#view`, so a payload whose subject IS what needs a human is not
+    /// observable from `view` alone.
+    pub rail: Vec<Value>,
     pub tabs_hidden: bool,
     pub controls_hidden: bool,
     pub args: Value,
@@ -1283,6 +1287,11 @@ impl Dispatched {
             .filter_map(|node| node.get("picks").cloned())
             .filter(|picks| !picks.is_null())
             .collect()
+    }
+
+    /// The rail item drawn under one label, if any.
+    pub fn rail_item(&self, label: &str) -> Option<&Value> {
+        self.rail.iter().find(|item| item["label"] == json!(label))
     }
 }
 
@@ -1314,6 +1323,7 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
                     .collect()
             })
             .unwrap_or_default(),
+        rail: out["rail"].as_array().cloned().unwrap_or_default(),
         tabs_hidden: out["tabsHidden"].as_bool().unwrap_or(false),
         controls_hidden: out["controlsHidden"].as_bool().unwrap_or(false),
         args: out["args"].clone(),

@@ -93,6 +93,13 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
   border-radius: var(--border-radius-sm);
 }
 .copy:hover { color: var(--color-text-primary); background: var(--color-background-tertiary); }
+/* One click back up to the portfolio, from any subject view. */
+.up {
+  border: 0; padding: 1px 6px;
+  font: 400 11px/1.4 var(--font-sans); color: var(--color-text-tertiary);
+  border-radius: var(--border-radius-sm);
+}
+.up:hover { color: var(--color-text-primary); background: var(--color-background-tertiary); }
 .subident {
   margin-top: calc(var(--u) * 1.5);
   display: flex; gap: calc(var(--u) * 3); flex-wrap: wrap;
@@ -1665,33 +1672,105 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       body.append(el("div", "empty", "Nothing in the ledger matches. Ask work_list for the whole inventory."));
       return [box];
     }
-    const grid = el("div", "beads");
-    for (const candidate of candidates) {
-      const card = el("button", "bead bead--pick");
-      card.type = "button";
-      const top = el("div", "bead__top");
-      top.append(el("span", "bead__id", candidate.id));
-      top.append(chip(candidate.kind || "unknown", candidate.kind === "epic" ? "warn" : "idle"));
-      card.append(top);
-      card.append(el("div", "bead__title", candidate.beadId || ""));
-      const foot = el("div", "bead__foot");
-      foot.append(el("span", "", candidate.state || "unknown"));
-      if (candidate.branch) foot.append(el("span", "trunc", candidate.branch));
-      card.append(foot);
-      card.addEventListener("click", () => choose(candidate));
-      grid.append(card);
-    }
-    body.append(grid);
+    body.append(pickGrid(candidates));
     return [box];
   }
 
-  /** Re-ask about one candidate under the explicit param its kind implies. */
-  function choose(candidate) {
+  /**
+   * One grid of inventory entries, each a click into that subject.
+   *
+   * A chooser's candidates and the portfolio's entries are the same rows of
+   * the same inventory, so they draw the same card; a key a row does not
+   * carry — spend, on a candidate — renders nothing rather than a zero it
+   * was never told.
+   */
+  function pickGrid(entries) {
+    const grid = el("div", "beads");
+    for (const entry of entries) {
+      const card = el("button", "bead bead--pick");
+      card.type = "button";
+      const top = el("div", "bead__top");
+      top.append(el("span", "bead__id", entry.id));
+      top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
+      card.append(top);
+      card.append(el("div", "bead__title", entry.beadId || ""));
+      const foot = el("div", "bead__foot");
+      foot.append(el("span", "", entry.state || "unknown"));
+      if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
+      if (num(entry.costUsdKnown)) foot.append(el("span", "", `$${num(entry.costUsdKnown).toFixed(2)}`));
+      if (entry.branch) foot.append(el("span", "trunc", entry.branch));
+      card.append(foot);
+      card.addEventListener("click", () => choose(entry));
+      grid.append(card);
+    }
+    return grid;
+  }
+
+  /**
+   * The root view: every unit of work the ledger holds, newest first.
+   *
+   * The portfolio states its own bound — `total` against the entries it
+   * carries — so a truncated answer reads as truncated. Spend and the
+   * attention count cover the WHOLE inventory, not the page.
+   */
+  function viewPortfolio(data) {
+    const entries = arr(data.entries);
+    const total = num(data.total);
+    const missing = num(at(data, "spend.rowsMissingCost"));
+    const held = num(data.attentionTotal);
+
+    const head = panel("Portfolio", `cap ${int(data.cap)}`);
+    const stats = el("div", "spend");
+    const stat = (value, key, sub) => {
+      const cell = el("div");
+      cell.append(el("div", "spend__n", value));
+      cell.append(el("div", "spend__k", key));
+      if (sub) cell.append(el("div", "spend__sub", sub));
+      stats.append(cell);
+    };
+    stat(int(total), "work items",
+      entries.length < total ? `newest ${int(entries.length)} shown` : "all of them");
+    stat(int(data.liveSeats), "live seats",
+      num(data.liveSeats) ? "executing now" : "nothing is executing");
+    stat(int(held), "needs a human", held ? "see the rail" : "nothing is waiting");
+    stat(`$${num(at(data, "spend.costUsdKnown")).toFixed(2)}`, "known spend",
+      missing ? `${int(missing)} rows carry no cost` : "every row priced");
+    head.body.append(stats);
+
+    const box = panel("Work", entries.length < total
+      ? `newest ${int(entries.length)} of ${int(total)}`
+      : "newest first");
+    const body = box.flush();
+    if (!entries.length) {
+      body.append(el("div", "empty", "Nothing in the ledger yet. Start a run or an epic and it appears here."));
+      return [head, box];
+    }
+    body.append(pickGrid(entries));
+    return [head, box];
+  }
+
+  /**
+   * Re-ask under the explicit param the entry's kind implies — never the id
+   * that failed to resolve. The portfolio is the one subject addressed by
+   * ABSENCE, so returning to it is this same click with no param at all.
+   */
+  function choose(entry) {
     state.args = {
       schemaVersion: 1,
-      params: candidate.kind === "epic" ? { epic: candidate.id } : { run: candidate.id },
+      params: entry.kind === "portfolio"
+        ? {}
+        : entry.kind === "epic" ? { epic: entry.id } : { run: entry.id },
     };
     refresh();
+  }
+
+  /** One click back up to the portfolio, offered by every subject view. */
+  function upToPortfolio() {
+    const up = el("button", "up", "↑ all work");
+    up.type = "button";
+    up.title = "Every run and epic";
+    up.addEventListener("click", () => choose({ kind: "portfolio" }));
+    return up;
   }
 
   // ------------------------------------------------------------------ shell
@@ -1708,6 +1787,39 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     poll: document.getElementById("poll"),
     expand: document.getElementById("expand"),
   };
+
+  /**
+   * Draw one attention rail, most blocking first, and hand back what it
+   * drew. One shape — `{tone, label, detail}` — whether the items were
+   * derived from a subject projection or carried by the portfolio.
+   */
+  function drawRail(items) {
+    const order = { block: 0, warn: 1, info: 2 };
+    const sorted = items.slice().sort((a, b) => (order[a.tone] ?? 3) - (order[b.tone] ?? 3));
+    for (const item of sorted) {
+      const node = el("div", `rail__item rail__item--${item.tone}`);
+      node.append(el("div", "rail__label", item.label));
+      node.append(el("div", "rail__detail", item.detail));
+      nodes.rail.append(node);
+    }
+    return sorted;
+  }
+
+  /**
+   * The portfolio's rail items, read from the payload's own conditions.
+   *
+   * The condition and its evidence are projected, never re-derived here:
+   * the App has no ledger to check them against. Only the tone is the
+   * App's, because only tone is presentation.
+   */
+  function portfolioRail(data) {
+    const tone = { "input-required": "block", revoking: "block", quarantined: "block", "missing-cost": "info" };
+    return arr(data.attention).map((item) => ({
+      tone: tone[item.condition] || "warn",
+      label: String(item.condition || "attention").replace(/-/g, " "),
+      detail: `${item.id} · ${item.detail || ""}`,
+    }));
+  }
 
   function render() {
     const data = state.data;
@@ -1740,6 +1852,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
       nodes.ident.append(chip(data.resolution.reason || "unresolved", "warn"));
       nodes.subident.textContent = "";
+      nodes.subident.append(upToPortfolio());
       const hint = el("span", "trunc");
       hint.append(el("b", "", "id "), document.createTextNode("names no single run or epic"));
       nodes.subident.append(hint);
@@ -1747,6 +1860,30 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.tabs.hidden = true;
       nodes.view.className = "view view--enter";
       for (const node of viewResolution(data.resolution)) nodes.view.append(node);
+      nodes.foot.append(el("span", "", `schema ${data.schema}`));
+      reportSize();
+      setTimeout(reportSize, 250);
+      return;
+    }
+
+    // The portfolio has no subject either — it is the level above one. No
+    // tabs and no seats: the rail names what needs a human, the view lists
+    // what exists, and a click on any entry drills in.
+    if (data.kind === "portfolio") {
+      nodes.identText.textContent = "all work";
+      nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
+      const held = num(data.attentionTotal);
+      nodes.ident.append(chip(`${int(data.total)} in the ledger`, num(data.liveSeats) ? "live" : "idle"));
+      if (held) nodes.ident.append(chip(`${int(held)} need${held === 1 ? "s" : ""} a human`, "block"));
+      nodes.subident.textContent = "";
+      const scope = el("span", "trunc");
+      scope.append(el("b", "", "scope "), document.createTextNode("every run and epic"));
+      nodes.subident.append(scope);
+      nodes.controls.hidden = false;
+      nodes.tabs.hidden = true;
+      drawRail(portfolioRail(data));
+      nodes.view.className = "view view--enter";
+      for (const node of viewPortfolio(data)) nodes.view.append(node);
       nodes.foot.append(el("span", "", `schema ${data.schema}`));
       reportSize();
       setTimeout(reportSize, 250);
@@ -1762,6 +1899,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     nodes.ident.append(chip(head.label, head.tone));
 
     nodes.subident.textContent = "";
+    nodes.subident.append(upToPortfolio());
     const bits = data.kind === "epic"
       ? [["kind", "epic"], ["title", at(data, "status.title")], ["branch", at(data, "status.integrationBranch")], ["cursor", data.cursor]]
       : [["kind", "slice"], ["bead", at(data, "status.beadId")], ["branch", at(data, "status.branch")], ["cursor", data.cursor]];
@@ -1779,14 +1917,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
     nodes.controls.hidden = false;
 
-    const order = { block: 0, warn: 1, info: 2 };
-    const items = attention(data, rows).sort((a, b) => (order[a.tone] ?? 3) - (order[b.tone] ?? 3));
-    for (const item of items) {
-      const node = el("div", `rail__item rail__item--${item.tone}`);
-      node.append(el("div", "rail__label", item.label));
-      node.append(el("div", "rail__detail", item.detail));
-      nodes.rail.append(node);
-    }
+    const items = drawRail(attention(data, rows));
 
     const tabs = data.kind === "epic"
       ? [["flow", "Overview", null], ["waves", "Waves", arr(at(data, "status.children")).length],
@@ -1883,16 +2014,25 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
     state.error = null;
     state.data = data;
-    if (!state.args) {
-      // A resolution has no single subject, but it does have the id the
-      // caller asked about — so Refresh re-asks the SAME question rather
-      // than no-opping against a null `state.args`. Candidates are live
-      // work: one that was ambiguous a minute ago can resolve on its own.
-      state.args = data.resolution
-        ? { schemaVersion: 1, params: { id: data.resolution.query || "" } }
-        : { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
-    }
+    // Refresh has to have something to send even when the host supplied no
+    // arguments at all.
+    if (!state.args) state.args = { schemaVersion: 1, params: subjectParams(data) };
     render();
+  }
+
+  /**
+   * The params that re-ask for exactly this payload.
+   *
+   * A resolution has no single subject, but it does have the id the caller
+   * asked about, and candidates are live work: one that was ambiguous a
+   * minute ago can resolve on its own. The portfolio is addressed by
+   * ABSENCE, so its params are the empty object — never a `run` key holding
+   * an id the payload never had.
+   */
+  function subjectParams(data) {
+    if (data.resolution) return { id: data.resolution.query || "" };
+    if (data.kind === "portfolio") return {};
+    return data.kind === "epic" ? { epic: data.id } : { run: data.id };
   }
 
   function readToolResult(params) {
@@ -1906,10 +2046,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
   async function refresh() {
     if (state.loading || !host.connected) return;
-    const args = state.args || (state.data?.id
-      ? { schemaVersion: 1, params: state.data.kind === "epic" ? { epic: state.data.id } : { run: state.data.id } }
-      : null);
-    if (!args) return;
+    // Nothing to re-ask about is itself a question: with no args and no
+    // payload the App asks for the portfolio rather than sending nothing.
+    const args = state.data
+      ? state.args || { schemaVersion: 1, params: subjectParams(state.data) }
+      : state.args || { schemaVersion: 1, params: {} };
     state.loading = true;
     render();
     try {

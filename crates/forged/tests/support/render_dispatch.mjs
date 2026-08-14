@@ -14,6 +14,9 @@
 //             order, with its class, plus `picks` for a clickable card
 //   ident     the identity line's text
 //   chips     the chip labels rendered beside it
+//   rail      the attention rail's items, each `{label, detail}` — the rail
+//             lives outside #view, and a payload whose whole point is what
+//             needs a human is not observable without it
 //   tabsHidden / controlsHidden   what the resolution branch asserts
 //   args      `state.args` after ingest, which is what Refresh would send
 //   error     `state.error`, so an unknown schema is observable too
@@ -125,7 +128,11 @@ const document = {
   },
 };
 
-const source = ["el", "arr", "chip", "panel", "choose", "viewResolution", "render", "ingest"]
+const source = [
+  "el", "arr", "at", "num", "int", "chip", "panel", "pickGrid", "choose", "upToPortfolio",
+  "viewResolution", "viewPortfolio", "drawRail", "portfolioRail", "render", "subjectParams",
+  "ingest",
+]
   .map(lift)
   .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
@@ -171,6 +178,10 @@ process.stdout.write(
     text: view.map((n) => n.text).filter(Boolean).join("\n"),
     ident: nodes.identText.textContent ?? "",
     chips: nodes.ident.kids.filter((k) => k.className.includes("chip")).map((k) => k.textContent),
+    rail: nodes.rail.kids.map((item) => ({
+      label: String(item.kids[0]?.textContent ?? ""),
+      detail: String(item.kids[1]?.textContent ?? ""),
+    })),
     tabsHidden: nodes.tabs.hidden,
     controlsHidden: nodes.controls.hidden,
     args: state.args,
