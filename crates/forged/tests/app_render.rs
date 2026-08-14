@@ -1,4 +1,4 @@
-//! Renderer-level tests for the App's Cost tab.
+//! Renderer-level tests for the App's Cost tab and candidate chooser.
 //!
 //! The spend header is the one place the projection can lie to an operator:
 //! an epic whose codex seats were priced from the operator's rate card must
@@ -10,7 +10,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{render_cost, require_node};
+use support::{render_cost, render_resolution, require_node};
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
 fn row(run_id: &str, seat: &str, basis: &str, cost: f64, searches: u64) -> Value {
@@ -136,6 +136,73 @@ fn an_epic_with_no_usage_renders_the_empty_state() {
             .text
             .contains("No usage recorded on any child run."),
         "an epic with no rows says so: {}",
+        rendered.text
+    );
+}
+
+// ------------------------------------------------------------ resolution
+
+/// An unresolvable id degrades into a menu: the guard at `ingest` still
+/// rejects an unknown schema, so a `resolution` payload stays on
+/// `forged.overview/1` and the view has to draw it rather than fall through
+/// to "a payload this view does not know how to draw".
+#[test]
+fn an_ambiguous_id_renders_every_candidate_with_its_kind_and_state() {
+    let Some(node) = require_node() else { return };
+    let rendered = render_resolution(
+        &node,
+        &json!({
+            "query": "beads-mk2",
+            "reason": "ambiguous",
+            "candidates": [
+                {"id": "beads-mk2.1", "kind": "slice", "state": "active", "beadId": "beads-mk2.1"},
+                {"id": "beads-mk2.2", "kind": "epic", "state": "stopped", "beadId": "beads-mk2.2"},
+            ],
+        }),
+    );
+    for expected in [
+        "beads-mk2.1",
+        "beads-mk2.2",
+        "slice",
+        "epic",
+        "active",
+        "stopped",
+    ] {
+        assert!(
+            rendered.text.contains(expected),
+            "the chooser names {expected}: {}",
+            rendered.text
+        );
+    }
+    // Picking a candidate re-asks with the explicit param its kind implies —
+    // never with the id that failed to resolve.
+    let picks: Vec<Value> = rendered
+        .nodes
+        .iter()
+        .filter_map(|n| n.get("picks").cloned())
+        .collect();
+    assert_eq!(
+        picks.len(),
+        2,
+        "every candidate is pickable: {}",
+        rendered.text
+    );
+    assert_eq!(picks[0]["params"], json!({"run": "beads-mk2.1"}));
+    assert_eq!(picks[1]["params"], json!({"epic": "beads-mk2.2"}));
+}
+
+/// "Nothing could have been meant" is an answer, and the chooser says so
+/// instead of rendering an empty grid.
+#[test]
+fn an_unknown_id_renders_an_empty_state_rather_than_an_empty_grid() {
+    let Some(node) = require_node() else { return };
+    let rendered = render_resolution(
+        &node,
+        &json!({"query": "nothing", "reason": "unknown", "candidates": []}),
+    );
+    assert!(
+        rendered.text.contains("Nothing in the ledger matches"),
+        "an unknown id says so: {}",
         rendered.text
     );
 }
