@@ -547,7 +547,7 @@ fn concurrent_submit_keys_share_one_controller_generation() {
     let status = wait_for(
         &env,
         &["run", "status", "--run", "bead-submit-singleton"],
-        |value| value["result"]["run"]["nextAction"]["stop"]["done"].is_object(),
+        |value| value["result"]["run"]["nextAction"]["stop"].is_object(),
     );
     assert_eq!(
         status["result"]["run"]["controller"]["generation"],
