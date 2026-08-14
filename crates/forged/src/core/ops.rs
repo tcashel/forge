@@ -1,7 +1,8 @@
 //! The non-drive core functions: doctor, init, run start/status, packet
-//! lifecycle, gate run, reconcile, usage, events, worktree retire.
+//! lifecycle, gate run, reconcile, usage, work list, events, worktree
+//! retire.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
@@ -17,7 +18,7 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, err_response, fenced, key_absent, on_ledger, param_opt_str, param_str,
-    read_only, session_claimant, Ctx, Failure,
+    read_only, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -1183,6 +1184,62 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
         note(&attempt.packet_id, attempt.attempt_id);
     }
     latest
+}
+
+// ------------------------------------------------------------- inventory
+
+/// `work list` — the discovery surface: every run the ledger holds, live or
+/// historical, each labelled `slice` or `epic`.
+///
+/// The one entry point that takes no id, so a caller with no prior knowledge
+/// can enumerate the inventory and then address any entry. `kind` is derived
+/// from the presence of a `forged.epic.started` event — the only signal that
+/// separates an epic run from a slice run; there is no column for it. Live
+/// seats come from ONE `list_live_attempts(None)` scan grouped by run, never
+/// a per-run query. Absent usage is data: a run with no usage rows reports
+/// zero spend rather than failing.
+pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("work_list", req, || async {
+        let runs = on_ledger(&ctx.ledger, |l| l.list_runs()).await?;
+        let epics: BTreeSet<String> = on_ledger(&ctx.ledger, |l| {
+            l.list_events_by_kind("forged.epic.started")
+        })
+        .await?
+        .into_iter()
+        .filter_map(|event| event.run_id)
+        .collect();
+        let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
+        for attempt in on_ledger(&ctx.ledger, |l| l.list_live_attempts(None)).await? {
+            let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
+            *live_seats.entry(run_id).or_default() += 1;
+        }
+        let mut entries = Vec::with_capacity(runs.len());
+        for run in runs {
+            let totals = {
+                let run_id = run.run_id.clone();
+                on_ledger(&ctx.ledger, move |l| l.usage_totals(&run_id)).await?
+            };
+            entries.push(json!({
+                "id": run.run_id,
+                "kind": if epics.contains(&run.run_id) { "epic" } else { "slice" },
+                "beadId": run.bead_id,
+                "repo": run.repo,
+                "branch": run.branch,
+                "state": match run.state {
+                    RunState::Active => "active",
+                    RunState::Stopped => "stopped",
+                },
+                "stopReason": run.stop_reason,
+                "createdAt": run.created_at,
+                "updatedAt": run.updated_at,
+                "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
+                "costUsdKnown": totals.cost_usd_known,
+                "rowsMissingCost": totals.rows_missing_cost,
+            }));
+        }
+        Ok(json!({"runs": entries}))
+    })
+    .await
 }
 
 // ---------------------------------------------------------------- events

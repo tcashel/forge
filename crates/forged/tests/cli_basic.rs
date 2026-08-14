@@ -34,6 +34,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "usage",
         "events",
         "overview",
+        "work",
         "worktree",
         "mcp",
     ] {
@@ -107,6 +108,8 @@ fn help_lists_every_command_and_subcommand_flags() {
     }
     let usage = help_text(&env, &["usage", "--help"]);
     assert!(usage.contains("ingest"), "usage --help must list ingest");
+    let work = help_text(&env, &["work", "--help"]);
+    assert!(work.contains("list"), "work --help must list list");
     let events = help_text(&env, &["events", "--help"]);
     for flag in ["--run", "--after", "--limit"] {
         assert!(events.contains(flag), "events --help must document {flag}");
