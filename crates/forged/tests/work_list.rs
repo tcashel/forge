@@ -96,9 +96,146 @@ fn an_empty_ledger_enumerates_to_an_empty_list() {
     let (code, response) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "work list: {response}");
     assert_eq!(response["ok"], json!(true));
-    assert_eq!(response["result"], json!({"runs": []}));
+    assert_eq!(response["result"]["runs"], json!([]));
+    let groups = response["result"]["queue"]["groups"]
+        .as_array()
+        .expect("the empty queue still names every group");
+    assert_eq!(groups.len(), 5);
+    assert!(groups.iter().all(|group| group["entries"] == json!([])));
     // No id in, no InvalidRequest out.
     assert_eq!(response["error"], Value::Null);
+}
+
+#[test]
+fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
+    let env = TestEnv::new("forged-work-operator-queue");
+    env.forged(&["init"]);
+    fabricate_run(&env, "q-planned");
+    fabricate_run(&env, "q-running");
+    fabricate_run(&env, "q-stalled");
+    fabricate_run(&env, "q-ready");
+    fabricate_live_seats(&env, "q-running", 1);
+    env.set_bead_field("bead-q-planned", "title", "Prepare the operator queue");
+    env.set_bead_field("bead-q-stalled", "status", "in_progress");
+    env.set_assignee("bead-q-stalled", "someone-else");
+    env.set_bead_field("bead-q-ready", "status", "in_progress");
+    env.set_assignee("bead-q-ready", "forged:bead-q-ready:0");
+    let ledger = env.ledger();
+    ledger
+        .set_run_state(
+            "q-stalled",
+            forged_ledger::RunState::Stopped,
+            Some("driver exited before settlement".to_owned()),
+        )
+        .expect("stop stalled run");
+    ledger
+        .settle_run(
+            "q-ready",
+            forged_ledger::RunOutcome::Clean,
+            "reviewed candidate awaits delivery".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle ready run");
+    ledger
+        .append_event(
+            Some("q-ready"),
+            "proto.pr",
+            json!({
+                "schemaVersion": 1,
+                "number": 42,
+                "isDraft": true,
+                "url": "https://example.invalid/pr/42",
+            }),
+        )
+        .expect("record ready PR");
+    ledger
+        .append_event(
+            Some("q-running"),
+            "proto.pr",
+            json!({
+                "schemaVersion": 1,
+                "number": 43,
+                "isDraft": true,
+                "url": "https://example.invalid/pr/43",
+            }),
+        )
+        .expect("record in-flight draft PR");
+    ledger.close().expect("close ledger");
+
+    let (code, response) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {response}");
+    let groups = response["result"]["queue"]["groups"]
+        .as_array()
+        .expect("queue groups");
+    assert_eq!(
+        groups
+            .iter()
+            .map(|group| group["name"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        vec![
+            "Needs me",
+            "Ready to merge",
+            "Running",
+            "Stalled or recoverable",
+            "Planned",
+        ]
+    );
+    let in_group = |name: &str, id: &str| {
+        groups
+            .iter()
+            .find(|group| group["name"] == json!(name))
+            .and_then(|group| group["entries"].as_array())
+            .and_then(|entries| entries.iter().find(|entry| entry["id"] == json!(id)))
+            .cloned()
+            .unwrap_or_else(|| panic!("{id} is in {name}: {response}"))
+    };
+    assert_eq!(
+        in_group("Ready to merge", "q-ready")["pr"]["number"],
+        json!(42)
+    );
+    assert_eq!(
+        in_group("Ready to merge", "q-ready")["pr"]["baseBranch"],
+        json!("main")
+    );
+    assert_eq!(
+        in_group("Ready to merge", "q-ready")["claimHealth"]["staleInProgress"],
+        json!(false)
+    );
+    assert_eq!(
+        in_group("Running", "q-running")["currentStage"],
+        json!("implement")
+    );
+    let stalled = in_group("Stalled or recoverable", "q-stalled");
+    assert_eq!(stalled["claimHealth"]["staleInProgress"], json!(true));
+    assert!(stalled["blocker"].as_str().is_some());
+    let planned = in_group("Planned", "q-planned");
+    assert_eq!(planned["title"], json!("Prepare the operator queue"));
+    assert_eq!(planned["ci"]["status"], json!("unknown"));
+    for key in [
+        "outcome",
+        "delivery",
+        "supersededBy",
+        "controller",
+        "nextAction",
+    ] {
+        assert!(
+            planned.get(key).is_some(),
+            "entry includes {key}: {planned}"
+        );
+    }
+
+    let calls =
+        std::fs::read_to_string(env.beads_dir.join("shim-state/calls.log")).expect("bd calls");
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("list "))
+            .count(),
+        1,
+        "one bounded Beads read enriches the whole queue: {calls}"
+    );
 }
 
 #[test]
@@ -406,26 +543,14 @@ fn an_unreadable_pause_payload_still_lists_a_paused_epic() {
     assert_eq!(epic["stopReason"], Value::Null, "no reason invented");
 }
 
-/// The `runs` row is the durable state wherever one exists. An id that
-/// carries BOTH — `epic start` on a bead, then `run start` on that same
-/// bead — is ONE entry: labelled `epic` by the event, with the row's
-/// columns.
+/// The `runs` row is the durable state wherever one exists. A legacy/corrupt
+/// id that carries BOTH an epic start event and a fabricated run row is ONE
+/// entry: labelled `epic` by the event, with the row's columns. Production
+/// now refuses routing an epic Bead through `run start`.
 #[test]
 fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
-    let (env, repo, spec) = started_epic("forged-work-list-both", "epic-both", "child-both");
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--bead",
-        "epic-both",
-        "--repo",
-        &repo,
-        "--spec",
-        &spec,
-        "--base-ref",
-        "main",
-    ]);
-    assert_eq!(code, 0, "run start: {started}");
+    let (env, _, _) = started_epic("forged-work-list-both", "epic-both", "child-both");
+    fabricate_run(&env, "epic-both");
 
     let (code, response) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "work list: {response}");

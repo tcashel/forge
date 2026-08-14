@@ -14,7 +14,7 @@ use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
 };
-use forged_types::{Deliverable, OperationRequest, Stage, StageContract, WorkPacket};
+use forged_types::{Deliverable, OperationRequest, Outcome, Stage, StageContract, WorkPacket};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -33,6 +33,10 @@ pub struct ExecutionContext {
     pub findings: Vec<forged_types::Finding>,
     /// Standing review evidence supplied to an adaptive synthesis seat.
     pub review_evidence: Vec<String>,
+    /// Frozen consequence context used to classify review severity.
+    pub risk_context: String,
+    /// Frozen maximum number of remediation attempts.
+    pub fix_round_budget: u8,
     /// The run's remote URL (for Fix prompts).
     pub push_url: String,
     /// Frozen process-host policy for this run.
@@ -166,7 +170,7 @@ pub fn build_packet(
         },
         result_schema: PromptStage::for_stage(stage).result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
-        field_notes: Vec::new(),
+        field_notes: spec.bead_context.clone(),
     };
     packet.spec.path = match source {
         SpecSource::File(path) => path.clone(),
@@ -348,6 +352,7 @@ fn render_context(
             } else {
                 packet.field_notes.clone()
             },
+            "risk_context": exec.risk_context,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -355,8 +360,12 @@ fn render_context(
             "bead_id": packet.bead_id,
             "pr_number": exec.pr_number.unwrap_or(0),
             "worktree": worktree,
-            "round": fix_round,
-            "total_rounds": 1,
+            "round": if packet.execution.is_some() { fix_round + 1 } else { fix_round },
+            "total_rounds": if packet.execution.is_some() {
+                i64::from(exec.fix_round_budget)
+            } else {
+                1
+            },
             "gate_commands": packet.contract.gate_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
@@ -663,9 +672,9 @@ async fn settle_host_fallback(
 /// standing on its bounded-retry budget rather than as this stage's answer.
 /// That distinction is load-bearing: a plain note classifies SEMANTIC, and a
 /// semantic failure IS a stage result — `contribution` merges it into the
-/// review fan-out as `RequestChanges`, and `advance` spends the run's one fix
+/// review fan-out as `RequestChanges`, and `advance` spends a remediation
 /// round on it — so a review seat that never spawned would speak a verdict it
-/// never had and a fix seat that never spawned would end the run.
+/// never had and a fix seat that never spawned could end the run.
 ///
 /// The row is failed either way, so the packet is re-claimable and
 /// re-pinnable; the budget is what bounds a cause that will not clear. An
@@ -1137,6 +1146,47 @@ pub async fn land_result(
             .and_then(Value::as_str)
             == Some("Landed");
         if landed {
+            if let Outcome::Review {
+                verdict,
+                findings,
+                available,
+                ..
+            } = &result.outcome
+            {
+                let packet_id_for_read = packet_id.to_owned();
+                let packet = on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.get_packet(&packet_id_for_read)
+                })
+                .await?;
+                let stored = forged_proto::stored_packet(&packet).map_err(|error| {
+                    Failure::internal(format!("stored review packet does not parse: {error}"))
+                })?;
+                let execution = stored.execution.as_ref();
+                let event = json!({
+                    "schemaVersion": 1,
+                    "packetId": packet_id,
+                    "attemptId": attempt_id,
+                    "seatId": execution.map(|value| value.seat_id.as_str()),
+                    "roleId": execution.map(|value| value.role_id.as_str()),
+                    "purpose": execution.map(|value| value.purpose),
+                    "round": execution.map(|value| value.round),
+                    "stage": stored.stage,
+                    "seq": packet.seq,
+                    "verdict": verdict,
+                    "available": available,
+                    "findingCount": findings.len(),
+                });
+                let run_for_event = run_id.to_owned();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_event_once(
+                        &run_for_event,
+                        "forged.review.seat.settled",
+                        event,
+                    )?;
+                    Ok(())
+                })
+                .await?;
+            }
             Ok(PacketOutcome::Landed(Box::new(result)))
         } else {
             Ok(PacketOutcome::Quarantined)
@@ -1483,6 +1533,8 @@ mod settle_tests {
             pr_number: None,
             findings: Vec::new(),
             review_evidence: Vec::new(),
+            risk_context: "routine".to_owned(),
+            fix_round_budget: 1,
             push_url: String::new(),
             host_policy: HostPolicy::Required,
             herdr_socket: Some(socket.clone()),
@@ -1506,6 +1558,7 @@ mod settle_tests {
             body: None,
             sha256: spec_sha.clone(),
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
+            bead_context: Vec::new(),
         };
         let packet =
             build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600).expect("packet");

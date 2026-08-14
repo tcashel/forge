@@ -182,13 +182,41 @@ pub enum Severity {
 }
 
 /// A single review finding.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Finding {
     pub severity: Severity,
     pub file: Option<String>,
     pub line: Option<u32>,
     pub message: String,
+}
+
+/// A provider's structured request to change the specification instead of
+/// guessing through a contradiction or repairing toward the wrong outcome.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SpecAmendment {
+    /// Short statement of the contract that cannot be implemented safely.
+    pub summary: String,
+    /// Concrete repository evidence that makes the amendment necessary.
+    pub evidence: String,
+    /// Replacement requirement proposed for operator adjudication.
+    pub proposed_change: String,
+}
+
+/// An operator's explicit decision to land with known review findings.
+///
+/// This is terminal evidence, never a reviewer verdict: only the run control
+/// surface may create it after the configured review budget is exhausted.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AcceptedRisk {
+    /// Stable operator or lead-agent identity making the decision.
+    pub accepted_by: String,
+    /// Why the findings are acceptable in this run's declared risk context.
+    pub rationale: String,
+    /// The deduplicated findings visible when the decision was made.
+    pub findings: Vec<Finding>,
 }
 
 /// Stage-specific outcome payloads.
@@ -211,6 +239,11 @@ pub enum Outcome {
     Fix {
         applied: bool,
         summary: String,
+    },
+    /// Stop the current loop for operator adjudication without inventing a
+    /// fix, successor run, or successor Bead.
+    SpecAmendment {
+        amendment: SpecAmendment,
     },
 }
 
@@ -525,6 +558,39 @@ mod tests {
                 applied: false,
                 summary: "nothing to fix".to_owned(),
             },
+        });
+    }
+
+    #[test]
+    fn spec_amendment_and_accepted_risk_round_trip() {
+        let amendment = SpecAmendment {
+            summary: "the requested API does not exist".to_owned(),
+            evidence: "src/lib.rs exports only the replacement API".to_owned(),
+            proposed_change: "target the replacement API".to_owned(),
+        };
+        let result = PacketResult {
+            schema: "forged.result.implement/1".to_owned(),
+            packet_id: "pkt-4".to_owned(),
+            outcome: Outcome::SpecAmendment {
+                amendment: amendment.clone(),
+            },
+        };
+        round_trip(&result);
+        assert_eq!(
+            serde_json::to_value(&result).expect("serializes")["outcome"]["specAmendment"]
+                ["amendment"]["proposedChange"],
+            json!("target the replacement API")
+        );
+
+        round_trip(&AcceptedRisk {
+            accepted_by: "lead-agent".to_owned(),
+            rationale: "the affected path is disabled in this deployment".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::High,
+                file: Some("src/lib.rs".to_owned()),
+                line: Some(7),
+                message: "disabled path can return stale data".to_owned(),
+            }],
         });
     }
 

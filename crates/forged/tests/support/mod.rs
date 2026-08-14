@@ -471,15 +471,21 @@ esac
 inner=""
 case "$stage" in
   implement|implementation)
-    printf 'impl by shim\n' > "impl-$seq.txt"
-    git add "impl-$seq.txt"
-    git commit -q -m "feat: shim implement $seq"
-    commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
-    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    if [ "$mode" = spec-amendment ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
+    else
+      printf 'impl by shim\n' > "impl-$seq.txt"
+      git add "impl-$seq.txt"
+      git commit -q -m "feat: shim implement $seq"
+      commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    fi
     ;;
   reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
     if [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif [ "$mode" = request-changes ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
@@ -568,15 +574,21 @@ esac
 inner=""
 case "$stage" in
   implement|implementation)
-    printf 'impl by shim\n' > "impl-$seq.txt"
-    git add "impl-$seq.txt"
-    git commit -q -m "feat: shim implement $seq"
-    commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
-    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    if [ "$mode" = spec-amendment ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
+    else
+      printf 'impl by shim\n' > "impl-$seq.txt"
+      git add "impl-$seq.txt"
+      git commit -q -m "feat: shim implement $seq"
+      commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    fi
     ;;
   reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
     if [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif [ "$mode" = request-changes ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
@@ -634,25 +646,60 @@ issue_json() {
   acceptance=$(cat "$state/$id.acceptance" 2>/dev/null || true)
   design=$(cat "$state/$id.design" 2>/dev/null || true)
   notes=$(cat "$state/$id.notes" 2>/dev/null || true)
+  metadata=$(cat "$state/$id.metadata" 2>/dev/null || echo '{}')
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
 }
 case "$cmd" in
   version)
     printf '{"schema_version":1,"data":{"version":"1.2.1"}}\n' ;;
+  where)
+    printf '{"schema_version":1,"data":{"path":"%s","database_path":"%s/embeddeddolt"}}\n' "$BEADS_DIR" "$BEADS_DIR" ;;
+  dolt)
+    printf '{"schema_version":1,"data":{"backend":"dolt","data_dir":"%s/embeddeddolt","database":"beads","embedded":true}}\n' "$BEADS_DIR" ;;
   update)
     id=$2
     actor=$(val --actor "$@")
     new_status=$(val --status "$@")
+    has_assignee=0; has_if_assignee=0; expected_assignee=""; prev=""
+    for a in "$@"; do
+      [ "$prev" = "--assignee" ] && has_assignee=1
+      if [ "$prev" = "--if-assignee" ]; then
+        has_if_assignee=1
+        expected_assignee=$a
+      fi
+      prev=$a
+    done
+    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
+    # Deterministic close-CAS race: a successor claim lands after forged's
+    # pre-read but before bd evaluates --if-assignee. The guarded update must
+    # then refuse without changing status or clearing the successor.
+    successor_on_guard="$state/$id.successor-on-guard"
+    if [ "$has_if_assignee" = 1 ] && [ -f "$successor_on_guard" ]; then
+      cur=$(cat "$successor_on_guard")
+      printf '%s' "$cur" > "$state/$id.assignee"
+      rm -f "$successor_on_guard"
+      bump_revision "$id"
+    fi
+    if [ "$has_if_assignee" = 1 ] && [ "$cur" != "$expected_assignee" ]; then
+      printf '{"schema_version":1,"data":{"error":"stale --if-assignee guard: expected %s, found %s"}}\n' "$expected_assignee" "$cur"
+      exit 13
+    fi
     if [ -n "$new_status" ]; then
       printf '%s' "$new_status" > "$state/$id.status"
+      [ "$has_assignee" = 1 ] && rm -f "$state/$id.assignee"
       bump_revision "$id"
       printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
       exit 0
     fi
-    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
+    if [ "$has_assignee" = 1 ]; then
+      rm -f "$state/$id.assignee"
+      bump_revision "$id"
+      printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
+      exit 0
+    fi
     if [ -z "$cur" ] || [ "$cur" = "$actor" ]; then
       printf '%s' "$actor" > "$state/$id.assignee"
       bump_revision "$id"
@@ -693,7 +740,32 @@ case "$cmd" in
       printf 'bd: connection refused\n' >&2
       exit 1
     fi
+    # A direct run-start test has no reason to maintain the global frontier
+    # fixture by hand. Remember every shown issue so `bd ready` can expose
+    # open ones when no explicit frontier was seeded. Tests that exercise a
+    # competing frontier still seed it and therefore keep exact control.
+    : > "$state/$id.seen"
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+  comments)
+    id=$2; text=$(cat "$state/$id.comment" 2>/dev/null || true)
+    if [ -n "$text" ]; then
+      printf '{"schema_version":1,"data":[{"text":"%s"}]}\n' "$text"
+    else
+      printf '{"schema_version":1,"data":[]}\n'
+    fi ;;
+  comment)
+    id=$2; printf '%s' "$3" > "$state/$id.comment"
+    printf '{"schema_version":1,"data":{"id":"%s"}}\n' "$id" ;;
+  list)
+    ids=$(val --id "$@")
+    first=1; printf '{"schema_version":1,"data":['
+    oldifs=$IFS; IFS=,
+    for id in $ids; do
+      [ -n "$id" ] || continue
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done
+    IFS=$oldifs
+    printf ']}\n' ;;
   children)
     epic=$2; first=1
     printf '{"schema_version":1,"data":['
@@ -712,11 +784,19 @@ case "$cmd" in
     front="$state/frontier"
     if [ -z "$actor" ]; then
       first=1; printf '{"schema_version":1,"data":['
-      while IFS= read -r id; do
+      if [ -s "$front" ]; then
+        ids=$(cat "$front")
+      else
+        ids=$(for seen in "$state"/*.seen; do
+          [ -e "$seen" ] || continue
+          basename "$seen" .seen
+        done)
+      fi
+      printf '%s\n' "$ids" | while IFS= read -r id; do
         [ -n "$id" ] || continue
-        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = closed ] && continue
+        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = open ] || continue
         [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
-      done < "$front"
+      done
       printf ']}\n'
     elif [ -s "$front" ]; then
       id=$(head -1 "$front")
@@ -1021,6 +1101,16 @@ impl TestEnv {
         std::fs::write(state.join(format!("{epic}.title")), "Test epic").expect("epic title");
         std::fs::write(state.join(format!("{epic}.type")), "epic").expect("epic type");
         std::fs::write(state.join(format!("{epic}.status")), "open").expect("epic status");
+        std::fs::write(
+            state.join(format!("{epic}.description")),
+            "## Context\\n\\nThe epic Bead is the canonical plan map.",
+        )
+        .expect("epic description");
+        std::fs::write(
+            state.join(format!("{epic}.acceptance")),
+            "- every child is accounted for",
+        )
+        .expect("epic acceptance");
         let mut inventory = String::new();
         let mut frontier = String::new();
         for (id, spec, ready) in children {
@@ -1152,6 +1242,15 @@ impl TestEnv {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
         std::fs::write(state.join(format!("{bead}.assignee")), holder).expect("set assignee");
+    }
+
+    /// Arrange for the bd shim to install a successor immediately before its
+    /// next `--if-assignee` check, simulating the close-CAS race precisely.
+    pub fn set_successor_on_guard(&self, bead: &str, holder: &str) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{bead}.successor-on-guard")), holder)
+            .expect("set successor race");
     }
 
     /// Mark a bead's lease UNEXPIRED in the bd shim state: every scoped

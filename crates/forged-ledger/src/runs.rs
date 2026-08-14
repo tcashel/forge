@@ -3,8 +3,8 @@
 use std::fmt::Write as _;
 
 use forged_types::{
-    canonical_json_bytes, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1, ResolvedRosterV1,
-    EXECUTION_PACKAGE_SCHEMA_V1,
+    canonical_json_bytes, AcceptedRisk, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1,
+    ResolvedRosterV1, EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -16,8 +16,8 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{
-    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunRow,
-    RunState,
+    NewRun, NewRunDefinition, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome,
+    RunRow, RunSettlement, RunState,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -35,17 +35,79 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
         stop_reason: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
+        terminal_outcome: row
+            .get::<_, Option<String>>(10)?
+            .as_deref()
+            .map(RunOutcome::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    10,
+                    rusqlite::types::Type::Text,
+                    Box::new(error),
+                )
+            })?,
+        delivery_pr: row
+            .get::<_, Option<i64>>(11)?
+            .map(u64::try_from)
+            .transpose()
+            .map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    11,
+                    rusqlite::types::Type::Integer,
+                    Box::new(error),
+                )
+            })?,
+        delivery_sha: row.get(12)?,
+        superseded_by: row.get(13)?,
     })
 }
 
 const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
-                           stop_reason, created_at, updated_at";
+                           stop_reason, created_at, updated_at, terminal_outcome, delivery_pr, \
+                           delivery_sha, superseded_by";
 
 const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.profile_ref_json, \
     d.roster_ref_json, COALESCE(m.package_sha256, d.package_sha256), d.profile_sha256, \
     d.roster_sha256, COALESCE(m.package_json, d.package_json), d.compatibility_roster_json, \
     d.created_at";
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
+const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
+
+fn append_controller_revocation_tx(
+    conn: &Connection,
+    run_id: &str,
+    generation: u32,
+    reason: &str,
+) -> Result<(), LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+    )?;
+    let rows = statement.query_map(rusqlite::params![run_id, CONTROLLER_REVOKED], |row| {
+        row.get::<_, String>(0)
+    })?;
+    for payload in rows {
+        let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+        if payload
+            .get("generation")
+            .and_then(serde_json::Value::as_u64)
+            == Some(u64::from(generation))
+        {
+            return Ok(());
+        }
+    }
+    append_event_tx(
+        conn,
+        Some(run_id),
+        CONTROLLER_REVOKED,
+        &json!({
+            "schemaVersion": 1,
+            "runId": run_id,
+            "generation": generation,
+            "reason": reason,
+        }),
+    )
+}
 
 fn definition_row(row: &rusqlite::Row<'_>) -> Result<RunDefinitionRow, rusqlite::Error> {
     Ok(RunDefinitionRow {
@@ -727,7 +789,8 @@ impl Ledger {
             }
             let now = now_iso();
             tx.execute(
-                "UPDATE runs SET state = ?1, stop_reason = ?2, updated_at = ?3 \
+                "UPDATE runs SET state = ?1, stop_reason = ?2, terminal_outcome = NULL, \
+                 delivery_pr = NULL, delivery_sha = NULL, superseded_by = NULL, updated_at = ?3 \
                  WHERE run_id = ?4",
                 rusqlite::params![state.as_str(), reason, now, run_id],
             )?;
@@ -744,6 +807,371 @@ impl Ledger {
             )?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Settle a complete run with an explicit outcome and immutable evidence.
+    ///
+    /// The transition and `run.settled` event commit together. Replaying the
+    /// identical settlement is a no-op; a different settlement is refused so
+    /// a late controller cannot rewrite an operator's terminal decision.
+    pub fn settle_run(
+        &self,
+        run_id: &str,
+        outcome: RunOutcome,
+        reason: String,
+        delivery_pr: Option<u64>,
+        delivery_sha: Option<String>,
+        superseded_by: Option<String>,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(
+            run_id,
+            RunSettlement {
+                outcome,
+                reason,
+                delivery_pr,
+                delivery_sha,
+                superseded_by,
+            },
+            None,
+        )
+    }
+
+    /// Settle a run and durably revoke one detached controller generation in
+    /// the same transaction. Machine-effect admission joins this event via
+    /// [`Ledger::begin_controller_operation`].
+    pub fn settle_run_fencing_controller(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: u32,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(run_id, settlement, Some(controller_generation))
+    }
+
+    fn settle_run_inner(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: Option<u32>,
+    ) -> Result<RunRow, LedgerError> {
+        let RunSettlement {
+            outcome,
+            reason,
+            delivery_pr,
+            delivery_sha,
+            superseded_by,
+        } = settlement;
+        if reason.trim().is_empty() {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "settling a run requires a reason",
+            ));
+        }
+        match outcome {
+            RunOutcome::Landed => {
+                let valid_sha = delivery_sha.as_deref().is_some_and(|sha| {
+                    matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+                });
+                if delivery_pr.is_none() || !valid_sha {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "landed requires a PR number and an exact 40- or 64-hex commit SHA",
+                    ));
+                }
+                if superseded_by.is_some() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "landed cannot name a successor run",
+                    ));
+                }
+            }
+            RunOutcome::Superseded => {
+                if superseded_by.as_deref().is_none_or(str::is_empty) {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "superseded requires a successor run id",
+                    ));
+                }
+                if delivery_pr.is_some() || delivery_sha.is_some() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        "superseded cannot carry landed delivery evidence",
+                    ));
+                }
+            }
+            _ if delivery_pr.is_some() || delivery_sha.is_some() || superseded_by.is_some() => {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "only landed carries delivery evidence and only superseded names a successor",
+                ));
+            }
+            _ => {}
+        }
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let current = get_run_tx(&tx, &run_id)?;
+            if current.state == RunState::Stopped {
+                if current.terminal_outcome == Some(outcome)
+                    && current.stop_reason.as_deref() == Some(reason.as_str())
+                    && current.delivery_pr == delivery_pr
+                    && current.delivery_sha == delivery_sha
+                    && current.superseded_by == superseded_by
+                {
+                    if let Some(generation) = controller_generation {
+                        append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
+                    }
+                    tx.commit()?;
+                    return Ok(current);
+                }
+                let advances = matches!(
+                    (current.terminal_outcome, outcome),
+                    (
+                        Some(RunOutcome::Clean | RunOutcome::AcceptedRisk),
+                        RunOutcome::Landed
+                    ) | (Some(RunOutcome::Blocked), RunOutcome::AcceptedRisk)
+                        | (
+                            Some(
+                                RunOutcome::Clean
+                                    | RunOutcome::Blocked
+                                    | RunOutcome::InputRequired
+                                    | RunOutcome::Cancelled
+                            ),
+                            RunOutcome::Superseded
+                        )
+                );
+                if !advances {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "run {run_id:?} is already stopped with outcome {:?}",
+                            current.terminal_outcome
+                        ),
+                    ));
+                }
+            }
+            let now = now_iso();
+            let delivery_pr_i64 = delivery_pr
+                .map(i64::try_from)
+                .transpose()
+                .map_err(|_| refused(ErrorCode::InvalidRequest, "PR number is too large"))?;
+            tx.execute(
+                "UPDATE runs SET state = 'stopped', stop_reason = ?1, terminal_outcome = ?2, \
+                 delivery_pr = ?3, delivery_sha = ?4, superseded_by = ?5, updated_at = ?6 \
+                 WHERE run_id = ?7",
+                rusqlite::params![
+                    reason,
+                    outcome.as_str(),
+                    delivery_pr_i64,
+                    delivery_sha,
+                    superseded_by,
+                    now,
+                    run_id,
+                ],
+            )?;
+            append_event_tx(
+                &tx,
+                Some(&run_id),
+                "run.settled",
+                &json!({
+                    "schemaVersion": 1,
+                    "runId": run_id,
+                    "previousOutcome": current.terminal_outcome.map(RunOutcome::as_str),
+                    "outcome": outcome.as_str(),
+                    "reason": reason,
+                    "delivery": {
+                        "pr": delivery_pr,
+                        "sha": delivery_sha,
+                    },
+                    "supersededBy": superseded_by,
+                }),
+            )?;
+            if let Some(generation) = controller_generation {
+                append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
+            }
+            let row = get_run_tx(&tx, &run_id)?;
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    /// Atomically accept the residual findings from an exhausted review run.
+    ///
+    /// The exhaustion evidence, singleton acceptance event, and durable
+    /// `blocked -> accepted-risk` transition are one immediate transaction.
+    /// Exact replay returns the standing row. A competing payload or terminal
+    /// transition is refused, so the event stream can never disagree with the
+    /// run's outcome or reason.
+    pub fn accept_review_risk(
+        &self,
+        run_id: &str,
+        review_rounds: u8,
+        acceptance: AcceptedRisk,
+    ) -> Result<RunRow, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if review_rounds == 0 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "accepted risk requires at least one completed review round",
+                ));
+            }
+            if acceptance.accepted_by.trim().is_empty() || acceptance.rationale.trim().is_empty() {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "accepted risk requires non-empty acceptedBy and rationale evidence",
+                ));
+            }
+
+            let payload = json!({
+                "schemaVersion": 1,
+                "reviewRounds": review_rounds,
+                "acceptance": acceptance,
+            });
+            let payload_json = serde_json::to_string(&payload)?;
+            let accepted_reason = format!(
+                "review risk accepted by {}: {}",
+                acceptance.accepted_by, acceptance.rationale
+            );
+            let current = get_run_tx(&tx, &run_id)?;
+
+            let standing_payloads = {
+                let mut statement = tx.prepare(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = \
+                     'forged.review.risk_accepted' ORDER BY event_id ASC LIMIT 2",
+                )?;
+                let rows = statement.query_map([&run_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            if standing_payloads.len() > 1 {
+                return Err(crate::error::internal(format!(
+                    "run {run_id:?} has multiple accepted-risk singleton events"
+                )));
+            }
+            let standing_payload = standing_payloads.first();
+
+            if current.terminal_outcome == Some(RunOutcome::AcceptedRisk) {
+                if standing_payload == Some(&payload_json)
+                    && current.stop_reason.as_deref() == Some(accepted_reason.as_str())
+                    && current.delivery_pr.is_none()
+                    && current.delivery_sha.is_none()
+                    && current.superseded_by.is_none()
+                {
+                    tx.commit()?;
+                    return Ok(current);
+                }
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} already accepted risk with different evidence or reason"
+                    ),
+                ));
+            }
+            if current.state != RunState::Stopped
+                || current.terminal_outcome != Some(RunOutcome::Blocked)
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} must be stopped with outcome blocked before accepting risk"
+                    ),
+                ));
+            }
+            if standing_payload.is_some_and(|stored| stored != &payload_json) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("run {run_id:?} already has different accepted-risk evidence"),
+                ));
+            }
+
+            let terminal_payload: String = tx
+                .query_row(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = \
+                     'run.protocol-terminal' ORDER BY event_id ASC LIMIT 1",
+                    [&run_id],
+                    |row| row.get(0),
+                )
+                .optional()?
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} has no persisted review-exhaustion evidence"),
+                    )
+                })?;
+            let terminal: serde_json::Value = serde_json::from_str(&terminal_payload)?;
+            let exhausted = terminal
+                .pointer("/terminal/reviewBudgetExhausted")
+                .and_then(serde_json::Value::as_object)
+                .ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} did not stop for review-budget exhaustion"),
+                    )
+                })?;
+            let stored_rounds = exhausted
+                .get("reviewRounds")
+                .and_then(serde_json::Value::as_u64);
+            if stored_rounds != Some(u64::from(review_rounds)) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "accepted-risk review rounds {review_rounds} do not match persisted exhaustion evidence {stored_rounds:?}"
+                    ),
+                ));
+            }
+            let final_verdict = exhausted
+                .get("finalVerdict")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("unavailable");
+            let blocked_reason = format!(
+                "review budget exhausted after {review_rounds} rounds with verdict {final_verdict}"
+            );
+            if current.stop_reason.as_deref() != Some(blocked_reason.as_str()) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "run {run_id:?} blocked reason does not match its review-exhaustion evidence"
+                    ),
+                ));
+            }
+
+            let now = now_iso();
+            tx.execute(
+                "UPDATE runs SET terminal_outcome = 'accepted-risk', stop_reason = ?1, \
+                 delivery_pr = NULL, delivery_sha = NULL, superseded_by = NULL, updated_at = ?2 \
+                 WHERE run_id = ?3 AND state = 'stopped' AND terminal_outcome = 'blocked'",
+                rusqlite::params![accepted_reason, now, run_id],
+            )?;
+            if standing_payload.is_none() {
+                append_event_tx(
+                    &tx,
+                    Some(&run_id),
+                    "forged.review.risk_accepted",
+                    &payload,
+                )?;
+            }
+            append_event_tx(
+                &tx,
+                Some(&run_id),
+                "run.settled",
+                &json!({
+                    "schemaVersion": 1,
+                    "runId": run_id,
+                    "previousOutcome": RunOutcome::Blocked.as_str(),
+                    "outcome": RunOutcome::AcceptedRisk.as_str(),
+                    "reason": accepted_reason,
+                    "delivery": {
+                        "pr": serde_json::Value::Null,
+                        "sha": serde_json::Value::Null,
+                    },
+                    "supersededBy": serde_json::Value::Null,
+                }),
+            )?;
+            let row = get_run_tx(&tx, &run_id)?;
+            tx.commit()?;
+            Ok(row)
         })
     }
 }

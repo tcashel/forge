@@ -20,6 +20,79 @@ pub enum RunState {
     Stopped,
 }
 
+/// Why a whole run stopped (`runs.terminal_outcome`).
+///
+/// This is deliberately distinct from [`AttemptState::Stopped`]: an attempt
+/// stop only retires one worker, while this value is the operator-visible
+/// settlement of the complete run.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RunOutcome {
+    /// Protocol work is clean and ready for delivery.
+    Clean,
+    /// Work cannot continue without resolving a blocker.
+    Blocked,
+    /// The run needs an explicit operator answer.
+    InputRequired,
+    /// The operator cancelled this run without declaring the Bead complete.
+    Cancelled,
+    /// The operator accepted a documented residual risk.
+    AcceptedRisk,
+    /// A named successor run replaced this generation.
+    Superseded,
+    /// Delivery landed and carries immutable PR and commit evidence.
+    Landed,
+}
+
+/// Immutable evidence for one whole-run terminal projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RunSettlement {
+    /// Operator-visible terminal outcome.
+    pub outcome: RunOutcome,
+    /// Durable explanation for the terminal decision.
+    pub reason: String,
+    /// Landed delivery PR, when applicable.
+    pub delivery_pr: Option<u64>,
+    /// Landed delivery commit, when applicable.
+    pub delivery_sha: Option<String>,
+    /// Successor run for a superseded settlement.
+    pub superseded_by: Option<String>,
+}
+
+impl RunOutcome {
+    /// The closed spelling stored in SQLite and exposed on the wire.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RunOutcome::Clean => "clean",
+            RunOutcome::Blocked => "blocked",
+            RunOutcome::InputRequired => "input-required",
+            RunOutcome::Cancelled => "cancelled",
+            RunOutcome::AcceptedRisk => "accepted-risk",
+            RunOutcome::Superseded => "superseded",
+            RunOutcome::Landed => "landed",
+        }
+    }
+}
+
+impl TryFrom<&str> for RunOutcome {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "clean" => Ok(RunOutcome::Clean),
+            "blocked" => Ok(RunOutcome::Blocked),
+            "input-required" => Ok(RunOutcome::InputRequired),
+            "cancelled" => Ok(RunOutcome::Cancelled),
+            "accepted-risk" => Ok(RunOutcome::AcceptedRisk),
+            "superseded" => Ok(RunOutcome::Superseded),
+            "landed" => Ok(RunOutcome::Landed),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown run outcome: {other:?}"),
+            )),
+        }
+    }
+}
+
 impl RunState {
     /// The DDL CHECK string for this state.
     pub fn as_str(&self) -> &'static str {
@@ -58,6 +131,55 @@ pub enum AttemptState {
     Revoking,
     /// Kill-confirmed and externally reclaimed; a successor may claim.
     Reclaimed,
+    /// Kill-confirmed and settled by an operator's attempt-local stop. The
+    /// bead's bd lease is deliberately untouched — it is bead-scoped and
+    /// shared with every sibling generation — so a successor claims under
+    /// the same `run_holder` with no waiting period.
+    Stopped,
+}
+
+/// Which scope a `revoking` marker was committed under — the durable record
+/// of WHOSE revocation this is, and therefore which terminal exit resumes it.
+///
+/// `revoking` alone cannot say: a bead-scoped saga revocation and an
+/// attempt-local operator stop write the identical state, so a stop whose
+/// `kill_confirmed` failed would otherwise be indistinguishable from a dead
+/// worker and get resumed through the bead-scoped reclaim it exists to
+/// avoid. Written once, when the marker commits, and never changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeScope {
+    /// The reclaim saga: a dead or hung worker, whose bd lease the run wants
+    /// back. Resumes through the full revoke order and ends at
+    /// [`AttemptState::Reclaimed`].
+    Bead,
+    /// An operator's stop of ONE attempt. Resumes through confirmed death
+    /// alone and ends at [`AttemptState::Stopped`], touching no lease.
+    Attempt,
+}
+
+impl RevokeScope {
+    /// The DDL string, the only spelling stored.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevokeScope::Bead => "bead",
+            RevokeScope::Attempt => "attempt",
+        }
+    }
+}
+
+impl TryFrom<&str> for RevokeScope {
+    type Error = LedgerError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "bead" => Ok(RevokeScope::Bead),
+            "attempt" => Ok(RevokeScope::Attempt),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown revoke scope: {other:?}"),
+            )),
+        }
+    }
 }
 
 impl AttemptState {
@@ -69,6 +191,7 @@ impl AttemptState {
             AttemptState::Failed => "failed",
             AttemptState::Revoking => "revoking",
             AttemptState::Reclaimed => "reclaimed",
+            AttemptState::Stopped => "stopped",
         }
     }
 }
@@ -83,6 +206,7 @@ impl TryFrom<&str> for AttemptState {
             "failed" => Ok(AttemptState::Failed),
             "revoking" => Ok(AttemptState::Revoking),
             "reclaimed" => Ok(AttemptState::Reclaimed),
+            "stopped" => Ok(AttemptState::Stopped),
             other => Err(refused(
                 ErrorCode::InvalidRequest,
                 format!("unknown attempt state: {other:?}"),
@@ -210,6 +334,14 @@ pub struct RunRow {
     pub created_at: String,
     /// `runs.updated_at`.
     pub updated_at: String,
+    /// `runs.terminal_outcome` — absent on active and legacy-stopped runs.
+    pub terminal_outcome: Option<RunOutcome>,
+    /// `runs.delivery_pr` — required for [`RunOutcome::Landed`].
+    pub delivery_pr: Option<u64>,
+    /// `runs.delivery_sha` — required for [`RunOutcome::Landed`].
+    pub delivery_sha: Option<String>,
+    /// `runs.superseded_by` — required for [`RunOutcome::Superseded`].
+    pub superseded_by: Option<String>,
 }
 
 /// One immutable `run_definitions` row.
@@ -294,6 +426,12 @@ pub struct AttemptRow {
     pub state: AttemptState,
     /// `attempts.revoke_reason`.
     pub revoke_reason: Option<String>,
+    /// `attempts.revoke_scope` — `None` until a `revoking` marker commits,
+    /// and on every row written before the column existed. A reader that
+    /// must route on it treats `None` as [`RevokeScope::Bead`]: the
+    /// attempt-local stop did not exist when those rows were written, so
+    /// every one of them is a saga revocation.
+    pub revoke_scope: Option<RevokeScope>,
     /// `attempts.fail_note` — the note supplied to `fail_packet`.
     pub fail_note: Option<String>,
     /// `attempts.result_json` — serialized `PacketResult` on completion.

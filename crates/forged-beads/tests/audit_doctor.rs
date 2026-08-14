@@ -210,6 +210,16 @@ async fn doctor_with_the_sandboxed_bd_probes_green() {
         "beads-dir-resolves must see the non-empty scratch store: {}",
         results[2].detail
     );
+    assert!(
+        results[2].detail.contains("mode=embedded"),
+        "doctor must name the active Beads mode: {}",
+        results[2].detail
+    );
+    assert!(
+        results[2].detail.contains("database="),
+        "doctor must name the active Beads database: {}",
+        results[2].detail
+    );
     assert!(results[5].ok, "anvil-home-writable: {}", results[5].detail);
     // The spec amendment of 2026-08-12 sanctions the probe's guarded
     // `bd init --prefix probe`, so create → claim → heartbeat →

@@ -3,7 +3,7 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 
-use forged_ledger::{AttemptState, EffectClass};
+use forged_ledger::{AttemptState, EffectClass, RevokeScope};
 use forged_types::{Capability, OperationRequest, OperationResponse, WorkPacket};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -501,8 +501,24 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
     .await
 }
 
-/// `session stop` — durable revoke first, then the existing confirmed-death
-/// reconciliation saga.
+/// `session stop` — durable revoke, confirmed death, terminal `stopped`,
+/// then the existing reconciliation pass.
+///
+/// The REVOCATION is attempt-local, and nothing wider. The stop names one
+/// attempt, so it takes one attempt to a terminal state and leaves the
+/// bead's bd lease alone: the lease is held under the bead-scoped
+/// `run_holder` that every generation of the run shares, and a successor on
+/// this packet claims under it immediately. The bead-scoped release is a
+/// different operation with a different fence, and is not this one. The
+/// durable marker records that scope, so a stop whose kill cannot be
+/// confirmed is resumed as a stop and never through the reclaim saga.
+///
+/// The reconcile pass afterwards is UNCHANGED and stays: the kill takes the
+/// claimant's whole process group with it, so the operations that group had
+/// in flight are interrupted and `settle_operations` is what settles them by
+/// effect class. Dropping it left a successor refused with
+/// `OperationInProgress` under the same derived key. Its `report` is
+/// reported back verbatim, as it always has been.
 pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let attempt_id = match param_attempt(&req.params) {
         Ok(value) => value,
@@ -543,11 +559,14 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         {
             move |_operation_id| async move {
                 let reason = param_str(&params, "reason")?.to_owned();
+                // Step 1: the durable marker commits BEFORE the kill, and
+                // carries the scope that decides who may resume it.
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.revoke_attempt(attempt_id, &reason)
+                    ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
                 })
                 .await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+                let state = forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
                 let view = crate::core::drive::project(ctx, &run_id).await?;
                 let config = forged_proto::ReconcileConfig {
                     stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
@@ -556,7 +575,12 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 let report =
                     forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())
                         .await?;
-                Ok(json!({"attemptId": attempt_id, "report": report_json(&report)}))
+                Ok(json!({
+                    "attemptId": attempt_id,
+                    "runId": run_id,
+                    "state": state.as_str(),
+                    "report": report_json(&report),
+                }))
             }
         },
     )

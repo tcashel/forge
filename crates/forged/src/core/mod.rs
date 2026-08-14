@@ -11,6 +11,7 @@ mod handoff;
 mod observe;
 mod ops;
 pub(crate) mod sessions;
+pub(crate) mod settlement;
 pub(crate) mod spec;
 pub(crate) mod usage;
 
@@ -29,6 +30,11 @@ pub struct Ctx {
     pub config: ForgedConfig,
     /// The open ledger (a cloneable handle to the writer thread).
     pub ledger: Ledger,
+}
+
+/// Publish the real detached driver identity before it opens runtime state.
+pub(crate) async fn record_controller_identity_from_env() -> Result<(), String> {
+    handoff::record_driver_identity_from_env().await
 }
 
 /// Upgrade durable state that predates frozen execution policy.
@@ -347,7 +353,7 @@ pub fn session_claimant(packet_id: &str, provider: &str) -> String {
 /// The note is classified `unspawned:`, never left to classify as semantic:
 /// no provider existed for this attempt, so it is not the stage's answer.
 /// A plain note would be merged into a review fan-out as `RequestChanges`
-/// and would spend the run's one fix round — see `settle_unspawned`, which
+/// and would spend a remediation round — see `settle_unspawned`, which
 /// this shares its settlement with.
 ///
 /// The ORIGINAL failure is what comes back — a ledger error while settling is
@@ -457,6 +463,12 @@ pub enum OnEffectError {
     LeaveInProgress,
 }
 
+#[derive(Clone, Copy)]
+enum FenceAdmission<'a> {
+    Ordinary(Option<&'a str>),
+    Machine(Option<u32>),
+}
+
 impl OnEffectError {
     fn for_class(class: EffectClass) -> Self {
         match class {
@@ -485,8 +497,66 @@ where
     F: FnOnce(String) -> Fut,
     Fut: std::future::Future<Output = CoreResult>,
 {
+    fenced_inner(
+        ctx,
+        name,
+        class,
+        req,
+        FenceAdmission::Ordinary(assert_token),
+        effect,
+    )
+    .await
+}
+
+/// Fence a detached controller's machine effect against whole-run
+/// settlement. The generation check and operation reservation are one
+/// ledger transaction; settlement kills the generation if reservation wins.
+pub(crate) async fn fenced_machine<F, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    class: EffectClass,
+    req: &OperationRequest,
+    generation: Option<u32>,
+    effect: F,
+) -> OperationResponse
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = CoreResult>,
+{
+    fenced_inner(
+        ctx,
+        name,
+        class,
+        req,
+        FenceAdmission::Machine(generation),
+        effect,
+    )
+    .await
+}
+
+async fn fenced_inner<F, Fut>(
+    ctx: &Ctx,
+    name: &str,
+    class: EffectClass,
+    req: &OperationRequest,
+    admission: FenceAdmission<'_>,
+    effect: F,
+) -> OperationResponse
+where
+    F: FnOnce(String) -> Fut,
+    Fut: std::future::Future<Output = CoreResult>,
+{
     let key = req.idempotency_key.clone();
     let request = req.clone();
+    let machine = matches!(admission, FenceAdmission::Machine(_));
+    let assert_token = match admission {
+        FenceAdmission::Ordinary(token) => token.map(str::to_owned),
+        FenceAdmission::Machine(_) => None,
+    };
+    let controller_generation = match admission {
+        FenceAdmission::Ordinary(_) => None,
+        FenceAdmission::Machine(generation) => generation,
+    };
 
     // Probe first: an existing row with a different request hash is an
     // IdempotencyConflict — refuse BEFORE recording the request event, so
@@ -547,9 +617,13 @@ where
     let begun = {
         let name = name.to_owned();
         let request = request.clone();
-        let token = assert_token.map(str::to_owned);
+        let token = assert_token.clone();
         on_ledger(&ctx.ledger, move |l| {
-            l.begin_operation(&name, &request, class, token.as_deref())
+            if machine {
+                l.begin_machine_operation(&name, &request, class, controller_generation)
+            } else {
+                l.begin_operation(&name, &request, class, token.as_deref())
+            }
         })
         .await
     };
@@ -563,7 +637,6 @@ where
     let operation_id = ticket.operation_id;
 
     if let Some(token) = assert_token {
-        let token = token.to_owned();
         if let Err(f) = on_ledger(&ctx.ledger, move |l| l.assert_attempt_live(&token)).await {
             release_if(ctx, OnEffectError::for_class(class), &operation_id).await;
             return err_response(&operation_id, &f);
@@ -624,7 +697,9 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_drive" => drive::run_drive(ctx, &req).await,
         "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
+        "run_stop" => settlement::run_stop(ctx, &mut req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
+        "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,
         "epic_advance" => epic::epic_advance(ctx, &req).await,
         "epic_drive" => epic::epic_drive(ctx, &req).await,

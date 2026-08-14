@@ -15,17 +15,24 @@
 //! Every bd child is spawned with `tokio::process::Command`,
 //! `kill_on_drop(true)`, `env_clear()` and an explicit allowlist and nothing
 //! else: `PATH` (copied from the parent), `HOME` (= `home_override` when set,
-//! else the parent's), `BEADS_DIR` (= `beads_dir`), `BD_JSON_ENVELOPE=1`, and
-//! `TMPDIR` (copied when present). `BEADS_DB`, `BD_DB`, `BEADS_ACTOR`,
-//! `BD_ACTOR`, and every other `BD_*`/`BEADS_*` variable MUST NOT reach a bd
-//! child — bd resolves `$BEADS_DB` ahead of `$BEADS_DIR`, so an inherited one
-//! would silently redirect an "isolated" call at the operator's live database.
+//! else the parent's), `BEADS_DIR` (= `beads_dir`), `BD_JSON_ENVELOPE=1`,
+//! `TMPDIR` (copied when present), and bd 1.2.1's four documented remote-server
+//! authentication settings: `BEADS_DOLT_PASSWORD`, `BEADS_DOLT_SERVER_TLS`,
+//! `BEADS_DOLT_SERVER_USER`, and `BEADS_CREDENTIALS_FILE`. `BEADS_DB`, `BD_DB`,
+//! `BEADS_ACTOR`, `BD_ACTOR`, server host/port/socket/mode overrides, and every
+//! other `BD_*`/`BEADS_*` variable MUST NOT reach a bd child — bd resolves
+//! `$BEADS_DB` ahead of `$BEADS_DIR`, so an inherited one would silently
+//! redirect an "isolated" call at the operator's live database. Host, port,
+//! mode, and database remain properties of the explicit `BEADS_DIR` metadata;
+//! only credentials and TLS cross the sanitized boundary. No caller logs this
+//! environment map or its values.
 //! Non-bd children (`kill`, `ps`, `gh`) are spawned elsewhere and inherit the
 //! process's REAL environment.
 //!
 //! `write(..)` serializes ALL bd writes behind an inter-process advisory file
 //! lock keyed by the canonicalized `beads_dir`; reads bypass the lock.
 
+use std::ffi::OsString;
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
@@ -87,19 +94,34 @@ impl WriteOp {
     }
 }
 
-/// Build the exact environment map for a bd child. A unit test asserts the
-/// key set is exactly `{PATH, HOME, BEADS_DIR, BD_JSON_ENVELOPE}` plus
-/// `TMPDIR` when the parent has one.
-pub(crate) fn bd_env(cfg: &BdConfig) -> Vec<(String, String)> {
+/// The complete set of inherited bd remote-server settings.
+///
+/// These are the four authentication/TLS variables named by pinned bd 1.2.1's
+/// `bd dolt --help`. Routing variables are intentionally absent: the explicit
+/// [`BdConfig::beads_dir`] metadata owns host, port, mode, and database.
+const REMOTE_AUTH_ENV: [&str; 4] = [
+    "BEADS_DOLT_PASSWORD",
+    "BEADS_DOLT_SERVER_TLS",
+    "BEADS_DOLT_SERVER_USER",
+    "BEADS_CREDENTIALS_FILE",
+];
+
+/// Build the exact environment map for a bd child from an environment reader.
+/// Keeping the reader injectable makes the allowlist test deterministic and
+/// avoids mutating the process environment in a parallel test suite.
+fn bd_env_from<F>(cfg: &BdConfig, inherited: F) -> Vec<(String, String)>
+where
+    F: Fn(&str) -> Option<OsString>,
+{
     let mut env = Vec::new();
-    if let Some(path) = std::env::var_os("PATH") {
+    if let Some(path) = inherited("PATH") {
         env.push(("PATH".to_string(), path.to_string_lossy().into_owned()));
     }
     let home = cfg
         .home_override
         .as_ref()
         .map(|p| p.to_string_lossy().into_owned())
-        .or_else(|| std::env::var_os("HOME").map(|h| h.to_string_lossy().into_owned()));
+        .or_else(|| inherited("HOME").map(|h| h.to_string_lossy().into_owned()));
     if let Some(h) = home {
         env.push(("HOME".to_string(), h));
     }
@@ -108,10 +130,21 @@ pub(crate) fn bd_env(cfg: &BdConfig) -> Vec<(String, String)> {
         cfg.beads_dir.to_string_lossy().into_owned(),
     ));
     env.push(("BD_JSON_ENVELOPE".to_string(), "1".to_string()));
-    if let Some(t) = std::env::var_os("TMPDIR") {
+    if let Some(t) = inherited("TMPDIR") {
         env.push(("TMPDIR".to_string(), t.to_string_lossy().into_owned()));
     }
+    for key in REMOTE_AUTH_ENV {
+        if let Some(value) = inherited(key) {
+            env.push((key.to_string(), value.to_string_lossy().into_owned()));
+        }
+    }
     env
+}
+
+/// Build the exact environment map for a bd child. A unit test asserts that
+/// only the fixed runtime keys and the four remote auth/TLS keys can survive.
+pub(crate) fn bd_env(cfg: &BdConfig) -> Vec<(String, String)> {
+    bd_env_from(cfg, |key| std::env::var_os(key))
 }
 
 /// Spawn one bd child and collect its outcome under `timeout_s`. On elapse
@@ -600,18 +633,78 @@ mod tests {
         if std::env::var_os("TMPDIR").is_some() {
             expected.push("TMPDIR");
         }
+        for key in REMOTE_AUTH_ENV {
+            if std::env::var_os(key).is_some() {
+                expected.push(key);
+            }
+        }
         let mut keys: Vec<&str> = env.iter().map(|(k, _)| k.as_str()).collect();
         keys.sort_unstable();
         expected.sort_unstable();
         assert_eq!(keys, expected, "bd child env must be exactly the allowlist");
-        // No BD_*/BEADS_* leakage beyond the two deliberate exports.
+        // No BD_*/BEADS_* leakage beyond the deliberate fixed exports.
         for (k, _) in &env {
             if k.starts_with("BD_") || k.starts_with("BEADS_") {
                 assert!(
-                    k == "BD_JSON_ENVELOPE" || k == "BEADS_DIR",
+                    k == "BD_JSON_ENVELOPE"
+                        || k == "BEADS_DIR"
+                        || REMOTE_AUTH_ENV.contains(&k.as_str()),
                     "unexpected bd-family key {k}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn bd_env_preserves_only_remote_auth_not_routing_or_actor_overrides() {
+        use std::collections::BTreeMap;
+
+        let inherited: BTreeMap<&str, OsString> = [
+            ("PATH", "/usr/bin".into()),
+            ("HOME", "/home/operator".into()),
+            ("TMPDIR", "/tmp".into()),
+            ("BEADS_DOLT_PASSWORD", "test-password".into()),
+            ("BEADS_DOLT_SERVER_TLS", "true".into()),
+            ("BEADS_DOLT_SERVER_USER", "team-user".into()),
+            ("BEADS_CREDENTIALS_FILE", "/secrets/beads.ini".into()),
+            ("BEADS_DB", "/wrong/store".into()),
+            ("BD_DB", "/also/wrong".into()),
+            ("BEADS_ACTOR", "wrong-actor".into()),
+            ("BD_ACTOR", "other-actor".into()),
+            ("BEADS_DOLT_SERVER_MODE", "1".into()),
+            ("BEADS_DOLT_SERVER_HOST", "wrong.example".into()),
+            ("BEADS_DOLT_SERVER_PORT", "13306".into()),
+            ("BEADS_DOLT_SERVER_SOCKET", "/wrong/server.sock".into()),
+            ("BEADS_DOLT_SHARED_SERVER", "1".into()),
+            ("BEADS_DOLT_PORT", "13307".into()),
+        ]
+        .into_iter()
+        .collect();
+        let env = bd_env_from(&cfg(), |key| inherited.get(key).cloned());
+        let keys: Vec<&str> = env.iter().map(|(key, _)| key.as_str()).collect();
+
+        for key in REMOTE_AUTH_ENV {
+            assert!(
+                keys.contains(&key),
+                "documented auth/TLS key {key} was stripped"
+            );
+        }
+        for key in [
+            "BEADS_DB",
+            "BD_DB",
+            "BEADS_ACTOR",
+            "BD_ACTOR",
+            "BEADS_DOLT_SERVER_MODE",
+            "BEADS_DOLT_SERVER_HOST",
+            "BEADS_DOLT_SERVER_PORT",
+            "BEADS_DOLT_SERVER_SOCKET",
+            "BEADS_DOLT_SHARED_SERVER",
+            "BEADS_DOLT_PORT",
+        ] {
+            assert!(
+                !keys.contains(&key),
+                "routing/identity override {key} must not escape environment sanitization"
+            );
         }
     }
 

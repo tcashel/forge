@@ -111,7 +111,7 @@ fn help_lists_every_command_and_subcommand_flags() {
     let work = help_text(&env, &["work", "--help"]);
     assert!(work.contains("list"), "work --help must list list");
     let events = help_text(&env, &["events", "--help"]);
-    for flag in ["--run", "--after", "--limit"] {
+    for flag in ["--run", "--after", "--limit", "--summary"] {
         assert!(events.contains(flag), "events --help must document {flag}");
     }
     let overview = help_text(&env, &["overview", "--help"]);

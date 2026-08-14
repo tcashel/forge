@@ -4,13 +4,14 @@
 //! ready-for-review calls; the origin repo holds the real commits.
 
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 mod support;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{assert_no_overlap, render_cost, require_node, rev_parse, TestEnv};
+use support::{assert_no_overlap, git, render_cost, require_node, rev_parse, TestEnv};
 
 fn canonical_json_and_sha(value: &Value) -> (String, String) {
     let bytes = forged_types::canonical_json_bytes(value).expect("canonical fixture JSON");
@@ -35,6 +36,73 @@ fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Val
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!("timed out waiting for forged {args:?}: {last}")
+}
+
+#[test]
+fn push_transport_retries_are_bounded_then_stop_as_input_required() {
+    let env = TestEnv::new("forged-push-retry");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-push-retry",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    let (code, resolved) = env.forged(&["run", "advance", "--run", "bead-push-retry"]);
+    assert_eq!(code, 0, "resolve: {resolved}");
+    assert_eq!(resolved["result"]["action"]["runMachine"], json!("resolve"));
+
+    let helper = env.shim_bin.join("git-remote-fail");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\necho attempt >> \"$FORGED_SHIM_DIR/push-attempts\"\necho 'fatal: Could not resolve host: github.com' >&2\nexit 1\n",
+    )
+    .expect("write remote helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod remote helper");
+    git(
+        &env.repos.repo,
+        &["remote", "set-url", "origin", "fail::remote"],
+    );
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-push-retry"]);
+    assert_ne!(
+        code, 0,
+        "the missing push is not a completed effect: {driven}"
+    );
+    let reason = driven["error"]["message"]
+        .as_str()
+        .expect("input-required error");
+    assert!(reason.starts_with("input-required: git push network transport failed"));
+    let attempts = std::fs::read_to_string(env.shim_dir.join("push-attempts"))
+        .expect("attempt log")
+        .lines()
+        .count();
+    assert_eq!(attempts, 4, "default retry budget is three retries");
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-push-retry"]);
+    assert_eq!(status["result"]["run"]["state"], json!("stopped"));
+    assert_eq!(
+        status["result"]["run"]["nextAction"]["stop"]["externallyStopped"]["reason"],
+        json!(reason)
+    );
+    let ledger = env.ledger();
+    let push = ledger
+        .find_operation("push", "bead-push-retry/push/0")
+        .expect("push probe")
+        .expect("interrupted push survives");
+    assert_eq!(push.state, forged_ledger::OperationState::InProgress);
+    ledger.close().expect("close");
 }
 
 #[test]
@@ -229,28 +297,22 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         );
     }
 
-    // A codex seat is priced from the operator's rate card, never billed by
-    // the provider. Rendered through the App's own Cost tab — this real
-    // projection, not a fixture — the spend header must split that spend out
-    // instead of claiming the provider billed all of it.
+    // The normal one-reviewer profile stays on its primary provider. The
+    // hoisted child rows therefore remain provider-billed end to end.
     assert!(
         epic_rows
             .iter()
-            .any(|row| row["pricingBasis"] == json!("imputed_api_rate")),
-        "the epic's child ran a codex seat, so a hoisted row is imputed: {epic_rows:?}"
+            .all(|row| row["pricingBasis"] == json!("billed")),
+        "standard child rows remain billed: {epic_rows:?}"
     );
     if let Some(node) = require_node() {
         let rendered = render_cost(&node, &overview["result"]);
         assert!(
-            !rendered.text.contains("provider-billed"),
-            "an epic whose child ran a codex seat renders as fully billed: {}",
+            rendered.text.contains("provider-billed"),
+            "a fully billed standard run says so: {}",
             rendered.text
         );
-        assert!(
-            rendered.spend_subtitle().ends_with(" imputed"),
-            "the spend header splits imputed spend out of the billed total: {}",
-            rendered.spend_subtitle()
-        );
+        assert_eq!(rendered.spend_subtitle(), "provider-billed");
         assert_eq!(
             rendered.stat("priced attempts"),
             epic_rows.len().to_string(),
@@ -485,7 +547,7 @@ fn concurrent_submit_keys_share_one_controller_generation() {
     let status = wait_for(
         &env,
         &["run", "status", "--run", "bead-submit-singleton"],
-        |value| value["result"]["run"]["nextAction"]["stop"]["done"].is_object(),
+        |value| value["result"]["run"]["nextAction"]["stop"].is_object(),
     );
     assert_eq!(
         status["result"]["run"]["controller"]["generation"],
@@ -767,18 +829,14 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert!(log.contains("shim implement"), "implement commit: {log}");
     assert!(log.contains("shim fix"), "fix commit: {log}");
 
-    // Provider selection routed by hints: the claude shim served implement
-    // and reviewclaude; the codex shim served reviewcodex — the packet ids
-    // in the shared shim log name the stages, and no packet's processes
-    // overlapped.
+    // Provider selection routed the normal profile's implementation,
+    // repo-aware review, and remediation through their declared seats.
     let plog = env.provider_log();
     for packet in [
         "bead-e2e/implementation/0",
         "bead-e2e/review-1/0",
-        "bead-e2e/review-2/0",
         "bead-e2e/remediation/0",
         "bead-e2e/review-1/1",
-        "bead-e2e/review-2/1",
     ] {
         assert!(
             plog.iter().any(|l| l.starts_with(packet)),
@@ -823,7 +881,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
                 attempt.claimant
             );
         }
-        assert!(seen >= 6, "every packet's attempt was inspected: {seen}");
+        assert!(seen >= 4, "every packet's attempt was inspected: {seen}");
         ledger.close().expect("close");
     }
 
@@ -867,9 +925,48 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         "proto.pr",
         "attempt.state",
         "proto.operation.request",
+        "forged.review.seat.settled",
     ] {
         assert!(kinds.contains(&kind), "{kind} in stream: {kinds:?}");
     }
+    let review_events = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.review.seat.settled"))
+        .collect::<Vec<_>>();
+    assert!(
+        !review_events.is_empty()
+            && review_events
+                .iter()
+                .all(|event| event["payload"]["seatId"].is_string()),
+        "each review verdict is visible as its seat settles: {review_events:?}"
+    );
+
+    let (code, summaries) = env.forged(&[
+        "events",
+        "--run",
+        "bead-e2e",
+        "--summary",
+        "--limit",
+        "1000",
+    ]);
+    assert_eq!(code, 0, "summary events: {summaries}");
+    assert_eq!(summaries["result"]["summary"], json!(true));
+    let gate = summaries["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .find(|event| event["kind"] == json!("proto.gate"))
+        .expect("gate summary");
+    assert!(
+        gate["payload"]["rows"].is_null(),
+        "gate logs are omitted: {gate}"
+    );
+    assert!(
+        gate["payload"]["artifactPaths"].is_array(),
+        "gate artifacts remain drill-down pointers: {gate}"
+    );
 
     // run status projects the finished run.
     let (code, status) = env.forged(&["run", "status", "--run", "bead-e2e"]);
@@ -897,13 +994,6 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         json!("claude"),
         "implement routed to the claude driver"
     );
-    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/review-2/0"]);
-    assert_eq!(
-        codex_shown["result"]["packet"]["providerHints"]["provider"],
-        json!("codex"),
-        "reviewcodex routed to the codex driver"
-    );
-
     // Retire the worktree once the run is done (explicit key required).
     let (code, retired) = env.forged(&[
         "worktree",
@@ -948,8 +1038,8 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     let (code, driven) = lean.forged(&["run", "drive", "--run", "bead-lean"]);
     assert_eq!(code, 0, "lean drive: {driven}");
     assert_eq!(
-        driven["result"]["terminal"]["done"]["finalVerdict"],
-        json!("requestChanges")
+        driven["result"]["terminal"]["reviewBudgetExhausted"],
+        json!({"reviewRounds": 1, "finalVerdict": "requestChanges"})
     );
     let log = lean.provider_log();
     assert!(log
@@ -1224,7 +1314,206 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
 }
 
 #[test]
-fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
+fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
+    let env = TestEnv::new("forged-review-budget");
+    env.forged(&["init"]);
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
+            .expect("config json");
+    config["profiles"] = json!({
+        "standard": {
+            "schema": "forged.profile/1",
+            "name": "standard",
+            "protocol": {"name": "slice", "version": 1},
+            "seats": [
+                {"id": "implementation", "role": "implementation", "purpose": "implement"},
+                {"id": "review-1", "role": "review.primary", "purpose": "review"},
+                {"id": "remediation", "role": "remediation", "purpose": "fix"}
+            ],
+            "riskContext": "Routine reversible test change.",
+            "fixRoundBudget": 2,
+            "escalateOn": []
+        }
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("config json"),
+    )
+    .expect("write config");
+    env.set_scenario("reviewclaude", "request-changes", 3);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-round-budget",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-round-budget"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["reviewBudgetExhausted"],
+        json!({"reviewRounds": 3, "finalVerdict": "requestChanges"})
+    );
+    let starts: Vec<_> = env
+        .provider_log()
+        .into_iter()
+        .filter(|line| line.contains(" start "))
+        .collect();
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|line| line.contains("/review-1/"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|line| line.contains("/remediation/"))
+            .count(),
+        2
+    );
+
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+    ]);
+    assert_eq!(code, 0, "accept risk: {accepted}");
+    assert_eq!(
+        accepted["result"]["acceptance"]["acceptedBy"],
+        json!("lead-agent")
+    );
+    assert_eq!(
+        accepted["result"]["acceptance"]["findings"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let (code, replayed) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+    ]);
+    assert_eq!(code, 0, "accept-risk replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+    let (code, exact_new_operation) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+        "--idempotency-key",
+        "risk-exact-replay-new-operation",
+    ]);
+    assert_eq!(code, 0, "exact ledger replay: {exact_new_operation}");
+    assert_eq!(exact_new_operation["reused"], json!(false));
+    let (code, competing) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "another-operator",
+        "--rationale",
+        "different acceptance evidence",
+        "--idempotency-key",
+        "risk-competing-evidence",
+    ]);
+    assert_ne!(code, 0, "competing evidence must be refused: {competing}");
+    assert_eq!(
+        competing["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "competing singleton payload is not an idempotent replay"
+    );
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-round-budget"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("accepted-risk"));
+    assert_eq!(
+        status["result"]["run"]["nextAction"]["stop"]["acceptedRisk"]["rationale"],
+        json!("the affected path is disabled in this deployment")
+    );
+    let (_, events) = env.forged(&["events", "--run", "bead-round-budget"]);
+    assert_eq!(
+        events["result"]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|event| event["kind"] == json!("forged.review.risk_accepted"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn implementer_spec_amendment_stops_before_gate_or_review() {
+    let env = TestEnv::new("forged-spec-amendment");
+    env.forged(&["init"]);
+    env.set_scenario("implement", "spec-amendment", 1);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-amendment",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-amendment"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["specAmendmentProposed"]["stageId"],
+        json!("implementation")
+    );
+    assert_eq!(
+        driven["result"]["terminal"]["specAmendmentProposed"]["amendment"]["proposedChange"],
+        json!("target the replacement API")
+    );
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-amendment"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("input-required"));
+    let log = env.provider_log();
+    assert_eq!(
+        log.iter().filter(|line| line.contains(" start ")).count(),
+        1,
+        "no gate-independent reviewer or fixer should run: {log:?}"
+    );
+}
+
+#[test]
+fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
     // Gate failure raises lean to its stored standard edge and survives
     // repeated projection/drive without duplicating the transition.
     let gate = TestEnv::new("forged-escalate-gate");
@@ -1279,8 +1568,8 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
     assert_eq!(escalations[0]["payload"]["to"], json!("standard"));
     assert_eq!(escalations[0]["payload"]["trigger"], json!("gateFailure"));
 
-    // Conflicting standard reviewers raise to high and materialize only its
-    // added review/synthesis seats.
+    // Standard is deliberately one repo-aware reviewer and never raises
+    // itself into the high-assurance panel after a review result.
     let conflict = TestEnv::new("forged-escalate-conflict");
     conflict.forged(&["init"]);
     let repo = conflict.repos.repo.to_string_lossy().into_owned();
@@ -1302,7 +1591,6 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
             .0,
         0
     );
-    conflict.set_scenario("reviewclaude", "approve", 1);
     assert_eq!(
         conflict
             .forged(&["run", "drive", "--run", "bead-conflict-edge"])
@@ -1312,21 +1600,21 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
     let (_, status) = conflict.forged(&["run", "status", "--run", "bead-conflict-edge"]);
     assert_eq!(
         status["result"]["run"]["execution"]["activeProfileRef"]["name"],
-        json!("high")
+        json!("standard")
     );
     assert_eq!(
         status["result"]["run"]["execution"]["profileHistory"]
             .as_array()
             .map(Vec::len),
-        Some(2)
+        Some(1)
     );
     let log = conflict.provider_log();
     assert!(log
         .iter()
-        .any(|line| line.starts_with("bead-conflict-edge/review-3/0")));
-    assert!(log
-        .iter()
-        .any(|line| line.starts_with("bead-conflict-edge/synthesis/0")));
+        .any(|line| line.starts_with("bead-conflict-edge/review-1/0")));
+    assert!(!log.iter().any(|line| line.contains("/review-2/")));
+    assert!(!log.iter().any(|line| line.contains("/review-3/")));
+    assert!(!log.iter().any(|line| line.contains("/synthesis/")));
 }
 
 #[test]

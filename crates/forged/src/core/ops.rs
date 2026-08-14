@@ -180,6 +180,51 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 
 // ------------------------------------------------------------- run start
 
+/// Resolve the Bead as work, not merely as a bag of spec fields.
+///
+/// `bd ready` is the authority for dependency readiness. Reading the issue
+/// first makes the refusal useful (status and type), while the frontier read
+/// prevents an open issue with active blockers from being dispatched. A
+/// non-code Bead has an explicit route instead of being forced through a
+/// commit-and-PR protocol that cannot represent its correct result.
+async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSummary, Failure> {
+    let issue = super::spec::read_bead(ctx, bead).await?;
+    if issue.status != "open" {
+        return Err(Failure::invalid(format!(
+            "bead {bead} is {:?}, not open and ready",
+            issue.status
+        )));
+    }
+    match issue.issue_type.as_str() {
+        "epic" => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is an epic; use `forged epic start`"
+            )))
+        }
+        "chore" | "decision" | "milestone" => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is a no-diff {}; complete it directly through Beads, not slice/v1",
+                issue.issue_type
+            )))
+        }
+        "bug" | "feature" | "task" | "story" | "spike" => {}
+        other => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} has unsupported issue type {other:?}"
+            )))
+        }
+    }
+    let ready = forged_beads::ready_issues(&ctx.config.bd_config())
+        .await
+        .map_err(|error| super::spec::read_failure("reading the Beads ready frontier", error))?;
+    if !ready.iter().any(|candidate| candidate.id == bead) {
+        return Err(Failure::invalid(format!(
+            "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
+        )));
+    }
+    Ok(issue)
+}
+
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
 /// explicit child generation id) and fill `NewRun` from the config plus the
 /// `--repo` and `--base-ref` arguments. The spec comes from the bead;
@@ -288,6 +333,7 @@ pub(crate) async fn run_start_with_definition(
                     "--repo must be an absolute path, got {repo:?}"
                 )));
             }
+            let issue = ready_slice_bead(ctx, &bead).await?;
             // The spec source is settled BEFORE the run row exists: a bead
             // with no spec, or a spec path that is not there, must never
             // reach a seat as an empty spec.
@@ -306,7 +352,7 @@ pub(crate) async fn run_start_with_definition(
                 None => {
                     // Resolving proves the bead carries a spec, and names
                     // every empty field when it does not.
-                    super::spec::resolve_bead(ctx, &bead).await?;
+                    super::spec::resolve_issue(&issue)?;
                     super::spec::SpecSource::Bead(bead.clone())
                 }
             };
@@ -344,11 +390,17 @@ pub(crate) async fn run_start_with_definition(
                     "source": "file",
                     "specPath": path,
                     "deprecated": true,
+                    "beadTitle": issue.title,
+                    "issueType": issue.issue_type,
+                    "metadata": issue.metadata,
                 }),
                 super::spec::SpecSource::Bead(bead_id) => json!({
                     "runId": row.run_id,
                     "source": "bead",
                     "beadId": bead_id,
+                    "beadTitle": issue.title,
+                    "issueType": issue.issue_type,
+                    "metadata": issue.metadata,
                 }),
             };
             on_ledger(&ctx.ledger, move |l| {
@@ -403,15 +455,85 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision) = on_ledger(&ctx.ledger, move |ledger| {
+        let (definition, revision, protocol_terminal) = on_ledger(&ctx.ledger, move |ledger| {
+            let protocol_terminal = ledger
+                .list_events(Some(&run_id_owned), 0, 4096)?
+                .into_iter()
+                .find(|event| event.kind == "run.protocol-terminal")
+                .map(|event| {
+                    serde_json::from_str::<Value>(&event.payload_json)
+                        .map_err(forged_ledger::LedgerError::from)
+                })
+                .transpose()?
+                .and_then(|payload| payload.get("terminal").cloned());
             Ok((
                 ledger.get_run_definition(&run_id_owned)?,
                 ledger.latest_roster_revision(&run_id_owned)?,
+                protocol_terminal,
             ))
         })
         .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
+        let expected_assignee = crate::core::run_holder(&view.run.bead_id);
+        let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
+            Ok(issue) => {
+                let holder_mismatch = issue
+                    .assignee
+                    .as_deref()
+                    .is_some_and(|holder| {
+                        holder != expected_assignee && holder != crate::core::FRONTIER_HOLDER
+                    });
+                let controller_dead = !controller.is_null()
+                    && matches!(
+                        controller.get("state").and_then(Value::as_str),
+                        Some("dead" | "vanished" | "exited")
+                    );
+                let execution_live = !view.live_attempts.is_empty()
+                    || controller.get("state").and_then(Value::as_str) == Some("running");
+                let awaiting_delivery = matches!(
+                    view.run.terminal_outcome,
+                    Some(
+                        forged_ledger::RunOutcome::Clean
+                            | forged_ledger::RunOutcome::AcceptedRisk
+                    )
+                );
+                let stale = issue.status == "in_progress"
+                    && (holder_mismatch
+                        || (!awaiting_delivery
+                            && (!execution_live
+                                || view.run.state == RunState::Stopped
+                                || controller_dead)));
+                let detail = if holder_mismatch {
+                    format!(
+                        "Bead is assigned to {}, expected {expected_assignee}",
+                        issue.assignee.as_deref().unwrap_or("nobody")
+                    )
+                } else if awaiting_delivery {
+                    "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+                } else if stale {
+                    "Bead remains in_progress although durable execution is no longer live".to_owned()
+                } else {
+                    "Live Beads claim agrees with execution evidence".to_owned()
+                };
+                json!({
+                    "known": true,
+                    "status": issue.status,
+                    "assignee": issue.assignee,
+                    "expectedAssignee": expected_assignee,
+                    "staleInProgress": stale,
+                    "detail": detail,
+                })
+            }
+            Err(error) => json!({
+                "known": false,
+                "status": Value::Null,
+                "assignee": Value::Null,
+                "expectedAssignee": expected_assignee,
+                "staleInProgress": false,
+                "detail": format!("Beads unavailable: {error}"),
+            }),
+        };
         let definition = match definition {
             Some(row) => {
                 let package: forged_types::ExecutionPackageV1 = serde_json::from_str(&row.package_json)
@@ -484,6 +606,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "profileHistory": history,
                 "topology": {
                     "seats": active_profile.seats,
+                    "riskContext": active_profile.risk_context,
                     "fixRoundBudget": active_profile.fix_round_budget,
                     "escalateOn": active_profile.escalate_on,
                     "escalateTo": active_profile.escalate_to,
@@ -503,6 +626,13 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     RunState::Stopped => "stopped",
                 },
                 "stopReason": view.run.stop_reason,
+                "outcome": view.run.terminal_outcome.map(|value| value.as_str()),
+                "delivery": {
+                    "pr": view.run.delivery_pr,
+                    "sha": view.run.delivery_sha,
+                },
+                "supersededBy": view.run.superseded_by,
+                "claimHealth": claim_health,
                 "protocolMode": if view.execution_package.is_some() { "adaptive" } else { "legacy" },
                 "definition": definition,
                 "execution": execution,
@@ -525,7 +655,9 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "name": o.name,
                     "idempotencyKey": o.idempotency_key,
                 })).collect::<Vec<_>>(),
-                "nextAction": match &action {
+                "nextAction": match protocol_terminal {
+                    Some(terminal) if view.accepted_risk.is_none() => json!({"stop": terminal}),
+                    _ => match &action {
                     forged_proto::NextAction::RunMachine(step) =>
                         json!({"runMachine": step.as_str()}),
                     forged_proto::NextAction::OpenPackets(intents) =>
@@ -538,10 +670,12 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                             "to": escalation.to,
                             "trigger": escalation.trigger,
                         }}),
-                    forged_proto::NextAction::Stop(t) =>
-                        json!({"stop": super::drive::terminal_json(t)}),
+                        forged_proto::NextAction::Stop(t) =>
+                            json!({"stop": super::drive::terminal_json(t)}),
+                    },
                 },
                 "controller": controller,
+                "claimHealth": claim_health,
             }
         }))
     })
@@ -700,6 +834,194 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
                     "reason": row.reason,
                 }))
             }
+        },
+    )
+    .await
+}
+
+// ------------------------------------------------------- run accept risk
+
+/// Record the operator's one auditable post-budget decision. Findings come
+/// from the frozen run projection rather than caller input, so the evidence
+/// accepted is exactly the deduplicated set the final remediation saw.
+pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let run_id = match param_str(&req.params, "run") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(&derive_key("run_accept_risk", None, None, None), &error)
+        }
+    };
+    let accepted_by = match param_str(&req.params, "acceptedBy") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), None, None),
+                &Failure::invalid("acceptedBy must not be empty"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), None, None),
+                &error,
+            )
+        }
+    };
+    let rationale = match param_str(&req.params, "rationale") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &Failure::invalid("rationale must not be empty"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &error,
+            )
+        }
+    };
+    let view = match super::drive::project(ctx, &run_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &error,
+            )
+        }
+    };
+    // Exhaustion normally settles the run before an operator can accept its
+    // risk. Read the preserved protocol terminal (or an existing acceptance)
+    // so the evidence gate survives the stopped state projection.
+    let persisted_review_rounds = {
+        let event_run = run_id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            let mut accepted = None;
+            let mut exhausted = None;
+            for event in ledger.list_events(Some(&event_run), 0, 4096)? {
+                let payload: Value = serde_json::from_str(&event.payload_json)?;
+                match event.kind.as_str() {
+                    "forged.review.risk_accepted" => {
+                        accepted = payload.get("reviewRounds").and_then(Value::as_u64);
+                    }
+                    "run.protocol-terminal" => {
+                        exhausted = payload
+                            .pointer("/terminal/reviewBudgetExhausted/reviewRounds")
+                            .and_then(Value::as_u64);
+                    }
+                    _ => {}
+                }
+            }
+            Ok(accepted
+                .or(exhausted)
+                .and_then(|rounds| u8::try_from(rounds).ok()))
+        })
+        .await
+        {
+            Ok(value) => value,
+            Err(error) => {
+                return err_response(
+                    &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                    &error,
+                )
+            }
+        }
+    };
+    let (review_rounds, acceptance) = match &view.accepted_risk {
+        Some(existing)
+            if existing.accepted_by == accepted_by && existing.rationale == rationale =>
+        {
+            let rounds = persisted_review_rounds.unwrap_or_else(|| {
+                view.execution_package
+                    .as_ref()
+                    .map(|package| {
+                        let name = view
+                            .profile_escalations
+                            .last()
+                            .map(|event| event.to.as_str())
+                            .unwrap_or(package.profile_ref.name.as_str());
+                        package
+                            .profile_catalog
+                            .get(name)
+                            .unwrap_or(&package.profile)
+                            .fix_round_budget
+                            .saturating_add(1)
+                    })
+                    .unwrap_or(1)
+            });
+            (rounds, existing.clone())
+        }
+        Some(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &Failure::invalid("risk was already accepted with different evidence"),
+            )
+        }
+        None => {
+            let rounds = match persisted_review_rounds {
+                Some(rounds) => rounds,
+                None => match forged_proto::advance(&view) {
+                    forged_proto::NextAction::Stop(
+                        forged_proto::Terminal::ReviewBudgetExhausted { review_rounds, .. },
+                    ) => review_rounds,
+                    _ => return err_response(
+                        &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                        &Failure::invalid(
+                            "risk can be accepted only after the review round budget is exhausted",
+                        ),
+                    ),
+                },
+            };
+            (
+                rounds,
+                forged_types::AcceptedRisk {
+                    accepted_by: accepted_by.clone(),
+                    rationale,
+                    findings: super::drive::latest_review_findings(&view),
+                },
+            )
+        }
+    };
+    default_key(
+        req,
+        derive_key(
+            "run_accept_risk",
+            Some(&run_id),
+            Some(&accepted_by),
+            Some(i64::from(review_rounds)),
+        ),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.clone());
+    }
+    fenced(
+        ctx,
+        "run_accept_risk",
+        EffectClass::SafeRetry,
+        req,
+        None,
+        move |_operation| async move {
+            {
+                let run_id = run_id.clone();
+                let acceptance = acceptance.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.accept_review_risk(&run_id, review_rounds, acceptance)
+                })
+                .await?;
+            }
+            let settlement = super::settlement::Settlement {
+                outcome: forged_ledger::RunOutcome::AcceptedRisk,
+                reason: super::settlement::accepted_risk_reason(&acceptance),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            };
+            super::settlement::settle(ctx, &run_id, settlement).await?;
+            Ok(json!({
+                "runId": run_id,
+                "reviewRounds": review_rounds,
+                "acceptance": acceptance,
+            }))
         },
     )
     .await
@@ -1256,7 +1578,18 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 // ------------------------------------------------------------- inventory
 
 /// The durable kinds an inventory entry's lifecycle is folded from.
-const LIFECYCLE_KINDS: [&str; 4] = [epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR];
+const RUN_SETTLED: &str = "run.settled";
+const PROTO_PR: &str = "proto.pr";
+const CONTROLLER_STARTED: &str = "forged.controller.started";
+const LIFECYCLE_KINDS: [&str; 7] = [
+    epic::STARTED,
+    epic::PAUSED,
+    epic::RESUMED,
+    epic::EPIC_PR,
+    PROTO_PR,
+    RUN_SETTLED,
+    CONTROLLER_STARTED,
+];
 
 /// A synthesized epic entry's derived lifecycle columns.
 struct EpicLifecycle {
@@ -1402,9 +1735,19 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         });
     }
     let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
+    let mut current: BTreeMap<String, (i64, String, String)> = BTreeMap::new();
     for attempt in &snapshot.live_attempts {
-        let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
-        *live_seats.entry(run_id).or_default() += 1;
+        let (run_id, stage, _) = split_packet_key(&attempt.packet_id)?;
+        *live_seats.entry(run_id.clone()).or_default() += 1;
+        let replace = current
+            .get(&run_id)
+            .is_none_or(|(seen, _, _)| *seen < attempt.attempt_id);
+        if replace {
+            current.insert(
+                run_id,
+                (attempt.attempt_id, stage, attempt.claimant.clone()),
+            );
+        }
     }
     // (createdAt, id, entry) — one ordering over both sources, keeping
     // `list_runs`'s chronological shape now that epics interleave.
@@ -1417,16 +1760,29 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "kind": if epic { "epic" } else { "slice" },
             "beadId": run.bead_id.clone(),
             "repo": run.repo.clone(),
+            "baseRef": run.base_ref.clone(),
             "branch": run.branch.clone(),
             "state": match run.state {
                 RunState::Active => "active",
                 RunState::Stopped => "stopped",
             },
             "stopReason": run.stop_reason.clone(),
+            "outcome": run.terminal_outcome.map(|value| value.as_str()),
+            "delivery": {
+                "pr": run.delivery_pr,
+                "sha": run.delivery_sha.clone(),
+            },
+            "supersededBy": run.superseded_by.clone(),
             "createdAt": run.created_at.clone(),
             "updatedAt": run.updated_at.clone(),
+            "lastProgressAt": snapshot.latest_event.get(&run.run_id)
+                .map(|event| json!(event.ts)).unwrap_or_else(|| json!(run.updated_at)),
             "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
+            "currentStage": current.get(&run.run_id).map(|(_, stage, _)| stage),
+            "currentSeat": current.get(&run.run_id).map(|(_, stage, _)| stage),
+            "currentAgent": current.get(&run.run_id).map(|(_, _, claimant)| claimant),
         });
+        add_lifecycle(snapshot, &run.run_id, &mut entry);
         add_spend(snapshot, &spend, &run.run_id, &mut entry);
         inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
     }
@@ -1451,6 +1807,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "kind": "epic",
             "beadId": bead_id,
             "repo": field("repo"),
+            "baseRef": field("baseRef"),
             "branch": field("integrationBranch"),
             "state": lifecycle.map(|l| l.state).unwrap_or("active"),
             "stopReason": lifecycle
@@ -1458,13 +1815,76 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
                 .unwrap_or(Value::Null),
             "createdAt": ts,
             "updatedAt": updated_at,
+            "lastProgressAt": updated_at,
             "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
+            "currentStage": current.get(&epic_id).map(|(_, stage, _)| stage),
+            "currentSeat": current.get(&epic_id).map(|(_, stage, _)| stage),
+            "currentAgent": current.get(&epic_id).map(|(_, _, claimant)| claimant),
         });
+        add_lifecycle(snapshot, &epic_id, &mut entry);
         add_spend(snapshot, &spend, &epic_id, &mut entry);
         inventory.push((ts, epic_id, entry));
     }
     inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
     Ok(inventory.into_iter().map(|(_, _, entry)| entry).collect())
+}
+
+/// Add the additive lifecycle contract. New `run.settled` writers can land
+/// independently; legacy rows degrade to null outcome/delivery rather than
+/// being guessed terminal.
+fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
+    let latest = |kind: &str| {
+        snapshot
+            .events(kind)
+            .iter()
+            .rev()
+            .find(|event| event.run_id.as_deref() == Some(id))
+            .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+    };
+    let settled = latest(RUN_SETTLED);
+    let outcome = settled
+        .as_ref()
+        .and_then(|value| value.get("outcome"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let superseded_by = settled
+        .as_ref()
+        .and_then(|value| value.get("supersededBy"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let settled_delivery = settled
+        .as_ref()
+        .and_then(|value| value.get("delivery"))
+        .cloned();
+    let pr = latest(epic::EPIC_PR).or_else(|| latest(PROTO_PR));
+    let pr_number = pr
+        .as_ref()
+        .and_then(|record| record.get("number"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let mut delivery = settled_delivery.unwrap_or_else(|| {
+        if pr_number.is_null() {
+            Value::Null
+        } else {
+            json!({"pr": pr_number.clone(), "sha": Value::Null})
+        }
+    });
+    // A clean settlement happens after review and before the human merge,
+    // while the draft PR is recorded independently by the protocol. Merge
+    // those two durable sources instead of letting the settlement's null PR
+    // erase a real delivery candidate.
+    if delivery.get("pr").is_some_and(Value::is_null) && !pr_number.is_null() {
+        delivery["pr"] = pr_number;
+    }
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("outcome".to_owned(), outcome);
+        object.insert("delivery".to_owned(), delivery);
+        object.insert("supersededBy".to_owned(), superseded_by);
+        object.insert(
+            "ci".to_owned(),
+            json!({"status": "unknown", "detail": "CI state is not recorded durably"}),
+        );
+    }
 }
 
 /// Stamp one entry's spend, when the caller asked for it.
@@ -1494,10 +1914,11 @@ fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut 
 /// [`LIFECYCLE_KINDS`]. `proto.quarantine` is spelled here rather than
 /// imported because the ledger stores kind strings and the proto crate
 /// exposes the vocabulary only through its parsed variants.
-const ATTENTION_KINDS: [&str; 3] = [
+const ATTENTION_KINDS: [&str; 4] = [
     epic::INPUT_REQUIRED,
     epic::INPUT_RESOLVED,
     "proto.quarantine",
+    "run.bead-settlement.pending",
 ];
 
 /// One condition needing a human, in the order the rail reports them.
@@ -1505,7 +1926,15 @@ const ATTENTION_KINDS: [&str; 3] = [
 /// Severity, not alphabet: a subject holding for an answer or stuck
 /// mid-reclaim blocks work, custody of a refused result is evidence a human
 /// must adjudicate, and an unpriced usage row only makes a figure partial.
-const CONDITIONS: [&str; 4] = ["input-required", "revoking", "quarantined", "missing-cost"];
+const CONDITIONS: [&str; 7] = [
+    "input-required",
+    "blocked",
+    "beads-settlement-pending",
+    "revoking",
+    "quarantined",
+    "awaiting-delivery",
+    "missing-cost",
+];
 
 /// The whole inventory and what needs a human, from ONE snapshot.
 pub struct Portfolio {
@@ -1513,6 +1942,8 @@ pub struct Portfolio {
     pub entries: Vec<Value>,
     /// One entry per (subject, condition), most severe condition first.
     pub attention: Vec<Value>,
+    /// The operator-facing grouping shared by `work list` and Overview.
+    pub queue: Value,
 }
 
 /// The portfolio: [`inventory`] with spend, plus the attention rail folded
@@ -1531,9 +1962,285 @@ pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
         .copied()
         .collect();
     let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
-    let entries = project_entries(&snapshot, Spend::Include)?;
+    let mut entries = project_entries(&snapshot, Spend::Include)?;
     let attention = attention_rail(&snapshot, &entries);
-    Ok(Portfolio { entries, attention })
+    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention).await;
+    Ok(Portfolio {
+        entries,
+        attention,
+        queue,
+    })
+}
+
+const QUEUE_GROUPS: [&str; 5] = [
+    "Needs me",
+    "Ready to merge",
+    "Running",
+    "Stalled or recoverable",
+    "Planned",
+];
+
+/// Enrich the inventory and group it once for every operator surface.
+///
+/// Beads is queried once for exactly the ids in the ledger. Controller
+/// records and progress events come from the already-open inventory
+/// snapshot, avoiding a ledger projection per row.
+async fn operator_queue(
+    ctx: &Ctx,
+    snapshot: &InventorySnapshot,
+    entries: &mut [Value],
+    attention: &[Value],
+) -> Value {
+    let bead_ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+        .collect();
+    let bead_read = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await;
+    let bead_error = bead_read.as_ref().err().map(ToString::to_string);
+    let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
+        .unwrap_or_default()
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    let mut attention_by_id: BTreeMap<&str, &Value> = BTreeMap::new();
+    for item in attention {
+        if let Some(id) = item["id"].as_str() {
+            // The rail is already severity ordered; retain the first and
+            // therefore most important blocker for the compact queue card.
+            attention_by_id.entry(id).or_insert(item);
+        }
+    }
+    let mut controller_records: BTreeMap<String, (i64, Value)> = BTreeMap::new();
+    for event in snapshot.events(CONTROLLER_STARTED) {
+        let Some(id) = event.run_id.clone() else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        if controller_records
+            .get(&id)
+            .is_none_or(|(seen, _)| *seen < event.event_id)
+        {
+            controller_records.insert(id, (event.event_id, record));
+        }
+    }
+    let mut pr_records: BTreeMap<String, (i64, Value)> = BTreeMap::new();
+    for kind in [PROTO_PR, epic::EPIC_PR] {
+        for event in snapshot.events(kind) {
+            let Some(id) = event.run_id.clone() else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Value>(&event.payload_json) else {
+                continue;
+            };
+            if pr_records
+                .get(&id)
+                .is_none_or(|(seen, _)| *seen < event.event_id)
+            {
+                pr_records.insert(id, (event.event_id, record));
+            }
+        }
+    }
+    let as_of = now_iso();
+    let mut grouped: BTreeMap<&str, Vec<Value>> = QUEUE_GROUPS
+        .iter()
+        .map(|name| (*name, Vec::new()))
+        .collect();
+
+    for entry in entries.iter_mut() {
+        let id = entry["id"].as_str().unwrap_or_default().to_owned();
+        let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
+        let controller = super::handoff::controller_status_from_snapshot(
+            ctx,
+            &id,
+            controller_records.remove(&id).map(|(_, record)| record),
+            snapshot.latest_event.get(&id),
+        )
+        .await;
+        let issue = beads.get(&bead_id);
+        let title = issue
+            .map(|issue| issue.title.trim())
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "Legacy {} {bead_id}",
+                    entry["kind"].as_str().unwrap_or("work")
+                )
+            });
+        let expected = crate::core::run_holder(&bead_id);
+        let controller_state = controller.get("state").and_then(Value::as_str);
+        let controller_live = controller_state == Some("running");
+        let execution_live = controller_live || entry["liveSeats"].as_u64().unwrap_or(0) > 0;
+        let claim_known = issue.is_some();
+        let claim_status = issue.map(|issue| issue.status.as_str());
+        let assignee = issue.and_then(|issue| issue.assignee.as_deref());
+        let holder_mismatch = assignee
+            .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
+        let outcome = entry["outcome"].as_str();
+        let awaiting_delivery = matches!(outcome, Some("clean" | "accepted-risk"));
+        let visibly_terminal = !entry["outcome"].is_null()
+            || !entry["delivery"].is_null()
+            || entry["state"] == json!("stopped");
+        let dead_controller = !controller.is_null()
+            && matches!(controller_state, Some("dead" | "vanished" | "exited"));
+        let stale = claim_status == Some("in_progress")
+            && (holder_mismatch
+                || (!awaiting_delivery
+                    && (!execution_live || visibly_terminal || dead_controller)));
+        let claim_detail = if !claim_known {
+            bead_error
+                .as_deref()
+                .map(|error| format!("Beads unavailable: {error}"))
+                .unwrap_or_else(|| "Bead was not returned by the bounded live read".to_owned())
+        } else if holder_mismatch {
+            format!(
+                "Bead is assigned to {}, expected {expected}",
+                assignee.unwrap_or("nobody")
+            )
+        } else if awaiting_delivery {
+            "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+        } else if stale {
+            "Bead remains in_progress although durable execution is no longer live".to_owned()
+        } else if claim_status == Some("blocked") {
+            "Bead is blocked in the authoritative live store".to_owned()
+        } else if claim_status == Some("closed") && !visibly_terminal {
+            "Bead is closed while durable execution is not settled".to_owned()
+        } else {
+            "Live Beads claim agrees with execution evidence".to_owned()
+        };
+        let claim_health = json!({
+            "known": claim_known,
+            "status": claim_status,
+            "assignee": assignee,
+            "expectedAssignee": expected,
+            "staleInProgress": stale,
+            "detail": claim_detail,
+        });
+        let attention_item = attention_by_id.get(id.as_str()).copied();
+        let attention_condition = attention_item.and_then(|item| item["condition"].as_str());
+        let blocker = attention_item
+            .map(|item| item["detail"].clone())
+            .or_else(|| {
+                entry["stopReason"]
+                    .is_string()
+                    .then(|| entry["stopReason"].clone())
+            })
+            .or_else(|| (!claim_known).then(|| json!(claim_detail)))
+            .or_else(|| {
+                matches!(claim_status, Some("blocked" | "closed")).then(|| json!(claim_detail))
+            })
+            .or_else(|| stale.then(|| json!(claim_detail)))
+            .or_else(|| {
+                matches!(controller_state, Some("dead" | "vanished" | "unknown")).then(|| {
+                    json!(format!(
+                        "detached controller is {}",
+                        controller_state.unwrap_or("unknown")
+                    ))
+                })
+            })
+            .unwrap_or(Value::Null);
+        let recorded_pr = pr_records.remove(&id).map(|(_, record)| record);
+        let delivered_pr = entry.pointer("/delivery/pr").cloned();
+        let pr = recorded_pr.map_or_else(
+            || match delivered_pr {
+                Some(value @ Value::Object(_)) => value,
+                Some(number @ Value::Number(_)) => json!({
+                    "number": number,
+                    "url": Value::Null,
+                    "baseBranch": entry["baseRef"],
+                    "isDraft": Value::Null,
+                }),
+                _ => Value::Null,
+            },
+            |record| {
+                json!({
+                    "number": record.get("number").cloned().unwrap_or(Value::Null),
+                    "url": record.get("url").cloned().unwrap_or(Value::Null),
+                    "baseBranch": record.get("base").cloned()
+                        .unwrap_or_else(|| entry["baseRef"].clone()),
+                    "isDraft": record.get("isDraft").cloned().unwrap_or(Value::Null),
+                })
+            },
+        );
+        let has_pr = !pr.is_null();
+        let merge_actionable = awaiting_delivery && has_pr;
+        let needs_intervention =
+            attention_item.is_some() && attention_condition != Some("awaiting-delivery");
+        let group = if needs_intervention || claim_status == Some("blocked") {
+            "Needs me"
+        } else if execution_live {
+            "Running"
+        } else if merge_actionable {
+            "Ready to merge"
+        } else if attention_item.is_some() {
+            // A clean outcome without its promised PR is not mergeable.
+            "Needs me"
+        } else if !claim_known
+            || stale
+            || claim_status == Some("closed")
+            || dead_controller
+            || controller_state == Some("unknown")
+            || entry["state"] == json!("stopped")
+        {
+            "Stalled or recoverable"
+        } else {
+            "Planned"
+        };
+        let next_action = match group {
+            "Needs me" => "Resolve the recorded blocker, then resume execution".to_owned(),
+            "Ready to merge" => format!(
+                "Merge PR {} into {}",
+                pr.get("number")
+                    .map_or_else(|| "unknown".to_owned(), Value::to_string),
+                pr.get("baseBranch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the recorded base")
+            ),
+            "Running" => entry["currentStage"].as_str().map_or_else(
+                || "Let the verified controller advance the workflow".to_owned(),
+                |stage| format!("Wait for {stage} to settle"),
+            ),
+            "Stalled or recoverable" => {
+                "Inspect the blocker and resubmit only after controller death is verified"
+                    .to_owned()
+            }
+            _ => "Submit a detached controller when this work should start".to_owned(),
+        };
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("title".to_owned(), json!(title));
+            object.insert("controller".to_owned(), controller);
+            object.insert("claimHealth".to_owned(), claim_health);
+            object.insert("blocker".to_owned(), blocker);
+            object.insert("nextAction".to_owned(), json!(next_action));
+            object.insert("pr".to_owned(), pr);
+            object.insert(
+                "spend".to_owned(),
+                json!({
+                    "costUsdKnown": object.get("costUsdKnown").cloned().unwrap_or(json!(0.0)),
+                    "rowsMissingCost": object.get("rowsMissingCost").cloned().unwrap_or(json!(0)),
+                }),
+            );
+            object.insert(
+                "progressAgeInput".to_owned(),
+                json!({"lastProgressAt": object.get("lastProgressAt"), "asOf": as_of}),
+            );
+            object.insert("queueGroup".to_owned(), json!(group));
+        }
+        grouped
+            .get_mut(group)
+            .expect("pinned queue group")
+            .push(entry.clone());
+    }
+    let groups: Vec<Value> = QUEUE_GROUPS
+        .iter()
+        .map(|name| {
+            let items = grouped.remove(name).unwrap_or_default();
+            json!({"name": name, "count": items.len(), "entries": items})
+        })
+        .collect();
+    json!({"groups": groups, "total": entries.len(), "asOf": as_of})
 }
 
 /// Fold one snapshot into the attention rail.
@@ -1603,6 +2310,81 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
                     .trim()
                     .to_owned(),
                 payload.clone(),
+            ),
+        );
+    }
+
+    // Slice settlement is itself operator-facing truth. A blocked/input
+    // outcome needs adjudication; clean and accepted-risk candidates need a
+    // delivery decision and must not disappear merely because no worker is
+    // live anymore.
+    for entry in entries {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        let reason = entry["stopReason"].as_str().unwrap_or("no reason recorded");
+        match entry["outcome"].as_str() {
+            Some("blocked") => push(
+                "blocked",
+                item(
+                    id,
+                    "blocked",
+                    format!("run is blocked: {reason}"),
+                    json!({"outcome": "blocked", "reason": reason}),
+                ),
+            ),
+            Some("input-required") => push(
+                "input-required",
+                item(
+                    id,
+                    "input-required",
+                    format!("run needs operator input: {reason}"),
+                    json!({"outcome": "input-required", "reason": reason}),
+                ),
+            ),
+            Some(outcome @ ("clean" | "accepted-risk")) => {
+                let pr = entry
+                    .pointer("/delivery/pr")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                push(
+                    "awaiting-delivery",
+                    item(
+                        id,
+                        "awaiting-delivery",
+                        if pr.is_null() {
+                            format!("{outcome} candidate has no recorded delivery PR")
+                        } else {
+                            format!("{outcome} candidate is awaiting merge of PR {pr}")
+                        },
+                        json!({"outcome": outcome, "pr": pr}),
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // A failed Beads reconciliation is a durable promise still owed. Keep
+    // the latest failed write visible; the exact error and intended outcome
+    // are the recovery evidence.
+    let mut bead_pending: BTreeMap<String, Value> = BTreeMap::new();
+    for event in snapshot.events("run.bead-settlement.pending") {
+        let Some(id) = event.run_id.clone() else {
+            continue;
+        };
+        let payload = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+        bead_pending.insert(id, payload);
+    }
+    for (id, payload) in bead_pending {
+        let error = payload["error"].as_str().unwrap_or("unknown Beads error");
+        push(
+            "beads-settlement-pending",
+            item(
+                &id,
+                "beads-settlement-pending",
+                format!("run outcome is stored but Beads reconciliation is pending: {error}"),
+                payload,
             ),
         );
     }
@@ -1725,12 +2507,92 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        Ok(json!({"runs": inventory(ctx, Spend::Include).await?}))
+        let portfolio = portfolio(ctx).await?;
+        Ok(json!({"runs": portfolio.entries, "queue": portfolio.queue}))
     })
     .await
 }
 
 // ---------------------------------------------------------------- events
+
+const EVENT_SUMMARY_STRING_MAX: usize = 500;
+const EVENT_SUMMARY_ARRAY_MAX: usize = 8;
+const EVENT_SUMMARY_DEPTH_MAX: usize = 3;
+
+fn bounded_event_value(value: &Value, depth: usize) -> Value {
+    if depth >= EVENT_SUMMARY_DEPTH_MAX {
+        return match value {
+            Value::Array(items) => json!({"omitted": "array", "count": items.len()}),
+            Value::Object(map) => json!({"omitted": "object", "count": map.len()}),
+            other => other.clone(),
+        };
+    }
+    match value {
+        Value::String(text) => {
+            let mut chars = text.chars();
+            let shortened: String = chars.by_ref().take(EVENT_SUMMARY_STRING_MAX).collect();
+            if chars.next().is_some() {
+                json!({"text": shortened, "truncated": true, "charactersAtLeast": EVENT_SUMMARY_STRING_MAX + 1})
+            } else {
+                Value::String(text.clone())
+            }
+        }
+        Value::Array(items) => {
+            let values = items
+                .iter()
+                .take(EVENT_SUMMARY_ARRAY_MAX)
+                .map(|item| bounded_event_value(item, depth + 1))
+                .collect::<Vec<_>>();
+            if items.len() > EVENT_SUMMARY_ARRAY_MAX {
+                json!({"items": values, "total": items.len(), "truncated": true})
+            } else {
+                Value::Array(values)
+            }
+        }
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(key, item)| (key.clone(), bounded_event_value(item, depth + 1)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
+fn event_summary(kind: &str, payload: &Value) -> Value {
+    if kind != "proto.gate" {
+        return bounded_event_value(payload, 0);
+    }
+    let rows = payload
+        .get("rows")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let commands = rows
+        .iter()
+        .filter_map(|row| row.get("command").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let failed_commands = rows
+        .iter()
+        .filter(|row| row.get("exitCode").and_then(Value::as_i64) != Some(0))
+        .filter_map(|row| row.get("command").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    let artifacts = rows
+        .iter()
+        .filter_map(|row| row.get("artifactPath").and_then(Value::as_str))
+        .map(str::to_owned)
+        .collect::<Vec<_>>();
+    json!({
+        "schemaVersion": payload.get("schemaVersion"),
+        "phase": payload.get("phase"),
+        "seq": payload.get("seq"),
+        "passed": payload.get("passed"),
+        "commands": commands,
+        "failedCommands": failed_commands,
+        "artifactPaths": artifacts,
+    })
+}
 
 /// `events` — read-only, paginated; proto rows are validated through the
 /// replay parser on the way out.
@@ -1739,6 +2601,11 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let run = param_opt_str(&req.params, "run").map(str::to_owned);
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
         let limit = req.params.get("limit").and_then(Value::as_u64);
+        let summary = req
+            .params
+            .get("summary")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
         let rows = {
             let run = run.clone();
             on_ledger(&ctx.ledger, move |l| {
@@ -1775,17 +2642,17 @@ pub async fn events_tail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         let events: Vec<Value> = rows
             .iter()
             .map(|r| {
+                let payload = serde_json::from_str::<Value>(&r.payload_json).unwrap_or(Value::Null);
                 json!({
                     "eventId": r.event_id,
                     "ts": r.ts,
                     "runId": r.run_id,
                     "kind": r.kind,
-                    "payload": serde_json::from_str::<Value>(&r.payload_json)
-                        .unwrap_or(Value::Null),
+                    "payload": if summary { event_summary(&r.kind, &payload) } else { payload },
                 })
             })
             .collect();
-        Ok(json!({"events": events, "last_event_id": last_event_id}))
+        Ok(json!({"events": events, "last_event_id": last_event_id, "summary": summary}))
     })
     .await
 }

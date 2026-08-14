@@ -30,6 +30,7 @@ fn review_context() -> Value {
         "spec_path": "specs/bead-1.md",
         "worktree": "/tmp/worktrees/run-1",
         "field_notes": [],
+        "risk_context": "Routine change with reversible effects.",
         "packet_id": PACKET_ID,
         "result_schema": PromptStage::Review.result_schema(),
     })
@@ -240,6 +241,7 @@ fn stage_variable_schemas_are_closed_and_exact() {
             "spec_path",
             "worktree",
             "field_notes",
+            "risk_context",
             "packet_id",
             "result_schema"
         ]

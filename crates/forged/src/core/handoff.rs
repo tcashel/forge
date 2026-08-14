@@ -5,13 +5,16 @@
 
 use std::collections::HashMap;
 use std::hash::{DefaultHasher, Hash, Hasher};
+use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
 use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
 use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 
 use crate::config::{now_iso, HostPolicy};
 use crate::core::{
@@ -21,11 +24,14 @@ use crate::core::{
 
 const CONTROLLER_STARTED: &str = "forged.controller.started";
 const CONTROLLER_FALLBACK: &str = "forged.controller.host.fallback";
-const PID_FILE: &str = "controller.pid";
-const LSTART_FILE: &str = "controller.lstart";
+const CONTROLLER_RECOVERED: &str = "forged.controller.recovered";
 const RECORD_FILE: &str = "controller.json";
-const OUTPUT_FILE: &str = "controller.log";
 const SUBMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
+const DRIVER_PID_ENV: &str = "FORGED_CONTROLLER_PID_PATH";
+const DRIVER_LSTART_ENV: &str = "FORGED_CONTROLLER_LSTART_PATH";
+const CONTROLLER_SCOPE_ENV: &str = "FORGED_CONTROLLER_SCOPE";
+const CONTROLLER_ID_ENV: &str = "FORGED_CONTROLLER_ID";
+const CONTROLLER_GENERATION_ENV: &str = "FORGED_CONTROLLER_GENERATION";
 
 #[derive(Debug, Clone, Copy)]
 enum Scope {
@@ -55,6 +61,103 @@ fn payload(row: &forged_ledger::EventRow) -> Option<Value> {
 
 fn shell_quote(value: &str) -> String {
     format!("'{}'", value.replace('\'', "'\"'\"'"))
+}
+
+fn binary_identity(path: &Path) -> Result<Value, Failure> {
+    let mut file = std::fs::File::open(path)
+        .map_err(|error| Failure::internal(format!("opening forged executable: {error}")))?;
+    let mut digest = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let read = file
+            .read(&mut buf)
+            .map_err(|error| Failure::internal(format!("hashing forged executable: {error}")))?;
+        if read == 0 {
+            break;
+        }
+        digest.update(&buf[..read]);
+    }
+    let sha256 = digest
+        .finalize()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(json!({
+        "path": path,
+        "version": env!("CARGO_PKG_VERSION"),
+        "sha256": sha256,
+    }))
+}
+
+fn current_binary_identity() -> Result<Value, Failure> {
+    static IDENTITY: OnceLock<Result<Value, String>> = OnceLock::new();
+    IDENTITY
+        .get_or_init(|| {
+            let path = std::env::current_exe()
+                .map_err(|error| format!("resolving forged executable: {error}"))?;
+            binary_identity(&path).map_err(|failure| failure.message)
+        })
+        .clone()
+        .map_err(Failure::internal)
+}
+
+fn controller_shell_line(
+    command: &str,
+    output_path: &Path,
+    exit_path: &Path,
+    mirror_to_pane: bool,
+) -> String {
+    if !mirror_to_pane {
+        return format!(
+            "exec </dev/null >>{} 2>&1; {command}",
+            shell_quote(&output_path.to_string_lossy())
+        );
+    }
+    // POSIX sh has no pipefail. Persist the driver's status before tee and
+    // make a final subshell reproduce it, so the host sentinel still records
+    // the forged process rather than tee's exit code.
+    format!(
+        "{{ {command}; printf '%s\\n' \"$?\" > {}; }} 2>&1 | tee -a {}; \
+         (exit \"$(cat {})\")",
+        shell_quote(&exit_path.to_string_lossy()),
+        shell_quote(&output_path.to_string_lossy()),
+        shell_quote(&exit_path.to_string_lossy()),
+    )
+}
+
+/// A detached `drive` process records ITS OWN pid and start time. The host
+/// shell and Herdr pane are transport only and are never liveness truth.
+pub(crate) async fn record_driver_identity_from_env() -> Result<(), String> {
+    let pid_path = std::env::var_os(DRIVER_PID_ENV).map(PathBuf::from);
+    let lstart_path = std::env::var_os(DRIVER_LSTART_ENV).map(PathBuf::from);
+    let (Some(pid_path), Some(lstart_path)) = (pid_path, lstart_path) else {
+        return Ok(());
+    };
+    if !pid_path.is_absolute() || !lstart_path.is_absolute() {
+        return Err("detached controller identity paths must be absolute".to_owned());
+    }
+    let pid = i32::try_from(std::process::id())
+        .map_err(|_| "detached controller pid does not fit i32".to_owned())?;
+    let lstart = crate::adapters::ports::lstart_of(pid)
+        .await
+        .ok_or_else(|| format!("cannot verify detached controller pid {pid}"))?;
+    let pid_value = nix::unistd::Pid::from_raw(pid);
+    if let Err(error) = nix::unistd::setpgid(pid_value, pid_value) {
+        let group = nix::unistd::getpgid(Some(pid_value))
+            .map_err(|probe| format!("cannot verify detached controller process group: {probe}"))?;
+        if group != pid_value {
+            return Err(format!(
+                "cannot establish detached controller process group {pid}: {error}"
+            ));
+        }
+    }
+    // PID is the publication marker. A submitter that observes it is
+    // guaranteed the matching start stamp was durably written first.
+    std::fs::write(&lstart_path, format!("{lstart}\n"))
+        .map_err(|error| format!("writing detached controller lstart: {error}"))?;
+    std::fs::write(&pid_path, format!("{pid}\n"))
+        .map_err(|error| format!("writing detached controller pid: {error}"))?;
+    Ok(())
 }
 
 fn controller_dir(ctx: &Ctx, id: &str) -> PathBuf {
@@ -94,7 +197,7 @@ fn submit_holder_identity(holder: &str) -> Option<(i32, Option<u64>)> {
     Some((pid, identity))
 }
 
-struct SubmitGuard {
+pub(super) struct SubmitGuard {
     ledger: Ledger,
     slot: String,
     holder: String,
@@ -180,6 +283,159 @@ async fn acquire_submit(ctx: &Ctx, id: &str, scope: Scope) -> Result<SubmitGuard
     }
 }
 
+pub(super) async fn acquire_run_submit(ctx: &Ctx, id: &str) -> Result<SubmitGuard, Failure> {
+    acquire_submit(ctx, id, Scope::Run).await
+}
+
+#[derive(Debug, Clone)]
+pub(super) struct ControllerFenceTarget {
+    pub(super) generation: u32,
+    pid: i32,
+    lstart: String,
+    owned_by_current_process: bool,
+}
+
+impl ControllerFenceTarget {
+    pub(super) fn effects_excluded(&self) -> bool {
+        !self.owned_by_current_process
+    }
+}
+
+/// The generation this detached run controller must join for machine effects.
+pub(super) fn controller_generation_for_run(run_id: &str) -> Option<u32> {
+    let scope = std::env::var(CONTROLLER_SCOPE_ENV).ok()?;
+    let id = std::env::var(CONTROLLER_ID_ENV).ok()?;
+    let generation = std::env::var(CONTROLLER_GENERATION_ENV)
+        .ok()?
+        .parse::<u32>()
+        .ok()?;
+    (scope == "run" && id == run_id && generation > 0).then_some(generation)
+}
+
+/// Resolve the latest durable run-controller identity while the caller owns
+/// the submit singleton. A generation remains useful even after its driver
+/// exited because settlement must still confirm its process group is gone.
+pub(super) async fn controller_fence_target(
+    ctx: &Ctx,
+    run_id: &str,
+) -> Result<Option<ControllerFenceTarget>, Failure> {
+    let Some(record) = latest_record(ctx, run_id).await? else {
+        return Ok(None);
+    };
+    let generation = generation(&record);
+    if generation == 0 {
+        return Ok(None);
+    }
+    let pid = record
+        .pointer("/driver/pid")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .or_else(|| {
+            record
+                .get("pidPath")
+                .and_then(Value::as_str)
+                .map(Path::new)
+                .and_then(read_pid)
+        })
+        .ok_or_else(|| Failure::internal("controller record has no driver pid"))?;
+    let lstart = record
+        .pointer("/driver/lstart")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            record
+                .get("lstartPath")
+                .and_then(Value::as_str)
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        })
+        .ok_or_else(|| Failure::internal("controller record has no driver start identity"))?;
+    let owned_by_current_process = pid == std::process::id() as i32
+        && controller_generation_for_run(run_id) == Some(generation);
+    Ok(Some(ControllerFenceTarget {
+        generation,
+        pid,
+        lstart,
+        owned_by_current_process,
+    }))
+}
+
+fn process_group_alive(group: i32) -> bool {
+    matches!(
+        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None),
+        Ok(()) | Err(nix::errno::Errno::EPERM)
+    )
+}
+
+async fn await_process_group_death(group: i32, attempts: usize) -> bool {
+    for _ in 0..attempts {
+        if !process_group_alive(group) {
+            return true;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    !process_group_alive(group)
+}
+
+/// Confirm a fenced controller cannot retain an effect-capable descendant.
+/// The driver is its generation's process-group leader before its PID is
+/// published, so negative-PID death is the relevant proof, not just parent
+/// process death.
+pub(super) async fn kill_controller_confirmed(
+    target: &ControllerFenceTarget,
+) -> Result<bool, Failure> {
+    if target.owned_by_current_process {
+        return Ok(false);
+    }
+    if !process_group_alive(target.pid) {
+        return Ok(false);
+    }
+    let current = crate::adapters::ports::lstart_of(target.pid).await;
+    if current.as_deref() != Some(target.lstart.as_str()) {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "controller generation {} process group {} is live but its leader identity changed",
+                target.generation, target.pid
+            ),
+            recoverable: true,
+        });
+    }
+    let group = nix::unistd::Pid::from_raw(target.pid);
+    match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGTERM) {
+        Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "stopping controller generation {}: {error}",
+                target.generation
+            )))
+        }
+    }
+    if !await_process_group_death(target.pid, 20).await {
+        match nix::sys::signal::killpg(group, nix::sys::signal::Signal::SIGKILL) {
+            Ok(()) | Err(nix::errno::Errno::ESRCH) => {}
+            Err(error) => {
+                return Err(Failure::internal(format!(
+                    "killing controller generation {}: {error}",
+                    target.generation
+                )))
+            }
+        }
+    }
+    if !await_process_group_death(target.pid, 100).await {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "controller generation {} process group {} did not die",
+                target.generation, target.pid
+            ),
+            recoverable: true,
+        });
+    }
+    Ok(true)
+}
+
 async fn events(ctx: &Ctx, id: &str) -> Result<Vec<forged_ledger::EventRow>, Failure> {
     let id = id.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
@@ -213,6 +469,28 @@ async fn latest_record(ctx: &Ctx, id: &str) -> Result<Option<Value>, Failure> {
     })
 }
 
+fn controller_state(
+    exit_code: Option<i32>,
+    pid: Option<i32>,
+    expected: Option<&str>,
+    current: Option<&str>,
+    pid_is_alive: bool,
+) -> &'static str {
+    if exit_code.is_some() {
+        return "exited";
+    }
+    match (pid, expected, current) {
+        (Some(_), Some(expected), Some(current)) if expected == current && pid_is_alive => {
+            "running"
+        }
+        // No identity answer proves neither life nor permission to duplicate
+        // the controller. Say unknown, never "running".
+        (Some(_), _, None) if pid_is_alive => "unknown",
+        (Some(_), None, Some(_)) if pid_is_alive => "unknown",
+        _ => "vanished",
+    }
+}
+
 async fn status_for(record: &Value) -> Value {
     let pid_path = record
         .get("pidPath")
@@ -226,53 +504,111 @@ async fn status_for(record: &Value) -> Value {
         .get("statusPath")
         .and_then(Value::as_str)
         .map(PathBuf::from);
-    let pid = pid_path.as_deref().and_then(read_pid);
-    let expected = lstart_path
-        .as_deref()
-        .and_then(|path| std::fs::read_to_string(path).ok())
-        .map(|value| value.trim().to_owned())
-        .filter(|value| !value.is_empty());
+    let pid = record
+        .pointer("/driver/pid")
+        .and_then(Value::as_i64)
+        .and_then(|value| i32::try_from(value).ok())
+        .or_else(|| pid_path.as_deref().and_then(read_pid));
+    let expected = record
+        .pointer("/driver/lstart")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+        .or_else(|| {
+            lstart_path
+                .as_deref()
+                .and_then(|path| std::fs::read_to_string(path).ok())
+                .map(|value| value.trim().to_owned())
+                .filter(|value| !value.is_empty())
+        });
     let exit_code = status_path.as_deref().and_then(read_exit_code);
     let current = match pid {
         Some(pid) if exit_code.is_none() => crate::adapters::ports::lstart_of(pid).await,
         _ => None,
     };
-    let state = if exit_code.is_some() {
-        "exited"
-    } else {
-        match (pid, expected.as_deref(), current.as_deref()) {
-            (Some(pid), Some(expected), Some(current)) if expected == current && pid_alive(pid) => {
-                "running"
-            }
-            // No identity answer proves neither death nor permission to
-            // duplicate the controller. Fail closed until a sentinel lands.
-            (Some(pid), _, None) if pid_alive(pid) => "running-unverified",
-            (Some(pid), None, Some(_)) if pid_alive(pid) => "running-unverified",
-            _ => "vanished",
-        }
-    };
+    let state = controller_state(
+        exit_code,
+        pid,
+        expected.as_deref(),
+        current.as_deref(),
+        pid.is_some_and(pid_alive),
+    );
     let mut status = record.clone();
     if let Some(object) = status.as_object_mut() {
         object.insert("state".to_owned(), json!(state));
         object.insert("pid".to_owned(), json!(pid));
         object.insert("exitCode".to_owned(), json!(exit_code));
+        let current_binary = current_binary_identity().ok();
+        let mismatch = match (
+            record.pointer("/binary/sha256").and_then(Value::as_str),
+            current_binary
+                .as_ref()
+                .and_then(|value| value.get("sha256"))
+                .and_then(Value::as_str),
+        ) {
+            (Some(recorded), Some(current)) => Some(recorded != current),
+            _ => None,
+        };
+        object.insert(
+            "currentBinary".to_owned(),
+            current_binary.unwrap_or(Value::Null),
+        );
+        object.insert("binaryMismatch".to_owned(), json!(mismatch));
+    }
+    status
+}
+
+/// Project controller truth from lifecycle rows already held by an
+/// inventory snapshot. This keeps portfolio construction to one ledger
+/// transaction; only the per-controller identity files and OS process table
+/// are consulted here.
+pub(super) async fn controller_status_from_snapshot(
+    ctx: &Ctx,
+    id: &str,
+    event_record: Option<Value>,
+    progress: Option<&forged_ledger::EventRow>,
+) -> Value {
+    let file_record = std::fs::read_to_string(controller_dir(ctx, id).join(RECORD_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let record = match (event_record, file_record) {
+        (Some(event), Some(file)) if generation(&file) > generation(&event) => Some(file),
+        (Some(event), _) => Some(event),
+        (None, file) => file,
+    };
+    let Some(record) = record else {
+        return Value::Null;
+    };
+    let mut status = status_for(&record).await;
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "lastProgressAt".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.ts)),
+        );
+        object.insert(
+            "lastProgressKind".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.kind)),
+        );
+        object.insert(
+            "lastProgressEventId".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.event_id)),
+        );
     }
     status
 }
 
 fn is_active(status: &Value) -> bool {
-    matches!(
-        status.get("state").and_then(Value::as_str),
-        Some("running" | "running-unverified")
-    )
+    status.get("state").and_then(Value::as_str) == Some("running")
+}
+
+fn is_unknown(status: &Value) -> bool {
+    status.get("state").and_then(Value::as_str) == Some("unknown")
 }
 
 /// Latest detached-controller projection, or null before the first submit.
 pub(super) async fn controller_status(ctx: &Ctx, id: &str) -> Result<Value, Failure> {
-    match latest_record(ctx, id).await? {
-        Some(record) => Ok(status_for(&record).await),
-        None => Ok(Value::Null),
-    }
+    let record = latest_record(ctx, id).await?;
+    let progress = events(ctx, id).await?.into_iter().last();
+    Ok(controller_status_from_snapshot(ctx, id, record, progress.as_ref()).await)
 }
 
 async fn append_once(ctx: &Ctx, id: &str, kind: &str, value: Value) -> Result<(), Failure> {
@@ -308,6 +644,67 @@ async fn record_fallback(
     .await
 }
 
+/// Once the submit singleton has verified the preceding controller dead,
+/// interrupted effects are attributable to that predecessor. Run recovery
+/// uses the full reconciler (including observe-before-redo effects); epic
+/// effects are all SafeRetry and can be handed back directly.
+async fn recover_abandoned(
+    ctx: &Ctx,
+    id: &str,
+    scope: Scope,
+    generation: u32,
+) -> Result<(), Failure> {
+    let id_for_rows = id.to_owned();
+    let inflight = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_inflight_operations(Some(&id_for_rows))
+    })
+    .await?;
+    if inflight.is_empty() {
+        return Ok(());
+    }
+    let result = match scope {
+        Scope::Run => {
+            let view = super::drive::project(ctx, id).await?;
+            let config = forged_proto::ReconcileConfig {
+                stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
+                gate_commands: view.policy.gate_commands,
+            };
+            let ports =
+                crate::adapters::ports::ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+            let report =
+                forged_proto::reconcile(&ctx.ledger, id, &ports, &config, &now_iso()).await?;
+            crate::adapters::ports::report_json(&report)
+        }
+        Scope::Epic => {
+            let mut released = Vec::new();
+            for row in inflight {
+                if row.effect_class != EffectClass::SafeRetry {
+                    continue;
+                }
+                let operation_id = row.operation_id.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.release_operation(&operation_id)
+                })
+                .await?;
+                released.push(row.operation_id);
+            }
+            json!({"released": released})
+        }
+    };
+    append_once(
+        ctx,
+        id,
+        CONTROLLER_RECOVERED,
+        json!({
+            "schemaVersion": 1,
+            "scope": scope.noun(),
+            "generation": generation,
+            "result": result,
+        }),
+    )
+    .await
+}
+
 async fn await_pid(path: &Path) -> Option<i32> {
     for _ in 0..50 {
         if let Some(pid) = read_pid(path) {
@@ -330,12 +727,14 @@ async fn spawn(
     let dir = controller_dir(ctx, id);
     std::fs::create_dir_all(&dir)
         .map_err(|error| Failure::internal(format!("creating controller directory: {error}")))?;
-    let pid_path = dir.join(PID_FILE);
-    let lstart_path = dir.join(LSTART_FILE);
+    let pid_path = dir.join(format!("controller-{generation}.pid"));
+    let lstart_path = dir.join(format!("controller-{generation}.lstart"));
     let record_path = dir.join(RECORD_FILE);
-    let output_path = dir.join(OUTPUT_FILE);
+    let output_path = dir.join(format!("controller-{generation}.log"));
+    let drive_exit_path = dir.join(format!("controller-{generation}.drive-exit"));
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(&lstart_path);
+    let _ = std::fs::remove_file(&drive_exit_path);
     let status_base = dir.join("status").join(generation.to_string());
 
     let (host, host_kind, socket_path): (Box<dyn SessionHost>, &str, Option<String>) =
@@ -375,6 +774,7 @@ async fn spawn(
 
     let exe = std::env::current_exe()
         .map_err(|error| Failure::internal(format!("resolving forged executable: {error}")))?;
+    let binary = current_binary_identity()?;
     let command = format!(
         "{} {} drive --{} {}",
         shell_quote(&exe.to_string_lossy()),
@@ -382,15 +782,12 @@ async fn spawn(
         scope.noun(),
         shell_quote(id),
     );
-    let pid_capture = format!("echo $$ > {}", shell_quote(&pid_path.to_string_lossy()));
-    let shell_line = if host_kind == "process" {
-        format!(
-            "exec </dev/null >>{} 2>&1; {pid_capture}; {command}",
-            shell_quote(&output_path.to_string_lossy()),
-        )
-    } else {
-        format!("{pid_capture}; {command}")
-    };
+    let shell_line = controller_shell_line(
+        &command,
+        &output_path,
+        &drive_exit_path,
+        host_kind == "herdr",
+    );
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
         env.insert("PATH".to_owned(), path);
@@ -407,6 +804,27 @@ async fn spawn(
         "BEADS_DIR".to_owned(),
         ctx.config.beads_dir.to_string_lossy().into_owned(),
     );
+    env.insert(
+        DRIVER_PID_ENV.to_owned(),
+        pid_path.to_string_lossy().into_owned(),
+    );
+    env.insert(
+        DRIVER_LSTART_ENV.to_owned(),
+        lstart_path.to_string_lossy().into_owned(),
+    );
+    env.insert(CONTROLLER_SCOPE_ENV.to_owned(), scope.noun().to_owned());
+    env.insert(CONTROLLER_ID_ENV.to_owned(), id.to_owned());
+    env.insert(CONTROLLER_GENERATION_ENV.to_owned(), generation.to_string());
+    #[cfg(feature = "failpoints")]
+    for key in [
+        "FORGED_FAILPOINT",
+        "FORGED_FAILPOINT_MODE",
+        "FORGED_FAILPOINT_DIR",
+    ] {
+        if let Ok(value) = std::env::var(key) {
+            env.insert(key.to_owned(), value);
+        }
+    }
 
     let session = host.spawn(Path::new(repo), &shell_line, &env).await?;
     let Some(pid) = await_pid(&pid_path).await else {
@@ -416,11 +834,17 @@ async fn spawn(
             "detached controller pid never appeared",
         ));
     };
-    let lstart = crate::adapters::ports::lstart_of(pid).await;
-    if let Some(value) = &lstart {
-        std::fs::write(&lstart_path, value).map_err(|error| {
-            Failure::internal(format!("writing detached controller identity: {error}"))
-        })?;
+    let lstart = std::fs::read_to_string(&lstart_path)
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty());
+    let current_lstart = crate::adapters::ports::lstart_of(pid).await;
+    if lstart.is_none() || lstart != current_lstart {
+        let _ = host.kill_confirmed(&session).await;
+        return Err(Failure::refused(
+            ErrorCode::ProviderSpawnFailed,
+            "detached controller identity was not verifiable",
+        ));
     }
     let status_path = status_base.join(session.as_str()).join("status");
     let record = json!({
@@ -432,6 +856,8 @@ async fn spawn(
         "sessionId": session.as_str(),
         "socketPath": socket_path,
         "attachHint": host.attach_hint(&session),
+        "driver": {"pid": pid, "lstart": lstart},
+        "binary": binary,
         "pidPath": pid_path,
         "lstartPath": lstart_path,
         "statusPath": status_path,
@@ -614,6 +1040,25 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 json!({"submitted": false, "alreadyRunning": true, "controller": status}),
             );
         }
+        if is_unknown(&status) {
+            return err_response(
+                &derive_key(scope.operation(), Some(&id), None, None),
+                &Failure {
+                    code: ErrorCode::HostUnavailable,
+                    message: format!(
+                        "{} {id} controller identity is unverified; refusing a duplicate spawn",
+                        scope.noun()
+                    ),
+                    recoverable: true,
+                },
+            );
+        }
+        if let Err(error) = recover_abandoned(ctx, &id, scope, generation(&status)).await {
+            return err_response(
+                &derive_key(scope.operation(), Some(&id), None, None),
+                &error,
+            );
+        }
     }
 
     let stopped = match scope {
@@ -660,6 +1105,31 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     }
 
     let next_generation = max_generation.saturating_add(1);
+    if !key_absent(req) {
+        let name = scope.operation().to_owned();
+        let key = req.idempotency_key.clone();
+        let key_for_probe = key.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation(&name, &key_for_probe)
+        })
+        .await
+        {
+            Ok(Some(row)) if row.state == OperationState::Terminal => {
+                return err_response(
+                    &key,
+                    &Failure::refused(
+                        ErrorCode::IdempotencyConflict,
+                        format!(
+                            "submit key {key:?} belongs to a controller that is no longer live; \
+                             use a fresh key to start generation {next_generation}"
+                        ),
+                    ),
+                );
+            }
+            Ok(_) => {}
+            Err(error) => return err_response(&key, &error),
+        }
+    }
     let (host_policy, herdr_socket) = match scope {
         Scope::Run => match super::drive::project(ctx, &id).await {
             Ok(view) => (view.policy.host_policy, view.policy.herdr_socket),
@@ -709,11 +1179,70 @@ pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 
 #[cfg(test)]
 mod tests {
-    use super::shell_quote;
+    use super::{controller_shell_line, controller_state, shell_quote, status_for};
+    use serde_json::json;
+    use std::path::Path;
 
     #[test]
     fn shell_quote_handles_spaces_and_apostrophes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b's"), "'a b'\"'\"'s'");
+    }
+
+    #[test]
+    fn both_hosts_get_a_durable_log_without_losing_driver_status() {
+        let process = controller_shell_line(
+            "forged run drive --run bead-1",
+            Path::new("/tmp/controller.log"),
+            Path::new("/tmp/driver.exit"),
+            false,
+        );
+        assert_eq!(
+            process,
+            "exec </dev/null >>'/tmp/controller.log' 2>&1; forged run drive --run bead-1"
+        );
+        let herdr = controller_shell_line(
+            "forged run drive --run bead-1",
+            Path::new("/tmp/controller.log"),
+            Path::new("/tmp/driver.exit"),
+            true,
+        );
+        assert!(herdr.contains("2>&1 | tee -a '/tmp/controller.log'"));
+        assert!(herdr.contains("printf '%s\\n' \"$?\" > '/tmp/driver.exit'"));
+        assert!(herdr.ends_with("(exit \"$(cat '/tmp/driver.exit')\")"));
+    }
+
+    #[tokio::test]
+    async fn installed_binary_mismatch_is_visible() {
+        let record = json!({
+            "driver": {
+                "pid": std::process::id(),
+                "lstart": "Thu Jan  1 00:00:00 1970",
+            },
+            "binary": {"sha256": "definitely-not-this-binary"},
+        });
+        let status = status_for(&record).await;
+        assert_eq!(status["binaryMismatch"], json!(true));
+    }
+
+    #[test]
+    fn a_recycled_pid_is_never_projected_as_running() {
+        assert_eq!(
+            controller_state(
+                None,
+                Some(42),
+                Some("Thu Jan  1 00:00:00 1970"),
+                Some("Fri Jan  2 00:00:00 1970"),
+                true,
+            ),
+            "vanished"
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_start_identity_is_unknown_not_running() {
+        let record = json!({"driver": {"pid": std::process::id()}});
+        let status = status_for(&record).await;
+        assert_eq!(status["state"], json!("unknown"));
     }
 }

@@ -5,9 +5,12 @@
 
 mod support;
 
-use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun, SpecFence};
-use forged_proto::{project_run, record, GatePhase, ProtoError, ProtoEvent};
+use forged_ledger::{AttemptState, Ledger, NewPacket, NewRun, RunOutcome, SpecFence};
+use forged_proto::{
+    advance, project_run, record, GatePhase, NextAction, ProtoError, ProtoEvent, Terminal,
+};
 use forged_types::{Outcome, RunId, Stage, Verdict};
+use serde_json::json;
 use support::*;
 
 const RUN: &str = "run-1";
@@ -225,5 +228,64 @@ fn record_refuses_a_review_the_parser_would_reject() {
     assert!(events.is_empty(), "{events:?}");
     let view = project_run(&ledger, RUN, full_roster(), vec![], 3, T0).expect("project");
     assert!(view.proto_events.is_empty());
+    ledger.close().expect("close");
+}
+
+#[test]
+fn stale_acceptance_event_cannot_override_superseded_outcome() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(RUN).expect("run id"),
+            bead_id: "bead-1".to_owned(),
+            repo: "octo/demo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "feat/x".to_owned(),
+        })
+        .expect("create run");
+    ledger
+        .settle_run(
+            RUN,
+            RunOutcome::Blocked,
+            "review blocked".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("block");
+    ledger
+        .append_event_kind_once(
+            RUN,
+            "forged.review.risk_accepted",
+            json!({
+                "schemaVersion": 1,
+                "reviewRounds": 2,
+                "acceptance": {
+                    "acceptedBy": "stale-operator",
+                    "rationale": "stale rationale",
+                    "findings": [],
+                }
+            }),
+        )
+        .expect("simulate legacy torn acceptance");
+    ledger
+        .settle_run(
+            RUN,
+            RunOutcome::Superseded,
+            "replaced by corrected run".to_owned(),
+            None,
+            None,
+            Some("successor-run".to_owned()),
+        )
+        .expect("supersede");
+
+    let view = project_run(&ledger, RUN, full_roster(), vec![], 3, T0).expect("project");
+    assert!(view.accepted_risk.is_none());
+    assert!(matches!(
+        advance(&view),
+        NextAction::Stop(Terminal::ExternallyStopped { reason })
+            if reason == "replaced by corrected run"
+    ));
     ledger.close().expect("close");
 }

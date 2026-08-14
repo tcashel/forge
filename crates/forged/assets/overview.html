@@ -1706,7 +1706,8 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       top.append(el("span", "bead__id", entry.id));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
       card.append(top);
-      card.append(el("div", "bead__title", entry.beadId || ""));
+      card.append(el("div", "bead__title", entry.title || entry.beadId || ""));
+      if (entry.beadId && entry.title) card.append(el("div", "muted", entry.beadId));
       const foot = el("div", "bead__foot");
       foot.append(el("span", "", entry.state || "unknown"));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
@@ -1718,6 +1719,8 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       }
       if (entry.branch) foot.append(el("span", "trunc", entry.branch));
       card.append(foot);
+      if (entry.blocker) card.append(el("div", "empty", `Blocked: ${entry.blocker}`));
+      if (entry.nextAction) card.append(el("div", "muted", `Next: ${entry.nextAction}`));
       if (canPick) card.addEventListener("click", () => choose(entry));
       grid.append(card);
     }
@@ -1733,9 +1736,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    */
   function viewPortfolio(data) {
     const entries = arr(data.entries);
+    const groups = arr(at(data, "queue.groups"));
     const total = num(data.total);
     const missing = num(at(data, "spend.rowsMissingCost"));
-    const held = num(data.attentionTotal);
+    const needsMe = groups.find((group) => group.name === "Needs me");
+    const held = needsMe ? num(needsMe.count) : num(data.attentionTotal);
 
     const head = panel("Portfolio", `cap ${int(data.cap)}`);
     const stats = el("div", "spend");
@@ -1750,7 +1755,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       entries.length < total ? `newest ${int(entries.length)} shown` : "all of them");
     stat(int(data.liveSeats), "live seats",
       num(data.liveSeats) ? "executing now" : "nothing is executing");
-    stat(int(held), "needs a human", held ? "see the rail" : "nothing is waiting");
+    stat(int(held), "needs me", held ? (needsMe ? "see the queue" : "see the rail") : "nothing is waiting");
     stat(`$${num(at(data, "spend.costUsdKnown")).toFixed(2)}`, "known spend",
       missing ? `${int(missing)} rows carry no cost` : "every row priced");
     head.body.append(stats);
@@ -1763,7 +1768,20 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       body.append(el("div", "empty", "Nothing in the ledger yet. Start a run or an epic and it appears here."));
       return [head, box];
     }
-    body.append(pickGrid(entries));
+    if (groups.length) {
+      for (const group of groups) {
+        const grouped = arr(group.entries);
+        const heading = el("div", "bead__top");
+        heading.append(el("strong", "", group.name || "Work"));
+        heading.append(el("span", "", `${int(group.count)} total`));
+        body.append(heading);
+        if (grouped.length) body.append(pickGrid(grouped));
+        else body.append(el("div", "empty", "None"));
+      }
+    } else {
+      // Compatibility for an older daemon feeding a newer cached App.
+      body.append(pickGrid(entries));
+    }
     return [head, box];
   }
 
@@ -1905,14 +1923,17 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     if (data.kind === "portfolio") {
       nodes.identText.textContent = "all work";
       nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
-      const held = num(data.attentionTotal);
+      const needsMe = arr(at(data, "queue.groups")).find((group) => group.name === "Needs me");
+      const held = needsMe ? num(needsMe.count) : num(data.attentionTotal);
       nodes.ident.append(chip(`${int(data.total)} in the ledger`, num(data.liveSeats) ? "live" : "idle"));
       // `attentionTotal` counts CONDITIONS, and one run can raise several —
       // "3 need a human" over two runs would be a lie about how many things
       // are waiting.
       if (held) {
         nodes.ident.append(chip(
-          `${int(held)} condition${held === 1 ? "" : "s"} need${held === 1 ? "s" : ""} a human`,
+          needsMe
+            ? `${int(held)} work item${held === 1 ? "" : "s"} need${held === 1 ? "s" : ""} me`
+            : `${int(held)} condition${held === 1 ? "" : "s"} need${held === 1 ? "s" : ""} a human`,
           "block",
         ));
       }

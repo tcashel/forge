@@ -154,12 +154,23 @@ pub struct ProfileDefinitionV1 {
     pub name: String,
     pub protocol: ProtocolRef,
     pub seats: Vec<SeatDefinitionV1>,
+    /// Human-readable consequence context supplied to every review seat.
+    /// Older frozen packages predate this field and receive the neutral
+    /// default rather than failing recovery.
+    #[serde(default = "default_risk_context")]
+    pub risk_context: String,
+    /// Number of remediation attempts after the initial review. The complete
+    /// review loop therefore has `fix_round_budget + 1` review rounds.
     pub fix_round_budget: u8,
     #[serde(default)]
     pub escalate_on: Vec<EscalationTrigger>,
     /// The stored profile selected when one of `escalate_on` fires.
     #[serde(default)]
     pub escalate_to: Option<ProfileRef>,
+}
+
+fn default_risk_context() -> String {
+    "Routine change: grade findings by concrete likelihood and consequence.".to_owned()
 }
 
 /// A capability a provider candidate declares to the dispatcher.
@@ -297,10 +308,16 @@ impl ProfileDefinitionV1 {
                 "seat count must be between 1 and 8",
             ));
         }
-        if self.fix_round_budget > 1 {
+        if self.fix_round_budget > 32 {
             errors.push(DefinitionError::at(
                 "$.profile.fixRoundBudget",
-                "fix round budget must be between 0 and 1",
+                "fix round budget must be between 0 and 32",
+            ));
+        }
+        if self.risk_context.trim().is_empty() || self.risk_context.len() > 1_024 {
+            errors.push(DefinitionError::at(
+                "$.profile.riskContext",
+                "risk context must contain between 1 and 1024 bytes",
             ));
         }
         match (&self.escalate_to, self.escalate_on.is_empty()) {
@@ -525,6 +542,7 @@ mod tests {
                     purpose: SeatPurpose::Fix,
                 },
             ],
+            risk_context: default_risk_context(),
             fix_round_budget: 1,
             escalate_on: vec![EscalationTrigger::GateFailure],
             escalate_to: Some(ProfileRef {
@@ -552,7 +570,7 @@ mod tests {
         let mut profile = standard_profile();
         profile.schema = "forged.profile/99".to_owned();
         profile.seats[1].id = profile.seats[0].id.clone();
-        profile.fix_round_budget = 9;
+        profile.fix_round_budget = 33;
         profile.escalate_on.push(EscalationTrigger::GateFailure);
         let errors = profile.validate();
         for path in [

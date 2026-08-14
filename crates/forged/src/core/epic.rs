@@ -42,6 +42,7 @@ const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
 struct FrozenChild {
     id: String,
     title: String,
+    issue_type: String,
     /// The child's frozen spec FILE, when it has one. `None` is the
     /// bead-sourced child: its run start reads the spec from the bead.
     spec_path: Option<String>,
@@ -53,7 +54,8 @@ struct EpicConfig {
     epic_id: String,
     title: String,
     repo: String,
-    spec_path: String,
+    /// Deprecated external epic-map path retained for old start events.
+    spec_path: Option<String>,
     base_ref: String,
     integration_branch: String,
     execution_package: ExecutionPackageV1,
@@ -105,6 +107,11 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             Ok(FrozenChild {
                 id: string(child, "id")?,
                 title: string(child, "title")?,
+                issue_type: child
+                    .get("issueType")
+                    .and_then(Value::as_str)
+                    .unwrap_or("task")
+                    .to_owned(),
                 spec_path: child
                     .get("specPath")
                     .and_then(Value::as_str)
@@ -120,7 +127,10 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
         epic_id: string(value, "epicId")?,
         title: string(value, "title")?,
         repo: string(value, "repo")?,
-        spec_path: string(value, "specPath")?,
+        spec_path: value
+            .get("specPath")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         base_ref: string(value, "baseRef")?,
         integration_branch: string(value, "integrationBranch")?,
         execution_package: serde_json::from_value(
@@ -414,6 +424,10 @@ fn spec_pointer(description: &str) -> Option<String> {
     })
 }
 
+fn is_no_diff(issue_type: &str) -> bool {
+    matches!(issue_type, "chore" | "decision" | "milestone")
+}
+
 fn response(resp: OperationResponse) -> Result<Value, Failure> {
     if resp.ok {
         return Ok(resp.result.unwrap_or(Value::Null));
@@ -603,16 +617,16 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     return status_json(ctx, project(ctx, &epic).await?).await;
                 }
                 let repo = param_str(&params, "repo")?.to_owned();
-                let spec = param_str(&params, "spec")?.to_owned();
-                if !Path::new(&repo).is_absolute() || !Path::new(&spec).is_absolute() {
-                    return Err(Failure::invalid(
-                        "epic --repo and --spec must be absolute paths",
-                    ));
+                let legacy_spec = param_opt_str(&params, "spec").map(str::to_owned);
+                if !Path::new(&repo).is_absolute() {
+                    return Err(Failure::invalid("epic --repo must be an absolute path"));
                 }
-                if !Path::new(&spec).exists() {
-                    return Err(Failure::invalid(format!(
-                        "epic spec {spec:?} does not exist"
-                    )));
+                if let Some(spec) = legacy_spec.as_deref() {
+                    if !Path::new(spec).is_absolute() || !Path::new(spec).exists() {
+                        return Err(Failure::invalid(format!(
+                            "deprecated epic --spec {spec:?} is not an existing absolute path"
+                        )));
+                    }
                 }
                 let compiled = ctx
                     .config
@@ -627,6 +641,13 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         ))
                     })?;
                 let issue = forged_beads::show_issue(&ctx.config.bd_config(), &epic).await?;
+                if issue.issue_type != "epic" {
+                    return Err(Failure::invalid(format!(
+                        "bead {epic} has issue type {:?}, not epic",
+                        issue.issue_type
+                    )));
+                }
+                let epic_spec = super::spec::resolve_issue(&issue)?;
                 let inventory = forged_beads::epic_children(&ctx.config.bd_config(), &epic).await?;
                 if inventory.is_empty() {
                     return Err(Failure::invalid(format!(
@@ -640,7 +661,8 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     // falls back to its `spec:` pointer — the route every
                     // epic frozen before this used — rather than freezing
                     // bead-sourced around a fragment.
-                    let child_spec = if super::spec::carries_spec(&child) {
+                    let no_diff = is_no_diff(&child.issue_type);
+                    let child_spec = if no_diff || super::spec::carries_spec(&child) {
                         None
                     } else {
                         let missing = super::spec::missing_spec_fields(&child).join(", ");
@@ -662,6 +684,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     children.push(json!({
                         "id": child.id,
                         "title": child.title,
+                        "issueType": child.issue_type,
                         "specPath": child_spec,
                         "initiallyClosed": child.status == "closed",
                     }));
@@ -676,7 +699,11 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "epicId": epic,
                     "title": issue.title,
                     "repo": repo,
-                    "specPath": spec,
+                    "specSource": "bead",
+                    "specRevision": issue.revision,
+                    "specSha256": epic_spec.sha256,
+                    "specPath": legacy_spec,
+                    "deprecatedSpecPath": legacy_spec,
                     "baseRef": base_ref,
                     "integrationBranch": integration_branch,
                     "profile": compiled.package.profile_ref.name,
@@ -701,6 +728,7 @@ fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str
     json!({
         "id": child.id,
         "title": child.title,
+        "issueType": child.issue_type,
         "specPath": child.spec_path,
         "beadsStatus": bead_status,
         "runId": state.map(|value| value.run_id.as_str()),
@@ -964,12 +992,13 @@ async fn require_input(
 
 fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
     let terminal = forged_proto::advance(view);
-    let approved = matches!(
-        terminal,
-        NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
-        })
-    );
+    let approved = view.run.terminal_outcome == Some(forged_ledger::RunOutcome::Clean)
+        || matches!(
+            terminal,
+            NextAction::Stop(Terminal::Done {
+                final_verdict: Some(Verdict::Approve)
+            })
+        );
     let gate_passed = view
         .proto_events
         .iter()
@@ -1305,6 +1334,9 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
         .collect();
     let all_accounted = view.config.children.iter().all(|child| {
         child.initially_closed
+            || statuses
+                .get(&child.id)
+                .is_some_and(|status| status == "closed")
             || view
                 .children
                 .get(&child.id)
@@ -1333,6 +1365,11 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
             .iter()
             .filter(|child| children.contains(child.id.as_str()))
             .filter(|child| !view.children.contains_key(&child.id))
+            .filter(|child| {
+                statuses
+                    .get(&child.id)
+                    .is_none_or(|status| status != "closed")
+            })
             .filter(|child| ready.contains(&child.id))
             .collect::<Vec<_>>();
         (!pending.is_empty()).then_some((number, pending))
@@ -1360,7 +1397,13 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
             .config
             .children
             .iter()
-            .filter(|child| !child.initially_closed && !view.children.contains_key(&child.id))
+            .filter(|child| {
+                !child.initially_closed
+                    && !view.children.contains_key(&child.id)
+                    && statuses
+                        .get(&child.id)
+                        .is_none_or(|status| status != "closed")
+            })
             .map(|child| child.id.clone())
             .collect::<Vec<_>>();
         let input = require_input(
@@ -1383,6 +1426,20 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
             "children": frontier.iter().map(|child| child.id.as_str()).collect::<Vec<_>>(),
         });
         append(ctx, epic, WAVE_STARTED, wave_event).await?;
+    }
+    if is_no_diff(&frontier[0].issue_type) {
+        let input = require_input(
+            ctx,
+            epic,
+            "non-code-child",
+            Some(&frontier[0].id),
+            format!(
+                "{} is a no-diff {} Bead; complete it directly in Beads, then resolve this hold",
+                frontier[0].id, frontier[0].issue_type
+            ),
+        )
+        .await?;
+        return Ok(Step::Stop(input));
     }
     let generation = view
         .child_generations

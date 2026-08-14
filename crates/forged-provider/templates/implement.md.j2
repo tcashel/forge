@@ -32,6 +32,11 @@ Operator interventions recorded before this provider boundary:
    implemented=false and the reason in note: a half-built worktree reported as
    done costs the reviewer far more than an honest failure does. Put the gate's
    final state in gateState, and 2-4 sentences on what you changed in summary.
+   If repository evidence proves the spec contradictory or unsafe, do not
+   guess. Return this result instead of an implement outcome:
+     {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
+      "outcome": {"specAmendment": {"amendment": {"summary": "...",
+      "evidence": "...", "proposedChange": "..."}}}}
 6. End your final message with the result block and nothing after it: exactly
    one fenced code block whose info string is the single word forged-result
    (open and close the fence with three backtick characters), holding this JSON
@@ -39,5 +44,6 @@ Operator interventions recorded before this provider boundary:
      {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
       "outcome": {"implement": {"implemented": true, "commitsAhead": 0,
       "summary": "...", "gateState": "...", "note": null}}}
-   filled in with your real values from step 5: note carries the reason when
-   implemented is false, and is null when you finished.
+   filled in with your real values from step 5 (or the amendment result shown
+   there): note carries the reason when implemented is false, and is null when
+   you finished.

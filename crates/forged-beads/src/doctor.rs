@@ -310,20 +310,102 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// Prove the operator's LIVE store still resolves: a read of `bd list
-/// --json` against the config exactly as given must return a NON-EMPTY list
-/// — the containment discipline is worthless if bd is silently reading a
-/// shadow database. Read-only; takes no lock; writes nothing.
+/// Prove the operator's LIVE store and backend identity still resolve.
+///
+/// A non-empty `bd list` proves useful data is visible, `bd where` proves
+/// CWD discovery did not redirect the configured workspace, and `bd dolt
+/// show` names the actual embedded/server database operators are sharing and,
+/// in server mode, proves the configured endpoint is reachable. The summary
+/// selects only non-secret identity fields; credential values are neither
+/// requested nor rendered.
+/// Read-only; takes no lock; writes nothing.
 async fn beads_dir_resolves(cfg: &DoctorConfig) -> Result<String, String> {
     let data = invoke::read(&cfg.bd, &["list", "--json"])
         .await
         .map_err(|e| e.to_string())?;
-    match envelope::as_list(&data) {
-        Some(items) if !items.is_empty() => Ok(format!("{} issues listed", items.len())),
-        _ => Err(format!(
-            "bd resolved an empty store at {} — not the operator's live database?",
-            cfg.bd.beads_dir.display()
-        )),
+    let issue_count = match envelope::as_list(&data) {
+        Some(items) if !items.is_empty() => items.len(),
+        _ => {
+            return Err(format!(
+                "bd resolved an empty store at {} — not the operator's live database?",
+                cfg.bd.beads_dir.display()
+            ))
+        }
+    };
+    let where_data = invoke::read(&cfg.bd, &["where", "--json"])
+        .await
+        .map_err(|e| format!("bd where: {e}"))?;
+    let where_obj = envelope::first_obj(&where_data)
+        .ok_or_else(|| format!("bd where returned no identity: {where_data}"))?;
+    let resolved = where_obj
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("bd where returned no workspace path: {where_data}"))?;
+    if !same_dir(&resolved, &cfg.bd.beads_dir) {
+        return Err(format!(
+            "configured BEADS_DIR {} resolved to {}; refusing shadow/CWD database drift",
+            cfg.bd.beads_dir.display(),
+            resolved.display()
+        ));
+    }
+    let backend_data = invoke::read(&cfg.bd, &["dolt", "show", "--json"])
+        .await
+        .map_err(|e| format!("bd dolt show: {e}"))?;
+    let backend = envelope::first_obj(&backend_data)
+        .ok_or_else(|| format!("bd dolt show returned no backend identity: {backend_data}"))?;
+    let backend_name = backend
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let database = backend
+        .get("database")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let backend_detail = backend_detail(backend)?;
+    Ok(format!(
+        "{issue_count} issues; workspace={}; backend={backend_name}; database={database}; {backend_detail}",
+        resolved.display(),
+    ))
+}
+
+/// Render the non-secret half of `bd dolt show --json`, refusing a server
+/// configuration whose built-in connection test did not pass.
+fn backend_detail(backend: &Value) -> Result<String, String> {
+    match backend.get("embedded").and_then(Value::as_bool) {
+        Some(true) => {
+            let data_dir = backend
+                .get("data_dir")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            Ok(format!("mode=embedded; data={data_dir}"))
+        }
+        Some(false) => {
+            let host = backend
+                .get("host")
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            let port = backend
+                .get("port")
+                .and_then(Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unknown".to_string());
+            let shared = backend
+                .get("shared_server")
+                .and_then(Value::as_bool)
+                .unwrap_or(false);
+            let tls = backend.get("tls").and_then(Value::as_bool).unwrap_or(false);
+            let mode = if shared { "shared-server" } else { "server" };
+            if backend.get("connection_ok").and_then(Value::as_bool) != Some(true) {
+                return Err(format!(
+                    "mode={mode}; endpoint={host}:{port}; tls={tls}; connection=failed"
+                ));
+            }
+            Ok(format!(
+                "mode={mode}; endpoint={host}:{port}; tls={tls}; connection=ok"
+            ))
+        }
+        None => Err("bd dolt show returned no embedded/server mode".to_string()),
     }
 }
 
@@ -376,4 +458,57 @@ async fn anvil_home_writable(cfg: &DoctorConfig) -> Result<String, String> {
     std::fs::remove_file(&probe_file)
         .map_err(|e| format!("removing {}: {e}", probe_file.display()))?;
     Ok(format!("{} writable", dir.display()))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn backend_detail_keeps_embedded_mode_unchanged() {
+        let value = serde_json::json!({
+            "embedded": true,
+            "data_dir": "/operator/beads/embeddeddolt",
+        });
+        let detail = backend_detail(&value).expect("embedded detail");
+        assert_eq!(detail, "mode=embedded; data=/operator/beads/embeddeddolt");
+    }
+
+    #[test]
+    fn backend_detail_names_reachable_shared_server_without_secrets() {
+        let value = serde_json::json!({
+            "embedded": false,
+            "host": "beads.team.example",
+            "port": 3307,
+            "user": "team-user",
+            "tls": true,
+            "shared_server": true,
+            "connection_ok": true,
+            "password": "must-not-appear",
+        });
+        let detail = backend_detail(&value).expect("server detail");
+        assert_eq!(
+            detail,
+            "mode=shared-server; endpoint=beads.team.example:3307; tls=true; connection=ok"
+        );
+        assert!(!detail.contains("team-user"));
+        assert!(!detail.contains("must-not-appear"));
+    }
+
+    #[test]
+    fn backend_detail_refuses_unreachable_server() {
+        let value = serde_json::json!({
+            "embedded": false,
+            "host": "beads.team.example",
+            "port": 3307,
+            "tls": true,
+            "shared_server": false,
+            "connection_ok": false,
+        });
+        let error = backend_detail(&value).expect_err("unreachable server cannot pass doctor");
+        assert_eq!(
+            error,
+            "mode=server; endpoint=beads.team.example:3307; tls=true; connection=failed"
+        );
+    }
 }

@@ -3,20 +3,21 @@
 //! may push any run at any time.
 //!
 //! Stage graph: `Resolve → Implement → Gate → Push → DraftPr → Review →
-//! [Fix → ReGate → Push → ReReview] → Stop`. Provider stages become packets
-//! and attempts; machine steps become operations keyed
-//! `<run_id>/<step>/<round>` (`round` is 0 before the fix round, 1 after),
-//! so the two `Push` positions never collide.
+//! [Fix → ReGate → Push → Review]* → Stop`. The bracketed loop is bounded
+//! solely by the frozen profile's fix-round budget. Provider stages become
+//! packets and attempts; machine steps become operations keyed
+//! `<run_id>/<step>/<round>`, so every loop iteration remains replay-safe.
 
 use std::collections::{BTreeMap, HashMap};
 
 use forged_ledger::{
-    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow, RunRow,
-    RunState,
+    AttemptRow, AttemptState, OperationRow, OperationState, PacketRow, RosterRevisionRow,
+    RunOutcome, RunRow, RunState,
 };
 use forged_types::{
-    EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome, ProfileDefinitionV1,
-    ProviderHints, SeatDefinitionV1, SeatExecutionV1, SeatPurpose, Stage, Verdict,
+    AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome,
+    ProfileDefinitionV1, ProviderHints, SeatDefinitionV1, SeatExecutionV1, SeatPurpose,
+    SpecAmendment, Stage, Verdict,
 };
 
 use crate::error::ProtoError;
@@ -87,6 +88,8 @@ pub struct RunView {
     pub active_roster_revision: Option<RosterRevisionRow>,
     /// Durable adaptive-profile transitions, in event order.
     pub profile_escalations: Vec<ProfileEscalation>,
+    /// The operator's durable post-budget decision, when one was recorded.
+    pub accepted_risk: Option<AcceptedRisk>,
 }
 
 /// One stored profile escalation.
@@ -158,11 +161,9 @@ pub enum NextAction {
     Stop(Terminal),
 }
 
-/// The run's stop vocabulary — wave-4's kill-matrix falsifier consumes this
-/// as mechanical wiring. Exactly three variants: fix-round exhaustion is a
-/// `Done` carrying the final verdict, and a `HumanAmbiguous` quarantine
-/// leaves its operation row in progress and is reported through
-/// `ReconcileReport::quarantined`, not here.
+/// The run's stop vocabulary. Review exhaustion, specification correction,
+/// and accepted risk are distinct outcomes rather than overloaded `Done`
+/// values, so a controller cannot silently turn review churn into success.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Terminal {
     /// The run finished its protocol. `final_verdict` is the merged verdict
@@ -172,6 +173,32 @@ pub enum Terminal {
     Done {
         /// The final merged verdict, when any leg ever spoke.
         final_verdict: Option<Verdict>,
+    },
+    /// The configured review/fix loop ran to its immutable limit.
+    ReviewBudgetExhausted {
+        /// Review invocations completed, including the initial review.
+        review_rounds: u8,
+        /// The last review's merged verdict.
+        final_verdict: Option<Verdict>,
+    },
+    /// A remediation provider ran but could not apply the standing findings.
+    RemediationFailed {
+        /// One-based remediation round that failed.
+        round: u8,
+        /// Review verdict that requested the remediation.
+        final_verdict: Option<Verdict>,
+    },
+    /// A provider found that continuing requires changing the specification.
+    SpecAmendmentProposed {
+        /// Semantic seat that proposed the amendment.
+        stage_id: String,
+        /// Structured evidence and replacement contract.
+        amendment: SpecAmendment,
+    },
+    /// The operator explicitly accepted the exhausted loop's known findings.
+    AcceptedRisk {
+        /// Durable identity, rationale, and deduplicated findings.
+        acceptance: AcceptedRisk,
     },
     /// A provider stage exhausted its bounded infrastructure-retry budget
     /// without the provider ever getting to think. Transport failures and
@@ -233,16 +260,15 @@ impl MachineStage {
 }
 
 /// The machine step's operation idempotency key:
-/// `<run_id>/<step>/<round>`, with `round` 0 before the fix round and 1
-/// after.
+/// `<run_id>/<step>/<round>`, with `round` 0 before remediation and one
+/// increasing round for every later gate/push pair.
 pub fn machine_idempotency_key(run_id: &str, step: MachineStage, round: u32) -> String {
     format!("{run_id}/{}/{round}", step.as_str())
 }
 
-/// Every machine step the slice/v1 graph can record, paired with its round —
-/// `Resolve → Gate → Push → DraftPr` in round 0, `ReGate → Push` in round 1.
-/// The set is closed and fixed, which is what lets the projection probe for
-/// each step's settled operation row with `find_operation`.
+/// The original two-review machine-step set retained for source compatibility
+/// with legacy callers. Definition-backed projection derives additional
+/// `ReGate`/`Push` pairs from the bounded semantic packet rounds.
 pub const MACHINE_STEPS: [(MachineStage, u32); 6] = [
     (MachineStage::Resolve, 0),
     (MachineStage::Gate, 0),
@@ -335,6 +361,13 @@ enum LegState<'v> {
 /// `Stop(Terminal::ExternallyStopped { reason: "roster missing stage
 /// <stage>" })` — loud, inspectable, and never a panic in the orchestrator.
 pub fn advance(view: &RunView) -> NextAction {
+    if view.run.terminal_outcome == Some(RunOutcome::AcceptedRisk) {
+        if let Some(acceptance) = &view.accepted_risk {
+            return NextAction::Stop(Terminal::AcceptedRisk {
+                acceptance: acceptance.clone(),
+            });
+        }
+    }
     if let Some(package) = &view.execution_package {
         return advance_adaptive(view, package);
     }
@@ -370,6 +403,14 @@ pub fn advance(view: &RunView) -> NextAction {
             return NextAction::Stop(Terminal::ProviderUnavailable {
                 stage: Stage::Implement,
                 attempts,
+            })
+        }
+        LegState::Completed {
+            outcome: Some(Outcome::SpecAmendment { amendment }),
+        } => {
+            return NextAction::Stop(Terminal::SpecAmendmentProposed {
+                stage_id: "implement".to_owned(),
+                amendment: amendment.clone(),
             })
         }
         LegState::Completed { .. } => {}
@@ -427,6 +468,14 @@ pub fn advance(view: &RunView) -> NextAction {
                 final_verdict: first_produced,
             })
         }
+        LegState::Completed {
+            outcome: Some(Outcome::SpecAmendment { amendment }),
+        } => {
+            return NextAction::Stop(Terminal::SpecAmendmentProposed {
+                stage_id: "fix".to_owned(),
+                amendment: amendment.clone(),
+            })
+        }
         LegState::Completed { .. } => {}
     }
 
@@ -472,6 +521,9 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
     let implement = seats_for(profile, SeatPurpose::Implement);
     match adaptive_group(view, package, &implement, 0) {
         AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) if done.amendment.is_some() => {
+            return amendment_stop(done.amendment.expect("checked"))
+        }
         AdaptiveGroup::Done(done) if done.semantic_failure => {
             if let Some(packet) = implement
                 .first()
@@ -505,57 +557,67 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
     }
 
     let reviews = seats_for(profile, SeatPurpose::Review);
-    let first = match adaptive_group(view, package, &reviews, 0) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) => done,
-    };
-    if verdicts_conflict(&first.verdicts) {
-        if let Some(action) = escalation_action(view, profile, EscalationTrigger::ReviewConflict) {
-            return action;
-        }
-    }
-    let first = match synthesis_verdict(view, package, profile, 0, first) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) => done,
-    };
-    if first.control == Verdict::Approve {
-        return NextAction::Stop(Terminal::Done {
-            final_verdict: first.produced,
-        });
-    }
-    if profile.fix_round_budget == 0 {
-        return NextAction::Stop(Terminal::Done {
-            final_verdict: first.produced,
-        });
-    }
-
     let fixes = seats_for(profile, SeatPurpose::Fix);
-    match adaptive_group(view, package, &fixes, 0) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) if done.semantic_failure => {
-            return NextAction::Stop(Terminal::Done {
-                final_verdict: first.produced,
-            })
+    for review_round in 0..=profile.fix_round_budget {
+        let reviewed = match adaptive_group(view, package, &reviews, review_round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = reviewed.amendment {
+            return amendment_stop(amendment);
         }
-        AdaptiveGroup::Done { .. } => {}
-    }
-    if !op_settled(view, MachineStage::ReGate, 1) {
-        return NextAction::RunMachine(MachineStage::ReGate);
-    }
-    if !op_settled(view, MachineStage::Push, 1) {
-        return NextAction::RunMachine(MachineStage::Push);
-    }
+        // A configured panel's synthesis seat is its one adjudication. A
+        // disagreement never rewrites the run's topology or raises it into a
+        // more expensive profile.
+        let reviewed = match synthesis_verdict(view, package, profile, review_round, reviewed) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = reviewed.amendment {
+            return amendment_stop(amendment);
+        }
+        if reviewed.control == Verdict::Approve {
+            return NextAction::Stop(Terminal::Done {
+                final_verdict: reviewed.produced,
+            });
+        }
+        if review_round == profile.fix_round_budget {
+            return NextAction::Stop(Terminal::ReviewBudgetExhausted {
+                review_rounds: review_round.saturating_add(1),
+                final_verdict: reviewed.produced,
+            });
+        }
 
-    let second = match adaptive_group(view, package, &reviews, 1) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) => done,
-    };
-    let second = match synthesis_verdict(view, package, profile, 1, second) {
-        AdaptiveGroup::Action(action) => return action,
-        AdaptiveGroup::Done(done) => done,
-    };
-    NextAction::Stop(Terminal::Done {
-        final_verdict: second.produced.or(first.produced),
+        let fixed = match adaptive_group(view, package, &fixes, review_round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = fixed.amendment {
+            return amendment_stop(amendment);
+        }
+        if fixed.semantic_failure {
+            return NextAction::Stop(Terminal::RemediationFailed {
+                round: review_round.saturating_add(1),
+                final_verdict: reviewed.produced,
+            });
+        }
+        let machine_round = u32::from(review_round) + 1;
+        if !op_settled(view, MachineStage::ReGate, machine_round) {
+            return NextAction::RunMachine(MachineStage::ReGate);
+        }
+        if !op_settled(view, MachineStage::Push, machine_round) {
+            return NextAction::RunMachine(MachineStage::Push);
+        }
+    }
+    NextAction::Stop(Terminal::ExternallyStopped {
+        reason: "review loop exceeded its validated round bound".to_owned(),
+    })
+}
+
+fn amendment_stop((stage_id, amendment): (String, SpecAmendment)) -> NextAction {
+    NextAction::Stop(Terminal::SpecAmendmentProposed {
+        stage_id,
+        amendment,
     })
 }
 
@@ -623,8 +685,8 @@ fn escalation_action(
 struct AdaptiveDone {
     control: Verdict,
     produced: Option<Verdict>,
-    verdicts: Vec<Verdict>,
     semantic_failure: bool,
+    amendment: Option<(String, SpecAmendment)>,
 }
 
 enum AdaptiveGroup {
@@ -651,6 +713,7 @@ fn adaptive_group(
     let mut pending = Vec::new();
     let mut verdicts = Vec::new();
     let mut semantic_failure = false;
+    let mut amendment = None;
     for seat in seats {
         let Some(packet) = adaptive_packet(view, seat, round) else {
             return AdaptiveGroup::Action(NextAction::Stop(Terminal::ExternallyStopped {
@@ -687,6 +750,11 @@ fn adaptive_group(
                     implemented: true, ..
                 })
                 | Some(Outcome::Fix { applied: true, .. }) => {}
+                Some(Outcome::SpecAmendment { amendment: value }) => {
+                    if amendment.is_none() {
+                        amendment = Some((seat.id.as_str().to_owned(), value.clone()));
+                    }
+                }
                 _ => {
                     semantic_failure = true;
                     verdicts.push(Verdict::RequestChanges);
@@ -708,8 +776,8 @@ fn adaptive_group(
     AdaptiveGroup::Done(AdaptiveDone {
         control: produced.unwrap_or(Verdict::RequestChanges),
         produced,
-        verdicts,
         semantic_failure,
+        amendment,
     })
 }
 
@@ -725,12 +793,6 @@ fn synthesis_verdict(
         return AdaptiveGroup::Done(reviews);
     }
     adaptive_group(view, package, &synthesis, round)
-}
-
-fn verdicts_conflict(verdicts: &[Verdict]) -> bool {
-    verdicts
-        .first()
-        .is_some_and(|first| verdicts.iter().any(|value| value != first))
 }
 
 fn adaptive_packet<'a>(
@@ -977,7 +1039,10 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             }
             FailureKind::Semantic => LegState::FailedSemantic,
         },
-        // A reclaimed attempt leaves the packet open for a successor.
+        // A reclaimed or stopped attempt leaves the packet open for a
+        // successor, with no deadline: neither is a failure charged to the
+        // packet's budget, and an operator's stop in particular is meant to
+        // be re-claimable at once.
         _ => LegState::Pending {
             packet_id,
             not_before: None,

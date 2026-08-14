@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use forged_gate::GateRequest;
 use forged_git::GhClient;
-use forged_ledger::{EffectClass, OperationState, RunRow};
+use forged_ledger::{EffectClass, OperationState, RunRow, RunState};
 use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
@@ -25,7 +25,8 @@ use crate::adapters::ports::{repo_slug, ForgedPorts};
 use crate::config::now_iso;
 use crate::core::spec::SpecSource;
 use crate::core::{
-    derive_key, err_response, fenced, ok_response, on_ledger, param_str, run_holder, Ctx, Failure,
+    derive_key, err_response, fenced_machine, ok_response, on_ledger, param_str, run_holder, Ctx,
+    Failure,
 };
 use crate::failpoint;
 
@@ -77,8 +78,15 @@ fn op_settled_in(view: &RunView, step: MachineStage, round: u32) -> bool {
 /// The round a `RunMachine` action refers to, derived from the view.
 fn round_of(view: &RunView, step: MachineStage) -> u32 {
     match step {
-        MachineStage::ReGate => 1,
-        MachineStage::Push if op_settled_in(view, MachineStage::Push, 0) => 1,
+        MachineStage::ReGate => (1..=33)
+            .find(|round| !op_settled_in(view, MachineStage::ReGate, *round))
+            .unwrap_or(33),
+        MachineStage::Push if op_settled_in(view, MachineStage::Push, 0) => (1..=33)
+            .find(|round| {
+                op_settled_in(view, MachineStage::ReGate, *round)
+                    && !op_settled_in(view, MachineStage::Push, *round)
+            })
+            .unwrap_or(33),
         _ => 0,
     }
 }
@@ -136,8 +144,11 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
             .filter_map(|row| {
                 let packet = forged_proto::stored_packet(row).ok()?;
                 let execution = packet.execution?;
-                (execution.purpose == forged_types::SeatPurpose::Review)
-                    .then_some((row, execution.round))
+                matches!(
+                    execution.purpose,
+                    forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis
+                )
+                .then_some((row, execution.round))
             })
             .collect();
         let latest_round = semantic.iter().map(|(_, round)| *round).max();
@@ -159,7 +170,7 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
                 }
             }
         }
-        return findings;
+        return deduplicate_findings(findings);
     }
     let latest_seq = view
         .packets
@@ -189,6 +200,49 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
             }
         }
     }
+    deduplicate_findings(findings)
+}
+
+/// Collapse corroborated findings into one remediation item. Location and a
+/// whitespace/case-normalized message identify the issue; when reviewers use
+/// different severities, the more consequential classification wins.
+fn deduplicate_findings(findings: Vec<forged_types::Finding>) -> Vec<forged_types::Finding> {
+    use std::collections::BTreeMap;
+
+    fn rank(severity: forged_types::Severity) -> u8 {
+        match severity {
+            forged_types::Severity::Blocker => 3,
+            forged_types::Severity::High => 2,
+            forged_types::Severity::Medium => 1,
+            forged_types::Severity::Low => 0,
+        }
+    }
+
+    let mut unique: BTreeMap<(Option<String>, Option<u32>, String), forged_types::Finding> =
+        BTreeMap::new();
+    for finding in findings {
+        let key = (
+            finding.file.as_ref().map(|file| file.trim().to_owned()),
+            finding.line,
+            finding
+                .message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
+        );
+        match unique.get_mut(&key) {
+            Some(existing) if rank(finding.severity) > rank(existing.severity) => {
+                existing.severity = finding.severity;
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(key, finding);
+            }
+        }
+    }
+    let mut findings: Vec<_> = unique.into_values().collect();
+    findings.sort_by_key(|finding| std::cmp::Reverse(rank(finding.severity)));
     findings
 }
 
@@ -272,6 +326,36 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
         Terminal::Done { final_verdict } => json!({
             "done": {"finalVerdict": final_verdict.map(verdict_str)}
         }),
+        Terminal::ReviewBudgetExhausted {
+            review_rounds,
+            final_verdict,
+        } => json!({
+            "reviewBudgetExhausted": {
+                "reviewRounds": review_rounds,
+                "finalVerdict": final_verdict.map(verdict_str),
+            }
+        }),
+        Terminal::RemediationFailed {
+            round,
+            final_verdict,
+        } => json!({
+            "remediationFailed": {
+                "round": round,
+                "finalVerdict": final_verdict.map(verdict_str),
+            }
+        }),
+        Terminal::SpecAmendmentProposed {
+            stage_id,
+            amendment,
+        } => json!({
+            "specAmendmentProposed": {
+                "stageId": stage_id,
+                "amendment": amendment,
+            }
+        }),
+        Terminal::AcceptedRisk { acceptance } => json!({
+            "acceptedRisk": acceptance
+        }),
         Terminal::ProviderUnavailable { stage, attempts } => json!({
             "providerUnavailable": {
                 "stage": crate::config::stage_str(*stage),
@@ -296,6 +380,100 @@ fn verdict_str(v: Verdict) -> &'static str {
         Verdict::RequestChanges => "requestChanges",
         Verdict::Block => "block",
     }
+}
+
+fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settlement> {
+    let (outcome, reason) = match terminal {
+        Terminal::Done {
+            final_verdict: Some(Verdict::Approve),
+        } => (
+            forged_ledger::RunOutcome::Clean,
+            "protocol completed with an approve verdict".to_owned(),
+        ),
+        Terminal::Done { final_verdict } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "protocol exhausted its review rounds with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::ReviewBudgetExhausted {
+            review_rounds,
+            final_verdict,
+        } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "review budget exhausted after {review_rounds} rounds with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::RemediationFailed {
+            round,
+            final_verdict,
+        } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "remediation failed in round {round} with verdict {}",
+                final_verdict.map(verdict_str).unwrap_or("unavailable")
+            ),
+        ),
+        Terminal::SpecAmendmentProposed { stage_id, .. } => (
+            forged_ledger::RunOutcome::InputRequired,
+            format!("stage {stage_id} proposed a specification amendment"),
+        ),
+        Terminal::AcceptedRisk { acceptance } => (
+            forged_ledger::RunOutcome::AcceptedRisk,
+            super::settlement::accepted_risk_reason(acceptance),
+        ),
+        Terminal::ProviderUnavailable { stage, attempts } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!(
+                "provider unavailable for {} after {attempts} attempts",
+                crate::config::stage_str(*stage)
+            ),
+        ),
+        Terminal::SemanticProviderUnavailable { stage_id, attempts } => (
+            forged_ledger::RunOutcome::Blocked,
+            format!("provider unavailable for {stage_id} after {attempts} attempts"),
+        ),
+        // This is already a ledger stop (including one settled explicitly by
+        // `run stop`), so it must not invent or rewrite an outcome.
+        Terminal::ExternallyStopped { .. } => return None,
+    };
+    Some(super::settlement::Settlement {
+        outcome,
+        reason,
+        delivery_pr: None,
+        delivery_sha: None,
+        superseded_by: None,
+    })
+}
+
+async fn settle_terminal(ctx: &Ctx, run_id: &str, terminal: &Terminal) -> Result<(), Failure> {
+    if let Some(settlement) = automatic_settlement(terminal) {
+        // `settle_run` deliberately makes the protocol project as externally
+        // stopped. Preserve the terminal that caused automatic settlement so
+        // status remains a faithful (and backwards-compatible) projection of
+        // the completed protocol rather than losing its approve/block/outage
+        // evidence behind that lifecycle guard. Kind-once makes the first
+        // terminal immutable across controller races and crash replay.
+        let event_run = run_id.to_owned();
+        let terminal = terminal_json(terminal);
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.append_event_kind_once(
+                &event_run,
+                "run.protocol-terminal",
+                json!({
+                    "schemaVersion": 1,
+                    "terminal": terminal,
+                }),
+            )?;
+            Ok(())
+        })
+        .await?;
+        super::settlement::settle(ctx, run_id, settlement).await?;
+    }
+    Ok(())
 }
 
 /// What honoring one action produced.
@@ -576,10 +754,29 @@ fn transport_fallback_index(
 
 /// Assemble the execution context for provider packets.
 async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContext, Failure> {
+    let active_profile = view.execution_package.as_ref().map(|package| {
+        let name = view
+            .profile_escalations
+            .last()
+            .map(|event| event.to.as_str())
+            .unwrap_or(package.profile_ref.name.as_str());
+        package
+            .profile_catalog
+            .get(name)
+            .unwrap_or(&package.profile)
+    });
     Ok(ExecutionContext {
         pr_number: pr_number_of(view),
         findings: latest_review_findings(view),
         review_evidence: latest_review_evidence(view),
+        risk_context: active_profile
+            .map(|profile| profile.risk_context.clone())
+            .unwrap_or_else(|| {
+                "Routine change: grade findings by concrete likelihood and consequence.".to_owned()
+            }),
+        fix_round_budget: active_profile
+            .map(|profile| profile.fix_round_budget)
+            .unwrap_or(1),
         push_url: push_url_of(&view.run.repo).await,
         host_policy: view.policy.host_policy,
         herdr_socket: view.policy.herdr_socket.clone(),
@@ -621,18 +818,28 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
     };
     let run = run.clone();
     let gate_commands = view.policy.gate_commands.clone();
-    let resp =
-        fenced(
-            ctx,
-            step.as_str(),
-            class,
-            &req,
-            None,
-            move |op_id| async move {
-                machine_effect(ctx, &run, step, round, &op_id, &gate_commands).await
-            },
-        )
-        .await;
+    let transport_retry_budget = view.policy.transport_retry_budget;
+    let controller_generation = super::handoff::controller_generation_for_run(run.run_id.as_str());
+    let resp = fenced_machine(
+        ctx,
+        step.as_str(),
+        class,
+        &req,
+        controller_generation,
+        move |op_id| async move {
+            machine_effect(
+                ctx,
+                &run,
+                step,
+                round,
+                &op_id,
+                &gate_commands,
+                transport_retry_budget,
+            )
+            .await
+        },
+    )
+    .await;
     if resp.ok {
         Ok(())
     } else {
@@ -683,6 +890,7 @@ async fn machine_effect(
     round: u32,
     op_id: &str,
     gate_commands: &[String],
+    transport_retry_budget: u32,
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
@@ -752,24 +960,55 @@ async fn machine_effect(
         MachineStage::Push => {
             let worktree = ctx.config.worktree(&run.run_id);
             let expected = rev_parse_head(&worktree).await?;
-            failpoint::hit("git.push.before");
             let refspec = format!("{0}:refs/heads/{0}", run.branch);
-            let out = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&worktree)
-                .args(["push", "origin", &refspec])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .await
-                .map_err(|e| Failure::internal(format!("git push: {e}")))?;
-            failpoint::hit("git.push.after");
-            if !out.status.success() {
-                return Err(Failure::internal(format!(
-                    "git push origin {refspec}: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )));
+            let max_attempts = transport_retry_budget.saturating_add(1);
+            for attempt in 1..=max_attempts {
+                failpoint::hit("git.push.before");
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&worktree)
+                    .args(["push", "origin", &refspec])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| Failure::internal(format!("git push: {e}")))?;
+                failpoint::hit("git.push.after");
+                if out.status.success() {
+                    return Ok(json!({
+                        "remoteSha": expected,
+                        "branch": run.branch,
+                        "attempts": attempt,
+                    }));
+                }
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                let kind = classify_push_failure(&stderr);
+                if kind.is_transport() && attempt < max_attempts {
+                    let exponent = attempt.saturating_sub(1).min(5);
+                    let delay_ms = 100u64.saturating_mul(1u64 << exponent);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                let reason = format!(
+                    "input-required: git push {} after {attempt} attempt(s): {stderr}",
+                    kind.label()
+                );
+                let run_id = run.run_id.clone();
+                let reason_for_store = reason.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.set_run_state(&run_id, RunState::Stopped, Some(reason_for_store))
+                })
+                .await?;
+                // The push did NOT happen, so its ObserveOnly operation must
+                // remain in progress for a later reconcile to observe and
+                // release. Completing it here would let a resumed run skip
+                // the missing push and open a PR for a nonexistent branch.
+                return Err(Failure {
+                    code: forged_types::ErrorCode::GhError,
+                    message: reason,
+                    recoverable: true,
+                });
             }
-            Ok(json!({"remoteSha": expected, "branch": run.branch}))
+            unreachable!("push loop always runs at least once")
         }
         MachineStage::DraftPr => {
             let slug = repo_slug(std::path::Path::new(&run.repo))
@@ -802,6 +1041,63 @@ async fn machine_effect(
                 }
             }))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushFailureKind {
+    Authentication,
+    Network,
+    Other,
+}
+
+impl PushFailureKind {
+    fn is_transport(self) -> bool {
+        matches!(self, Self::Authentication | Self::Network)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication failed",
+            Self::Network => "network transport failed",
+            Self::Other => "was refused",
+        }
+    }
+}
+
+fn classify_push_failure(stderr: &str) -> PushFailureKind {
+    let lower = stderr.to_ascii_lowercase();
+    if [
+        "authentication failed",
+        "could not read username",
+        "permission denied (publickey)",
+        "repository not found",
+        "http 401",
+        "http 403",
+        "terminal prompts disabled",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        PushFailureKind::Authentication
+    } else if [
+        "could not resolve host",
+        "connection reset",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "network is unreachable",
+        "remote end hung up unexpectedly",
+        "the remote end hung up unexpectedly",
+        "tls",
+        "ssl",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        PushFailureKind::Network
+    } else {
+        PushFailureKind::Other
     }
 }
 
@@ -872,7 +1168,10 @@ async fn advance_once(
         )),
         _ => None,
     };
-    honor(ctx, ports, &view, &action, wait_allowed).await?;
+    let honored = honor(ctx, ports, &view, &action, wait_allowed).await?;
+    if let Honored::Stopped(terminal) = honored {
+        settle_terminal(ctx, run_id, &terminal).await?;
+    }
     Ok((action_json(&action), machine_key))
 }
 
@@ -903,6 +1202,9 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         }
         match honor(ctx, &ports, &view, &action, true).await {
             Ok(Honored::Stopped(terminal)) => {
+                if let Err(failure) = settle_terminal(ctx, &run_id, &terminal).await {
+                    return err_response(&echo, &failure);
+                }
                 return ok_response(
                     &echo,
                     false,
@@ -932,8 +1234,11 @@ pub fn intents_json(intents: &[PacketIntent]) -> Value {
 mod adaptive_tests {
     use forged_ledger::AttemptState;
     use forged_proto::TerminalAttempt;
+    use forged_types::{Finding, Severity};
 
-    use super::transport_fallback_index;
+    use super::{
+        classify_push_failure, deduplicate_findings, transport_fallback_index, PushFailureKind,
+    };
 
     fn failed(note: &str) -> TerminalAttempt {
         TerminalAttempt {
@@ -970,5 +1275,39 @@ mod adaptive_tests {
             ),
             0
         );
+    }
+
+    #[test]
+    fn push_failures_separate_retryable_transport_from_operator_action() {
+        assert_eq!(
+            classify_push_failure("fatal: Could not resolve host: github.com"),
+            PushFailureKind::Network
+        );
+        assert_eq!(
+            classify_push_failure("git@github.com: Permission denied (publickey)."),
+            PushFailureKind::Authentication
+        );
+        assert_eq!(
+            classify_push_failure("! [rejected] branch -> branch (non-fast-forward)"),
+            PushFailureKind::Other
+        );
+    }
+
+    #[test]
+    fn corroborated_findings_collapse_and_keep_the_highest_severity() {
+        let finding = |severity, message: &str| Finding {
+            severity,
+            file: Some("src/lib.rs".to_owned()),
+            line: Some(42),
+            message: message.to_owned(),
+        };
+        let findings = deduplicate_findings(vec![
+            finding(Severity::Medium, "Unchecked   result"),
+            finding(Severity::High, "unchecked result"),
+            finding(Severity::Low, "different issue"),
+        ]);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(findings[0].message, "Unchecked   result");
     }
 }

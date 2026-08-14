@@ -389,6 +389,28 @@ async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
         .into_iter()
         .take(PORTFOLIO_CAP)
         .collect();
+    let mut remaining = PORTFOLIO_CAP;
+    let queue_groups: Vec<Value> = portfolio.queue["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .map(|group| {
+            let all = group["entries"].as_array().cloned().unwrap_or_default();
+            let shown: Vec<Value> = all.iter().take(remaining).cloned().collect();
+            remaining = remaining.saturating_sub(shown.len());
+            json!({
+                "name": group["name"],
+                "count": all.len(),
+                "entries": shown,
+            })
+        })
+        .collect();
+    let queue = json!({
+        "groups": queue_groups,
+        "total": total,
+        "cap": PORTFOLIO_CAP,
+        "asOf": portfolio.queue["asOf"],
+    });
     Ok(json!({
         "schema": "forged.overview/1",
         "kind": "portfolio",
@@ -398,6 +420,7 @@ async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
         "liveSeats": live_seats,
         "attention": attention,
         "attentionTotal": attention_total,
+        "queue": queue,
         "spend": {
             "costUsdKnown": cost_usd_known,
             "rowsMissingCost": rows_missing_cost,

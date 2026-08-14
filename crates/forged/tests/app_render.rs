@@ -372,6 +372,46 @@ fn a_portfolio_envelope_reaches_the_root_view_through_ingest_and_render() {
     );
 }
 
+#[test]
+fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
+    let Some(node) = require_node() else { return };
+    let entry = json!({
+        "id": "queue-run",
+        "kind": "slice",
+        "beadId": "bead-queue-run",
+        "title": "Make work legible",
+        "state": "active",
+        "nextAction": "Submit a detached controller when this work should start",
+    });
+    let mut payload = portfolio(vec![entry.clone()], Vec::new());
+    payload["queue"] = json!({
+        "total": 1,
+        "groups": [
+            {"name": "Needs me", "count": 0, "entries": []},
+            {"name": "Ready to merge", "count": 0, "entries": []},
+            {"name": "Running", "count": 0, "entries": []},
+            {"name": "Stalled or recoverable", "count": 0, "entries": []},
+            {"name": "Planned", "count": 1, "entries": [entry]},
+        ],
+    });
+    let dispatched = render_dispatch(&node, &json!({"ok": true, "result": payload}));
+    for expected in [
+        "Needs me",
+        "Ready to merge",
+        "Running",
+        "Stalled or recoverable",
+        "Planned",
+        "Make work legible",
+        "Next: Submit a detached controller",
+    ] {
+        assert!(
+            dispatched.text.contains(expected),
+            "the queue renders {expected}: {}",
+            dispatched.text
+        );
+    }
+}
+
 /// The rail is the answer to "what needs a human", so it has to be drawn
 /// from the payload's own conditions rather than re-derived by the App.
 #[test]

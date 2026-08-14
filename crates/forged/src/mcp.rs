@@ -269,6 +269,15 @@ impl ForgedServer {
         self.call("run_status", args.0).await
     }
 
+    /// Stop and settle a complete run.
+    #[tool(
+        name = "run_stop",
+        description = "Stop every live attempt and settle the run as clean, blocked, input-required, cancelled, superseded, or landed. Landed requires PR and exact SHA evidence."
+    )]
+    pub async fn run_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_stop", args.0).await
+    }
+
     /// Append an explicit roster revision.
     #[tool(
         name = "run_revise_roster",
@@ -276,6 +285,15 @@ impl ForgedServer {
     )]
     pub async fn run_revise_roster(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_revise_roster", args.0).await
+    }
+
+    /// Accept the final deduplicated findings after review exhaustion.
+    #[tool(
+        name = "run_accept_risk",
+        description = "Record an operator's auditable accepted-risk decision after review-budget exhaustion."
+    )]
+    pub async fn run_accept_risk(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("run_accept_risk", args.0).await
     }
 
     /// Freeze an epic inventory and child execution defaults.
@@ -401,7 +419,9 @@ impl ForgedServer {
     /// Revoke and confirmed-stop one provider attempt.
     #[tool(
         name = "session_stop",
-        description = "Revoke and stop a provider attempt."
+        description = "Revoke and stop ONE provider attempt: confirmed death, terminal \
+                       `stopped`, the bead's bd lease left where it is. Returns attemptId, \
+                       runId, state and the reconcile report."
     )]
     pub async fn session_stop(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("session_stop", args.0).await

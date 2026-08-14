@@ -663,6 +663,7 @@ pub fn report_json(report: &forged_proto::ReconcileReport) -> Value {
     serde_json::json!({
         "leftRunning": report.left_running,
         "reclaimed": report.reclaimed,
+        "stopped": report.stopped,
         "released": report.released,
         "observed": report.observed,
         "quarantined": report.quarantined,

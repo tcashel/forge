@@ -5,14 +5,15 @@
 
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::mpsc;
-use std::sync::Arc;
+use std::sync::{Arc, Barrier};
 
 use forged_ledger::{
     AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
-    RunState, SpecFence,
+    RunOutcome, RunSettlement, RunState, SpecFence,
 };
 use forged_types::{
-    ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
+    AcceptedRisk, ErrorCode, Finding, OperationRequest, OperationResponse, Outcome, PacketResult,
+    RunId, Severity, Stage,
 };
 use serde_json::json;
 
@@ -78,6 +79,47 @@ fn fresh(outcome: OperationOutcome) -> String {
         OperationOutcome::Fresh(ticket) => ticket.operation_id,
         other => panic!("expected Fresh, got {other:?}"),
     }
+}
+
+fn acceptance(actor: &str, rationale: &str) -> AcceptedRisk {
+    AcceptedRisk {
+        accepted_by: actor.to_owned(),
+        rationale: rationale.to_owned(),
+        findings: vec![Finding {
+            severity: Severity::High,
+            file: Some("src/lib.rs".to_owned()),
+            line: Some(17),
+            message: "known residual risk".to_owned(),
+        }],
+    }
+}
+
+fn block_after_review_exhaustion(ledger: &Ledger, run_id: &str, rounds: u8) {
+    ledger
+        .append_event_kind_once(
+            run_id,
+            "run.protocol-terminal",
+            json!({
+                "schemaVersion": 1,
+                "terminal": {
+                    "reviewBudgetExhausted": {
+                        "reviewRounds": rounds,
+                        "finalVerdict": "requestChanges",
+                    }
+                }
+            }),
+        )
+        .expect("review terminal");
+    ledger
+        .settle_run(
+            run_id,
+            RunOutcome::Blocked,
+            format!("review budget exhausted after {rounds} rounds with verdict requestChanges"),
+            None,
+            None,
+            None,
+        )
+        .expect("blocked settlement");
 }
 
 /// Shim variant 1: revoked mid-flight. The durable `revoking` marker lands
@@ -336,6 +378,82 @@ fn saga_order_is_enforced_mechanically() {
     ledger.close().expect("close");
 }
 
+/// `stopped` is the attempt-local terminal exit from `revoking`: reachable
+/// only through the durable marker, distinguishable from `reclaimed`, and
+/// leaving the packet claimable at once.
+#[test]
+fn mark_stopped_is_the_only_path_into_stopped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-stopped");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(
+            &packet,
+            "claude:sess-8:800",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+
+    // stopped is unreachable from running: no path skips the marker.
+    let err = ledger
+        .mark_stopped(claim.attempt_id)
+        .expect_err("must refuse");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    ledger
+        .revoke_attempt_scoped(
+            claim.attempt_id,
+            "operator requested",
+            forged_ledger::RevokeScope::Attempt,
+        )
+        .expect("revoke");
+    ledger.mark_stopped(claim.attempt_id).expect("stop");
+
+    let stopped = ledger.get_attempt(claim.attempt_id).expect("get");
+    // The scope survives the transition too: a reader of the terminal row
+    // knows an operator stopped this, not that the saga reclaimed it.
+    assert_eq!(
+        stopped.revoke_scope,
+        Some(forged_ledger::RevokeScope::Attempt)
+    );
+    assert_eq!(stopped.state, AttemptState::Stopped);
+    assert_ne!(stopped.state, AttemptState::Reclaimed);
+    assert_eq!(stopped.revoke_reason.as_deref(), Some("operator requested"));
+    assert!(stopped.ended_at.is_some());
+
+    // The transition is on the wire as its own event, so a reader tells an
+    // operator's stop from the saga's reclaim without the row.
+    let events = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("run-scoped events");
+    let event = events
+        .iter()
+        .filter(|e| e.kind == "attempt.state")
+        .map(|e| serde_json::from_str::<serde_json::Value>(&e.payload_json).expect("payload"))
+        .find(|p| p["new"] == "stopped")
+        .expect("stopped transition event");
+    assert_eq!(event["old"], json!("revoking"));
+    assert_eq!(event["reason"], json!("operator requested"));
+    assert_eq!(event["attemptId"], json!(claim.attempt_id));
+
+    // Terminal both ways: no second exit, and no return to reclaimed.
+    let err = ledger
+        .mark_reclaimed(claim.attempt_id)
+        .expect_err("stopped is terminal");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    // And the packet is claimable with no waiting period.
+    ledger
+        .claim_packet(
+            &packet,
+            "claude:sess-9:900",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("successor claim after a stop");
+    ledger.close().expect("close");
+}
+
 /// The fail note is readable both ways: `fail_note` on the row and,
 /// verbatim, as the `attempt.state` event's reason.
 #[test]
@@ -540,4 +658,518 @@ fn events_are_append_only_and_run_attributed() {
         .expect("limit zero")
         .is_empty());
     ledger.close().expect("close");
+}
+
+/// The marker's SCOPE is durable and first-writer-wins. Without it a
+/// `revoking` row cannot say whose revocation it is, and the recovery path
+/// finishes an operator's stop through the bead-scoped reclaim it exists to
+/// avoid.
+#[test]
+fn a_revoking_marker_records_the_scope_that_placed_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-scope");
+    let fence = SpecFence::Sha256("cafe".to_owned());
+
+    // The saga's own entry point is bead-scoped.
+    let saga_packet = make_packet(&ledger, &run);
+    // One live attempt per packet, so the two revocations need two packets.
+    let stop_packet = ledger
+        .open_packet(NewPacket {
+            run_id: run.clone(),
+            stage: Stage::Implement,
+            seq: 2,
+            spec_path: "specs/x.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
+        })
+        .expect("open packet");
+    let saga = ledger
+        .claim_packet(&saga_packet, "claude:sess-1:100", &fence)
+        .expect("claim");
+    ledger
+        .revoke_attempt(saga.attempt_id, "session vanished")
+        .expect("revoke");
+    assert_eq!(
+        ledger
+            .get_attempt(saga.attempt_id)
+            .expect("get")
+            .revoke_scope,
+        Some(forged_ledger::RevokeScope::Bead)
+    );
+
+    // An operator's stop is attempt-scoped, and a second revocation of an
+    // already-marked row changes NOTHING: reason, scope, and stamps all
+    // belong to the writer that committed the marker.
+    let stop = ledger
+        .claim_packet(&stop_packet, "claude:sess-2:200", &fence)
+        .expect("claim");
+    ledger
+        .revoke_attempt_scoped(
+            stop.attempt_id,
+            "operator requested",
+            forged_ledger::RevokeScope::Attempt,
+        )
+        .expect("revoke");
+    ledger
+        .revoke_attempt(stop.attempt_id, "session vanished")
+        .expect("a second revocation of a revoking row is a no-op");
+    let row = ledger.get_attempt(stop.attempt_id).expect("get");
+    assert_eq!(row.revoke_scope, Some(forged_ledger::RevokeScope::Attempt));
+    assert_eq!(row.revoke_reason.as_deref(), Some("operator requested"));
+    ledger.close().expect("close");
+}
+
+#[test]
+fn whole_run_settlement_is_immutable_idempotent_and_evented() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-settlement");
+    let sha = "a".repeat(40);
+    let packet = make_packet(&ledger, &run);
+
+    let landed = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Landed,
+            "merged cleanly".to_owned(),
+            Some(121),
+            Some(sha.clone()),
+            None,
+        )
+        .expect("settle");
+    assert_eq!(landed.state, RunState::Stopped);
+    assert_eq!(landed.terminal_outcome, Some(RunOutcome::Landed));
+    assert_eq!(landed.delivery_pr, Some(121));
+    assert_eq!(landed.delivery_sha.as_deref(), Some(sha.as_str()));
+
+    let replay = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Landed,
+            "merged cleanly".to_owned(),
+            Some(121),
+            Some(sha),
+            None,
+        )
+        .expect("identical replay");
+    assert_eq!(replay, landed);
+    let settlement_events: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "run.settled")
+        .collect();
+    assert_eq!(settlement_events.len(), 1);
+    let claim_after_stop = ledger
+        .claim_packet(
+            &packet,
+            "claude:late:99",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect_err("a terminal run cannot race in a successor attempt");
+    assert_eq!(claim_after_stop.code(), ErrorCode::PacketNotClaimable);
+
+    let conflict = ledger
+        .settle_run(
+            &run,
+            RunOutcome::Cancelled,
+            "changed my mind".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("terminal outcome cannot be rewritten");
+    assert_eq!(conflict.code(), ErrorCode::InvalidRequest);
+    ledger.close().expect("close");
+}
+
+#[test]
+fn controller_generation_settlement_fences_new_effects_and_replays_once() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-controller-fence");
+    let before = request("machine:gate:0", Some(&run));
+    let before_id = match ledger
+        .begin_controller_operation("gate", &before, EffectClass::SafeRetry, 4)
+        .expect("active generation may reserve an effect")
+    {
+        OperationOutcome::Fresh(ticket) => ticket.operation_id,
+        other => panic!("expected fresh operation, got {other:?}"),
+    };
+    ledger
+        .complete_operation(&before_id, &ok_response(&before_id))
+        .expect("complete harmless predecessor");
+
+    ledger
+        .settle_run_fencing_controller(
+            &run,
+            RunSettlement {
+                outcome: RunOutcome::Cancelled,
+                reason: "operator cancelled".to_owned(),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            },
+            4,
+        )
+        .expect("settle and fence generation");
+
+    let late = request("machine:push:0", Some(&run));
+    let error = ledger
+        .begin_controller_operation("push", &late, EffectClass::ObserveOnly, 4)
+        .expect_err("fenced generation cannot receive a machine-effect ticket");
+    assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+    let foreground = request("machine:foreground-push:0", Some(&run));
+    let error = ledger
+        .begin_machine_operation("push", &foreground, EffectClass::ObserveOnly, None)
+        .expect_err("a foreground machine cannot admit work after settlement");
+    assert_eq!(error.code(), ErrorCode::StaleClaimToken);
+
+    let replay = ledger
+        .begin_controller_operation("gate", &before, EffectClass::SafeRetry, 4)
+        .expect("an already-terminal operation remains replayable");
+    assert!(matches!(replay, OperationOutcome::Replayed(_)));
+
+    ledger
+        .settle_run_fencing_controller(
+            &run,
+            RunSettlement {
+                outcome: RunOutcome::Cancelled,
+                reason: "operator cancelled".to_owned(),
+                delivery_pr: None,
+                delivery_sha: None,
+                superseded_by: None,
+            },
+            4,
+        )
+        .expect("identical settlement replay");
+    let revocations: Vec<_> = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.controller.revoked")
+        .collect();
+    assert_eq!(
+        revocations.len(),
+        1,
+        "one durable revocation per generation"
+    );
+    assert_eq!(
+        serde_json::from_str::<serde_json::Value>(&revocations[0].payload_json).expect("payload")
+            ["generation"],
+        json!(4)
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn foreground_machine_ticket_is_not_mistaken_for_a_killed_generation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-foreground-fence");
+    let request = request("machine:push:foreground", Some(&run));
+    let operation_id = match ledger
+        .begin_machine_operation("push", &request, EffectClass::ObserveOnly, None)
+        .expect("foreground machine admission")
+    {
+        OperationOutcome::Fresh(ticket) => ticket.operation_id,
+        other => panic!("expected fresh operation, got {other:?}"),
+    };
+    ledger
+        .settle_run(
+            &run,
+            RunOutcome::Cancelled,
+            "operator cancelled".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("terminal projection wins after admission");
+    assert_eq!(
+        ledger
+            .uncontained_machine_operations(&run, None)
+            .expect("unsafe operations"),
+        vec![operation_id],
+        "settlement cannot claim an unidentified foreground effect is dead"
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn settlement_requires_outcome_specific_evidence() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let landed = make_run(&ledger, "run-bad-landed");
+    let superseded = make_run(&ledger, "run-bad-superseded");
+
+    let missing = ledger
+        .settle_run(
+            &landed,
+            RunOutcome::Landed,
+            "merged".to_owned(),
+            Some(7),
+            Some("short".to_owned()),
+            None,
+        )
+        .expect_err("abbreviated SHA is not immutable evidence");
+    assert_eq!(missing.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_run(&landed).expect("run").state,
+        RunState::Active
+    );
+
+    let unnamed = ledger
+        .settle_run(
+            &superseded,
+            RunOutcome::Superseded,
+            "replaced".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect_err("a successor is required");
+    assert_eq!(unnamed.code(), ErrorCode::InvalidRequest);
+    ledger.close().expect("close");
+}
+
+#[test]
+fn accepted_risk_settlement_replays_exactly_and_compares_singleton_payload() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-risk-replay");
+    block_after_review_exhaustion(&ledger, &run, 3);
+    let evidence = acceptance("lead-agent", "feature is disabled in production");
+
+    let mismatched = ledger
+        .accept_review_risk(&run, 2, evidence.clone())
+        .expect_err("caller evidence must match persisted exhaustion");
+    assert_eq!(mismatched.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger
+            .get_run(&run)
+            .expect("still blocked")
+            .terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+    assert!(ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .iter()
+        .all(|event| event.kind != "forged.review.risk_accepted"));
+
+    let settled = ledger
+        .accept_review_risk(&run, 3, evidence.clone())
+        .expect("accept risk");
+    assert_eq!(settled.terminal_outcome, Some(RunOutcome::AcceptedRisk));
+    assert_eq!(
+        settled.stop_reason.as_deref(),
+        Some("review risk accepted by lead-agent: feature is disabled in production")
+    );
+    assert_eq!(
+        ledger
+            .accept_review_risk(&run, 3, evidence.clone())
+            .expect("exact replay"),
+        settled
+    );
+
+    let competing = ledger
+        .accept_review_risk(&run, 3, acceptance("lead-agent", "a different rationale"))
+        .expect_err("competing evidence must not replay");
+    assert_eq!(competing.code(), ErrorCode::InvalidRequest);
+    let events = ledger.list_events(Some(&run), 0, 100).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "forged.review.risk_accepted")
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event.kind == "run.settled")
+            .count(),
+        2,
+        "blocked and accepted-risk each settle exactly once"
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn accepted_risk_repairs_only_an_exact_legacy_torn_event() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let exact_run = make_run(&ledger, "run-risk-torn-exact");
+    let conflict_run = make_run(&ledger, "run-risk-torn-conflict");
+    let evidence = acceptance("lead-agent", "known containment");
+    for run in [&exact_run, &conflict_run] {
+        block_after_review_exhaustion(&ledger, run, 2);
+    }
+    ledger
+        .append_event_kind_once(
+            &exact_run,
+            "forged.review.risk_accepted",
+            json!({
+                "schemaVersion": 1,
+                "reviewRounds": 2,
+                "acceptance": evidence,
+            }),
+        )
+        .expect("legacy exact event");
+    ledger
+        .accept_review_risk(&exact_run, 2, evidence.clone())
+        .expect("exact torn write can finish atomically");
+    assert_eq!(
+        ledger
+            .list_events(Some(&exact_run), 0, 100)
+            .expect("events")
+            .iter()
+            .filter(|event| event.kind == "forged.review.risk_accepted")
+            .count(),
+        1
+    );
+
+    ledger
+        .append_event_kind_once(
+            &conflict_run,
+            "forged.review.risk_accepted",
+            json!({
+                "schemaVersion": 1,
+                "reviewRounds": 2,
+                "acceptance": acceptance("another-operator", "different evidence"),
+            }),
+        )
+        .expect("legacy competing event");
+    let conflict = ledger
+        .accept_review_risk(&conflict_run, 2, evidence)
+        .expect_err("different singleton payload must be refused");
+    assert_eq!(conflict.code(), ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger.get_run(&conflict_run).expect("run").terminal_outcome,
+        Some(RunOutcome::Blocked)
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
+fn competing_acceptances_leave_one_matching_event_outcome_and_reason() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Arc::new(Ledger::open(&dir.path().join("state.db")).expect("open"));
+    let run = make_run(&ledger, "run-risk-race");
+    block_after_review_exhaustion(&ledger, &run, 2);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let handles: Vec<_> = [
+        ("operator-a", "containment a"),
+        ("operator-b", "containment b"),
+    ]
+    .into_iter()
+    .map(|(actor, rationale)| {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.accept_review_risk(&run, 2, acceptance(actor, rationale))
+        })
+    })
+    .collect();
+    barrier.wait();
+    let results: Vec<_> = handles
+        .into_iter()
+        .map(|handle| handle.join().expect("join"))
+        .collect();
+    assert_eq!(results.iter().filter(|result| result.is_ok()).count(), 1);
+    assert_eq!(results.iter().filter(|result| result.is_err()).count(), 1);
+
+    let row = ledger.get_run(&run).expect("run");
+    let event = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.kind == "forged.review.risk_accepted")
+        .expect("acceptance event");
+    let payload: serde_json::Value = serde_json::from_str(&event.payload_json).expect("payload");
+    let actor = payload
+        .pointer("/acceptance/acceptedBy")
+        .and_then(serde_json::Value::as_str)
+        .expect("actor");
+    let rationale = payload
+        .pointer("/acceptance/rationale")
+        .and_then(serde_json::Value::as_str)
+        .expect("rationale");
+    let expected_reason = format!("review risk accepted by {actor}: {rationale}");
+    assert_eq!(row.terminal_outcome, Some(RunOutcome::AcceptedRisk));
+    assert_eq!(row.stop_reason.as_deref(), Some(expected_reason.as_str()));
+    drop(ledger);
+}
+
+#[test]
+fn acceptance_and_supersede_race_has_one_self_consistent_winner() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Arc::new(Ledger::open(&dir.path().join("state.db")).expect("open"));
+    let run = make_run(&ledger, "run-risk-supersede-race");
+    block_after_review_exhaustion(&ledger, &run, 2);
+    let barrier = Arc::new(Barrier::new(3));
+
+    let accept = {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.accept_review_risk(&run, 2, acceptance("lead", "known containment"))
+        })
+    };
+    let supersede = {
+        let ledger = ledger.clone();
+        let barrier = barrier.clone();
+        let run = run.clone();
+        std::thread::spawn(move || {
+            barrier.wait();
+            ledger.settle_run(
+                &run,
+                RunOutcome::Superseded,
+                "replaced by corrected run".to_owned(),
+                None,
+                None,
+                Some("successor-run".to_owned()),
+            )
+        })
+    };
+    barrier.wait();
+    let accepted = accept.join().expect("accept join");
+    let superseded = supersede.join().expect("supersede join");
+    assert_ne!(
+        accepted.is_ok(),
+        superseded.is_ok(),
+        "exactly one transition wins"
+    );
+
+    let row = ledger.get_run(&run).expect("run");
+    let accepted_events = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.review.risk_accepted")
+        .count();
+    match row.terminal_outcome {
+        Some(RunOutcome::AcceptedRisk) => {
+            assert!(accepted.is_ok());
+            assert_eq!(accepted_events, 1);
+            assert_eq!(
+                row.stop_reason.as_deref(),
+                Some("review risk accepted by lead: known containment")
+            );
+        }
+        Some(RunOutcome::Superseded) => {
+            assert!(superseded.is_ok());
+            assert_eq!(accepted_events, 0);
+            assert_eq!(row.superseded_by.as_deref(), Some("successor-run"));
+        }
+        other => panic!("unexpected terminal outcome: {other:?}"),
+    }
+    drop(ledger);
 }

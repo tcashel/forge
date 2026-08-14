@@ -25,9 +25,21 @@ forged doctor
 forged definition validate --profile standard --roster default
 ```
 
+`BEADS_DIR` may point to an embedded store or to metadata for one central team
+Dolt SQL database. The collaborative setup, credential boundary, connectivity
+check, and the reasons active embedded work need not migrate are documented in
+[Central Beads server](beads-team-server.md). In either mode Beads owns the
+work graph and leases while Forged retains its separate execution ledger.
+
 `$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
 `standard`, `high`) and named ordered provider/model rosters. Change a roster
 when model or provider availability changes; do not rewrite topology or skills.
+`standard` uses one repository-aware reviewer. `high` is an explicit choice for
+consequential security, data, migration, financial, or irreversible-operation
+risk; reviewer disagreement never promotes a standard run into it. A profile's
+`fixRoundBudget` is the only review-loop limit: after the initial review, each
+budgeted remediation is followed by another review, and exhaustion is reported
+as `reviewBudgetExhausted` rather than starting a successor run or Bead.
 Run start freezes the resolved package and hashes, including gate commands,
 stage and transport budgets, and Herdr host policy. Editing authoring YAML
 affects later runs only; recovery and detached controllers continue from the
@@ -35,6 +47,16 @@ stored policy. A live slice changes roster only at a durable boundary:
 
 ```sh
 forged run revise-roster --run <run-id> --roster <name> --reason '<reason>'
+```
+
+An implement or remediation seat may stop with a structured
+`specAmendmentProposed` result when repository evidence contradicts the frozen
+spec. After `reviewBudgetExhausted`, a lead may make the one explicit exception;
+Forged records the deduplicated final findings, identity, and rationale:
+
+```sh
+forged run accept-risk --run <run-id> --accepted-by <identity> \
+  --rationale '<why the concrete consequence is acceptable>'
 ```
 
 For an epic, revise once at the parent. The append-only event and all current
@@ -72,16 +94,63 @@ before its next claim. `--spec <path>` still names a spec file for one
 release and is recorded as deprecated.
 
 Submit returns a durable controller identity immediately. Retrying while it is
-live adopts the same controller. The run ends at a reviewed draft PR; the
-human adjudicates the merge.
+live adopts the same verified driver; a confirmed-dead driver is reconciled
+and restarted under a new generation. Status includes the driver's pid/start
+identity, the exact executable version and digest, a per-generation durable
+log, and the latest ledger progress event. An unverifiable identity is
+reported as `unknown` and blocks a duplicate spawn. The run ends at a reviewed
+draft PR; the human adjudicates the merge.
+
+Push authentication and network failures consume the frozen transport retry
+budget. Exhaustion stops the run with an `input-required:` reason while the
+unconfirmed push operation remains reconcilable; it is never recorded as a
+successful push.
+
+Settle that whole run explicitly rather than treating a controller exit as a
+delivery decision:
+
+```sh
+forged run stop --run <run-id> --outcome clean --reason '<ready-to-land reason>'
+forged run stop --run <run-id> --outcome input-required --reason '<question>'
+forged run stop --run <run-id> --outcome superseded \
+  --superseded-by <successor-run> --reason '<replacement reason>'
+forged run stop --run <run-id> --outcome landed --reason '<verification>' \
+  --pr <number> --sha <exact-merge-sha>
+```
+
+The whole-run stop first makes the state machine terminal, then durably
+revokes and confirms death for every live attempt. `blocked` and
+`input-required` return the Bead to blocked/unassigned; `cancelled` and
+`superseded` return it open/unassigned; `clean` preserves its claim while the
+reviewed PR awaits delivery. Only `landed` closes the Bead, clears its
+assignment, and retires a clean worktree. The stored PR and full SHA make a
+clean squash-merged worktree safe to retire without pretending the topic
+branch is an ancestor of the base. Dirty or unresolved worktrees remain for
+inspection and are reported in the settlement result.
+
+`run status` reports the terminal outcome, delivery evidence, successor, and
+`claimHealth`. An `in_progress` Bead with neither a live controller nor a live
+attempt is marked `staleInProgress: true` instead of silently looking active.
 
 ## Submit an epic
 
 ```sh
 forged epic start --epic <epic-id> --repo /absolute/repo \
-  --spec "$ANVIL_HOME/specs/<epic-id>.md" --profile standard --roster default
+  --profile standard --roster default
 forged epic submit --epic <epic-id>
 ```
+
+The epic Bead is the plan map and the frozen child inventory is read from its
+native parent links; there is no second editable epic spec file. The old
+`--spec <absolute-path>` flag remains readable for one release and is recorded
+as deprecated provenance only.
+
+Code-producing children (`bug`, `feature`, `task`, `story`, and `spike`) run
+through `slice/v1`. No-diff children (`chore`, `decision`, and `milestone`)
+become one explicit `inputRequired` action: complete the work directly in
+Beads, close the child, then `epic resolve`. Forged never manufactures an
+empty commit or PR for them, and a child closed after epic start counts as
+accounted work.
 
 Resolving a child-specific stop retires that terminal child binding from the
 epic projection. The next wave starts a fresh child run generation (for
@@ -111,9 +180,9 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
-Start with `overview` for the operator-facing portfolio, or `work list` for
-the raw inventory. Both take no id and are the discovery surfaces for the ids
-the scoped commands need.
+Start with `overview` or `work list`. Both carry the same operator queue;
+`work list` additionally serves the uncapped raw inventory. Neither needs an
+id.
 
 ```sh
 forged work list
@@ -128,18 +197,38 @@ forged events --run <id> --limit 200
 `overview` with no scope answers with the portfolio: `kind: "portfolio"` on
 the same `forged.overview/1` schema, carrying the inventory entries newest
 first (capped, with `total` and `cap` stated so a truncated page reads as
-truncated), the portfolio-wide `spend`, and an `attention` rail naming each
+truncated), the portfolio-wide `spend`, and one queue grouped in this stable
+order: **Needs me**, **Ready to merge**, **Running**, **Stalled or
+recoverable**, **Planned**. The App renders that same queue; it does not
+derive a second classification. The `attention` rail names each
 subject that needs a human and the durable evidence for it — an epic holding
-on `input.required`, an attempt marked `revoking` and not yet reclaimed, a
-result taken into custody by `proto.quarantine`, or usage rows carrying no
-cost. An empty rail means nothing needs attention; it is never omitted.
+on `input.required`, a blocked/input-required slice, a clean or accepted-risk
+candidate awaiting delivery, a pending Beads settlement, an attempt marked
+`revoking` and not yet reclaimed, a result taken into custody by
+`proto.quarantine`, or usage rows carrying no cost. An empty rail means
+nothing needs attention; it is never omitted.
 
-Each `work list` entry carries its `kind` (`slice` or `epic`), lifecycle
-(`state`, `stopReason`, `createdAt`, `updatedAt`), live seat count, and
-spend, so an inventory can be drawn without a second call per entry. An
+Each queue/inventory entry carries a live Bead title (with a deterministic
+legacy fallback), repository and base branch, current stage/seat, last
+progress timestamp plus the clock used for age, exact blocker and next
+action, PR delivery, explicitly-known-or-unknown CI, spend, verified
+controller identity, and Bead `claimHealth`. Beads enrichment is one bounded
+read for the exact ledger ids, not one subprocess per row. A shell or Herdr
+pane is never enough to classify an entry as Running; a verified driver
+identity or live attempt is required. An
 epic's lifecycle is derived from its durable events — `active` until
 `forged.epic.paused`, `active` again after `forged.epic.resumed`,
 `submitted` once its final PR exists.
+
+Lifecycle fields are additive and always present: `outcome`,
+`delivery: {pr, sha}`, and `supersededBy`. Legacy rows have null values until
+a `run.settled` event records them. CI remains `unknown` unless durable
+evidence exists; the queue does not turn an unavailable GitHub lookup into a
+green check. `run status` and queue entries use the same `claimHealth` shape
+(`known`, status, assignee, expected assignee, stale-in-progress flag, and
+detail), so abandoned Bead ownership is visible instead of silently trusted.
+A clean or accepted-risk run deliberately retains its claim while its reviewed
+PR awaits delivery and is reported as awaiting delivery, not as stale.
 
 The overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the

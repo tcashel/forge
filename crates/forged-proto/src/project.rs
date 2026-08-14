@@ -11,15 +11,17 @@
 
 use std::collections::{BTreeMap, HashMap};
 
-use forged_ledger::{AttemptState, EventRow, Ledger, OperationRow, OperationState};
+use forged_ledger::{
+    AttemptState, EventRow, Ledger, OperationRow, OperationState, PacketRow, RunOutcome, RunRow,
+};
 use forged_types::{
-    EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, HostPolicyV1, PacketResult,
-    ProviderHints, ResolvedRosterV1, Stage,
+    AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, HostPolicyV1,
+    PacketResult, ProviderHints, ResolvedRosterV1, Stage,
 };
 use serde_json::Value;
 
 use crate::engine::{
-    machine_idempotency_key, ProfileEscalation, RunView, TerminalAttempt, MACHINE_STEPS,
+    machine_idempotency_key, MachineStage, ProfileEscalation, RunView, TerminalAttempt,
 };
 use crate::error::ProtoError;
 use crate::events::parse_proto_events;
@@ -126,11 +128,12 @@ pub fn project_run_with_policy(
     let packets = ledger.list_packets(run_id)?;
     let live_attempts = ledger.list_live_attempts(Some(run_id))?;
     let inflight_operations = ledger.list_inflight_operations(Some(run_id))?;
-    let settled_operations = settled_machine_operations(ledger, run_id)?;
     let events = fetch_all_events(ledger, run_id)?;
     let terminal_attempts = reconstruct_terminal_attempts(ledger, &events)?;
     let proto_events = parse_proto_events(&events)?;
     let profile_escalations = parse_profile_escalations(&events)?;
+    let accepted_risk = parse_accepted_risk(&run, &events)?;
+    let settled_operations = settled_machine_operations(ledger, run_id, &packets)?;
     let mut active_roster_revision = None;
     let execution_package = match ledger.get_run_definition(run_id)? {
         Some(definition) => {
@@ -174,6 +177,48 @@ pub fn project_run_with_policy(
         execution_package,
         active_roster_revision,
         profile_escalations,
+        accepted_risk,
+    })
+}
+
+fn parse_accepted_risk(
+    run: &RunRow,
+    events: &[EventRow],
+) -> Result<Option<AcceptedRisk>, ProtoError> {
+    // Acceptance is audit history after a later terminal transition. Only
+    // the durable run outcome can make it the standing protocol terminal;
+    // otherwise a stale event could mask cancellation or supersession.
+    if run.terminal_outcome != Some(RunOutcome::AcceptedRisk) {
+        return Ok(None);
+    }
+    let acceptance = events
+        .iter()
+        .rev()
+        .find(|event| event.kind == "forged.review.risk_accepted")
+        .map(|event| {
+            let value: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
+                ProtoError::MalformedEvent {
+                    event_id: event.event_id,
+                    detail: format!("accepted-risk payload is not JSON: {error}"),
+                }
+            })?;
+            serde_json::from_value(value.get("acceptance").cloned().ok_or_else(|| {
+                ProtoError::MalformedEvent {
+                    event_id: event.event_id,
+                    detail: "accepted-risk payload has no acceptance".to_owned(),
+                }
+            })?)
+            .map_err(|error| ProtoError::MalformedEvent {
+                event_id: event.event_id,
+                detail: format!("accepted-risk contract is invalid: {error}"),
+            })
+        })
+        .transpose()?;
+    acceptance.map(Some).ok_or_else(|| {
+        ProtoError::Projection(format!(
+            "run {:?} has accepted-risk outcome without acceptance evidence",
+            run.run_id
+        ))
     })
 }
 
@@ -221,9 +266,10 @@ fn parse_profile_escalations(events: &[EventRow]) -> Result<Vec<ProfileEscalatio
 
 /// The terminal operation row of every machine step that has one.
 ///
-/// The machine-step key set is closed (`MACHINE_STEPS`), so this is a
-/// bounded probe with `find_operation` rather than a new ledger query, and
-/// it is the engine's only evidence that a step is settled: a step whose row
+/// The machine-step names are closed and review rounds are bounded by the
+/// frozen profile, so this is a bounded probe with `find_operation` rather
+/// than a new ledger query. It is the engine's only evidence that a step
+/// is settled: a step whose row
 /// was released for redo, or whose `begin_operation` never ran, is simply
 /// absent here and runs again.
 ///
@@ -233,9 +279,30 @@ fn parse_profile_escalations(events: &[EventRow]) -> Result<Vec<ProfileEscalatio
 fn settled_machine_operations(
     ledger: &Ledger,
     run_id: &str,
+    packets: &[PacketRow],
 ) -> Result<Vec<OperationRow>, ProtoError> {
     let mut out = Vec::new();
-    for (step, round) in MACHINE_STEPS {
+    // Every post-review machine step is preceded by a semantic fix packet.
+    // Probe through one round above the greatest packet round so the window
+    // after a fix lands but before its re-review packet opens is recoverable.
+    let highest_semantic_round = packets
+        .iter()
+        .filter_map(|packet| stored_packet(packet).ok()?.execution)
+        .map(|execution| u32::from(execution.round))
+        .max()
+        .unwrap_or(0);
+    let highest_machine_round = highest_semantic_round.saturating_add(1).max(1);
+    let mut steps = vec![
+        (MachineStage::Resolve, 0),
+        (MachineStage::Gate, 0),
+        (MachineStage::Push, 0),
+        (MachineStage::DraftPr, 0),
+    ];
+    for round in 1..=highest_machine_round {
+        steps.push((MachineStage::ReGate, round));
+        steps.push((MachineStage::Push, round));
+    }
+    for (step, round) in steps {
         let key = machine_idempotency_key(run_id, step, round);
         if let Some(row) = ledger.find_operation(step.as_str(), &key)? {
             if row.state == OperationState::Terminal {
@@ -272,6 +339,7 @@ fn reconstruct_terminal_attempts(
             "completed" => AttemptState::Completed,
             "failed" => AttemptState::Failed,
             "reclaimed" => AttemptState::Reclaimed,
+            "stopped" => AttemptState::Stopped,
             // Live transitions are not terminal history.
             _ => continue,
         };
