@@ -1147,16 +1147,58 @@ pub fn assert_no_overlap_after_kills(log: &[String], packet_id: &str, killed_pid
     }
 }
 
+// ------------------------------------------------------ inventory fixtures
+
+/// Create a bare run row — what `run_start` writes for a slice.
+pub fn fabricate_run(env: &TestEnv, run_id: &str) {
+    let ledger = env.ledger();
+    ledger
+        .create_run(forged_ledger::NewRun {
+            run_id: forged_types::RunId::new(run_id).expect("run id"),
+            bead_id: format!("bead-{run_id}"),
+            repo: env.repos.repo.to_string_lossy().into_owned(),
+            base_ref: env.repos.base.clone(),
+            branch: format!("forged/{run_id}"),
+        })
+        .expect("create run");
+    ledger.close().expect("close");
+}
+
+/// Start an epic the way `epic_start` does: ONE `forged.epic.started` event
+/// under the epic bead id and NO run row — the combination production
+/// actually produces. A fixture that also created a run row would prove
+/// nothing about epic discovery.
+pub fn fabricate_epic(env: &TestEnv, epic_id: &str) {
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(epic_id),
+            "forged.epic.started",
+            json!({
+                "schema": "forged.epic/1",
+                "epicId": epic_id,
+                "title": format!("Epic {epic_id}"),
+                "repo": env.repos.repo.to_string_lossy(),
+                "specPath": env.spec.to_string_lossy(),
+                "baseRef": env.repos.base,
+                "integrationBranch": format!("forged/epic-{epic_id}"),
+                "children": [],
+            }),
+        )
+        .expect("epic started event");
+    ledger.close().expect("close");
+}
+
 // ------------------------------------------------------- App render harness
 
-/// The App's Cost tab as an operator reads it: every rendered node that
-/// carries text, in document order, plus those texts joined by newlines.
-pub struct RenderedCost {
+/// One App view as an operator reads it: every rendered node that carries
+/// text, in document order, plus those texts joined by newlines.
+pub struct Rendered {
     pub nodes: Vec<Value>,
     pub text: String,
 }
 
-impl RenderedCost {
+impl Rendered {
     /// The spend header's cost subtitle — the line that either splits billed
     /// from imputed spend or claims the provider billed all of it.
     pub fn spend_subtitle(&self) -> String {
@@ -1187,13 +1229,13 @@ impl RenderedCost {
     }
 }
 
-/// Resolve a `node` able to run the render harness, or SKIP loudly.
+/// Resolve a `node` able to run the render harnesses, or SKIP loudly.
 ///
-/// The Cost tab lives in `assets/overview.html`, which ships no JS
-/// toolchain and no module boundary; the harness lifts `viewCost` out of it
-/// and runs it against a DOM shim. Without a node on PATH the App's own
-/// render cannot be exercised, so the test says so rather than passing on a
-/// re-implementation of the same arithmetic.
+/// The App lives in `assets/overview.html`, which ships no JS toolchain and
+/// no module boundary; a harness lifts one view function out of it and runs
+/// it against a DOM shim. Without a node on PATH the App's own render cannot
+/// be exercised, so the test says so rather than passing on a
+/// re-implementation of what the asset does.
 pub fn require_node() -> Option<String> {
     let ok = Command::new("node")
         .arg("--version")
@@ -1209,8 +1251,99 @@ pub fn require_node() -> Option<String> {
 }
 
 /// Render `data`'s Cost tab through `assets/overview.html` itself.
-pub fn render_cost(node: &str, data: &Value) -> RenderedCost {
-    let harness = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/render_cost.mjs");
+pub fn render_cost(node: &str, data: &Value) -> Rendered {
+    render(
+        node,
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/support/render_cost.mjs"),
+        data,
+    )
+}
+
+/// What one envelope produced after the App's own `ingest` and `render`.
+///
+/// [`Rendered`] reports a single view called directly. This reports the
+/// DISPATCH: which branch of `render` an envelope reached, and the identity,
+/// chips, chrome and `state.args` it left behind on the way.
+pub struct Dispatched {
+    pub view: Vec<Value>,
+    pub text: String,
+    pub ident: String,
+    pub chips: Vec<String>,
+    pub tabs_hidden: bool,
+    pub controls_hidden: bool,
+    pub args: Value,
+    pub error: Value,
+}
+
+impl Dispatched {
+    /// What clicking each pickable card would ask the host for.
+    pub fn picks(&self) -> Vec<Value> {
+        self.view
+            .iter()
+            .filter_map(|node| node.get("picks").cloned())
+            .filter(|picks| !picks.is_null())
+            .collect()
+    }
+}
+
+/// Drive one whole operation envelope through `ingest` and `render`.
+///
+/// `render_resolution` calls `viewResolution` directly, so it proves the
+/// chooser draws and proves nothing about whether a resolution payload ever
+/// reaches it — delete `render`'s `if (data.resolution)` branch and those
+/// tests stay green. This enters where the host enters.
+pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+    );
+    Dispatched {
+        view: out["view"].as_array().cloned().unwrap_or_default(),
+        text: out["text"].as_str().unwrap_or_default().to_owned(),
+        ident: out["ident"].as_str().unwrap_or_default().to_owned(),
+        chips: out["chips"]
+            .as_array()
+            .map(|chips| {
+                chips
+                    .iter()
+                    .map(|chip| chip.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tabs_hidden: out["tabsHidden"].as_bool().unwrap_or(false),
+        controls_hidden: out["controlsHidden"].as_bool().unwrap_or(false),
+        args: out["args"].clone(),
+        error: out["error"].clone(),
+    }
+}
+
+/// Render one `resolution` object's chooser through `assets/overview.html`
+/// itself.
+pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
+    render(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_resolution.mjs"
+        ),
+        resolution,
+    )
+}
+
+fn render(node: &str, harness: &str, data: &Value) -> Rendered {
+    let rendered = harness_output(node, harness, data);
+    Rendered {
+        nodes: rendered["nodes"].as_array().cloned().unwrap_or_default(),
+        text: rendered["text"].as_str().unwrap_or_default().to_owned(),
+    }
+}
+
+/// Run one render harness against the asset and return the JSON it printed.
+fn harness_output(node: &str, harness: &str, data: &Value) -> Value {
     let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/overview.html");
     let mut child = Command::new(node)
         .args([harness, asset])
@@ -1231,12 +1364,7 @@ pub fn render_cost(node: &str, data: &Value) -> RenderedCost {
         "the App render harness failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let rendered: Value =
-        serde_json::from_slice(&out.stdout).expect("the harness prints one JSON object");
-    RenderedCost {
-        nodes: rendered["nodes"].as_array().cloned().unwrap_or_default(),
-        text: rendered["text"].as_str().unwrap_or_default().to_owned(),
-    }
+    serde_json::from_slice(&out.stdout).expect("the harness prints one JSON object")
 }
 
 // ------------------------------------------------------------- MCP client

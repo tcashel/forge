@@ -105,21 +105,20 @@ pub struct OverviewArgs {
     pub params: OverviewParams,
 }
 
-/// `overview` parameters. Exactly one of `run` or `epic` is required; the
-/// other two page the event tail.
+/// `overview` parameters. Exactly one of `run`, `epic`, or `id` is required;
+/// `after` and `limit` page the event tail.
 ///
 /// Typing these MOVED one boundary, deliberately. A wrong-TYPED `after` or
-/// `limit` (`"5"`, `1.5`, a negative `limit`) is refused as
-/// `invalid_params` before dispatch and reaches the host as an `isError`
-/// result carrying a deserialization message, NOT an operation envelope;
-/// the free-form map used to drop it silently and answer with a default
-/// page. That is the intended surface — a host is told its call was
-/// malformed instead of being handed a projection of something it did not
-/// ask for, and the CLI's own parser has always refused a non-integer
-/// `--after` the same way. A value of the right type but the wrong RANGE
-/// (`after: -1`, `limit: 0`, `limit: 1001`) still reaches the core and
-/// comes back as an ordinary `InvalidRequest` envelope, so domain questions
-/// keep their domain answers.
+/// `limit` (`"5"`, `1.5`, a negative `limit`) is refused as `invalid_params`
+/// before dispatch and reaches the host as an `isError` result carrying a
+/// deserialization message, NOT an operation envelope; the free-form map used
+/// to drop it silently and answer with a default page. That is the intended
+/// surface — a host is told its call was malformed instead of being handed a
+/// projection of something it did not ask for, and the CLI's own parser has
+/// always refused a non-integer `--after` the same way. A value of the right
+/// type but the wrong RANGE (`after: -1`, `limit: 0`, `limit: 1001`) still
+/// reaches the core and comes back as an ordinary `InvalidRequest` envelope,
+/// so domain questions keep their domain answers.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 pub struct OverviewParams {
@@ -129,6 +128,10 @@ pub struct OverviewParams {
     /// Project one epic and its child runs, by epic run id.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub epic: Option<String>,
+    /// Project whichever of the two this id names, without saying which;
+    /// an id that resolves to no single subject returns candidates.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub id: Option<String>,
     /// Return only event rows with an eventId greater than this
     /// (default 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -308,8 +311,9 @@ impl ForgedServer {
     #[tool(
         name = "overview",
         description = "Project one slice or epic with workers, evidence, usage, and events. \
-                       Exactly one of params.run or params.epic is required; use work_list to \
-                       discover ids.",
+                       Exactly one of params.run, params.epic, or params.id is required; \
+                       params.id resolves either kind and answers with candidates when it \
+                       cannot; use work_list to enumerate every id.",
         meta = overview_tool_meta()
     )]
     pub async fn overview(&self, args: Parameters<OverviewArgs>) -> CallToolResult {

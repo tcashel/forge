@@ -108,6 +108,7 @@ where the ids every other command needs come from.
 forged work list
 forged overview --run <run-id>
 forged overview --epic <epic-id>
+forged overview --id <id>          # kind-blind: resolves either, or lists candidates
 forged session list --run <run-id>
 forged events --run <id> --limit 200
 ```

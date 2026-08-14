@@ -1,4 +1,4 @@
-//! Renderer-level tests for the App's Cost tab.
+//! Renderer-level tests for the App's Cost tab and candidate chooser.
 //!
 //! The spend header is the one place the projection can lie to an operator:
 //! an epic whose codex seats were priced from the operator's rate card must
@@ -10,7 +10,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{render_cost, require_node};
+use support::{render_cost, render_dispatch, render_resolution, require_node};
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
 fn row(run_id: &str, seat: &str, basis: &str, cost: f64, searches: u64) -> Value {
@@ -137,5 +137,168 @@ fn an_epic_with_no_usage_renders_the_empty_state() {
             .contains("No usage recorded on any child run."),
         "an epic with no rows says so: {}",
         rendered.text
+    );
+}
+
+// ------------------------------------------------------------ resolution
+
+/// An unresolvable id degrades into a menu: the guard at `ingest` still
+/// rejects an unknown schema, so a `resolution` payload stays on
+/// `forged.overview/1` and the view has to draw it rather than fall through
+/// to "a payload this view does not know how to draw".
+#[test]
+fn an_ambiguous_id_renders_every_candidate_with_its_kind_and_state() {
+    let Some(node) = require_node() else { return };
+    let rendered = render_resolution(
+        &node,
+        &json!({
+            "query": "beads-mk2",
+            "reason": "ambiguous",
+            "candidates": [
+                {"id": "beads-mk2.1", "kind": "slice", "state": "active", "beadId": "beads-mk2.1"},
+                {"id": "beads-mk2.2", "kind": "epic", "state": "stopped", "beadId": "beads-mk2.2"},
+            ],
+        }),
+    );
+    for expected in [
+        "beads-mk2.1",
+        "beads-mk2.2",
+        "slice",
+        "epic",
+        "active",
+        "stopped",
+    ] {
+        assert!(
+            rendered.text.contains(expected),
+            "the chooser names {expected}: {}",
+            rendered.text
+        );
+    }
+    // Picking a candidate re-asks with the explicit param its kind implies —
+    // never with the id that failed to resolve.
+    let picks: Vec<Value> = rendered
+        .nodes
+        .iter()
+        .filter_map(|n| n.get("picks").cloned())
+        .collect();
+    assert_eq!(
+        picks.len(),
+        2,
+        "every candidate is pickable: {}",
+        rendered.text
+    );
+    assert_eq!(picks[0]["params"], json!({"run": "beads-mk2.1"}));
+    assert_eq!(picks[1]["params"], json!({"epic": "beads-mk2.2"}));
+}
+
+/// "Nothing could have been meant" is an answer, and the chooser says so
+/// instead of rendering an empty grid.
+#[test]
+fn an_unknown_id_renders_an_empty_state_rather_than_an_empty_grid() {
+    let Some(node) = require_node() else { return };
+    let rendered = render_resolution(
+        &node,
+        &json!({"query": "nothing", "reason": "unknown", "candidates": []}),
+    );
+    assert!(
+        rendered.text.contains("Nothing in the ledger matches"),
+        "an unknown id says so: {}",
+        rendered.text
+    );
+}
+
+// --------------------------------------------------- dispatch, not just view
+
+/// The chooser tests above call `viewResolution` directly, so they would all
+/// still pass if `render` stopped routing a resolution payload to it. This
+/// enters where the host enters — one envelope into `ingest` — and asserts
+/// the branch was actually taken.
+#[test]
+fn a_resolution_envelope_reaches_the_chooser_through_ingest_and_render() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({
+            "ok": true,
+            "result": {
+                "schema": "forged.overview/1",
+                "resolution": {
+                    "query": "beads-mk",
+                    "reason": "ambiguous",
+                    "candidates": [
+                        {"id": "beads-mk2", "kind": "slice", "state": "active", "beadId": "beads-mk2"},
+                        {"id": "beads-mk9", "kind": "epic", "state": "stopped", "beadId": "beads-mk9"},
+                    ],
+                },
+            },
+        }),
+    );
+    assert!(
+        dispatched.error.is_null(),
+        "a resolution is not an error: {}",
+        dispatched.error
+    );
+    assert_eq!(
+        dispatched.ident, "beads-mk",
+        "the identity line carries the id that failed to resolve: {}",
+        dispatched.text
+    );
+    assert_eq!(dispatched.chips, vec!["ambiguous".to_owned()]);
+    assert!(
+        dispatched.tabs_hidden,
+        "a resolution has no single subject, so it draws no tabs: {}",
+        dispatched.text
+    );
+    assert_eq!(
+        dispatched.picks(),
+        vec![
+            json!({"schemaVersion": 1, "params": {"run": "beads-mk2"}}),
+            json!({"schemaVersion": 1, "params": {"epic": "beads-mk9"}}),
+        ],
+        "each candidate re-asks with the explicit param its kind implies: {}",
+        dispatched.text
+    );
+}
+
+/// Refresh is offered on a resolution view, so it must have something to
+/// send. `state.args` falls back to the query itself: re-asking the same
+/// question is meaningful, because candidates are live work and one that was
+/// ambiguous a minute ago can resolve on its own.
+#[test]
+fn a_resolution_leaves_refresh_able_to_re_ask_the_same_question() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({
+            "schema": "forged.overview/1",
+            "resolution": {"query": "beads-mk", "reason": "ambiguous", "candidates": []},
+        }),
+    );
+    assert!(
+        !dispatched.controls_hidden,
+        "the resolution view offers Refresh: {}",
+        dispatched.text
+    );
+    assert_eq!(
+        dispatched.args,
+        json!({"schemaVersion": 1, "params": {"id": "beads-mk"}}),
+        "so Refresh re-asks the same id rather than sending nothing"
+    );
+}
+
+/// The schema guard is what makes the resolution contract meaningful: a
+/// payload on any other schema is still an error, not a chooser.
+#[test]
+fn an_unknown_schema_is_still_refused_by_ingest() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"schema": "forged.resolution/1", "resolution": {"query": "x", "candidates": []}}),
+    );
+    assert_eq!(
+        dispatched.error["code"],
+        json!("unexpected"),
+        "an unknown schema is refused: {}",
+        dispatched.error
     );
 }

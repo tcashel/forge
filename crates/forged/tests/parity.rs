@@ -90,6 +90,7 @@ fn all_thirty_tools_match_their_cli_counterparts() {
     for (param, ty) in [
         ("run", "string"),
         ("epic", "string"),
+        ("id", "string"),
         ("after", "integer"),
         ("limit", "integer"),
     ] {
@@ -104,7 +105,7 @@ fn all_thirty_tools_match_their_cli_counterparts() {
     }
     let description = overview_tool["description"].as_str().unwrap_or_default();
     assert!(
-        description.contains("Exactly one of params.run or params.epic is required"),
+        description.contains("Exactly one of params.run, params.epic, or params.id is required"),
         "overview must state its one-of rule: {description}"
     );
     let work_list = mcp.tool("work_list");
