@@ -30,7 +30,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 7);
+        assert_eq!(handle.join().expect("thread"), 9);
     }
 }
 
@@ -376,10 +376,22 @@ fn enums_round_trip_their_ddl_strings() {
         (AttemptState::Failed, "failed"),
         (AttemptState::Revoking, "revoking"),
         (AttemptState::Reclaimed, "reclaimed"),
+        (AttemptState::Stopped, "stopped"),
     ] {
         assert_eq!(state.as_str(), s);
         assert_eq!(AttemptState::try_from(s).expect("parse"), state);
     }
+    for (scope, s) in [
+        (forged_ledger::RevokeScope::Bead, "bead"),
+        (forged_ledger::RevokeScope::Attempt, "attempt"),
+    ] {
+        assert_eq!(scope.as_str(), s);
+        assert_eq!(
+            forged_ledger::RevokeScope::try_from(s).expect("parse"),
+            scope
+        );
+    }
+    assert!(forged_ledger::RevokeScope::try_from("run").is_err());
     for (class, s) in [
         (EffectClass::SafeRetry, "safe-retry"),
         (EffectClass::ObserveOnly, "observe-only"),

@@ -38,4 +38,6 @@ pub use ports::{
 pub use project::{
     packet_columns, packet_spec, project_run, project_run_with_policy, stored_packet,
 };
-pub use reconcile::{land_packet_result, reconcile, LandOutcome, ReconcileConfig, ReconcileReport};
+pub use reconcile::{
+    land_packet_result, reconcile, stop_attempt, LandOutcome, ReconcileConfig, ReconcileReport,
+};

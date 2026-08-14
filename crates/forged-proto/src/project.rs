@@ -272,6 +272,7 @@ fn reconstruct_terminal_attempts(
             "completed" => AttemptState::Completed,
             "failed" => AttemptState::Failed,
             "reclaimed" => AttemptState::Reclaimed,
+            "stopped" => AttemptState::Stopped,
             // Live transitions are not terminal history.
             _ => continue,
         };

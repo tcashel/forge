@@ -8,6 +8,18 @@
 //! surfaces as [`ProtoError::Port`] with the attempt left `revoking`, and
 //! the next invocation resumes from that durable marker.
 //!
+//! [`stop_attempt`] is the attempt-local sibling of that order, and a
+//! SEPARATE function on purpose: it ends at `stopped` after the same
+//! confirmed death and reclaims nothing, because the bd lease is bead-scoped
+//! and shared with every sibling generation. One function serving both
+//! scopes is what let an attempt-local stop reach for a bead-scoped lease.
+//!
+//! Which of the two resumes a durable `revoking` marker is read from the
+//! marker itself: [`AttemptRow::revoke_scope`] committed with it. A stop
+//! whose `kill_confirmed` failed leaves an attempt-scoped marker, and this
+//! pass finishes it AS A STOP — resuming it through the bead-scoped order
+//! would re-arm the exact defect the split removes.
+//!
 //! The ledger is synchronous by design; every ledger call here goes through
 //! `tokio::task::spawn_blocking`, and no transaction ever spans an
 //! `.await`.
@@ -15,7 +27,7 @@
 use std::collections::HashMap;
 
 use forged_ledger::{
-    AttemptRow, AttemptState, EffectClass, Ledger, LedgerError, OperationRow, RunRow,
+    AttemptRow, AttemptState, EffectClass, Ledger, LedgerError, OperationRow, RevokeScope, RunRow,
 };
 use forged_types::{ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, Stage};
 use serde_json::{json, Value};
@@ -63,6 +75,16 @@ pub struct ReconcileReport {
     /// Attempts that reached `reclaimed` (including convergence with a
     /// racing reconciler).
     pub reclaimed: Vec<i64>,
+    /// Attempts settled at `stopped` — an operator's attempt-local stop, no
+    /// lease touched.
+    ///
+    /// Unlike [`ReconcileReport::reclaimed`] this reports the run's ALREADY
+    /// terminal stops as well as the ones this pass drove there, because a
+    /// stop is an operator's own decision and a pass that silently omitted
+    /// it would read as "nothing to say about that attempt" when the honest
+    /// answer is "an operator stopped it, and I deliberately did not resume
+    /// the saga for it".
+    pub stopped: Vec<i64>,
     /// Operations released for redo: every `SafeRetry` row, plus any
     /// `ObserveOnly` row whose observation did not confirm its effect.
     pub released: Vec<String>,
@@ -210,10 +232,25 @@ pub async fn reconcile(
 
         match attempt.state {
             // A revoking row skips the liveness ladder entirely: the durable
-            // revocation decision has already been made. Resume at step 2.
-            AttemptState::Revoking => {
-                revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
-            }
+            // revocation decision has already been made. Resume at step 2 —
+            // of WHICHEVER order placed the marker, which is what the
+            // marker's scope records.
+            AttemptState::Revoking => match attempt.revoke_scope {
+                // An operator's stop that could not confirm death. Finishing
+                // it through the bead-scoped order instead would reclaim the
+                // shared lease on an attempt-local operation's behalf: the
+                // exact defect the split removes.
+                Some(RevokeScope::Attempt) => {
+                    let settled = stop_order(ledger, ports, &attempt).await?;
+                    note_terminal(settled, attempt.attempt_id, &mut report);
+                }
+                // `bead`, and `None` for every row written before the scope
+                // was durable — all of those are saga revocations, because
+                // the attempt-local stop did not exist when they were made.
+                Some(RevokeScope::Bead) | None => {
+                    revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
+                }
+            },
             AttemptState::Running => {
                 let liveness = ports
                     .liveness(&attempt.claimant)
@@ -254,11 +291,11 @@ pub async fn reconcile(
                         revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
                     }
                     Err(err) if err.code() == ErrorCode::InvalidRequest => {
+                        // A racing reconciler finished the saga, or a racing
+                        // operator stop finished the attempt; either way the
+                        // terminal row is the answer.
                         let current = get_attempt(ledger, attempt.attempt_id).await?;
-                        if current.state == AttemptState::Reclaimed {
-                            // A racing reconciler finished the saga.
-                            report.reclaimed.push(attempt.attempt_id);
-                        }
+                        note_terminal(current.state, attempt.attempt_id, &mut report);
                         // Completed/failed on its own: nothing live remains.
                     }
                     Err(err) => return Err(ProtoError::Ledger(err)),
@@ -268,6 +305,24 @@ pub async fn reconcile(
             _ => {}
         }
     }
+
+    // Attempts an operator already stopped are terminal, so the live loop
+    // above never sees them. Reporting them is the pass's answer to "what
+    // about that attempt?": stopped, by an operator, and deliberately not
+    // resumed.
+    let terminal_stops: Vec<AttemptRow> = {
+        let run_id = run_id.to_owned();
+        on_ledger(ledger, move |l| {
+            l.list_attempts_in_state(Some(&run_id), AttemptState::Stopped)
+                .map_err(ProtoError::Ledger)
+        })
+        .await?
+    };
+    report
+        .stopped
+        .extend(terminal_stops.iter().map(|a| a.attempt_id));
+    report.stopped.sort_unstable();
+    report.stopped.dedup();
 
     let events = {
         let run_id = run_id.to_owned();
@@ -279,6 +334,26 @@ pub async fn reconcile(
     harvest_and_verify(ports, run_id, config, &proto_events, &mut report).await?;
 
     Ok(report)
+}
+
+/// Record an attempt whose terminal state some other actor drove it to.
+/// `reclaimed` and `stopped` are BOTH convergence — the saga and an operator
+/// stop can race, and each must read the other's terminal row as the answer
+/// rather than an error. Returns whether the state was one of them;
+/// `completed`/`failed` mean the attempt settled itself and there is nothing
+/// to report.
+fn note_terminal(state: AttemptState, attempt_id: i64, report: &mut ReconcileReport) -> bool {
+    match state {
+        AttemptState::Reclaimed => {
+            report.reclaimed.push(attempt_id);
+            true
+        }
+        AttemptState::Stopped => {
+            report.stopped.push(attempt_id);
+            true
+        }
+        _ => false,
+    }
 }
 
 async fn get_attempt(ledger: &Ledger, attempt_id: i64) -> Result<AttemptRow, ProtoError> {
@@ -306,6 +381,18 @@ async fn revoke_order(
         .await
         .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
 
+    // Between the marker and here an operator's stop may have settled this
+    // row. Re-read before the external reclaim: this fires a BEAD-scoped
+    // effect, and firing it for an attempt no longer under this order's
+    // marker is the scope mismatch the split exists to remove. No step is
+    // added or reordered — the order simply declines to continue one it no
+    // longer owns.
+    let current = get_attempt(ledger, attempt_id).await?;
+    if current.state != AttemptState::Revoking {
+        note_terminal(current.state, attempt_id, report);
+        return Ok(());
+    }
+
     // Step 3: scoped external reclaim, holder = claimant verbatim.
     let older_than_s = reclaim_older_than(stage_budget_s);
     let outcome = ports
@@ -328,12 +415,11 @@ async fn revoke_order(
         };
     if !scoped_to_holder {
         // A refusal shape (unscoped, or another owner) is not an error. A
-        // racing reconciler may already have finished the saga; otherwise
-        // leave the durable `revoking` marker for the next pass.
+        // racing reconciler may already have finished the saga, or a racing
+        // operator stop the attempt; otherwise leave the durable `revoking`
+        // marker for the next pass.
         let current = get_attempt(ledger, attempt_id).await?;
-        if current.state == AttemptState::Reclaimed {
-            report.reclaimed.push(attempt_id);
-        } else {
+        if !note_terminal(current.state, attempt_id, report) {
             report.deferred.push(attempt_id);
         }
         return Ok(());
@@ -345,12 +431,11 @@ async fn revoke_order(
     match marked {
         Ok(()) => report.reclaimed.push(attempt_id),
         Err(err) if err.code() == ErrorCode::InvalidRequest => {
+            // Terminal-state idempotence: the loser's mark on an
+            // already-terminal row is convergence, and the winner may have
+            // been an operator's stop rather than another reconciler.
             let current = get_attempt(ledger, attempt_id).await?;
-            if current.state == AttemptState::Reclaimed {
-                // Terminal-state idempotence: the loser's mark on an
-                // already-reclaimed row is convergence.
-                report.reclaimed.push(attempt_id);
-            } else {
+            if !note_terminal(current.state, attempt_id, report) {
                 return Err(ProtoError::Ledger(err));
             }
         }
@@ -359,6 +444,81 @@ async fn revoke_order(
 
     // Step 5: only now may a successor claim — the caller's business.
     Ok(())
+}
+
+/// End ONE attempt at `stopped`: confirmed death, then the attempt-local
+/// terminal transition. Entered only after the durable `revoking` marker is
+/// committed, exactly as [`revoke_order`] is.
+///
+/// **This deliberately reclaims no lease.** `run_holder` is bead-scoped —
+/// every generation of the run derives the identical string — so an
+/// attempt-local operation has no standing to take it, and a "no live
+/// sibling right now" check cannot be made safe against a sibling claimed
+/// one instruction later. Leaving the lease where it is costs nothing: a
+/// successor attempt on the same packet reuses it under the same holder,
+/// which is why the stop settles with no waiting period at all.
+///
+/// Confirmed death is still the whole fence, and still gates the transition:
+/// a `kill_confirmed` that cannot VERIFY death surfaces as
+/// [`ProtoError::Port`] with the attempt left `revoking`, where the next
+/// pass resumes from the durable marker — as a STOP, because the marker
+/// carries [`RevokeScope::Attempt`]. An attempt not under that marker is
+/// refused by the ledger BEFORE anything is killed.
+pub async fn stop_attempt(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    attempt_id: i64,
+) -> Result<AttemptState, ProtoError> {
+    let attempt = get_attempt(ledger, attempt_id).await?;
+    stop_order(ledger, ports, &attempt).await
+}
+
+/// The stop order over an attempt row already read — the form reconcile
+/// resumes an attempt-scoped marker through, without re-reading it.
+async fn stop_order(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    attempt: &AttemptRow,
+) -> Result<AttemptState, ProtoError> {
+    let attempt_id = attempt.attempt_id;
+    if attempt.state != AttemptState::Revoking {
+        // Not under the durable marker: the ledger's own transition speaks
+        // the refusal (or converges on a terminal row), and nothing is
+        // killed.
+        return mark_stopped(ledger, attempt_id).await;
+    }
+
+    // Step 2 of the revoke order, unchanged: verified death, never
+    // signal-send.
+    ports
+        .kill_confirmed(&attempt.claimant)
+        .await
+        .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
+
+    mark_stopped(ledger, attempt_id).await
+}
+
+/// `revoking → stopped`, converging on whichever terminal row won.
+///
+/// Returns the state the attempt actually settled in: `stopped` on this
+/// caller's own transition, and the winner's state when a racing reconciler
+/// or stop got there first. `reclaimed` is convergence too — the saga and a
+/// stop can race, and a terminal row that already says "kill-confirmed and
+/// settled" is an answer, not an error.
+async fn mark_stopped(ledger: &Ledger, attempt_id: i64) -> Result<AttemptState, ProtoError> {
+    let marked: Result<(), LedgerError> =
+        on_ledger(ledger, move |l| Ok(l.mark_stopped(attempt_id))).await?;
+    match marked {
+        Ok(()) => Ok(AttemptState::Stopped),
+        Err(err) if err.code() == ErrorCode::InvalidRequest => {
+            let current = get_attempt(ledger, attempt_id).await?;
+            match current.state {
+                AttemptState::Stopped | AttemptState::Reclaimed => Ok(current.state),
+                _ => Err(ProtoError::Ledger(err)),
+            }
+        }
+        Err(err) => Err(ProtoError::Ledger(err)),
+    }
 }
 
 /// Settle every interrupted operation by its effect class.

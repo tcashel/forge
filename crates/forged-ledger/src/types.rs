@@ -58,6 +58,55 @@ pub enum AttemptState {
     Revoking,
     /// Kill-confirmed and externally reclaimed; a successor may claim.
     Reclaimed,
+    /// Kill-confirmed and settled by an operator's attempt-local stop. The
+    /// bead's bd lease is deliberately untouched — it is bead-scoped and
+    /// shared with every sibling generation — so a successor claims under
+    /// the same `run_holder` with no waiting period.
+    Stopped,
+}
+
+/// Which scope a `revoking` marker was committed under — the durable record
+/// of WHOSE revocation this is, and therefore which terminal exit resumes it.
+///
+/// `revoking` alone cannot say: a bead-scoped saga revocation and an
+/// attempt-local operator stop write the identical state, so a stop whose
+/// `kill_confirmed` failed would otherwise be indistinguishable from a dead
+/// worker and get resumed through the bead-scoped reclaim it exists to
+/// avoid. Written once, when the marker commits, and never changed.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RevokeScope {
+    /// The reclaim saga: a dead or hung worker, whose bd lease the run wants
+    /// back. Resumes through the full revoke order and ends at
+    /// [`AttemptState::Reclaimed`].
+    Bead,
+    /// An operator's stop of ONE attempt. Resumes through confirmed death
+    /// alone and ends at [`AttemptState::Stopped`], touching no lease.
+    Attempt,
+}
+
+impl RevokeScope {
+    /// The DDL string, the only spelling stored.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            RevokeScope::Bead => "bead",
+            RevokeScope::Attempt => "attempt",
+        }
+    }
+}
+
+impl TryFrom<&str> for RevokeScope {
+    type Error = LedgerError;
+
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match s {
+            "bead" => Ok(RevokeScope::Bead),
+            "attempt" => Ok(RevokeScope::Attempt),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown revoke scope: {other:?}"),
+            )),
+        }
+    }
 }
 
 impl AttemptState {
@@ -69,6 +118,7 @@ impl AttemptState {
             AttemptState::Failed => "failed",
             AttemptState::Revoking => "revoking",
             AttemptState::Reclaimed => "reclaimed",
+            AttemptState::Stopped => "stopped",
         }
     }
 }
@@ -83,6 +133,7 @@ impl TryFrom<&str> for AttemptState {
             "failed" => Ok(AttemptState::Failed),
             "revoking" => Ok(AttemptState::Revoking),
             "reclaimed" => Ok(AttemptState::Reclaimed),
+            "stopped" => Ok(AttemptState::Stopped),
             other => Err(refused(
                 ErrorCode::InvalidRequest,
                 format!("unknown attempt state: {other:?}"),
@@ -294,6 +345,12 @@ pub struct AttemptRow {
     pub state: AttemptState,
     /// `attempts.revoke_reason`.
     pub revoke_reason: Option<String>,
+    /// `attempts.revoke_scope` — `None` until a `revoking` marker commits,
+    /// and on every row written before the column existed. A reader that
+    /// must route on it treats `None` as [`RevokeScope::Bead`]: the
+    /// attempt-local stop did not exist when those rows were written, so
+    /// every one of them is a saga revocation.
+    pub revoke_scope: Option<RevokeScope>,
     /// `attempts.fail_note` — the note supplied to `fail_packet`.
     pub fail_note: Option<String>,
     /// `attempts.result_json` — serialized `PacketResult` on completion.

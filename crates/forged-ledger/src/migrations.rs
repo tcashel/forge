@@ -196,6 +196,56 @@ const MIGRATION_007: &str = "
 ALTER TABLE packets ADD COLUMN spec_revision TEXT;
 ";
 
+/// Migration 008: `stopped`, the attempt-local terminal exit from
+/// `revoking`.
+///
+/// A CHECK constraint cannot be widened in place, so the table is rebuilt by
+/// SQLite's documented procedure. No other table references `attempts`, so
+/// the drop-and-rename carries no foreign key with it; the partial unique
+/// index is recreated with its predicate UNCHANGED — `stopped` is terminal
+/// and deliberately not live.
+const MIGRATION_008: &str = "
+CREATE TABLE attempts_008 (
+  attempt_id        INTEGER PRIMARY KEY AUTOINCREMENT,
+  packet_id         TEXT NOT NULL REFERENCES packets(packet_id),
+  claim_token       TEXT NOT NULL UNIQUE,
+  claimant          TEXT NOT NULL,
+  state             TEXT NOT NULL CHECK (state IN
+                    ('running','completed','failed','revoking','reclaimed',
+                     'stopped')),
+  revoke_reason     TEXT,
+  fail_note         TEXT,
+  result_json       TEXT,
+  started_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL,
+  last_heartbeat_at TEXT,
+  ended_at          TEXT
+);
+INSERT INTO attempts_008 (attempt_id, packet_id, claim_token, claimant, state,
+                          revoke_reason, fail_note, result_json, started_at,
+                          updated_at, last_heartbeat_at, ended_at)
+  SELECT attempt_id, packet_id, claim_token, claimant, state,
+         revoke_reason, fail_note, result_json, started_at,
+         updated_at, last_heartbeat_at, ended_at
+  FROM attempts;
+DROP TABLE attempts;
+ALTER TABLE attempts_008 RENAME TO attempts;
+CREATE UNIQUE INDEX one_live_attempt_per_packet
+  ON attempts(packet_id) WHERE state IN ('running','revoking');
+";
+
+/// Migration 009: `revoke_scope`, the durable record of WHOSE revocation a
+/// `revoking` marker is.
+///
+/// A plain ADD COLUMN, deliberately: the CHECK belongs to the decoder, which
+/// fails closed on an unrecognized string exactly as `attempts.state` does,
+/// and a second table rebuild would be a second chance to lose rows. Every
+/// pre-009 row reads NULL, which routes as `bead` — the attempt-local stop
+/// did not exist when those rows were written.
+const MIGRATION_009: &str = "
+ALTER TABLE attempts ADD COLUMN revoke_scope TEXT;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -205,6 +255,8 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_005,
     MIGRATION_006,
     MIGRATION_007,
+    MIGRATION_008,
+    MIGRATION_009,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -324,7 +376,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 7);
+        assert_eq!(pragmas.user_version, 9);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -371,7 +423,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 7);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
         ledger.close().expect("close");
     }
 
@@ -392,7 +444,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 7);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
         assert_eq!(
             ledger.get_run("old-run").expect("old run").bead_id,
             "old-bead"
@@ -401,6 +453,120 @@ mod tests {
             .get_run_definition("old-run")
             .expect("legacy definition query")
             .is_none());
+    }
+
+    /// Migration 008 rebuilds `attempts` to widen a CHECK constraint. A
+    /// rebuild is the one migration shape that can lose rows, drop an index,
+    /// or reset an AUTOINCREMENT sequence, so a populated pre-008 database
+    /// is the only honest test of it.
+    #[test]
+    fn the_attempts_rebuild_keeps_rows_index_and_sequence() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            conn.execute_batch(MIGRATION_001).expect("v0 schema");
+            conn.execute_batch(
+                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, created_at, \
+                    updated_at) \
+                 VALUES ('old-run', 'old-bead', '/repo', 'main', 'forged/old', 't', 't');
+                 INSERT INTO packets (packet_id, run_id, stage, seq, spec_path, spec_sha256, \
+                    body_json, created_at) \
+                 VALUES ('old-run/implement/1', 'old-run', 'implement', 1, 's.md', 'cafe', \
+                    '{}', 't');
+                 INSERT INTO attempts (packet_id, claim_token, claimant, state, revoke_reason, \
+                    started_at, updated_at, ended_at) \
+                 VALUES ('old-run/implement/1', 'tok-1', 'claude:old:1', 'reclaimed', 'stalled', \
+                    't', 't', 't');
+                 INSERT INTO attempts (packet_id, claim_token, claimant, state, started_at, \
+                    updated_at) \
+                 VALUES ('old-run/implement/1', 'tok-2', 'claude:old:2', 'running', 't', 't');
+                 PRAGMA user_version=1;",
+            )
+            .expect("seed a pre-008 database");
+        }
+
+        let ledger = Ledger::open(&path).expect("migrate");
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 9);
+        let first = ledger.get_attempt(1).expect("attempt 1 survived");
+        assert_eq!(first.claim_token, "tok-1");
+        assert_eq!(first.state, crate::AttemptState::Reclaimed);
+        assert_eq!(first.revoke_reason.as_deref(), Some("stalled"));
+        let live = ledger.list_live_attempts(Some("old-run")).expect("live");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].claim_token, "tok-2");
+        ledger.close().expect("close");
+
+        let conn = rusqlite::Connection::open(&path).expect("open raw");
+        // The partial unique index is recreated with its predicate intact:
+        // `stopped` is terminal and deliberately NOT live.
+        let predicate: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                ["one_live_attempt_per_packet"],
+                |row| row.get(0),
+            )
+            .expect("partial index survived the rebuild");
+        assert!(
+            predicate.contains("'running','revoking'") && !predicate.contains("stopped"),
+            "unexpected index predicate: {predicate}"
+        );
+        // AUTOINCREMENT never hands back an id the rebuild copied over.
+        let next: i64 = conn
+            .query_row(
+                "SELECT seq FROM sqlite_sequence WHERE name = 'attempts'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("sequence survived the rename");
+        assert_eq!(next, 2);
+        // The widened CHECK admits `stopped` and nothing beyond the six.
+        conn.execute(
+            "UPDATE attempts SET state = 'stopped' WHERE attempt_id = 2",
+            [],
+        )
+        .expect("stopped is a legal state after 008");
+        conn.execute(
+            "UPDATE attempts SET state = 'zombie' WHERE attempt_id = 2",
+            [],
+        )
+        .expect_err("the CHECK still fails closed");
+    }
+
+    /// Migration 009 adds `revoke_scope` to rows that already exist. Every
+    /// one of them reads `None`, which routes as the reclaim saga — the only
+    /// revocation there was when they were written.
+    #[test]
+    fn a_pre_009_revoking_row_carries_no_scope() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        {
+            let conn = rusqlite::Connection::open(&path).expect("raw database");
+            conn.execute_batch(MIGRATION_001).expect("v0 schema");
+            conn.execute_batch(
+                "INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, created_at, \
+                    updated_at) \
+                 VALUES ('old-run', 'old-bead', '/repo', 'main', 'forged/old', 't', 't');
+                 INSERT INTO packets (packet_id, run_id, stage, seq, spec_path, spec_sha256, \
+                    body_json, created_at) \
+                 VALUES ('old-run/implement/1', 'old-run', 'implement', 1, 's.md', 'cafe', \
+                    '{}', 't');
+                 INSERT INTO attempts (packet_id, claim_token, claimant, state, revoke_reason, \
+                    started_at, updated_at) \
+                 VALUES ('old-run/implement/1', 'tok-1', 'claude:old:1', 'revoking', 'vanished', \
+                    't', 't');
+                 PRAGMA user_version=1;",
+            )
+            .expect("seed a pre-009 database");
+        }
+
+        let ledger = Ledger::open(&path).expect("migrate");
+        let row = ledger.get_attempt(1).expect("the revoking row survived");
+        assert_eq!(row.state, crate::AttemptState::Revoking);
+        assert_eq!(row.revoke_scope, None);
+        // And a scope written now round-trips, so the column is real.
+        ledger.mark_reclaimed(1).expect("finish the saga");
+        ledger.close().expect("close");
     }
 
     #[test]

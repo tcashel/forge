@@ -82,6 +82,26 @@ fn live_implement_attempt_awaits_that_attempt() {
     );
 }
 
+/// The whole point of the attempt-local stop, at the layer that decides it:
+/// a stopped attempt reopens its packet for a successor with NO deadline, so
+/// the next `claim_next` takes it immediately rather than after a lease
+/// ages out.
+#[test]
+fn a_stopped_attempt_reopens_its_packet_with_no_waiting_period() {
+    let view = ViewBuilder::new(RUN)
+        .op_done(MachineStage::Resolve, 0)
+        .packet(Stage::Implement, 1)
+        .stopped_attempt(Stage::Implement, 1)
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::Implement, 1),
+            not_before: None
+        }
+    );
+}
+
 #[test]
 fn completed_implement_runs_gate_then_push_then_draftpr() {
     let base = || {
