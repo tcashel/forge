@@ -165,6 +165,30 @@ pub trait SessionHost: Send + Sync {
     /// Kill the session and VERIFY death before reporting success.
     async fn kill_confirmed(&self, id: &HostSessionId) -> Result<Confirmed, HostError>;
 
+    /// Give up the terminal of a session that has ALREADY SETTLED.
+    ///
+    /// This is not a kill and it fences no SETTLEMENT: it verifies nothing,
+    /// waits for nothing, and returns `()` precisely so no failure of it can
+    /// reach a caller that has already settled an attempt. A backend with
+    /// nothing to give up does nothing. Callers that need verified death
+    /// call [`SessionHost::kill_confirmed`] instead, which releases the
+    /// terminal itself — the two are never issued for the same session.
+    ///
+    /// It IS gated on ownership, which is a different thing. A backend must
+    /// act only on an id it issued: the effect is destructive and addressed
+    /// by a name the backend does not control, so an id from elsewhere would
+    /// take down someone else's terminal. Ownership decides whether the
+    /// effect fires at all; settlement is never allowed to depend on whether
+    /// it succeeded.
+    ///
+    /// The id REMAINS VALID afterwards: `alive` and `kill_confirmed` must
+    /// keep answering for a released session (from the sentinel, and from
+    /// whatever the backend can still observe) rather than
+    /// [`HostError::SessionNotFound`]. Settling an attempt and settling its
+    /// ROW are different events, and a reconcile pass that reaches the
+    /// second one must not be told the session never existed.
+    async fn release(&self, id: &HostSessionId);
+
     /// A stable locator string a UI can render to attach to the session, if
     /// the backend has one. Non-blocking; no I/O.
     fn attach_hint(&self, id: &HostSessionId) -> Option<String>;
