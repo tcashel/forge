@@ -336,6 +336,72 @@ fn saga_order_is_enforced_mechanically() {
     ledger.close().expect("close");
 }
 
+/// `stopped` is the attempt-local terminal exit from `revoking`: reachable
+/// only through the durable marker, distinguishable from `reclaimed`, and
+/// leaving the packet claimable at once.
+#[test]
+fn mark_stopped_is_the_only_path_into_stopped() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-stopped");
+    let packet = make_packet(&ledger, &run);
+    let claim = ledger
+        .claim_packet(
+            &packet,
+            "claude:sess-8:800",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+
+    // stopped is unreachable from running: no path skips the marker.
+    let err = ledger
+        .mark_stopped(claim.attempt_id)
+        .expect_err("must refuse");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    ledger
+        .revoke_attempt(claim.attempt_id, "operator requested")
+        .expect("revoke");
+    ledger.mark_stopped(claim.attempt_id).expect("stop");
+
+    let stopped = ledger.get_attempt(claim.attempt_id).expect("get");
+    assert_eq!(stopped.state, AttemptState::Stopped);
+    assert_ne!(stopped.state, AttemptState::Reclaimed);
+    assert_eq!(stopped.revoke_reason.as_deref(), Some("operator requested"));
+    assert!(stopped.ended_at.is_some());
+
+    // The transition is on the wire as its own event, so a reader tells an
+    // operator's stop from the saga's reclaim without the row.
+    let events = ledger
+        .list_events(Some(&run), 0, 100)
+        .expect("run-scoped events");
+    let event = events
+        .iter()
+        .filter(|e| e.kind == "attempt.state")
+        .map(|e| serde_json::from_str::<serde_json::Value>(&e.payload_json).expect("payload"))
+        .find(|p| p["new"] == "stopped")
+        .expect("stopped transition event");
+    assert_eq!(event["old"], json!("revoking"));
+    assert_eq!(event["reason"], json!("operator requested"));
+    assert_eq!(event["attemptId"], json!(claim.attempt_id));
+
+    // Terminal both ways: no second exit, and no return to reclaimed.
+    let err = ledger
+        .mark_reclaimed(claim.attempt_id)
+        .expect_err("stopped is terminal");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
+
+    // And the packet is claimable with no waiting period.
+    ledger
+        .claim_packet(
+            &packet,
+            "claude:sess-9:900",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("successor claim after a stop");
+    ledger.close().expect("close");
+}
+
 /// The fail note is readable both ways: `fail_note` on the row and,
 /// verbatim, as the `attempt.state` event's reason.
 #[test]

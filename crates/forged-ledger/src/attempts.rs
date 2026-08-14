@@ -1,10 +1,18 @@
 //! The attempt saga: claim → running → (completed | failed | revoking →
-//! reclaimed), with the partial unique index as the race backstop.
+//! (reclaimed | stopped)), with the partial unique index as the race
+//! backstop.
 //!
 //! Saga order (the epic's third seam contract): the durable `revoking`
-//! marker COMMITS before any external kill or bd reclaim, and `reclaimed`
-//! is reachable only from `revoking` — there is no path that skips the
-//! marker. While `revoking`, the fence refuses everything under that token.
+//! marker COMMITS before any external kill or bd reclaim, and neither
+//! `reclaimed` nor `stopped` is reachable except from `revoking` — there is
+//! no path that skips the marker. While `revoking`, the fence refuses
+//! everything under that token.
+//!
+//! `revoking` has TWO terminal exits because the revocation has two scopes.
+//! `reclaimed` is the bead-scoped one: the reclaim saga confirmed a dead
+//! worker and took its bd lease back. `stopped` is the attempt-local one: an
+//! operator ended one attempt, the lease was never in scope and is untouched.
+//! Both are kill-confirmed; a reader tells them apart to know which happened.
 
 use forged_types::{new_claim_token, ErrorCode, PacketResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -20,7 +28,7 @@ const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, fail_note, \
      result_json, started_at, updated_at, last_heartbeat_at, ended_at";
 
-/// Decode a stored `attempts.state`, failing CLOSED: only the five DDL CHECK
+/// Decode a stored `attempts.state`, failing CLOSED: only the six DDL CHECK
 /// strings are accepted, and `running` in particular must be stored
 /// explicitly — an unrecognized string surfaces as an internal storage
 /// error, never as a live attempt the fence would honor.
@@ -31,6 +39,7 @@ fn attempt_state(idx: usize, s: &str) -> Result<AttemptState, rusqlite::Error> {
         "failed" => Ok(AttemptState::Failed),
         "revoking" => Ok(AttemptState::Revoking),
         "reclaimed" => Ok(AttemptState::Reclaimed),
+        "stopped" => Ok(AttemptState::Stopped),
         other => Err(column_decode_error(idx, "attempt state", other)),
     }
 }
@@ -492,6 +501,47 @@ impl Ledger {
         })
     }
 
+    /// Move `revoking → stopped` ONLY — the attempt-local terminal exit,
+    /// and the only path into it, exactly as [`Ledger::mark_reclaimed`] is
+    /// the only path into `reclaimed`.
+    ///
+    /// Callers invoke this only after kill-confirmed. NOTHING external is
+    /// reclaimed on this path: the bd lease is bead-scoped and shared with
+    /// every sibling generation, so an attempt-local stop has no standing to
+    /// take it. Sets `updated_at` and `ended_at`; the event's reason is the
+    /// stored `revoke_reason`.
+    pub fn mark_stopped(&self, attempt_id: i64) -> Result<(), LedgerError> {
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let attempt = get_attempt_tx(&tx, attempt_id)?;
+            if attempt.state != AttemptState::Revoking {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!(
+                        "attempt {attempt_id} is {}, not revoking",
+                        attempt.state.as_str()
+                    ),
+                ));
+            }
+            let now = now_iso();
+            tx.execute(
+                "UPDATE attempts SET state = 'stopped', updated_at = ?1, ended_at = ?1 \
+                 WHERE attempt_id = ?2",
+                rusqlite::params![now, attempt_id],
+            )?;
+            attempt_event(
+                &tx,
+                attempt_id,
+                &attempt.packet_id,
+                Some(AttemptState::Revoking),
+                AttemptState::Stopped,
+                attempt.revoke_reason.as_deref(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// The fence's mid-flight enforcement point, checked immediately before
     /// an effect fires: `Ok(())` only while the token's attempt is
     /// `running`; unknown tokens and every other state refuse with
@@ -520,6 +570,7 @@ mod tests {
             ("failed", AttemptState::Failed),
             ("revoking", AttemptState::Revoking),
             ("reclaimed", AttemptState::Reclaimed),
+            ("stopped", AttemptState::Stopped),
         ] {
             assert_eq!(attempt_state(4, s).expect(s), want);
         }

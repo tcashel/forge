@@ -30,7 +30,7 @@ fn ledger_is_send_sync_and_arc_shareable() {
         }));
     }
     for handle in handles {
-        assert_eq!(handle.join().expect("thread"), 7);
+        assert_eq!(handle.join().expect("thread"), 8);
     }
 }
 
@@ -376,6 +376,7 @@ fn enums_round_trip_their_ddl_strings() {
         (AttemptState::Failed, "failed"),
         (AttemptState::Revoking, "revoking"),
         (AttemptState::Reclaimed, "reclaimed"),
+        (AttemptState::Stopped, "stopped"),
     ] {
         assert_eq!(state.as_str(), s);
         assert_eq!(AttemptState::try_from(s).expect("parse"), state);

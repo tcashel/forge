@@ -58,6 +58,11 @@ pub enum AttemptState {
     Revoking,
     /// Kill-confirmed and externally reclaimed; a successor may claim.
     Reclaimed,
+    /// Kill-confirmed and settled by an operator's attempt-local stop. The
+    /// bead's bd lease is deliberately untouched — it is bead-scoped and
+    /// shared with every sibling generation — so a successor claims under
+    /// the same `run_holder` with no waiting period.
+    Stopped,
 }
 
 impl AttemptState {
@@ -69,6 +74,7 @@ impl AttemptState {
             AttemptState::Failed => "failed",
             AttemptState::Revoking => "revoking",
             AttemptState::Reclaimed => "reclaimed",
+            AttemptState::Stopped => "stopped",
         }
     }
 }
@@ -83,6 +89,7 @@ impl TryFrom<&str> for AttemptState {
             "failed" => Ok(AttemptState::Failed),
             "revoking" => Ok(AttemptState::Revoking),
             "reclaimed" => Ok(AttemptState::Reclaimed),
+            "stopped" => Ok(AttemptState::Stopped),
             other => Err(refused(
                 ErrorCode::InvalidRequest,
                 format!("unknown attempt state: {other:?}"),
