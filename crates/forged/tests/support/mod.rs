@@ -634,14 +634,19 @@ issue_json() {
   acceptance=$(cat "$state/$id.acceptance" 2>/dev/null || true)
   design=$(cat "$state/$id.design" 2>/dev/null || true)
   notes=$(cat "$state/$id.notes" 2>/dev/null || true)
+  metadata=$(cat "$state/$id.metadata" 2>/dev/null || echo '{}')
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
 }
 case "$cmd" in
   version)
     printf '{"schema_version":1,"data":{"version":"1.2.1"}}\n' ;;
+  where)
+    printf '{"schema_version":1,"data":{"path":"%s","database_path":"%s/embeddeddolt"}}\n' "$BEADS_DIR" "$BEADS_DIR" ;;
+  dolt)
+    printf '{"schema_version":1,"data":{"backend":"dolt","data_dir":"%s/embeddeddolt","database":"beads","embedded":true}}\n' "$BEADS_DIR" ;;
   update)
     id=$2
     actor=$(val --actor "$@")
@@ -693,6 +698,11 @@ case "$cmd" in
       printf 'bd: connection refused\n' >&2
       exit 1
     fi
+    # A direct run-start test has no reason to maintain the global frontier
+    # fixture by hand. Remember every shown issue so `bd ready` can expose
+    # open ones when no explicit frontier was seeded. Tests that exercise a
+    # competing frontier still seed it and therefore keep exact control.
+    : > "$state/$id.seen"
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   children)
     epic=$2; first=1
@@ -712,11 +722,19 @@ case "$cmd" in
     front="$state/frontier"
     if [ -z "$actor" ]; then
       first=1; printf '{"schema_version":1,"data":['
-      while IFS= read -r id; do
+      if [ -s "$front" ]; then
+        ids=$(cat "$front")
+      else
+        ids=$(for seen in "$state"/*.seen; do
+          [ -e "$seen" ] || continue
+          basename "$seen" .seen
+        done)
+      fi
+      printf '%s\n' "$ids" | while IFS= read -r id; do
         [ -n "$id" ] || continue
-        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = closed ] && continue
+        [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" = open ] || continue
         [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
-      done < "$front"
+      done
       printf ']}\n'
     elif [ -s "$front" ]; then
       id=$(head -1 "$front")
@@ -1021,6 +1039,16 @@ impl TestEnv {
         std::fs::write(state.join(format!("{epic}.title")), "Test epic").expect("epic title");
         std::fs::write(state.join(format!("{epic}.type")), "epic").expect("epic type");
         std::fs::write(state.join(format!("{epic}.status")), "open").expect("epic status");
+        std::fs::write(
+            state.join(format!("{epic}.description")),
+            "## Context\\n\\nThe epic Bead is the canonical plan map.",
+        )
+        .expect("epic description");
+        std::fs::write(
+            state.join(format!("{epic}.acceptance")),
+            "- every child is accounted for",
+        )
+        .expect("epic acceptance");
         let mut inventory = String::new();
         let mut frontier = String::new();
         for (id, spec, ready) in children {

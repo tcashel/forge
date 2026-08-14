@@ -49,6 +49,11 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     let env = TestEnv::new("forged-bead-spec");
     assert_eq!(env.forged(&["init"]).0, 0);
     env.seed_bead_spec("bead-sourced", DESCRIPTION, ACCEPTANCE);
+    env.set_bead_field(
+        "bead-sourced",
+        "metadata",
+        r#"{"repository":"/tmp/example","qualityGates":["cargo test"]}"#,
+    );
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
     // No --spec: the bead's own fields are the spec.
@@ -79,6 +84,19 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
         "body_json must not duplicate the spec its row carries as columns: {}",
         packet.body_json
     );
+    let stored: Value = serde_json::from_str(&packet.body_json).expect("stored packet body");
+    let notes = stored["fieldNotes"].as_array().expect("bead field notes");
+    for expected in [
+        "Bead title: Bead bead-sourced",
+        "Bead issue type: task",
+        "Bead metadata qualityGates: [\"cargo test\"]",
+        "Bead metadata repository: /tmp/example",
+    ] {
+        assert!(
+            notes.iter().any(|note| note == expected),
+            "provider context must carry {expected:?}: {notes:?}"
+        );
+    }
 
     // Drive far enough for the seat to actually run, then read what it read.
     let stopped = wait_for(&env, &["run", "drive", "--run", "bead-sourced"], |value| {
@@ -120,6 +138,64 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
         assert_eq!(seat_body, body, "every seat reads byte-identical bytes");
     }
     ledger.close().expect("close");
+}
+
+#[test]
+fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
+    let env = TestEnv::new("forged-bead-ready-types");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    env.seed_bead_spec("blocked-target", DESCRIPTION, ACCEPTANCE);
+    env.seed_bead_spec("ready-competitor", DESCRIPTION, ACCEPTANCE);
+    env.seed_frontier("ready-competitor");
+    let (code, blocked) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "blocked-target",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(
+        code, 0,
+        "a bead outside bd ready must not dispatch: {blocked}"
+    );
+    assert!(
+        blocked["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("absent from `bd ready`"),
+        "readiness refusal is actionable: {blocked}"
+    );
+
+    for (bead, issue_type, route) in [
+        ("wrong-epic", "epic", "epic start"),
+        ("no-diff", "decision", "directly through Beads"),
+    ] {
+        env.seed_bead_spec(bead, DESCRIPTION, ACCEPTANCE);
+        env.set_bead_field(bead, "type", issue_type);
+        let (code, refused) = env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            bead,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main",
+        ]);
+        assert_ne!(code, 0, "{issue_type} must not enter slice/v1: {refused}");
+        assert!(
+            refused["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains(route),
+            "the refusal must name the correct route: {refused}"
+        );
+    }
 }
 
 #[test]
@@ -971,12 +1047,15 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         "epic-bead",
         "--repo",
         &repo,
-        "--spec",
-        &spec,
         "--base-ref",
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(started["result"]["specSource"], json!("bead"));
+    assert!(
+        started["result"]["specPath"].is_null(),
+        "the epic Bead replaces a separate spec file: {started}"
+    );
 
     let children = started["result"]["children"]
         .as_array()
@@ -1025,5 +1104,65 @@ fn an_epic_child_prefers_its_bead_fields_over_its_spec_pointer() {
         packet.spec_path.ends_with("/spec.md") && !packet.spec_path.starts_with(&spec),
         "a bead-sourced child reads the materialized body, not the pointed-to \
          file: {packet:?}"
+    );
+}
+
+#[test]
+fn a_no_diff_epic_child_holds_for_direct_beads_completion_then_counts_as_accounted() {
+    let env = TestEnv::new("forged-epic-no-diff");
+    env.enable_dynamic_gh();
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_epic("epic-no-diff", &[("record-decision", &env.spec, true)]);
+    env.set_bead_field("record-decision", "type", "decision");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-no-diff",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+
+    let mut held = Value::Null;
+    for _ in 0..4 {
+        let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-no-diff"]);
+        assert_eq!(code, 0, "epic advance: {advanced}");
+        held = advanced;
+        if held["result"]["stopped"]["code"] == json!("non-code-child") {
+            break;
+        }
+    }
+    assert_eq!(
+        held["result"]["stopped"]["code"],
+        json!("non-code-child"),
+        "no-diff work becomes one explicit operator action: {held}"
+    );
+    assert!(
+        env.ledger().list_runs().expect("runs").is_empty(),
+        "no empty slice run or PR is created for a decision"
+    );
+
+    env.set_bead_field("record-decision", "status", "closed");
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-no-diff",
+        "--child",
+        "record-decision",
+        "--note",
+        "decision recorded in Beads",
+    ]);
+    assert_eq!(code, 0, "resolve direct completion: {resolved}");
+    let (code, completed) = env.forged(&["epic", "advance", "--epic", "epic-no-diff"]);
+    assert_eq!(code, 0, "advance after direct completion: {completed}");
+    assert!(
+        completed["result"]["stopped"]["finalPr"].is_object(),
+        "a later Beads close is accounted without a slice: {completed}"
     );
 }

@@ -180,6 +180,51 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 
 // ------------------------------------------------------------- run start
 
+/// Resolve the Bead as work, not merely as a bag of spec fields.
+///
+/// `bd ready` is the authority for dependency readiness. Reading the issue
+/// first makes the refusal useful (status and type), while the frontier read
+/// prevents an open issue with active blockers from being dispatched. A
+/// non-code Bead has an explicit route instead of being forced through a
+/// commit-and-PR protocol that cannot represent its correct result.
+async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSummary, Failure> {
+    let issue = super::spec::read_bead(ctx, bead).await?;
+    if issue.status != "open" {
+        return Err(Failure::invalid(format!(
+            "bead {bead} is {:?}, not open and ready",
+            issue.status
+        )));
+    }
+    match issue.issue_type.as_str() {
+        "epic" => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is an epic; use `forged epic start`"
+            )))
+        }
+        "chore" | "decision" | "milestone" => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is a no-diff {}; complete it directly through Beads, not slice/v1",
+                issue.issue_type
+            )))
+        }
+        "bug" | "feature" | "task" | "story" | "spike" => {}
+        other => {
+            return Err(Failure::invalid(format!(
+                "bead {bead} has unsupported issue type {other:?}"
+            )))
+        }
+    }
+    let ready = forged_beads::ready_issues(&ctx.config.bd_config())
+        .await
+        .map_err(|error| super::spec::read_failure("reading the Beads ready frontier", error))?;
+    if !ready.iter().any(|candidate| candidate.id == bead) {
+        return Err(Failure::invalid(format!(
+            "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
+        )));
+    }
+    Ok(issue)
+}
+
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
 /// explicit child generation id) and fill `NewRun` from the config plus the
 /// `--repo` and `--base-ref` arguments. The spec comes from the bead;
@@ -288,6 +333,7 @@ pub(crate) async fn run_start_with_definition(
                     "--repo must be an absolute path, got {repo:?}"
                 )));
             }
+            let issue = ready_slice_bead(ctx, &bead).await?;
             // The spec source is settled BEFORE the run row exists: a bead
             // with no spec, or a spec path that is not there, must never
             // reach a seat as an empty spec.
@@ -306,7 +352,7 @@ pub(crate) async fn run_start_with_definition(
                 None => {
                     // Resolving proves the bead carries a spec, and names
                     // every empty field when it does not.
-                    super::spec::resolve_bead(ctx, &bead).await?;
+                    super::spec::resolve_issue(&issue)?;
                     super::spec::SpecSource::Bead(bead.clone())
                 }
             };
@@ -344,11 +390,17 @@ pub(crate) async fn run_start_with_definition(
                     "source": "file",
                     "specPath": path,
                     "deprecated": true,
+                    "beadTitle": issue.title,
+                    "issueType": issue.issue_type,
+                    "metadata": issue.metadata,
                 }),
                 super::spec::SpecSource::Bead(bead_id) => json!({
                     "runId": row.run_id,
                     "source": "bead",
                     "beadId": bead_id,
+                    "beadTitle": issue.title,
+                    "issueType": issue.issue_type,
+                    "metadata": issue.metadata,
                 }),
             };
             on_ledger(&ctx.ledger, move |l| {

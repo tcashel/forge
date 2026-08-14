@@ -79,9 +79,21 @@ human adjudicates the merge.
 
 ```sh
 forged epic start --epic <epic-id> --repo /absolute/repo \
-  --spec "$ANVIL_HOME/specs/<epic-id>.md" --profile standard --roster default
+  --profile standard --roster default
 forged epic submit --epic <epic-id>
 ```
+
+The epic Bead is the plan map and the frozen child inventory is read from its
+native parent links; there is no second editable epic spec file. The old
+`--spec <absolute-path>` flag remains readable for one release and is recorded
+as deprecated provenance only.
+
+Code-producing children (`bug`, `feature`, `task`, `story`, and `spike`) run
+through `slice/v1`. No-diff children (`chore`, `decision`, and `milestone`)
+become one explicit `inputRequired` action: complete the work directly in
+Beads, close the child, then `epic resolve`. Forged never manufactures an
+empty commit or PR for them, and a child closed after epic start counts as
+accounted work.
 
 Resolving a child-specific stop retires that terminal child binding from the
 epic projection. The next wave starts a fresh child run generation (for

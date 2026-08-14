@@ -310,21 +310,68 @@ fn same_dir(a: &Path, b: &Path) -> bool {
     canon(a) == canon(b)
 }
 
-/// Prove the operator's LIVE store still resolves: a read of `bd list
-/// --json` against the config exactly as given must return a NON-EMPTY list
-/// — the containment discipline is worthless if bd is silently reading a
-/// shadow database. Read-only; takes no lock; writes nothing.
+/// Prove the operator's LIVE store and backend identity still resolve.
+///
+/// A non-empty `bd list` proves useful data is visible, `bd where` proves
+/// CWD discovery did not redirect the configured workspace, and `bd dolt
+/// show` names the actual embedded/server database operators are sharing.
+/// Read-only; takes no lock; writes nothing.
 async fn beads_dir_resolves(cfg: &DoctorConfig) -> Result<String, String> {
     let data = invoke::read(&cfg.bd, &["list", "--json"])
         .await
         .map_err(|e| e.to_string())?;
-    match envelope::as_list(&data) {
-        Some(items) if !items.is_empty() => Ok(format!("{} issues listed", items.len())),
-        _ => Err(format!(
-            "bd resolved an empty store at {} — not the operator's live database?",
-            cfg.bd.beads_dir.display()
-        )),
+    let issue_count = match envelope::as_list(&data) {
+        Some(items) if !items.is_empty() => items.len(),
+        _ => {
+            return Err(format!(
+                "bd resolved an empty store at {} — not the operator's live database?",
+                cfg.bd.beads_dir.display()
+            ))
+        }
+    };
+    let where_data = invoke::read(&cfg.bd, &["where", "--json"])
+        .await
+        .map_err(|e| format!("bd where: {e}"))?;
+    let where_obj = envelope::first_obj(&where_data)
+        .ok_or_else(|| format!("bd where returned no identity: {where_data}"))?;
+    let resolved = where_obj
+        .get("path")
+        .and_then(Value::as_str)
+        .map(PathBuf::from)
+        .ok_or_else(|| format!("bd where returned no workspace path: {where_data}"))?;
+    if !same_dir(&resolved, &cfg.bd.beads_dir) {
+        return Err(format!(
+            "configured BEADS_DIR {} resolved to {}; refusing shadow/CWD database drift",
+            cfg.bd.beads_dir.display(),
+            resolved.display()
+        ));
     }
+    let backend_data = invoke::read(&cfg.bd, &["dolt", "show", "--json"])
+        .await
+        .map_err(|e| format!("bd dolt show: {e}"))?;
+    let backend = envelope::first_obj(&backend_data)
+        .ok_or_else(|| format!("bd dolt show returned no backend identity: {backend_data}"))?;
+    let backend_name = backend
+        .get("backend")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let database = backend
+        .get("database")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    let mode = match backend.get("embedded").and_then(Value::as_bool) {
+        Some(true) => "embedded",
+        Some(false) => "server",
+        None => "unknown",
+    };
+    let data_dir = backend
+        .get("data_dir")
+        .and_then(Value::as_str)
+        .unwrap_or("unknown");
+    Ok(format!(
+        "{issue_count} issues; workspace={}; backend={backend_name}; mode={mode}; database={database}; data={data_dir}",
+        resolved.display()
+    ))
 }
 
 /// `gh auth status` exits 0. gh from PATH is fine — it is table-stakes

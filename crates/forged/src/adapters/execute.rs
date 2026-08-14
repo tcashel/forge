@@ -166,7 +166,7 @@ pub fn build_packet(
         },
         result_schema: PromptStage::for_stage(stage).result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
-        field_notes: Vec::new(),
+        field_notes: spec.bead_context.clone(),
     };
     packet.spec.path = match source {
         SpecSource::File(path) => path.clone(),
@@ -1506,6 +1506,7 @@ mod settle_tests {
             body: None,
             sha256: spec_sha.clone(),
             fence: forged_ledger::SpecFence::Sha256(spec_sha.clone()),
+            bead_context: Vec::new(),
         };
         let packet =
             build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600).expect("packet");

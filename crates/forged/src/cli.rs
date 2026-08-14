@@ -141,9 +141,9 @@ pub struct EpicStartArgs {
     /// Absolute target checkout path.
     #[arg(long)]
     pub repo: String,
-    /// Locked epic-map path.
+    /// Deprecated locked epic-map path. The epic Bead is authoritative.
     #[arg(long)]
-    pub spec: String,
+    pub spec: Option<String>,
     /// Default-branch target; defaults from origin/HEAD.
     #[arg(long)]
     pub base_ref: Option<String>,

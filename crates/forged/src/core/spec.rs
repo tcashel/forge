@@ -100,6 +100,10 @@ pub struct ResolvedSpec {
     pub sha256: String,
     /// The fence this spec is pinned by.
     pub fence: SpecFence,
+    /// Human work context copied from the Bead for provider prompts. This is
+    /// explanatory only: the rendered body above remains the requirements
+    /// contract and the ledger fence remains the execution authority.
+    pub bead_context: Vec<String>,
 }
 
 impl ResolvedSpec {
@@ -188,7 +192,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 /// reported the one thing the operator can act on. The `transport:` prefix
 /// is load-bearing — it is what classifies a stored fail note as transport —
 /// so only a genuinely unanswered call may carry it.
-fn read_failure(context: &str, err: BdError) -> Failure {
+pub(crate) fn read_failure(context: &str, err: BdError) -> Failure {
     let code = match &err {
         BdError::Contention { .. } => ErrorCode::BeadsContention,
         _ => ErrorCode::BeadsError,
@@ -220,7 +224,7 @@ fn no_spec_refusal(bead_id: &str, missing: &[&'static str]) -> Failure {
 }
 
 /// Read one bead, budgeting exactly one bd call.
-async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
+pub(crate) async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
     forged_beads::show_issue(&ctx.config.bd_config(), bead_id)
         .await
         .map_err(|err| read_failure(&format!("reading bead {bead_id}"), err))
@@ -234,6 +238,14 @@ async fn read_bead(ctx: &Ctx, bead_id: &str) -> Result<IssueSummary, Failure> {
 /// empty.
 pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Failure> {
     let issue = read_bead(ctx, bead_id).await?;
+    resolve_issue(&issue)
+}
+
+/// Resolve an issue already read at a lifecycle boundary. Run start uses
+/// this after its readiness check so validating the spec does not pay for a
+/// second `bd show`; packet open and claim still re-read independently.
+pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failure> {
+    let bead_id = &issue.id;
     let missing = missing_spec_fields(&issue);
     if !missing.is_empty() {
         return Err(no_spec_refusal(bead_id, &missing));
@@ -245,6 +257,16 @@ pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Fail
     })?;
     let body = render_body(&issue);
     let body_sha256 = sha256_bytes(body.as_bytes());
+    let mut bead_context = vec![
+        format!("Bead title: {}", issue.title),
+        format!("Bead issue type: {}", issue.issue_type),
+    ];
+    bead_context.extend(
+        issue
+            .metadata
+            .iter()
+            .map(|(key, value)| format!("Bead metadata {key}: {value}")),
+    );
     Ok(ResolvedSpec {
         sha256: body_sha256.clone(),
         body: Some(body),
@@ -252,6 +274,7 @@ pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Fail
             revision,
             body_sha256,
         },
+        bead_context,
     })
 }
 
@@ -262,6 +285,7 @@ pub fn resolve_file(path: &str) -> Result<ResolvedSpec, Failure> {
         body: None,
         fence: SpecFence::Sha256(sha256.clone()),
         sha256,
+        bead_context: Vec::new(),
     })
 }
 
@@ -535,6 +559,7 @@ mod tests {
                 revision: "8".to_owned(),
                 body_sha256: "beef".to_owned(),
             },
+            bead_context: Vec::new(),
         };
         let failure = assert_pinned(&pinned, &moved).expect_err("must refuse");
         assert_eq!(failure.code, ErrorCode::SpecDrift);

@@ -406,26 +406,14 @@ fn an_unreadable_pause_payload_still_lists_a_paused_epic() {
     assert_eq!(epic["stopReason"], Value::Null, "no reason invented");
 }
 
-/// The `runs` row is the durable state wherever one exists. An id that
-/// carries BOTH — `epic start` on a bead, then `run start` on that same
-/// bead — is ONE entry: labelled `epic` by the event, with the row's
-/// columns.
+/// The `runs` row is the durable state wherever one exists. A legacy/corrupt
+/// id that carries BOTH an epic start event and a fabricated run row is ONE
+/// entry: labelled `epic` by the event, with the row's columns. Production
+/// now refuses routing an epic Bead through `run start`.
 #[test]
 fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
-    let (env, repo, spec) = started_epic("forged-work-list-both", "epic-both", "child-both");
-    let (code, started) = env.forged(&[
-        "run",
-        "start",
-        "--bead",
-        "epic-both",
-        "--repo",
-        &repo,
-        "--spec",
-        &spec,
-        "--base-ref",
-        "main",
-    ]);
-    assert_eq!(code, 0, "run start: {started}");
+    let (env, _, _) = started_epic("forged-work-list-both", "epic-both", "child-both");
+    fabricate_run(&env, "epic-both");
 
     let (code, response) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "work list: {response}");
