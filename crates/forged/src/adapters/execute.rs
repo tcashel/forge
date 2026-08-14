@@ -10,7 +10,7 @@ use std::time::Duration;
 
 use forged_host::{ProcessHost, SessionHost};
 use forged_ledger::{EffectClass, RunRow};
-use forged_proto::{LandOutcome, PacketIntent, ProtoEvent};
+use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
 };
@@ -50,6 +50,10 @@ pub enum PacketOutcome {
     Quarantined,
     /// A transport failure was recorded (free retry within the budget).
     Transport(String),
+    /// A claimed attempt was retired before any provider ran, and charged to
+    /// the same bounded budget. Distinct from `Transport` because nothing
+    /// was transported: no seat spoke, so there is no stage result to read.
+    Unspawned(String),
     /// A semantic failure was recorded.
     Semantic(String),
     /// Our own attempt was revoked mid-flight; the provider was stopped.
@@ -180,27 +184,81 @@ pub fn build_packet(
 
 /// Open a packet through the fence (`packet_open`, SafeRetry, ledger-local).
 ///
-/// The idempotency key carries the spec fence. That is the fix for the
-/// defect this file used to have: keyed on (run, stage, seq) alone, a
-/// re-open after a spec revision replayed its stored response verbatim and
-/// left the packet pinned to bytes nobody could reach any more. A revised
-/// spec now mints a fresh key, so the re-open genuinely re-pins.
+/// THE FIRST OPEN IS AN OPERATION AND A RE-PIN IS NOT ([`repin_packet`]),
+/// and the two differ because of what each one is. This is the packet's
+/// CREATION: it runs inside the advance that opens a whole stage's packets
+/// together, and replaying its stored response after a crash is exactly
+/// right, because the row it would create already exists. A re-pin is a pure
+/// row update whose result must CHANGE when the bead does — fence that on a
+/// key and the key has to carry the world's state, and a content address is
+/// not injective over time (a bead edited A -> B -> A mints the key A
+/// already stored, and the replay writes nothing). The ledger's own
+/// `Immediate` transaction is the re-pin's fence instead: atomic, re-read
+/// every time, with no memory of an earlier call to replay.
 ///
-/// The fence in the key is the CONTENT digest, never the bead revision:
-/// bd mints a revision on every write to the bead, so a revision-keyed open
-/// would mint a fresh key — and attempt a re-pin the ledger rightly refuses
-/// while a seat is live — every time the run touched its own lease.
+/// So the key is (run, stage, seq) — the packet's identity, and nothing
+/// about its spec.
 pub async fn open_packet_op(ctx: &Ctx, packet: &WorkPacket) -> Result<(), Failure> {
     let body_json = packet
         .stored_body()
         .map_err(|e| Failure::internal(format!("cannot serialize packet: {e}")))?;
-    open_packet_body_op(ctx, packet, body_json).await
+    let run_id = packet.run_id.clone();
+    let target = open_target(packet, body_json)?;
+    let key = crate::core::derive_key(
+        "packet_open",
+        Some(&run_id),
+        Some(&target.stage_key),
+        Some(target.logical_seq),
+    );
+    let req = OperationRequest {
+        schema_version: 1,
+        idempotency_key: key,
+        run_id: Some(run_id.clone()),
+        params: match json!({
+            "stage": target.stage_key,
+            "seq": target.logical_seq,
+        }) {
+            Value::Object(map) => map,
+            _ => unreachable!("literal is an object"),
+        },
+    };
+    let OpenTarget {
+        new_packet,
+        semantic_id,
+        ..
+    } = target;
+    let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
+        let ledger = ctx.ledger.clone();
+        move |_op_id| async move {
+            let packet_id =
+                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
+                    .await
+                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
+            Ok(json!({"packetId": packet_id}))
+        }
+    })
+    .await;
+    if resp.ok {
+        Ok(())
+    } else {
+        let err = resp.error.unwrap_or(forged_types::OpError {
+            code: forged_types::ErrorCode::Internal,
+            message: "packet open failed".to_owned(),
+            recoverable: false,
+            detail: None,
+        });
+        Err(Failure {
+            code: err.code,
+            message: err.message,
+            recoverable: err.recoverable,
+        })
+    }
 }
 
 /// The ledger write one packet open performs, plus the key segments the
 /// operation envelope derives from the same packet.
 ///
-/// Shared by the fenced open and the direct re-pin so both write the
+/// Shared by the fenced first open and the direct re-pin so both write the
 /// identical row: a re-pin that built its row differently would be a second
 /// definition of the packet.
 struct OpenTarget {
@@ -250,72 +308,6 @@ fn apply_open(
     match semantic_id {
         Some(packet_id) => ledger.open_packet_with_id(new_packet, packet_id),
         None => ledger.open_packet(new_packet),
-    }
-}
-
-/// The shared body of [`open_packet_op`], taking the stored definition
-/// verbatim so a re-pin can carry the row's OWN body rather than one
-/// re-serialized from an in-memory packet the caller may have adjusted.
-async fn open_packet_body_op(
-    ctx: &Ctx,
-    packet: &WorkPacket,
-    body_json: String,
-) -> Result<(), Failure> {
-    let run_id = packet.run_id.clone();
-    let target = open_target(packet, body_json)?;
-    let fence = packet.spec.sha256.clone();
-    let key = format!(
-        "{}:{fence}",
-        crate::core::derive_key(
-            "packet_open",
-            Some(&run_id),
-            Some(&target.stage_key),
-            Some(target.logical_seq),
-        )
-    );
-    let req = OperationRequest {
-        schema_version: 1,
-        idempotency_key: key,
-        run_id: Some(run_id.clone()),
-        params: match json!({
-            "stage": target.stage_key,
-            "seq": target.logical_seq,
-            "specFence": fence,
-        }) {
-            Value::Object(map) => map,
-            _ => unreachable!("literal is an object"),
-        },
-    };
-    let OpenTarget {
-        new_packet,
-        semantic_id,
-        ..
-    } = target;
-    let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
-        let ledger = ctx.ledger.clone();
-        move |_op_id| async move {
-            let packet_id =
-                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
-                    .await
-                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
-            Ok(json!({"packetId": packet_id}))
-        }
-    })
-    .await;
-    if resp.ok {
-        Ok(())
-    } else {
-        let err = resp.error.unwrap_or(forged_types::OpError {
-            code: forged_types::ErrorCode::Internal,
-            message: "packet open failed".to_owned(),
-            recoverable: false,
-            detail: None,
-        });
-        Err(Failure {
-            code: err.code,
-            message: err.message,
-            recoverable: err.recoverable,
-        })
     }
 }
 
@@ -399,43 +391,6 @@ async fn await_pid(packet_dir: &Path) -> Option<u32> {
     None
 }
 
-/// The packet's transport-failure count so far, from its latest
-/// `proto.retry` grant.
-async fn prior_transport_failures(ctx: &Ctx, run_id: &str, packet_id: &str) -> u32 {
-    let run_id = run_id.to_owned();
-    let packet_id = packet_id.to_owned();
-    let events = on_ledger(&ctx.ledger, move |l| {
-        let mut out = Vec::new();
-        let mut after = 0i64;
-        loop {
-            let page = l.list_events(Some(&run_id), after, 256)?;
-            let full = page.len() == 256;
-            if let Some(last) = page.last() {
-                after = last.event_id;
-            }
-            out.extend(page);
-            if !full {
-                return Ok(out);
-            }
-        }
-    })
-    .await
-    .unwrap_or_default();
-    let parsed = forged_proto::parse_proto_events(&events).unwrap_or_default();
-    parsed
-        .iter()
-        .rev()
-        .find_map(|e| match e {
-            ProtoEvent::Retry {
-                packet_id: p,
-                transport_failures,
-                ..
-            } if *p == packet_id => Some(*transport_failures),
-            _ => None,
-        })
-        .unwrap_or(0)
-}
-
 /// Execute one open packet end to end: re-pin, claim, render, spawn, await,
 /// harvest, land or fail. Follows the section-(d) order exactly.
 ///
@@ -510,25 +465,25 @@ pub async fn execute_packet(
 /// is the same one `resolve_for_packet` branches on.
 ///
 /// Otherwise a no-op unless the rendered body moved: the claim itself
-/// re-pins a moved REVISION over an unchanged body, and re-opening for that
-/// would only mint the same idempotency key.
+/// re-pins a moved REVISION over an unchanged body.
 ///
-/// The re-open carries the row's OWN stored body, never one re-serialized
-/// from the caller's packet. A re-pin revises the spec and nothing else —
-/// the ledger refuses any re-open that would move the definition too — and
-/// the caller's packet may legitimately differ from the stored definition
-/// (`stored_packet_for_attempt` rebinds provider hints to the active roster
-/// revision).
+/// NOT AN OPERATION. A re-pin writes three spec columns and nothing else —
+/// no bd call, no GitHub call, no spawn — so there is no external effect to
+/// deduplicate, and the operation layer exists for external effects. Its
+/// result must also change whenever the bead does, which is precisely what
+/// a fence keyed on an idempotency key refuses to do: encode the spec in the
+/// key and a bead edited A -> B -> A reproduces the key its first open at A
+/// already stored, replaying that response over a row still pinned at B.
+/// `Ledger::repin_packet_spec`'s own `Immediate` transaction is the right
+/// fence and the only one needed — atomic, re-reading current state on every
+/// call, and its refusal on a live attempt still stands.
 ///
-/// THE RE-OPEN ALONE IS NOT ENOUGH, and this is the whole reason for the
-/// re-read below. `packet_open` is keyed on the TARGET fence, so a bead
-/// edited A → B → A re-opens under the key the first open at A already
-/// stored: the operation replays its recorded response, the ledger UPDATE
-/// never runs, and the row stays pinned at B while this returns `Ok`. Every
-/// later claim then refuses `SpecDrift` forever — exactly the wedge this
-/// function exists to close. When the replay leaves the row behind, the
-/// re-pin is driven straight at the ledger, whose own refusals (a live
-/// attempt, a moved definition) still stand.
+/// Nothing is read back out to write it in again. The definition never
+/// becomes a parameter, so this cannot move it and there is no window
+/// between checking it and writing — which also means the caller's packet
+/// may legitimately differ from the stored definition, as it does whenever
+/// `stored_packet_for_attempt` rebinds provider hints to the active roster
+/// revision.
 async fn repin_packet(
     ctx: &Ctx,
     packet: &WorkPacket,
@@ -537,23 +492,17 @@ async fn repin_packet(
     if packet.spec.revision.is_none() || spec.sha256 == packet.spec.sha256 {
         return Ok(packet.clone());
     }
-    let read_row = || {
-        let packet_id = packet.packet_id.clone();
-        on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id))
-    };
-    let body_json = read_row().await?.body_json;
     let mut repinned = packet.clone();
     repinned.spec.sha256 = spec.sha256.clone();
     repinned.spec.revision = spec.revision();
-    open_packet_body_op(ctx, &repinned, body_json.clone()).await?;
-    if read_row().await?.spec_sha256 != repinned.spec.sha256 {
-        let OpenTarget {
-            new_packet,
-            semantic_id,
-            ..
-        } = open_target(&repinned, body_json)?;
-        on_ledger(&ctx.ledger, move |l| apply_open(l, new_packet, semantic_id)).await?;
-    }
+    let packet_id = packet.packet_id.clone();
+    let spec_path = repinned.spec.path.clone();
+    let spec_sha256 = repinned.spec.sha256.clone();
+    let spec_revision = repinned.spec.revision.clone();
+    on_ledger(&ctx.ledger, move |l| {
+        l.repin_packet_spec(packet_id, spec_path, spec_sha256, spec_revision)
+    })
+    .await?;
     Ok(repinned)
 }
 
@@ -564,33 +513,41 @@ async fn repin_packet(
 /// packet's history. The `proto.retry` grant carries both the count and the
 /// deadline, which is exactly what `advance` reads for a packet with no
 /// terminal attempts of its own.
+///
+/// Nothing fences this path — the failure is pre-claim by definition — so
+/// the charge is read-and-append inside ONE ledger transaction
+/// (`grant_retry`). Two advances racing the same outage would otherwise read
+/// the same count and both write `n + 1`.
 async fn grant_pre_claim_retry(
     ctx: &Ctx,
     packet_id: &str,
     note: String,
 ) -> Result<PacketOutcome, Failure> {
     let (run_id, _, _) = crate::core::split_packet_key(packet_id)?;
-    let count = prior_transport_failures(ctx, &run_id, packet_id).await + 1;
-    let now = now_iso();
-    let deadline = forged_proto::backoff_deadline(&now, count.saturating_sub(1)).unwrap_or(now);
-    let event = ProtoEvent::Retry {
-        packet_id: packet_id.to_owned(),
-        transport_failures: count,
-        retry_after: deadline,
-    };
-    {
-        let run_id = run_id.clone();
-        on_ledger(&ctx.ledger, move |l| {
-            forged_proto::record(l, &run_id, event).map_err(|e| match e {
-                forged_proto::ProtoError::Ledger(inner) => inner,
-                other => forged_ledger::LedgerError::Internal {
-                    message: other.to_string(),
-                },
-            })
-        })
-        .await?;
-    }
+    charge_retry(ctx, &run_id, packet_id, now_iso()).await?;
     Ok(PacketOutcome::Transport(note))
+}
+
+/// Append one packet's `proto.retry` grant, mapping the proto error onto the
+/// ledger's.
+async fn charge_retry(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    since: String,
+) -> Result<(), Failure> {
+    let run_id = run_id.to_owned();
+    let packet_id = packet_id.to_owned();
+    on_ledger(&ctx.ledger, move |l| {
+        forged_proto::grant_retry(l, &run_id, &packet_id, &since).map_err(|e| match e {
+            forged_proto::ProtoError::Ledger(inner) => inner,
+            other => forged_ledger::LedgerError::Internal {
+                message: other.to_string(),
+            },
+        })
+    })
+    .await?;
+    Ok(())
 }
 
 /// Adopt an already-claimed attempt whose provider was never spawned (the
@@ -638,7 +595,7 @@ async fn settle_adoption(
         &packet.packet_id,
         claim_token,
         format!("transport: adoption could not read the spec: {failure}"),
-        format!("adoption refused: {failure}"),
+        format!("unspawned: adoption refused: {failure}"),
         failure,
     )
     .await
@@ -655,12 +612,15 @@ async fn settle_host_fallback(
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
+    // Both notes name the seam; the PREFIX carries the recoverable split, so
+    // the row stays diagnosable either way rather than reading as a generic
+    // pre-spawn refusal.
     settle_unspawned(
         ctx,
         packet_id,
         claim_token,
         format!("transport: the host fallback could not be recorded: {failure}"),
-        format!("attempt refused before spawn: {failure}"),
+        format!("unspawned: the host fallback could not be recorded: {failure}"),
         failure,
     )
     .await
@@ -674,11 +634,20 @@ async fn settle_host_fallback(
 /// re-enters the identical failure forever, and the reclaim saga has to time
 /// out a lease that no process is renewing.
 ///
-/// A TRANSPORT failure goes onto the packet's existing bounded-retry budget —
-/// the same budget a provider transport failure uses. Anything else is
-/// terminal for this attempt: the row is failed so the packet becomes
-/// re-claimable and re-pinnable, and the failure still surfaces to the caller
-/// rather than being swallowed into a retry.
+/// EITHER WAY THE NOTE SAYS NO SEAT RAN, because no seat did. A `transport:`
+/// note carries a recoverable failure and an `unspawned:` note an
+/// unrecoverable one, and `classify_failure` reads both as the packet
+/// standing on its bounded-retry budget rather than as this stage's answer.
+/// That distinction is load-bearing: a plain note classifies SEMANTIC, and a
+/// semantic failure IS a stage result — `contribution` merges it into the
+/// review fan-out as `RequestChanges`, and `advance` spends the run's one fix
+/// round on it — so a review seat that never spawned would speak a verdict it
+/// never had and a fix seat that never spawned would end the run.
+///
+/// The row is failed either way, so the packet is re-claimable and
+/// re-pinnable; the budget is what bounds a cause that will not clear. An
+/// unrecoverable failure still surfaces to the caller rather than being
+/// swallowed into the retry.
 async fn settle_unspawned(
     ctx: &Ctx,
     packet_id: &str,
@@ -690,14 +659,7 @@ async fn settle_unspawned(
     if failure.recoverable {
         return fail_and_grant_retry(ctx, packet_id, claim_token, transport_note).await;
     }
-    {
-        let packet_id = packet_id.to_owned();
-        let token = claim_token.to_owned();
-        on_ledger(&ctx.ledger, move |l| {
-            l.fail_packet(&packet_id, &token, &refusal_note)
-        })
-        .await?;
-    }
+    fail_and_grant_retry(ctx, packet_id, claim_token, refusal_note).await?;
     Err(failure)
 }
 
@@ -768,7 +730,7 @@ async fn run_attempt(
         Ok(prepared) => prepared,
         Err(failure) => {
             let transport = format!("transport: the attempt could not be prepared: {failure}");
-            let refusal = format!("attempt refused before spawn: {failure}");
+            let refusal = format!("unspawned: attempt refused before spawn: {failure}");
             return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
                 .await;
         }
@@ -790,7 +752,7 @@ async fn run_attempt(
         Ok(invocation) => invocation,
         Err(failure) => {
             let transport = format!("transport: the provider invocation failed: {failure}");
-            let refusal = format!("attempt refused before spawn: {failure}");
+            let refusal = format!("unspawned: attempt refused before spawn: {failure}");
             return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
                 .await;
         }
@@ -1161,12 +1123,14 @@ pub async fn land_result(
     }
 }
 
-/// Record a transport failure and grant the retry: fail the packet with the
-/// `transport:` note, then append the `proto.retry` event carrying the
-/// packet's transport-failure count and the backoff deadline computed from
-/// the failed attempt's `ended_at` — what lets kill-matrix case 7 assert
-/// the fix round is untouched.
-async fn fail_and_grant_retry(
+/// Fail the attempt and charge its packet's bounded budget: store the note,
+/// then append the `proto.retry` grant carrying the packet's failure count
+/// and the backoff deadline computed from the failed attempt's `ended_at` —
+/// what lets kill-matrix case 7 assert the fix round is untouched.
+///
+/// The note's own prefix is what classifies the failure (`transport:` or
+/// `unspawned:`); both stand on this one budget.
+pub(crate) async fn fail_and_grant_retry(
     ctx: &Ctx,
     packet_id: &str,
     claim_token: &str,
@@ -1188,27 +1152,14 @@ async fn fail_and_grant_retry(
         })
         .await?
     };
-    let count = prior_transport_failures(ctx, &run_id, packet_id).await + 1;
-    let deadline = forged_proto::backoff_deadline(&failed_at, count.saturating_sub(1))
-        .unwrap_or_else(|_| now_iso());
-    let event = ProtoEvent::Retry {
-        packet_id: packet_id.to_owned(),
-        transport_failures: count,
-        retry_after: deadline,
-    };
-    {
-        let run_id = run_id.clone();
-        on_ledger(&ctx.ledger, move |l| {
-            forged_proto::record(l, &run_id, event).map_err(|e| match e {
-                forged_proto::ProtoError::Ledger(inner) => inner,
-                other => forged_ledger::LedgerError::Internal {
-                    message: other.to_string(),
-                },
-            })
-        })
-        .await?;
-    }
-    Ok(PacketOutcome::Transport(note))
+    charge_retry(ctx, &run_id, packet_id, failed_at).await?;
+    // The note's prefix classified the failure for the ledger; report the
+    // same distinction to the caller rather than calling an unspawned seat
+    // a transport failure.
+    Ok(match forged_proto::classify_failure(&note) {
+        forged_proto::FailureKind::Unspawned => PacketOutcome::Unspawned(note),
+        _ => PacketOutcome::Transport(note),
+    })
 }
 
 #[cfg(test)]

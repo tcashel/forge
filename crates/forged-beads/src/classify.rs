@@ -89,21 +89,24 @@ pub enum BdError {
         /// The child's full stderr.
         stderr: String,
     },
-    /// bd ANSWERED with its schema-1 envelope and the answer was unusable:
-    /// no `data` key at all, or a payload carrying none of what was asked
-    /// for. An outcome, never a transport failure — every retry re-reads the
-    /// same envelope. Wire mapping: `BEADS_ERROR`.
+    /// bd ANSWERED and the answer was unusable: a schema-1 envelope with no
+    /// `data` key or a payload carrying none of what was asked for, or an
+    /// envelope under a `schema_version` this build does not read. An
+    /// outcome, never a transport failure — every retry re-reads the same
+    /// envelope, and a schema this build cannot read means bd was UPGRADED,
+    /// which retrying cannot resolve. Wire mapping: `BEADS_ERROR`.
     Envelope {
         /// What was being run.
         context: String,
         /// Both output streams, for diagnosis.
         detail: String,
     },
-    /// NO envelope: stdout would not parse at all, or carried a
-    /// `schema_version` other than 1. bd never answered, so this rides the
-    /// bounded transport budget exactly like a spawn failure or a timeout.
-    /// Split out of [`BdError::Envelope`] because that variant also carries
-    /// genuine answers and must stay terminal. Wire mapping: `BEADS_ERROR`.
+    /// NO envelope: stdout would not parse at all. bd never answered, so this
+    /// rides the bounded transport budget exactly like a spawn failure or a
+    /// timeout. Split out of [`BdError::Envelope`] because that variant
+    /// carries genuine ANSWERS and must stay terminal — a wrong
+    /// `schema_version` is one of them, not this. Wire mapping:
+    /// `BEADS_ERROR`.
     Unparseable {
         /// What was being run.
         context: String,
@@ -141,14 +144,29 @@ impl BdError {
     /// before it could write, unparseable stdout) says nothing about the
     /// store and is the one thing worth trying again.
     ///
-    /// The Dolt embedded lock is the documented exception, and it is checked
-    /// FIRST, against every variant: bd answered, but with a lock that
-    /// clears on its own. READS need that check here and nowhere else —
-    /// `invoke::read` runs no classifier and no retries, so a `bd show`
-    /// refused by the lock a live run or an epic wave holds arrives as a
-    /// finished error and would otherwise take the run down instead of
-    /// riding the budget.
+    /// AN ANSWER IS CLASSIFIED ON WHAT IT SAYS, never on the fact that it
+    /// parsed. The Dolt embedded lock is the documented case and it is
+    /// checked against every variant including the well-formed ones: bd
+    /// answered, but with a lock that clears on its own. READS need that
+    /// check here and nowhere else — `invoke::read` runs no classifier and no
+    /// retries, so a `bd show` refused by the lock a live run or an epic wave
+    /// holds arrives as a finished error and would otherwise take the run
+    /// down instead of riding the budget.
+    ///
+    /// The converse holds too: an envelope that parses under a
+    /// `schema_version` this build does not read is an ANSWER — bd was
+    /// upgraded — and stays terminal. THAT ANSWER OUTRANKS THE CAUSE TEXT,
+    /// which is why it is tested first. A cause is worth retrying only when a
+    /// later attempt could read a different outcome, and no attempt against
+    /// an upgraded bd can: the lock clearing would only yield the same
+    /// unreadable dialect, so a lock marker inside an unsupported envelope
+    /// would otherwise burn the whole bounded budget on a condition the
+    /// budget cannot resolve. A DECLARED version is the test — stdout with no
+    /// envelope at all declares nothing and keeps riding the budget.
     pub fn is_transport(&self) -> bool {
+        if self.unretryable_answer() {
+            return false;
+        }
         if self.haystack().contains(DOLT_LOCK_REFUSAL) {
             return true;
         }
@@ -162,14 +180,27 @@ impl BdError {
             // `{"data":{"error":"no issues found matching the provided
             // IDs"},"schema_version":1}` — and a transport failure when it
             // did not.
-            BdError::Beads { stdout, .. } => {
-                let lenient = envelope::parse_lenient(stdout);
-                !(lenient.parsed && lenient.schema_ok)
-            }
+            BdError::Beads { stdout, .. } => !envelope::parse_lenient(stdout).parsed,
             BdError::Envelope { .. }
             | BdError::LeaseHeld { .. }
             | BdError::HeartbeatRefused { .. }
             | BdError::SlotBusy { .. } => false,
+        }
+    }
+
+    /// Whether this error carries an answer NO RETRY CAN CHANGE — the one
+    /// class that outranks the cause-text check.
+    ///
+    /// [`BdError::Envelope`] is that variant by construction: bd answered in
+    /// a dialect or a shape this build cannot use, and the variant exists to
+    /// stay terminal. `Beads` carries the stdout to re-read the declared
+    /// `schema_version` from. Either way a retry earned by a cause marker
+    /// could only re-read the same unusable answer.
+    fn unretryable_answer(&self) -> bool {
+        match self {
+            BdError::Beads { stdout, .. } => envelope::parse_lenient(stdout).unsupported_schema(),
+            BdError::Envelope { .. } => true,
+            _ => false,
         }
     }
 
@@ -264,15 +295,15 @@ pub(crate) enum Class {
         /// The refusal text (stderr, or the envelope error when stderr empty).
         detail: String,
     },
-    /// Zero exit and a schema-1 envelope that carried no `data` key:
-    /// terminal, because bd answered.
+    /// bd answered and the answer is unusable: a schema-1 envelope carrying
+    /// no `data` key, or an envelope under a `schema_version` this build does
+    /// not read. Terminal either way, because bd answered.
     EnvelopeBad {
         /// Both streams for diagnosis.
         detail: String,
     },
-    /// Zero exit but unparseable stdout or wrong `schema_version`: terminal
-    /// for the write policy, but bd never answered, so the error it mints
-    /// rides the transport budget.
+    /// Zero exit and unparseable stdout: terminal for the write policy, but
+    /// bd never answered, so the error it mints rides the transport budget.
     Unparseable {
         /// Both streams for diagnosis.
         detail: String,
@@ -284,11 +315,26 @@ pub(crate) enum Class {
 /// Classify one attempt. All text matching runs against the combined haystack
 /// of raw stdout, the envelope's error string, and stderr — case-sensitive
 /// substring, evaluated regardless of exit status, operation-aware.
+///
+/// An envelope declaring a `schema_version` this build does not read is
+/// settled BEFORE any of that matching, because it is the one answer no
+/// retry can change. Everything after it describes a condition a later
+/// attempt could plausibly find cleared.
 pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -> Class {
     let lenient = envelope::parse_lenient(&out.stdout);
     let env_err = lenient.error.clone().unwrap_or_default();
     let haystack = format!("{}\n{}\n{}", out.stdout, env_err, out.stderr);
 
+    if !raw_mode && lenient.unsupported_schema() {
+        // FIRST, ahead of every cause-text check below and of the
+        // operation-specific arms: bd DECLARED a dialect this build does not
+        // read, and no retry can read a different one. A lock marker inside
+        // such an envelope would otherwise take the contention schedule and
+        // spend the whole bounded budget on an upgrade that outlives it.
+        return Class::EnvelopeBad {
+            detail: format!("unsupported schema_version; {}", both_streams(out)),
+        };
+    }
     if haystack.contains(DOLT_LOCK_REFUSAL) {
         return Class::Contention;
     }
@@ -317,9 +363,16 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
                 },
             };
         }
-        if out.exit == Some(0) && (!lenient.parsed || !lenient.schema_ok) {
+        if out.exit == Some(0) && !lenient.parsed {
             return Class::Unparseable {
                 detail: both_streams(out),
+            };
+        }
+        if out.exit == Some(0) && !lenient.schema_ok {
+            // Parsed, but declaring no version at all — the check above took
+            // every declared-and-unreadable one.
+            return Class::EnvelopeBad {
+                detail: format!("unsupported schema_version; {}", both_streams(out)),
             };
         }
         let detail = if out.stderr.trim().is_empty() {
@@ -339,9 +392,18 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
                 },
             };
         }
-        if !lenient.parsed || !lenient.schema_ok {
+        if !lenient.parsed {
             return Class::Unparseable {
                 detail: both_streams(out),
+            };
+        }
+        if !lenient.schema_ok {
+            // Parsed, but declaring no version at all — the declared-and-
+            // unreadable case is settled at the top of this function.
+            // Terminal either way: bd handed back a payload this build has no
+            // envelope contract for.
+            return Class::EnvelopeBad {
+                detail: format!("unsupported schema_version; {}", both_streams(out)),
             };
         }
         if lenient.error.is_some() {
@@ -811,6 +873,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_write_policy_splits_unparseable_from_unsupported() {
+        // The two are opposite answers to "did bd speak?". Unparseable
+        // stdout says no and rides the transport budget; an envelope under a
+        // schema this build cannot read says YES — from a bd that has been
+        // upgraded — and retrying it forever never resolves the upgrade.
+        let zero_exit = |stdout: &str| {
+            Ok(RawOutcome {
+                exit: Some(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        };
+
+        let mut runner = Canned::new(vec![zero_exit("<html>502</html>")]);
+        let err = write_policy(&other_op(), &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Unparseable { .. }), "got {err:?}");
+        assert!(err.is_transport(), "no envelope means bd never answered");
+
+        let mut runner = Canned::new(vec![zero_exit(
+            r#"{"data": {"id": "beads-1al"}, "schema_version": 2}"#,
+        )]);
+        let err = write_policy(&other_op(), &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert!(
+            !err.is_transport(),
+            "a bd upgrade is an answer, not an outage: {err}"
+        );
+        assert_eq!(runner.runs, 1, "an answer is never retried");
+
+        // The same split on the heartbeat path, which classifies separately.
+        let op = WriteOp::Heartbeat {
+            bead: "beads-1al".to_string(),
+            actor: "me".to_string(),
+        };
+        let mut runner = Canned::new(vec![zero_exit(r#"{"data": {}, "schema_version": 2}"#)]);
+        let err = write_policy(&op, &mut runner, false, "bd heartbeat")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert!(!err.is_transport());
+    }
+
+    #[tokio::test]
+    async fn a_nonzero_exit_carrying_an_unsupported_envelope_still_answered() {
+        // `is_transport`'s own arm for `Beads`: bd spoke, in a dialect this
+        // build does not read. It is still an answer, and folding "wrong
+        // schema" into "no envelope" made every one of these retryable.
+        let upgraded = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: r#"{"data":{"error":"no issues found"},"schema_version":2}"#.to_string(),
+            stderr: String::new(),
+        };
+        assert!(!upgraded.is_transport(), "{upgraded}");
+
+        let silent = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: String::new(),
+            stderr: "killed".to_string(),
+        };
+        assert!(silent.is_transport(), "no envelope at all: {silent}");
+    }
+
+    #[tokio::test]
     async fn a_terminally_timed_out_heartbeat_never_becomes_lease_held() {
         let t = || {
             Err(BdError::Timeout {
@@ -1043,5 +1174,101 @@ mod tests {
             stderr: String::new(),
         };
         assert!(!refusal.is_transport());
+    }
+
+    /// The lock marker inside an envelope this build cannot read.
+    ///
+    /// Both markers are present and they disagree: the lock says "try again",
+    /// the declared version says "this build never reads bd again". The
+    /// version wins, because the retry the lock earns can only re-read the
+    /// same unreadable dialect — and taking the lock's answer spends the
+    /// whole bounded budget on a condition the budget cannot clear.
+    #[test]
+    fn an_upgraded_bd_stays_terminal_even_holding_the_dolt_lock() {
+        let upgraded_and_locked = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(0),
+            stdout: format!(
+                "{{\"data\":{{\"error\":\"{DOLT_LOCK_REFUSAL}\"}},\"schema_version\":2}}"
+            ),
+            stderr: String::new(),
+        };
+        assert!(
+            !upgraded_and_locked.is_transport(),
+            "no retry re-reads an upgrade: {upgraded_and_locked}"
+        );
+
+        // `invoke::read` mints this shape for the same stdout, and it carries
+        // the marker in its detail.
+        let as_read = BdError::Envelope {
+            context: "bd show beads-1al".to_string(),
+            detail: format!("unsupported schema_version; stdout: {DOLT_LOCK_REFUSAL}"),
+        };
+        assert!(!as_read.is_transport(), "{as_read}");
+
+        // And the split holds: stdout carrying no envelope at all declares no
+        // version, so the lock still rides the budget.
+        let no_envelope = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: String::new(),
+            stderr: DOLT_LOCK_REFUSAL.to_string(),
+        };
+        assert!(no_envelope.is_transport(), "{no_envelope}");
+    }
+
+    /// The same disagreement on the WRITE path, where the retry actually
+    /// costs attempts: `classify_attempt` must not hand an upgraded bd to the
+    /// contention schedule.
+    #[tokio::test]
+    async fn an_upgraded_bd_holding_the_lock_is_never_retried_on_the_write_path() {
+        let locked_and_upgraded = || RawOutcome {
+            exit: Some(1),
+            stdout: format!(
+                "{{\"data\":{{\"error\":\"{DOLT_LOCK_REFUSAL}\"}},\"schema_version\":2}}"
+            ),
+            stderr: String::new(),
+        };
+        let op = WriteOp::Claim {
+            bead: Some("beads-1al".to_string()),
+            actor: "me".to_string(),
+        };
+        assert!(matches!(
+            classify_attempt(&op, &locked_and_upgraded(), false),
+            Class::EnvelopeBad { .. }
+        ));
+
+        // The heartbeat path classifies separately and must agree.
+        let heartbeat = WriteOp::Heartbeat {
+            bead: "beads-1al".to_string(),
+            actor: "me".to_string(),
+        };
+        assert!(matches!(
+            classify_attempt(&heartbeat, &locked_and_upgraded(), false),
+            Class::EnvelopeBad { .. }
+        ));
+
+        // End to end: one attempt, terminal, and not charged as transport.
+        let mut runner = Canned::new(vec![Ok(locked_and_upgraded())]);
+        let err = write_policy(&op, &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert!(!err.is_transport(), "{err}");
+        assert_eq!(runner.runs, 1, "an upgrade is never retried");
+
+        // A schema-1 envelope carrying the same lock keeps the contention
+        // schedule it has always had.
+        let locked = RawOutcome {
+            exit: Some(1),
+            stdout: format!(
+                "{{\"data\":{{\"error\":\"{DOLT_LOCK_REFUSAL}\"}},\"schema_version\":1}}"
+            ),
+            stderr: String::new(),
+        };
+        assert!(matches!(
+            classify_attempt(&op, &locked, false),
+            Class::Contention
+        ));
     }
 }

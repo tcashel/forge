@@ -562,6 +562,114 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
         row.body_json, packet.body_json,
         "a re-pin revises the spec and leaves the definition alone"
     );
+
+    // AND CLAIMABLE THERE — the half a replayed re-pin passes by reporting
+    // `Ok` over a row still pinned at B. The claim fences on the row, so a
+    // row left behind refuses `SpecDrift` on every claim from here on.
+    let ledger = env.ledger();
+    let attempts: Vec<forged_ledger::AttemptRow> = (1..=8)
+        .filter_map(|id| ledger.get_attempt(id).ok())
+        .filter(|attempt| attempt.packet_id == packet.packet_id)
+        .collect();
+    ledger.close().expect("close");
+    assert!(
+        attempts.len() > 1,
+        "the advance at the original body must claim the packet again: {attempts:?}"
+    );
+    let latest = attempts.last().expect("an attempt");
+    assert_ne!(
+        latest.state,
+        forged_ledger::AttemptState::Failed,
+        "the re-claim at the pinned body must not refuse: {latest:?}"
+    );
+    let body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("seat spec at {}: {e}", row.spec_path));
+    assert!(
+        body.contains(ACCEPTANCE) && !body.contains("- revised acceptance"),
+        "the seat must read the body the row followed back to: {body}"
+    );
+}
+
+#[test]
+fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
+    // The guards live in `Ledger::open_packet_with_id`'s own transaction,
+    // which is the whole reason the re-pin may leave the operation layer:
+    // dropping the fence must not drop a refusal with it.
+    let env = TestEnv::new("forged-bead-spec-guards");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-guarded", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-guarded",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    let packet = advance_to_open_packet(&env, "bead-guarded");
+
+    // A LIVE ATTEMPT refuses the re-pin: a seat's spec must never move
+    // underneath it.
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "packet claim: {claimed}");
+    let ledger = env.ledger();
+    let mut revised = forged_ledger::NewPacket {
+        run_id: packet.run_id.clone(),
+        stage: packet.stage,
+        seq: packet.seq,
+        spec_path: packet.spec_path.clone(),
+        spec_sha256: "cafe".to_owned(),
+        spec_revision: Some("a-later-write-token".to_owned()),
+        body_json: packet.body_json.clone(),
+    };
+    let refused = ledger
+        .open_packet_with_id(revised.clone(), packet.packet_id.clone())
+        .expect_err("a live attempt must refuse the re-pin");
+    assert_eq!(refused.code(), forged_types::ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger
+            .get_packet(&packet.packet_id)
+            .expect("packet row")
+            .spec_sha256,
+        packet.spec_sha256,
+        "the refused re-pin changed nothing"
+    );
+
+    // A DIFFERING BODY is a changed definition, not a revised spec, and is
+    // refused with `InvalidRequest` whatever the attempt state.
+    revised.spec_sha256 = packet.spec_sha256.clone();
+    revised.spec_revision = packet.spec_revision.clone();
+    revised.body_json.push(' ');
+    let refused = ledger
+        .open_packet_with_id(revised, packet.packet_id.clone())
+        .expect_err("a differing definition must be refused");
+    assert_eq!(refused.code(), forged_types::ErrorCode::InvalidRequest);
+    assert_eq!(
+        ledger
+            .get_packet(&packet.packet_id)
+            .expect("packet row")
+            .body_json,
+        packet.body_json,
+        "the refused re-open changed nothing"
+    );
+    ledger.close().expect("close");
+
+    // End to end: with that live attempt standing, an operator edit cannot
+    // be adopted under the seat either. The refusal comes from adoption's
+    // `assert_pinned`, NOT from the re-pin guard above — a live attempt is
+    // adopted rather than re-claimed, so the drive path never reaches the
+    // re-pin. Both doors are shut; they are different doors.
+    env.set_bead_field("bead-guarded", "acceptance", "- revised acceptance");
+    let (code, drifted) = env.forged(&["run", "advance", "--run", "bead-guarded"]);
+    assert_ne!(
+        code, 0,
+        "a live seat must refuse the drifted bead: {drifted}"
+    );
+    assert_eq!(drifted["error"]["code"], json!("SPEC_DRIFT"));
 }
 
 #[test]
@@ -752,6 +860,84 @@ fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
     assert!(
         exhausted["result"]["action"]["stop"]["providerUnavailable"].is_object(),
         "a spent budget stops the run instead of retrying forever: {exhausted}"
+    );
+}
+
+#[test]
+fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
+    // The other half of the budget's contract, and the one that says it is a
+    // BUDGET rather than a countdown to a stop: a bounded retry that only
+    // ever ends in exhaustion is indistinguishable from a hang. bd going away
+    // and coming back must leave the run exactly where it would have been.
+    let env = TestEnv::new("forged-bead-spec-recovers");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-recovers", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-recovers",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    let packet = advance_to_open_packet(&env, "bead-recovers");
+
+    // One outage, charged: the budget of three is now one down.
+    env.set_bd_show_unreachable(true);
+    let (code, charged) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
+    assert_eq!(
+        code, 0,
+        "a transport failure is recorded, not raised: {charged}"
+    );
+    assert_eq!(
+        latest_retry(&env, "bead-recovers")["transportFailures"],
+        json!(1),
+        "the outage is charged"
+    );
+
+    // bd comes back well inside the budget.
+    env.set_bd_show_unreachable(false);
+    expire_retry_deadline(&env, "bead-recovers");
+    let (code, recovered) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
+    assert_eq!(
+        code, 0,
+        "the packet must claim once bd answers: {recovered}"
+    );
+
+    // The seat ran, at the body the packet pins, and the outage cost nothing
+    // beyond the one charge it earned.
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the packet was claimed");
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    ledger.close().expect("close");
+    assert_eq!(attempt.packet_id, packet.packet_id);
+    assert_eq!(
+        row.spec_sha256, packet.spec_sha256,
+        "a recovered claim pins the same body it opened at: {row:?}"
+    );
+    assert_eq!(
+        latest_retry(&env, "bead-recovers")["transportFailures"],
+        json!(1),
+        "a successful claim charges the budget nothing further"
+    );
+    let body = std::fs::read_to_string(&row.spec_path)
+        .unwrap_or_else(|e| panic!("seat spec at {}: {e}", row.spec_path));
+    assert!(
+        body.contains(ACCEPTANCE),
+        "the recovered seat reads the rendered body: {body}"
+    );
+
+    // And the run goes on to finish: the outage delayed it, nothing more.
+    let driven = wait_for(&env, &["run", "drive", "--run", "bead-recovers"], |value| {
+        value["ok"] == json!(true)
+    });
+    assert!(
+        driven["result"]["terminal"]["done"].is_object(),
+        "an outage inside the budget must not change where the run ends: {driven}"
     );
 }
 

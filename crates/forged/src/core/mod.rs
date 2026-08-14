@@ -344,6 +344,12 @@ pub fn session_claimant(packet_id: &str, provider: &str) -> String {
 /// the cause, and the reclaim saga has to time out a lease that no process
 /// is renewing.
 ///
+/// The note is classified `unspawned:`, never left to classify as semantic:
+/// no provider existed for this attempt, so it is not the stage's answer.
+/// A plain note would be merged into a review fan-out as `RequestChanges`
+/// and would spend the run's one fix round — see `settle_unspawned`, which
+/// this shares its settlement with.
+///
 /// The ORIGINAL failure is what comes back — a ledger error while settling is
 /// logged, not substituted, because the cause is what the caller needs to
 /// report and the saga remains the backstop for the row.
@@ -353,13 +359,9 @@ pub async fn abandon_claim(
     claim_token: &str,
     failure: Failure,
 ) -> Failure {
-    let note = format!("attempt refused before spawn: {failure}");
-    let owned_packet = packet_id.to_owned();
-    let token = claim_token.to_owned();
-    if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.fail_packet(&owned_packet, &token, &note)
-    })
-    .await
+    let note = format!("unspawned: attempt refused before spawn: {failure}");
+    if let Err(error) =
+        crate::adapters::execute::fail_and_grant_retry(ctx, packet_id, claim_token, note).await
     {
         tracing::warn!(packet_id, %error, "could not retire an unspawned attempt");
     }
