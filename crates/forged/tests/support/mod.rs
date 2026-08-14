@@ -663,11 +663,30 @@ case "$cmd" in
     id=$2
     actor=$(val --actor "$@")
     new_status=$(val --status "$@")
-    has_assignee=0; prev=""
+    has_assignee=0; has_if_assignee=0; expected_assignee=""; prev=""
     for a in "$@"; do
       [ "$prev" = "--assignee" ] && has_assignee=1
+      if [ "$prev" = "--if-assignee" ]; then
+        has_if_assignee=1
+        expected_assignee=$a
+      fi
       prev=$a
     done
+    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
+    # Deterministic close-CAS race: a successor claim lands after forged's
+    # pre-read but before bd evaluates --if-assignee. The guarded update must
+    # then refuse without changing status or clearing the successor.
+    successor_on_guard="$state/$id.successor-on-guard"
+    if [ "$has_if_assignee" = 1 ] && [ -f "$successor_on_guard" ]; then
+      cur=$(cat "$successor_on_guard")
+      printf '%s' "$cur" > "$state/$id.assignee"
+      rm -f "$successor_on_guard"
+      bump_revision "$id"
+    fi
+    if [ "$has_if_assignee" = 1 ] && [ "$cur" != "$expected_assignee" ]; then
+      printf '{"schema_version":1,"data":{"error":"stale --if-assignee guard: expected %s, found %s"}}\n' "$expected_assignee" "$cur"
+      exit 13
+    fi
     if [ -n "$new_status" ]; then
       printf '%s' "$new_status" > "$state/$id.status"
       [ "$has_assignee" = 1 ] && rm -f "$state/$id.assignee"
@@ -681,7 +700,6 @@ case "$cmd" in
       printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
       exit 0
     fi
-    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
     if [ -z "$cur" ] || [ "$cur" = "$actor" ]; then
       printf '%s' "$actor" > "$state/$id.assignee"
       bump_revision "$id"
@@ -1224,6 +1242,15 @@ impl TestEnv {
         let state = self.beads_dir.join("shim-state");
         std::fs::create_dir_all(&state).expect("shim state");
         std::fs::write(state.join(format!("{bead}.assignee")), holder).expect("set assignee");
+    }
+
+    /// Arrange for the bd shim to install a successor immediately before its
+    /// next `--if-assignee` check, simulating the close-CAS race precisely.
+    pub fn set_successor_on_guard(&self, bead: &str, holder: &str) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{bead}.successor-on-guard")), holder)
+            .expect("set successor race");
     }
 
     /// Mark a bead's lease UNEXPIRED in the bd shim state: every scoped

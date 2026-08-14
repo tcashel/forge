@@ -109,21 +109,25 @@ async fn settle_bead(
         ),
         _ => settlement.reason.clone(),
     };
-    forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
     match settlement.outcome {
         RunOutcome::Landed => {
-            let closed = forged_beads::close_issue(&bd, bead_id, &actor, &detail).await?;
-            let released = forged_beads::release_issue(&bd, bead_id, &actor).await?;
+            // Ownership is the first mutation and is repeated inside bd's
+            // atomic update. A successor or an unowned Bead therefore gets
+            // neither closed nor annotated by this predecessor. Close and
+            // release are one CAS, removing the old partially-closed seam.
+            let closed = forged_beads::close_held_issue(&bd, bead_id, &actor).await?;
+            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
-                "status": released.status,
-                "assignee": released.assignee,
+                "status": closed.status,
+                "assignee": closed.assignee,
                 "closed": closed.status == "closed",
-                "released": released.assignee.is_none(),
+                "released": closed.assignee.is_none(),
             }))
         }
         RunOutcome::Blocked | RunOutcome::InputRequired => {
+            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
             let issue = forged_beads::release_unresolved_issue(&bd, bead_id, &actor, true).await?;
             Ok(json!({
                 "id": bead_id,
@@ -134,6 +138,7 @@ async fn settle_bead(
             }))
         }
         RunOutcome::Cancelled | RunOutcome::Superseded => {
+            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
             let issue = forged_beads::release_unresolved_issue(&bd, bead_id, &actor, false).await?;
             Ok(json!({
                 "id": bead_id,
@@ -146,11 +151,14 @@ async fn settle_bead(
         // Clean stays claimed while its reviewed delivery waits for the
         // explicit landed settlement. AcceptedRisk is rejected by parse and
         // owned by the review acceptance operation.
-        RunOutcome::Clean | RunOutcome::AcceptedRisk => Ok(json!({
-            "id": bead_id,
-            "settled": true,
-            "preserved": true,
-        })),
+        RunOutcome::Clean | RunOutcome::AcceptedRisk => {
+            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
+            Ok(json!({
+                "id": bead_id,
+                "settled": true,
+                "preserved": true,
+            }))
+        }
     }
 }
 
@@ -185,11 +193,14 @@ pub(crate) async fn settle(
         stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
     let bead = match settle_bead(ctx, run_id, &run.bead_id, &settlement).await {
         Ok(value) => value,
-        Err(error) if settlement.outcome != RunOutcome::Landed => {
+        Err(error) => {
             let pending = json!({
                 "schemaVersion": 1,
                 "beadId": run.bead_id,
                 "outcome": settlement.outcome.as_str(),
+                "expectedAssignee": run_holder(&run.bead_id),
+                "settled": false,
+                "pending": true,
                 "error": error.to_string(),
             });
             let event_run = run_id.to_owned();
@@ -201,7 +212,6 @@ pub(crate) async fn settle(
             .await?;
             pending
         }
-        Err(error) => return Err(error),
     };
 
     // Squash merge ancestry is deliberately irrelevant: a clean linked

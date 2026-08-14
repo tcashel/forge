@@ -63,6 +63,25 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
         "a clean squash-merged branch retires without requiring ancestry"
     );
     assert_eq!(env.assignee(&bead), None);
+    let close_calls: Vec<_> = env
+        .bd_calls()
+        .into_iter()
+        .filter(|call| call.starts_with(&format!("update {bead} ")))
+        .collect();
+    assert!(
+        close_calls.iter().any(|call| {
+            call.contains("--status closed")
+                && call.contains("--assignee")
+                && call.contains(&format!("--if-assignee forged:{bead}:0"))
+        }),
+        "landed close must use bd's assignee CAS: {close_calls:?}"
+    );
+    assert!(
+        env.bd_calls()
+            .iter()
+            .all(|call| !call.starts_with(&format!("close {bead} "))),
+        "unguarded bd close must not be used for landed settlement"
+    );
     assert_eq!(
         std::fs::read_to_string(env.beads_dir.join(format!("shim-state/{bead}.status")))
             .expect("status"),
@@ -97,6 +116,129 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
     assert_eq!(code, 0, "{replay}");
     assert_eq!(replay["reused"], json!(true));
     assert_eq!(env.bd_calls().len(), before, "replay fires no Beads write");
+}
+
+#[test]
+fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
+    let env = TestEnv::new("forged-run-landed-successor");
+    env.forged(&["init"]);
+    let run = "landed-predecessor";
+    let bead = seed(&env, run);
+    let successor = "forged:successor:0";
+    let revision_before = env.bead_revision(&bead);
+    let revision_seq_path = env.beads_dir.join(format!("shim-state/{bead}.revseq"));
+    let revision_seq_before: u64 = std::fs::read_to_string(&revision_seq_path)
+        .expect("revision sequence before")
+        .parse()
+        .expect("numeric revision sequence");
+    env.set_successor_on_guard(&bead, successor);
+    let sha = "b".repeat(40);
+
+    let (code, response) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--reason",
+        "predecessor delivery landed",
+        "--pr",
+        "122",
+        "--sha",
+        &sha,
+    ]);
+    assert_eq!(code, 0, "{response}");
+    assert_eq!(response["ok"], json!(true), "{response}");
+    assert_eq!(response["result"]["bead"]["pending"], json!(true));
+    assert_eq!(response["result"]["bead"]["settled"], json!(false));
+    assert_eq!(env.assignee(&bead).as_deref(), Some(successor));
+    assert_eq!(
+        std::fs::read_to_string(env.beads_dir.join(format!("shim-state/{bead}.status")))
+            .expect("status"),
+        "in_progress"
+    );
+    assert_ne!(
+        env.bead_revision(&bead),
+        revision_before,
+        "the fixture must actually land the successor between read and CAS"
+    );
+    assert_eq!(
+        std::fs::read_to_string(&revision_seq_path)
+            .expect("revision sequence")
+            .parse::<u64>()
+            .expect("numeric revision sequence"),
+        revision_seq_before + 1,
+        "only the successor claim may mutate the Bead; refused close/comment add no revision"
+    );
+    assert!(
+        !env.beads_dir
+            .join(format!("shim-state/{bead}.comment"))
+            .exists(),
+        "ownership must be checked before the terminal comment mutation"
+    );
+
+    let calls = env.bd_calls();
+    assert!(
+        calls
+            .iter()
+            .all(|call| !call.starts_with(&format!("close {bead} "))),
+        "late predecessor must never issue an unguarded close: {calls:?}"
+    );
+    let guarded_updates: Vec<_> = calls
+        .iter()
+        .filter(|call| call.starts_with(&format!("update {bead} ")))
+        .collect();
+    assert!(
+        !guarded_updates.is_empty()
+            && guarded_updates.iter().all(|call| {
+                call.contains("--status closed")
+                    && call.contains(&format!("--if-assignee forged:{bead}:0"))
+            }),
+        "every attempted close must carry the predecessor CAS: {guarded_updates:?}"
+    );
+    let ledger = env.ledger();
+    let pending = ledger
+        .list_events(Some(run), 0, 4096)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.kind == "run.bead-settlement.pending")
+        .expect("visible pending settlement event");
+    let payload: serde_json::Value =
+        serde_json::from_str(&pending.payload_json).expect("pending payload");
+    assert_eq!(payload["beadId"], json!(bead));
+    assert_eq!(payload["outcome"], json!("landed"));
+    assert_eq!(
+        payload["expectedAssignee"],
+        json!(format!("forged:{bead}:0"))
+    );
+    assert!(
+        payload["error"]
+            .as_str()
+            .is_some_and(|error| error.contains(successor)),
+        "{payload}"
+    );
+    ledger.close().expect("close ledger");
+
+    let calls_before_replay = env.bd_calls().len();
+    let (code, replay) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--reason",
+        "predecessor delivery landed",
+        "--pr",
+        "122",
+        "--sha",
+        &sha,
+    ]);
+    assert_eq!(code, 0, "{replay}");
+    assert_eq!(replay["reused"], json!(true), "{replay}");
+    assert_eq!(env.bd_calls().len(), calls_before_replay);
+    assert_eq!(env.assignee(&bead).as_deref(), Some(successor));
 }
 
 #[test]
@@ -151,7 +293,7 @@ fn status_flags_an_orphaned_in_progress_bead() {
     assert!(
         health["detail"]
             .as_str()
-            .is_some_and(|detail| detail.contains("no live controller")),
+            .is_some_and(|detail| detail.contains("execution is no longer live")),
         "{response}"
     );
 }
