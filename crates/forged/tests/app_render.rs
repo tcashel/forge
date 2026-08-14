@@ -10,7 +10,10 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{render_cost, render_dispatch, render_resolution, require_node};
+use support::{
+    render_cost, render_dispatch, render_resolution, render_resolution_without_server_tools,
+    require_node,
+};
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
 fn row(run_id: &str, seat: &str, basis: &str, cost: f64, searches: u64) -> Value {
@@ -300,5 +303,54 @@ fn an_unknown_schema_is_still_refused_by_ingest() {
         json!("unexpected"),
         "an unknown schema is refused: {}",
         dispatched.error
+    );
+}
+
+/// A host that does not proxy `tools/call` cannot navigate, so the chooser
+/// must not offer a pick it cannot serve.
+///
+/// `refresh`'s own `!host.connected` guard does not cover this: the handshake
+/// sets `connected` true and only afterwards disables the controls, so a card
+/// clicked here would send a call the host refuses and replace a chooser the
+/// operator can still read with an `unreachable` error.
+#[test]
+fn a_host_without_server_tools_gets_candidates_it_cannot_click() {
+    let Some(node) = require_node() else { return };
+    let resolution = json!({
+        "query": "beads-mk",
+        "reason": "ambiguous",
+        "candidates": [
+            {"id": "beads-mk2", "kind": "slice", "state": "active", "beadId": "beads-mk2"},
+            {"id": "beads-mk9", "kind": "epic", "state": "stopped", "beadId": "beads-mk9"},
+        ],
+    });
+
+    let capable = render_resolution(&node, &resolution);
+    assert_eq!(
+        capable.picks().len(),
+        2,
+        "a capable host picks: {}",
+        capable.text
+    );
+
+    let limited = render_resolution_without_server_tools(&node, &resolution);
+    assert!(
+        limited.picks().is_empty(),
+        "no card may fire a call this host cannot serve: {}",
+        limited.text
+    );
+    // The candidates are still WORTH SEEING — the answer to "which one did
+    // you mean" is information, not a button.
+    for expected in ["beads-mk2", "beads-mk9", "slice", "epic"] {
+        assert!(
+            limited.text.contains(expected),
+            "the chooser still names {expected}: {}",
+            limited.text
+        );
+    }
+    assert!(
+        limited.text.contains("does not proxy tool calls"),
+        "and says why they cannot be opened: {}",
+        limited.text
     );
 }

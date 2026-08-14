@@ -1656,6 +1656,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    * be re-asked with. A wrong guess is a menu, not a dead end.
    */
   function viewResolution(resolution) {
+    const canPick = !!host.capabilities.serverTools;
     const candidates = arr(resolution.candidates);
     const box = panel("Which one", resolution.reason === "ambiguous"
       ? `${candidates.length} ids start with this one`
@@ -1667,8 +1668,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
     const grid = el("div", "beads");
     for (const candidate of candidates) {
-      const card = el("button", "bead bead--pick");
+      // Pickable only where a pick can be served; elsewhere the same card
+      // renders as the information it is, with its id copyable.
+      const card = el("button", canPick ? "bead bead--pick" : "bead");
       card.type = "button";
+      card.disabled = !canPick;
       const top = el("div", "bead__top");
       top.append(el("span", "bead__id", candidate.id));
       top.append(chip(candidate.kind || "unknown", candidate.kind === "epic" ? "warn" : "idle"));
@@ -1678,15 +1682,29 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       foot.append(el("span", "", candidate.state || "unknown"));
       if (candidate.branch) foot.append(el("span", "trunc", candidate.branch));
       card.append(foot);
-      card.addEventListener("click", () => choose(candidate));
+      if (canPick) card.addEventListener("click", () => choose(candidate));
       grid.append(card);
     }
     body.append(grid);
+    if (!canPick) {
+      body.append(el(
+        "div",
+        "empty",
+        "This host does not proxy tool calls, so these cannot be opened from here. Ask overview for one by id.",
+      ));
+    }
     return [box];
   }
 
   /** Re-ask about one candidate under the explicit param its kind implies. */
   function choose(candidate) {
+    // A host that does not proxy `tools/call` cannot navigate. `refresh`'s
+    // own `!host.connected` guard does NOT cover this: the handshake sets
+    // `connected` true and only afterwards disables the controls, so the
+    // guard passes and the call goes out to a host that will refuse it —
+    // replacing a chooser the operator can still read with an `unreachable`
+    // error. Picking is offered only where picking can work.
+    if (!host.capabilities.serverTools) return;
     state.args = {
       schemaVersion: 1,
       params: candidate.kind === "epic" ? { epic: candidate.id } : { run: candidate.id },
@@ -2043,6 +2061,10 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.refresh.disabled = true;
       nodes.poll.disabled = true;
       nodes.refresh.title = "This host does not proxy tool calls.";
+      // A chooser rendered before the handshake finished is still on screen
+      // and still looks pickable; re-render so its cards say why they are
+      // not, instead of failing silently under the pointer.
+      if (state.data?.resolution) render();
     }
     reportSize();
     const observer = new ResizeObserver(reportSize);
