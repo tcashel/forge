@@ -99,6 +99,53 @@ fn block_plus_absent_merges_to_block() {
     );
 }
 
+/// The note `settle_unspawned` and `abandon_claim` store for a seat retired
+/// between its claim and a spawn.
+const UNSPAWNED: &str = "unspawned: attempt refused before spawn: could not \
+                         create the packet directory";
+
+#[test]
+fn a_review_seat_that_never_spawned_contributes_no_verdict() {
+    // The defect: a plain note classifies SEMANTIC, and a semantic review
+    // leg contributes `RequestChanges` — so a seat whose provider never
+    // existed spoke a verdict it never had, and `Approve + never-ran` merged
+    // to `RequestChanges`. An `unspawned:` note stands on the packet's
+    // bounded budget instead: nothing to merge, and the leg is re-claimable.
+    let view = at_rereview(RUN)
+        .completed(Stage::ReviewClaude, 2, review(Verdict::Approve))
+        .failed(Stage::ReviewCodex, 2, UNSPAWNED)
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::AwaitPacket {
+            packet_id: packet_id(RUN, Stage::ReviewCodex, 2),
+            not_before: None
+        },
+        "a seat that never ran is re-claimed, never merged"
+    );
+}
+
+#[test]
+fn an_unspawned_review_leg_stops_the_run_once_its_budget_is_spent() {
+    // Bounded, so a cause that never clears cannot re-claim forever — and
+    // the stop names the seat as one that never got a provider, which is
+    // what it is, rather than reporting a verdict.
+    let view = at_rereview(RUN)
+        .budget(1)
+        .completed(Stage::ReviewClaude, 2, review(Verdict::Approve))
+        .failed(Stage::ReviewCodex, 2, UNSPAWNED)
+        .failed(Stage::ReviewCodex, 2, UNSPAWNED)
+        .retry_event(Stage::ReviewCodex, 2, 2, T0)
+        .build();
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::ProviderUnavailable {
+            stage: Stage::ReviewCodex,
+            attempts: 2
+        })
+    );
+}
+
 #[test]
 fn approve_plus_semantic_failure_merges_to_request_changes() {
     // A reviewer that tried and died is not an absent reviewer.

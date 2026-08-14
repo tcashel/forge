@@ -1164,6 +1164,13 @@ mod tests {
         assert_eq!(classify_failure("Transport: x"), FailureKind::Semantic);
         assert_eq!(classify_failure(" transport: x"), FailureKind::Semantic);
         assert_eq!(classify_failure("provider exploded"), FailureKind::Semantic);
+        assert_eq!(
+            classify_failure("unspawned: attempt refused before spawn: io"),
+            FailureKind::Unspawned
+        );
+        assert_eq!(classify_failure("unspawned:"), FailureKind::Unspawned);
+        assert_eq!(classify_failure("Unspawned: x"), FailureKind::Semantic);
+        assert_eq!(classify_failure(" unspawned: x"), FailureKind::Semantic);
     }
 
     #[test]

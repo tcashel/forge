@@ -828,6 +828,75 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn the_write_policy_splits_unparseable_from_unsupported() {
+        // The two are opposite answers to "did bd speak?". Unparseable
+        // stdout says no and rides the transport budget; an envelope under a
+        // schema this build cannot read says YES — from a bd that has been
+        // upgraded — and retrying it forever never resolves the upgrade.
+        let zero_exit = |stdout: &str| {
+            Ok(RawOutcome {
+                exit: Some(0),
+                stdout: stdout.to_string(),
+                stderr: String::new(),
+            })
+        };
+
+        let mut runner = Canned::new(vec![zero_exit("<html>502</html>")]);
+        let err = write_policy(&other_op(), &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Unparseable { .. }), "got {err:?}");
+        assert!(err.is_transport(), "no envelope means bd never answered");
+
+        let mut runner = Canned::new(vec![zero_exit(
+            r#"{"data": {"id": "beads-1al"}, "schema_version": 2}"#,
+        )]);
+        let err = write_policy(&other_op(), &mut runner, false, "bd update")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert!(
+            !err.is_transport(),
+            "a bd upgrade is an answer, not an outage: {err}"
+        );
+        assert_eq!(runner.runs, 1, "an answer is never retried");
+
+        // The same split on the heartbeat path, which classifies separately.
+        let op = WriteOp::Heartbeat {
+            bead: "beads-1al".to_string(),
+            actor: "me".to_string(),
+        };
+        let mut runner = Canned::new(vec![zero_exit(r#"{"data": {}, "schema_version": 2}"#)]);
+        let err = write_policy(&op, &mut runner, false, "bd heartbeat")
+            .await
+            .unwrap_err();
+        assert!(matches!(err, BdError::Envelope { .. }), "got {err:?}");
+        assert!(!err.is_transport());
+    }
+
+    #[tokio::test]
+    async fn a_nonzero_exit_carrying_an_unsupported_envelope_still_answered() {
+        // `is_transport`'s own arm for `Beads`: bd spoke, in a dialect this
+        // build does not read. It is still an answer, and folding "wrong
+        // schema" into "no envelope" made every one of these retryable.
+        let upgraded = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: r#"{"data":{"error":"no issues found"},"schema_version":2}"#.to_string(),
+            stderr: String::new(),
+        };
+        assert!(!upgraded.is_transport(), "{upgraded}");
+
+        let silent = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: String::new(),
+            stderr: "killed".to_string(),
+        };
+        assert!(silent.is_transport(), "no envelope at all: {silent}");
+    }
+
+    #[tokio::test]
     async fn a_terminally_timed_out_heartbeat_never_becomes_lease_held() {
         let t = || {
             Err(BdError::Timeout {
