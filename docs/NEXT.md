@@ -72,8 +72,17 @@ before its next claim. `--spec <path>` still names a spec file for one
 release and is recorded as deprecated.
 
 Submit returns a durable controller identity immediately. Retrying while it is
-live adopts the same controller. The run ends at a reviewed draft PR; the
-human adjudicates the merge.
+live adopts the same verified driver; a confirmed-dead driver is reconciled
+and restarted under a new generation. Status includes the driver's pid/start
+identity, the exact executable version and digest, a per-generation durable
+log, and the latest ledger progress event. An unverifiable identity is
+reported as `unknown` and blocks a duplicate spawn. The run ends at a reviewed
+draft PR; the human adjudicates the merge.
+
+Push authentication and network failures consume the frozen transport retry
+budget. Exhaustion stops the run with an `input-required:` reason while the
+unconfirmed push operation remains reconcilable; it is never recorded as a
+successful push.
 
 ## Submit an epic
 

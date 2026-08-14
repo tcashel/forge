@@ -64,6 +64,9 @@ fn pre_dispatch_failure(name: &str, code: ErrorCode, message: String) -> i32 {
 
 async fn run(args: cli::Cli) -> i32 {
     let name = cli::command_name(&args.command);
+    if let Err(message) = core::record_controller_identity_from_env().await {
+        return pre_dispatch_failure(name, ErrorCode::ProviderSpawnFailed, message);
+    }
     let config = match ForgedConfig::load() {
         Ok(config) => config,
         // A malformed or unreadable config file is a bad request, not an

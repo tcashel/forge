@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use forged_gate::GateRequest;
 use forged_git::GhClient;
-use forged_ledger::{EffectClass, OperationState, RunRow};
+use forged_ledger::{EffectClass, OperationState, RunRow, RunState};
 use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
@@ -621,18 +621,27 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
     };
     let run = run.clone();
     let gate_commands = view.policy.gate_commands.clone();
-    let resp =
-        fenced(
-            ctx,
-            step.as_str(),
-            class,
-            &req,
-            None,
-            move |op_id| async move {
-                machine_effect(ctx, &run, step, round, &op_id, &gate_commands).await
-            },
-        )
-        .await;
+    let transport_retry_budget = view.policy.transport_retry_budget;
+    let resp = fenced(
+        ctx,
+        step.as_str(),
+        class,
+        &req,
+        None,
+        move |op_id| async move {
+            machine_effect(
+                ctx,
+                &run,
+                step,
+                round,
+                &op_id,
+                &gate_commands,
+                transport_retry_budget,
+            )
+            .await
+        },
+    )
+    .await;
     if resp.ok {
         Ok(())
     } else {
@@ -683,6 +692,7 @@ async fn machine_effect(
     round: u32,
     op_id: &str,
     gate_commands: &[String],
+    transport_retry_budget: u32,
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
@@ -752,24 +762,55 @@ async fn machine_effect(
         MachineStage::Push => {
             let worktree = ctx.config.worktree(&run.run_id);
             let expected = rev_parse_head(&worktree).await?;
-            failpoint::hit("git.push.before");
             let refspec = format!("{0}:refs/heads/{0}", run.branch);
-            let out = tokio::process::Command::new("git")
-                .arg("-C")
-                .arg(&worktree)
-                .args(["push", "origin", &refspec])
-                .stdin(std::process::Stdio::null())
-                .output()
-                .await
-                .map_err(|e| Failure::internal(format!("git push: {e}")))?;
-            failpoint::hit("git.push.after");
-            if !out.status.success() {
-                return Err(Failure::internal(format!(
-                    "git push origin {refspec}: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                )));
+            let max_attempts = transport_retry_budget.saturating_add(1);
+            for attempt in 1..=max_attempts {
+                failpoint::hit("git.push.before");
+                let out = tokio::process::Command::new("git")
+                    .arg("-C")
+                    .arg(&worktree)
+                    .args(["push", "origin", &refspec])
+                    .stdin(std::process::Stdio::null())
+                    .output()
+                    .await
+                    .map_err(|e| Failure::internal(format!("git push: {e}")))?;
+                failpoint::hit("git.push.after");
+                if out.status.success() {
+                    return Ok(json!({
+                        "remoteSha": expected,
+                        "branch": run.branch,
+                        "attempts": attempt,
+                    }));
+                }
+                let stderr = String::from_utf8_lossy(&out.stderr).trim().to_owned();
+                let kind = classify_push_failure(&stderr);
+                if kind.is_transport() && attempt < max_attempts {
+                    let exponent = attempt.saturating_sub(1).min(5);
+                    let delay_ms = 100u64.saturating_mul(1u64 << exponent);
+                    tokio::time::sleep(Duration::from_millis(delay_ms)).await;
+                    continue;
+                }
+                let reason = format!(
+                    "input-required: git push {} after {attempt} attempt(s): {stderr}",
+                    kind.label()
+                );
+                let run_id = run.run_id.clone();
+                let reason_for_store = reason.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.set_run_state(&run_id, RunState::Stopped, Some(reason_for_store))
+                })
+                .await?;
+                // The push did NOT happen, so its ObserveOnly operation must
+                // remain in progress for a later reconcile to observe and
+                // release. Completing it here would let a resumed run skip
+                // the missing push and open a PR for a nonexistent branch.
+                return Err(Failure {
+                    code: forged_types::ErrorCode::GhError,
+                    message: reason,
+                    recoverable: true,
+                });
             }
-            Ok(json!({"remoteSha": expected, "branch": run.branch}))
+            unreachable!("push loop always runs at least once")
         }
         MachineStage::DraftPr => {
             let slug = repo_slug(std::path::Path::new(&run.repo))
@@ -802,6 +843,63 @@ async fn machine_effect(
                 }
             }))
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PushFailureKind {
+    Authentication,
+    Network,
+    Other,
+}
+
+impl PushFailureKind {
+    fn is_transport(self) -> bool {
+        matches!(self, Self::Authentication | Self::Network)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Authentication => "authentication failed",
+            Self::Network => "network transport failed",
+            Self::Other => "was refused",
+        }
+    }
+}
+
+fn classify_push_failure(stderr: &str) -> PushFailureKind {
+    let lower = stderr.to_ascii_lowercase();
+    if [
+        "authentication failed",
+        "could not read username",
+        "permission denied (publickey)",
+        "repository not found",
+        "http 401",
+        "http 403",
+        "terminal prompts disabled",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        PushFailureKind::Authentication
+    } else if [
+        "could not resolve host",
+        "connection reset",
+        "connection refused",
+        "connection timed out",
+        "operation timed out",
+        "network is unreachable",
+        "remote end hung up unexpectedly",
+        "the remote end hung up unexpectedly",
+        "tls",
+        "ssl",
+    ]
+    .iter()
+    .any(|pattern| lower.contains(pattern))
+    {
+        PushFailureKind::Network
+    } else {
+        PushFailureKind::Other
     }
 }
 
@@ -933,7 +1031,7 @@ mod adaptive_tests {
     use forged_ledger::AttemptState;
     use forged_proto::TerminalAttempt;
 
-    use super::transport_fallback_index;
+    use super::{classify_push_failure, transport_fallback_index, PushFailureKind};
 
     fn failed(note: &str) -> TerminalAttempt {
         TerminalAttempt {
@@ -969,6 +1067,22 @@ mod adaptive_tests {
                 Some("2026-08-12T00:00:00.000000001Z"),
             ),
             0
+        );
+    }
+
+    #[test]
+    fn push_failures_separate_retryable_transport_from_operator_action() {
+        assert_eq!(
+            classify_push_failure("fatal: Could not resolve host: github.com"),
+            PushFailureKind::Network
+        );
+        assert_eq!(
+            classify_push_failure("git@github.com: Permission denied (publickey)."),
+            PushFailureKind::Authentication
+        );
+        assert_eq!(
+            classify_push_failure("! [rejected] branch -> branch (non-fast-forward)"),
+            PushFailureKind::Other
         );
     }
 }
