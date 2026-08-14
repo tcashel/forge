@@ -191,6 +191,56 @@ impl OverviewArgs {
     }
 }
 
+/// The `work_list` envelope: the shared envelope shape with the one typed
+/// repository selector this discovery operation accepts.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct WorkListArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_list:read` when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Work discovery has no run id; retained for envelope compatibility.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Discovery parameters.
+    #[serde(default)]
+    pub params: WorkListParams,
+}
+
+/// Optional repository scope for `work_list`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+pub struct WorkListParams {
+    /// Exact repository identity from Bead `metadata.repository`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+}
+
+impl WorkListArgs {
+    /// Project onto the shared envelope, omitting an absent repository so it
+    /// remains byte-compatible with the operator-wide request.
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
 /// The forged MCP server: a thin adapter over the shared core.
 #[derive(Clone)]
 pub struct ForgedServer {
@@ -486,10 +536,11 @@ impl ForgedServer {
         name = "work_list",
         description = "List all forged work — every slice run and every started epic, live and \
                        historical, each labelled slice or epic. Takes no id: this is how a \
-                       caller with no prior knowledge discovers the ids the other tools require."
+                       caller with no prior knowledge discovers the ids the other tools require. \
+                       Optional params.repo selects the exact Bead metadata.repository identity."
     )]
-    pub async fn work_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_list", args.0).await
+    pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
+        self.call("work_list", args.0.into_envelope()).await
     }
 }
 

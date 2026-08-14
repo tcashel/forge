@@ -757,11 +757,24 @@ case "$cmd" in
     id=$2; printf '%s' "$3" > "$state/$id.comment"
     printf '{"schema_version":1,"data":{"id":"%s"}}\n' "$id" ;;
   list)
+    if [ -f "$state/list.unreachable" ]; then
+      printf 'bd: connection refused\n' >&2
+      exit 1
+    fi
     ids=$(val --id "$@")
+    metadata_filter=$(val --metadata-field "$@")
     first=1; printf '{"schema_version":1,"data":['
     oldifs=$IFS; IFS=,
     for id in $ids; do
       [ -n "$id" ] || continue
+      if [ -n "$metadata_filter" ]; then
+        case "$metadata_filter" in
+          repository=*) expected_repository=${metadata_filter#repository=} ;;
+          *) continue ;;
+        esac
+        repository=$(cat "$state/$id.repository" 2>/dev/null || true)
+        [ "$repository" = "$expected_repository" ] || continue
+      fi
       [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
     done
     IFS=$oldifs
@@ -1207,6 +1220,23 @@ impl TestEnv {
         .expect("revision");
     }
 
+    /// Set the authoritative Beads `metadata.repository` identity used by
+    /// native repository-filter tests.
+    pub fn set_bead_repository(&self, bead: &str, repository: &str) {
+        self.set_bead_field(
+            bead,
+            "metadata",
+            &json!({"repository": repository}).to_string(),
+        );
+        std::fs::write(
+            self.beads_dir
+                .join("shim-state")
+                .join(format!("{bead}.repository")),
+            repository,
+        )
+        .expect("set bead repository");
+    }
+
     /// The revision the bd shim reports for a bead right now.
     pub fn bead_revision(&self, bead: &str) -> String {
         std::fs::read_to_string(
@@ -1232,6 +1262,19 @@ impl TestEnv {
         let marker = state.join("show.unreachable");
         if unreachable {
             std::fs::write(marker, "1").expect("set bd outage");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+
+    /// Make every `bd list` fail, the way an unreachable authoritative store
+    /// does during repository-scoped discovery.
+    pub fn set_bd_list_unreachable(&self, unreachable: bool) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        let marker = state.join("list.unreachable");
+        if unreachable {
+            std::fs::write(marker, "1").expect("set bd list outage");
         } else {
             let _ = std::fs::remove_file(marker);
         }

@@ -213,10 +213,12 @@ forged epic submit --epic <epic-id>
 
 Start with `overview` or `work list`. Both carry the same operator queue;
 `work list` additionally serves the uncapped raw inventory. Neither needs an
-id.
+id. `work list` can narrow that same projection to one exact repository
+identity from the canonical Bead metadata:
 
 ```sh
 forged work list
+forged work list --repo /absolute/path/to/repository
 forged overview                    # no scope: the whole portfolio
 forged overview --run <run-id>
 forged overview --epic <epic-id>
@@ -224,6 +226,15 @@ forged overview --id <id>          # kind-blind: resolves either, or lists candi
 forged session list --run <run-id>
 forged events --run <id> --limit 200
 ```
+
+The repository selector performs one native, id-bounded
+`metadata.repository` Beads query and reuses its rows for claim-health and
+queue enrichment. Missing metadata and deleted or unreadable Beads are
+reported as `repositoryScope.known: false` in the operator-wide view and are
+never guessed into a scoped result; an unavailable authoritative read fails a
+scoped request closed. The operator-database storage and repository-identity
+decision is recorded in Bead `beads-zws.17`. The selector changes only the
+query projection: one operator-scoped Beads database remains authoritative.
 
 `overview` with no scope answers with the portfolio: `kind: "portfolio"` on
 the same `forged.overview/1` schema, carrying the inventory entries newest
@@ -240,7 +251,8 @@ candidate awaiting delivery, a pending Beads settlement, an attempt marked
 nothing needs attention; it is never omitted.
 
 Each queue/inventory entry carries a live Bead title (with a deterministic
-legacy fallback), repository and base branch, current stage/seat, last
+legacy fallback), durable launch repository and base branch, authoritative
+`repositoryScope`, current stage/seat, last
 progress timestamp plus the clock used for age, exact blocker and next
 action, PR delivery, explicitly-known-or-unknown CI, spend, verified
 controller identity, and Bead `claimHealth`. Beads enrichment is one bounded

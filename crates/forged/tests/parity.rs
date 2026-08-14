@@ -6,7 +6,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{McpClient, TestEnv};
+use support::{fabricate_run, McpClient, TestEnv};
 
 /// Normalize the minted operationId (a per-call uuid) out of an envelope;
 /// derived and read-default ids are deterministic and stay.
@@ -18,6 +18,23 @@ fn normalized(mut envelope: Value) -> Value {
     }
     if envelope["result"]["queue"]["asOf"].is_string() {
         envelope["result"]["queue"]["asOf"] = json!("<sampled>");
+    }
+    if let Some(entries) = envelope["result"]["runs"].as_array_mut() {
+        for entry in entries {
+            if entry["progressAgeInput"]["asOf"].is_string() {
+                entry["progressAgeInput"]["asOf"] = json!("<sampled>");
+            }
+        }
+    }
+    if let Some(groups) = envelope["result"]["queue"]["groups"].as_array_mut() {
+        for entry in groups
+            .iter_mut()
+            .flat_map(|group| group["entries"].as_array_mut().into_iter().flatten())
+        {
+            if entry["progressAgeInput"]["asOf"].is_string() {
+                entry["progressAgeInput"]["asOf"] = json!("<sampled>");
+            }
+        }
     }
     envelope
 }
@@ -39,6 +56,9 @@ fn doctor_shape(envelope: &Value) -> Value {
 fn all_thirty_four_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
+    fabricate_run(&env, "par-repository");
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    env.set_bead_repository("bead-par-repository", &repository);
     let mut mcp = McpClient::new(&env);
 
     // The server declares exactly the public operation tools.
@@ -124,6 +144,18 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     assert!(
         description.contains("Takes no id"),
         "work_list must state that it takes no id: {description}"
+    );
+    assert!(
+        description.contains("params.repo"),
+        "work_list must describe its optional repository selector: {description}"
+    );
+    let repository_schema = work_list
+        .pointer("/inputSchema/properties/params/properties/repo")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        repository_schema.to_string().contains("string"),
+        "work_list advertises params.repo as a string: {repository_schema}"
     );
 
     assert_eq!(
@@ -579,11 +611,19 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("events_tail", envelope(json!({})));
     assert_eq!(normalized(cli), normalized(tool), "events_tail parity");
 
-    // work_list: the discovery surface takes no id on either surface.
+    // work_list: no selector and the exact repository selector are the same
+    // shared operation on both surfaces.
     let cli = env.forged(&["work", "list"]).1;
     let tool = mcp.call_tool("work_list", envelope(json!({})));
     assert_eq!(tool["operationId"], json!("op:work_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_list parity");
+    let cli = env.forged(&["work", "list", "--repo", &repository]).1;
+    let tool = mcp.call_tool("work_list", envelope(json!({"repo": repository})));
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "repository-scoped work_list parity"
+    );
 
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.
@@ -656,5 +696,32 @@ fn overview_refuses_wrong_typed_paging_at_the_transport() {
         assert_eq!(tool["ok"], json!(false), "{params}: {tool}");
         assert_eq!(tool["error"]["code"], json!("INVALID_REQUEST"), "{tool}");
         assert_eq!(tool["error"]["message"], json!(message), "{tool}");
+    }
+}
+
+#[test]
+fn work_list_refuses_present_non_string_repository_scopes() {
+    let env = TestEnv::new("forged-work-list-mcp-params");
+    env.forged(&["init"]);
+    fabricate_run(&env, "mcp-repository-widening-guard");
+    let mut mcp = McpClient::new(&env);
+
+    for repository in [Value::Null, json!(7), json!({"path": "/repo"})] {
+        let refusal = mcp.call_tool_error_result(
+            "work_list",
+            json!({"schemaVersion": 1, "params": {"repo": repository.clone()}}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "present non-string repo is refused before dispatch: {repository}: {refusal}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "transport refusal is not an unfiltered operation envelope: {text}"
+        );
     }
 }

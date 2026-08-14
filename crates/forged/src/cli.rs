@@ -670,8 +670,19 @@ pub struct OverviewArgs {
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
-    /// List every slice run and started epic, with no id (read-only).
-    List(KeyOnly),
+    /// List slice runs and started epics, optionally scoped by repository.
+    List(WorkListArgs),
+}
+
+/// `work list` flags.
+#[derive(Debug, Args)]
+pub struct WorkListArgs {
+    /// Exact repository identity from Bead metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `worktree` subcommands.
@@ -1158,7 +1169,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             request(a.idempotency_key, None, json!({"once": a.once})),
         ),
         Command::Work { command } => match command {
-            WorkCmd::List(a) => ("work_list", request(a.idempotency_key, None, json!({}))),
+            WorkCmd::List(a) => {
+                let mut params = Map::new();
+                if let Some(repo) = a.repo {
+                    params.insert("repo".to_owned(), json!(repo));
+                }
+                (
+                    "work_list",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
         },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (

@@ -144,17 +144,40 @@ pub async fn show_issue(cfg: &BdConfig, id: &str) -> Result<IssueSummary, BdErro
 /// Missing or deleted ids are absent from the result. Supplying exact ids
 /// avoids both an operator-wide scan and one `bd show` process per row.
 pub async fn list_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<IssueSummary>, BdError> {
+    list_issues_matching_repository(cfg, ids, None).await
+}
+
+/// Read an exact, bounded set of issues whose `metadata.repository` equals
+/// `repository`, in one native `bd list` invocation.
+///
+/// The caller supplies the candidate ids, keeping this a bounded join against
+/// Forged's ledger rather than an operator-wide Beads scan. Matching remains
+/// Beads-owned: Forged passes the exact `repository=<value>` predicate through
+/// `--metadata-field` and never reimplements metadata filtering in memory.
+pub async fn list_issues_for_repository(
+    cfg: &BdConfig,
+    ids: &[String],
+    repository: &str,
+) -> Result<Vec<IssueSummary>, BdError> {
+    list_issues_matching_repository(cfg, ids, Some(repository)).await
+}
+
+async fn list_issues_matching_repository(
+    cfg: &BdConfig,
+    ids: &[String],
+    repository: Option<&str>,
+) -> Result<Vec<IssueSummary>, BdError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let joined = ids.join(",");
-    let data = invoke::read(
-        cfg,
-        &[
-            "list", "--id", &joined, "--limit", "0", "--brief", "--flat", "--json",
-        ],
-    )
-    .await?;
+    let metadata_field = repository.map(|value| format!("repository={value}"));
+    let mut args = vec!["list", "--id", &joined];
+    if let Some(field) = metadata_field.as_deref() {
+        args.extend(["--metadata-field", field]);
+    }
+    args.extend(["--limit", "0", "--brief", "--flat", "--json"]);
+    let data = invoke::read(cfg, &args).await?;
     Ok(list(&data))
 }
 

@@ -3,7 +3,7 @@
 //! retire.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use forged_gate::GateRequest;
 use forged_ledger::{
@@ -2013,6 +2013,15 @@ pub struct Portfolio {
 /// Neither spend nor any condition adds a query, so the entries, the spend
 /// and the rail describe ONE ledger rather than a state that never held.
 pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
+    portfolio_for_repository(ctx, None).await
+}
+
+/// Build the shared operator projection, optionally restricted to Beads
+/// whose authoritative `metadata.repository` exactly matches `repository`.
+async fn portfolio_for_repository(
+    ctx: &Ctx,
+    repository: Option<&str>,
+) -> Result<Portfolio, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS
         .iter()
         .chain(ATTENTION_KINDS.iter())
@@ -2020,8 +2029,32 @@ pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
         .collect();
     let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
     let mut entries = project_entries(&snapshot, Spend::Include)?;
+    let prefetched_beads = if let Some(repository) = repository {
+        let bead_ids: Vec<String> = entries
+            .iter()
+            .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+            .collect();
+        // ONE native, id-bounded metadata query is both the membership
+        // decision and the queue's live Beads enrichment. An outage is not
+        // widened into an unfiltered result: scoped discovery fails closed.
+        let beads = forged_beads::list_issues_for_repository(
+            &ctx.config.bd_config(),
+            &bead_ids,
+            repository,
+        )
+        .await?;
+        let matching_ids: BTreeSet<&str> = beads.iter().map(|issue| issue.id.as_str()).collect();
+        entries.retain(|entry| {
+            entry["beadId"]
+                .as_str()
+                .is_some_and(|id| matching_ids.contains(id))
+        });
+        Some(beads)
+    } else {
+        None
+    };
     let attention = attention_rail(&snapshot, &entries);
-    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention).await;
+    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention, prefetched_beads).await;
     Ok(Portfolio {
         entries,
         attention,
@@ -2047,12 +2080,18 @@ async fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
+    prefetched_beads: Option<Vec<forged_beads::IssueSummary>>,
 ) -> Value {
-    let bead_ids: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-        .collect();
-    let bead_read = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await;
+    let bead_read = match prefetched_beads {
+        Some(beads) => Ok(beads),
+        None => {
+            let bead_ids: Vec<String> = entries
+                .iter()
+                .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+                .collect();
+            forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await
+        }
+    };
     let bead_error = bead_read.as_ref().err().map(ToString::to_string);
     let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
         .unwrap_or_default()
@@ -2133,6 +2172,10 @@ async fn operator_queue(
         let claim_known = issue.is_some();
         let claim_status = issue.map(|issue| issue.status.as_str());
         let assignee = issue.and_then(|issue| issue.assignee.as_deref());
+        let repository_identity = issue
+            .and_then(|issue| issue.metadata.get("repository"))
+            .map(String::as_str)
+            .filter(|identity| !identity.is_empty());
         let holder_mismatch = assignee
             .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
         let outcome = entry["outcome"].as_str();
@@ -2267,6 +2310,16 @@ async fn operator_queue(
         };
         if let Some(object) = entry.as_object_mut() {
             object.insert("title".to_owned(), json!(title));
+            object.insert(
+                "repositoryScope".to_owned(),
+                json!({
+                    "known": repository_identity.is_some(),
+                    "identity": repository_identity,
+                    "source": repository_identity
+                        .map(|_| "beads.metadata.repository")
+                        .unwrap_or("unknown"),
+                }),
+            );
             object.insert("controller".to_owned(), controller);
             object.insert("claimHealth".to_owned(), claim_health);
             object.insert("blocker".to_owned(), blocker);
@@ -2558,13 +2611,58 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
         .collect()
 }
 
-/// `work list` — the discovery surface, serving [`inventory`] whole.
+/// Normalize one repository identity without consulting the filesystem.
+///
+/// Existing absolute checkout paths are collapsed lexically (`//`, `.`, and
+/// `..`) but never canonicalized through the live checkout: a checkout rename
+/// must not silently turn a stored identity into another one. Non-path
+/// identities are retained as exact strings so a future remote identity can
+/// use this same public selector.
+fn repository_selector(req: &OperationRequest) -> Result<Option<String>, Failure> {
+    let Some(value) = req.params.get("repo") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| Failure::invalid("work_list repo must be a non-empty string"))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Failure::invalid(
+            "work_list repo must be a non-empty string",
+        ));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Ok(Some(trimmed.to_owned()));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(Failure::invalid(format!(
+                        "work_list repo cannot escape its absolute root: {trimmed:?}"
+                    )));
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(Some(normalized.to_string_lossy().into_owned()))
+}
+
+/// `work list` — the discovery surface, serving [`inventory`] whole or the
+/// exact repository subset named by Bead metadata.
 ///
 /// The one entry point that takes no id, so a caller with no prior knowledge
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let portfolio = portfolio(ctx).await?;
+        let repository = repository_selector(req)?;
+        let portfolio = portfolio_for_repository(ctx, repository.as_deref()).await?;
         Ok(json!({"runs": portfolio.entries, "queue": portfolio.queue}))
     })
     .await
