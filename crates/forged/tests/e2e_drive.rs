@@ -4,13 +4,14 @@
 //! ready-for-review calls; the origin repo holds the real commits.
 
 use std::fmt::Write as _;
+use std::os::unix::fs::PermissionsExt;
 use std::process::Stdio;
 
 mod support;
 
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use support::{assert_no_overlap, render_cost, require_node, rev_parse, TestEnv};
+use support::{assert_no_overlap, git, render_cost, require_node, rev_parse, TestEnv};
 
 fn canonical_json_and_sha(value: &Value) -> (String, String) {
     let bytes = forged_types::canonical_json_bytes(value).expect("canonical fixture JSON");
@@ -35,6 +36,73 @@ fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Val
         std::thread::sleep(std::time::Duration::from_millis(100));
     }
     panic!("timed out waiting for forged {args:?}: {last}")
+}
+
+#[test]
+fn push_transport_retries_are_bounded_then_stop_as_input_required() {
+    let env = TestEnv::new("forged-push-retry");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-push-retry",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    let (code, resolved) = env.forged(&["run", "advance", "--run", "bead-push-retry"]);
+    assert_eq!(code, 0, "resolve: {resolved}");
+    assert_eq!(resolved["result"]["action"]["runMachine"], json!("resolve"));
+
+    let helper = env.shim_bin.join("git-remote-fail");
+    std::fs::write(
+        &helper,
+        "#!/bin/sh\necho attempt >> \"$FORGED_SHIM_DIR/push-attempts\"\necho 'fatal: Could not resolve host: github.com' >&2\nexit 1\n",
+    )
+    .expect("write remote helper");
+    std::fs::set_permissions(&helper, std::fs::Permissions::from_mode(0o755))
+        .expect("chmod remote helper");
+    git(
+        &env.repos.repo,
+        &["remote", "set-url", "origin", "fail::remote"],
+    );
+
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-push-retry"]);
+    assert_ne!(
+        code, 0,
+        "the missing push is not a completed effect: {driven}"
+    );
+    let reason = driven["error"]["message"]
+        .as_str()
+        .expect("input-required error");
+    assert!(reason.starts_with("input-required: git push network transport failed"));
+    let attempts = std::fs::read_to_string(env.shim_dir.join("push-attempts"))
+        .expect("attempt log")
+        .lines()
+        .count();
+    assert_eq!(attempts, 4, "default retry budget is three retries");
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-push-retry"]);
+    assert_eq!(status["result"]["run"]["state"], json!("stopped"));
+    assert_eq!(
+        status["result"]["run"]["nextAction"]["stop"]["externallyStopped"]["reason"],
+        json!(reason)
+    );
+    let ledger = env.ledger();
+    let push = ledger
+        .find_operation("push", "bead-push-retry/push/0")
+        .expect("push probe")
+        .expect("interrupted push survives");
+    assert_eq!(push.state, forged_ledger::OperationState::InProgress);
+    ledger.close().expect("close");
 }
 
 #[test]

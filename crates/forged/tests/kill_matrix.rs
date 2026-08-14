@@ -13,7 +13,7 @@ use std::process::{Child, Stdio};
 use std::time::{Duration, Instant};
 
 use nix::errno::Errno;
-use nix::sys::signal::{killpg, Signal};
+use nix::sys::signal::{kill, killpg, Signal};
 use nix::unistd::Pid;
 use serde_json::{json, Value};
 use support::{assert_no_overlap, pid_alive, rev_parse, HomeBeadsGuard, TestEnv};
@@ -605,6 +605,115 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
         .count();
     assert_eq!(implementation_starts, 1, "no duplicate packet execution");
     assert_no_overlap(&env.provider_log(), "bead-khandoff/implementation/0");
+}
+
+#[test]
+fn confirmed_dead_controller_restarts_with_a_fresh_truthful_generation() {
+    let env = TestEnv::new("km-controller-restart");
+    start_run(&env, "bead-krestart");
+    env.set_scenario("implement", "slow", 1);
+    env.set_scenario("reviewclaude", "slow", 1);
+
+    let (code, first) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "bead-krestart",
+        "--idempotency-key",
+        "first-controller",
+    ]);
+    assert_eq!(code, 0, "first submit: {first}");
+    let first_controller = &first["result"]["controller"];
+    assert_eq!(first_controller["generation"], json!(1));
+    assert_eq!(first_controller["state"], json!("running"));
+    assert_eq!(
+        first_controller["binary"]["version"],
+        json!(env!("CARGO_PKG_VERSION"))
+    );
+    assert!(first_controller["binary"]["sha256"]
+        .as_str()
+        .is_some_and(|sha| sha.len() == 64));
+    assert_eq!(first_controller["binaryMismatch"], json!(false));
+    let first_pid = first_controller["driver"]["pid"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("real driver pid");
+    let first_log = Path::new(
+        first_controller["outputPath"]
+            .as_str()
+            .expect("output path"),
+    );
+    assert!(first_log.ends_with("controller-1.log"));
+    assert!(first_log.exists(), "durable log is created at spawn");
+
+    // A controller-local SafeRetry effect left in progress belongs to this
+    // generation once its verified driver is dead.
+    {
+        let ledger = env.ledger();
+        let request = forged_types::OperationRequest {
+            schema_version: 1,
+            idempotency_key: "abandoned-safe-retry".to_owned(),
+            run_id: Some("bead-krestart".to_owned()),
+            params: serde_json::Map::new(),
+        };
+        ledger
+            .begin_operation(
+                "controller-test-effect",
+                &request,
+                forged_ledger::EffectClass::SafeRetry,
+                None,
+            )
+            .expect("begin abandoned operation");
+        ledger.close().expect("close");
+    }
+
+    kill(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill first controller driver");
+    wait_until("first controller death", || {
+        let (_, status) = env.forged(&["run", "status", "--run", "bead-krestart"]);
+        matches!(
+            status["result"]["run"]["controller"]["state"].as_str(),
+            Some("exited" | "vanished")
+        )
+    });
+
+    // Replaying the old key cannot return the old success and pretend a
+    // controller was spawned. A new logical submit gets a new generation.
+    let (code, stale) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "bead-krestart",
+        "--idempotency-key",
+        "first-controller",
+    ]);
+    assert_ne!(code, 0, "dead generation must not replay success: {stale}");
+    assert_eq!(stale["error"]["code"], json!("IDEMPOTENCY_CONFLICT"));
+
+    let (code, restarted) = env.forged(&["run", "submit", "--run", "bead-krestart"]);
+    assert_eq!(code, 0, "fresh submit: {restarted}");
+    assert_eq!(restarted["result"]["submitted"], json!(true));
+    assert_eq!(restarted["result"]["controller"]["generation"], json!(2));
+    assert!(restarted["result"]["controller"]["outputPath"]
+        .as_str()
+        .is_some_and(|path| path.ends_with("controller-2.log")));
+    {
+        let ledger = env.ledger();
+        assert!(ledger
+            .find_operation("controller-test-effect", "abandoned-safe-retry")
+            .expect("probe recovered operation")
+            .is_none());
+        assert!(ledger
+            .list_events(Some("bead-krestart"), 0, 65_536)
+            .expect("events")
+            .iter()
+            .any(|row| row.kind == "forged.controller.recovered"));
+        ledger.close().expect("close");
+    }
+
+    wait_until("restarted controller completes", || {
+        let (_, status) = env.forged(&["run", "status", "--run", "bead-krestart"]);
+        status["result"]["run"]["nextAction"]["stop"]["done"].is_object()
+    });
 }
 
 // ------------------------------------------------------------- schedule 5

@@ -31,6 +31,11 @@ pub struct Ctx {
     pub ledger: Ledger,
 }
 
+/// Publish the real detached driver identity before it opens runtime state.
+pub(crate) async fn record_controller_identity_from_env() -> Result<(), String> {
+    handoff::record_driver_identity_from_env().await
+}
+
 /// Upgrade durable state that predates frozen execution policy.
 ///
 /// This is the sole compatibility boundary for definition-backed runs and
