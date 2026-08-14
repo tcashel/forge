@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::AbortHandle;
 
@@ -297,38 +297,80 @@ impl Connection {
     /// is an unclosed pane, never a delayed or altered settlement. Bounded
     /// by [`DISPATCH_BUDGET`] because reaching a socket whose backlog is
     /// full can itself block.
+    ///
+    /// Forgetting the outcome is not the same as never observing it: every
+    /// way this can fail leaves the residual an operator would otherwise
+    /// only meet as a stray shell, so each is logged at `warn`. The caller
+    /// still waits for none of it.
     pub(crate) async fn dispatch(&self, method: &str, params: Value) {
+        let request_id = self.next_request_id();
         let frame = serde_json::json!({
-            "id": self.next_request_id(),
+            "id": &request_id,
             "method": method,
             "params": params,
         });
         let line = format!("{}\n", frame);
         let socket_path = &self.socket_path;
         let sent = tokio::time::timeout(DISPATCH_BUDGET, async {
-            let mut stream = UnixStream::connect(socket_path).await.ok()?;
-            stream.write_all(line.as_bytes()).await.ok()?;
+            let mut stream = match UnixStream::connect(socket_path).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(
+                        method,
+                        socket = %socket_path.display(),
+                        %error,
+                        "herdr dispatch never connected; request unsent"
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = stream.write_all(line.as_bytes()).await {
+                tracing::warn!(method, %error, "herdr dispatch write failed; request unsent");
+                return None;
+            }
             Some(stream)
         })
         .await;
+        let stream = match sent {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return,
+            Err(_elapsed) => {
+                tracing::warn!(
+                    method,
+                    budget_ms = u64::try_from(DISPATCH_BUDGET.as_millis()).unwrap_or(u64::MAX),
+                    "herdr dispatch exceeded its budget; request unsent"
+                );
+                return;
+            }
+        };
 
-        // Drain and discard the answer in the background. Herdr sees an
-        // ordinary peer that stays until it has replied — hanging up on the
-        // request we just wrote would invite the server to abandon it — and
-        // nothing here is ever awaited by the caller.
-        if let Ok(Some(mut stream)) = sent {
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
-                    let mut sink = [0_u8; 1024];
-                    while let Ok(read) = stream.read(&mut sink).await {
-                        if read == 0 {
-                            break;
+        // Drain the answer in the background, keeping only its refusal.
+        // Herdr sees an ordinary peer that stays until it has replied —
+        // hanging up on the request we just wrote would invite the server to
+        // abandon it — and nothing here is ever awaited by the caller.
+        let method = method.to_owned();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
+                let mut lines = BufReader::new(stream).lines();
+                while let Ok(Some(incoming)) = lines.next_line().await {
+                    if let Frame::Response {
+                        id,
+                        result: Err(error),
+                    } = parse_frame(&incoming)
+                    {
+                        if id == request_id {
+                            tracing::warn!(
+                                method,
+                                code = %error.code,
+                                message = %error.message,
+                                "herdr refused the dispatched request"
+                            );
                         }
                     }
-                })
-                .await;
-            });
-        }
+                }
+            })
+            .await;
+        });
     }
 
     /// Open Herdr's dedicated long-lived subscription mode. Ordinary RPCs
