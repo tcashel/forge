@@ -519,3 +519,68 @@ fn all_thirty_tools_match_their_cli_counterparts() {
     assert_eq!(cli["operationId"], json!("op:doctor:read"));
     assert_eq!(tool["operationId"], json!("op:doctor:read"));
 }
+
+/// The typed `overview` params moved one boundary and this pins it: a
+/// wrong-TYPED `after`/`limit` is refused as `invalid_params` before
+/// dispatch and never becomes an operation envelope, while a right-typed
+/// out-of-RANGE one still reaches the core and comes back as an ordinary
+/// `InvalidRequest` envelope.
+#[test]
+fn overview_refuses_wrong_typed_paging_at_the_transport() {
+    let env = TestEnv::new("forged-overview-params");
+    env.forged(&["init"]);
+    let mut mcp = McpClient::new(&env);
+
+    for params in [
+        json!({"run": "absent", "after": "5"}),
+        json!({"run": "absent", "after": 1.5}),
+        json!({"run": "absent", "limit": -1}),
+    ] {
+        let refusal = mcp.call_tool_error_result(
+            "overview",
+            json!({"schemaVersion": 1, "runId": "absent", "params": params.clone()}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "{params} is refused by the schema the tool advertises: {refusal}"
+        );
+        // The refusal is NOT an operation envelope: dispatch never ran, so
+        // no idempotency key was minted and no operation row exists.
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "{params} earns a message, not an envelope: {text}"
+        );
+    }
+
+    // Right type, wrong RANGE: the core still answers, as an ordinary
+    // operation envelope with its own message. (The CLI cannot be compared
+    // here: its clap group has refused `--run` together with `--after` /
+    // `--limit` since #105, which is a defect in that group, not in this
+    // boundary.)
+    for (params, message) in [
+        (
+            json!({"run": "absent", "after": -1}),
+            "overview after must be non-negative",
+        ),
+        (
+            json!({"run": "absent", "limit": 0}),
+            "overview limit must be between 1 and 1000",
+        ),
+        (
+            json!({"run": "absent", "limit": 1001}),
+            "overview limit must be between 1 and 1000",
+        ),
+    ] {
+        let tool = mcp.call_tool(
+            "overview",
+            json!({"schemaVersion": 1, "runId": "absent", "params": params.clone()}),
+        );
+        assert_eq!(tool["ok"], json!(false), "{params}: {tool}");
+        assert_eq!(tool["error"]["code"], json!("INVALID_REQUEST"), "{tool}");
+        assert_eq!(tool["error"]["message"], json!(message), "{tool}");
+    }
+}

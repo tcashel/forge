@@ -1325,6 +1325,20 @@ impl McpClient {
             .unwrap_or_else(|e| panic!("tool {name} text is not an envelope ({e}): {text}"))
     }
 
+    /// Call a tool and return the error result a malformed argument earns.
+    /// An `invalid_params` refusal reaches the host as an `isError` tool
+    /// result whose text is a deserialization message, NOT an operation
+    /// envelope — dispatch never ran, so there is no envelope to read.
+    pub fn call_tool_error_result(&mut self, name: &str, envelope: Value) -> Value {
+        let result = self.call_tool_result(name, envelope);
+        assert_eq!(
+            result["isError"],
+            json!(true),
+            "tool {name} answered instead of refusing: {result}"
+        );
+        result
+    }
+
     /// Call a tool and return its raw JSON-RPC result object.
     pub fn call_tool_result(&mut self, name: &str, envelope: Value) -> Value {
         self.request("tools/call", json!({"name": name, "arguments": envelope}))

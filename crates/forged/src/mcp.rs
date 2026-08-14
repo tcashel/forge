@@ -107,6 +107,19 @@ pub struct OverviewArgs {
 
 /// `overview` parameters. Exactly one of `run` or `epic` is required; the
 /// other two page the event tail.
+///
+/// Typing these MOVED one boundary, deliberately. A wrong-TYPED `after` or
+/// `limit` (`"5"`, `1.5`, a negative `limit`) is refused as
+/// `invalid_params` before dispatch and reaches the host as an `isError`
+/// result carrying a deserialization message, NOT an operation envelope;
+/// the free-form map used to drop it silently and answer with a default
+/// page. That is the intended surface — a host is told its call was
+/// malformed instead of being handed a projection of something it did not
+/// ask for, and the CLI's own parser has always refused a non-integer
+/// `--after` the same way. A value of the right type but the wrong RANGE
+/// (`after: -1`, `limit: 0`, `limit: 1001`) still reaches the core and
+/// comes back as an ordinary `InvalidRequest` envelope, so domain questions
+/// keep their domain answers.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 pub struct OverviewParams {
