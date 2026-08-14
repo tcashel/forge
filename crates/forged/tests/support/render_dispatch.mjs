@@ -166,7 +166,7 @@ const report = (root) => {
   const out = [];
   const walk = (node) => {
     if (node.textContent !== undefined && node.textContent !== null && node.textContent !== "") {
-      out.push({ class: node.className, text: String(node.textContent) });
+      out.push({ class: node.className, text: String(node.textContent), disabled: !!node.disabled });
     }
     if (node.handler) {
       state.args = null;

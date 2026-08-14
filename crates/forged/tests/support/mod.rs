@@ -1425,6 +1425,24 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
         ),
         envelope,
     );
+    dispatched(out)
+}
+
+/// Drive the dispatch as a host that cannot proxy `tools/call` receives it.
+pub fn render_dispatch_without_server_tools(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output_env(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+        &[("SERVER_TOOLS", "0")],
+    );
+    dispatched(out)
+}
+
+fn dispatched(out: Value) -> Dispatched {
     Dispatched {
         view: out["view"].as_array().cloned().unwrap_or_default(),
         subident: out["subident"].as_array().cloned().unwrap_or_default(),

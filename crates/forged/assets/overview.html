@@ -1791,10 +1791,14 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
   /** One click back up to the portfolio, offered by every subject view. */
   function upToPortfolio() {
+    const canNavigate = !!host.capabilities.serverTools;
     const up = el("button", "up", "↑ all work");
     up.type = "button";
-    up.title = "Every run and epic";
-    up.addEventListener("click", () => choose({ kind: "portfolio" }));
+    up.disabled = !canNavigate;
+    up.title = canNavigate
+      ? "Every run and epic"
+      : "This host does not proxy tool calls";
+    if (canNavigate) up.addEventListener("click", () => choose({ kind: "portfolio" }));
     return up;
   }
 

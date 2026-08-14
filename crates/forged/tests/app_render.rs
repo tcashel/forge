@@ -12,8 +12,8 @@ mod support;
 
 use serde_json::{json, Value};
 use support::{
-    render_cost, render_dispatch, render_resolution, render_resolution_without_server_tools,
-    require_node,
+    render_cost, render_dispatch, render_dispatch_without_server_tools, render_resolution,
+    render_resolution_without_server_tools, require_node,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -491,6 +491,28 @@ fn an_unknown_schema_is_still_refused_by_ingest() {
         dispatched.navigation_param_keys(),
         vec![json!([])],
         "portfolio navigation means no scope key, not an undefined scoped id"
+    );
+}
+
+#[test]
+fn portfolio_navigation_is_disabled_when_the_host_cannot_serve_it() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch_without_server_tools(
+        &node,
+        &json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "refused"}}),
+    );
+    assert!(
+        dispatched.navigation_picks().is_empty(),
+        "a limited host must receive no live portfolio handler"
+    );
+    assert!(
+        dispatched.subident.iter().any(|node| {
+            node["class"] == json!("up")
+                && node["text"] == json!("↑ all work")
+                && node["disabled"] == json!(true)
+        }),
+        "the portfolio control remains visible but reads as disabled: {:?}",
+        dispatched.subident
     );
 }
 
