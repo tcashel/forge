@@ -1420,6 +1420,7 @@ fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
     assert_eq!(code, 0, "accept-risk replay: {replayed}");
     assert_eq!(replayed["reused"], json!(true));
     let (_, status) = env.forged(&["run", "status", "--run", "bead-round-budget"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("accepted-risk"));
     assert_eq!(
         status["result"]["run"]["nextAction"]["stop"]["acceptedRisk"]["rationale"],
         json!("the affected path is disabled in this deployment")
@@ -1469,6 +1470,8 @@ fn implementer_spec_amendment_stops_before_gate_or_review() {
         driven["result"]["terminal"]["specAmendmentProposed"]["amendment"]["proposedChange"],
         json!("target the replacement API")
     );
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-amendment"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("input-required"));
     let log = env.provider_log();
     assert_eq!(
         log.iter().filter(|line| line.contains(" start ")).count(),

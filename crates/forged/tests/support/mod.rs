@@ -738,6 +738,16 @@ case "$cmd" in
   comment)
     id=$2; printf '%s' "$3" > "$state/$id.comment"
     printf '{"schema_version":1,"data":{"id":"%s"}}\n' "$id" ;;
+  list)
+    ids=$(val --id "$@")
+    first=1; printf '{"schema_version":1,"data":['
+    oldifs=$IFS; IFS=,
+    for id in $ids; do
+      [ -n "$id" ] || continue
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done
+    IFS=$oldifs
+    printf ']}\n' ;;
   children)
     epic=$2; first=1
     printf '{"schema_version":1,"data":['

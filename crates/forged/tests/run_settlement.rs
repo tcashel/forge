@@ -155,3 +155,33 @@ fn status_flags_an_orphaned_in_progress_bead() {
         "{response}"
     );
 }
+
+#[test]
+fn clean_candidate_claim_is_awaiting_delivery_not_stale() {
+    let env = TestEnv::new("forged-run-clean-claim");
+    env.forged(&["init"]);
+    let run = "clean-run";
+    seed(&env, run);
+
+    let (code, settled) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "clean",
+        "--reason",
+        "review approved; awaiting delivery",
+    ]);
+    assert_eq!(code, 0, "{settled}");
+    let (code, response) = env.forged(&["run", "status", "--run", run]);
+    assert_eq!(code, 0, "{response}");
+    let health = &response["result"]["run"]["claimHealth"];
+    assert_eq!(health["staleInProgress"], json!(false), "{response}");
+    assert!(
+        health["detail"]
+            .as_str()
+            .is_some_and(|detail| detail.contains("retains its Beads claim")),
+        "{response}"
+    );
+}

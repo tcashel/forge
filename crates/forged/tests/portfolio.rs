@@ -266,6 +266,42 @@ fn an_empty_ledger_answers_with_an_empty_portfolio() {
     assert_eq!(value["liveSeats"], json!(0));
 }
 
+#[test]
+fn work_list_and_no_scope_overview_share_the_same_operator_groups() {
+    let env = TestEnv::new("forged-portfolio-shared-queue");
+    env.forged(&["init"]);
+    fabricate_run(&env, "pf-queued");
+
+    let overview = portfolio(&env);
+    let (code, listed) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {listed}");
+    let overview_groups = overview["queue"]["groups"]
+        .as_array()
+        .expect("overview queue groups");
+    let listed_groups = listed["result"]["queue"]["groups"]
+        .as_array()
+        .expect("work-list queue groups");
+    assert_eq!(
+        overview_groups
+            .iter()
+            .map(|group| (&group["name"], &group["count"]))
+            .collect::<Vec<_>>(),
+        listed_groups
+            .iter()
+            .map(|group| (&group["name"], &group["count"]))
+            .collect::<Vec<_>>(),
+        "both surfaces use one grouping contract"
+    );
+    assert_eq!(
+        overview_groups
+            .iter()
+            .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+            .map(|entry| entry["id"].clone())
+            .collect::<Vec<_>>(),
+        vec![json!("pf-queued")]
+    );
+}
+
 /// Each condition names its subject, its condition, and the durable row it
 /// was read from. All four come from ONE snapshot — the same one the
 /// entries come from.
@@ -359,6 +395,70 @@ fn the_rail_names_every_condition_with_the_evidence_for_it() {
             json!("missing-cost"),
         ],
         "{value}"
+    );
+}
+
+#[test]
+fn settled_slices_remain_visible_at_the_operator_boundary() {
+    let env = TestEnv::new("forged-portfolio-settled");
+    env.forged(&["init"]);
+    for run in ["pf-blocked", "pf-ready", "pf-beads-pending"] {
+        fabricate_run(&env, run);
+    }
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "pf-blocked",
+            forged_ledger::RunOutcome::Blocked,
+            "migration choice is unresolved".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle blocked run");
+    ledger
+        .settle_run(
+            "pf-ready",
+            forged_ledger::RunOutcome::Clean,
+            "review approved".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle clean run");
+    ledger
+        .append_event(
+            Some("pf-ready"),
+            "proto.pr",
+            json!({"number": 88, "base": "main", "isDraft": true}),
+        )
+        .expect("record delivery PR");
+    ledger
+        .append_event(
+            Some("pf-beads-pending"),
+            "run.bead-settlement.pending",
+            json!({
+                "beadId": "bead-pf-beads-pending",
+                "outcome": "blocked",
+                "error": "team Beads server is unavailable",
+            }),
+        )
+        .expect("record pending Beads write");
+    ledger.close().expect("close ledger");
+
+    let value = portfolio(&env);
+    assert_eq!(value["attentionTotal"], json!(3), "{value}");
+    assert_eq!(
+        item(&value, "pf-blocked", "blocked")["evidence"]["outcome"],
+        json!("blocked")
+    );
+    assert_eq!(
+        item(&value, "pf-ready", "awaiting-delivery")["evidence"]["pr"],
+        json!(88)
+    );
+    assert_eq!(
+        item(&value, "pf-beads-pending", "beads-settlement-pending")["evidence"]["error"],
+        json!("team Beads server is unavailable")
     );
 }
 

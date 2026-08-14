@@ -174,9 +174,9 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
-Start with `overview` for the operator-facing portfolio, or `work list` for
-the raw inventory. Both take no id and are the discovery surfaces for the ids
-the scoped commands need.
+Start with `overview` or `work list`. Both carry the same operator queue;
+`work list` additionally serves the uncapped raw inventory. Neither needs an
+id.
 
 ```sh
 forged work list
@@ -191,18 +191,34 @@ forged events --run <id> --limit 200
 `overview` with no scope answers with the portfolio: `kind: "portfolio"` on
 the same `forged.overview/1` schema, carrying the inventory entries newest
 first (capped, with `total` and `cap` stated so a truncated page reads as
-truncated), the portfolio-wide `spend`, and an `attention` rail naming each
+truncated), the portfolio-wide `spend`, and one queue grouped in this stable
+order: **Needs me**, **Ready to merge**, **Running**, **Stalled or
+recoverable**, **Planned**. The App renders that same queue; it does not
+derive a second classification. The `attention` rail names each
 subject that needs a human and the durable evidence for it — an epic holding
 on `input.required`, an attempt marked `revoking` and not yet reclaimed, a
 result taken into custody by `proto.quarantine`, or usage rows carrying no
 cost. An empty rail means nothing needs attention; it is never omitted.
 
-Each `work list` entry carries its `kind` (`slice` or `epic`), lifecycle
-(`state`, `stopReason`, `createdAt`, `updatedAt`), live seat count, and
-spend, so an inventory can be drawn without a second call per entry. An
+Each queue/inventory entry carries a live Bead title (with a deterministic
+legacy fallback), repository and base branch, current stage/seat, last
+progress timestamp plus the clock used for age, exact blocker and next
+action, PR delivery, explicitly-known-or-unknown CI, spend, verified
+controller identity, and Bead `claimHealth`. Beads enrichment is one bounded
+read for the exact ledger ids, not one subprocess per row. A shell or Herdr
+pane is never enough to classify an entry as Running; a verified driver
+identity or live attempt is required. An
 epic's lifecycle is derived from its durable events — `active` until
 `forged.epic.paused`, `active` again after `forged.epic.resumed`,
 `submitted` once its final PR exists.
+
+Lifecycle fields are additive and always present: `outcome`,
+`delivery: {pr, sha}`, and `supersededBy`. Legacy rows have null values until
+a `run.settled` event records them. CI remains `unknown` unless durable
+evidence exists; the queue does not turn an unavailable GitHub lookup into a
+green check. `run status` and queue entries use the same `claimHealth` shape
+(`known`, status, assignee, expected assignee, stale-in-progress flag, and
+detail), so abandoned Bead ownership is visible instead of silently trusted.
 
 The overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the

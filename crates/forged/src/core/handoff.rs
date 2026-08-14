@@ -391,6 +391,45 @@ async fn status_for(record: &Value) -> Value {
     status
 }
 
+/// Project controller truth from lifecycle rows already held by an
+/// inventory snapshot. This keeps portfolio construction to one ledger
+/// transaction; only the per-controller identity files and OS process table
+/// are consulted here.
+pub(super) async fn controller_status_from_snapshot(
+    ctx: &Ctx,
+    id: &str,
+    event_record: Option<Value>,
+    progress: Option<&forged_ledger::EventRow>,
+) -> Value {
+    let file_record = std::fs::read_to_string(controller_dir(ctx, id).join(RECORD_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok());
+    let record = match (event_record, file_record) {
+        (Some(event), Some(file)) if generation(&file) > generation(&event) => Some(file),
+        (Some(event), _) => Some(event),
+        (None, file) => file,
+    };
+    let Some(record) = record else {
+        return Value::Null;
+    };
+    let mut status = status_for(&record).await;
+    if let Some(object) = status.as_object_mut() {
+        object.insert(
+            "lastProgressAt".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.ts)),
+        );
+        object.insert(
+            "lastProgressKind".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.kind)),
+        );
+        object.insert(
+            "lastProgressEventId".to_owned(),
+            progress.map_or(Value::Null, |row| json!(row.event_id)),
+        );
+    }
+    status
+}
+
 fn is_active(status: &Value) -> bool {
     status.get("state").and_then(Value::as_str) == Some("running")
 }
@@ -401,37 +440,9 @@ fn is_unknown(status: &Value) -> bool {
 
 /// Latest detached-controller projection, or null before the first submit.
 pub(super) async fn controller_status(ctx: &Ctx, id: &str) -> Result<Value, Failure> {
-    match latest_record(ctx, id).await? {
-        Some(record) => {
-            let mut status = status_for(&record).await;
-            if let Some(object) = status.as_object_mut() {
-                let progress = events(ctx, id).await?.into_iter().last();
-                object.insert(
-                    "lastProgressAt".to_owned(),
-                    progress
-                        .as_ref()
-                        .map(|row| json!(row.ts))
-                        .unwrap_or(Value::Null),
-                );
-                object.insert(
-                    "lastProgressKind".to_owned(),
-                    progress
-                        .as_ref()
-                        .map(|row| json!(row.kind))
-                        .unwrap_or(Value::Null),
-                );
-                object.insert(
-                    "lastProgressEventId".to_owned(),
-                    progress
-                        .as_ref()
-                        .map(|row| json!(row.event_id))
-                        .unwrap_or(Value::Null),
-                );
-            }
-            Ok(status)
-        }
-        None => Ok(Value::Null),
-    }
+    let record = latest_record(ctx, id).await?;
+    let progress = events(ctx, id).await?.into_iter().last();
+    Ok(controller_status_from_snapshot(ctx, id, record, progress.as_ref()).await)
 }
 
 async fn append_once(ctx: &Ctx, id: &str, kind: &str, value: Value) -> Result<(), Failure> {

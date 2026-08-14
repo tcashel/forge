@@ -246,7 +246,7 @@ pub async fn resolve_bead(ctx: &Ctx, bead_id: &str) -> Result<ResolvedSpec, Fail
 /// second `bd show`; packet open and claim still re-read independently.
 pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failure> {
     let bead_id = &issue.id;
-    let missing = missing_spec_fields(&issue);
+    let missing = missing_spec_fields(issue);
     if !missing.is_empty() {
         return Err(no_spec_refusal(bead_id, &missing));
     }
@@ -255,7 +255,7 @@ pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failur
             "bead {bead_id} reports no revision; a bead-sourced spec cannot be fenced without one"
         ))
     })?;
-    let body = render_body(&issue);
+    let body = render_body(issue);
     let body_sha256 = sha256_bytes(body.as_bytes());
     let mut bead_context = vec![
         format!("Bead title: {}", issue.title),

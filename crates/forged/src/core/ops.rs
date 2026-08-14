@@ -20,7 +20,7 @@ use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
     default_key, derive_key, epic, err_response, fenced, key_absent, on_ledger, param_opt_str,
-    param_str, read_only, run_holder, session_claimant, split_packet_key, Ctx, Failure,
+    param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -475,32 +475,63 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
-        let bead = forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await;
-        let controller_live = matches!(
-            controller.get("state").and_then(Value::as_str),
-            Some("running" | "running-unverified")
-        );
-        let claim_health = match bead {
+        let expected_assignee = crate::core::run_holder(&view.run.bead_id);
+        let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
             Ok(issue) => {
+                let holder_mismatch = issue
+                    .assignee
+                    .as_deref()
+                    .is_some_and(|holder| {
+                        holder != expected_assignee && holder != crate::core::FRONTIER_HOLDER
+                    });
+                let controller_dead = !controller.is_null()
+                    && matches!(
+                        controller.get("state").and_then(Value::as_str),
+                        Some("dead" | "vanished" | "exited")
+                    );
+                let execution_live = !view.live_attempts.is_empty()
+                    || controller.get("state").and_then(Value::as_str) == Some("running");
+                let awaiting_delivery = matches!(
+                    view.run.terminal_outcome,
+                    Some(
+                        forged_ledger::RunOutcome::Clean
+                            | forged_ledger::RunOutcome::AcceptedRisk
+                    )
+                );
                 let stale = issue.status == "in_progress"
-                    && view.live_attempts.is_empty()
-                    && !controller_live;
+                    && (holder_mismatch
+                        || (!awaiting_delivery
+                            && (!execution_live
+                                || view.run.state == RunState::Stopped
+                                || controller_dead)));
+                let detail = if holder_mismatch {
+                    format!(
+                        "Bead is assigned to {}, expected {expected_assignee}",
+                        issue.assignee.as_deref().unwrap_or("nobody")
+                    )
+                } else if awaiting_delivery {
+                    "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+                } else if stale {
+                    "Bead remains in_progress although durable execution is no longer live".to_owned()
+                } else {
+                    "Live Beads claim agrees with execution evidence".to_owned()
+                };
                 json!({
                     "known": true,
                     "status": issue.status,
                     "assignee": issue.assignee,
-                    "expectedAssignee": run_holder(&view.run.bead_id),
+                    "expectedAssignee": expected_assignee,
                     "staleInProgress": stale,
-                    "detail": stale.then(|| if view.run.terminal_outcome.is_some() {
-                        "Bead remains in_progress after its run reached a terminal outcome"
-                    } else {
-                        "Bead is in_progress with no live controller or provider attempt"
-                    }),
+                    "detail": detail,
                 })
             }
             Err(error) => json!({
                 "known": false,
-                "error": error.to_string(),
+                "status": Value::Null,
+                "assignee": Value::Null,
+                "expectedAssignee": expected_assignee,
+                "staleInProgress": false,
+                "detail": format!("Beads unavailable: {error}"),
             }),
         };
         let definition = match definition {
@@ -644,6 +675,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                         json!({"stop": super::drive::terminal_json(t)}),
                 }},
                 "controller": controller,
+                "claimHealth": claim_health,
             }
         }))
     })
@@ -1550,7 +1582,18 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 // ------------------------------------------------------------- inventory
 
 /// The durable kinds an inventory entry's lifecycle is folded from.
-const LIFECYCLE_KINDS: [&str; 4] = [epic::STARTED, epic::PAUSED, epic::RESUMED, epic::EPIC_PR];
+const RUN_SETTLED: &str = "run.settled";
+const PROTO_PR: &str = "proto.pr";
+const CONTROLLER_STARTED: &str = "forged.controller.started";
+const LIFECYCLE_KINDS: [&str; 7] = [
+    epic::STARTED,
+    epic::PAUSED,
+    epic::RESUMED,
+    epic::EPIC_PR,
+    PROTO_PR,
+    RUN_SETTLED,
+    CONTROLLER_STARTED,
+];
 
 /// A synthesized epic entry's derived lifecycle columns.
 struct EpicLifecycle {
@@ -1696,9 +1739,19 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         });
     }
     let mut live_seats: BTreeMap<String, u64> = BTreeMap::new();
+    let mut current: BTreeMap<String, (i64, String, String)> = BTreeMap::new();
     for attempt in &snapshot.live_attempts {
-        let (run_id, _, _) = split_packet_key(&attempt.packet_id)?;
-        *live_seats.entry(run_id).or_default() += 1;
+        let (run_id, stage, _) = split_packet_key(&attempt.packet_id)?;
+        *live_seats.entry(run_id.clone()).or_default() += 1;
+        let replace = current
+            .get(&run_id)
+            .is_none_or(|(seen, _, _)| *seen < attempt.attempt_id);
+        if replace {
+            current.insert(
+                run_id,
+                (attempt.attempt_id, stage, attempt.claimant.clone()),
+            );
+        }
     }
     // (createdAt, id, entry) — one ordering over both sources, keeping
     // `list_runs`'s chronological shape now that epics interleave.
@@ -1711,6 +1764,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "kind": if epic { "epic" } else { "slice" },
             "beadId": run.bead_id.clone(),
             "repo": run.repo.clone(),
+            "baseRef": run.base_ref.clone(),
             "branch": run.branch.clone(),
             "state": match run.state {
                 RunState::Active => "active",
@@ -1725,8 +1779,14 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "supersededBy": run.superseded_by.clone(),
             "createdAt": run.created_at.clone(),
             "updatedAt": run.updated_at.clone(),
+            "lastProgressAt": snapshot.latest_event.get(&run.run_id)
+                .map(|event| json!(event.ts)).unwrap_or_else(|| json!(run.updated_at)),
             "liveSeats": live_seats.get(&run.run_id).copied().unwrap_or(0),
+            "currentStage": current.get(&run.run_id).map(|(_, stage, _)| stage),
+            "currentSeat": current.get(&run.run_id).map(|(_, stage, _)| stage),
+            "currentAgent": current.get(&run.run_id).map(|(_, _, claimant)| claimant),
         });
+        add_lifecycle(snapshot, &run.run_id, &mut entry);
         add_spend(snapshot, &spend, &run.run_id, &mut entry);
         inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
     }
@@ -1751,6 +1811,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "kind": "epic",
             "beadId": bead_id,
             "repo": field("repo"),
+            "baseRef": field("baseRef"),
             "branch": field("integrationBranch"),
             "state": lifecycle.map(|l| l.state).unwrap_or("active"),
             "stopReason": lifecycle
@@ -1758,13 +1819,65 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
                 .unwrap_or(Value::Null),
             "createdAt": ts,
             "updatedAt": updated_at,
+            "lastProgressAt": updated_at,
             "liveSeats": live_seats.get(&epic_id).copied().unwrap_or(0),
+            "currentStage": current.get(&epic_id).map(|(_, stage, _)| stage),
+            "currentSeat": current.get(&epic_id).map(|(_, stage, _)| stage),
+            "currentAgent": current.get(&epic_id).map(|(_, _, claimant)| claimant),
         });
+        add_lifecycle(snapshot, &epic_id, &mut entry);
         add_spend(snapshot, &spend, &epic_id, &mut entry);
         inventory.push((ts, epic_id, entry));
     }
     inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
     Ok(inventory.into_iter().map(|(_, _, entry)| entry).collect())
+}
+
+/// Add the additive lifecycle contract. New `run.settled` writers can land
+/// independently; legacy rows degrade to null outcome/delivery rather than
+/// being guessed terminal.
+fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
+    let latest = |kind: &str| {
+        snapshot
+            .events(kind)
+            .iter()
+            .rev()
+            .find(|event| event.run_id.as_deref() == Some(id))
+            .and_then(|event| serde_json::from_str::<Value>(&event.payload_json).ok())
+    };
+    let settled = latest(RUN_SETTLED);
+    let outcome = settled
+        .as_ref()
+        .and_then(|value| value.get("outcome"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let superseded_by = settled
+        .as_ref()
+        .and_then(|value| value.get("supersededBy"))
+        .cloned()
+        .unwrap_or(Value::Null);
+    let settled_delivery = settled
+        .as_ref()
+        .and_then(|value| value.get("delivery"))
+        .cloned();
+    let pr = latest(epic::EPIC_PR).or_else(|| latest(PROTO_PR));
+    let delivery = settled_delivery.unwrap_or_else(|| {
+        pr.map_or(Value::Null, |pr| {
+            json!({
+                "pr": pr.get("number").cloned().unwrap_or(Value::Null),
+                "sha": Value::Null,
+            })
+        })
+    });
+    if let Some(object) = entry.as_object_mut() {
+        object.insert("outcome".to_owned(), outcome);
+        object.insert("delivery".to_owned(), delivery);
+        object.insert("supersededBy".to_owned(), superseded_by);
+        object.insert(
+            "ci".to_owned(),
+            json!({"status": "unknown", "detail": "CI state is not recorded durably"}),
+        );
+    }
 }
 
 /// Stamp one entry's spend, when the caller asked for it.
@@ -1794,10 +1907,11 @@ fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut 
 /// [`LIFECYCLE_KINDS`]. `proto.quarantine` is spelled here rather than
 /// imported because the ledger stores kind strings and the proto crate
 /// exposes the vocabulary only through its parsed variants.
-const ATTENTION_KINDS: [&str; 3] = [
+const ATTENTION_KINDS: [&str; 4] = [
     epic::INPUT_REQUIRED,
     epic::INPUT_RESOLVED,
     "proto.quarantine",
+    "run.bead-settlement.pending",
 ];
 
 /// One condition needing a human, in the order the rail reports them.
@@ -1805,7 +1919,15 @@ const ATTENTION_KINDS: [&str; 3] = [
 /// Severity, not alphabet: a subject holding for an answer or stuck
 /// mid-reclaim blocks work, custody of a refused result is evidence a human
 /// must adjudicate, and an unpriced usage row only makes a figure partial.
-const CONDITIONS: [&str; 4] = ["input-required", "revoking", "quarantined", "missing-cost"];
+const CONDITIONS: [&str; 7] = [
+    "input-required",
+    "blocked",
+    "beads-settlement-pending",
+    "revoking",
+    "quarantined",
+    "awaiting-delivery",
+    "missing-cost",
+];
 
 /// The whole inventory and what needs a human, from ONE snapshot.
 pub struct Portfolio {
@@ -1813,6 +1935,8 @@ pub struct Portfolio {
     pub entries: Vec<Value>,
     /// One entry per (subject, condition), most severe condition first.
     pub attention: Vec<Value>,
+    /// The operator-facing grouping shared by `work list` and Overview.
+    pub queue: Value,
 }
 
 /// The portfolio: [`inventory`] with spend, plus the attention rail folded
@@ -1831,9 +1955,285 @@ pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
         .copied()
         .collect();
     let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
-    let entries = project_entries(&snapshot, Spend::Include)?;
+    let mut entries = project_entries(&snapshot, Spend::Include)?;
     let attention = attention_rail(&snapshot, &entries);
-    Ok(Portfolio { entries, attention })
+    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention).await;
+    Ok(Portfolio {
+        entries,
+        attention,
+        queue,
+    })
+}
+
+const QUEUE_GROUPS: [&str; 5] = [
+    "Needs me",
+    "Ready to merge",
+    "Running",
+    "Stalled or recoverable",
+    "Planned",
+];
+
+/// Enrich the inventory and group it once for every operator surface.
+///
+/// Beads is queried once for exactly the ids in the ledger. Controller
+/// records and progress events come from the already-open inventory
+/// snapshot, avoiding a ledger projection per row.
+async fn operator_queue(
+    ctx: &Ctx,
+    snapshot: &InventorySnapshot,
+    entries: &mut [Value],
+    attention: &[Value],
+) -> Value {
+    let bead_ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+        .collect();
+    let bead_read = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await;
+    let bead_error = bead_read.as_ref().err().map(ToString::to_string);
+    let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
+        .unwrap_or_default()
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect();
+    let mut attention_by_id: BTreeMap<&str, &Value> = BTreeMap::new();
+    for item in attention {
+        if let Some(id) = item["id"].as_str() {
+            // The rail is already severity ordered; retain the first and
+            // therefore most important blocker for the compact queue card.
+            attention_by_id.entry(id).or_insert(item);
+        }
+    }
+    let mut controller_records: BTreeMap<String, (i64, Value)> = BTreeMap::new();
+    for event in snapshot.events(CONTROLLER_STARTED) {
+        let Some(id) = event.run_id.clone() else {
+            continue;
+        };
+        let Ok(record) = serde_json::from_str::<Value>(&event.payload_json) else {
+            continue;
+        };
+        if controller_records
+            .get(&id)
+            .is_none_or(|(seen, _)| *seen < event.event_id)
+        {
+            controller_records.insert(id, (event.event_id, record));
+        }
+    }
+    let mut pr_records: BTreeMap<String, (i64, Value)> = BTreeMap::new();
+    for kind in [PROTO_PR, epic::EPIC_PR] {
+        for event in snapshot.events(kind) {
+            let Some(id) = event.run_id.clone() else {
+                continue;
+            };
+            let Ok(record) = serde_json::from_str::<Value>(&event.payload_json) else {
+                continue;
+            };
+            if pr_records
+                .get(&id)
+                .is_none_or(|(seen, _)| *seen < event.event_id)
+            {
+                pr_records.insert(id, (event.event_id, record));
+            }
+        }
+    }
+    let as_of = now_iso();
+    let mut grouped: BTreeMap<&str, Vec<Value>> = QUEUE_GROUPS
+        .iter()
+        .map(|name| (*name, Vec::new()))
+        .collect();
+
+    for entry in entries.iter_mut() {
+        let id = entry["id"].as_str().unwrap_or_default().to_owned();
+        let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
+        let controller = super::handoff::controller_status_from_snapshot(
+            ctx,
+            &id,
+            controller_records.remove(&id).map(|(_, record)| record),
+            snapshot.latest_event.get(&id),
+        )
+        .await;
+        let issue = beads.get(&bead_id);
+        let title = issue
+            .map(|issue| issue.title.trim())
+            .filter(|title| !title.is_empty())
+            .map(str::to_owned)
+            .unwrap_or_else(|| {
+                format!(
+                    "Legacy {} {bead_id}",
+                    entry["kind"].as_str().unwrap_or("work")
+                )
+            });
+        let expected = crate::core::run_holder(&bead_id);
+        let controller_state = controller.get("state").and_then(Value::as_str);
+        let controller_live = controller_state == Some("running");
+        let execution_live = controller_live || entry["liveSeats"].as_u64().unwrap_or(0) > 0;
+        let claim_known = issue.is_some();
+        let claim_status = issue.map(|issue| issue.status.as_str());
+        let assignee = issue.and_then(|issue| issue.assignee.as_deref());
+        let holder_mismatch = assignee
+            .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
+        let outcome = entry["outcome"].as_str();
+        let awaiting_delivery = matches!(outcome, Some("clean" | "accepted-risk"));
+        let visibly_terminal = !entry["outcome"].is_null()
+            || !entry["delivery"].is_null()
+            || entry["state"] == json!("stopped");
+        let dead_controller = !controller.is_null()
+            && matches!(controller_state, Some("dead" | "vanished" | "exited"));
+        let stale = claim_status == Some("in_progress")
+            && (holder_mismatch
+                || (!awaiting_delivery
+                    && (!execution_live || visibly_terminal || dead_controller)));
+        let claim_detail = if !claim_known {
+            bead_error
+                .as_deref()
+                .map(|error| format!("Beads unavailable: {error}"))
+                .unwrap_or_else(|| "Bead was not returned by the bounded live read".to_owned())
+        } else if holder_mismatch {
+            format!(
+                "Bead is assigned to {}, expected {expected}",
+                assignee.unwrap_or("nobody")
+            )
+        } else if awaiting_delivery {
+            "Reviewed delivery retains its Beads claim until the PR lands".to_owned()
+        } else if stale {
+            "Bead remains in_progress although durable execution is no longer live".to_owned()
+        } else if claim_status == Some("blocked") {
+            "Bead is blocked in the authoritative live store".to_owned()
+        } else if claim_status == Some("closed") && !visibly_terminal {
+            "Bead is closed while durable execution is not settled".to_owned()
+        } else {
+            "Live Beads claim agrees with execution evidence".to_owned()
+        };
+        let claim_health = json!({
+            "known": claim_known,
+            "status": claim_status,
+            "assignee": assignee,
+            "expectedAssignee": expected,
+            "staleInProgress": stale,
+            "detail": claim_detail,
+        });
+        let attention_item = attention_by_id.get(id.as_str()).copied();
+        let attention_condition = attention_item.and_then(|item| item["condition"].as_str());
+        let blocker = attention_item
+            .map(|item| item["detail"].clone())
+            .or_else(|| {
+                entry["stopReason"]
+                    .is_string()
+                    .then(|| entry["stopReason"].clone())
+            })
+            .or_else(|| (!claim_known).then(|| json!(claim_detail)))
+            .or_else(|| {
+                matches!(claim_status, Some("blocked" | "closed")).then(|| json!(claim_detail))
+            })
+            .or_else(|| stale.then(|| json!(claim_detail)))
+            .or_else(|| {
+                matches!(controller_state, Some("dead" | "vanished" | "unknown")).then(|| {
+                    json!(format!(
+                        "detached controller is {}",
+                        controller_state.unwrap_or("unknown")
+                    ))
+                })
+            })
+            .unwrap_or(Value::Null);
+        let recorded_pr = pr_records.remove(&id).map(|(_, record)| record);
+        let delivered_pr = entry.pointer("/delivery/pr").cloned();
+        let pr = recorded_pr.map_or_else(
+            || match delivered_pr {
+                Some(value @ Value::Object(_)) => value,
+                Some(number @ Value::Number(_)) => json!({
+                    "number": number,
+                    "url": Value::Null,
+                    "baseBranch": entry["baseRef"],
+                    "isDraft": Value::Null,
+                }),
+                _ => Value::Null,
+            },
+            |record| {
+                json!({
+                    "number": record.get("number").cloned().unwrap_or(Value::Null),
+                    "url": record.get("url").cloned().unwrap_or(Value::Null),
+                    "baseBranch": record.get("base").cloned()
+                        .unwrap_or_else(|| entry["baseRef"].clone()),
+                    "isDraft": record.get("isDraft").cloned().unwrap_or(Value::Null),
+                })
+            },
+        );
+        let has_pr = !pr.is_null();
+        let merge_actionable = awaiting_delivery && has_pr;
+        let needs_intervention =
+            attention_item.is_some() && attention_condition != Some("awaiting-delivery");
+        let group = if needs_intervention || claim_status == Some("blocked") {
+            "Needs me"
+        } else if execution_live {
+            "Running"
+        } else if merge_actionable {
+            "Ready to merge"
+        } else if attention_item.is_some() {
+            // A clean outcome without its promised PR is not mergeable.
+            "Needs me"
+        } else if !claim_known
+            || stale
+            || claim_status == Some("closed")
+            || dead_controller
+            || controller_state == Some("unknown")
+            || entry["state"] == json!("stopped")
+        {
+            "Stalled or recoverable"
+        } else {
+            "Planned"
+        };
+        let next_action = match group {
+            "Needs me" => "Resolve the recorded blocker, then resume execution".to_owned(),
+            "Ready to merge" => format!(
+                "Merge PR {} into {}",
+                pr.get("number")
+                    .map_or_else(|| "unknown".to_owned(), Value::to_string),
+                pr.get("baseBranch")
+                    .and_then(Value::as_str)
+                    .unwrap_or("the recorded base")
+            ),
+            "Running" => entry["currentStage"].as_str().map_or_else(
+                || "Let the verified controller advance the workflow".to_owned(),
+                |stage| format!("Wait for {stage} to settle"),
+            ),
+            "Stalled or recoverable" => {
+                "Inspect the blocker and resubmit only after controller death is verified"
+                    .to_owned()
+            }
+            _ => "Submit a detached controller when this work should start".to_owned(),
+        };
+        if let Some(object) = entry.as_object_mut() {
+            object.insert("title".to_owned(), json!(title));
+            object.insert("controller".to_owned(), controller);
+            object.insert("claimHealth".to_owned(), claim_health);
+            object.insert("blocker".to_owned(), blocker);
+            object.insert("nextAction".to_owned(), json!(next_action));
+            object.insert("pr".to_owned(), pr);
+            object.insert(
+                "spend".to_owned(),
+                json!({
+                    "costUsdKnown": object.get("costUsdKnown").cloned().unwrap_or(json!(0.0)),
+                    "rowsMissingCost": object.get("rowsMissingCost").cloned().unwrap_or(json!(0)),
+                }),
+            );
+            object.insert(
+                "progressAgeInput".to_owned(),
+                json!({"lastProgressAt": object.get("lastProgressAt"), "asOf": as_of}),
+            );
+            object.insert("queueGroup".to_owned(), json!(group));
+        }
+        grouped
+            .get_mut(group)
+            .expect("pinned queue group")
+            .push(entry.clone());
+    }
+    let groups: Vec<Value> = QUEUE_GROUPS
+        .iter()
+        .map(|name| {
+            let items = grouped.remove(name).unwrap_or_default();
+            json!({"name": name, "count": items.len(), "entries": items})
+        })
+        .collect();
+    json!({"groups": groups, "total": entries.len(), "asOf": as_of})
 }
 
 /// Fold one snapshot into the attention rail.
@@ -1903,6 +2303,81 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
                     .trim()
                     .to_owned(),
                 payload.clone(),
+            ),
+        );
+    }
+
+    // Slice settlement is itself operator-facing truth. A blocked/input
+    // outcome needs adjudication; clean and accepted-risk candidates need a
+    // delivery decision and must not disappear merely because no worker is
+    // live anymore.
+    for entry in entries {
+        let Some(id) = entry["id"].as_str() else {
+            continue;
+        };
+        let reason = entry["stopReason"].as_str().unwrap_or("no reason recorded");
+        match entry["outcome"].as_str() {
+            Some("blocked") => push(
+                "blocked",
+                item(
+                    id,
+                    "blocked",
+                    format!("run is blocked: {reason}"),
+                    json!({"outcome": "blocked", "reason": reason}),
+                ),
+            ),
+            Some("input-required") => push(
+                "input-required",
+                item(
+                    id,
+                    "input-required",
+                    format!("run needs operator input: {reason}"),
+                    json!({"outcome": "input-required", "reason": reason}),
+                ),
+            ),
+            Some(outcome @ ("clean" | "accepted-risk")) => {
+                let pr = entry
+                    .pointer("/delivery/pr")
+                    .cloned()
+                    .unwrap_or(Value::Null);
+                push(
+                    "awaiting-delivery",
+                    item(
+                        id,
+                        "awaiting-delivery",
+                        if pr.is_null() {
+                            format!("{outcome} candidate has no recorded delivery PR")
+                        } else {
+                            format!("{outcome} candidate is awaiting merge of PR {pr}")
+                        },
+                        json!({"outcome": outcome, "pr": pr}),
+                    ),
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // A failed Beads reconciliation is a durable promise still owed. Keep
+    // the latest failed write visible; the exact error and intended outcome
+    // are the recovery evidence.
+    let mut bead_pending: BTreeMap<String, Value> = BTreeMap::new();
+    for event in snapshot.events("run.bead-settlement.pending") {
+        let Some(id) = event.run_id.clone() else {
+            continue;
+        };
+        let payload = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+        bead_pending.insert(id, payload);
+    }
+    for (id, payload) in bead_pending {
+        let error = payload["error"].as_str().unwrap_or("unknown Beads error");
+        push(
+            "beads-settlement-pending",
+            item(
+                &id,
+                "beads-settlement-pending",
+                format!("run outcome is stored but Beads reconciliation is pending: {error}"),
+                payload,
             ),
         );
     }
@@ -2025,7 +2500,8 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        Ok(json!({"runs": inventory(ctx, Spend::Include).await?}))
+        let portfolio = portfolio(ctx).await?;
+        Ok(json!({"runs": portfolio.entries, "queue": portfolio.queue}))
     })
     .await
 }

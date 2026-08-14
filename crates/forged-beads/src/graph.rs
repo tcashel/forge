@@ -139,6 +139,25 @@ pub async fn show_issue(cfg: &BdConfig, id: &str) -> Result<IssueSummary, BdErro
         })
 }
 
+/// Read an exact, bounded set of issues in one `bd list` invocation.
+///
+/// Missing or deleted ids are absent from the result. Supplying exact ids
+/// avoids both an operator-wide scan and one `bd show` process per row.
+pub async fn list_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<IssueSummary>, BdError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let joined = ids.join(",");
+    let data = invoke::read(
+        cfg,
+        &[
+            "list", "--id", &joined, "--limit", "0", "--brief", "--flat", "--json",
+        ],
+    )
+    .await?;
+    Ok(list(&data))
+}
+
 /// Read an epic's inventory. Native parent/child links are preferred, with
 /// the Anvil-compatible epic-depends-on-children encoding unioned in.
 pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
