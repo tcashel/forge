@@ -12,7 +12,8 @@ mod support;
 
 use serde_json::{json, Value};
 use support::{
-    render_cost, render_dispatch, render_dispatch_without_server_tools, render_resolution,
+    render_cost, render_dispatch, render_dispatch_before_server_tools,
+    render_dispatch_without_server_tools, render_resolution,
     render_resolution_without_server_tools, require_node,
 };
 
@@ -512,6 +513,29 @@ fn portfolio_navigation_is_disabled_when_the_host_cannot_serve_it() {
                 && node["disabled"] == json!(true)
         }),
         "the portfolio control remains visible but reads as disabled: {:?}",
+        dispatched.subident
+    );
+}
+
+#[test]
+fn a_capable_late_handshake_reenables_portfolio_navigation() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch_before_server_tools(
+        &node,
+        &json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "refused"}}),
+    );
+    assert_eq!(
+        dispatched.navigation_picks(),
+        vec![json!({"schemaVersion": 1, "params": {}})],
+        "the handshake rebuilds a refusal drawn before capabilities arrived"
+    );
+    assert!(
+        dispatched.subident.iter().any(|node| {
+            node["class"] == json!("up")
+                && node["text"] == json!("↑ all work")
+                && node["disabled"] == json!(false)
+        }),
+        "the rebuilt portfolio control is enabled: {:?}",
         dispatched.subident
     );
 }

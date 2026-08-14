@@ -131,7 +131,7 @@ const document = {
 const source = [
   "el", "arr", "at", "num", "int", "chip", "panel", "pickGrid", "choose", "upToPortfolio",
   "viewResolution", "viewPortfolio", "drawRail", "portfolioRail", "render", "subjectParams",
-  "ingest",
+  "capabilitiesSettled", "ingest",
 ]
   .map(lift)
   .join("\n");
@@ -141,7 +141,7 @@ const host = {
   connected: true,
   capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
 };
-const { ingest, state, nodes } = new Function(
+const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "document",
   "setTimeout",
   "reportSize",
@@ -149,13 +149,17 @@ const { ingest, state, nodes } = new Function(
   "packetRows",
   "headline",
   "host",
-  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { ingest, state, nodes };`,
+  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
 )(document, () => {}, () => {}, () => {}, () => [], () => ({}), host);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) stdin += chunk;
 ingest(JSON.parse(stdin));
+if (process.env.SERVER_TOOLS_AFTER_INGEST === "1") {
+  host.capabilities.serverTools = true;
+  capabilitiesSettled();
+}
 
 // Firing a card's click to record what it would ask for WRITES `state.args`,
 // which is also one of the things being reported. Snapshot it before the

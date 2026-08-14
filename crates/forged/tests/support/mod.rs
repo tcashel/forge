@@ -1442,6 +1442,20 @@ pub fn render_dispatch_without_server_tools(node: &str, envelope: &Value) -> Dis
     dispatched(out)
 }
 
+/// Drive a payload that arrives before a capable host finishes its handshake.
+pub fn render_dispatch_before_server_tools(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output_env(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+        &[("SERVER_TOOLS", "0"), ("SERVER_TOOLS_AFTER_INGEST", "1")],
+    );
+    dispatched(out)
+}
+
 fn dispatched(out: Value) -> Dispatched {
     Dispatched {
         view: out["view"].as_array().cloned().unwrap_or_default(),
