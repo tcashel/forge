@@ -581,7 +581,14 @@ async fn honor_await(
     if let Some(attempt) = live {
         let (run_id, stage_key, seq) = crate::core::split_packet_key(packet_id)?;
         let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
-        let pid = std::fs::read_to_string(packet_dir.join("provider.pid"))
+        let attempt_dir =
+            forged_provider::PacketDirs::new(&packet_dir, attempt.attempt_id).attempt_path();
+        let runtime_dir = if attempt_dir.exists() {
+            attempt_dir
+        } else {
+            packet_dir
+        };
+        let pid = std::fs::read_to_string(runtime_dir.join("provider.pid"))
             .ok()
             .and_then(|t| t.trim().parse::<i32>().ok());
         match pid {

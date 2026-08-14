@@ -1,0 +1,26 @@
+{
+  "name": "forged",
+  "version": "0.2.0",
+  "description": "Forge-owned lead-agent planning, critique, adjudication, setup, and typed handoff to Forged.",
+  "author": {
+    "name": "Tripp Cashel"
+  },
+  "homepage": "https://github.com/tcashel/forge",
+  "repository": "https://github.com/tcashel/forge",
+  "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
+  "keywords": ["forged", "planning", "code-review", "beads", "orchestration"],
+  "skills": "./skills/",
+  "interface": {
+    "displayName": "forged",
+    "shortDescription": "Plan and adjudicate, then hand execution to Forged",
+    "longDescription": "Maintain native Bead specifications with one lead agent, critique and adjudicate them proportionally, then submit approved slices and epics to Forged for durable provider-neutral execution.",
+    "developerName": "Tripp Cashel",
+    "category": "Development",
+    "capabilities": ["Interactive", "Write"],
+    "defaultPrompt": [
+      "Plan this work as a native Bead before execution.",
+      "Critique and adjudicate this Bead specification.",
+      "Submit the next ready Bead through Forged."
+    ]
+  }
+}

@@ -39,7 +39,7 @@ impl ProviderDriver for ClaudeDriver {
         claim_token: &str,
     ) -> Result<Invocation, ProviderError> {
         let prompt_path = dirs.prompt();
-        let stdout_path = dirs.stdout();
+        let stdout_path = dirs.stdout_working();
         let prompt = validate_embedded_path(&prompt_path)?;
         let stdout = validate_embedded_path(&stdout_path)?;
         let model = &packet.provider_hints.model;

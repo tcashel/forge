@@ -29,11 +29,14 @@ export ANVIL_HOME="${ANVIL_HOME:-$HOME/.anvil}"
 export BEADS_DIR="$ANVIL_HOME/beads-team"
 export BD_BIN="$ANVIL_HOME/tools/bd-1.2.1/bin/bd"
 
-mkdir -p "$BEADS_DIR" "$ANVIL_HOME/beads-bootstrap"
-"$BD_BIN" -C "$ANVIL_HOME/beads-bootstrap" init \
-  --server --external --non-interactive --skip-agents --skip-hooks \
-  --server-host beads.team.example --server-port 3307 \
-  --server-user forged --database forged_team
+mkdir -p "$BEADS_DIR"
+(
+  cd "$BEADS_DIR"
+  env BEADS_DIR="$BEADS_DIR" "$BD_BIN" init \
+    --server --external --non-interactive --skip-agents --skip-hooks \
+    --server-host beads.team.example --server-port 3307 \
+    --server-user forged --database forged_team
+)
 ```
 
 The server user used for initialization needs permission to create and migrate

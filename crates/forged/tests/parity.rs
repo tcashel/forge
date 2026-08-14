@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the thirty-one public core functions, the CLI path and the MCP tool path produce
+//! the thirty-four public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -36,7 +36,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_thirty_one_tools_match_their_cli_counterparts() {
+fn all_thirty_four_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -46,6 +46,8 @@ fn all_thirty_one_tools_match_their_cli_counterparts() {
     tools.sort();
     let mut expected = vec![
         "claim_next",
+        "artifact_verify",
+        "artifact_compact",
         "doctor",
         "definition_validate",
         "events_tail",
@@ -79,7 +81,7 @@ fn all_thirty_one_tools_match_their_cli_counterparts() {
         "work_list",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the thirty-one tools, exactly");
+    assert_eq!(tools, expected, "the thirty-four tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -463,6 +465,16 @@ fn all_thirty_one_tools_match_their_cli_counterparts() {
         })),
     );
     assert_eq!(normalized(cli), normalized(tool), "packet_fail parity");
+
+    // artifact_verify: a missing attempt is the same read-only refusal.
+    let cli = env.forged(&["artifact", "verify", "--attempt", "1"]).1;
+    let tool = mcp.call_tool("artifact_verify", envelope(json!({"attempt": 1})));
+    assert_eq!(normalized(cli), normalized(tool), "artifact_verify parity");
+
+    // artifact_compact requires an explicit key on both adapters.
+    let cli = env.forged(&["artifact", "compact", "--attempt", "1"]).1;
+    let tool = mcp.call_tool("artifact_compact", envelope(json!({"attempt": 1})));
+    assert_eq!(normalized(cli), normalized(tool), "artifact_compact parity");
 
     // Session controls: missing durable state refuses identically.
     let cli = env.forged(&["session", "list", "--run", "absent"]).1;

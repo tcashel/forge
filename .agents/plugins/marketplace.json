@@ -1,0 +1,20 @@
+{
+  "name": "forge",
+  "interface": {
+    "displayName": "Forge"
+  },
+  "plugins": [
+    {
+      "name": "forged",
+      "source": {
+        "source": "local",
+        "path": "./plugins/forged"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Development"
+    }
+  ]
+}

@@ -132,9 +132,12 @@ fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -
 }
 
 fn read_pid(env: &TestEnv, run: &str, stage: &str, seq: i64) -> Option<i32> {
-    std::fs::read_to_string(env.packet_dir(run, stage, seq).join("provider.pid"))
-        .ok()
-        .and_then(|t| t.trim().parse().ok())
+    std::fs::read_to_string(
+        env.latest_attempt_dir(run, stage, seq)?
+            .join("provider.pid"),
+    )
+    .ok()
+    .and_then(|t| t.trim().parse().ok())
 }
 
 fn kill_group(pid: i32) {
@@ -728,6 +731,316 @@ fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
 // -------------------------------------------------- detached handoff recovery
 
 #[test]
+fn epic_terminal_and_input_stops_serialize_with_supervisor_spawn() {
+    let cases = [
+        (
+            "input",
+            forged_ledger::DesiredState::Running,
+            forged_ledger::DesiredReconcileOutcome::Attention,
+        ),
+        (
+            "final",
+            forged_ledger::DesiredState::Stopped,
+            forged_ledger::DesiredReconcileOutcome::Terminal,
+        ),
+    ];
+
+    for (case, expected_state, expected_outcome) in cases {
+        let env = TestEnv::new(&format!("km-epic-desired-stop-{case}"));
+        let epic = format!("epic-stop-{case}");
+        env.enable_dynamic_gh();
+        if case == "input" {
+            env.seed_epic(&epic, &[("direct-decision", &env.spec, true)]);
+            env.set_bead_field("direct-decision", "type", "decision");
+        } else {
+            env.seed_epic(&epic, &[("already-landed", &env.spec, true)]);
+            env.set_bead_field("already-landed", "status", "closed");
+        }
+        assert_eq!(env.forged(&["init"]).0, 0);
+        let repo = env.repos.repo.to_string_lossy().into_owned();
+        let spec = env.spec.to_string_lossy().into_owned();
+        let (code, started) = env.forged(&[
+            "epic",
+            "start",
+            "--epic",
+            &epic,
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ]);
+        assert_eq!(code, 0, "epic start: {started}");
+        let (code, prepared) = env.forged(&["epic", "advance", "--epic", &epic]);
+        assert_eq!(code, 0, "prepare integration: {prepared}");
+        assert!(prepared["result"]["progress"].is_object());
+        let ledger = env.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic, 0)
+            .expect("authorize desired epic");
+        ledger.close().expect("close");
+
+        // The stop transition wins the shared fence but pauses before its
+        // atomic event+desired commit, so the supervisor can complete its
+        // earlier landed-stop observation without seeing a partial stop.
+        let stop_fp = env.root.join(format!("fp-stop-{case}"));
+        std::fs::create_dir_all(&stop_fp).expect("stop failpoint dir");
+        let stop_reached = stop_fp.join("epic.stop.guarded.before-commit.reached");
+        let advance = env
+            .forged_cmd(&["epic", "advance", "--epic", &epic])
+            .env("FORGED_FAILPOINT", "epic.stop.guarded.before-commit")
+            .env("FORGED_FAILPOINT_MODE", "pause")
+            .env("FORGED_FAILPOINT_DIR", &stop_fp)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("manual epic advance spawns");
+        wait_until("guarded stop commit boundary", || stop_reached.exists());
+
+        let supervisor_fp = env.root.join(format!("fp-supervisor-{case}"));
+        std::fs::create_dir_all(&supervisor_fp).expect("supervisor failpoint dir");
+        let supervisor_reached = supervisor_fp.join("supervisor.stop-check.after.reached");
+        let supervisor = env
+            .forged_cmd(&["supervise", "--once"])
+            .env("FORGED_FAILPOINT", "supervisor.stop-check.after")
+            .env("FORGED_FAILPOINT_MODE", "pause")
+            .env("FORGED_FAILPOINT_DIR", &supervisor_fp)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("supervisor tick spawns");
+        wait_until("supervisor post-stop-check boundary", || {
+            supervisor_reached.exists()
+        });
+
+        let ledger = env.ledger();
+        let before_release = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic)
+            .expect("desired query")
+            .expect("desired row");
+        let starts_before = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count();
+        let stop_events_before = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| {
+                event.kind == "forged.epic.input.required" || event.kind == "forged.epic.pr"
+            })
+            .count();
+        ledger.close().expect("close");
+
+        std::fs::write(
+            supervisor_fp.join("supervisor.stop-check.after.release"),
+            b"",
+        )
+        .expect("release supervisor");
+        std::thread::sleep(Duration::from_millis(100));
+        std::fs::write(stop_fp.join("epic.stop.guarded.before-commit.release"), b"")
+            .expect("commit guarded stop");
+        let advance_output = advance.wait_with_output().expect("manual advance exits");
+        let supervisor_output = supervisor
+            .wait_with_output()
+            .expect("supervisor tick exits");
+
+        assert!(before_release.reconcile_token.is_some());
+        assert_ne!(before_release.last_outcome, Some(expected_outcome));
+        assert_eq!(starts_before, 0, "spawn remained behind the held fence");
+        assert_eq!(stop_events_before, 0, "event and intent commit together");
+        assert!(
+            supervisor_output.status.success(),
+            "supervisor failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&supervisor_output.stdout),
+            String::from_utf8_lossy(&supervisor_output.stderr)
+        );
+        let supervisor_json: Value =
+            serde_json::from_slice(&supervisor_output.stdout).expect("supervisor JSON");
+        assert_eq!(
+            supervisor_json["result"]["subjects"][0]["action"],
+            json!("superseded"),
+            "the winning stop transition must invalidate the stale claim"
+        );
+        assert!(
+            advance_output.status.success(),
+            "manual advance failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&advance_output.stdout),
+            String::from_utf8_lossy(&advance_output.stderr)
+        );
+
+        let ledger = env.ledger();
+        let desired = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic)
+            .expect("desired query")
+            .expect("desired row");
+        let starts = ledger
+            .list_events(Some(&epic), 0, 65_536)
+            .expect("events")
+            .into_iter()
+            .filter(|event| event.kind == "forged.controller.started")
+            .count();
+        ledger.close().expect("close");
+        assert_eq!(desired.desired_state, expected_state);
+        assert_eq!(desired.last_outcome, Some(expected_outcome));
+        assert!(desired.next_wake_at.is_none());
+        assert_eq!(desired.controller_generation, 0);
+        assert_eq!(desired.restart_used, 0);
+        assert_eq!(starts, 0, "no controller spawned after the stop won");
+    }
+}
+
+#[test]
+fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
+    let env = TestEnv::new("km-epic-resolution-identity");
+    env.seed_epic(
+        "epic-resolve-crash",
+        &[("resolve-decision", &env.spec, true)],
+    );
+    env.set_bead_field("resolve-decision", "type", "decision");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-resolve-crash",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(
+        env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"])
+            .0,
+        0
+    );
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-resolve-crash",
+            0,
+        )
+        .expect("authorize desired epic");
+    ledger.close().expect("close");
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "input stop: {held}");
+    assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));
+
+    env.set_bead_field("resolve-decision", "type", "task");
+    let fp = env.root.join("fp-resolve-identity");
+    std::fs::create_dir_all(&fp).expect("failpoint dir");
+    let mut crashed = env
+        .forged_cmd(&[
+            "epic",
+            "resolve",
+            "--epic",
+            "epic-resolve-crash",
+            "--child",
+            "resolve-decision",
+            "--note",
+            "convert to executable work",
+        ])
+        .env("FORGED_FAILPOINT", "epic.resolve.desired.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("resolve process spawns");
+    assert!(!crashed.wait().expect("resolve crashes").success());
+
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .collect::<Vec<_>>();
+    assert_eq!(resolved_events.len(), 1);
+    let first_payload: Value =
+        serde_json::from_str(&resolved_events[0].payload_json).expect("resolution payload");
+    assert!(first_payload["resolutionId"].as_str().is_some());
+    let due = ledger
+        .get_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-resolve-crash",
+        )
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(
+        due.last_outcome,
+        Some(forged_ledger::DesiredReconcileOutcome::Authorized)
+    );
+    assert!(due.next_wake_at.is_some());
+    ledger.close().expect("close");
+
+    let (code, replayed) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-resolve-crash",
+        "--child",
+        "resolve-decision",
+        "--note",
+        "convert to executable work",
+    ]);
+    assert_eq!(code, 0, "resolution replay: {replayed}");
+    assert_eq!(
+        replayed["result"]["resolutionId"],
+        first_payload["resolutionId"]
+    );
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .count();
+    assert_eq!(resolved_events, 1, "replay never duplicates resolution");
+    ledger.close().expect("close");
+
+    let (code, held_again) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "repeat input stop: {held_again}");
+    assert_eq!(
+        held_again["result"]["stopped"]["code"],
+        json!("non-code-child")
+    );
+    let (code, resolved_again) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-resolve-crash",
+        "--child",
+        "resolve-decision",
+        "--note",
+        "convert to executable work",
+    ]);
+    assert_eq!(code, 0, "later same-note resolution: {resolved_again}");
+    assert_ne!(
+        resolved_again["result"]["resolutionId"],
+        first_payload["resolutionId"]
+    );
+    let ledger = env.ledger();
+    let resolved_events = ledger
+        .list_events(Some("epic-resolve-crash"), 0, 65_536)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.epic.input.resolved")
+        .count();
+    assert_eq!(resolved_events, 2, "later resolution has a new identity");
+    ledger.close().expect("close");
+}
+
+#[test]
 fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
     let env = TestEnv::new("km-controller-handoff");
     start_run(&env, "bead-khandoff");
@@ -768,6 +1081,12 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
             .expect("submit operation probe")
             .expect("submit operation survives");
         assert_eq!(operation.state, forged_ledger::OperationState::Terminal);
+        let desired = ledger
+            .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "bead-khandoff")
+            .expect("desired-work probe")
+            .expect("recovered submit authorizes desired work");
+        assert_eq!(desired.controller_generation, 1);
+        assert_eq!(desired.desired_state, forged_ledger::DesiredState::Running);
         let controller_events = ledger
             .list_events(Some("bead-khandoff"), 0, 65_536)
             .expect("controller events")
@@ -929,7 +1248,7 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
     let killed_pids = shim_pids(&env, "bead-k5/implementation/0");
 
     // Two INDEPENDENT OS processes reconcile the same run, concurrently.
-    let mut first = env
+    let first = env
         .forged_cmd(&[
             "reconcile",
             "--run",
@@ -938,9 +1257,10 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
             "op:reconcile:k5-a",
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("reconciler A");
-    let mut second = env
+    let second = env
         .forged_cmd(&[
             "reconcile",
             "--run",
@@ -949,13 +1269,18 @@ fn two_racing_reconcilers_converge_to_reclaimed() {
             "op:reconcile:k5-b",
         ])
         .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
         .spawn()
         .expect("reconciler B");
-    let a = first.wait().expect("A exits");
-    let b = second.wait().expect("B exits");
+    let a = first.wait_with_output().expect("A exits");
+    let b = second.wait_with_output().expect("B exits");
     assert!(
-        a.success() && b.success(),
-        "both reconcilers settle cleanly"
+        a.status.success() && b.status.success(),
+        "both reconcilers settle cleanly\nA stdout: {}\nA stderr: {}\nB stdout: {}\nB stderr: {}",
+        String::from_utf8_lossy(&a.stdout),
+        String::from_utf8_lossy(&a.stderr),
+        String::from_utf8_lossy(&b.stdout),
+        String::from_utf8_lossy(&b.stderr),
     );
 
     // Convergence: the attempt reached Reclaimed exactly once.
@@ -1295,6 +1620,70 @@ fn assert_retired_unspawned(env: &TestEnv, run: &str) -> forged_ledger::AttemptR
     attempt
 }
 
+/// Every post-claim failure owns a complete immutable attempt record even
+/// when no provider process was started.
+fn assert_pre_spawn_evidence(env: &TestEnv, run: &str, attempt_id: i64, phase: &str) {
+    let ledger = env.ledger();
+    let joined = ledger
+        .get_attempt_artifact(attempt_id)
+        .expect("artifact lookup")
+        .expect("pre-spawn attempt joined an immutable manifest");
+    ledger.close().expect("close");
+    let run_root = env.anvil.join("runs").join(run);
+    let manifest_bytes = std::fs::read(run_root.join(&joined.manifest_path)).expect("manifest");
+    let manifest: Value = serde_json::from_slice(&manifest_bytes).expect("manifest json");
+    assert_eq!(manifest["attemptId"], attempt_id);
+    assert_eq!(manifest["retentionClass"], "retain");
+    assert_eq!(manifest["files"]["output"]["bytes"], 0);
+    let output = manifest["files"]["output"]["path"]
+        .as_str()
+        .expect("output path");
+    assert_eq!(std::fs::read(run_root.join(output)).unwrap(), b"");
+    let prompt = manifest["files"]["prompt"]["path"]
+        .as_str()
+        .expect("prompt path");
+    assert!(!std::fs::read(run_root.join(prompt)).unwrap().is_empty());
+    let result = manifest["files"]["result"]["path"]
+        .as_str()
+        .expect("result path");
+    let result: Value =
+        serde_json::from_slice(&std::fs::read(run_root.join(result)).unwrap()).unwrap();
+    assert_eq!(result["outcome"], "transport");
+    assert_eq!(result["detail"]["providerStarted"], false);
+    let session = manifest["files"]["session"]["path"]
+        .as_str()
+        .expect("session path");
+    let session: Value =
+        serde_json::from_slice(&std::fs::read(run_root.join(session)).unwrap()).unwrap();
+    assert_eq!(session["metadata"]["spawned"], false);
+    assert_eq!(session["metadata"]["phase"], phase);
+}
+
+fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: &str, model: &str) {
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    env.write_config(None);
+    let path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_slice(&std::fs::read(&path).expect("config")).expect("config json");
+    config["roster"]["implement"]["provider"] = json!(provider);
+    config["roster"]["implement"]["model"] = json!(model);
+    std::fs::write(&path, serde_json::to_vec_pretty(&config).unwrap()).unwrap();
+    env.seed_bead_spec(bead, r"## Context\n\nthe bead is the spec.", "- ship it");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        bead,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+}
+
 #[test]
 fn an_external_packet_claim_retires_its_own_unspawned_attempt() {
     // `packet claim` -> `packet complete` never enters `run_attempt`, so the
@@ -1449,6 +1838,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
         Some(json!(packet.packet_id)),
         "the attempt is charged to its packet's bounded budget: {grants:?}"
     );
+    assert_pre_spawn_evidence(&env, "bead-k9c", attempt.attempt_id, "host-selection");
 
     // And nothing was spawned: no provider ever ran for this packet.
     assert!(
@@ -1495,6 +1885,7 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
         note.contains("host fallback"),
         "the note names the cause it settled for: {note}"
     );
+    assert_pre_spawn_evidence(&env, "bead-k9d", attempt.attempt_id, "host-selection");
 
     // Charged to the packet's bounded budget, exactly as every other
     // pre-spawn settlement is: the cause is unrecoverable, so the budget is
@@ -1548,6 +1939,51 @@ fn a_refused_host_fallback_record_settles_before_the_spawn_rather_than_propagati
         states.len(),
         1,
         "the backoff is honored rather than re-entered: {states:?}"
+    );
+}
+
+#[test]
+fn a_missing_adapter_settles_with_complete_zero_byte_evidence() {
+    let env = TestEnv::new("km9e");
+    start_bead_run_with_implementation_hint(&env, "bead-k9e", "missing-provider", "model-1");
+    advance_to_open_packet(&env, "bead-k9e");
+    let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9e"]);
+    assert_eq!(
+        code, 0,
+        "unknown adapter is a recorded transport: {refused}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger.get_attempt(1).expect("the claimed attempt");
+    ledger.close().expect("close");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Failed);
+    assert_eq!(
+        forged_proto::classify_failure(attempt.fail_note.as_deref().unwrap_or_default()),
+        forged_proto::FailureKind::Transport
+    );
+    assert_pre_spawn_evidence(&env, "bead-k9e", attempt.attempt_id, "adapter-selection");
+    assert!(
+        env.provider_log().is_empty(),
+        "no provider may have spawned"
+    );
+}
+
+#[test]
+fn an_invalid_invocation_settles_with_complete_zero_byte_evidence() {
+    let env = TestEnv::new("km9f");
+    // The authoring contract permits provider-defined model identifiers;
+    // the shell adapter applies the stricter first-character rule.
+    start_bead_run_with_implementation_hint(&env, "bead-k9f", "claude", "_invalid-model");
+    advance_to_open_packet(&env, "bead-k9f");
+    let (code, refused) = env.forged(&["run", "advance", "--run", "bead-k9f"]);
+    assert_ne!(
+        code, 0,
+        "unsafe invocation is an explicit refusal: {refused}"
+    );
+    let attempt = assert_retired_unspawned(&env, "bead-k9f");
+    assert_pre_spawn_evidence(&env, "bead-k9f", attempt.attempt_id, "invocation");
+    assert!(
+        env.provider_log().is_empty(),
+        "no provider may have spawned"
     );
 }
 

@@ -59,32 +59,68 @@ fn event_payloads(all: &Value, kind: impl Fn(&str) -> bool) -> Vec<Value> {
         .collect()
 }
 
-fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Vec<Value> {
-    view.packets
-        .iter()
-        .filter_map(|packet| {
-            let (_, stage, seq) = super::split_packet_key(&packet.packet_id).ok()?;
-            let dir = ctx.config.packet_dir_key(&view.run.run_id, &stage, seq);
-            let mut files = std::fs::read_dir(&dir)
-                .into_iter()
-                .flatten()
-                .flatten()
-                .filter_map(|entry| {
-                    entry
-                        .file_type()
-                        .ok()
-                        .filter(|kind| kind.is_file())
-                        .map(|_| entry.path().to_string_lossy().into_owned())
-                })
-                .collect::<Vec<_>>();
-            files.sort();
-            Some(json!({
-                "packetId": packet.packet_id,
-                "directory": dir,
-                "files": files,
-            }))
-        })
-        .collect()
+async fn packet_artifacts(ctx: &Ctx, view: &forged_proto::RunView) -> Result<Vec<Value>, Failure> {
+    let run_id = view.run.run_id.clone();
+    let joined = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_attempt_artifacts(&run_id)
+    })
+    .await?;
+    let joined = joined
+        .into_iter()
+        .map(|row| (row.attempt_id, row))
+        .collect::<BTreeMap<_, _>>();
+    let run_id = view.run.run_id.clone();
+    let compactions = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_attempt_artifact_compactions(&run_id)
+    })
+    .await?
+    .into_iter()
+    .map(|row| (row.attempt_id, row))
+    .collect::<BTreeMap<_, _>>();
+    let mut out = Vec::new();
+    for packet in &view.packets {
+        let (_, stage, seq) = super::split_packet_key(&packet.packet_id)?;
+        let dir = ctx.config.packet_dir_key(&view.run.run_id, &stage, seq);
+        let mut ids = view
+            .terminal_attempts
+            .get(&packet.packet_id)
+            .into_iter()
+            .flatten()
+            .map(|attempt| attempt.attempt_id)
+            .chain(
+                view.live_attempts
+                    .iter()
+                    .filter(|attempt| attempt.packet_id == packet.packet_id)
+                    .map(|attempt| attempt.attempt_id),
+            )
+            .collect::<Vec<_>>();
+        ids.sort_unstable();
+        ids.dedup();
+        let attempts = ids
+            .iter()
+            .map(|attempt_id| match joined.get(attempt_id) {
+                Some(row) => super::artifacts::joined_projection_with_compaction(
+                    row,
+                    compactions.get(attempt_id),
+                ),
+                None => super::artifacts::legacy_projection(&dir, *attempt_id),
+            })
+            .collect::<Vec<_>>();
+        let legacy_files = ["prompt.md", "out.jsonl", "last.txt"]
+            .into_iter()
+            .map(|name| dir.join(name))
+            .filter(|path| path.is_file())
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        out.push(json!({
+            "packetId": packet.packet_id,
+            "directory": dir,
+            // Backwards-compatible field for pre-attempt packet layouts.
+            "files": legacy_files,
+            "attempts": attempts,
+        }));
+    }
+    Ok(out)
 }
 
 /// Per-packet terminal attempt history. The projection already carries live
@@ -161,7 +197,7 @@ async fn run_overview(ctx: &Ctx, run_id: &str, after: i64, limit: u64) -> Result
             "latestFindings": findings,
         },
         "packetHistory": packet_history(&view),
-        "artifacts": packet_artifacts(ctx, &view),
+        "artifacts": packet_artifacts(ctx, &view).await?,
         "interventions": event_payloads(&all_events, |kind| kind.starts_with("forged.intervention.")),
         "rosterRevisions": roster_revisions,
         "usage": usage,

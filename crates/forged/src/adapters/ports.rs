@@ -10,7 +10,7 @@
 //! names it. The two are deliberately different strings:
 //! `attempts.claimant` carries [`crate::core::session_claimant`], scoped to
 //! the packet, so the `session` this adapter receives resolves to exactly
-//! ONE attempt and one packet directory. Aggregating by the shared lease
+//! ONE attempt and one attempt directory. Aggregating by the shared lease
 //! holder instead would let one Review leg report its sibling's liveness and
 //! let revoking one leg kill both providers. The lease holder is recovered
 //! from the session only at the `reclaim_lease` seam, where bd is the one
@@ -44,6 +44,7 @@ use forged_ledger::{AttemptRow, Ledger};
 use forged_proto::{
     KillOutcome, LeaseReclaim, PortError, PrSnapshot, ReconcilePorts, ResolveState, SessionLiveness,
 };
+use forged_provider::PacketDirs;
 use forged_types::GateRow;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
@@ -119,6 +120,19 @@ impl ForgedPorts {
         Ok(self.config.packet_dir_key(&run_id, &stage_key, seq))
     }
 
+    /// New attempts keep process identity inside their immutable attempt
+    /// directory. A missing attempt directory identifies a pre-manifest
+    /// legacy packet whose runtime files remain at packet level.
+    fn runtime_dir_of(&self, attempt: &AttemptRow) -> Result<PathBuf, PortError> {
+        let packet_dir = self.packet_dir_of(&attempt.packet_id)?;
+        let attempt_dir = PacketDirs::new(&packet_dir, attempt.attempt_id).attempt_path();
+        Ok(if attempt_dir.exists() {
+            attempt_dir
+        } else {
+            packet_dir
+        })
+    }
+
     /// Whether an attempt's process identity is past the window in which it
     /// could still be materializing.
     ///
@@ -186,7 +200,7 @@ impl ForgedPorts {
                 Liveness::Vanished => SessionLiveness::Vanished,
             });
         }
-        let dir = self.packet_dir_of(&attempt.packet_id)?;
+        let dir = self.runtime_dir_of(attempt)?;
         // The sentinel FIRST: it is the only exit truth, so a written status
         // file means Exited no matter what the pid reads as — a recycled pid
         // must never resurrect a session that already reported its code.
@@ -246,7 +260,7 @@ impl ForgedPorts {
                 Err(e) => Err(PortError::Unavailable(e.to_string())),
             };
         }
-        let dir = self.packet_dir_of(&attempt.packet_id)?;
+        let dir = self.runtime_dir_of(attempt)?;
         let attempt_id = attempt.attempt_id;
         // The sentinel FIRST, before any signal: a written status file means
         // the session already exited, so there is nothing to kill and the
@@ -315,6 +329,47 @@ impl ForgedPorts {
         Err(PortError::Unavailable(format!(
             "kill sent to pgid {pid} but death was never verified"
         )))
+    }
+
+    /// Preserve bytes for a revocation/reclaim performed by a different
+    /// controller process. Legacy packet-level captures cannot be assigned
+    /// unambiguously to an earlier attempt and remain on the fallback path;
+    /// an attempt directory is exact identity and is finalized before the
+    /// terminal saga transition.
+    async fn preserve_after_kill(&self, attempt: &AttemptRow) -> Result<(), PortError> {
+        let packet_dir = self.packet_dir_of(&attempt.packet_id)?;
+        let dirs = PacketDirs::new(&packet_dir, attempt.attempt_id);
+        if !dirs.path().is_dir() || !dirs.prompt().is_file() {
+            return Ok(());
+        }
+        let packet_id = attempt.packet_id.clone();
+        let row = self
+            .on_ledger(move |ledger| ledger.get_packet(&packet_id))
+            .await?;
+        let packet = forged_proto::stored_packet(&row).map_err(|error| {
+            PortError::Internal(format!("stored packet does not parse: {error}"))
+        })?;
+        let ctx = crate::core::Ctx {
+            config: self.config.clone(),
+            ledger: self.ledger.clone(),
+        };
+        crate::core::artifacts::materialize_and_join(
+            &ctx,
+            &packet,
+            attempt.attempt_id,
+            "revoked",
+            &serde_json::json!({
+                "reason": attempt.revoke_reason,
+                "scope": attempt.revoke_scope.map(|scope| scope.as_str()),
+            }),
+            &serde_json::json!({
+                "recovered": true,
+                "providerClaimant": attempt.claimant,
+            }),
+        )
+        .await
+        .map(|_| ())
+        .map_err(|error| PortError::Internal(error.to_string()))
     }
 
     async fn run_row(&self, run_id: &str) -> Result<forged_ledger::RunRow, PortError> {
@@ -421,17 +476,23 @@ fn run_of_session(session: &str) -> Option<String> {
     Some(run_id)
 }
 
-/// Find the attempt's sentinel status file under
-/// `<packet_dir>/status/<attempt_id>/<session>/status` — the only exit-code
-/// truth.
-fn read_sentinel_code(packet_dir: &Path, attempt_id: i64) -> Option<i32> {
-    let base = packet_dir.join("status").join(attempt_id.to_string());
-    let entries = std::fs::read_dir(&base).ok()?;
-    for entry in entries.flatten() {
-        let status = entry.path().join("status");
-        if let Ok(text) = std::fs::read_to_string(&status) {
-            if let Ok(code) = text.trim().parse::<i32>() {
-                return Some(code);
+/// Find the attempt's sentinel. New runtime dirs use
+/// `<attempt>/status/<session>/status`; legacy packet dirs retain
+/// `<packet>/status/<attempt>/<session>/status`.
+fn read_sentinel_code(runtime_dir: &Path, attempt_id: i64) -> Option<i32> {
+    for base in [
+        runtime_dir.join("status"),
+        runtime_dir.join("status").join(attempt_id.to_string()),
+    ] {
+        let Ok(entries) = std::fs::read_dir(base) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let status = entry.path().join("status");
+            if let Ok(text) = std::fs::read_to_string(&status) {
+                if let Ok(code) = text.trim().parse::<i32>() {
+                    return Some(code);
+                }
             }
         }
     }
@@ -489,7 +550,11 @@ impl ReconcilePorts for ForgedPorts {
 
     async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
         match self.attempt_for(session).await? {
-            Some(attempt) => self.attempt_kill(&attempt).await,
+            Some(attempt) => {
+                let outcome = self.attempt_kill(&attempt).await?;
+                self.preserve_after_kill(&attempt).await?;
+                Ok(outcome)
+            }
             None => Ok(KillOutcome::AlreadyDead),
         }
     }

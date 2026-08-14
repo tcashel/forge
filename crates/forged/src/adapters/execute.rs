@@ -387,10 +387,10 @@ fn driver_for(provider: &str) -> Result<Box<dyn ProviderDriver>, Failure> {
     }
 }
 
-/// Poll `<packet_dir>/provider.pid` until the spawned shell writes it.
-async fn await_pid(packet_dir: &Path) -> Option<u32> {
+/// Poll `<attempt_dir>/provider.pid` until the spawned shell writes it.
+async fn await_pid(attempt_dir: &Path) -> Option<u32> {
     for _ in 0..50 {
-        if let Ok(text) = std::fs::read_to_string(packet_dir.join("provider.pid")) {
+        if let Ok(text) = std::fs::read_to_string(attempt_dir.join("provider.pid")) {
             if let Ok(pid) = text.trim().parse::<u32>() {
                 return Some(pid);
             }
@@ -606,10 +606,12 @@ pub async fn execute_adopted(
     let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
     {
         Ok(spec) => spec,
-        Err(failure) => return settle_adoption(ctx, packet, claim_token, failure).await,
+        Err(failure) => {
+            return settle_adoption(ctx, packet, attempt_id, claim_token, failure).await
+        }
     };
     if let Err(failure) = crate::core::spec::assert_pinned(&packet.spec, &spec) {
-        return settle_adoption(ctx, packet, claim_token, failure).await;
+        return settle_adoption(ctx, packet, attempt_id, claim_token, failure).await;
     }
     run_attempt(ctx, ports, exec, packet, &spec, attempt_id, claim_token).await
 }
@@ -619,16 +621,21 @@ pub async fn execute_adopted(
 async fn settle_adoption(
     ctx: &Ctx,
     packet: &WorkPacket,
+    attempt_id: i64,
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
     settle_unspawned(
         ctx,
-        &packet.packet_id,
+        packet,
+        attempt_id,
         claim_token,
-        format!("transport: adoption could not read the spec: {failure}"),
-        format!("unspawned: adoption refused: {failure}"),
-        failure,
+        PreSpawnFailure {
+            transport_note: format!("transport: adoption could not read the spec: {failure}"),
+            refusal_note: format!("unspawned: adoption refused: {failure}"),
+            failure,
+            phase: "adoption",
+        },
     )
     .await
 }
@@ -640,7 +647,8 @@ async fn settle_adoption(
 /// row is already `running` with no process behind it.
 async fn settle_host_fallback(
     ctx: &Ctx,
-    packet_id: &str,
+    packet: &WorkPacket,
+    attempt_id: i64,
     claim_token: &str,
     failure: Failure,
 ) -> Result<PacketOutcome, Failure> {
@@ -649,11 +657,17 @@ async fn settle_host_fallback(
     // pre-spawn refusal.
     settle_unspawned(
         ctx,
-        packet_id,
+        packet,
+        attempt_id,
         claim_token,
-        format!("transport: the host fallback could not be recorded: {failure}"),
-        format!("unspawned: the host fallback could not be recorded: {failure}"),
-        failure,
+        PreSpawnFailure {
+            transport_note: format!(
+                "transport: the host fallback could not be recorded: {failure}"
+            ),
+            refusal_note: format!("unspawned: the host fallback could not be recorded: {failure}"),
+            failure,
+            phase: "host-selection",
+        },
     )
     .await
 }
@@ -680,19 +694,86 @@ async fn settle_host_fallback(
 /// re-pinnable; the budget is what bounds a cause that will not clear. An
 /// unrecoverable failure still surfaces to the caller rather than being
 /// swallowed into the retry.
-async fn settle_unspawned(
-    ctx: &Ctx,
-    packet_id: &str,
-    claim_token: &str,
+struct PreSpawnFailure<'a> {
     transport_note: String,
     refusal_note: String,
     failure: Failure,
+    phase: &'a str,
+}
+
+async fn settle_unspawned(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    claim_token: &str,
+    settlement: PreSpawnFailure<'_>,
 ) -> Result<PacketOutcome, Failure> {
+    let PreSpawnFailure {
+        transport_note,
+        refusal_note,
+        failure,
+        phase,
+    } = settlement;
+    let note = if failure.recoverable {
+        &transport_note
+    } else {
+        &refusal_note
+    };
+    let evidence = preserve_pre_spawn_failure(ctx, packet, attempt_id, note, phase).await;
+    let settled = fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note.clone()).await;
+    let outcome = settled?;
+    evidence?;
     if failure.recoverable {
-        return fail_and_grant_retry(ctx, packet_id, claim_token, transport_note).await;
+        Ok(outcome)
+    } else {
+        Err(failure)
     }
-    fail_and_grant_retry(ctx, packet_id, claim_token, refusal_note).await?;
-    Err(failure)
+}
+
+async fn preserve_pre_spawn_failure(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    note: &str,
+    phase: &str,
+) -> Result<(), Failure> {
+    let (run_id, stage, seq) = crate::core::split_packet_key(&packet.packet_id)?;
+    let run_root = ctx.config.run_dir(&run_id);
+    let packet_dir = ctx.config.packet_dir_key(&run_id, &stage, seq);
+    let dirs = PacketDirs::new(&packet_dir, attempt_id);
+    crate::core::artifacts::prepare_attempt(&run_root, &dirs)?;
+    if !crate::core::artifacts::prompt_exists(&run_root, &dirs)? {
+        let prompt = format!(
+            "Forged did not start a provider for this attempt.\nPhase: {phase}\nFailure: {note}\n"
+        );
+        crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
+    }
+    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+    crate::core::artifacts::materialize_and_join(
+        ctx,
+        packet,
+        attempt_id,
+        "transport",
+        &json!({"note": note, "providerStarted": false}),
+        &json!({"host": null, "spawned": false, "phase": phase}),
+    )
+    .await?;
+    Ok(())
+}
+
+async fn fail_pre_spawn_transport(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    claim_token: &str,
+    note: String,
+    phase: &str,
+) -> Result<PacketOutcome, Failure> {
+    let evidence = preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, phase).await;
+    let settled = fail_and_grant_retry(ctx, &packet.packet_id, claim_token, note).await;
+    let outcome = settled?;
+    evidence?;
+    Ok(outcome)
 }
 
 /// The shared attempt pipeline: render, spawn, await, harvest, settle.
@@ -708,6 +789,7 @@ async fn run_attempt(
     let run_id = packet.run_id.clone();
     let packet_id = packet.packet_id.clone();
     let claim_token = claim_token.to_owned();
+    let run_root = ctx.config.run_dir(&run_id);
 
     // 1. Everything between the claim and the spawn. The attempt is already
     // `running` with no process behind it, so NOTHING in here may propagate
@@ -718,6 +800,7 @@ async fn run_attempt(
     // prompt are materialized here. The spec bytes are written from the read
     // this attempt was fenced on, so every seat of this packet reads the
     // same bytes.
+    let unprepared_packet = packet.clone();
     let packet = packet.clone();
     let prepared = async {
         let mut packet = packet;
@@ -745,16 +828,14 @@ async fn run_attempt(
         };
         let packet_dir = ctx.config.packet_dir_key(&run_id, &stage_key, seq);
         failpoint::hit("packet.materialize.before");
-        std::fs::create_dir_all(&packet_dir)
-            .map_err(|e| Failure::internal(format!("creating {}: {e}", packet_dir.display())))?;
+        let dirs = PacketDirs::new(&packet_dir, attempt_id);
+        crate::core::artifacts::prepare_attempt(&run_root, &dirs)?;
         crate::core::spec::assert_pinned(&packet.spec, spec)?;
         crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
-        let dirs = PacketDirs::new(&packet_dir);
         let templates = PromptTemplates::load()?;
         let context = render_context(exec, &packet, seq)?;
         let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
-        std::fs::write(dirs.prompt(), prompt)
-            .map_err(|e| Failure::internal(format!("writing prompt: {e}")))?;
+        crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
         Ok::<_, Failure>((packet, interventions, holder, packet_dir))
     }
     .await;
@@ -763,18 +844,37 @@ async fn run_attempt(
         Err(failure) => {
             let transport = format!("transport: the attempt could not be prepared: {failure}");
             let refusal = format!("unspawned: attempt refused before spawn: {failure}");
-            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
-                .await;
+            return settle_unspawned(
+                ctx,
+                &unprepared_packet,
+                attempt_id,
+                &claim_token,
+                PreSpawnFailure {
+                    transport_note: transport,
+                    refusal_note: refusal,
+                    failure,
+                    phase: "preparation",
+                },
+            )
+            .await;
         }
     };
-    let dirs = PacketDirs::new(&packet_dir);
+    let dirs = PacketDirs::new(&packet_dir, attempt_id);
 
     // 2. The sentinel-free shell line.
     let driver = match driver_for(&packet.provider_hints.provider) {
         Ok(driver) => driver,
         Err(error) => {
             let note = format!("transport: provider adapter unavailable: {}", error.message);
-            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "adapter-selection",
+            )
+            .await;
         }
     };
     let invocation = match driver
@@ -785,8 +885,19 @@ async fn run_attempt(
         Err(failure) => {
             let transport = format!("transport: the provider invocation failed: {failure}");
             let refusal = format!("unspawned: attempt refused before spawn: {failure}");
-            return settle_unspawned(ctx, &packet_id, &claim_token, transport, refusal, failure)
-                .await;
+            return settle_unspawned(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                PreSpawnFailure {
+                    transport_note: transport,
+                    refusal_note: refusal,
+                    failure,
+                    phase: "invocation",
+                },
+            )
+            .await;
         }
     };
 
@@ -795,15 +906,15 @@ async fn run_attempt(
     // with PATH passed explicitly. A stale pid file from a prior attempt is
     // removed first: absence means "spawn never happened", and only this
     // attempt's shell may write the file back.
-    let pid_path = packet_dir.join("provider.pid");
+    let pid_path = dirs.provider_pid();
     let _ = std::fs::remove_file(&pid_path);
-    let _ = std::fs::remove_file(packet_dir.join(crate::adapters::ports::PROVIDER_LSTART));
+    let _ = std::fs::remove_file(dirs.provider_lstart());
     let shell_line = format!(
         "echo $$ > {}; {}",
         pid_path.to_string_lossy(),
         invocation.shell_line
     );
-    let status_base = packet_dir.join("status").join(attempt_id.to_string());
+    let status_base = dirs.status();
     // Herdr is the preferred visibility adapter. The ledger records the
     // actual host selection, so a missing socket can never masquerade as a
     // Herdr-backed session.
@@ -814,11 +925,13 @@ async fn run_attempt(
         HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
             None => {
                 if exec.host_policy == HostPolicy::Required {
-                    return fail_and_grant_retry(
+                    return fail_pre_spawn_transport(
                         ctx,
-                        &packet_id,
+                        &packet,
+                        attempt_id,
                         &claim_token,
                         "transport: Herdr is required but no socket is configured".to_owned(),
+                        "host-selection",
                     )
                     .await;
                 }
@@ -831,7 +944,8 @@ async fn run_attempt(
                 )
                 .await
                 {
-                    return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                    return settle_host_fallback(ctx, &packet, attempt_id, &claim_token, failure)
+                        .await;
                 }
                 (Arc::new(ProcessHost::new(&status_base)), "process", None)
             }
@@ -854,16 +968,25 @@ async fn run_attempt(
                     )
                     .await
                     {
-                        return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                        return settle_host_fallback(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            &claim_token,
+                            failure,
+                        )
+                        .await;
                     }
                     (Arc::new(ProcessHost::new(&status_base)), "process", None)
                 }
                 Err(error) => {
-                    return fail_and_grant_retry(
+                    return fail_pre_spawn_transport(
                         ctx,
-                        &packet_id,
+                        &packet,
+                        attempt_id,
                         &claim_token,
                         format!("transport: required Herdr host unavailable: {error}"),
+                        "host-selection",
                     )
                     .await;
                 }
@@ -896,6 +1019,15 @@ async fn run_attempt(
         Err(e) => {
             // A spawn failure is transport: the provider never got to think.
             let note = format!("transport: provider spawn failed: {e}");
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "transport",
+                &json!({"note": &note}),
+                &json!({"host": host_kind, "spawned": false}),
+            )
+            .await?;
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
@@ -921,6 +1053,12 @@ async fn run_attempt(
         "boundary",
     )
     .await?;
+    let session_evidence = json!({
+        "host": host_kind,
+        "sessionId": session.as_str(),
+        "socketPath": socket_path,
+        "attachHint": attach_hint,
+    });
     ports
         .adopt_session(attempt_id, Arc::clone(&host), session.clone())
         .await;
@@ -933,19 +1071,25 @@ async fn run_attempt(
     // reclaim its apparently-expired work while it is still writing to the
     // worktree. Stop the session, record a transport failure, and let the
     // transport-retry budget decide whether to try again.
-    let Some(pid) = await_pid(&packet_dir).await else {
+    let Some(pid) = await_pid(dirs.path()).await else {
         let _ = host.kill_confirmed(&session).await;
         let note = "transport: provider pid file never appeared".to_owned();
+        crate::core::artifacts::materialize_and_join(
+            ctx,
+            &packet,
+            attempt_id,
+            "transport",
+            &json!({"note": &note}),
+            &session_evidence,
+        )
+        .await?;
         return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
     };
     // The start-time stamp beside the pid is the pid-reuse guard for every
     // process that did not spawn this attempt (see `adapters::ports`).
     if let Some(lstart) = crate::adapters::ports::lstart_of(i32::try_from(pid).unwrap_or(-1)).await
     {
-        let _ = std::fs::write(
-            packet_dir.join(crate::adapters::ports::PROVIDER_LSTART),
-            lstart,
-        );
+        let _ = std::fs::write(dirs.provider_lstart(), lstart);
     }
     failpoint::hit("guardian.start");
     let gcfg = forged_beads::GuardianConfig::new(
@@ -970,14 +1114,15 @@ async fn run_attempt(
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
                     if renewed.is_err() {
                         // Our attempt was revoked out from under us: stop the
-                        // provider and report. Its tokens were still spent,
-                        // and the successor attempt is about to overwrite
-                        // the capture, so read it before killing the shell.
+                        // provider and report. Its tokens were still spent;
+                        // freeze this attempt's private capture before any
+                        // successor is allowed to proceed.
                         let _ = host.kill_confirmed(&session).await;
                         if let Some(handle) = guardian.take() {
                             handle.abort();
                         }
-                        let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+                        crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+                        let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
                         crate::core::usage::capture_attempt(
                             ctx,
                             &run_id,
@@ -988,6 +1133,15 @@ async fn run_attempt(
                             &out,
                         )
                         .await;
+                        crate::core::artifacts::materialize_and_join(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            "revoked",
+                            &json!({"note": "attempt claim was revoked while provider was running"}),
+                            &session_evidence,
+                        )
+                        .await?;
                         return Ok(PacketOutcome::Revoked);
                     }
                 }
@@ -1006,15 +1160,18 @@ async fn run_attempt(
         handle.abort();
     }
 
+    // Provider output was streamed to private names. Publish those names
+    // only after the provider is terminal; no successor shares this attempt
+    // directory, and the manifest written below is the completion marker.
+    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+
     // 5. Record what this attempt spent, before deciding what it produced.
     //
     // Here and nowhere else: the capture is complete, the attempt id is in
-    // hand, and the outcome has not yet branched. A batch pass over packet
-    // directories cannot reach this point — the packet directory is keyed
-    // by stage and round, so the next attempt overwrites `out.jsonl` and
-    // the tokens this one burned become unrecoverable. Rework spend is
-    // only ever visible from inside the attempt that spent it.
-    let out = std::fs::read_to_string(dirs.stdout()).unwrap_or_default();
+    // hand, and the outcome has not yet branched. The attempt-addressed
+    // capture makes later reconciliation possible too, but the live path
+    // still records spend immediately rather than depending on a backfill.
+    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
     crate::core::usage::capture_attempt(
         ctx,
         &run_id,
@@ -1033,13 +1190,33 @@ async fn run_attempt(
         }
         forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
             "codex" => {
-                let last = std::fs::read_to_string(dirs.last_message()).ok();
+                let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
                 harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
             }
             _ => harvest_claude(&out, &packet.result_schema, &packet_id),
         },
         forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
     };
+
+    let (artifact_outcome, artifact_detail) = match &harvest {
+        Harvest::Result(result) => (
+            "result",
+            serde_json::to_value(result.as_ref()).map_err(|error| {
+                Failure::internal(format!("serializing harvested result evidence: {error}"))
+            })?,
+        ),
+        Harvest::Transport(note) => ("transport", json!({"note": note})),
+        Harvest::Semantic(note) => ("semantic", json!({"note": note})),
+    };
+    crate::core::artifacts::materialize_and_join(
+        ctx,
+        &packet,
+        attempt_id,
+        artifact_outcome,
+        &artifact_detail,
+        &session_evidence,
+    )
+    .await?;
 
     // 7. Settle. Every arm BINDS rather than returns, so the three settle
     // paths share one exit and none of them can skip the release below.
@@ -1585,11 +1762,10 @@ mod settle_tests {
 
         let packet_dir = ctx.config.packet_dir_key(RUN_ID, "implement", 1);
         std::fs::create_dir_all(&packet_dir).expect("packet dir");
+        let attempt_dirs = PacketDirs::new(&packet_dir, claimed.attempt_id);
         tokio::spawn(play_provider(
-            packet_dir.clone(),
-            packet_dir
-                .join("status")
-                .join(claimed.attempt_id.to_string()),
+            attempt_dirs.attempt_path(),
+            attempt_dirs.status(),
             claude_capture(&packet_id),
         ));
 

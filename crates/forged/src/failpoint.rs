@@ -27,6 +27,13 @@
 //! `controller.record.after` is the handoff equivalent: the detached
 //! controller identity is on disk, but its event and operation response are
 //! not yet durable in the ledger.
+//! `supervisor.stop-check.after` is the gap after landed-stop projection and
+//! before the controller-submit singleton. `epic.stop.guarded.before-commit`
+//! holds that same singleton immediately before an input/final event and its
+//! desired-state transition commit atomically.
+//! `epic.resolve.desired.after` is the inverse seam: the identified
+//! INPUT_RESOLVED event and due wake are committed, but the safe-effect
+//! operation has not yet been settled.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

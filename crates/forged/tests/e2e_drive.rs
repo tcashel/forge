@@ -380,7 +380,8 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-session"]);
     assert_eq!(code, 0, "drive: {driven}");
     let prompt = std::fs::read_to_string(
-        env.packet_dir("bead-session", "implementation", 0)
+        env.latest_attempt_dir("bead-session", "implementation", 0)
+            .expect("implementation attempt directory")
             .join("prompt.md"),
     )
     .expect("implementation prompt");
@@ -652,10 +653,10 @@ fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
 
     let mut ids = Vec::new();
     for (command, reason) in [
-        ("pause", "first checkpoint"),
-        ("resume", "first continuation"),
-        ("pause", "second checkpoint"),
-        ("resume", "second continuation"),
+        ("pause", "same checkpoint"),
+        ("resume", "same continuation"),
+        ("pause", "same checkpoint"),
+        ("resume", "same continuation"),
     ] {
         let (code, response) = env.forged(&[
             "epic",
@@ -667,6 +668,14 @@ fn repeated_epic_pause_resume_cycles_get_distinct_transition_keys() {
         ]);
         assert_eq!(code, 0, "{command}: {response}");
         ids.push(response["operationId"].as_str().unwrap().to_owned());
+        if ids.len() == 3 {
+            let (code, status) = env.forged(&["epic", "status", "--epic", "epic-controls"]);
+            assert_eq!(code, 0, "status after repeated-reason pause: {status}");
+            assert!(
+                status["result"]["paused"].is_object(),
+                "the second same-reason pause must remain in event projection: {status}"
+            );
+        }
     }
     assert_ne!(ids[0], ids[2], "pause epochs differ");
     assert_ne!(ids[1], ids[3], "resume epochs differ");
@@ -2223,11 +2232,14 @@ fn a_provider_that_never_reports_its_pid_is_killed_not_left_unguarded() {
         "main",
     ]);
 
-    // Occupy the pid path with a DIRECTORY: the spawned shell's
+    // This fresh ledger's first claim has attempt id 1. Occupy that
+    // attempt-scoped pid path with a DIRECTORY: the spawned shell's
     // `echo $$ > provider.pid` fails, the provider still runs, and the file
     // never appears — deterministically, with no race against the shim.
-    let packet_dir = env.packet_dir("bead-nopid", "implementation", 0);
-    std::fs::create_dir_all(packet_dir.join("provider.pid")).expect("occupy the pid path");
+    let attempt_dir = env
+        .packet_dir("bead-nopid", "implementation", 0)
+        .join("attempts/1");
+    std::fs::create_dir_all(attempt_dir.join("provider.pid")).expect("occupy the pid path");
     // A provider that would otherwise outlive the window, so the kill is
     // observable rather than a no-op on an already-exited shim.
     env.set_scenario("implement", "hang", 1);

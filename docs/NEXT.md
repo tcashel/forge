@@ -7,13 +7,44 @@ user, lock the work, submit it, then inspect durable state.
 ## Ownership
 
 - The user talks to one lead agent.
-- Smithy/Anvil owns plan, proportional critique, and adjudication.
+- Forge's dual-host `plugins/forged` lead-agent plugin owns plan,
+  proportional critique, adjudication, and the explicit typed handoff.
 - Beads owns inventory, dependencies, readiness, and leases.
 - Forged owns cognitive-stage contracts, topology, provider dispatch, gates,
   review/remediation, epic waves, and results.
 - Provider adapters perform cognition.
 - Herdr owns panes/process transport; the Forged ledger remains truth.
 - Git/GitHub own code, branches, PRs, and merge truth.
+
+**2026-08-14 clarification:** the thin planning client is moving from the
+sibling Smithy experiment into the current Forge tree for its next containing
+release. Claude and Codex load one shared skill tree from this repository.
+Smithy remains historical evidence and is neither an installation dependency
+nor a second workflow authority. The move changes distribution and ownership
+only: the lead agent still performs cognition, native Bead fields remain the
+editable specification, and Forged remains the durable execution control
+plane.
+
+## Install the lead-agent plugin
+
+From a Forge checkout, validate first with `bash scripts/validate-plugin.sh`.
+Then register the checkout as the `forge` marketplace and install `forged`:
+
+```text
+# Claude Code
+/plugin marketplace add /absolute/path/to/forge
+/plugin install forged@forge
+```
+
+```sh
+# Codex
+codex plugin marketplace add /absolute/path/to/forge
+codex plugin add forged@forge
+```
+
+Run `/forged:setup` after installation. Setup preserves `ANVIL_HOME` and
+`BEADS_DIR`, and its before/after cleanliness check proves zero target-repo
+imposition. Validation and CI do not install or configure the plugin.
 
 ## Configure once
 
@@ -315,13 +346,19 @@ forged session message --run <run-id> --attempt <attempt-id> \
 Messages without live-delivery capability are ledgered for the next provider
 boundary.
 
-## Smithy cutover
+## Forge plugin convergence — 2026-08-14
 
-Anvil 0.3 removes `execute-review-fix.js`, `run-epic.js`, the critique Workflow,
-`watch-epic`, and its monitor. Its dispatch skills are typed clients of the
-commands above. Planning remains human-in-the-loop and provider-neutral;
-execution has one durable authority.
+The current Forge tree now carries the six lead-agent capabilities in
+`plugins/forged` with Claude and Codex manifests over one shared tree. The
+plugin writes complete native Bead fields and parent links, then invokes the
+typed commands above; it does not carry the removed execution Workflow/watch
+stack. Smithy Anvil 0.3.1 is archival migration input only.
 
-The next operational action is to review/merge the Forge and Smithy branches,
-install those exact versions, and use the normal Anvil plan → adjudicate →
-submit path on real work. No alternate execution path remains to reconcile.
+Normal validation is noninteractive and separate from installation:
+`scripts/validate-plugin.sh` checks manifests, marketplaces, version parity,
+skill contracts, bootstrap syntax, and absence of legacy execution paths; the
+`plugin` CI workflow runs that validator independently of Rust CI. The next
+operational action after merge and release is to install the first Forge
+version containing this marketplace and use `/forged:plan` →
+`/forged:critique` → `/forged:adjudicate` → typed submission on real work. No
+alternate execution path remains to reconcile.

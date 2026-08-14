@@ -55,6 +55,21 @@ boundary. An epic freezes the package used to create children. Its roster
 revision atomically updates every current unmerged child and becomes the
 template for future children; no child re-resolves an authoring-config name.
 
+## Clarification — 2026-08-14
+
+References above to Smithy describe the experiment's original distribution.
+The current Forge tree now owns the thin lead-agent client as the dual-host
+`plugins/forged` plugin for its next containing release. Claude and Codex
+consume one shared skill tree; Smithy is no longer required to install or
+operate the supported path.
+
+The exclusive boundaries remain the same. The user still talks to one lead
+agent, and the plugin still owns conversational planning, proportional
+critique, adjudication, and explicit submission. Complete specifications live
+in native Bead fields with native parent/dependency edges. The Forged binary
+still begins at the typed immutable execution-package handoff and does not
+author plans or absorb lead-agent cognition.
+
 ## Consequences
 
 - The default does not imply that every commit or bead receives the largest

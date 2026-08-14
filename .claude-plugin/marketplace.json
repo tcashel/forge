@@ -1,0 +1,14 @@
+{
+  "name": "forge",
+  "description": "Forge-owned lead-agent skills and the Forged provider-neutral execution control plane.",
+  "owner": {
+    "name": "Tripp Cashel"
+  },
+  "plugins": [
+    {
+      "name": "forged",
+      "source": "./plugins/forged",
+      "description": "Plan and maintain native Bead specifications, then submit durable slice or epic execution to Forged."
+    }
+  ]
+}

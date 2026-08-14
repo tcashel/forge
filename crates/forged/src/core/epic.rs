@@ -5,10 +5,14 @@ use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
 
-use forged_ledger::{EffectClass, Ledger, OperationState, SlotOutcome};
+use forged_ledger::{
+    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState,
+    SlotOutcome,
+};
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
-    ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
+    ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity,
+    Verdict,
 };
 use serde_json::{json, Map, Value};
 
@@ -414,6 +418,61 @@ async fn append(ctx: &Ctx, epic: &str, kind: &str, value: Value) -> Result<(), F
     .await
 }
 
+struct EpicStopTransition {
+    state: DesiredState,
+    outcome: DesiredReconcileOutcome,
+    error: Option<String>,
+    identity_field: Option<&'static str>,
+}
+
+async fn append_stop_event(
+    ctx: &Ctx,
+    epic: &str,
+    kind: &str,
+    event: Value,
+    transition: EpicStopTransition,
+) -> Result<(), Failure> {
+    let _submit_guard =
+        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
+    crate::failpoint::hit("epic.stop.guarded.before-commit");
+    let epic = epic.to_owned();
+    let kind = kind.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_settling_desired(
+            DesiredSubjectKind::Epic,
+            &epic,
+            &kind,
+            event,
+            transition.state,
+            transition.outcome,
+            false,
+            transition.error,
+            transition.identity_field,
+        )
+    })
+    .await
+}
+
+async fn append_resolution_event(ctx: &Ctx, epic: &str, event: Value) -> Result<(), Failure> {
+    let _submit_guard =
+        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
+    let epic = epic.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_settling_desired(
+            DesiredSubjectKind::Epic,
+            &epic,
+            INPUT_RESOLVED,
+            event,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            true,
+            None,
+            Some("resolutionId"),
+        )
+    })
+    .await
+}
+
 fn spec_pointer(description: &str) -> Option<String> {
     description.lines().find_map(|line| {
         line.trim()
@@ -585,6 +644,55 @@ where
         },
     };
     response(fenced(ctx, name, EffectClass::SafeRetry, &req, None, effect).await)
+}
+
+async fn recover_applied_epic_resolution(
+    ctx: &Ctx,
+    key: &str,
+    epic: &str,
+    child: &str,
+    note: &str,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "epic_resolve".to_owned();
+    let key_owned = key.to_owned();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key_owned)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let rows = epic_events(ctx, epic).await?;
+    for event in rows
+        .iter()
+        .rev()
+        .filter(|event| event.kind == INPUT_RESOLVED)
+    {
+        let landed = payload(event)?;
+        if landed.get("resolutionId").and_then(Value::as_str) != Some(row.operation_id.as_str()) {
+            continue;
+        }
+        if landed.get("childId").and_then(Value::as_str) != Some(child)
+            || landed.get("note").and_then(Value::as_str) != Some(note)
+        {
+            return Err(Failure::refused(
+                ErrorCode::IdempotencyConflict,
+                format!(
+                    "epic resolution operation {} landed with different child or note",
+                    row.operation_id
+                ),
+            ));
+        }
+        let response = ok_response(&row.operation_id, false, landed);
+        let operation_id = row.operation_id;
+        let stored = response.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.resolve_interrupted_operation(&operation_id, &stored)
+        })
+        .await?;
+        return Ok(Some(response));
+    }
+    Ok(None)
 }
 
 /// Freeze the Beads inventory and child execution defaults.
@@ -981,12 +1089,27 @@ async fn require_input(
     child: Option<&str>,
     detail: impl Into<String>,
 ) -> Result<Value, Failure> {
+    let detail = detail.into();
     let event = json!({
         "code": code,
         "childId": child,
-        "detail": detail.into(),
+        "detail": detail.clone(),
     });
-    append(ctx, epic, INPUT_REQUIRED, event.clone()).await?;
+    append_stop_event(
+        ctx,
+        epic,
+        INPUT_REQUIRED,
+        event.clone(),
+        EpicStopTransition {
+            state: DesiredState::Running,
+            outcome: DesiredReconcileOutcome::Attention,
+            error: Some(format!(
+                "epic {epic} requires explicit input resolution: {detail}"
+            )),
+            identity_field: None,
+        },
+    )
+    .await?;
     Ok(event)
 }
 
@@ -1225,7 +1348,7 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
         key,
         &operation_epic,
         json!({"head": config.integration_branch, "base": config.base_ref}),
-        move |_operation| async move {
+        move |operation| async move {
             let body = format!(
                 "Epic {} executed by forged.\n\n## Wave journal\n{}",
                 config.epic_id,
@@ -1250,8 +1373,21 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
                 "isDraft": pr.is_draft,
                 "head": pr.head_ref_name,
                 "base": pr.base_ref_name,
+                "transitionId": operation,
             });
-            append(ctx, &config.epic_id, EPIC_PR, event.clone()).await?;
+            append_stop_event(
+                ctx,
+                &config.epic_id,
+                EPIC_PR,
+                event.clone(),
+                EpicStopTransition {
+                    state: DesiredState::Stopped,
+                    outcome: DesiredReconcileOutcome::Terminal,
+                    error: None,
+                    identity_field: Some("transitionId"),
+                },
+            )
+            .await?;
             Ok(event)
         },
     )
@@ -1453,6 +1589,45 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
     ))
 }
 
+async fn record_desired_stop(ctx: &Ctx, epic: &str, stop: &Value) -> Result<(), Failure> {
+    // Share the controller-submit singleton through the durable stop write.
+    // A supervisor that already owns the fence linearizes its spawn first;
+    // otherwise this transition clears its claim before it can reserve or
+    // spawn a generation.
+    let _submit_guard =
+        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
+    let (state, outcome, detail) = if stop.get("finalPr").is_some() {
+        (
+            DesiredState::Stopped,
+            DesiredReconcileOutcome::Terminal,
+            None,
+        )
+    } else if stop.get("paused").is_some() {
+        (DesiredState::Paused, DesiredReconcileOutcome::Paused, None)
+    } else {
+        // Input-required remains a separate explicit resolution rail. Keep
+        // authorization, but park it with no wake until resume/resolve makes
+        // the subject due again.
+        (
+            DesiredState::Running,
+            DesiredReconcileOutcome::Attention,
+            Some(format!("epic {epic} requires explicit input resolution")),
+        )
+    };
+    let epic = epic.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.record_desired_outcome(
+            DesiredSubjectKind::Epic,
+            &epic,
+            state,
+            outcome,
+            None,
+            detail,
+        )
+    })
+    .await
+}
+
 /// One epic scheduler action.
 pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
@@ -1466,7 +1641,10 @@ pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
     };
     match advance_once(ctx, &epic, false).await {
         Ok(Step::Progress(value)) => ok_response(&key, false, json!({"progress": value})),
-        Ok(Step::Stop(value)) => ok_response(&key, false, json!({"stopped": value})),
+        Ok(Step::Stop(value)) => match record_desired_stop(ctx, &epic, &value).await {
+            Ok(()) => ok_response(&key, false, json!({"stopped": value})),
+            Err(error) => err_response(&key, &error),
+        },
         Err(error) => err_response(&key, &error),
     }
 }
@@ -1485,7 +1663,12 @@ pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
     loop {
         match advance_once(ctx, &epic, true).await {
             Ok(Step::Progress(_)) => continue,
-            Ok(Step::Stop(value)) => return ok_response(&key, false, json!({"stopped": value})),
+            Ok(Step::Stop(value)) => {
+                if let Err(error) = record_desired_stop(ctx, &epic, &value).await {
+                    return err_response(&key, &error);
+                }
+                return ok_response(&key, false, json!({"stopped": value}));
+            }
             Err(error) => return err_response(&key, &error),
         }
     }
@@ -1538,8 +1721,22 @@ async fn control_event(
         },
         false => None,
     };
-    let event = json!({"reason": reason});
+    // Serialize the desired-state transition with manual submit and
+    // supervisor restart. Pause remains out-of-band with respect to the
+    // long-lived epic driver, but it cannot race a new controller spawn.
+    let _submit_guard =
+        match super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await {
+            Ok(guard) => guard,
+            Err(error) => return err_response(&key, &error),
+        };
+    let event = json!({"reason": reason, "controlId": key.clone()});
     let event_epic = epic.clone();
+    let desired_state = if kind == PAUSED {
+        DesiredState::Paused
+    } else {
+        DesiredState::Running
+    };
+    let control_kind = kind.to_owned();
     match safe_effect(
         ctx,
         name,
@@ -1548,7 +1745,18 @@ async fn control_event(
         event.clone(),
         move |_operation| async move {
             project(ctx, &event_epic).await?;
-            append(ctx, &event_epic, kind, event.clone()).await?;
+            let desired_epic = event_epic.clone();
+            let desired_event = event.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.append_event_controlling_desired(
+                    DesiredSubjectKind::Epic,
+                    &desired_epic,
+                    &control_kind,
+                    desired_event,
+                    desired_state,
+                )
+            })
+            .await?;
             Ok(event)
         },
     )
@@ -1590,20 +1798,50 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             )
         }
     };
+    let resolution_epoch = match epic_events(ctx, &epic).await {
+        Ok(events) => i64::try_from(
+            events
+                .iter()
+                .filter(|event| event.kind == INPUT_REQUIRED)
+                .count(),
+        )
+        .unwrap_or(i64::MAX),
+        Err(error) => {
+            return err_response(
+                &derive_key("epic_resolve", Some(&epic), Some(&child), None),
+                &error,
+            )
+        }
+    };
     default_key(
         req,
-        derive_key("epic_resolve", Some(&epic), Some(&child), None),
+        derive_key(
+            "epic_resolve",
+            Some(&epic),
+            Some(&child),
+            Some(resolution_epoch),
+        ),
     );
     let key = req.idempotency_key.clone();
     let _guard = match acquire_driver(ctx, &epic).await {
         Ok(guard) => guard,
         Err(error) => return err_response(&key, &error),
     };
+    match recover_applied_epic_resolution(ctx, &key, &epic, &child, &note).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&key, &error),
+    }
     let event = json!({"childId": child, "note": note});
     let result = safe_effect(ctx, "epic_resolve", key.clone(), &epic, event.clone(), {
         let epic = epic.clone();
         let child = child.clone();
-        move |_operation| async move {
+        move |operation| async move {
+            let mut resolved_event = event.clone();
+            let Some(resolved_object) = resolved_event.as_object_mut() else {
+                return Err(Failure::internal("epic resolution event is not an object"));
+            };
+            resolved_object.insert("resolutionId".to_owned(), json!(operation));
             let view = project(ctx, &epic).await?;
             if !view.config.children.iter().any(|item| item.id == child) {
                 return Err(Failure::invalid(format!(
@@ -1611,6 +1849,13 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 )));
             }
             let Some(input) = view.input.as_ref() else {
+                let rows = epic_events(ctx, &epic).await?;
+                for row in rows.iter().filter(|row| row.kind == INPUT_RESOLVED) {
+                    let landed = payload(row)?;
+                    if landed.get("resolutionId") == resolved_event.get("resolutionId") {
+                        return Ok(resolved_event);
+                    }
+                }
                 return Err(Failure::invalid(format!(
                     "epic {epic:?} has no input requirement to resolve"
                 )));
@@ -1643,8 +1888,9 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 )
                 .await?;
             }
-            append(ctx, &epic, INPUT_RESOLVED, event.clone()).await?;
-            Ok(event)
+            append_resolution_event(ctx, &epic, resolved_event.clone()).await?;
+            crate::failpoint::hit("epic.resolve.desired.after");
+            Ok(resolved_event)
         }
     })
     .await;

@@ -75,9 +75,46 @@ real 5-minute TTL) is `#[ignore]`d and run deliberately:
 
 The Rust product now owns adaptive execution packages, YAML profiles/rosters,
 Claude and Codex provider adapters, Herdr supervision, durable epic waves,
-detached handoff, and one CLI/MCP/MCP-App control plane. Smithy/Anvil 0.3 is the
-thin planning client: it hands locked slices and epics to these typed
-contracts instead of running Claude-specific execution Workflows.
+detached handoff, and one CLI/MCP/MCP-App control plane.
+
+**2026-08-14 ownership clarification:** the current Forge tree also owns the
+dual-host `forged` lead-agent plugin under
+[`plugins/forged`](plugins/forged). Its one shared skill tree maintains native
+Bead specifications, performs proportional critique and adjudication, and
+submits approved slices or epics through the typed Forged contracts.
+Smithy/Anvil 0.3 is historical migration evidence, not an installation or
+runtime dependency. This colocation does not move planning or other cognition
+into the Rust control plane.
+
+## Install the lead-agent plugin
+
+Validate a checkout before registering its marketplace:
+
+```bash
+bash scripts/validate-plugin.sh
+```
+
+Claude Code:
+
+```text
+/plugin marketplace add /absolute/path/to/forge
+/plugin install forged@forge
+/forged:setup
+```
+
+Codex:
+
+```bash
+codex plugin marketplace add /absolute/path/to/forge
+codex plugin add forged@forge
+```
+
+Then invoke `/forged:setup` in the host. It preserves explicit `ANVIL_HOME`
+and `BEADS_DIR` values and proves that setup added nothing to the target
+repository. The manifest remains version-aligned with the current 0.2.0
+workspace; availability begins with the next release that contains this tree.
+These commands are installation instructions only; repository validation and
+CI do not install the plugin.
 
 History and rationale live in [`docs/adr/`](docs/adr/) — start at
 [ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md) and

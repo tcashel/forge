@@ -2,7 +2,7 @@
 //! lifecycle, gate run, reconcile, usage, work list, events, worktree
 //! retire.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 use forged_gate::GateRequest;
@@ -10,7 +10,7 @@ use forged_ledger::{
     AttemptState, EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState,
     RunState,
 };
-use forged_provider::{CodexDriver, PacketDirs, ProviderDriver};
+use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
 };
@@ -1490,63 +1490,120 @@ pub async fn usage_ingest(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
 
 /// Re-derive one run's usage from its packet directories.
 ///
-/// Attribution matches [`crate::core::usage::capture_attempt`] exactly:
-/// each packet directory holds the output of that packet's LATEST attempt,
-/// so the row is keyed to that attempt's id. Recording `attempt_id: NULL`
-/// here instead would miss the natural key that capture already wrote and
-/// double the run's spend on every ingest.
+/// Attempt manifests are the primary source and attribute every retained
+/// capture exactly. A packet-level capture is read only when no manifest
+/// exists for that packet, preserving the pre-0.2 latest-attempt fallback.
 async fn ingest_run(ctx: &Ctx, run_id: &str) -> Result<u64, Failure> {
     let packets = {
         let run_id = run_id.to_owned();
         on_ledger(&ctx.ledger, move |l| l.list_packets(&run_id)).await?
     };
-    let latest_attempt = latest_attempt_per_packet(ctx, run_id).await;
     let mut ingested = 0u64;
+    let manifests = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |l| l.list_attempt_artifacts(&run_id)).await?
+    };
+    let compacted = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |l| {
+            l.list_attempt_artifact_compactions(&run_id)
+        })
+        .await?
+        .into_iter()
+        .filter(|row| row.state == "completed")
+        .map(|row| row.attempt_id)
+        .collect::<BTreeSet<_>>()
+    };
+    let mut manifested_packets = BTreeSet::new();
+    for artifact in manifests {
+        if compacted.contains(&artifact.attempt_id) {
+            manifested_packets.insert(artifact.packet_id.clone());
+            continue;
+        }
+        let (provider, model, stdout) =
+            super::artifacts::manifest_output(&ctx.config.run_dir(run_id), &artifact)?;
+        manifested_packets.insert(artifact.packet_id.clone());
+        ingested += ingest_capture(
+            ctx,
+            run_id,
+            &artifact.packet_id,
+            Some(artifact.attempt_id),
+            &provider,
+            &model,
+            &stdout,
+        )
+        .await?;
+    }
+
+    // Compatibility projection: only packets with no attempt manifests read
+    // the pre-0.2 packet-level capture, attributed to that packet's latest
+    // attempt exactly as before.
+    let latest_attempt = latest_attempt_per_packet(ctx, run_id).await;
     for row in packets {
+        if manifested_packets.contains(&row.packet_id) {
+            continue;
+        }
         let packet: WorkPacket = match forged_proto::stored_packet(&row) {
             Ok(p) => p,
             Err(_) => continue,
         };
         let (_, stage_key, logical_seq) = crate::core::split_packet_key(&row.packet_id)?;
-        let dirs = PacketDirs::new(ctx.config.packet_dir_key(run_id, &stage_key, logical_seq));
-        let Ok(stdout) = std::fs::read_to_string(dirs.stdout()) else {
+        let packet_dir = ctx.config.packet_dir_key(run_id, &stage_key, logical_seq);
+        let Ok(stdout) = std::fs::read_to_string(packet_dir.join("out.jsonl")) else {
             continue;
         };
         let model = packet.provider_hints.model.clone();
         let provider = packet.provider_hints.provider.clone();
-        let capture = match provider.as_str() {
-            "codex" => CodexDriver.parse_usage(&stdout, &model)?,
-            _ => forged_provider::ClaudeDriver.parse_usage(&stdout, &model)?,
-        };
-        let mut rows = capture.rows;
-        if rows.is_empty() && provider == "codex" {
-            // A codex turn that failed before reporting usage: fall back to
-            // the rollout file. Absent usage is data — RolloutNotFound and
-            // a missing session_ref are both zero rows and Ok.
-            if let Some(thread_id) = capture.session_ref.as_deref() {
-                match forged_provider::recover_usage_from_rollout(
-                    &ctx.config.codex_home,
-                    thread_id,
-                    &model,
-                )
-                .await
-                {
-                    Ok(recovered) => rows = recovered.rows,
-                    Err(forged_provider::ProviderError::RolloutNotFound { .. }) => {}
-                    Err(other) => {
-                        return Err(Failure::refused(ErrorCode::Internal, other.to_string()))
-                    }
-                }
+        let attempt_id = latest_attempt.get(&row.packet_id).copied();
+        ingested += ingest_capture(
+            ctx,
+            run_id,
+            &row.packet_id,
+            attempt_id,
+            &provider,
+            &model,
+            &stdout,
+        )
+        .await?;
+    }
+    Ok(ingested)
+}
+
+async fn ingest_capture(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: Option<i64>,
+    provider: &str,
+    model: &str,
+    stdout: &str,
+) -> Result<u64, Failure> {
+    let capture = match provider {
+        "codex" => CodexDriver.parse_usage(stdout, model)?,
+        _ => forged_provider::ClaudeDriver.parse_usage(stdout, model)?,
+    };
+    let mut rows = capture.rows;
+    if rows.is_empty() && provider == "codex" {
+        if let Some(thread_id) = capture.session_ref.as_deref() {
+            match forged_provider::recover_usage_from_rollout(
+                &ctx.config.codex_home,
+                thread_id,
+                model,
+            )
+            .await
+            {
+                Ok(recovered) => rows = recovered.rows,
+                Err(forged_provider::ProviderError::RolloutNotFound { .. }) => {}
+                Err(other) => return Err(Failure::refused(ErrorCode::Internal, other.to_string())),
             }
         }
-        crate::core::usage::price(ctx, &mut rows);
-        let attempt_id = latest_attempt.get(&row.packet_id).copied();
-        for usage in rows {
-            let new_usage =
-                crate::core::usage::to_new_usage(run_id, &row.packet_id, attempt_id, usage);
-            on_ledger(&ctx.ledger, move |l| l.record_usage(new_usage)).await?;
-            ingested += 1;
-        }
+    }
+    crate::core::usage::price(ctx, &mut rows);
+    let mut ingested = 0;
+    for usage in rows {
+        let new_usage = crate::core::usage::to_new_usage(run_id, packet_id, attempt_id, usage);
+        on_ledger(&ctx.ledger, move |l| l.record_usage(new_usage)).await?;
+        ingested += 1;
     }
     Ok(ingested)
 }
