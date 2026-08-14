@@ -221,11 +221,11 @@ impl HerdrHost {
     ///
     /// Every failure degrades to `None`, which spawns an untargeted pane. A
     /// pane in the wrong workspace is a strictly better outcome than a seat
-    /// that cannot start, so placement never propagates an error. This crate
-    /// carries no logging dependency; the degraded case is silent by
-    /// construction and is why `workspace.list` is re-consulted on each new
-    /// host rather than cached process-wide — a workspace the operator closed
-    /// is recreated on the next spawn instead of stranding placement.
+    /// that cannot start, so placement never propagates an error, and the
+    /// degraded case is silent — which is why `workspace.list` is
+    /// re-consulted on each new host rather than cached process-wide: a
+    /// workspace the operator closed is recreated on the next spawn instead
+    /// of stranding placement.
     async fn workspace_id(&self) -> Option<String> {
         let label = self.workspace_label.as_deref()?;
         if let Some(id) = self.workspace.lock().expect("workspace lock").clone() {
@@ -587,17 +587,34 @@ impl SessionHost for HerdrHost {
     /// its response is never read.
     ///
     /// The seat itself SURVIVES. Releasing gives up the terminal, never the
-    /// session identity: a reconcile pass that reaches an attempt this
-    /// process already released — a row left `revoking` by a refused settle,
-    /// say — must still get a liveness answer and a confirmable kill out of
-    /// it, and `SessionNotFound` there would abort the pass that was going
-    /// to reclaim the packet.
+    /// session identity: dropping the map entry would make
+    /// `session_status_path` — and so `alive` and `kill_confirmed` —
+    /// answer [`HostError::SessionNotFound`] for an id this instance
+    /// issued. The saga does not ask about liveness first: step 2 of
+    /// `forged_proto::reconcile`'s revoking path calls `kill_confirmed`
+    /// directly, because the fence is confirmed death and never a liveness
+    /// reading. `ForgedPorts` turns the host's error into
+    /// `PortError::Unavailable` and reconcile propagates it with `?`, so a
+    /// row this process released but left `revoking` — a refused settle,
+    /// still owing a confirmable kill — would abort the very pass that was
+    /// going to reclaim its packet.
+    ///
+    /// An id absent from the map is NOT this host's pane: herdr closes
+    /// whatever pane carries the id it is handed, so the dispatch is fenced
+    /// by ownership here rather than by the caller's good behaviour.
     async fn release(&self, id: &HostSessionId) {
-        {
+        let owned = {
             let mut sessions = self.sessions.lock().expect("sessions lock");
-            if let Some(seat) = sessions.get_mut(id) {
-                seat.released = true;
+            match sessions.get_mut(id) {
+                Some(seat) => {
+                    seat.released = true;
+                    true
+                }
+                None => false,
             }
+        };
+        if !owned {
+            return;
         }
         self.conn
             .dispatch("pane.close", json!({"pane_id": id.as_str()}))

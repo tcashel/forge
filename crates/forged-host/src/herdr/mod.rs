@@ -30,6 +30,11 @@ pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(5);
 /// what a caller that has already settled must never spend.
 pub(crate) const DISPATCH_BUDGET: Duration = Duration::from_millis(250);
 
+/// How much of a dispatched request's answer is read before the drain gives
+/// up. One JSON-RPC response frame is orders of magnitude smaller; the cap
+/// exists so a peer that never terminates a line cannot grow this buffer.
+const DRAIN_READ_CAP: u64 = 64 * 1024;
+
 /// Bound on the pre-synchronization set of retained `pane_created` ids.
 const GATE_RETAIN_CAP: usize = 1024;
 
@@ -288,47 +293,107 @@ impl Connection {
         }
     }
 
-    /// Fire one request and never read its response.
+    /// Fire one request and never let its response reach the caller.
     ///
-    /// The write IS the whole contract: no answer is awaited, so an
-    /// unresponsive herdr costs the caller one socket write rather than
-    /// [`RPC_TIMEOUT`]. Only for callers that have already settled and whose
-    /// correctness does not depend on the request's outcome — the residual
-    /// is an unclosed pane, never a delayed or altered settlement. Bounded
-    /// by [`DISPATCH_BUDGET`] because reaching a socket whose backlog is
-    /// full can itself block.
+    /// The write IS the whole contract for the CALLER: no answer is awaited
+    /// on their thread, so an unresponsive herdr costs them one socket write
+    /// rather than [`RPC_TIMEOUT`]. Only for callers that have already
+    /// settled and whose correctness does not depend on the request's
+    /// outcome — the residual is an unclosed pane, never a delayed or
+    /// altered settlement. Bounded by [`DISPATCH_BUDGET`] because reaching a
+    /// socket whose backlog is full can itself block.
+    ///
+    /// Forgetting the outcome is not the same as never observing it: a
+    /// failure here leaves a residual an operator would otherwise only meet
+    /// as a stray shell, so a detached task DOES read the response, and a
+    /// refusal that says the request was not honoured is logged at `warn`.
+    /// The caller waits for none of it.
+    ///
+    /// Two outcomes are deliberately silent. A refusal proving the pane is
+    /// ALREADY gone is the goal state reached by another route, not a
+    /// failure. And a drain that cannot read or outlives [`RPC_TIMEOUT`]
+    /// says nothing about whether herdr honoured the request — logging a
+    /// warning there would report a residual that may not exist.
     pub(crate) async fn dispatch(&self, method: &str, params: Value) {
+        let request_id = self.next_request_id();
         let frame = serde_json::json!({
-            "id": self.next_request_id(),
+            "id": &request_id,
             "method": method,
             "params": params,
         });
         let line = format!("{}\n", frame);
         let socket_path = &self.socket_path;
         let sent = tokio::time::timeout(DISPATCH_BUDGET, async {
-            let mut stream = UnixStream::connect(socket_path).await.ok()?;
-            stream.write_all(line.as_bytes()).await.ok()?;
+            let mut stream = match UnixStream::connect(socket_path).await {
+                Ok(stream) => stream,
+                Err(error) => {
+                    tracing::warn!(
+                        method,
+                        socket = %socket_path.display(),
+                        %error,
+                        "herdr dispatch never connected; request unsent"
+                    );
+                    return None;
+                }
+            };
+            if let Err(error) = stream.write_all(line.as_bytes()).await {
+                tracing::warn!(method, %error, "herdr dispatch write failed; request unsent");
+                return None;
+            }
             Some(stream)
         })
         .await;
+        let stream = match sent {
+            Ok(Some(stream)) => stream,
+            Ok(None) => return,
+            Err(_elapsed) => {
+                // NOT "unsent": the budget can expire after a partial or
+                // even a complete write, so delivery is genuinely unknown
+                // here. Reporting it as unsent would send an operator
+                // looking for a pane that may well have closed.
+                tracing::warn!(
+                    method,
+                    budget_ms = u64::try_from(DISPATCH_BUDGET.as_millis()).unwrap_or(u64::MAX),
+                    "herdr dispatch exceeded its budget; delivery unknown"
+                );
+                return;
+            }
+        };
 
-        // Drain and discard the answer in the background. Herdr sees an
-        // ordinary peer that stays until it has replied — hanging up on the
-        // request we just wrote would invite the server to abandon it — and
-        // nothing here is ever awaited by the caller.
-        if let Ok(Some(mut stream)) = sent {
-            tokio::spawn(async move {
-                let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
-                    let mut sink = [0_u8; 1024];
-                    while let Ok(read) = stream.read(&mut sink).await {
-                        if read == 0 {
-                            break;
+        // Drain the answer in the background, keeping only its refusal.
+        // Herdr sees an ordinary peer that stays until it has replied —
+        // hanging up on the request we just wrote would invite the server to
+        // abandon it — and nothing here is ever awaited by the caller.
+        let method = method.to_owned();
+        tokio::spawn(async move {
+            let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
+                // Bounded: this reads a peer's answer into memory with
+                // nothing awaiting it, so an unterminated line must not be
+                // able to grow without limit.
+                let mut lines = BufReader::new(stream.take(DRAIN_READ_CAP)).lines();
+                while let Ok(Some(incoming)) = lines.next_line().await {
+                    if let Frame::Response {
+                        id,
+                        result: Err(error),
+                    } = parse_frame(&incoming)
+                    {
+                        // A pane herdr cannot find is a pane already closed:
+                        // the request's whole purpose is served, so this is
+                        // the one refusal that is not worth an operator's
+                        // attention.
+                        if id == request_id && !error.is_pane_not_found() {
+                            tracing::warn!(
+                                method,
+                                code = %error.code,
+                                message = %error.message,
+                                "herdr refused the dispatched request"
+                            );
                         }
                     }
-                })
-                .await;
-            });
-        }
+                }
+            })
+            .await;
+        });
     }
 
     /// Open Herdr's dedicated long-lived subscription mode. Ordinary RPCs
@@ -451,6 +516,8 @@ fn observe_event(
 mod tests {
     use super::*;
 
+    use tokio::net::UnixListener;
+
     /// Criterion 6 fixture: the exact event shapes from the wire contract —
     /// stale foreign `pane_created`/`pane_exited` lines, then the
     /// self-triggered `pane_created`, then a genuine `pane_exited`.
@@ -568,5 +635,204 @@ mod tests {
             message: "method not found: pane.fly".to_string(),
         };
         assert!(!method.is_pane_not_found());
+    }
+
+    // -----------------------------------------------------------------------
+    // Dispatch failure logging. Every way a fire-and-forget request can fail
+    // leaves a residual the operator would otherwise meet only as a stray
+    // shell, so the `warn` IS the observable: restoring the original silence
+    // must fail a test rather than merely change one. Each branch below is
+    // driven through the real `dispatch`, never through a stand-in.
+    // -----------------------------------------------------------------------
+
+    /// Every warning this process emits, rendered as `message field=value …`.
+    fn captured() -> &'static Mutex<Vec<String>> {
+        static CAPTURED: OnceLock<Mutex<Vec<String>>> = OnceLock::new();
+        CAPTURED.get_or_init(|| Mutex::new(Vec::new()))
+    }
+
+    struct CaptureLayer;
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for CaptureLayer {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if event.metadata().level() > &tracing::Level::WARN {
+                return;
+            }
+            let mut rendered = String::new();
+            event.record(&mut RenderFields(&mut rendered));
+            captured().lock().expect("capture lock").push(rendered);
+        }
+    }
+
+    struct RenderFields<'a>(&'a mut String);
+
+    impl tracing::field::Visit for RenderFields<'_> {
+        fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+            use std::fmt::Write as _;
+            let _ = write!(self.0, " {}={value:?}", field.name());
+        }
+    }
+
+    /// Route this process's warnings into [`captured`]. Deliberately the
+    /// GLOBAL subscriber: the refusal branch logs from a detached task that
+    /// no thread-local default would ever cover. Tests therefore share one
+    /// buffer and each identifies its own line by its unique method name.
+    fn capture_warnings() {
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        INSTALLED.get_or_init(|| {
+            use tracing_subscriber::layer::SubscriberExt as _;
+            use tracing_subscriber::util::SubscriberInitExt as _;
+            let _ = tracing_subscriber::registry().with(CaptureLayer).try_init();
+        });
+    }
+
+    /// Wait for a captured warning containing `needle`, failing with
+    /// everything that WAS captured.
+    async fn warning_containing(needle: &str) -> String {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let hit = captured()
+                .lock()
+                .expect("capture lock")
+                .iter()
+                .find(|line| line.contains(needle))
+                .cloned();
+            if let Some(line) = hit {
+                return line;
+            }
+            if std::time::Instant::now() >= deadline {
+                // Cloned out first: a guard alive across the panic would
+                // poison the buffer and fail every other test for the wrong
+                // reason.
+                let seen = captured().lock().expect("capture lock").clone();
+                panic!("no warning mentioning {needle:?}; captured: {seen:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    }
+
+    /// A body far larger than any socket buffer, so a peer that never reads
+    /// necessarily leaves the write unfinished instead of silently absorbing
+    /// it — the stalled and hung-up sockets below both depend on that.
+    fn oversized_params() -> Value {
+        serde_json::json!({ "blob": "x".repeat(4 * 1024 * 1024) })
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_the_socket_cannot_be_reached() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let absent = tmp.path().join("herdr.sock");
+        let connection = Connection::dial(&absent).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.unreachable", Value::Null)
+            .await;
+
+        let line = warning_containing("test.dispatch.unreachable").await;
+        assert!(line.contains("never connected"), "{line}");
+        assert!(
+            line.contains(&absent.display().to_string()),
+            "the unreachable socket must be named: {line}"
+        );
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_the_write_fails() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Accept and hang up at once: the peer is gone long before an
+        // oversized body could drain into the socket.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            drop(stream);
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.hangup", oversized_params())
+            .await;
+
+        let line = warning_containing("test.dispatch.hangup").await;
+        assert!(line.contains("write failed"), "{line}");
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_it_exceeds_its_budget() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Accept and never read: the herdr whose backlog is full, on which
+        // the write can only stall.
+        let stalled = tokio::spawn(async move {
+            let (_held, _) = listener.accept().await.expect("accept");
+            std::future::pending::<()>().await;
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        let started = std::time::Instant::now();
+        connection
+            .dispatch("test.dispatch.stalled", oversized_params())
+            .await;
+        let elapsed = started.elapsed();
+
+        let line = warning_containing("test.dispatch.stalled").await;
+        assert!(line.contains("exceeded its budget"), "{line}");
+        assert!(
+            line.contains(&format!("budget_ms={}", DISPATCH_BUDGET.as_millis())),
+            "{line}"
+        );
+        // The point of the budget: a settled caller never pays an RPC's wait.
+        assert!(elapsed < RPC_TIMEOUT, "dispatch waited {elapsed:?}");
+        stalled.abort();
+    }
+
+    #[tokio::test]
+    async fn dispatch_warns_when_herdr_refuses_the_request() {
+        capture_warnings();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let socket_path = tmp.path().join("herdr.sock");
+        let listener = UnixListener::bind(&socket_path).expect("bind");
+        // Answer with an error object carrying the request's own id: the one
+        // shape the background drain exists to notice.
+        tokio::spawn(async move {
+            let (stream, _) = listener.accept().await.expect("accept");
+            let (read_half, mut write_half) = stream.into_split();
+            let mut lines = BufReader::new(read_half).lines();
+            let request = lines.next_line().await.expect("read").expect("request");
+            let frame: Value = serde_json::from_str(&request).expect("request json");
+            let id = frame["id"].as_str().expect("request id").to_string();
+            let response = serde_json::json!({
+                "id": id,
+                "error": {"code": "INTERNAL", "message": "close refused by the test"},
+            });
+            write_half
+                .write_all(format!("{response}\n").as_bytes())
+                .await
+                .expect("write response");
+        });
+        let connection = Connection::dial(&socket_path).await.expect("dial");
+
+        connection
+            .dispatch("test.dispatch.refused", Value::Null)
+            .await;
+
+        let line = warning_containing("test.dispatch.refused").await;
+        assert!(line.contains("refused the dispatched request"), "{line}");
+        assert!(
+            line.contains("INTERNAL"),
+            "the refusal code is lost: {line}"
+        );
+        assert!(
+            line.contains("close refused by the test"),
+            "the refusal message is lost: {line}"
+        );
     }
 }

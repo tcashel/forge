@@ -778,6 +778,55 @@ async fn repeated_releases_are_silent_whatever_herdr_answers() {
     assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
 }
 
+#[tokio::test]
+async fn releasing_an_id_this_host_never_spawned_sends_nothing() {
+    // Herdr closes whatever pane carries the id it is handed, so `release`
+    // must be fenced by THIS host's ownership rather than by its caller
+    // happening to pass back an id it spawned. The second host below is the
+    // stand-in for every other holder of a pane id — another forged process,
+    // the operator's own terminal — and a release aimed at their pane must
+    // not reach the socket at all.
+    let mock = Mock::start(|method, _params, n| {
+        // Only the FIRST host spawns; the second one merely connects.
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("ping", _) => vec![Action::Respond(pong(19))],
+            ("events.subscribe", _) => vec![Action::Respond(json!({"type": "ok"}))],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (owner, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    let stranger_base = tempfile::tempdir().expect("tempdir");
+    let stranger = HerdrHost::connect(&mock.socket_path, stranger_base.path())
+        .await
+        .expect("connect");
+
+    let methods_before = mock.methods();
+    let connections_before = mock.connection_count();
+    stranger.release(&id).await;
+    // A dispatched close lands asynchronously, so absence is only provable
+    // after leaving one time to arrive.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    assert_eq!(
+        mock.methods(),
+        methods_before,
+        "releasing an unowned id issued a request"
+    );
+    assert_eq!(
+        mock.connection_count(),
+        connections_before,
+        "releasing an unowned id opened a socket"
+    );
+    // The owner is untouched: its own release still closes its own pane.
+    assert_eq!(stranger.attach_hint(&id), None);
+    assert!(owner.attach_hint(&id).is_some());
+}
+
 // ---------------------------------------------------------------------------
 // Placement: seats land in a forged-owned workspace, never the focused one.
 // ---------------------------------------------------------------------------
