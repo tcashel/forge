@@ -82,8 +82,26 @@ detached: do not poll in this turn.
 ## Return to the operator
 
 Report the Bead id, run id, repository, frozen profile, base and work branch if
-shown, and the exact read-only inspection commands printed by Forged. Explain
-the terminal contract: a reviewed draft PR or an explicit input-required stop.
+shown, then include these concrete read-only reconnect commands:
+
+```bash
+forged overview --run "$RUN_ID"
+forged run status --run "$RUN_ID"
+forged session list --run "$RUN_ID"
+forged events --run "$RUN_ID" --limit 100
+```
+
+When `session list` reports a live Herdr-backed attempt, read its recent output
+using that returned attempt id:
+
+```bash
+forged session read --attempt "$ATTEMPT_ID" --lines 120
+```
+
+Explain the terminal contract: a reviewed draft PR or an explicit
+input-required stop. A slice has no generic `resolve` command: report the exact
+blocker and its typed remedy rather than blindly resubmitting or starting a
+replacement run.
 
 No auto-routing, external-tracker synchronization, background watch loop,
 install step, or protocol change belongs here. Never approve or merge the

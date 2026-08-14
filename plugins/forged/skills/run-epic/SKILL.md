@@ -72,6 +72,34 @@ for human adjudication, or an explicit input-required stop naming the failed
 gate, exhausted budget, stale assumption, conflict, or missing authority.
 
 Report the epic id, frozen children and waves, profile, integration/default
-branches, controller identity, and exact read-only inspection commands returned
-by Forged. No external-tracker integration, auto-routing, install action,
+branches, and controller identity, then include these concrete read-only
+reconnect commands:
+
+```bash
+forged overview --epic "$EPIC_ID"
+forged epic status --epic "$EPIC_ID"
+forged events --run "$EPIC_ID" --limit 200
+```
+
+Use the child run id returned by epic status to inspect an active provider
+session. Use the attempt id returned by session list for the Herdr pane read:
+
+```bash
+forged session list --run "$CHILD_RUN_ID"
+forged session read --attempt "$ATTEMPT_ID" --lines 120
+```
+
+When `inputRequired.childId` names a child, first update and adjudicate that
+child's native Bead fields. Then clear only that recorded hold and submit the
+next detached controller generation:
+
+```bash
+forged epic resolve --epic "$EPIC_ID" --child "$CHILD_ID" \
+  --note "$RESOLUTION_NOTE"
+forged epic submit --epic "$EPIC_ID"
+```
+
+Do not invoke `epic resolve` for an input requirement that names no child; report
+that global blocker because the current typed command deliberately requires a
+child id. No external-tracker integration, auto-routing, install action,
 protocol change, or implicit default-branch approval is allowed.

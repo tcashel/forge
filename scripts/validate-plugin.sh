@@ -105,6 +105,25 @@ check_handoff_block() {
   ' "$1"
 }
 
+check_reconnect_surface() {
+  local path=$1
+  shift
+  local verb
+  for verb in "$@"; do
+    awk -v verb="$verb" '
+      function invokes(line, tail) {
+        sub(/^[[:space:]]+/, "", line)
+        if (index(line, verb) != 1) return 0
+        tail = substr(line, length(verb) + 1, 1)
+        return tail == "" || tail ~ /[[:space:]]/
+      }
+      /^[[:space:]]*```/ { fenced = !fenced; next }
+      fenced && invokes($0) { found = 1 }
+      END { exit !found }
+    ' "$path" || return 1
+  done
+}
+
 required=(
   "$plugin/README.md"
   "$plugin/LEARNINGS.md"
@@ -156,6 +175,17 @@ check "slice handoff start then submit" check_handoff_block \
   "$plugin/skills/dispatch/SKILL.md" "forged run start" "forged run submit"
 check "epic handoff start then submit" check_handoff_block \
   "$plugin/skills/run-epic/SKILL.md" "forged epic start" "forged epic submit"
+check "slice reconnect command surface" check_reconnect_surface \
+  "$plugin/skills/dispatch/SKILL.md" \
+  "forged overview --run" "forged run status --run" \
+  "forged session list --run" "forged session read --attempt" \
+  "forged events --run"
+check "epic reconnect and resume command surface" check_reconnect_surface \
+  "$plugin/skills/run-epic/SKILL.md" \
+  "forged overview --epic" "forged epic status --epic" \
+  "forged session list --run" "forged session read --attempt" \
+  "forged events --run" "forged epic resolve --epic" \
+  "forged epic submit --epic"
 
 if rg -n --glob '*.md' --glob '*.sh' \
   '(\.anvil/specs|--spec([[:space:]]|`)|bd create --repo|--(description|acceptance|notes)-file|workflows/(execute-review-fix|run-epic|plan-critique-improve)\.js|watch-epic)' \
