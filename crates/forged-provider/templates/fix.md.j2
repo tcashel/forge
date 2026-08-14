@@ -22,10 +22,16 @@ location of ? means the reviewer named no file. Findings:
    to {{ push_url }}. If there is nothing to change, report applied=false.
 3. Do NOT mark the PR ready, do NOT merge — forged owns any later round and
    the final human adjudication after you return. Report what you changed.
+   If a requested fix conflicts with repository evidence or would implement a
+   broken specification, return this result instead of a fix outcome:
+     {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
+      "outcome": {"specAmendment": {"amendment": {"summary": "...",
+      "evidence": "...", "proposedChange": "..."}}}}
 4. End your final message with the result block and nothing after it: exactly
    one fenced code block whose info string is the single word forged-result
    (open and close the fence with three backtick characters), holding this JSON
    and no prose —
      {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
       "outcome": {"fix": {"applied": true, "summary": "..."}}}
-   applied is false when there was nothing to change.
+   applied is false when there was nothing to change; the amendment result in
+   step 3 is the only alternative shape.

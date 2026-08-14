@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the thirty public core functions, the CLI path and the MCP tool path produce
+//! the thirty-one public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_thirty_tools_match_their_cli_counterparts() {
+fn all_thirty_one_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -61,6 +61,7 @@ fn all_thirty_tools_match_their_cli_counterparts() {
         "packet_fail",
         "reconcile",
         "run_advance",
+        "run_accept_risk",
         "run_revise_roster",
         "run_start",
         "run_status",
@@ -74,7 +75,7 @@ fn all_thirty_tools_match_their_cli_counterparts() {
         "work_list",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the thirty tools, exactly");
+    assert_eq!(tools, expected, "the thirty-one tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -216,6 +217,32 @@ fn all_thirty_tools_match_their_cli_counterparts() {
         normalized(tool),
         "run_revise_roster parity"
     );
+
+    let cli = env
+        .forged(&[
+            "run",
+            "accept-risk",
+            "--run",
+            "absent",
+            "--accepted-by",
+            "lead-agent",
+            "--rationale",
+            "known deployment boundary",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "run_accept_risk",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {
+                "run": "absent",
+                "acceptedBy": "lead-agent",
+                "rationale": "known deployment boundary"
+            }
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "run_accept_risk parity");
 
     // Epic lifecycle and control refusals have identical envelopes.
     let cli = env

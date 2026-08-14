@@ -158,22 +158,19 @@ fn profile(name: &str, review_roles: &[&str], synthesis: bool) -> ProfileDefinit
             version: 1,
         },
         seats,
+        risk_context: match name {
+            "high" => "Consequential change: treat credible security, data-loss, migration, financial, and irreversible-operation failures as blocking even when their likelihood is low.",
+            _ => "Routine change: grade findings by demonstrated likelihood and concrete user or operator consequence; a specification mismatch is not automatically a blocker when the spec itself is wrong.",
+        }
+        .to_owned(),
         fix_round_budget: if name == "lean" { 0 } else { 1 },
         escalate_on: match name {
             "lean" => vec![EscalationTrigger::GateFailure],
-            "standard" => vec![
-                EscalationTrigger::GateFailure,
-                EscalationTrigger::ReviewConflict,
-            ],
             _ => Vec::new(),
         },
         escalate_to: match name {
             "lean" => Some(ProfileRef {
                 name: "standard".to_owned(),
-                version: 1,
-            }),
-            "standard" => Some(ProfileRef {
-                name: "high".to_owned(),
                 version: 1,
             }),
             _ => None,
@@ -184,10 +181,7 @@ fn profile(name: &str, review_roles: &[&str], synthesis: bool) -> ProfileDefinit
 fn default_profiles() -> BTreeMap<String, ProfileDefinitionV1> {
     [
         ("lean", profile("lean", &["review.primary"], false)),
-        (
-            "standard",
-            profile("standard", &["review.primary", "review.secondary"], false),
-        ),
+        ("standard", profile("standard", &["review.primary"], false)),
         (
             "high",
             profile(
@@ -1048,15 +1042,47 @@ mod tests {
     }
 
     #[test]
+    fn standard_is_one_reviewer_and_high_assurance_is_explicit() {
+        let cfg = config();
+        let standard = cfg.profiles.get("standard").expect("standard");
+        assert_eq!(
+            standard
+                .seats
+                .iter()
+                .filter(|seat| seat.purpose == SeatPurpose::Review)
+                .count(),
+            1
+        );
+        assert!(standard.escalate_on.is_empty());
+        assert!(standard.escalate_to.is_none());
+
+        let high = cfg.profiles.get("high").expect("high");
+        assert_eq!(
+            high.seats
+                .iter()
+                .filter(|seat| seat.purpose == SeatPurpose::Review)
+                .count(),
+            3
+        );
+        assert!(high
+            .seats
+            .iter()
+            .any(|seat| seat.purpose == SeatPurpose::Synthesis));
+    }
+
+    #[test]
     fn reachable_profile_names_must_match_their_map_keys() {
         let mut cfg = config();
-        cfg.profiles.get_mut("high").expect("high profile").name = "misnamed".to_owned();
+        cfg.profiles
+            .get_mut("standard")
+            .expect("standard profile")
+            .name = "misnamed".to_owned();
         let errors = cfg
-            .compile_definition(Some("standard"), None)
+            .compile_definition(Some("lean"), None)
             .expect_err("reachable mismatched profile must fail");
         assert!(errors.iter().any(|error| {
-            error.path == "$.profiles.high.name"
-                && error.message.contains("referenced key \"high\"")
+            error.path == "$.profiles.standard.name"
+                && error.message.contains("referenced key \"standard\"")
         }));
     }
 

@@ -107,6 +107,8 @@ pub enum RunCmd {
     Status(RunScoped),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
+    /// Accept the final deduplicated findings after review-budget exhaustion.
+    AcceptRisk(RunAcceptRiskArgs),
 }
 
 /// `epic` subcommands.
@@ -229,6 +231,23 @@ pub struct RunReviseRosterArgs {
     /// Human-readable reason recorded with the revision.
     #[arg(long)]
     pub reason: String,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `run accept-risk` flags.
+#[derive(Debug, Args)]
+pub struct RunAcceptRiskArgs {
+    /// Run whose review budget is exhausted.
+    #[arg(long)]
+    pub run: String,
+    /// Operator or lead-agent identity making the decision.
+    #[arg(long)]
+    pub accepted_by: String,
+    /// Why the final findings are acceptable in this risk context.
+    #[arg(long)]
+    pub rationale: String,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -608,6 +627,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Submit(_) => "run_submit",
             RunCmd::Status(_) => "run_status",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
+            RunCmd::AcceptRisk(_) => "run_accept_risk",
         },
         Command::Epic { command } => match command {
             EpicCmd::Start(_) => "epic_start",
@@ -724,6 +744,18 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     a.idempotency_key,
                     Some(a.run.clone()),
                     json!({"run": a.run, "roster": a.roster, "reason": a.reason}),
+                ),
+            ),
+            RunCmd::AcceptRisk(a) => (
+                "run_accept_risk",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({
+                        "run": a.run,
+                        "acceptedBy": a.accepted_by,
+                        "rationale": a.rationale,
+                    }),
                 ),
             ),
         },

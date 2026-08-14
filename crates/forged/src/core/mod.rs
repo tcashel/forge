@@ -347,7 +347,7 @@ pub fn session_claimant(packet_id: &str, provider: &str) -> String {
 /// The note is classified `unspawned:`, never left to classify as semantic:
 /// no provider existed for this attempt, so it is not the stage's answer.
 /// A plain note would be merged into a review fan-out as `RequestChanges`
-/// and would spend the run's one fix round — see `settle_unspawned`, which
+/// and would spend a remediation round — see `settle_unspawned`, which
 /// this shares its settlement with.
 ///
 /// The ORIGINAL failure is what comes back — a ledger error while settling is
@@ -625,6 +625,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
+        "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,
         "epic_advance" => epic::epic_advance(ctx, &req).await,
         "epic_drive" => epic::epic_drive(ctx, &req).await,
