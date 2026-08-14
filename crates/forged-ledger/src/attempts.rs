@@ -13,6 +13,12 @@
 //! worker and took its bd lease back. `stopped` is the attempt-local one: an
 //! operator ended one attempt, the lease was never in scope and is untouched.
 //! Both are kill-confirmed; a reader tells them apart to know which happened.
+//!
+//! Which exit a marker is HEADED for is durable too, in `revoke_scope`,
+//! committed with the marker itself. Without it a stop whose `kill_confirmed`
+//! failed is a `revoking` row indistinguishable from a dead worker's, and the
+//! next reconcile pass resumes it through the bead-scoped reclaim the stop
+//! exists to avoid.
 
 use forged_types::{new_claim_token, ErrorCode, PacketResult};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
@@ -22,11 +28,11 @@ use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, SpecFence};
+use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, SpecFence};
 
 const ATTEMPT_COLUMNS: &str =
-    "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, fail_note, \
-     result_json, started_at, updated_at, last_heartbeat_at, ended_at";
+    "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, revoke_scope, \
+     fail_note, result_json, started_at, updated_at, last_heartbeat_at, ended_at";
 
 /// Decode a stored `attempts.state`, failing CLOSED: only the six DDL CHECK
 /// strings are accepted, and `running` in particular must be stored
@@ -44,6 +50,19 @@ fn attempt_state(idx: usize, s: &str) -> Result<AttemptState, rusqlite::Error> {
     }
 }
 
+/// Decode a stored `attempts.revoke_scope`, failing CLOSED on an
+/// unrecognized string exactly as [`attempt_state`] does. `NULL` is not a
+/// failure: it is every row written before the column existed, plus every
+/// row that has never been revoked.
+fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, rusqlite::Error> {
+    match s.as_deref() {
+        None => Ok(None),
+        Some("bead") => Ok(Some(RevokeScope::Bead)),
+        Some("attempt") => Ok(Some(RevokeScope::Attempt)),
+        Some(other) => Err(column_decode_error(idx, "revoke scope", other)),
+    }
+}
+
 fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
     Ok(AttemptRow {
         attempt_id: row.get(0)?,
@@ -52,12 +71,13 @@ fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
         claimant: row.get(3)?,
         state: attempt_state(4, &row.get::<_, String>(4)?)?,
         revoke_reason: row.get(5)?,
-        fail_note: row.get(6)?,
-        result_json: row.get(7)?,
-        started_at: row.get(8)?,
-        updated_at: row.get(9)?,
-        last_heartbeat_at: row.get(10)?,
-        ended_at: row.get(11)?,
+        revoke_scope: revoke_scope(6, row.get::<_, Option<String>>(6)?)?,
+        fail_note: row.get(7)?,
+        result_json: row.get(8)?,
+        started_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        last_heartbeat_at: row.get(11)?,
+        ended_at: row.get(12)?,
     })
 }
 
@@ -68,8 +88,8 @@ pub(crate) fn list_live_attempts_tx(
     run_id: Option<&str>,
 ) -> Result<Vec<AttemptRow>, LedgerError> {
     let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
-         a.revoke_reason, a.fail_note, a.result_json, a.started_at, a.updated_at, \
-         a.last_heartbeat_at, a.ended_at \
+         a.revoke_reason, a.revoke_scope, a.fail_note, a.result_json, a.started_at, \
+         a.updated_at, a.last_heartbeat_at, a.ended_at \
          FROM attempts a JOIN packets p ON p.packet_id = a.packet_id \
          WHERE a.state IN ('running','revoking') \
          AND (?1 IS NULL OR p.run_id = ?1) ORDER BY a.rowid";
@@ -421,12 +441,59 @@ impl Ledger {
         self.submit(move |conn| list_live_attempts_tx(conn, run_id.as_deref()))
     }
 
-    /// Durably mark `running → revoking` and COMMIT — this marker lands
-    /// BEFORE the caller performs any external kill or bd reclaim.
-    /// Idempotent when already `revoking` (the original reason and
-    /// timestamps are preserved, and no event is emitted); refused with
-    /// `InvalidRequest` from terminal states.
+    /// Attempts in exactly `state`, ordered by rowid ascending — the
+    /// terminal counterpart of [`Ledger::list_live_attempts`], which by
+    /// construction can never return one. `run_id: None` returns all;
+    /// `Some(r)` only the attempts whose packet belongs to `r`.
+    pub fn list_attempts_in_state(
+        &self,
+        run_id: Option<&str>,
+        state: AttemptState,
+    ) -> Result<Vec<AttemptRow>, LedgerError> {
+        let run_id = run_id.map(str::to_owned);
+        self.submit(move |conn| {
+            let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
+                 a.revoke_reason, a.revoke_scope, a.fail_note, a.result_json, a.started_at, \
+                 a.updated_at, a.last_heartbeat_at, a.ended_at \
+                 FROM attempts a JOIN packets p ON p.packet_id = a.packet_id \
+                 WHERE a.state = ?1 AND (?2 IS NULL OR p.run_id = ?2) ORDER BY a.rowid";
+            let mut stmt = conn.prepare(sql)?;
+            let rows = stmt.query_map(
+                rusqlite::params![state.as_str(), run_id.as_deref()],
+                attempt_row,
+            )?;
+            let mut out = Vec::new();
+            for row in rows {
+                out.push(row?);
+            }
+            Ok(out)
+        })
+    }
+
+    /// Durably mark `running → revoking` under [`RevokeScope::Bead`] — the
+    /// reclaim saga's marker. See [`Ledger::revoke_attempt_scoped`] for the
+    /// contract; an operator's attempt-local stop calls that one with
+    /// [`RevokeScope::Attempt`] instead.
     pub fn revoke_attempt(&self, attempt_id: i64, reason: &str) -> Result<(), LedgerError> {
+        self.revoke_attempt_scoped(attempt_id, reason, RevokeScope::Bead)
+    }
+
+    /// Durably mark `running → revoking` and COMMIT — this marker lands
+    /// BEFORE the caller performs any external kill or bd reclaim. `scope`
+    /// commits WITH it, and is what a later pass routes on: a marker is
+    /// resumed by the revocation that placed it, never by the other one.
+    ///
+    /// Idempotent when already `revoking` (the original reason, scope, and
+    /// timestamps are preserved, and no event is emitted) — first writer
+    /// wins the scope, so a stop that arrives after the saga's marker
+    /// settles the attempt without inheriting standing over the lease.
+    /// Refused with `InvalidRequest` from terminal states.
+    pub fn revoke_attempt_scoped(
+        &self,
+        attempt_id: i64,
+        reason: &str,
+        scope: RevokeScope,
+    ) -> Result<(), LedgerError> {
         let reason = reason.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
@@ -440,8 +507,8 @@ impl Ledger {
                     let now = now_iso();
                     tx.execute(
                         "UPDATE attempts SET state = 'revoking', revoke_reason = ?1, \
-                         updated_at = ?2 WHERE attempt_id = ?3",
-                        rusqlite::params![reason, now, attempt_id],
+                         revoke_scope = ?2, updated_at = ?3 WHERE attempt_id = ?4",
+                        rusqlite::params![reason, scope.as_str(), now, attempt_id],
                     )?;
                     attempt_event(
                         &tx,
@@ -581,6 +648,32 @@ mod tests {
         for bad in ["", "Running", "runnin", "zombie"] {
             let err: LedgerError = attempt_state(4, bad)
                 .expect_err("unknown state must fail closed, never default to Running")
+                .into();
+            assert!(
+                matches!(err, LedgerError::Internal { .. }),
+                "{bad:?}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn revoke_scope_decodes_its_two_strings_and_tolerates_null() {
+        assert_eq!(revoke_scope(6, None).expect("null"), None);
+        assert_eq!(
+            revoke_scope(6, Some("bead".to_owned())).expect("bead"),
+            Some(RevokeScope::Bead)
+        );
+        assert_eq!(
+            revoke_scope(6, Some("attempt".to_owned())).expect("attempt"),
+            Some(RevokeScope::Attempt)
+        );
+    }
+
+    #[test]
+    fn revoke_scope_fails_closed_on_unknown_strings() {
+        for bad in ["", "Bead", "run", "whole-bead"] {
+            let err: LedgerError = revoke_scope(6, Some(bad.to_owned()))
+                .expect_err("an unknown scope must never default to a scope")
                 .into();
             assert!(
                 matches!(err, LedgerError::Internal { .. }),

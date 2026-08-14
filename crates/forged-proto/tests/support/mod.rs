@@ -244,6 +244,7 @@ impl ViewBuilder {
             claimant: format!("claude:sess-{attempt_id}:1"),
             state: AttemptState::Running,
             revoke_reason: None,
+            revoke_scope: None,
             fail_note: None,
             result_json: None,
             started_at: T0.to_owned(),
@@ -292,6 +293,21 @@ impl ViewBuilder {
         self.terminal.entry(pid).or_default().push(TerminalAttempt {
             attempt_id,
             state: AttemptState::Reclaimed,
+            outcome: None,
+            fail_note: None,
+            started_at: T0.to_owned(),
+        });
+        self
+    }
+
+    /// Land a terminal attempt an operator stopped.
+    pub fn stopped_attempt(mut self, stage: Stage, seq: i64) -> Self {
+        let pid = packet_id(&self.run_id, stage, seq);
+        let attempt_id = self.next_attempt_id;
+        self.next_attempt_id += 1;
+        self.terminal.entry(pid).or_default().push(TerminalAttempt {
+            attempt_id,
+            state: AttemptState::Stopped,
             outcome: None,
             fail_note: None,
             started_at: T0.to_owned(),
@@ -510,6 +526,12 @@ pub struct FakePorts {
     pub sha_script: Mutex<VecDeque<Option<String>>>,
     /// Scripted resolve states; default worktree present, no lease holder.
     pub resolve_script: Mutex<VecDeque<ResolveState>>,
+    /// Called at the TOP of `kill_confirmed` and `reclaim_lease` with that
+    /// step's name. The saga's races are between its steps, so a test that
+    /// wants one lands its concurrent transition from here rather than
+    /// hoping two tasks interleave.
+    #[allow(clippy::type_complexity)]
+    pub interpose: Mutex<Option<Box<dyn FnMut(&str) + Send>>>,
 }
 
 impl FakePorts {
@@ -526,6 +548,13 @@ impl FakePorts {
     pub fn recorded(&self) -> Vec<PortCall> {
         self.calls.lock().expect("calls lock").clone()
     }
+
+    /// Run whatever a test interposed at `step`, if anything.
+    fn interpose(&self, step: &str) {
+        if let Some(hook) = self.interpose.lock().expect("lock").as_mut() {
+            hook(step);
+        }
+    }
 }
 
 #[async_trait::async_trait]
@@ -537,6 +566,7 @@ impl ReconcilePorts for FakePorts {
     }
 
     async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
+        self.interpose("kill_confirmed");
         if let Some(failure) = self.kill_failure.lock().expect("lock").clone() {
             return Err(failure);
         }
@@ -570,6 +600,7 @@ impl ReconcilePorts for FakePorts {
         holder: &str,
         older_than_s: u64,
     ) -> Result<LeaseReclaim, PortError> {
+        self.interpose("reclaim_lease");
         let scripted = self.reclaim_script.lock().expect("lock").pop_front();
         let outcome =
             scripted.unwrap_or_else(|| {

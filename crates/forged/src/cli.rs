@@ -421,6 +421,11 @@ pub struct SessionMessageArgs {
 }
 
 /// `session stop` flags.
+///
+/// ATTEMPT-LOCAL: this settles one attempt at `stopped` and leaves the
+/// bead's bd lease with `run_holder`, where a successor on the same packet
+/// claims under it immediately. Releasing the bead's lease is a different
+/// operation with a different fence.
 #[derive(Debug, Args)]
 pub struct SessionStopArgs {
     /// Attempt id to revoke and stop.

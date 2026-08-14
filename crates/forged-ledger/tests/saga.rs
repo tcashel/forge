@@ -360,11 +360,21 @@ fn mark_stopped_is_the_only_path_into_stopped() {
     assert_eq!(err.code(), ErrorCode::InvalidRequest);
 
     ledger
-        .revoke_attempt(claim.attempt_id, "operator requested")
+        .revoke_attempt_scoped(
+            claim.attempt_id,
+            "operator requested",
+            forged_ledger::RevokeScope::Attempt,
+        )
         .expect("revoke");
     ledger.mark_stopped(claim.attempt_id).expect("stop");
 
     let stopped = ledger.get_attempt(claim.attempt_id).expect("get");
+    // The scope survives the transition too: a reader of the terminal row
+    // knows an operator stopped this, not that the saga reclaimed it.
+    assert_eq!(
+        stopped.revoke_scope,
+        Some(forged_ledger::RevokeScope::Attempt)
+    );
     assert_eq!(stopped.state, AttemptState::Stopped);
     assert_ne!(stopped.state, AttemptState::Reclaimed);
     assert_eq!(stopped.revoke_reason.as_deref(), Some("operator requested"));
@@ -605,5 +615,66 @@ fn events_are_append_only_and_run_attributed() {
         .list_events(None, 0, 0)
         .expect("limit zero")
         .is_empty());
+    ledger.close().expect("close");
+}
+
+/// The marker's SCOPE is durable and first-writer-wins. Without it a
+/// `revoking` row cannot say whose revocation it is, and the recovery path
+/// finishes an operator's stop through the bead-scoped reclaim it exists to
+/// avoid.
+#[test]
+fn a_revoking_marker_records_the_scope_that_placed_it() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-scope");
+    let fence = SpecFence::Sha256("cafe".to_owned());
+
+    // The saga's own entry point is bead-scoped.
+    let saga_packet = make_packet(&ledger, &run);
+    // One live attempt per packet, so the two revocations need two packets.
+    let stop_packet = ledger
+        .open_packet(NewPacket {
+            run_id: run.clone(),
+            stage: Stage::Implement,
+            seq: 2,
+            spec_path: "specs/x.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: "{\"schema\":\"forged.packet/1\"}".to_owned(),
+        })
+        .expect("open packet");
+    let saga = ledger
+        .claim_packet(&saga_packet, "claude:sess-1:100", &fence)
+        .expect("claim");
+    ledger
+        .revoke_attempt(saga.attempt_id, "session vanished")
+        .expect("revoke");
+    assert_eq!(
+        ledger
+            .get_attempt(saga.attempt_id)
+            .expect("get")
+            .revoke_scope,
+        Some(forged_ledger::RevokeScope::Bead)
+    );
+
+    // An operator's stop is attempt-scoped, and a second revocation of an
+    // already-marked row changes NOTHING: reason, scope, and stamps all
+    // belong to the writer that committed the marker.
+    let stop = ledger
+        .claim_packet(&stop_packet, "claude:sess-2:200", &fence)
+        .expect("claim");
+    ledger
+        .revoke_attempt_scoped(
+            stop.attempt_id,
+            "operator requested",
+            forged_ledger::RevokeScope::Attempt,
+        )
+        .expect("revoke");
+    ledger
+        .revoke_attempt(stop.attempt_id, "session vanished")
+        .expect("a second revocation of a revoking row is a no-op");
+    let row = ledger.get_attempt(stop.attempt_id).expect("get");
+    assert_eq!(row.revoke_scope, Some(forged_ledger::RevokeScope::Attempt));
+    assert_eq!(row.revoke_reason.as_deref(), Some("operator requested"));
     ledger.close().expect("close");
 }
