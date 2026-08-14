@@ -31,6 +31,10 @@ fn run(ledger: &Ledger, id: &str) -> String {
         .run_id
 }
 
+/// A packet at one spec pin. `body_json` carries the DEFINITION and nothing
+/// the spec columns already hold — exactly what `WorkPacket::stored_body`
+/// writes — so it is invariant under a spec revision, which is what lets a
+/// re-pin be told apart from a redefinition.
 fn packet_at(run_id: &str, revision: &str, body_sha256: &str) -> NewPacket {
     NewPacket {
         run_id: run_id.to_owned(),
@@ -39,7 +43,7 @@ fn packet_at(run_id: &str, revision: &str, body_sha256: &str) -> NewPacket {
         spec_path: format!("/runs/{run_id}/packets/implement/0/spec.md"),
         spec_sha256: body_sha256.to_owned(),
         spec_revision: Some(revision.to_owned()),
-        body_json: format!("{{\"schema\":\"forged.packet/1\",\"rev\":\"{revision}\"}}"),
+        body_json: format!("{{\"schema\":\"forged.packet/1\",\"branch\":\"forged/{run_id}\"}}"),
     }
 }
 
@@ -135,6 +139,20 @@ fn re_opening_after_a_spec_edit_pins_the_new_body() {
     let row = ledger.get_packet(&packet).expect("get packet");
     assert_eq!(row.spec_revision.as_deref(), Some(REVISION_N1));
     assert_eq!(row.spec_sha256, EDITED_BODY);
+    assert_eq!(
+        row.body_json,
+        packet_at(&run_id, REVISION_N, BODY).body_json,
+        "a re-pin revises the spec columns and leaves the definition alone"
+    );
+
+    // A DIFFERING DEFINITION is not a revised spec: the packet's contract is
+    // fixed when it is opened.
+    let mut redefined = packet_at(&run_id, REVISION_N1, EDITED_BODY);
+    redefined.body_json = "{\"schema\":\"forged.packet/1\",\"branch\":\"other\"}".to_owned();
+    let err = ledger
+        .open_packet(redefined)
+        .expect_err("a re-open may re-pin the spec and nothing else");
+    assert_eq!(err.code(), ErrorCode::InvalidRequest);
 
     // And the seat now claims at the NEW body — the whole point: the run
     // survives a spec revision instead of being pinned to bytes nobody can

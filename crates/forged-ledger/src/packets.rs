@@ -49,9 +49,10 @@ impl Ledger {
     /// id `"<run>/<stage>/<seq>"`.
     ///
     /// Re-opening with byte-identical content adds no row. Re-opening with a
-    /// DIFFERENT spec re-pins the row — see [`Ledger::open_packet_with_id`]
-    /// for the guard that keeps a live seat's spec from moving under it. An
-    /// unknown run refuses with `RunNotFound`.
+    /// DIFFERENT spec re-pins the row's spec columns — see
+    /// [`Ledger::open_packet_with_id`] for the guards that keep a live seat's
+    /// spec, and any packet's definition, from moving under it. An unknown
+    /// run refuses with `RunNotFound`.
     pub fn open_packet(&self, new_packet: NewPacket) -> Result<String, LedgerError> {
         let packet_id = format!(
             "{}/{}/{}",
@@ -67,11 +68,18 @@ impl Ledger {
     /// against `new_packet.run_id`; storage still carries a temporary v0 lane.
     ///
     /// RE-PIN: a re-open whose spec differs from the stored one rewrites the
-    /// row's spec columns and body — this is how a revised spec reaches an
+    /// row's SPEC COLUMNS — this is how a revised spec reaches an
     /// already-open packet, and the whole reason a run survives an edit. It
     /// is refused the moment the packet has a `running`, `revoking`, or
     /// `completed` attempt: a seat's spec must never move underneath it, and
     /// a settled packet is history.
+    ///
+    /// A differing `body_json` is NOT a re-pin and is refused with
+    /// `InvalidRequest`. The body is the packet's DEFINITION — worktree,
+    /// branch, contract, roster hints — fixed when the packet was opened,
+    /// and it carries no spec and no identity of its own to be revised
+    /// (`WorkPacket::stored_body`). Accepting a differing one would silently
+    /// redefine work the run has already committed to.
     pub fn open_packet_with_id(
         &self,
         new_packet: NewPacket,
@@ -112,10 +120,18 @@ impl Ledger {
                 )
                 .optional()?;
             if let Some((spec_path, spec_sha256, spec_revision, body_json)) = existing {
+                if body_json != new_packet.body_json {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "packet {packet_id:?} is already open with a different definition; \
+                             a re-open may re-pin the spec and nothing else"
+                        ),
+                    ));
+                }
                 if spec_path == new_packet.spec_path
                     && spec_sha256 == new_packet.spec_sha256
                     && spec_revision == new_packet.spec_revision
-                    && body_json == new_packet.body_json
                 {
                     tx.commit()?;
                     return Ok(packet_id);
@@ -138,13 +154,12 @@ impl Ledger {
                 }
                 tx.execute(
                     "UPDATE packets SET spec_path = ?2, spec_sha256 = ?3, \
-                     spec_revision = ?4, body_json = ?5 WHERE packet_id = ?1",
+                     spec_revision = ?4 WHERE packet_id = ?1",
                     rusqlite::params![
                         packet_id,
                         new_packet.spec_path,
                         new_packet.spec_sha256,
                         new_packet.spec_revision,
-                        new_packet.body_json,
                     ],
                 )?;
                 tx.commit()?;

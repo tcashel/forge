@@ -32,5 +32,7 @@ pub use events::{parse_proto_events, record, widen_rfc3339, GatePhase, ProtoEven
 pub use ports::{
     KillOutcome, LeaseReclaim, PrSnapshot, ReconcilePorts, ResolveState, SessionLiveness,
 };
-pub use project::{packet_spec, project_run, project_run_with_policy, stored_packet};
+pub use project::{
+    packet_columns, packet_spec, project_run, project_run_with_policy, stored_packet,
+};
 pub use reconcile::{land_packet_result, reconcile, LandOutcome, ReconcileConfig, ReconcileReport};
