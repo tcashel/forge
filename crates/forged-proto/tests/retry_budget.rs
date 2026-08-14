@@ -78,11 +78,10 @@ fn concurrent_charges_each_land_on_their_own_count() {
     );
 
     for ledger in ledgers {
-        Arc::try_unwrap(ledger)
-            .ok()
-            .expect("sole owner")
-            .close()
-            .expect("close");
+        match Arc::try_unwrap(ledger) {
+            Ok(sole) => sole.close().expect("close"),
+            Err(_) => panic!("every charger thread was joined"),
+        }
     }
 }
 
