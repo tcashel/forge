@@ -14,6 +14,9 @@
 //             order, with its class, plus `picks` for a clickable card
 //   ident     the identity line's text
 //   chips     the chip labels rendered beside it
+//   rail      the attention rail's items, each `{label, detail}` — the rail
+//             lives outside #view, and a payload whose whole point is what
+//             needs a human is not observable without it
 //   tabsHidden / controlsHidden   what the resolution branch asserts
 //   args      `state.args` after ingest, which is what Refresh would send
 //   error     `state.error`, so an unknown schema is observable too
@@ -125,7 +128,11 @@ const document = {
   },
 };
 
-const source = ["el", "arr", "chip", "panel", "choose", "viewResolution", "render", "ingest"]
+const source = [
+  "el", "arr", "at", "num", "int", "chip", "panel", "pickGrid", "choose", "upToPortfolio",
+  "viewResolution", "viewPortfolio", "drawRail", "portfolioRail", "render", "subjectParams",
+  "capabilitiesSettled", "ingest",
+]
   .map(lift)
   .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
@@ -134,7 +141,7 @@ const host = {
   connected: true,
   capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
 };
-const { ingest, state, nodes } = new Function(
+const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "document",
   "setTimeout",
   "reportSize",
@@ -142,40 +149,65 @@ const { ingest, state, nodes } = new Function(
   "packetRows",
   "headline",
   "host",
-  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { ingest, state, nodes };`,
+  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
 )(document, () => {}, () => {}, () => {}, () => [], () => ({}), host);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");
 for await (const chunk of process.stdin) stdin += chunk;
 ingest(JSON.parse(stdin));
+if (process.env.SERVER_TOOLS_AFTER_INGEST === "1") {
+  host.capabilities.serverTools = true;
+  capabilitiesSettled();
+}
 
-const view = [];
 // Firing a card's click to record what it would ask for WRITES `state.args`,
 // which is also one of the things being reported. Snapshot it before the
 // walk and restore it after, or the report shows whichever candidate was
 // clicked last instead of what ingest left behind.
 const ingested = state.args;
-const walk = (node) => {
-  if (node.textContent !== undefined && node.textContent !== null && node.textContent !== "") {
-    view.push({ class: node.className, text: String(node.textContent) });
-  }
-  if (node.handler) {
-    state.args = null;
-    node.handler();
-    view.push({ class: node.className, text: "", picks: state.args });
-  }
-  for (const kid of node.kids) walk(kid);
+const report = (root) => {
+  const out = [];
+  const walk = (node) => {
+    if (node.textContent !== undefined && node.textContent !== null && node.textContent !== "") {
+      out.push({ class: node.className, text: String(node.textContent), disabled: !!node.disabled });
+    }
+    if (node.handler) {
+      state.args = null;
+      node.handler();
+      out.push({
+        class: node.className,
+        text: "",
+        picks: state.args,
+        // JSON.stringify drops an `undefined` value but Object.keys does
+        // not: `{run: undefined}` must not masquerade as the portfolio's
+        // genuinely empty params object in this harness.
+        paramKeys: Object.keys(state.args?.params || {}),
+      });
+    }
+    for (const kid of node.kids) walk(kid);
+  };
+  walk(root);
+  return out;
 };
-walk(nodes.view);
+// Navigation lives under the identity strip, outside #view. Report it
+// separately so its click contract is exercised without changing `view`'s
+// card-only `picks` contract.
+const subident = report(nodes.subident);
+const view = report(nodes.view);
 state.args = ingested;
 
 process.stdout.write(
   JSON.stringify({
     view,
+    subident,
     text: view.map((n) => n.text).filter(Boolean).join("\n"),
     ident: nodes.identText.textContent ?? "",
     chips: nodes.ident.kids.filter((k) => k.className.includes("chip")).map((k) => k.textContent),
+    rail: nodes.rail.kids.map((item) => ({
+      label: String(item.kids[0]?.textContent ?? ""),
+      detail: String(item.kids[1]?.textContent ?? ""),
+    })),
     tabsHidden: nodes.tabs.hidden,
     controlsHidden: nodes.controls.hidden,
     args: state.args,

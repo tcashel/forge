@@ -20,15 +20,17 @@ use crate::core::{
 
 // STARTED and the three lifecycle kinds below are `pub(super)` because the
 // inventory (`super::ops::work_list`) derives an epic's entry from exactly
-// these; every other kind stays private to the scheduler.
+// these, and the input pair because the portfolio's attention rail folds an
+// epic's hold out of exactly those two; every other kind stays private to
+// the scheduler.
 pub(super) const STARTED: &str = "forged.epic.started";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
 const WAVE_STARTED: &str = "forged.epic.wave.started";
 const CHILD_STARTED: &str = "forged.epic.child.started";
 const CHILD_RESET: &str = "forged.epic.child.reset";
 const CHILD_MERGED: &str = "forged.epic.child.merged";
-const INPUT_REQUIRED: &str = "forged.epic.input.required";
-const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
+pub(super) const INPUT_REQUIRED: &str = "forged.epic.input.required";
+pub(super) const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
 pub(super) const PAUSED: &str = "forged.epic.paused";
 pub(super) const RESUMED: &str = "forged.epic.resumed";
 pub(super) const EPIC_PR: &str = "forged.epic.pr";

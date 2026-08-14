@@ -1,4 +1,5 @@
-//! Renderer-level tests for the App's Cost tab and candidate chooser.
+//! Renderer-level tests for the App's Cost tab, candidate chooser, and
+//! portfolio root view.
 //!
 //! The spend header is the one place the projection can lie to an operator:
 //! an epic whose codex seats were priced from the operator's rate card must
@@ -11,8 +12,9 @@ mod support;
 
 use serde_json::{json, Value};
 use support::{
-    render_cost, render_dispatch, render_resolution, render_resolution_without_server_tools,
-    require_node,
+    render_cost, render_dispatch, render_dispatch_before_server_tools,
+    render_dispatch_without_server_tools, render_resolution,
+    render_resolution_without_server_tools, require_node,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -289,6 +291,183 @@ fn a_resolution_leaves_refresh_able_to_re_ask_the_same_question() {
     );
 }
 
+// ------------------------------------------------------------- portfolio
+
+/// One portfolio payload, in the shape `portfolio_overview` emits.
+fn portfolio(entries: Vec<Value>, attention: Vec<Value>) -> Value {
+    let (total, held) = (entries.len(), attention.len());
+    json!({
+        "schema": "forged.overview/1",
+        "kind": "portfolio",
+        "entries": entries,
+        "total": total,
+        "cap": 200,
+        "liveSeats": 2,
+        "attention": attention,
+        "attentionTotal": held,
+        "spend": {"costUsdKnown": 1.25, "rowsMissingCost": 3},
+    })
+}
+
+/// The root view, entered where the host enters. Lifting `viewPortfolio` and
+/// calling it directly would prove the grid draws and prove nothing about
+/// whether a portfolio payload ever reaches it — the gap the dispatch
+/// harness exists to close.
+#[test]
+fn a_portfolio_envelope_reaches_the_root_view_through_ingest_and_render() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"ok": true, "result": portfolio(
+            vec![
+                json!({"id": "pf-epic", "kind": "epic", "beadId": "pf-epic", "state": "active",
+                       "branch": "forged/epic-pf-epic", "liveSeats": 0, "costUsdKnown": 0.0,
+                       "rowsMissingCost": 3}),
+                json!({"id": "pf-slice", "kind": "slice", "beadId": "bead-pf-slice",
+                       "state": "active", "branch": "forged/pf-slice", "liveSeats": 2,
+                       "costUsdKnown": 1.25, "rowsMissingCost": 0}),
+            ],
+            Vec::new(),
+        )}),
+    );
+    assert!(
+        dispatched.error.is_null(),
+        "a portfolio is not an error: {}",
+        dispatched.error
+    );
+    assert_eq!(
+        dispatched.ident, "all work",
+        "the portfolio has no subject to name: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.tabs_hidden,
+        "the portfolio is the level above a subject, so it draws no tabs: {}",
+        dispatched.text
+    );
+    for expected in ["pf-epic", "pf-slice", "epic", "slice", "2 live", "$1.25"] {
+        assert!(
+            dispatched.text.contains(expected),
+            "the root view renders {expected}: {}",
+            dispatched.text
+        );
+    }
+    // Clicking an entry re-asks under the explicit param its kind implies —
+    // the same `choose` the candidate chooser has always used.
+    assert_eq!(
+        dispatched.picks(),
+        vec![
+            json!({"schemaVersion": 1, "params": {"epic": "pf-epic"}}),
+            json!({"schemaVersion": 1, "params": {"run": "pf-slice"}}),
+        ],
+        "each entry drills in under its own kind: {}",
+        dispatched.text
+    );
+    // And Refresh re-asks for the portfolio itself: it is addressed by
+    // absence, never by a `run` key holding an id the payload never had.
+    assert_eq!(
+        dispatched.args,
+        json!({"schemaVersion": 1, "params": {}}),
+        "the portfolio re-asks with no scope"
+    );
+}
+
+/// The rail is the answer to "what needs a human", so it has to be drawn
+/// from the payload's own conditions rather than re-derived by the App.
+#[test]
+fn the_portfolio_draws_every_attention_entry_it_was_given() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"ok": true, "result": portfolio(
+            vec![json!({"id": "pf-epic", "kind": "epic", "state": "active"})],
+            vec![
+                json!({"id": "pf-epic", "kind": "epic", "condition": "input-required",
+                       "detail": "pf-child is holding on bd-unready: the bead is not ready",
+                       "evidence": {"code": "bd-unready"}}),
+                json!({"id": "pf-slice", "kind": "slice", "condition": "missing-cost",
+                       "detail": "3 usage rows carry no cost, so the spend shown is partial",
+                       "evidence": {"rowsMissingCost": 3}}),
+            ],
+        )}),
+    );
+    let held = dispatched
+        .rail_item("input required")
+        .unwrap_or_else(|| panic!("the rail names the hold: {:?}", dispatched.rail));
+    let detail = held["detail"].as_str().unwrap_or_default();
+    assert!(
+        detail.contains("pf-epic") && detail.contains("bd-unready"),
+        "a rail item states its id and its evidence: {detail}"
+    );
+    assert!(
+        dispatched.rail_item("missing cost").is_some(),
+        "every condition reaches the rail: {:?}",
+        dispatched.rail
+    );
+    // The count is of CONDITIONS, and it says so. These two sit on two
+    // different subjects here, but one run can raise several at once —
+    // "2 need a human" would then claim two subjects are waiting when one
+    // is, which is a lie about the size of the queue.
+    assert_eq!(
+        dispatched.chips,
+        vec![
+            "1 in the ledger".to_owned(),
+            "2 conditions need a human".to_owned()
+        ],
+        "the identity strip counts the ledger and the conditions waiting"
+    );
+}
+
+/// An empty rail is a successful answer meaning nothing needs attention, and
+/// an empty portfolio is not a broken projection.
+#[test]
+fn an_empty_portfolio_draws_an_empty_state_and_no_rail() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"ok": true, "result": {
+            "schema": "forged.overview/1",
+            "kind": "portfolio",
+            "entries": [],
+            "total": 0,
+            "cap": 200,
+            "liveSeats": 0,
+            "attention": [],
+            "attentionTotal": 0,
+            "spend": {"costUsdKnown": 0.0, "rowsMissingCost": 0},
+        }}),
+    );
+    assert!(dispatched.rail.is_empty(), "{:?}", dispatched.rail);
+    assert!(
+        dispatched.text.contains("Nothing in the ledger yet"),
+        "an empty ledger says so: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.picks().is_empty(),
+        "there is nothing to drill into: {}",
+        dispatched.text
+    );
+}
+
+/// The bound reaches the operator: a truncated page says which slice of the
+/// ledger it is, so a complete answer is distinguishable from a partial one.
+#[test]
+fn a_truncated_portfolio_says_it_is_showing_only_the_newest() {
+    let Some(node) = require_node() else { return };
+    let mut payload = portfolio(
+        vec![json!({"id": "pf-one", "kind": "slice", "state": "active"})],
+        Vec::new(),
+    );
+    payload["total"] = json!(201);
+    let dispatched = render_dispatch(&node, &json!({"ok": true, "result": payload}));
+    assert!(
+        dispatched.text.contains("newest 1 of 201"),
+        "the page states its bound: {}",
+        dispatched.text
+    );
+}
+
 /// The schema guard is what makes the resolution contract meaningful: a
 /// payload on any other schema is still an error, not a chooser.
 #[test]
@@ -303,6 +482,61 @@ fn an_unknown_schema_is_still_refused_by_ingest() {
         json!("unexpected"),
         "an unknown schema is refused: {}",
         dispatched.error
+    );
+    assert_eq!(
+        dispatched.navigation_picks(),
+        vec![json!({"schemaVersion": 1, "params": {}})],
+        "the refusal can return to the portfolio instead of repeating itself"
+    );
+    assert_eq!(
+        dispatched.navigation_param_keys(),
+        vec![json!([])],
+        "portfolio navigation means no scope key, not an undefined scoped id"
+    );
+}
+
+#[test]
+fn portfolio_navigation_is_disabled_when_the_host_cannot_serve_it() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch_without_server_tools(
+        &node,
+        &json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "refused"}}),
+    );
+    assert!(
+        dispatched.navigation_picks().is_empty(),
+        "a limited host must receive no live portfolio handler"
+    );
+    assert!(
+        dispatched.subident.iter().any(|node| {
+            node["class"] == json!("up")
+                && node["text"] == json!("↑ all work")
+                && node["disabled"] == json!(true)
+        }),
+        "the portfolio control remains visible but reads as disabled: {:?}",
+        dispatched.subident
+    );
+}
+
+#[test]
+fn a_capable_late_handshake_reenables_portfolio_navigation() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch_before_server_tools(
+        &node,
+        &json!({"ok": false, "error": {"code": "INVALID_REQUEST", "message": "refused"}}),
+    );
+    assert_eq!(
+        dispatched.navigation_picks(),
+        vec![json!({"schemaVersion": 1, "params": {}})],
+        "the handshake rebuilds a refusal drawn before capabilities arrived"
+    );
+    assert!(
+        dispatched.subident.iter().any(|node| {
+            node["class"] == json!("up")
+                && node["text"] == json!("↑ all work")
+                && node["disabled"] == json!(false)
+        }),
+        "the rebuilt portfolio control is enabled: {:?}",
+        dispatched.subident
     );
 }
 

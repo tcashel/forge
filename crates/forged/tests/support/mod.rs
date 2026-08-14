@@ -1361,9 +1361,16 @@ pub fn render_cost(node: &str, data: &Value) -> Rendered {
 /// chips, chrome and `state.args` it left behind on the way.
 pub struct Dispatched {
     pub view: Vec<Value>,
+    /// Identity-strip navigation lives outside `#view`; report it separately
+    /// so return-to-portfolio clicks are part of the dispatch contract.
+    pub subident: Vec<Value>,
     pub text: String,
     pub ident: String,
     pub chips: Vec<String>,
+    /// The attention rail, each item `{label, detail}`. It is drawn outside
+    /// `#view`, so a payload whose subject IS what needs a human is not
+    /// observable from `view` alone.
+    pub rail: Vec<Value>,
     pub tabs_hidden: bool,
     pub controls_hidden: bool,
     pub args: Value,
@@ -1378,6 +1385,28 @@ impl Dispatched {
             .filter_map(|node| node.get("picks").cloned())
             .filter(|picks| !picks.is_null())
             .collect()
+    }
+
+    /// What clicking identity-strip navigation would ask the host for.
+    pub fn navigation_picks(&self) -> Vec<Value> {
+        self.subident
+            .iter()
+            .filter_map(|node| node.get("picks").cloned())
+            .filter(|picks| !picks.is_null())
+            .collect()
+    }
+
+    /// Parameter keys present before JSON serialization of navigation calls.
+    pub fn navigation_param_keys(&self) -> Vec<Value> {
+        self.subident
+            .iter()
+            .filter_map(|node| node.get("paramKeys").cloned())
+            .collect()
+    }
+
+    /// The rail item drawn under one label, if any.
+    pub fn rail_item(&self, label: &str) -> Option<&Value> {
+        self.rail.iter().find(|item| item["label"] == json!(label))
     }
 }
 
@@ -1396,8 +1425,41 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
         ),
         envelope,
     );
+    dispatched(out)
+}
+
+/// Drive the dispatch as a host that cannot proxy `tools/call` receives it.
+pub fn render_dispatch_without_server_tools(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output_env(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+        &[("SERVER_TOOLS", "0")],
+    );
+    dispatched(out)
+}
+
+/// Drive a payload that arrives before a capable host finishes its handshake.
+pub fn render_dispatch_before_server_tools(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output_env(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+        &[("SERVER_TOOLS", "0"), ("SERVER_TOOLS_AFTER_INGEST", "1")],
+    );
+    dispatched(out)
+}
+
+fn dispatched(out: Value) -> Dispatched {
     Dispatched {
         view: out["view"].as_array().cloned().unwrap_or_default(),
+        subident: out["subident"].as_array().cloned().unwrap_or_default(),
         text: out["text"].as_str().unwrap_or_default().to_owned(),
         ident: out["ident"].as_str().unwrap_or_default().to_owned(),
         chips: out["chips"]
@@ -1409,6 +1471,7 @@ pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
                     .collect()
             })
             .unwrap_or_default(),
+        rail: out["rail"].as_array().cloned().unwrap_or_default(),
         tabs_hidden: out["tabsHidden"].as_bool().unwrap_or(false),
         controls_hidden: out["controlsHidden"].as_bool().unwrap_or(false),
         args: out["args"].clone(),

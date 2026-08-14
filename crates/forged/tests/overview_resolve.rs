@@ -202,8 +202,10 @@ fn an_id_alongside_an_explicit_kind_is_refused() {
     assert_eq!(response["ok"], json!(false), "{response}");
     assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
 
-    // And so is naming no subject at all.
+    // Naming NO subject is the one relaxation: it asks about no kind at all
+    // and answers with the portfolio. `tests/portfolio.rs` owns that
+    // contract; here it only has to not be a refusal.
     let response = mcp.call_tool("overview", json!({"schemaVersion": 1, "params": {}}));
-    assert_eq!(response["ok"], json!(false), "{response}");
-    assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+    assert_eq!(response["ok"], json!(true), "{response}");
+    assert_eq!(response["result"]["kind"], json!("portfolio"));
 }

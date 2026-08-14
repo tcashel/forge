@@ -105,8 +105,12 @@ fn all_thirty_tools_match_their_cli_counterparts() {
     }
     let description = overview_tool["description"].as_str().unwrap_or_default();
     assert!(
-        description.contains("Exactly one of params.run, params.epic, or params.id is required"),
-        "overview must state its one-of rule: {description}"
+        description.contains("At most one of params.run, params.epic, or params.id is accepted"),
+        "overview must state its at-most-one rule: {description}"
+    );
+    assert!(
+        description.contains("omitting all three projects the portfolio"),
+        "overview must state that no scope is the portfolio: {description}"
     );
     let work_list = mcp.tool("work_list");
     let description = work_list["description"].as_str().unwrap_or_default();
