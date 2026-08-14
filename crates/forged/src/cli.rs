@@ -68,6 +68,12 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Work inventory.
+    Work {
+        /// The work subcommand.
+        #[command(subcommand)]
+        command: WorkCmd,
+    },
     /// Worktree lifecycle.
     Worktree {
         /// The worktree subcommand.
@@ -531,6 +537,13 @@ pub struct OverviewArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `work` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum WorkCmd {
+    /// List every slice run and started epic, with no id (read-only).
+    List(KeyOnly),
+}
+
 /// `worktree` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorktreeCmd {
@@ -622,6 +635,9 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Work { command } => match command {
+            WorkCmd::List(_) => "work_list",
+        },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
         },
@@ -944,6 +960,9 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 ),
             )
         }
+        Command::Work { command } => match command {
+            WorkCmd::List(a) => ("work_list", request(a.idempotency_key, None, json!({}))),
+        },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (
                 "worktree_retire",

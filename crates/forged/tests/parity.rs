@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the twenty-eight public core functions, the CLI path and the MCP tool path produce
+//! the thirty public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -33,7 +33,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_twenty_eight_tools_match_their_cli_counterparts() {
+fn all_thirty_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     let mut mcp = McpClient::new(&env);
@@ -71,15 +71,49 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
         "session_stop",
         "usage_ingest",
         "usage_report",
+        "work_list",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the twenty-nine tools, exactly");
+    assert_eq!(tools, expected, "the thirty tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
         overview_tool.pointer("/_meta/ui/resourceUri"),
         Some(&json!("ui://forged/overview.html"))
     );
+    // The one tool a host renders advertises its params concretely, and
+    // says which of them is required.
+    let properties = overview_tool
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for (param, ty) in [
+        ("run", "string"),
+        ("epic", "string"),
+        ("after", "integer"),
+        ("limit", "integer"),
+    ] {
+        let schema = properties
+            .get(param)
+            .unwrap_or_else(|| panic!("overview advertises {param}: {properties}"));
+        let text = schema.to_string();
+        assert!(
+            text.contains(ty),
+            "overview param {param} must advertise type {ty}: {schema}"
+        );
+    }
+    let description = overview_tool["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("Exactly one of params.run or params.epic is required"),
+        "overview must state its one-of rule: {description}"
+    );
+    let work_list = mcp.tool("work_list");
+    let description = work_list["description"].as_str().unwrap_or_default();
+    assert!(
+        description.contains("Takes no id"),
+        "work_list must state that it takes no id: {description}"
+    );
+
     assert_eq!(
         mcp.list_resources(),
         vec!["ui://forged/overview.html".to_owned()]
@@ -470,6 +504,12 @@ fn all_twenty_eight_tools_match_their_cli_counterparts() {
     let cli = env.forged(&["events"]).1;
     let tool = mcp.call_tool("events_tail", envelope(json!({})));
     assert_eq!(normalized(cli), normalized(tool), "events_tail parity");
+
+    // work_list: the discovery surface takes no id on either surface.
+    let cli = env.forged(&["work", "list"]).1;
+    let tool = mcp.call_tool("work_list", envelope(json!({})));
+    assert_eq!(tool["operationId"], json!("op:work_list:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_list parity");
 
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.
