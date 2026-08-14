@@ -116,6 +116,42 @@ pub enum BdError {
     },
 }
 
+impl BdError {
+    /// Whether bd never ANSWERED — the only class a caller may charge to a
+    /// bounded transport-retry budget.
+    ///
+    /// The split is not severity, it is whether the store spoke. A call that
+    /// produced its schema-1 envelope reported an OUTCOME — a bead that does
+    /// not exist, a lease held by someone else, a refused write — and every
+    /// retry re-reads the same answer until the budget is gone. A call that
+    /// produced no envelope at all (spawn failure, timeout, a child killed
+    /// before it could write, unparseable stdout) says nothing about the
+    /// store and is the one thing worth trying again.
+    ///
+    /// [`BdError::Contention`] is the documented exception: bd answered, but
+    /// with its own embedded lock, which clears on its own.
+    pub fn is_transport(&self) -> bool {
+        match self {
+            BdError::Contention { .. } | BdError::SpawnFailed { .. } | BdError::Timeout { .. } => {
+                true
+            }
+            // A nonzero exit is a REFUSAL when bd still emitted its
+            // envelope — bd 1.2.1 answers an unknown id with exit 1 and
+            // `{"data":{"error":"no issues found matching the provided
+            // IDs"},"schema_version":1}` — and a transport failure when it
+            // did not.
+            BdError::Beads { stdout, .. } => {
+                let lenient = envelope::parse_lenient(stdout);
+                !(lenient.parsed && lenient.schema_ok)
+            }
+            BdError::Envelope { .. }
+            | BdError::LeaseHeld { .. }
+            | BdError::HeartbeatRefused { .. }
+            | BdError::SlotBusy { .. } => false,
+        }
+    }
+}
+
 impl fmt::Display for BdError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -844,5 +880,56 @@ mod tests {
         assert_eq!(jitter_cap_ms(5), 800);
         assert_eq!(jitter_cap_ms(6), 1000);
         assert_eq!(jitter_cap_ms(60), 1000);
+    }
+
+    #[test]
+    fn a_refusal_bd_answered_is_not_transport_but_an_unanswered_call_is() {
+        // Probe-verified bd 1.2.1 shape for an unknown id: exit 1, and the
+        // envelope still arrives. bd answered; retrying re-reads the same
+        // answer, so this must never ride a transport budget.
+        let not_found = BdError::Beads {
+            context: "bd show does-not-exist".to_string(),
+            exit: Some(1),
+            stdout: "{\"data\":{\"error\":\"no issues found matching the provided IDs\"},\
+                     \"schema_version\":1}\n"
+                .to_string(),
+            stderr: "Error fetching does-not-exist: no issue found".to_string(),
+        };
+        assert!(!not_found.is_transport(), "a refusal is an outcome");
+
+        // The same exit code with no envelope behind it: bd never spoke.
+        let unreachable = BdError::Beads {
+            context: "bd show bead-1".to_string(),
+            exit: Some(1),
+            stdout: String::new(),
+            stderr: "bd: connection refused".to_string(),
+        };
+        assert!(
+            unreachable.is_transport(),
+            "an unanswered call is retryable"
+        );
+
+        assert!(BdError::Timeout {
+            context: "bd show bead-1".to_string(),
+            after_s: 30,
+        }
+        .is_transport());
+        assert!(BdError::SpawnFailed {
+            context: "bd show bead-1".to_string(),
+            detail: "no such file".to_string(),
+        }
+        .is_transport());
+        assert!(BdError::Contention {
+            attempts: 5,
+            stderr: DOLT_LOCK_REFUSAL.to_string(),
+        }
+        .is_transport());
+        // `show_issue`'s own not-found shape: a well-formed envelope that
+        // carried no issue.
+        assert!(!BdError::Envelope {
+            context: "bd show bead-1".to_string(),
+            detail: "response contained no issue".to_string(),
+        }
+        .is_transport());
     }
 }
