@@ -70,13 +70,21 @@ const document = {
 // the harness has no host to call.
 const state = { args: null };
 const refresh = () => {};
+// The chooser reads the host's capabilities: a host that does not proxy
+// `tools/call` gets cards it cannot open. Default to a capable host; set
+// SERVER_TOOLS=0 to render the other one.
+const host = {
+  connected: true,
+  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
+};
 const source = ["el", "arr", "chip", "panel", "choose", "viewResolution"].map(lift).join("\n");
 const { viewResolution, choose } = new Function(
   "document",
   "state",
   "refresh",
+  "host",
   `${source}\nreturn { viewResolution, choose };`,
-)(document, state, refresh);
+)(document, state, refresh, host);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");

@@ -221,8 +221,43 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // exactly why the fence is the rendered body and not the revision:
         // fenced on the write token, a crash resume would be refused for
         // forged's own lease write.
+        //
+        // PRE-CLAIM, exactly as in `execute_packet`: there is no attempt row
+        // and no claim token to fail one under, so a recoverable failure is
+        // charged to the packet's bounded budget through its grant alone.
+        // Untracked, an unreachable bd would refuse here for free, forever —
+        // and `claim-next` is the path an operator retries by hand, so
+        // "for free, forever" is a loop with a human in it.
         let resolved =
-            crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id).await?;
+            match crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id)
+                .await
+            {
+                Ok(resolved) => resolved,
+                Err(failure) if failure.recoverable => {
+                    let note = format!("transport: the resume could not read the spec: {failure}");
+                    crate::adapters::execute::grant_pre_claim_retry(
+                        ctx,
+                        &candidate.packet_id,
+                        note,
+                    )
+                    .await?;
+                    return Err(failure);
+                }
+                Err(failure) => return Err(failure),
+            };
+        // Re-pin BEFORE claiming. A bead edited under this open packet leaves
+        // the row pinned to bytes no seat can reach, and `claim_packet` would
+        // refuse the current body as drift — forever, since nothing else on
+        // this path ever moves the pin. `run advance` re-pins on its
+        // claim-again branch; a resume that could not would make the
+        // ledger-first recovery the weaker of the two.
+        let spec_ref = crate::adapters::execute::repin_spec_ref(
+            ctx,
+            &candidate.packet_id,
+            &candidate.spec,
+            &resolved,
+        )
+        .await?;
         let fence = resolved.fence.clone();
         let claimed = {
             let packet_id = candidate.packet_id.clone();
@@ -240,11 +275,8 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // its own token before it propagates (`abandon_claim`), never leaving
         // a `running` row with no process behind it.
         if let Err(failure) =
-            crate::core::spec::assert_pinned(&candidate.spec, &resolved).and_then(|()| {
-                crate::core::spec::materialize(
-                    &resolved,
-                    std::path::Path::new(&candidate.spec.path),
-                )
+            crate::core::spec::assert_pinned(&spec_ref, &resolved).and_then(|()| {
+                crate::core::spec::materialize(&resolved, std::path::Path::new(&spec_ref.path))
             })
         {
             return Err(crate::core::abandon_claim(
