@@ -8,8 +8,7 @@ use forged_types::{Capability, OperationRequest, OperationResponse, WorkPacket};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::ports::{report_json, ForgedPorts};
-use crate::config::now_iso;
+use crate::adapters::ports::ForgedPorts;
 use crate::core::{
     default_key, derive_key, err_response, fenced, on_ledger, param_opt_str, param_str, read_only,
     Ctx, Failure,
@@ -501,8 +500,14 @@ pub async fn session_message(ctx: &Ctx, req: &mut OperationRequest) -> Operation
     .await
 }
 
-/// `session stop` — durable revoke first, then the existing confirmed-death
-/// reconciliation saga.
+/// `session stop` — durable revoke, confirmed death, terminal `stopped`.
+///
+/// ATTEMPT-LOCAL, and nothing wider. The stop names one attempt, so it takes
+/// one attempt to a terminal state and leaves the bead's bd lease alone: the
+/// lease is held under the bead-scoped `run_holder` that every generation of
+/// the run shares, and a successor on this packet claims under it
+/// immediately. The bead-scoped release is a different operation with a
+/// different fence, and is not this one.
 pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let attempt_id = match param_attempt(&req.params) {
         Ok(value) => value,
@@ -543,20 +548,18 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         {
             move |_operation_id| async move {
                 let reason = param_str(&params, "reason")?.to_owned();
+                // Step 1: the durable marker commits BEFORE the kill.
                 on_ledger(&ctx.ledger, move |ledger| {
                     ledger.revoke_attempt(attempt_id, &reason)
                 })
                 .await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-                let view = crate::core::drive::project(ctx, &run_id).await?;
-                let config = forged_proto::ReconcileConfig {
-                    stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
-                    gate_commands: view.policy.gate_commands,
-                };
-                let report =
-                    forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())
-                        .await?;
-                Ok(json!({"attemptId": attempt_id, "report": report_json(&report)}))
+                forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
+                Ok(json!({
+                    "attemptId": attempt_id,
+                    "runId": run_id,
+                    "state": AttemptState::Stopped.as_str(),
+                }))
             }
         },
     )

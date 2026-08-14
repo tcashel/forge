@@ -977,7 +977,10 @@ fn packet_state<'v>(view: &'v RunView, packet: &'v PacketRow) -> LegState<'v> {
             }
             FailureKind::Semantic => LegState::FailedSemantic,
         },
-        // A reclaimed attempt leaves the packet open for a successor.
+        // A reclaimed or stopped attempt leaves the packet open for a
+        // successor, with no deadline: neither is a failure charged to the
+        // packet's budget, and an operator's stop in particular is meant to
+        // be re-claimable at once.
         _ => LegState::Pending {
             packet_id,
             not_before: None,

@@ -8,6 +8,12 @@
 //! surfaces as [`ProtoError::Port`] with the attempt left `revoking`, and
 //! the next invocation resumes from that durable marker.
 //!
+//! [`stop_attempt`] is the attempt-local sibling of that order, and a
+//! SEPARATE function on purpose: it ends at `stopped` after the same
+//! confirmed death and reclaims nothing, because the bd lease is bead-scoped
+//! and shared with every sibling generation. One function serving both
+//! scopes is what let an attempt-local stop reach for a bead-scoped lease.
+//!
 //! The ledger is synchronous by design; every ledger call here goes through
 //! `tokio::task::spawn_blocking`, and no transaction ever spans an
 //! `.await`.
@@ -359,6 +365,65 @@ async fn revoke_order(
 
     // Step 5: only now may a successor claim — the caller's business.
     Ok(())
+}
+
+/// End ONE attempt at `stopped`: confirmed death, then the attempt-local
+/// terminal transition. Entered only after the durable `revoking` marker is
+/// committed, exactly as [`revoke_order`] is.
+///
+/// **This deliberately reclaims no lease.** `run_holder` is bead-scoped —
+/// every generation of the run derives the identical string — so an
+/// attempt-local operation has no standing to take it, and a "no live
+/// sibling right now" check cannot be made safe against a sibling claimed
+/// one instruction later. Leaving the lease where it is costs nothing: a
+/// successor attempt on the same packet reuses it under the same holder,
+/// which is why the stop settles with no waiting period at all.
+///
+/// Confirmed death is still the whole fence, and still gates the transition:
+/// a `kill_confirmed` that cannot VERIFY death surfaces as
+/// [`ProtoError::Port`] with the attempt left `revoking`, where the next
+/// pass resumes from the durable marker. An attempt not under that marker
+/// is refused by the ledger BEFORE anything is killed.
+pub async fn stop_attempt(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    attempt_id: i64,
+) -> Result<(), ProtoError> {
+    let attempt = get_attempt(ledger, attempt_id).await?;
+    if attempt.state != AttemptState::Revoking {
+        // Not under the durable marker: the ledger's own transition speaks
+        // the refusal (or converges on `stopped`), and nothing is killed.
+        return mark_stopped(ledger, attempt_id).await;
+    }
+
+    // Step 2 of the revoke order, unchanged: verified death, never
+    // signal-send.
+    ports
+        .kill_confirmed(&attempt.claimant)
+        .await
+        .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
+
+    mark_stopped(ledger, attempt_id).await
+}
+
+/// `revoking → stopped`, converging with a racing stop that got there first.
+async fn mark_stopped(ledger: &Ledger, attempt_id: i64) -> Result<(), ProtoError> {
+    let marked: Result<(), LedgerError> =
+        on_ledger(ledger, move |l| Ok(l.mark_stopped(attempt_id))).await?;
+    match marked {
+        Ok(()) => Ok(()),
+        Err(err) if err.code() == ErrorCode::InvalidRequest => {
+            let current = get_attempt(ledger, attempt_id).await?;
+            if current.state == AttemptState::Stopped {
+                // Terminal-state idempotence: the loser's mark on an
+                // already-stopped row is convergence.
+                Ok(())
+            } else {
+                Err(ProtoError::Ledger(err))
+            }
+        }
+        Err(err) => Err(ProtoError::Ledger(err)),
+    }
 }
 
 /// Settle every interrupted operation by its effect class.

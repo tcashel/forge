@@ -493,6 +493,10 @@ pub struct FakePorts {
     /// Scripted kill answers; default: first call `Killed`, later calls
     /// `AlreadyDead` (one process only dies once).
     pub kill_script: Mutex<VecDeque<KillOutcome>>,
+    /// When set, every `kill_confirmed` refuses with this instead of
+    /// answering — death that cannot be VERIFIED, which no caller may treat
+    /// as death.
+    pub kill_failure: Mutex<Option<PortError>>,
     /// Scripted reclaim answers; default: first call per holder echoes the
     /// holder scoped, later calls return the empty refusal shape.
     pub reclaim_script: Mutex<VecDeque<LeaseReclaim>>,
@@ -533,6 +537,9 @@ impl ReconcilePorts for FakePorts {
     }
 
     async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
+        if let Some(failure) = self.kill_failure.lock().expect("lock").clone() {
+            return Err(failure);
+        }
         let scripted = self.kill_script.lock().expect("lock").pop_front();
         let outcome = scripted.unwrap_or_else(|| {
             let killed_before = self.calls.lock().expect("lock").iter().any(|c| {
