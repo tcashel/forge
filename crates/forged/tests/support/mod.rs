@@ -471,15 +471,21 @@ esac
 inner=""
 case "$stage" in
   implement|implementation)
-    printf 'impl by shim\n' > "impl-$seq.txt"
-    git add "impl-$seq.txt"
-    git commit -q -m "feat: shim implement $seq"
-    commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
-    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    if [ "$mode" = spec-amendment ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
+    else
+      printf 'impl by shim\n' > "impl-$seq.txt"
+      git add "impl-$seq.txt"
+      git commit -q -m "feat: shim implement $seq"
+      commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    fi
     ;;
   reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
     if [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif [ "$mode" = request-changes ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else
@@ -568,15 +574,21 @@ esac
 inner=""
 case "$stage" in
   implement|implementation)
-    printf 'impl by shim\n' > "impl-$seq.txt"
-    git add "impl-$seq.txt"
-    git commit -q -m "feat: shim implement $seq"
-    commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
-    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    if [ "$mode" = spec-amendment ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
+    else
+      printf 'impl by shim\n' > "impl-$seq.txt"
+      git add "impl-$seq.txt"
+      git commit -q -m "feat: shim implement $seq"
+      commits=$(git rev-list --count "origin/${FORGED_SHIM_BASE:-main}..HEAD" 2>/dev/null || echo 1)
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
+    fi
     ;;
   reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
     if [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
+    elif [ "$mode" = request-changes ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     elif { [ "$stage" = reviewclaude ] || [ "$stage" = reviewcodex ]; } && [ "$seq" -le 1 ] || { [ "$stage" != reviewclaude ] && [ "$stage" != reviewcodex ] && [ "$seq" -eq 0 ]; }; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
     else

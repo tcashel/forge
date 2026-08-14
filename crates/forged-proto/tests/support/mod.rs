@@ -397,6 +397,7 @@ impl ViewBuilder {
             execution_package: None,
             active_roster_revision: None,
             profile_escalations: Vec::new(),
+            accepted_risk: None,
         }
     }
 }

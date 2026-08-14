@@ -33,6 +33,10 @@ pub struct ExecutionContext {
     pub findings: Vec<forged_types::Finding>,
     /// Standing review evidence supplied to an adaptive synthesis seat.
     pub review_evidence: Vec<String>,
+    /// Frozen consequence context used to classify review severity.
+    pub risk_context: String,
+    /// Frozen maximum number of remediation attempts.
+    pub fix_round_budget: u8,
     /// The run's remote URL (for Fix prompts).
     pub push_url: String,
     /// Frozen process-host policy for this run.
@@ -348,6 +352,7 @@ fn render_context(
             } else {
                 packet.field_notes.clone()
             },
+            "risk_context": exec.risk_context,
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -355,8 +360,12 @@ fn render_context(
             "bead_id": packet.bead_id,
             "pr_number": exec.pr_number.unwrap_or(0),
             "worktree": worktree,
-            "round": fix_round,
-            "total_rounds": 1,
+            "round": if packet.execution.is_some() { fix_round + 1 } else { fix_round },
+            "total_rounds": if packet.execution.is_some() {
+                i64::from(exec.fix_round_budget)
+            } else {
+                1
+            },
             "gate_commands": packet.contract.gate_commands,
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
@@ -663,9 +672,9 @@ async fn settle_host_fallback(
 /// standing on its bounded-retry budget rather than as this stage's answer.
 /// That distinction is load-bearing: a plain note classifies SEMANTIC, and a
 /// semantic failure IS a stage result — `contribution` merges it into the
-/// review fan-out as `RequestChanges`, and `advance` spends the run's one fix
+/// review fan-out as `RequestChanges`, and `advance` spends a remediation
 /// round on it — so a review seat that never spawned would speak a verdict it
-/// never had and a fix seat that never spawned would end the run.
+/// never had and a fix seat that never spawned could end the run.
 ///
 /// The row is failed either way, so the packet is re-claimable and
 /// re-pinnable; the budget is what bounds a cause that will not clear. An
@@ -1524,6 +1533,8 @@ mod settle_tests {
             pr_number: None,
             findings: Vec::new(),
             review_evidence: Vec::new(),
+            risk_context: "routine".to_owned(),
+            fix_round_budget: 1,
             push_url: String::new(),
             host_policy: HostPolicy::Required,
             herdr_socket: Some(socket.clone()),

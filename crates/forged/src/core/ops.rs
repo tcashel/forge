@@ -536,6 +536,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                 "profileHistory": history,
                 "topology": {
                     "seats": active_profile.seats,
+                    "riskContext": active_profile.risk_context,
                     "fixRoundBudget": active_profile.fix_round_budget,
                     "escalateOn": active_profile.escalate_on,
                     "escalateTo": active_profile.escalate_to,
@@ -752,6 +753,150 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
                     "reason": row.reason,
                 }))
             }
+        },
+    )
+    .await
+}
+
+// ------------------------------------------------------- run accept risk
+
+/// Record the operator's one auditable post-budget decision. Findings come
+/// from the frozen run projection rather than caller input, so the evidence
+/// accepted is exactly the deduplicated set the final remediation saw.
+pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let run_id = match param_str(&req.params, "run") {
+        Ok(value) => value.to_owned(),
+        Err(error) => {
+            return err_response(&derive_key("run_accept_risk", None, None, None), &error)
+        }
+    };
+    let accepted_by = match param_str(&req.params, "acceptedBy") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), None, None),
+                &Failure::invalid("acceptedBy must not be empty"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), None, None),
+                &error,
+            )
+        }
+    };
+    let rationale = match param_str(&req.params, "rationale") {
+        Ok(value) if !value.trim().is_empty() => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &Failure::invalid("rationale must not be empty"),
+            )
+        }
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &error,
+            )
+        }
+    };
+    let view = match super::drive::project(ctx, &run_id).await {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &error,
+            )
+        }
+    };
+    let (review_rounds, acceptance) = match &view.accepted_risk {
+        Some(existing)
+            if existing.accepted_by == accepted_by && existing.rationale == rationale =>
+        {
+            let rounds = view
+                .execution_package
+                .as_ref()
+                .map(|package| {
+                    let name = view
+                        .profile_escalations
+                        .last()
+                        .map(|event| event.to.as_str())
+                        .unwrap_or(package.profile_ref.name.as_str());
+                    package
+                        .profile_catalog
+                        .get(name)
+                        .unwrap_or(&package.profile)
+                        .fix_round_budget
+                        .saturating_add(1)
+                })
+                .unwrap_or(1);
+            (rounds, existing.clone())
+        }
+        Some(_) => {
+            return err_response(
+                &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                &Failure::invalid("risk was already accepted with different evidence"),
+            )
+        }
+        None => {
+            let rounds =
+                match forged_proto::advance(&view) {
+                    forged_proto::NextAction::Stop(
+                        forged_proto::Terminal::ReviewBudgetExhausted { review_rounds, .. },
+                    ) => review_rounds,
+                    _ => return err_response(
+                        &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
+                        &Failure::invalid(
+                            "risk can be accepted only after the review round budget is exhausted",
+                        ),
+                    ),
+                };
+            (
+                rounds,
+                forged_types::AcceptedRisk {
+                    accepted_by: accepted_by.clone(),
+                    rationale,
+                    findings: super::drive::latest_review_findings(&view),
+                },
+            )
+        }
+    };
+    default_key(
+        req,
+        derive_key(
+            "run_accept_risk",
+            Some(&run_id),
+            Some(&accepted_by),
+            Some(i64::from(review_rounds)),
+        ),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.clone());
+    }
+    fenced(
+        ctx,
+        "run_accept_risk",
+        EffectClass::SafeRetry,
+        req,
+        None,
+        move |_operation| async move {
+            let payload = json!({
+                "schemaVersion": 1,
+                "reviewRounds": review_rounds,
+                "acceptance": acceptance,
+            });
+            {
+                let run_id = run_id.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_event_kind_once(&run_id, "forged.review.risk_accepted", payload)
+                })
+                .await?;
+            }
+            Ok(json!({
+                "runId": run_id,
+                "reviewRounds": review_rounds,
+                "acceptance": acceptance,
+            }))
         },
     )
     .await

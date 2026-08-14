@@ -77,8 +77,15 @@ fn op_settled_in(view: &RunView, step: MachineStage, round: u32) -> bool {
 /// The round a `RunMachine` action refers to, derived from the view.
 fn round_of(view: &RunView, step: MachineStage) -> u32 {
     match step {
-        MachineStage::ReGate => 1,
-        MachineStage::Push if op_settled_in(view, MachineStage::Push, 0) => 1,
+        MachineStage::ReGate => (1..=33)
+            .find(|round| !op_settled_in(view, MachineStage::ReGate, *round))
+            .unwrap_or(33),
+        MachineStage::Push if op_settled_in(view, MachineStage::Push, 0) => (1..=33)
+            .find(|round| {
+                op_settled_in(view, MachineStage::ReGate, *round)
+                    && !op_settled_in(view, MachineStage::Push, *round)
+            })
+            .unwrap_or(33),
         _ => 0,
     }
 }
@@ -136,8 +143,11 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
             .filter_map(|row| {
                 let packet = forged_proto::stored_packet(row).ok()?;
                 let execution = packet.execution?;
-                (execution.purpose == forged_types::SeatPurpose::Review)
-                    .then_some((row, execution.round))
+                matches!(
+                    execution.purpose,
+                    forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis
+                )
+                .then_some((row, execution.round))
             })
             .collect();
         let latest_round = semantic.iter().map(|(_, round)| *round).max();
@@ -159,7 +169,7 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
                 }
             }
         }
-        return findings;
+        return deduplicate_findings(findings);
     }
     let latest_seq = view
         .packets
@@ -189,6 +199,49 @@ pub(crate) fn latest_review_findings(view: &RunView) -> Vec<forged_types::Findin
             }
         }
     }
+    deduplicate_findings(findings)
+}
+
+/// Collapse corroborated findings into one remediation item. Location and a
+/// whitespace/case-normalized message identify the issue; when reviewers use
+/// different severities, the more consequential classification wins.
+fn deduplicate_findings(findings: Vec<forged_types::Finding>) -> Vec<forged_types::Finding> {
+    use std::collections::BTreeMap;
+
+    fn rank(severity: forged_types::Severity) -> u8 {
+        match severity {
+            forged_types::Severity::Blocker => 3,
+            forged_types::Severity::High => 2,
+            forged_types::Severity::Medium => 1,
+            forged_types::Severity::Low => 0,
+        }
+    }
+
+    let mut unique: BTreeMap<(Option<String>, Option<u32>, String), forged_types::Finding> =
+        BTreeMap::new();
+    for finding in findings {
+        let key = (
+            finding.file.as_ref().map(|file| file.trim().to_owned()),
+            finding.line,
+            finding
+                .message
+                .split_whitespace()
+                .collect::<Vec<_>>()
+                .join(" ")
+                .to_lowercase(),
+        );
+        match unique.get_mut(&key) {
+            Some(existing) if rank(finding.severity) > rank(existing.severity) => {
+                existing.severity = finding.severity;
+            }
+            Some(_) => {}
+            None => {
+                unique.insert(key, finding);
+            }
+        }
+    }
+    let mut findings: Vec<_> = unique.into_values().collect();
+    findings.sort_by_key(|finding| std::cmp::Reverse(rank(finding.severity)));
     findings
 }
 
@@ -271,6 +324,36 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
     match terminal {
         Terminal::Done { final_verdict } => json!({
             "done": {"finalVerdict": final_verdict.map(verdict_str)}
+        }),
+        Terminal::ReviewBudgetExhausted {
+            review_rounds,
+            final_verdict,
+        } => json!({
+            "reviewBudgetExhausted": {
+                "reviewRounds": review_rounds,
+                "finalVerdict": final_verdict.map(verdict_str),
+            }
+        }),
+        Terminal::RemediationFailed {
+            round,
+            final_verdict,
+        } => json!({
+            "remediationFailed": {
+                "round": round,
+                "finalVerdict": final_verdict.map(verdict_str),
+            }
+        }),
+        Terminal::SpecAmendmentProposed {
+            stage_id,
+            amendment,
+        } => json!({
+            "specAmendmentProposed": {
+                "stageId": stage_id,
+                "amendment": amendment,
+            }
+        }),
+        Terminal::AcceptedRisk { acceptance } => json!({
+            "acceptedRisk": acceptance
         }),
         Terminal::ProviderUnavailable { stage, attempts } => json!({
             "providerUnavailable": {
@@ -576,10 +659,29 @@ fn transport_fallback_index(
 
 /// Assemble the execution context for provider packets.
 async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContext, Failure> {
+    let active_profile = view.execution_package.as_ref().map(|package| {
+        let name = view
+            .profile_escalations
+            .last()
+            .map(|event| event.to.as_str())
+            .unwrap_or(package.profile_ref.name.as_str());
+        package
+            .profile_catalog
+            .get(name)
+            .unwrap_or(&package.profile)
+    });
     Ok(ExecutionContext {
         pr_number: pr_number_of(view),
         findings: latest_review_findings(view),
         review_evidence: latest_review_evidence(view),
+        risk_context: active_profile
+            .map(|profile| profile.risk_context.clone())
+            .unwrap_or_else(|| {
+                "Routine change: grade findings by concrete likelihood and consequence.".to_owned()
+            }),
+        fix_round_budget: active_profile
+            .map(|profile| profile.fix_round_budget)
+            .unwrap_or(1),
         push_url: push_url_of(&view.run.repo).await,
         host_policy: view.policy.host_policy,
         herdr_socket: view.policy.herdr_socket.clone(),
@@ -1030,8 +1132,11 @@ pub fn intents_json(intents: &[PacketIntent]) -> Value {
 mod adaptive_tests {
     use forged_ledger::AttemptState;
     use forged_proto::TerminalAttempt;
+    use forged_types::{Finding, Severity};
 
-    use super::{classify_push_failure, transport_fallback_index, PushFailureKind};
+    use super::{
+        classify_push_failure, deduplicate_findings, transport_fallback_index, PushFailureKind,
+    };
 
     fn failed(note: &str) -> TerminalAttempt {
         TerminalAttempt {
@@ -1084,5 +1189,23 @@ mod adaptive_tests {
             classify_push_failure("! [rejected] branch -> branch (non-fast-forward)"),
             PushFailureKind::Other
         );
+    }
+
+    #[test]
+    fn corroborated_findings_collapse_and_keep_the_highest_severity() {
+        let finding = |severity, message: &str| Finding {
+            severity,
+            file: Some("src/lib.rs".to_owned()),
+            line: Some(42),
+            message: message.to_owned(),
+        };
+        let findings = deduplicate_findings(vec![
+            finding(Severity::Medium, "Unchecked   result"),
+            finding(Severity::High, "unchecked result"),
+            finding(Severity::Low, "different issue"),
+        ]);
+        assert_eq!(findings.len(), 2);
+        assert_eq!(findings[0].severity, Severity::High);
+        assert_eq!(findings[0].message, "Unchecked   result");
     }
 }

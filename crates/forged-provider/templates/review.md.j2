@@ -9,6 +9,8 @@ number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url`;
 `gh pr checks {{ pr_number }}`; and the spec at {{ spec_path }}. The
 implementing agent saw ONLY that spec — it is the sole contract you grade
 against.
+
+Declared assurance context: {{ risk_context }}
 {% if field_notes %}
 
 Additional execution context:
@@ -29,8 +31,12 @@ Additional execution context:
    auth gaps, input reaching queries or shell commands or file paths
    unsanitized, missing tests on non-trivial branches, and flag default flips.
 4. Severity-classify every finding as exactly BLOCKER / HIGH / MEDIUM / LOW.
-   Between two adjacent labels, pick the higher one.
-   BLOCKER: spec violated; data loss or leak; security hole (injection, auth
+   Evaluate likelihood, reachability, reversibility, and concrete consequence
+   against the declared assurance context above. Do not turn a spec mismatch
+   into a BLOCKER mechanically: when repository evidence shows the contract is
+   wrong, identify that evidence and the needed contract correction so the
+   remediation seat can propose a structured amendment instead of guessing.
+   BLOCKER: consequential spec violation; data loss or leak; security hole (injection, auth
    bypass, secrets exposure, path traversal) even if unlikely; crash on normal
    input; backward-compatibility break without intent; CI failing because of
    this PR.

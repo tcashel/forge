@@ -28,6 +28,12 @@ forged definition validate --profile standard --roster default
 `$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
 `standard`, `high`) and named ordered provider/model rosters. Change a roster
 when model or provider availability changes; do not rewrite topology or skills.
+`standard` uses one repository-aware reviewer. `high` is an explicit choice for
+consequential security, data, migration, financial, or irreversible-operation
+risk; reviewer disagreement never promotes a standard run into it. A profile's
+`fixRoundBudget` is the only review-loop limit: after the initial review, each
+budgeted remediation is followed by another review, and exhaustion is reported
+as `reviewBudgetExhausted` rather than starting a successor run or Bead.
 Run start freezes the resolved package and hashes, including gate commands,
 stage and transport budgets, and Herdr host policy. Editing authoring YAML
 affects later runs only; recovery and detached controllers continue from the
@@ -35,6 +41,16 @@ stored policy. A live slice changes roster only at a durable boundary:
 
 ```sh
 forged run revise-roster --run <run-id> --roster <name> --reason '<reason>'
+```
+
+An implement or remediation seat may stop with a structured
+`specAmendmentProposed` result when repository evidence contradicts the frozen
+spec. After `reviewBudgetExhausted`, a lead may make the one explicit exception;
+Forged records the deduplicated final findings, identity, and rationale:
+
+```sh
+forged run accept-risk --run <run-id> --accepted-by <identity> \
+  --rationale '<why the concrete consequence is acceptable>'
 ```
 
 For an epic, revise once at the parent. The append-only event and all current

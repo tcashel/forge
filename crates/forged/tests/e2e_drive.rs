@@ -297,28 +297,22 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         );
     }
 
-    // A codex seat is priced from the operator's rate card, never billed by
-    // the provider. Rendered through the App's own Cost tab — this real
-    // projection, not a fixture — the spend header must split that spend out
-    // instead of claiming the provider billed all of it.
+    // The normal one-reviewer profile stays on its primary provider. The
+    // hoisted child rows therefore remain provider-billed end to end.
     assert!(
         epic_rows
             .iter()
-            .any(|row| row["pricingBasis"] == json!("imputed_api_rate")),
-        "the epic's child ran a codex seat, so a hoisted row is imputed: {epic_rows:?}"
+            .all(|row| row["pricingBasis"] == json!("billed")),
+        "standard child rows remain billed: {epic_rows:?}"
     );
     if let Some(node) = require_node() {
         let rendered = render_cost(&node, &overview["result"]);
         assert!(
-            !rendered.text.contains("provider-billed"),
-            "an epic whose child ran a codex seat renders as fully billed: {}",
+            rendered.text.contains("provider-billed"),
+            "a fully billed standard run says so: {}",
             rendered.text
         );
-        assert!(
-            rendered.spend_subtitle().ends_with(" imputed"),
-            "the spend header splits imputed spend out of the billed total: {}",
-            rendered.spend_subtitle()
-        );
+        assert_eq!(rendered.spend_subtitle(), "provider-billed");
         assert_eq!(
             rendered.stat("priced attempts"),
             epic_rows.len().to_string(),
@@ -835,18 +829,14 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
     assert!(log.contains("shim implement"), "implement commit: {log}");
     assert!(log.contains("shim fix"), "fix commit: {log}");
 
-    // Provider selection routed by hints: the claude shim served implement
-    // and reviewclaude; the codex shim served reviewcodex — the packet ids
-    // in the shared shim log name the stages, and no packet's processes
-    // overlapped.
+    // Provider selection routed the normal profile's implementation,
+    // repo-aware review, and remediation through their declared seats.
     let plog = env.provider_log();
     for packet in [
         "bead-e2e/implementation/0",
         "bead-e2e/review-1/0",
-        "bead-e2e/review-2/0",
         "bead-e2e/remediation/0",
         "bead-e2e/review-1/1",
-        "bead-e2e/review-2/1",
     ] {
         assert!(
             plog.iter().any(|l| l.starts_with(packet)),
@@ -891,7 +881,7 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
                 attempt.claimant
             );
         }
-        assert!(seen >= 6, "every packet's attempt was inspected: {seen}");
+        assert!(seen >= 4, "every packet's attempt was inspected: {seen}");
         ledger.close().expect("close");
     }
 
@@ -1004,13 +994,6 @@ fn run_drive_reaches_done_with_one_draft_pr_and_real_commits() {
         json!("claude"),
         "implement routed to the claude driver"
     );
-    let (_, codex_shown) = env.forged(&["packet", "show", "--packet", "bead-e2e/review-2/0"]);
-    assert_eq!(
-        codex_shown["result"]["packet"]["providerHints"]["provider"],
-        json!("codex"),
-        "reviewcodex routed to the codex driver"
-    );
-
     // Retire the worktree once the run is done (explicit key required).
     let (code, retired) = env.forged(&[
         "worktree",
@@ -1055,8 +1038,8 @@ fn profiles_scale_topology_and_an_explicit_roster_revision_switches_provider_fam
     let (code, driven) = lean.forged(&["run", "drive", "--run", "bead-lean"]);
     assert_eq!(code, 0, "lean drive: {driven}");
     assert_eq!(
-        driven["result"]["terminal"]["done"]["finalVerdict"],
-        json!("requestChanges")
+        driven["result"]["terminal"]["reviewBudgetExhausted"],
+        json!({"reviewRounds": 1, "finalVerdict": "requestChanges"})
     );
     let log = lean.provider_log();
     assert!(log
@@ -1331,7 +1314,171 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
 }
 
 #[test]
-fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
+fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
+    let env = TestEnv::new("forged-review-budget");
+    env.forged(&["init"]);
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
+            .expect("config json");
+    config["profiles"] = json!({
+        "standard": {
+            "schema": "forged.profile/1",
+            "name": "standard",
+            "protocol": {"name": "slice", "version": 1},
+            "seats": [
+                {"id": "implementation", "role": "implementation", "purpose": "implement"},
+                {"id": "review-1", "role": "review.primary", "purpose": "review"},
+                {"id": "remediation", "role": "remediation", "purpose": "fix"}
+            ],
+            "riskContext": "Routine reversible test change.",
+            "fixRoundBudget": 2,
+            "escalateOn": []
+        }
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("config json"),
+    )
+    .expect("write config");
+    env.set_scenario("reviewclaude", "request-changes", 3);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-round-budget",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-round-budget"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["reviewBudgetExhausted"],
+        json!({"reviewRounds": 3, "finalVerdict": "requestChanges"})
+    );
+    let starts: Vec<_> = env
+        .provider_log()
+        .into_iter()
+        .filter(|line| line.contains(" start "))
+        .collect();
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|line| line.contains("/review-1/"))
+            .count(),
+        3
+    );
+    assert_eq!(
+        starts
+            .iter()
+            .filter(|line| line.contains("/remediation/"))
+            .count(),
+        2
+    );
+
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+    ]);
+    assert_eq!(code, 0, "accept risk: {accepted}");
+    assert_eq!(
+        accepted["result"]["acceptance"]["acceptedBy"],
+        json!("lead-agent")
+    );
+    assert_eq!(
+        accepted["result"]["acceptance"]["findings"]
+            .as_array()
+            .map(Vec::len),
+        Some(1)
+    );
+    let (code, replayed) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-round-budget",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the affected path is disabled in this deployment",
+    ]);
+    assert_eq!(code, 0, "accept-risk replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-round-budget"]);
+    assert_eq!(
+        status["result"]["run"]["nextAction"]["stop"]["acceptedRisk"]["rationale"],
+        json!("the affected path is disabled in this deployment")
+    );
+    let (_, events) = env.forged(&["events", "--run", "bead-round-budget"]);
+    assert_eq!(
+        events["result"]["events"]
+            .as_array()
+            .expect("events")
+            .iter()
+            .filter(|event| event["kind"] == json!("forged.review.risk_accepted"))
+            .count(),
+        1
+    );
+}
+
+#[test]
+fn implementer_spec_amendment_stops_before_gate_or_review() {
+    let env = TestEnv::new("forged-spec-amendment");
+    env.forged(&["init"]);
+    env.set_scenario("implement", "spec-amendment", 1);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    assert_eq!(
+        env.forged(&[
+            "run",
+            "start",
+            "--bead",
+            "bead-amendment",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ])
+        .0,
+        0
+    );
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-amendment"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["specAmendmentProposed"]["stageId"],
+        json!("implementation")
+    );
+    assert_eq!(
+        driven["result"]["terminal"]["specAmendmentProposed"]["amendment"]["proposedChange"],
+        json!("target the replacement API")
+    );
+    let log = env.provider_log();
+    assert_eq!(
+        log.iter().filter(|line| line.contains(" start ")).count(),
+        1,
+        "no gate-independent reviewer or fixer should run: {log:?}"
+    );
+}
+
+#[test]
+fn gate_failure_escalates_once_but_standard_review_never_escalates_topology() {
     // Gate failure raises lean to its stored standard edge and survives
     // repeated projection/drive without duplicating the transition.
     let gate = TestEnv::new("forged-escalate-gate");
@@ -1386,8 +1533,8 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
     assert_eq!(escalations[0]["payload"]["to"], json!("standard"));
     assert_eq!(escalations[0]["payload"]["trigger"], json!("gateFailure"));
 
-    // Conflicting standard reviewers raise to high and materialize only its
-    // added review/synthesis seats.
+    // Standard is deliberately one repo-aware reviewer and never raises
+    // itself into the high-assurance panel after a review result.
     let conflict = TestEnv::new("forged-escalate-conflict");
     conflict.forged(&["init"]);
     let repo = conflict.repos.repo.to_string_lossy().into_owned();
@@ -1409,7 +1556,6 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
             .0,
         0
     );
-    conflict.set_scenario("reviewclaude", "approve", 1);
     assert_eq!(
         conflict
             .forged(&["run", "drive", "--run", "bead-conflict-edge"])
@@ -1419,21 +1565,21 @@ fn gate_failure_and_review_conflict_follow_stored_escalation_edges_once() {
     let (_, status) = conflict.forged(&["run", "status", "--run", "bead-conflict-edge"]);
     assert_eq!(
         status["result"]["run"]["execution"]["activeProfileRef"]["name"],
-        json!("high")
+        json!("standard")
     );
     assert_eq!(
         status["result"]["run"]["execution"]["profileHistory"]
             .as_array()
             .map(Vec::len),
-        Some(2)
+        Some(1)
     );
     let log = conflict.provider_log();
     assert!(log
         .iter()
-        .any(|line| line.starts_with("bead-conflict-edge/review-3/0")));
-    assert!(log
-        .iter()
-        .any(|line| line.starts_with("bead-conflict-edge/synthesis/0")));
+        .any(|line| line.starts_with("bead-conflict-edge/review-1/0")));
+    assert!(!log.iter().any(|line| line.contains("/review-2/")));
+    assert!(!log.iter().any(|line| line.contains("/review-3/")));
+    assert!(!log.iter().any(|line| line.contains("/synthesis/")));
 }
 
 #[test]
