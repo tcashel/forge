@@ -25,6 +25,12 @@ forged doctor
 forged definition validate --profile standard --roster default
 ```
 
+`BEADS_DIR` may point to an embedded store or to metadata for one central team
+Dolt SQL database. The collaborative setup, credential boundary, connectivity
+check, and the reasons active embedded work need not migrate are documented in
+[Central Beads server](beads-team-server.md). In either mode Beads owns the
+work graph and leases while Forged retains its separate execution ledger.
+
 `$ANVIL_HOME/config.yaml` contains named assurance profiles (`lean`,
 `standard`, `high`) and named ordered provider/model rosters. Change a roster
 when model or provider availability changes; do not rewrite topology or skills.

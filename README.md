@@ -50,6 +50,11 @@ All operator state lives out-of-repo under `~/.anvil/` (ledger at
 `~/.anvil/state.db`, run artifacts under `~/.anvil/runs/`). forged imposes
 nothing on the repositories it targets.
 
+Beads may remain embedded or use one central Dolt SQL database for a team.
+The latter centralizes specs, dependencies, readiness, and leases only;
+Forged's execution ledger remains separate. See the
+[central Beads server guide](docs/beads-team-server.md).
+
 ## Build and test
 
 ```bash
