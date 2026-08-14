@@ -1,13 +1,40 @@
 //! `work list` — the discovery surface. An empty ledger enumerates to an
 //! empty list rather than refusing, an epic is discoverable from its
 //! `forged.epic.started` event ALONE (no forged path writes a `runs` row for
-//! an epic), and live seats are counted per run from one scan of every live
-//! attempt.
+//! an epic), live seats are counted per run from one scan of every live
+//! attempt, and a synthesized epic's `state`/`stopReason`/`updatedAt` are
+//! derived from that epic's own durable events.
+//!
+//! Every lifecycle here is produced the way production produces it — real
+//! `epic start`/`pause`/`resume`/`submit` through the CLI — because the
+//! fabrication `.2` shipped (a runs row AND a start event, which no forged
+//! path writes) is what hid the epic-discovery blocker.
 
 mod support;
 
 use serde_json::{json, Value};
 use support::TestEnv;
+
+/// Poll a forged command until it answers `ready`, or fail loudly.
+fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Value {
+    let mut last = Value::Null;
+    for _ in 0..600 {
+        let (code, value) = env.forged(args);
+        if code == 0 && ready(&value) {
+            return value;
+        }
+        last = value;
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+    panic!("timed out waiting for forged {args:?}: {last}")
+}
+
+/// Open the operator ledger directly. Only the two tests that must forge a
+/// condition no API can produce — a timestamp tie, an unreadable payload —
+/// use this.
+fn sqlite(env: &TestEnv) -> rusqlite::Connection {
+    rusqlite::Connection::open(env.anvil.join("state.db")).expect("open state.db")
+}
 
 /// Hash a file the way `claim_packet` demands the caller hash it.
 fn sha256_hex(path: &std::path::Path) -> String {
@@ -200,4 +227,239 @@ fn a_started_epic_is_listed_though_it_has_no_run_row() {
     assert_eq!(epic["repo"], json!(repo));
     assert_eq!(epic["branch"], json!("forged/epic-epic-list"));
     assert_eq!(epic["liveSeats"], json!(0));
+}
+
+/// Start one epic through the real CLI and hand back `(env, repo, spec)`.
+fn started_epic(name: &str, epic: &str, child: &str) -> (TestEnv, String, String) {
+    let env = TestEnv::new(name);
+    env.seed_epic(epic, &[(child, &env.spec, true)]);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    (env, repo, spec)
+}
+
+/// The epic entry `work list` currently reports.
+fn epic_entry(env: &TestEnv, epic: &str) -> Value {
+    let (code, response) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {response}");
+    entry(&response, epic)
+}
+
+/// An epic's lifecycle is observable even though it owns no `runs` row:
+/// pause, resume, and the final PR each move `state`, the pause's reason
+/// becomes `stopReason`, and every durable event moves `updatedAt` while
+/// `createdAt` stays pinned to the start.
+#[test]
+fn an_epic_reports_the_state_its_events_describe() {
+    let (env, _repo, _spec) =
+        started_epic("forged-work-list-epic-state", "epic-state", "child-state");
+    env.enable_dynamic_gh();
+
+    // One event so far: active, no reason, and updatedAt IS the start.
+    let epic = epic_entry(&env, "epic-state");
+    assert_eq!(epic["state"], json!("active"));
+    assert_eq!(epic["stopReason"], Value::Null);
+    assert_eq!(epic["updatedAt"], epic["createdAt"]);
+    let created_at = epic["createdAt"].clone();
+
+    let (code, paused) = env.forged(&[
+        "epic",
+        "pause",
+        "--epic",
+        "epic-state",
+        "--reason",
+        "operator checkpoint",
+    ]);
+    assert_eq!(code, 0, "epic pause: {paused}");
+    let epic = epic_entry(&env, "epic-state");
+    assert_eq!(epic["state"], json!("paused"));
+    // A stopReason that is structurally always null cannot be told apart
+    // from an unimplemented one; this one names the operator's reason.
+    assert_eq!(epic["stopReason"], json!("operator checkpoint"));
+    assert_eq!(epic["createdAt"], created_at, "createdAt stays the start");
+    assert_ne!(
+        epic["updatedAt"], created_at,
+        "a second durable event moves updatedAt: {epic}"
+    );
+
+    let (code, resumed) = env.forged(&[
+        "epic",
+        "resume",
+        "--epic",
+        "epic-state",
+        "--reason",
+        "operator approved continuation",
+    ]);
+    assert_eq!(code, 0, "epic resume: {resumed}");
+    let epic = epic_entry(&env, "epic-state");
+    assert_eq!(epic["state"], json!("active"), "resume reactivates: {epic}");
+    assert_eq!(epic["stopReason"], Value::Null);
+
+    // Drive the epic the whole way: the final PR is written by the
+    // scheduler, not by the test.
+    let (code, submitted) = env.forged(&["epic", "submit", "--epic", "epic-state"]);
+    assert_eq!(code, 0, "epic submit: {submitted}");
+    let driven = wait_for(&env, &["epic", "status", "--epic", "epic-state"], |value| {
+        value["result"]["finalPr"]["number"].is_number()
+    });
+    assert_eq!(driven["result"]["finalPr"]["isDraft"], json!(true));
+    let epic = epic_entry(&env, "epic-state");
+    assert_eq!(epic["state"], json!("submitted"), "final PR: {epic}");
+    assert_eq!(epic["stopReason"], Value::Null);
+    assert_ne!(epic["updatedAt"], created_at);
+}
+
+/// Ordering is by event id, not by timestamp string: two control events
+/// stamped in the same instant must not resolve by luck. The ledger writes
+/// nanosecond stamps, so the tie is forged in SQL — the one condition no
+/// API can produce.
+#[test]
+fn a_timestamp_tie_resolves_by_event_id() {
+    let (env, _repo, _spec) = started_epic("forged-work-list-epic-tie", "epic-tie", "child-tie");
+    for (command, reason) in [("pause", "hold"), ("resume", "continue")] {
+        let (code, response) =
+            env.forged(&["epic", command, "--epic", "epic-tie", "--reason", reason]);
+        assert_eq!(code, 0, "epic {command}: {response}");
+    }
+    let tie = "2026-01-01T00:00:00.000000000Z";
+    let touched = sqlite(&env)
+        .execute(
+            "UPDATE events SET ts = ?1 WHERE run_id = 'epic-tie' \
+             AND kind IN ('forged.epic.paused', 'forged.epic.resumed')",
+            [tie],
+        )
+        .expect("stamp the control events identically");
+    assert_eq!(touched, 2, "one pause and one resume");
+
+    let epic = epic_entry(&env, "epic-tie");
+    assert_eq!(
+        epic["state"],
+        json!("active"),
+        "the resume was appended later: {epic}"
+    );
+    assert_eq!(epic["stopReason"], Value::Null);
+    assert_eq!(epic["updatedAt"], json!(tie));
+}
+
+/// A lifecycle payload that will not parse degrades exactly like an
+/// unparseable start event: the epic stays discoverable and reports the
+/// state its kind implies, with no reason invented.
+#[test]
+fn an_unreadable_pause_payload_still_lists_a_paused_epic() {
+    let (env, _repo, _spec) = started_epic(
+        "forged-work-list-epic-garbled",
+        "epic-garbled",
+        "child-garbled",
+    );
+    let (code, paused) = env.forged(&[
+        "epic",
+        "pause",
+        "--epic",
+        "epic-garbled",
+        "--reason",
+        "operator checkpoint",
+    ]);
+    assert_eq!(code, 0, "epic pause: {paused}");
+    let touched = sqlite(&env)
+        .execute(
+            "UPDATE events SET payload_json = '{not json' \
+             WHERE run_id = 'epic-garbled' AND kind = 'forged.epic.paused'",
+            [],
+        )
+        .expect("garble the pause payload");
+    assert_eq!(touched, 1);
+
+    let epic = epic_entry(&env, "epic-garbled");
+    assert_eq!(epic["state"], json!("paused"), "still paused: {epic}");
+    assert_eq!(epic["stopReason"], Value::Null, "no reason invented");
+}
+
+/// The `runs` row is the durable state wherever one exists. An id that
+/// carries BOTH — `epic start` on a bead, then `run start` on that same
+/// bead — is ONE entry: labelled `epic` by the event, with the row's
+/// columns.
+#[test]
+fn an_id_with_a_run_row_and_a_start_event_is_one_epic_entry() {
+    let (env, repo, spec) = started_epic("forged-work-list-both", "epic-both", "child-both");
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "epic-both",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    let (code, response) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {response}");
+    assert_eq!(
+        runs_of(&response).len(),
+        1,
+        "one entry, not two: {response}"
+    );
+    let epic = entry(&response, "epic-both");
+    assert_eq!(epic["kind"], json!("epic"), "the start event labels it");
+    // The row's branch, not the integration branch the start event named.
+    assert_eq!(epic["branch"], json!("forged/epic-both"));
+    assert_eq!(epic["state"], json!("active"));
+    assert_eq!(epic["stopReason"], Value::Null);
+}
+
+/// A stopped run reports the reason its row carries. `run start` is the
+/// only production writer of a `runs` row and `set_run_state` the only
+/// writer of its stop columns — forged exposes no command that stops a run.
+#[test]
+fn a_stopped_run_reports_its_reason() {
+    let env = TestEnv::new("forged-work-list-stopped");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "wl-stopped",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+    let ledger = env.ledger();
+    ledger
+        .set_run_state(
+            "wl-stopped",
+            forged_ledger::RunState::Stopped,
+            Some("operator stopped the run".to_owned()),
+        )
+        .expect("stop the run");
+    ledger.close().expect("close");
+
+    let (code, response) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "work list: {response}");
+    let slice = entry(&response, "wl-stopped");
+    assert_eq!(slice["kind"], json!("slice"));
+    assert_eq!(slice["state"], json!("stopped"));
+    assert_eq!(slice["stopReason"], json!("operator stopped the run"));
 }

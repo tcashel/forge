@@ -18,7 +18,10 @@ use crate::core::{
     param_str, read_only, Ctx, Failure,
 };
 
-const STARTED: &str = "forged.epic.started";
+// STARTED and the three lifecycle kinds below are `pub(super)` because the
+// inventory (`super::ops::work_list`) derives an epic's entry from exactly
+// these; every other kind stays private to the scheduler.
+pub(super) const STARTED: &str = "forged.epic.started";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
 const WAVE_STARTED: &str = "forged.epic.wave.started";
 const CHILD_STARTED: &str = "forged.epic.child.started";
@@ -26,9 +29,9 @@ const CHILD_RESET: &str = "forged.epic.child.reset";
 const CHILD_MERGED: &str = "forged.epic.child.merged";
 const INPUT_REQUIRED: &str = "forged.epic.input.required";
 const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
-const PAUSED: &str = "forged.epic.paused";
-const RESUMED: &str = "forged.epic.resumed";
-const EPIC_PR: &str = "forged.epic.pr";
+pub(super) const PAUSED: &str = "forged.epic.paused";
+pub(super) const RESUMED: &str = "forged.epic.resumed";
+pub(super) const EPIC_PR: &str = "forged.epic.pr";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
 const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
 const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
