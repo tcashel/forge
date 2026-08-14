@@ -10,7 +10,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{render_cost, render_resolution, require_node};
+use support::{render_cost, render_dispatch, render_resolution, require_node};
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
 fn row(run_id: &str, seat: &str, basis: &str, cost: f64, searches: u64) -> Value {
@@ -204,5 +204,101 @@ fn an_unknown_id_renders_an_empty_state_rather_than_an_empty_grid() {
         rendered.text.contains("Nothing in the ledger matches"),
         "an unknown id says so: {}",
         rendered.text
+    );
+}
+
+// --------------------------------------------------- dispatch, not just view
+
+/// The chooser tests above call `viewResolution` directly, so they would all
+/// still pass if `render` stopped routing a resolution payload to it. This
+/// enters where the host enters — one envelope into `ingest` — and asserts
+/// the branch was actually taken.
+#[test]
+fn a_resolution_envelope_reaches_the_chooser_through_ingest_and_render() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({
+            "ok": true,
+            "result": {
+                "schema": "forged.overview/1",
+                "resolution": {
+                    "query": "beads-mk",
+                    "reason": "ambiguous",
+                    "candidates": [
+                        {"id": "beads-mk2", "kind": "slice", "state": "active", "beadId": "beads-mk2"},
+                        {"id": "beads-mk9", "kind": "epic", "state": "stopped", "beadId": "beads-mk9"},
+                    ],
+                },
+            },
+        }),
+    );
+    assert!(
+        dispatched.error.is_null(),
+        "a resolution is not an error: {}",
+        dispatched.error
+    );
+    assert_eq!(
+        dispatched.ident, "beads-mk",
+        "the identity line carries the id that failed to resolve: {}",
+        dispatched.text
+    );
+    assert_eq!(dispatched.chips, vec!["ambiguous".to_owned()]);
+    assert!(
+        dispatched.tabs_hidden,
+        "a resolution has no single subject, so it draws no tabs: {}",
+        dispatched.text
+    );
+    assert_eq!(
+        dispatched.picks(),
+        vec![
+            json!({"schemaVersion": 1, "params": {"run": "beads-mk2"}}),
+            json!({"schemaVersion": 1, "params": {"epic": "beads-mk9"}}),
+        ],
+        "each candidate re-asks with the explicit param its kind implies: {}",
+        dispatched.text
+    );
+}
+
+/// Refresh is offered on a resolution view, so it must have something to
+/// send. `state.args` falls back to the query itself: re-asking the same
+/// question is meaningful, because candidates are live work and one that was
+/// ambiguous a minute ago can resolve on its own.
+#[test]
+fn a_resolution_leaves_refresh_able_to_re_ask_the_same_question() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({
+            "schema": "forged.overview/1",
+            "resolution": {"query": "beads-mk", "reason": "ambiguous", "candidates": []},
+        }),
+    );
+    assert!(
+        !dispatched.controls_hidden,
+        "the resolution view offers Refresh: {}",
+        dispatched.text
+    );
+    assert_eq!(
+        dispatched.args,
+        json!({"schemaVersion": 1, "params": {"id": "beads-mk"}}),
+        "so Refresh re-asks the same id rather than sending nothing"
+    );
+}
+
+/// The schema guard is what makes the resolution contract meaningful: a
+/// payload on any other schema is still an error, not a chooser.
+#[test]
+fn an_unknown_schema_is_still_refused_by_ingest() {
+    let Some(node) = require_node() else { return };
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"schema": "forged.resolution/1", "resolution": {"query": "x", "candidates": []}}),
+    );
+    assert_eq!(
+        dispatched.error["code"],
+        json!("unexpected"),
+        "an unknown schema is refused: {}",
+        dispatched.error
     );
 }

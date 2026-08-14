@@ -1883,8 +1883,14 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     }
     state.error = null;
     state.data = data;
-    if (!state.args && !data.resolution) {
-      state.args = { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
+    if (!state.args) {
+      // A resolution has no single subject, but it does have the id the
+      // caller asked about — so Refresh re-asks the SAME question rather
+      // than no-opping against a null `state.args`. Candidates are live
+      // work: one that was ambiguous a minute ago can resolve on its own.
+      state.args = data.resolution
+        ? { schemaVersion: 1, params: { id: data.resolution.query || "" } }
+        : { schemaVersion: 1, params: data.kind === "epic" ? { epic: data.id } : { run: data.id } };
     }
     render();
   }

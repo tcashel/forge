@@ -1259,6 +1259,68 @@ pub fn render_cost(node: &str, data: &Value) -> Rendered {
     )
 }
 
+/// What one envelope produced after the App's own `ingest` and `render`.
+///
+/// [`Rendered`] reports a single view called directly. This reports the
+/// DISPATCH: which branch of `render` an envelope reached, and the identity,
+/// chips, chrome and `state.args` it left behind on the way.
+pub struct Dispatched {
+    pub view: Vec<Value>,
+    pub text: String,
+    pub ident: String,
+    pub chips: Vec<String>,
+    pub tabs_hidden: bool,
+    pub controls_hidden: bool,
+    pub args: Value,
+    pub error: Value,
+}
+
+impl Dispatched {
+    /// What clicking each pickable card would ask the host for.
+    pub fn picks(&self) -> Vec<Value> {
+        self.view
+            .iter()
+            .filter_map(|node| node.get("picks").cloned())
+            .filter(|picks| !picks.is_null())
+            .collect()
+    }
+}
+
+/// Drive one whole operation envelope through `ingest` and `render`.
+///
+/// `render_resolution` calls `viewResolution` directly, so it proves the
+/// chooser draws and proves nothing about whether a resolution payload ever
+/// reaches it — delete `render`'s `if (data.resolution)` branch and those
+/// tests stay green. This enters where the host enters.
+pub fn render_dispatch(node: &str, envelope: &Value) -> Dispatched {
+    let out = harness_output(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_dispatch.mjs"
+        ),
+        envelope,
+    );
+    Dispatched {
+        view: out["view"].as_array().cloned().unwrap_or_default(),
+        text: out["text"].as_str().unwrap_or_default().to_owned(),
+        ident: out["ident"].as_str().unwrap_or_default().to_owned(),
+        chips: out["chips"]
+            .as_array()
+            .map(|chips| {
+                chips
+                    .iter()
+                    .map(|chip| chip.as_str().unwrap_or_default().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default(),
+        tabs_hidden: out["tabsHidden"].as_bool().unwrap_or(false),
+        controls_hidden: out["controlsHidden"].as_bool().unwrap_or(false),
+        args: out["args"].clone(),
+        error: out["error"].clone(),
+    }
+}
+
 /// Render one `resolution` object's chooser through `assets/overview.html`
 /// itself.
 pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
@@ -1273,6 +1335,15 @@ pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
 }
 
 fn render(node: &str, harness: &str, data: &Value) -> Rendered {
+    let rendered = harness_output(node, harness, data);
+    Rendered {
+        nodes: rendered["nodes"].as_array().cloned().unwrap_or_default(),
+        text: rendered["text"].as_str().unwrap_or_default().to_owned(),
+    }
+}
+
+/// Run one render harness against the asset and return the JSON it printed.
+fn harness_output(node: &str, harness: &str, data: &Value) -> Value {
     let asset = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/overview.html");
     let mut child = Command::new(node)
         .args([harness, asset])
@@ -1293,12 +1364,7 @@ fn render(node: &str, harness: &str, data: &Value) -> Rendered {
         "the App render harness failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    let rendered: Value =
-        serde_json::from_slice(&out.stdout).expect("the harness prints one JSON object");
-    Rendered {
-        nodes: rendered["nodes"].as_array().cloned().unwrap_or_default(),
-        text: rendered["text"].as_str().unwrap_or_default().to_owned(),
-    }
+    serde_json::from_slice(&out.stdout).expect("the harness prints one JSON object")
 }
 
 // ------------------------------------------------------------- MCP client
