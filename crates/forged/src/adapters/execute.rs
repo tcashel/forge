@@ -197,15 +197,21 @@ pub async fn open_packet_op(ctx: &Ctx, packet: &WorkPacket) -> Result<(), Failur
     open_packet_body_op(ctx, packet, body_json).await
 }
 
-/// The shared body of [`open_packet_op`], taking the stored definition
-/// verbatim so a re-pin can carry the row's OWN body rather than one
-/// re-serialized from an in-memory packet the caller may have adjusted.
-async fn open_packet_body_op(
-    ctx: &Ctx,
-    packet: &WorkPacket,
-    body_json: String,
-) -> Result<(), Failure> {
-    let run_id = packet.run_id.clone();
+/// The ledger write one packet open performs, plus the key segments the
+/// operation envelope derives from the same packet.
+///
+/// Shared by the fenced open and the direct re-pin so both write the
+/// identical row: a re-pin that built its row differently would be a second
+/// definition of the packet.
+struct OpenTarget {
+    stage_key: String,
+    logical_seq: i64,
+    new_packet: forged_ledger::NewPacket,
+    /// Present only for a semantic packet, whose id the caller assigns.
+    semantic_id: Option<String>,
+}
+
+fn open_target(packet: &WorkPacket, body_json: String) -> Result<OpenTarget, Failure> {
     let (stage_key, logical_seq, lane_seq) = match &packet.execution {
         Some(execution) => (
             execution.stage_id.clone(),
@@ -219,44 +225,79 @@ async fn open_packet_body_op(
             (stage_str(stage).to_owned(), seq, seq)
         }
     };
+    Ok(OpenTarget {
+        stage_key,
+        logical_seq,
+        new_packet: forged_ledger::NewPacket {
+            run_id: packet.run_id.clone(),
+            stage: packet.stage,
+            seq: lane_seq,
+            spec_path: packet.spec.path.clone(),
+            spec_sha256: packet.spec.sha256.clone(),
+            spec_revision: packet.spec.revision.clone(),
+            body_json,
+        },
+        semantic_id: packet.execution.as_ref().map(|_| packet.packet_id.clone()),
+    })
+}
+
+/// The one ledger call every packet open makes.
+fn apply_open(
+    ledger: &forged_ledger::Ledger,
+    new_packet: forged_ledger::NewPacket,
+    semantic_id: Option<String>,
+) -> Result<String, forged_ledger::LedgerError> {
+    match semantic_id {
+        Some(packet_id) => ledger.open_packet_with_id(new_packet, packet_id),
+        None => ledger.open_packet(new_packet),
+    }
+}
+
+/// The shared body of [`open_packet_op`], taking the stored definition
+/// verbatim so a re-pin can carry the row's OWN body rather than one
+/// re-serialized from an in-memory packet the caller may have adjusted.
+async fn open_packet_body_op(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    body_json: String,
+) -> Result<(), Failure> {
+    let run_id = packet.run_id.clone();
+    let target = open_target(packet, body_json)?;
     let fence = packet.spec.sha256.clone();
     let key = format!(
         "{}:{fence}",
         crate::core::derive_key(
             "packet_open",
             Some(&run_id),
-            Some(&stage_key),
-            Some(logical_seq),
+            Some(&target.stage_key),
+            Some(target.logical_seq),
         )
     );
     let req = OperationRequest {
         schema_version: 1,
         idempotency_key: key,
         run_id: Some(run_id.clone()),
-        params: match json!({"stage": stage_key, "seq": logical_seq, "specFence": fence}) {
+        params: match json!({
+            "stage": target.stage_key,
+            "seq": target.logical_seq,
+            "specFence": fence,
+        }) {
             Value::Object(map) => map,
             _ => unreachable!("literal is an object"),
         },
     };
-    let new_packet = forged_ledger::NewPacket {
-        run_id,
-        stage: packet.stage,
-        seq: lane_seq,
-        spec_path: packet.spec.path.clone(),
-        spec_sha256: packet.spec.sha256.clone(),
-        spec_revision: packet.spec.revision.clone(),
-        body_json,
-    };
+    let OpenTarget {
+        new_packet,
+        semantic_id,
+        ..
+    } = target;
     let resp = crate::core::fenced(ctx, "packet_open", EffectClass::SafeRetry, &req, None, {
         let ledger = ctx.ledger.clone();
         move |_op_id| async move {
-            let semantic_id = packet.execution.as_ref().map(|_| packet.packet_id.clone());
-            let packet_id = tokio::task::spawn_blocking(move || match semantic_id {
-                Some(packet_id) => ledger.open_packet_with_id(new_packet, packet_id),
-                None => ledger.open_packet(new_packet),
-            })
-            .await
-            .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
+            let packet_id =
+                tokio::task::spawn_blocking(move || apply_open(&ledger, new_packet, semantic_id))
+                    .await
+                    .map_err(|e| Failure::internal(format!("join failure: {e}")))??;
             Ok(json!({"packetId": packet_id}))
         }
     })
@@ -461,9 +502,16 @@ pub async fn execute_packet(
 /// Re-pin an open packet to the spec just resolved, returning the packet the
 /// claim should fence on.
 ///
-/// A no-op unless the rendered body moved: the claim itself re-pins a moved
-/// REVISION over an unchanged body, and re-opening for that would only mint
-/// the same idempotency key.
+/// BEAD-SOURCED PACKETS ONLY. A file-sourced spec is fenced by the hash of a
+/// file the operator owns, and nothing moves that file but an operator edit:
+/// `claim_packet` refusing `SpecDrift` on it IS the fence doing its job.
+/// Re-pinning here would adopt the edit silently, and nothing downstream
+/// would catch it — `assert_pinned` returns early for a file spec. The gate
+/// is the same one `resolve_for_packet` branches on.
+///
+/// Otherwise a no-op unless the rendered body moved: the claim itself
+/// re-pins a moved REVISION over an unchanged body, and re-opening for that
+/// would only mint the same idempotency key.
 ///
 /// The re-open carries the row's OWN stored body, never one re-serialized
 /// from the caller's packet. A re-pin revises the spec and nothing else —
@@ -471,24 +519,41 @@ pub async fn execute_packet(
 /// the caller's packet may legitimately differ from the stored definition
 /// (`stored_packet_for_attempt` rebinds provider hints to the active roster
 /// revision).
+///
+/// THE RE-OPEN ALONE IS NOT ENOUGH, and this is the whole reason for the
+/// re-read below. `packet_open` is keyed on the TARGET fence, so a bead
+/// edited A → B → A re-opens under the key the first open at A already
+/// stored: the operation replays its recorded response, the ledger UPDATE
+/// never runs, and the row stays pinned at B while this returns `Ok`. Every
+/// later claim then refuses `SpecDrift` forever — exactly the wedge this
+/// function exists to close. When the replay leaves the row behind, the
+/// re-pin is driven straight at the ledger, whose own refusals (a live
+/// attempt, a moved definition) still stand.
 async fn repin_packet(
     ctx: &Ctx,
     packet: &WorkPacket,
     spec: &ResolvedSpec,
 ) -> Result<WorkPacket, Failure> {
-    if spec.sha256 == packet.spec.sha256 {
+    if packet.spec.revision.is_none() || spec.sha256 == packet.spec.sha256 {
         return Ok(packet.clone());
     }
-    let body_json = {
+    let read_row = || {
         let packet_id = packet.packet_id.clone();
         on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id))
-            .await?
-            .body_json
     };
+    let body_json = read_row().await?.body_json;
     let mut repinned = packet.clone();
     repinned.spec.sha256 = spec.sha256.clone();
     repinned.spec.revision = spec.revision();
-    open_packet_body_op(ctx, &repinned, body_json).await?;
+    open_packet_body_op(ctx, &repinned, body_json.clone()).await?;
+    if read_row().await?.spec_sha256 != repinned.spec.sha256 {
+        let OpenTarget {
+            new_packet,
+            semantic_id,
+            ..
+        } = open_target(&repinned, body_json)?;
+        on_ledger(&ctx.ledger, move |l| apply_open(l, new_packet, semantic_id)).await?;
+    }
     Ok(repinned)
 }
 
@@ -574,6 +639,28 @@ async fn settle_adoption(
         claim_token,
         format!("transport: adoption could not read the spec: {failure}"),
         format!("adoption refused: {failure}"),
+        failure,
+    )
+    .await
+}
+
+/// Retire a claimed attempt whose host-fallback event could not be recorded.
+///
+/// The fallback is recorded between the claim and the spawn, so a failure
+/// here is the shape nothing on that stretch may propagate on its own: the
+/// row is already `running` with no process behind it.
+async fn settle_host_fallback(
+    ctx: &Ctx,
+    packet_id: &str,
+    claim_token: &str,
+    failure: Failure,
+) -> Result<PacketOutcome, Failure> {
+    settle_unspawned(
+        ctx,
+        packet_id,
+        claim_token,
+        format!("transport: the host fallback could not be recorded: {failure}"),
+        format!("attempt refused before spawn: {failure}"),
         failure,
     )
     .await
@@ -726,62 +813,69 @@ async fn run_attempt(
     // Herdr is the preferred visibility adapter. The ledger records the
     // actual host selection, so a missing socket can never masquerade as a
     // Herdr-backed session.
-    let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) =
-        match exec.host_policy {
-            HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
-            HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
-                None => {
-                    if exec.host_policy == HostPolicy::Required {
-                        return fail_and_grant_retry(
-                            ctx,
-                            &packet_id,
-                            &claim_token,
-                            "transport: Herdr is required but no socket is configured".to_owned(),
-                        )
-                        .await;
-                    }
-                    crate::core::sessions::record_host_fallback(
+    let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) = match exec
+        .host_policy
+    {
+        HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
+        HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
+            None => {
+                if exec.host_policy == HostPolicy::Required {
+                    return fail_and_grant_retry(
+                        ctx,
+                        &packet_id,
+                        &claim_token,
+                        "transport: Herdr is required but no socket is configured".to_owned(),
+                    )
+                    .await;
+                }
+                if let Err(failure) = crate::core::sessions::record_host_fallback(
+                    ctx,
+                    &run_id,
+                    &packet_id,
+                    attempt_id,
+                    "no Herdr socket is configured",
+                )
+                .await
+                {
+                    return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                }
+                (Arc::new(ProcessHost::new(&status_base)), "process", None)
+            }
+            Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
+                Ok(herdr) => (
+                    Arc::new(match workspace_label(ctx, &run_id).await {
+                        Some(label) => herdr.with_workspace(label),
+                        None => herdr,
+                    }),
+                    "herdr",
+                    Some(sock.to_string_lossy().into_owned()),
+                ),
+                Err(error) if exec.host_policy == HostPolicy::Preferred => {
+                    if let Err(failure) = crate::core::sessions::record_host_fallback(
                         ctx,
                         &run_id,
                         &packet_id,
                         attempt_id,
-                        "no Herdr socket is configured",
+                        &error.to_string(),
                     )
-                    .await?;
+                    .await
+                    {
+                        return settle_host_fallback(ctx, &packet_id, &claim_token, failure).await;
+                    }
                     (Arc::new(ProcessHost::new(&status_base)), "process", None)
                 }
-                Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
-                    Ok(herdr) => (
-                        Arc::new(match workspace_label(ctx, &run_id).await {
-                            Some(label) => herdr.with_workspace(label),
-                            None => herdr,
-                        }),
-                        "herdr",
-                        Some(sock.to_string_lossy().into_owned()),
-                    ),
-                    Err(error) if exec.host_policy == HostPolicy::Preferred => {
-                        crate::core::sessions::record_host_fallback(
-                            ctx,
-                            &run_id,
-                            &packet_id,
-                            attempt_id,
-                            &error.to_string(),
-                        )
-                        .await?;
-                        (Arc::new(ProcessHost::new(&status_base)), "process", None)
-                    }
-                    Err(error) => {
-                        return fail_and_grant_retry(
-                            ctx,
-                            &packet_id,
-                            &claim_token,
-                            format!("transport: required Herdr host unavailable: {error}"),
-                        )
-                        .await;
-                    }
-                },
+                Err(error) => {
+                    return fail_and_grant_retry(
+                        ctx,
+                        &packet_id,
+                        &claim_token,
+                        format!("transport: required Herdr host unavailable: {error}"),
+                    )
+                    .await;
+                }
             },
-        };
+        },
+    };
     let attach_hint =
         (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
     let mut env = HashMap::new();

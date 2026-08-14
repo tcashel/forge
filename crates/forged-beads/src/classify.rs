@@ -89,9 +89,22 @@ pub enum BdError {
         /// The child's full stderr.
         stderr: String,
     },
-    /// A zero-exit call whose stdout was unparseable or whose
-    /// `schema_version` was not 1. Wire mapping: `BEADS_ERROR`.
+    /// bd ANSWERED with its schema-1 envelope and the answer was unusable:
+    /// no `data` key at all, or a payload carrying none of what was asked
+    /// for. An outcome, never a transport failure — every retry re-reads the
+    /// same envelope. Wire mapping: `BEADS_ERROR`.
     Envelope {
+        /// What was being run.
+        context: String,
+        /// Both output streams, for diagnosis.
+        detail: String,
+    },
+    /// NO envelope: stdout would not parse at all, or carried a
+    /// `schema_version` other than 1. bd never answered, so this rides the
+    /// bounded transport budget exactly like a spawn failure or a timeout.
+    /// Split out of [`BdError::Envelope`] because that variant also carries
+    /// genuine answers and must stay terminal. Wire mapping: `BEADS_ERROR`.
+    Unparseable {
         /// What was being run.
         context: String,
         /// Both output streams, for diagnosis.
@@ -128,13 +141,22 @@ impl BdError {
     /// before it could write, unparseable stdout) says nothing about the
     /// store and is the one thing worth trying again.
     ///
-    /// [`BdError::Contention`] is the documented exception: bd answered, but
-    /// with its own embedded lock, which clears on its own.
+    /// The Dolt embedded lock is the documented exception, and it is checked
+    /// FIRST, against every variant: bd answered, but with a lock that
+    /// clears on its own. READS need that check here and nowhere else —
+    /// `invoke::read` runs no classifier and no retries, so a `bd show`
+    /// refused by the lock a live run or an epic wave holds arrives as a
+    /// finished error and would otherwise take the run down instead of
+    /// riding the budget.
     pub fn is_transport(&self) -> bool {
+        if self.haystack().contains(DOLT_LOCK_REFUSAL) {
+            return true;
+        }
         match self {
-            BdError::Contention { .. } | BdError::SpawnFailed { .. } | BdError::Timeout { .. } => {
-                true
-            }
+            BdError::Contention { .. }
+            | BdError::SpawnFailed { .. }
+            | BdError::Timeout { .. }
+            | BdError::Unparseable { .. } => true,
             // A nonzero exit is a REFUSAL when bd still emitted its
             // envelope — bd 1.2.1 answers an unknown id with exit 1 and
             // `{"data":{"error":"no issues found matching the provided
@@ -148,6 +170,28 @@ impl BdError {
             | BdError::LeaseHeld { .. }
             | BdError::HeartbeatRefused { .. }
             | BdError::SlotBusy { .. } => false,
+        }
+    }
+
+    /// Every text stream this error still carries, joined exactly as
+    /// [`classify_attempt`] builds its own haystack: raw stdout, the
+    /// envelope's error string, and stderr. Case-sensitive substring
+    /// matching, evaluated regardless of exit status.
+    fn haystack(&self) -> String {
+        match self {
+            BdError::Beads { stdout, stderr, .. } => {
+                let env_err = envelope::parse_lenient(stdout).error.unwrap_or_default();
+                format!("{stdout}\n{env_err}\n{stderr}")
+            }
+            BdError::Envelope { detail, .. }
+            | BdError::Unparseable { detail, .. }
+            | BdError::SpawnFailed { detail, .. } => detail.clone(),
+            BdError::Contention { stderr, .. } | BdError::HeartbeatRefused { stderr, .. } => {
+                stderr.clone()
+            }
+            BdError::LeaseHeld { .. } | BdError::SlotBusy { .. } | BdError::Timeout { .. } => {
+                String::new()
+            }
         }
     }
 }
@@ -180,6 +224,9 @@ impl fmt::Display for BdError {
             ),
             BdError::Envelope { context, detail } => {
                 write!(f, "{context} returned a bad envelope: {detail}")
+            }
+            BdError::Unparseable { context, detail } => {
+                write!(f, "{context} returned no parseable envelope: {detail}")
             }
             BdError::SpawnFailed { context, detail } => {
                 write!(f, "{context} could not spawn: {detail}")
@@ -217,8 +264,16 @@ pub(crate) enum Class {
         /// The refusal text (stderr, or the envelope error when stderr empty).
         detail: String,
     },
-    /// Zero exit but unparseable stdout or wrong `schema_version`: terminal.
+    /// Zero exit and a schema-1 envelope that carried no `data` key:
+    /// terminal, because bd answered.
     EnvelopeBad {
+        /// Both streams for diagnosis.
+        detail: String,
+    },
+    /// Zero exit but unparseable stdout or wrong `schema_version`: terminal
+    /// for the write policy, but bd never answered, so the error it mints
+    /// rides the transport budget.
+    Unparseable {
         /// Both streams for diagnosis.
         detail: String,
     },
@@ -263,7 +318,7 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
             };
         }
         if out.exit == Some(0) && (!lenient.parsed || !lenient.schema_ok) {
-            return Class::EnvelopeBad {
+            return Class::Unparseable {
                 detail: both_streams(out),
             };
         }
@@ -279,13 +334,13 @@ pub(crate) fn classify_attempt(op: &WriteOp, out: &RawOutcome, raw_mode: bool) -
             // Merge-slot envelope exception: raw JSON, no data/schema wrapper.
             return match serde_json::from_str::<Value>(&out.stdout) {
                 Ok(v) => Class::Success(v),
-                Err(e) => Class::EnvelopeBad {
+                Err(e) => Class::Unparseable {
                     detail: format!("unparseable raw JSON ({e}); {}", both_streams(out)),
                 },
             };
         }
         if !lenient.parsed || !lenient.schema_ok {
-            return Class::EnvelopeBad {
+            return Class::Unparseable {
                 detail: both_streams(out),
             };
         }
@@ -386,6 +441,12 @@ pub(crate) async fn write_policy(
             }
             Class::EnvelopeBad { detail } => {
                 return Err(BdError::Envelope {
+                    context: context.to_string(),
+                    detail,
+                });
+            }
+            Class::Unparseable { detail } => {
+                return Err(BdError::Unparseable {
                     context: context.to_string(),
                     detail,
                 });
@@ -931,5 +992,56 @@ mod tests {
             detail: "response contained no issue".to_string(),
         }
         .is_transport());
+
+        // Stdout that carried no envelope at all: bd never answered.
+        assert!(BdError::Unparseable {
+            context: "bd show bead-1".to_string(),
+            detail: "stdout: <html>502</html>; stderr: ".to_string(),
+        }
+        .is_transport());
+    }
+
+    /// The Dolt embedded lock reaching a READ.
+    ///
+    /// `invoke::read` runs no classifier and no retries, so the lock — shared
+    /// with every live run and every epic wave — arrives at the caller as a
+    /// finished error. Classified as an answer it takes the reading run down
+    /// on a condition that clears on its own.
+    #[test]
+    fn the_dolt_lock_is_transport_on_every_shape_a_read_can_surface_it() {
+        // Exit 0 with the refusal in the envelope's own error string:
+        // `invoke::read` mints `Beads` for exactly this, and the envelope
+        // parses, so the generic arm alone would call it an answer.
+        let enveloped = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(0),
+            stdout: format!(
+                "{{\"data\":{{\"error\":\"{DOLT_LOCK_REFUSAL}\"}},\"schema_version\":1}}"
+            ),
+            stderr: String::new(),
+        };
+        assert!(
+            enveloped.is_transport(),
+            "an embedded lock clears on its own"
+        );
+
+        // The same lock on stderr behind a nonzero exit whose envelope still
+        // arrived.
+        let on_stderr = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: "{\"data\":{},\"schema_version\":1}".to_string(),
+            stderr: DOLT_LOCK_REFUSAL.to_string(),
+        };
+        assert!(on_stderr.is_transport());
+
+        // A refusal that is NOT the lock stays an answer.
+        let refusal = BdError::Beads {
+            context: "bd show beads-1al".to_string(),
+            exit: Some(1),
+            stdout: "{\"data\":{\"error\":\"no issues found\"},\"schema_version\":1}".to_string(),
+            stderr: String::new(),
+        };
+        assert!(!refusal.is_transport());
     }
 }

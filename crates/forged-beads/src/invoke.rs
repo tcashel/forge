@@ -330,7 +330,9 @@ pub(crate) async fn read(cfg: &BdConfig, args: &[&str]) -> Result<Value, BdError
     }
     let lenient = envelope::parse_lenient(&out.stdout);
     if !lenient.parsed || !lenient.schema_ok {
-        return Err(BdError::Envelope {
+        // No envelope at all: bd never answered, so this is the one read
+        // failure worth retrying. `Envelope` is reserved for answers.
+        return Err(BdError::Unparseable {
             context,
             detail: format!("stdout: {}; stderr: {}", out.stdout, out.stderr),
         });

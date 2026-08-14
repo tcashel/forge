@@ -501,6 +501,121 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
     );
 }
 
+#[test]
+fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
+    // The replay wedge INSIDE the re-pin. `packet_open` is keyed on the
+    // target fence, so a bead moved A -> B -> A re-opens under the key the
+    // first open at A already stored: the operation replays its recorded
+    // response, the ledger UPDATE never runs, and the re-pin reports success
+    // with the row still pinned at B. Every claim afterwards refuses
+    // `SpecDrift`, forever — the wedge the re-pin exists to close, reopened.
+    let env = TestEnv::new("forged-bead-spec-cycle");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("bead-cycled", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-cycled",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "run start: {started}");
+
+    let packet = advance_to_open_packet(&env, "bead-cycled");
+    let opened_at = packet.spec_sha256.clone();
+
+    // A -> B. The seat fails transport, which hands the packet back
+    // re-claimable instead of completing it.
+    env.set_bead_field("bead-cycled", "acceptance", "- revised acceptance");
+    env.set_scenario("implement", "rate-limit", 1);
+    let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-cycled"]);
+    assert_eq!(code, 0, "advance at the revised body: {advanced}");
+    let ledger = env.ledger();
+    let at_revision = ledger
+        .get_packet(&packet.packet_id)
+        .expect("packet row")
+        .spec_sha256;
+    ledger.close().expect("close");
+    assert_ne!(
+        at_revision, opened_at,
+        "the packet must first re-pin to the revised body"
+    );
+
+    // B -> A: back to the exact body this packet was OPENED at.
+    env.set_bead_field("bead-cycled", "acceptance", ACCEPTANCE);
+    expire_retry_deadline(&env, "bead-cycled");
+    let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-cycled"]);
+    assert_eq!(code, 0, "advance back at the original body: {advanced}");
+
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    ledger.close().expect("close");
+    assert_eq!(
+        row.spec_sha256, opened_at,
+        "the row must follow the bead back, not stay pinned where it left: {row:?}"
+    );
+    assert_eq!(
+        row.body_json, packet.body_json,
+        "a re-pin revises the spec and leaves the definition alone"
+    );
+}
+
+#[test]
+fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
+    // The re-pin is for BEAD-sourced packets alone. A file-sourced spec is
+    // fenced by the hash of a file the operator owns; adopting an edit to it
+    // silently would retire the one fence that route has, and nothing
+    // downstream would catch it — `assert_pinned` returns early for a file
+    // spec.
+    let env = TestEnv::new("forged-bead-spec-file-edit");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-file-edit",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "file-sourced run start: {started}");
+
+    let packet = advance_to_open_packet(&env, "bead-file-edit");
+    assert_eq!(
+        packet.spec_revision, None,
+        "the file route pins no revision"
+    );
+    std::fs::write(
+        &env.spec,
+        "# a spec the operator edited under the run
+",
+    )
+    .expect("revise the spec file");
+
+    let (_, advanced) = env.forged(&["run", "advance", "--run", "bead-file-edit"]);
+    let ledger = env.ledger();
+    let row = ledger.get_packet(&packet.packet_id).expect("packet row");
+    let claimed = ledger.get_attempt(1).ok();
+    ledger.close().expect("close");
+    assert_eq!(
+        row.spec_sha256, packet.spec_sha256,
+        "an edited spec file must not be adopted under an open packet: {row:?}"
+    );
+    assert!(
+        claimed.is_none(),
+        "the edit must refuse the claim, not seat it: {claimed:?} ({advanced})"
+    );
+}
+
 /// The packet's latest `proto.retry` grant: its failure count and deadline.
 fn latest_retry(env: &TestEnv, run: &str) -> Value {
     let ledger = env.ledger();
