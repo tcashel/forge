@@ -27,7 +27,13 @@ enum Action {
     },
     /// Drop the connection, leaving the request outstanding.
     Hangup,
+    /// Hold the connection open and never answer: the unresponsive server an
+    /// awaited RPC spends its whole timeout on.
+    Stall,
 }
+
+/// Long enough that any wait on an answer would be unmistakable in a test.
+const STALL: Duration = Duration::from_secs(30);
 
 struct Mock {
     socket_path: PathBuf,
@@ -89,6 +95,10 @@ impl Mock {
                                     json!({"id": id, "error": {"code": code, "message": message}})
                                 }
                                 Action::Hangup => return,
+                                Action::Stall => {
+                                    tokio::time::sleep(STALL).await;
+                                    return;
+                                }
                             };
                             let mut bytes = frame.to_string().into_bytes();
                             bytes.push(b'\n');
@@ -132,6 +142,26 @@ impl Mock {
 
     fn connection_count(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
+    }
+
+    fn count_of(&self, method: &str) -> usize {
+        self.methods().iter().filter(|m| *m == method).count()
+    }
+
+    /// Wait until `method` has been received `count` times. A dispatched
+    /// request is deliberately not awaited by the host, so the mock's record
+    /// of it lands asynchronously — asserting on it without waiting would be
+    /// a race, not a stricter test.
+    async fn wait_for(&self, method: &str, count: usize) {
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while self.count_of(method) < count {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for {count} {method} call(s); saw {:?}",
+                self.methods()
+            );
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
     }
 }
 
@@ -568,7 +598,7 @@ async fn bare_close_acknowledgement_is_never_confirmation() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn release_closes_the_spawned_pane_and_forgets_the_session() {
+async fn release_closes_the_spawned_pane_and_keeps_answering_for_it() {
     let mock = Mock::start(|method, _params, n| {
         if let Some(actions) = spawn_script(method, n, false) {
             return actions;
@@ -586,6 +616,7 @@ async fn release_closes_the_spawned_pane_and_forgets_the_session() {
     assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
 
     host.release(&id).await;
+    mock.wait_for("pane.close", 1).await;
 
     // Exactly one close, aimed at the pane this host spawned, with no probe
     // or verification traffic around it.
@@ -604,15 +635,121 @@ async fn release_closes_the_spawned_pane_and_forgets_the_session() {
         mock.params_of("pane.close"),
         json!({"pane_id": TEST_PANE_ID})
     );
-    // The session is gone from the host's map, so it holds nothing for it.
+    // The terminal is given up, so there is nothing left to attach to — but
+    // the session itself is NOT forgotten: it still answers from the
+    // sentinel, with no further traffic.
+    assert_eq!(host.attach_hint(&id), None);
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
+    assert_eq!(mock.count_of("pane.close"), 1);
+}
+
+#[tokio::test]
+async fn a_released_session_still_answers_liveness_and_kill() {
+    // The wedge this rules out: a release that forgot the session would make
+    // every later `alive`/`kill_confirmed` answer `SessionNotFound`, which
+    // the reconcile port surfaces as an unavailable host and which aborts
+    // the whole pass. An attempt settles and its ROW settles at different
+    // moments — a pass reaching a released session after a refused settle
+    // must still be able to reclaim the packet.
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+            // The pane is gone once the close lands; ids are never reused.
+            ("pane.process_info", _) => vec![PANE_NOT_FOUND],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    std::fs::write(only_status_path(base.path()), "0\n").expect("write sentinel");
+
+    host.release(&id).await;
+    mock.wait_for("pane.close", 1).await;
+
+    // The sentinel is still this session's exit truth...
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
+    // ...and a kill aimed at it reports verified prior death rather than
+    // failing the caller with an unknown session.
+    assert_eq!(
+        host.kill_confirmed(&id).await.expect("kill"),
+        Confirmed::AlreadyDead
+    );
+    // Prior death was already verified, so no second close was issued.
+    assert_eq!(mock.count_of("pane.close"), 1);
+}
+
+#[tokio::test]
+async fn a_released_session_with_no_sentinel_reports_vanished_not_unknown() {
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+            ("pane.process_info", _) => vec![PANE_NOT_FOUND],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+
+    host.release(&id).await;
+    mock.wait_for("pane.close", 1).await;
+
+    // No status file was ever written: the honest answer is Vanished, and no
+    // exit code is invented — the same answer any un-released session with a
+    // dead pane gets.
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Vanished);
+}
+
+#[tokio::test]
+async fn release_never_waits_for_herdr_to_answer() {
+    // The settlement contract: releasing fires the close and returns. A
+    // herdr that accepts the request and never answers would cost an awaited
+    // RPC its full five-second timeout; it must cost a release nothing, and
+    // must leave the settled session's answers untouched.
+    let mock = Mock::start(|method, _params, n| {
+        if let Some(actions) = spawn_script(method, n, false) {
+            return actions;
+        }
+        match (method, n) {
+            ("pane.close", _) => vec![Action::Stall],
+            other => panic!("unexpected request {other:?}"),
+        }
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
+    std::fs::write(only_status_path(base.path()), "0\n").expect("write sentinel");
+
+    let started = std::time::Instant::now();
+    host.release(&id).await;
+    let elapsed = started.elapsed();
+
+    // Well inside the RPC timeout an awaited close would have burned.
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "release waited {elapsed:?} on an unresponsive herdr"
+    );
+    // The close really was dispatched, not skipped.
+    mock.wait_for("pane.close", 1).await;
+    // And the settled session is exactly as it was: same exit code, same
+    // (absent) attach hint, no error anywhere.
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
     assert_eq!(host.attach_hint(&id), None);
 }
 
 #[tokio::test]
-async fn release_of_a_refused_or_forgotten_pane_is_silent() {
+async fn repeated_releases_are_silent_whatever_herdr_answers() {
     // First release: herdr refuses the close outright. Second: it answers
-    // pane-not-found, which is proof the goal state already holds. Neither
-    // may surface anything a settled attempt could trip over.
+    // pane-not-found, which is proof the goal state already holds. Third: it
+    // drops the connection. None of it is ever read — `release` returns `()`
+    // by construction — and none of it may disturb the settled session.
     let mock = Mock::start(|method, _params, n| {
         if let Some(actions) = spawn_script(method, n, false) {
             return actions;
@@ -632,16 +769,13 @@ async fn release_of_a_refused_or_forgotten_pane_is_silent() {
     let (host, id) = connect_and_spawn(&mock, base.path(), cwd.path()).await;
     std::fs::write(only_status_path(base.path()), "0\n").expect("write sentinel");
 
-    // `release` returns `()`: the refusal has nowhere to go, by construction.
-    host.release(&id).await;
-    // Repeat over a forgotten pane, and again over a dropped connection.
     host.release(&id).await;
     host.release(&id).await;
+    host.release(&id).await;
+    mock.wait_for("pane.close", 3).await;
 
-    assert_eq!(
-        mock.methods().iter().filter(|m| *m == "pane.close").count(),
-        3
-    );
+    assert_eq!(mock.count_of("pane.close"), 3);
+    assert_eq!(host.alive(&id).await.expect("alive"), Liveness::Exited(0));
 }
 
 // ---------------------------------------------------------------------------

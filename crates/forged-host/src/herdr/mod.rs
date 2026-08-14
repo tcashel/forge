@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixStream;
 use tokio::task::AbortHandle;
 
@@ -24,6 +24,11 @@ use wire::{PaneEvent, PaneEventKind, WireError};
 /// Every herdr RPC awaits its response with this timeout; timeout →
 /// `HostError::Unavailable`.
 pub(crate) const RPC_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// A DISPATCHED request awaits no response, so this bounds the connect and
+/// the write alone — deliberately a fraction of [`RPC_TIMEOUT`], which is
+/// what a caller that has already settled must never spend.
+pub(crate) const DISPATCH_BUDGET: Duration = Duration::from_millis(250);
 
 /// Bound on the pre-synchronization set of retained `pane_created` ids.
 const GATE_RETAIN_CAP: usize = 1024;
@@ -280,6 +285,49 @@ impl Connection {
             Err(_elapsed) => Err(CallError::Unavailable(format!(
                 "herdr did not answer {method} within the RPC timeout"
             ))),
+        }
+    }
+
+    /// Fire one request and never read its response.
+    ///
+    /// The write IS the whole contract: no answer is awaited, so an
+    /// unresponsive herdr costs the caller one socket write rather than
+    /// [`RPC_TIMEOUT`]. Only for callers that have already settled and whose
+    /// correctness does not depend on the request's outcome — the residual
+    /// is an unclosed pane, never a delayed or altered settlement. Bounded
+    /// by [`DISPATCH_BUDGET`] because reaching a socket whose backlog is
+    /// full can itself block.
+    pub(crate) async fn dispatch(&self, method: &str, params: Value) {
+        let frame = serde_json::json!({
+            "id": self.next_request_id(),
+            "method": method,
+            "params": params,
+        });
+        let line = format!("{}\n", frame);
+        let socket_path = &self.socket_path;
+        let sent = tokio::time::timeout(DISPATCH_BUDGET, async {
+            let mut stream = UnixStream::connect(socket_path).await.ok()?;
+            stream.write_all(line.as_bytes()).await.ok()?;
+            Some(stream)
+        })
+        .await;
+
+        // Drain and discard the answer in the background. Herdr sees an
+        // ordinary peer that stays until it has replied — hanging up on the
+        // request we just wrote would invite the server to abandon it — and
+        // nothing here is ever awaited by the caller.
+        if let Ok(Some(mut stream)) = sent {
+            tokio::spawn(async move {
+                let _ = tokio::time::timeout(RPC_TIMEOUT, async move {
+                    let mut sink = [0_u8; 1024];
+                    while let Ok(read) = stream.read(&mut sink).await {
+                        if read == 0 {
+                            break;
+                        }
+                    }
+                })
+                .await;
+            });
         }
     }
 

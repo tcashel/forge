@@ -229,8 +229,9 @@ impl SessionHost for ProcessHost {
         Err(HostError::KillVerifyTimeout)
     }
 
-    /// Nothing to release: a plain process owns no terminal, and the session
-    /// entry stays so a later `alive` still answers from the sentinel.
+    /// Nothing to release: a plain process owns no terminal. The session
+    /// entry stays, per the trait's retention contract, so a later `alive`
+    /// still answers from the sentinel.
     async fn release(&self, _id: &HostSessionId) {}
 
     fn attach_hint(&self, _id: &HostSessionId) -> Option<String> {

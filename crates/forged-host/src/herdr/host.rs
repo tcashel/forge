@@ -38,6 +38,18 @@ enum PaneProbe {
     Gone,
 }
 
+/// What the host retains for one session it spawned.
+struct Seat {
+    /// The sentinel path: the only exit-code truth for this session. It
+    /// deliberately OUTLIVES [`SessionHost::release`] — an id this instance
+    /// issued must keep resolving, or a later `alive`/`kill_confirmed` for a
+    /// row that never settled answers [`HostError::SessionNotFound`] and
+    /// aborts the reconcile pass that was going to reclaim it.
+    status_path: PathBuf,
+    /// The pane's close has been dispatched: nothing left to attach to.
+    released: bool,
+}
+
 /// Map Herdr's opaque pane id to a collision-free shell-safe directory name.
 /// Real ids contain `:`, and the sentinel path deliberately remains unquoted,
 /// so the transport id itself must never become a path component.
@@ -65,7 +77,7 @@ fn status_dir_key(pane_id: &str) -> String {
 pub struct HerdrHost {
     conn: Arc<Connection>,
     base_status_dir: PathBuf,
-    sessions: Mutex<HashMap<HostSessionId, PathBuf>>,
+    sessions: Mutex<HashMap<HostSessionId, Seat>>,
     /// Label of the workspace seats are placed in, when the caller named one.
     /// `None` reproduces the pre-placement behaviour: an untargeted split,
     /// which herdr resolves against the UI-FOCUSED pane — one that may belong
@@ -269,7 +281,7 @@ impl HerdrHost {
             .lock()
             .expect("sessions lock")
             .get(id)
-            .cloned()
+            .map(|seat| seat.status_path.clone())
             .ok_or_else(|| HostError::session_not_found(id))
     }
 
@@ -294,11 +306,9 @@ impl HerdrHost {
         }
     }
 
-    /// Best-effort `pane.close`, ignoring the result entirely — rollback
-    /// after a partially failed spawn, and release of a settled session.
-    /// Every error response is equally uninteresting here: pane-not-found is
-    /// the goal state already reached (ids are never reused), and anything
-    /// else leaves a pane whose fate no caller of this helper depends on.
+    /// Best-effort `pane.close`, ignoring the result entirely — used only
+    /// for rollback after a partially failed spawn, where the pane is not
+    /// yet a session and no caller depends on its fate.
     async fn best_effort_close(&self, pane_id: &str) {
         let _ = self
             .conn
@@ -434,10 +444,13 @@ impl SessionHost for HerdrHost {
         match self.finish_spawn(&pane_id, shell_line).await {
             Ok(status_path) => {
                 let id = HostSessionId(pane_id);
-                self.sessions
-                    .lock()
-                    .expect("sessions lock")
-                    .insert(id.clone(), status_path);
+                self.sessions.lock().expect("sessions lock").insert(
+                    id.clone(),
+                    Seat {
+                        status_path,
+                        released: false,
+                    },
+                );
                 Ok(id)
             }
             Err(original) => {
@@ -567,20 +580,37 @@ impl SessionHost for HerdrHost {
         Err(HostError::KillVerifyTimeout)
     }
 
-    /// Close the pane once and forget the session. Deliberately NOT
-    /// `kill_confirmed`'s close: no probe, no verification, no re-check
-    /// budget — settling an attempt must never wait on herdr answering.
+    /// Dispatch the pane's close and mark the seat released. Deliberately
+    /// NOT `kill_confirmed`'s close: no probe, no verification, no re-check
+    /// budget, and no wait for herdr's answer — a settled attempt must never
+    /// block on the terminal it is giving back, so the request is fired and
+    /// its response is never read.
+    ///
+    /// The seat itself SURVIVES. Releasing gives up the terminal, never the
+    /// session identity: a reconcile pass that reaches an attempt this
+    /// process already released — a row left `revoking` by a refused settle,
+    /// say — must still get a liveness answer and a confirmable kill out of
+    /// it, and `SessionNotFound` there would abort the pass that was going
+    /// to reclaim the packet.
     async fn release(&self, id: &HostSessionId) {
-        self.best_effort_close(id.as_str()).await;
-        self.sessions.lock().expect("sessions lock").remove(id);
+        {
+            let mut sessions = self.sessions.lock().expect("sessions lock");
+            if let Some(seat) = sessions.get_mut(id) {
+                seat.released = true;
+            }
+        }
+        self.conn
+            .dispatch("pane.close", json!({"pane_id": id.as_str()}))
+            .await;
     }
 
     fn attach_hint(&self, id: &HostSessionId) -> Option<String> {
         let sessions = self.sessions.lock().expect("sessions lock");
-        if sessions.contains_key(id) {
-            Some(format!("herdr:pane:{}", id.as_str()))
-        } else {
-            None
+        // A released seat still resolves for liveness, but its pane is
+        // closing: there is no terminal left for a UI to attach to.
+        match sessions.get(id) {
+            Some(seat) if !seat.released => Some(format!("herdr:pane:{}", id.as_str())),
+            _ => None,
         }
     }
 }

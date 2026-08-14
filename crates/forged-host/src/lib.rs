@@ -168,11 +168,19 @@ pub trait SessionHost: Send + Sync {
     /// Give up the terminal of a session that has ALREADY SETTLED.
     ///
     /// This is not a kill and never a fence: it verifies nothing, gates no
-    /// external effect, and returns `()` precisely so no failure of it can
-    /// reach a caller that has already settled an attempt. A backend with
-    /// nothing to give up does nothing. Callers that need verified death
-    /// call [`SessionHost::kill_confirmed`] instead, which releases the
-    /// terminal itself — the two are never issued for the same session.
+    /// external effect, waits for nothing, and returns `()` precisely so no
+    /// failure of it can reach a caller that has already settled an attempt.
+    /// A backend with nothing to give up does nothing. Callers that need
+    /// verified death call [`SessionHost::kill_confirmed`] instead, which
+    /// releases the terminal itself — the two are never issued for the same
+    /// session.
+    ///
+    /// The id REMAINS VALID afterwards: `alive` and `kill_confirmed` must
+    /// keep answering for a released session (from the sentinel, and from
+    /// whatever the backend can still observe) rather than
+    /// [`HostError::SessionNotFound`]. Settling an attempt and settling its
+    /// ROW are different events, and a reconcile pass that reaches the
+    /// second one must not be told the session never existed.
     async fn release(&self, id: &HostSessionId);
 
     /// A stable locator string a UI can render to attach to the session, if
