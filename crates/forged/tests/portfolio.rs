@@ -128,6 +128,20 @@ fn no_scope_projects_the_portfolio_and_every_combination_stays_refused() {
         json!({"schemaVersion": 1, "params": {"id": "pf-slice"}}),
     );
     assert_eq!(id["result"]["kind"], json!("slice"), "{id}");
+    // A fabricated epic has a start event and no execution package, so the
+    // epic projection refuses it on its own terms — which is the proof the
+    // param still ROUTES there rather than being read as no scope at all.
+    let epic = mcp.call_tool(
+        "overview",
+        json!({"schemaVersion": 1, "params": {"epic": "pf-epic"}}),
+    );
+    assert_eq!(epic["error"]["code"], json!("INTERNAL"), "{epic}");
+    assert!(
+        epic["error"]["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("execution package")),
+        "the epic projection answered, not the param guard: {epic}"
+    );
 
     for params in [
         json!({"run": "pf-slice", "epic": "pf-epic"}),
