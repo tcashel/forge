@@ -886,7 +886,7 @@ fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
 
     // bd goes away. The claim cannot read the fence, which says NOTHING
     // about whether the spec changed.
-    env.set_bd_show_unreachable(true);
+    env.set_bd_spec_show_unreachable(true);
     let (code, failed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
     assert_ne!(code, 0, "an unreachable bd must fail the claim: {failed}");
     assert_ne!(
@@ -979,7 +979,7 @@ fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
     let packet = advance_to_open_packet(&env, "bead-recovers");
 
     // One outage, charged: the budget of three is now one down.
-    env.set_bd_show_unreachable(true);
+    env.set_bd_spec_show_unreachable(true);
     let (code, charged) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
     assert_eq!(
         code, 0,
@@ -992,7 +992,7 @@ fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
     );
 
     // bd comes back well inside the budget.
-    env.set_bd_show_unreachable(false);
+    env.set_bd_spec_show_unreachable(false);
     expire_retry_deadline(&env, "bead-recovers");
     let (code, recovered) = env.forged(&["run", "advance", "--run", "bead-recovers"]);
     assert_eq!(

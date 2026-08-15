@@ -323,16 +323,16 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
             .lines()
             .filter(|line| line.starts_with("list "))
             .count(),
-        2,
-        "one exact claim batch plus one bounded plan discovery enrich the whole queue: {calls}"
+        1,
+        "only bounded plan discovery remains a list call: {calls}"
     );
     assert_eq!(
         calls
             .lines()
             .filter(|line| line.starts_with("show "))
             .count(),
-        1,
-        "plan dependency hydration remains one batch: {calls}"
+        2,
+        "one exact claim hydrate plus one plan dependency hydrate: {calls}"
     );
 }
 
@@ -477,8 +477,8 @@ fn repository_scope_fails_closed_when_beads_cannot_establish_membership() {
     assert_eq!(scoped["error"]["code"], json!("BEADS_ERROR"));
     assert!(scoped["result"].is_null(), "no scoped rows leak: {scoped}");
 
-    // The no-selector path deliberately retains its established behavior:
-    // it can still show durable work and marks live Beads claim data unknown.
+    // The no-selector path uses the independent exact `show` contract, so a
+    // membership-list outage cannot erase otherwise available claim facts.
     let (code, unfiltered) = env.forged(&["work", "list"]);
     assert_eq!(code, 0, "unfiltered compatibility: {unfiltered}");
     assert_eq!(
@@ -487,11 +487,15 @@ fn repository_scope_fails_closed_when_beads_cannot_establish_membership() {
     );
     assert_eq!(
         entry(&unfiltered, "repo-outage")["claimHealth"]["known"],
-        json!(false)
+        json!(true)
     );
     assert_eq!(
         entry(&unfiltered, "repo-outage")["repositoryScope"],
-        json!({"known": false, "identity": null, "source": "unknown"})
+        json!({
+            "known": true,
+            "identity": forge,
+            "source": "beads.metadata.repository",
+        })
     );
 }
 
