@@ -27,7 +27,7 @@ pub const HERDR_PROJECTION_RETRY_BUDGET: u32 = 8;
 const MAX_RETRY_BACKOFF_SECONDS: u64 = 300;
 const ERROR_MAX_BYTES: usize = 2_048;
 
-const COLUMNS: &str = "projection_id, schema, target_kind, subject_kind, subject_id, \
+pub(crate) const COLUMNS: &str = "projection_id, schema, target_kind, subject_kind, subject_id, \
     ownership_id, layout_id, pane_id, socket_path, protocol, controller_generation, \
     run_id, packet_id, attempt_id, claim_token, stage, provider, model, layout_revision, \
     metadata_source, lifecycle_source, lifecycle_agent, session_candidate, \
@@ -176,7 +176,7 @@ fn desired_lifecycle(index: usize, raw: &str) -> rusqlite::Result<HerdrProjectio
     }
 }
 
-fn projection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HerdrPaneProjectionRow> {
+pub(crate) fn projection_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<HerdrPaneProjectionRow> {
     let schema: String = row.get(1)?;
     if schema != HERDR_PANE_PROJECTION_SCHEMA_V1 {
         return Err(column_decode_error(1, "Herdr projection schema", &schema));

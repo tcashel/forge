@@ -13,6 +13,7 @@ pub mod herdr_ownership;
 pub mod herdr_projection;
 pub mod ids;
 pub mod packet;
+pub mod provider_session_inventory;
 pub mod review_publication;
 pub mod work_history;
 pub mod work_identity;
@@ -61,6 +62,16 @@ pub use packet::{
     AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
     ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
     WorkPacket,
+};
+pub use provider_session_inventory::{
+    ProviderSessionActivity, ProviderSessionAttemptV1, ProviderSessionDesiredWorkV1,
+    ProviderSessionDiagnosticAction, ProviderSessionEvidenceV1, ProviderSessionHostMode,
+    ProviderSessionInventoryCoverageV1, ProviderSessionInventoryFiltersV1,
+    ProviderSessionInventoryRowV1, ProviderSessionInventorySummaryV1, ProviderSessionInventoryV1,
+    ProviderSessionLegacyHerdrV1, ProviderSessionOwnedHerdrV1, ProviderSessionOwnedMutableV1,
+    ProviderSessionProjectionMutableV1, ProviderSessionProjectionV1,
+    ProviderSessionPublicationChannelV1, ProviderSessionRecovery,
+    PROVIDER_SESSION_INVENTORY_SCHEMA_V1,
 };
 pub use review_publication::{
     github_repository_from_pr_url, ReviewEpochKind, ReviewEpochV1, ReviewPublicationFindingStatus,

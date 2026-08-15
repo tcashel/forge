@@ -18,6 +18,7 @@ mod history;
 mod observe;
 mod ops;
 mod review;
+mod session_inventory;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
 pub(crate) mod spec;
@@ -790,6 +791,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "artifact_verify" => artifacts::artifact_verify(ctx, &req).await,
         "artifact_compact" => artifacts::artifact_compact(ctx, &mut req).await,
         "session_list" => sessions::session_list(ctx, &req).await,
+        "session_inventory" => session_inventory::session_inventory(ctx, &req).await,
         "session_read" => sessions::session_read(ctx, &req).await,
         "session_message" => sessions::session_message(ctx, &mut req).await,
         "session_stop" => sessions::session_stop(ctx, &mut req).await,

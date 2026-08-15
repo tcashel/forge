@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Forty-one tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-two tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -262,6 +262,78 @@ pub struct WorkListParams {
 impl WorkListArgs {
     /// Project onto the shared envelope, omitting an absent repository so it
     /// remains byte-compatible with the operator-wide request.
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// Closed attempt activity exposed in MCP discovery. These values are
+/// intentionally distinct from Herdr's `working`/`unknown` lifecycle.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionInventoryActivityParam {
+    Running,
+    Revoking,
+    Completed,
+    Failed,
+    Reclaimed,
+    Stopped,
+}
+
+/// Typed MCP envelope for the bounded provider-session inventory.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInventoryArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Retained for envelope compatibility; inventory is operator-wide.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Canonical filters and keyset pagination.
+    #[serde(default)]
+    pub params: SessionInventoryParams,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInventoryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionInventoryActivityParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_historical: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl SessionInventoryArgs {
     fn into_envelope(self) -> EnvelopeArgs {
         let params = match serde_json::to_value(&self.params) {
             Ok(Value::Object(map)) => map,
@@ -875,6 +947,18 @@ impl ForgedServer {
     )]
     pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("session_list", args.0).await
+    }
+
+    /// Transaction-consistent provider-session inventory across durable work.
+    #[tool(
+        name = "session_inventory",
+        description = "Inventory durable provider attempts across runs and repositories. Read-only; pane ids and confirmed provider-session ids remain distinct."
+    )]
+    pub async fn session_inventory(
+        &self,
+        args: Parameters<SessionInventoryArgs>,
+    ) -> CallToolResult {
+        self.call("session_inventory", args.0.into_envelope()).await
     }
 
     /// Read recent output from a Herdr-backed session.

@@ -586,12 +586,73 @@ pub struct AttemptScoped {
 pub enum SessionCmd {
     /// List durable provider-session metadata for a run.
     List(RunScoped),
+    /// Inventory durable provider attempts across runs and repositories.
+    Inventory(SessionInventoryArgs),
     /// Read recent output from a Herdr-backed attempt.
     Read(SessionReadArgs),
     /// Queue an intervention, delivering live only when capability permits.
     Message(SessionMessageArgs),
     /// Revoke and confirmed-stop one attempt.
     Stop(SessionStopArgs),
+}
+
+/// Exact attempt activity accepted by `session inventory`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SessionInventoryActivityArg {
+    Running,
+    Revoking,
+    Completed,
+    Failed,
+    Reclaimed,
+    Stopped,
+}
+
+impl SessionInventoryActivityArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Revoking => "revoking",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Reclaimed => "reclaimed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// `session inventory` flags. Every selector is a canonical durable key.
+#[derive(Debug, Args)]
+pub struct SessionInventoryArgs {
+    /// Exact run id.
+    #[arg(long)]
+    pub run: Option<String>,
+    /// Exact epic id.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Exact canonical repository path.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Exact frozen packet provider.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Exact frozen packet model.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Exact attempt activity (not Herdr lifecycle).
+    #[arg(long, value_enum)]
+    pub activity: Option<SessionInventoryActivityArg>,
+    /// Include every terminal attempt, not only unresolved owned Herdr rows.
+    #[arg(long)]
+    pub include_historical: bool,
+    /// Page size (default 100, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Opaque continuation cursor from the preceding page.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `session read` flags.
@@ -1199,6 +1260,7 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Session { command } => match command {
             SessionCmd::List(_) => "session_list",
+            SessionCmd::Inventory(_) => "session_inventory",
             SessionCmd::Read(_) => "session_read",
             SessionCmd::Message(_) => "session_message",
             SessionCmd::Stop(_) => "session_stop",
@@ -1501,6 +1563,34 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({"run": a.run}),
                 ),
             ),
+            SessionCmd::Inventory(a) => {
+                let mut params = Map::new();
+                for (name, value) in [
+                    ("run", a.run),
+                    ("epic", a.epic),
+                    ("repository", a.repository),
+                    ("provider", a.provider),
+                    ("model", a.model),
+                    ("cursor", a.cursor),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(activity) = a.activity {
+                    params.insert("activity".to_owned(), json!(activity.as_str()));
+                }
+                if a.include_historical {
+                    params.insert("includeHistorical".to_owned(), json!(true));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "session_inventory",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             SessionCmd::Read(a) => (
                 "session_read",
                 request(

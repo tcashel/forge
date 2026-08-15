@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-one public core functions, the CLI path and the MCP tool path produce
+//! the forty-two public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -20,6 +20,9 @@ fn normalized(mut envelope: Value) -> Value {
         envelope["result"]["queue"]["asOf"] = json!("<sampled>");
     }
     if envelope["result"]["schema"] == json!("forged.work-history/1") {
+        envelope["result"]["asOf"] = json!("<sampled>");
+    }
+    if envelope["result"]["schema"] == json!("forged.provider-session-inventory/1") {
         envelope["result"]["asOf"] = json!("<sampled>");
     }
     if envelope["result"]["capturedAt"]["ledger"].is_string() {
@@ -110,6 +113,7 @@ fn all_forty_two_tools_match_their_cli_counterparts() {
         "run_stop",
         "run_submit",
         "session_list",
+        "session_inventory",
         "session_message",
         "session_read",
         "session_stop",
@@ -195,6 +199,25 @@ fn all_forty_two_tools_match_their_cli_counterparts() {
         assert!(
             history_schema.contains(value),
             "work_history advertises closed value {value}: {history_schema}"
+        );
+    }
+    let session_inventory = mcp.tool("session_inventory");
+    let inventory_schema = session_inventory
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "running",
+        "revoking",
+        "completed",
+        "failed",
+        "reclaimed",
+        "stopped",
+    ] {
+        assert!(
+            inventory_schema.contains(value),
+            "session_inventory advertises closed activity {value}: {inventory_schema}"
         );
     }
 
@@ -844,6 +867,35 @@ fn all_forty_two_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "session_list parity");
+
+    let cli = env
+        .forged(&[
+            "session",
+            "inventory",
+            "--repository",
+            &repository,
+            "--provider",
+            "codex",
+            "--activity",
+            "running",
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_inventory",
+        envelope(json!({
+            "repository": repository,
+            "provider": "codex",
+            "activity": "running",
+            "limit": 25,
+        })),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "session_inventory parity"
+    );
 
     let cli = env.forged(&["session", "read", "--attempt", "1"]).1;
     let tool = mcp.call_tool(

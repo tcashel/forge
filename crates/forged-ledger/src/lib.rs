@@ -32,6 +32,7 @@ mod observation;
 mod operations;
 mod owned_herdr;
 mod packets;
+mod provider_session_inventory;
 mod review_delivery;
 mod runs;
 mod slots;
@@ -51,6 +52,10 @@ pub use observation::{
     WORK_OBSERVATION_MAX_EVENT_LIMIT,
 };
 pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;
+pub use provider_session_inventory::{
+    ProviderSessionInventoryAfter, ProviderSessionInventoryQuery, ProviderSessionInventorySnapshot,
+    PROVIDER_SESSION_INVENTORY_EVENT_KINDS,
+};
 pub use types::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
     AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
