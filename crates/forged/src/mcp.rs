@@ -56,6 +56,24 @@ fn work_detail_tool_meta() -> MetaObject {
     app_tool_meta(WORK_DETAIL_URI)
 }
 
+fn app_resource_meta() -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert(
+        "ui".to_owned(),
+        serde_json::json!({
+            "csp": {
+                "baseUriDomains": [],
+                "connectDomains": [],
+                "frameDomains": [],
+                "resourceDomains": [],
+            },
+            "permissions": {},
+            "prefersBorder": true,
+        }),
+    );
+    meta
+}
+
 /// The operation envelope as a tool input — one envelope type on every
 /// surface. `schemaVersion` defaults to 1 and `idempotencyKey` to absent,
 /// exactly as the CLI defaults them.
@@ -868,15 +886,18 @@ impl ServerHandler for ForgedServer {
             Resource::new(OVERVIEW_URI, "forged-overview")
                 .with_title("Forged Control Plane")
                 .with_description("Compatibility view of Forged slice and epic execution.")
-                .with_mime_type(APP_MIME),
+                .with_mime_type(APP_MIME)
+                .with_meta(app_resource_meta()),
             Resource::new(OPERATIONS_OVERVIEW_URI, "forged-operations-overview")
                 .with_title("Forged Operations")
                 .with_description("Bounded planned, queued, active, blocked, and mergeable work.")
-                .with_mime_type(APP_MIME),
+                .with_mime_type(APP_MIME)
+                .with_meta(app_resource_meta()),
             Resource::new(WORK_DETAIL_URI, "forged-work-detail")
                 .with_title("Forged Work Detail")
                 .with_description("Exact read-only projection of one Forged run or epic.")
-                .with_mime_type(APP_MIME),
+                .with_mime_type(APP_MIME)
+                .with_meta(app_resource_meta()),
         ]))
     }
 
@@ -896,10 +917,12 @@ impl ServerHandler for ForgedServer {
                 ))
             }
         };
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(html, request.uri).with_mime_type(APP_MIME)
-        ])
-        .into())
+        Ok(
+            ReadResourceResult::new(vec![ResourceContents::text(html, request.uri)
+                .with_mime_type(APP_MIME)
+                .with_meta(app_resource_meta())])
+            .into(),
+        )
     }
 }
 

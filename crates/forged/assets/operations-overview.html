@@ -89,12 +89,14 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   const notify = (method, params = {}) => post({ jsonrpc: "2.0", method, params });
   let rpcId = 0;
   const pending = new Map();
+  const timers = new Set();
+  let observer = null;
   function request(method, params = {}) {
     const id = `forged-operations-${++rpcId}`;
     return new Promise((resolve, reject) => {
-      pending.set(id, { resolve, reject });
+      const timer = setTimeout(() => { timers.delete(timer); if (pending.delete(id)) reject(new Error(`${method} timed out`)); }, 120000);
+      timers.add(timer); pending.set(id, { resolve, reject, timer });
       post({ jsonrpc: "2.0", id, method, params });
-      setTimeout(() => { if (pending.delete(id)) reject(new Error(`${method} timed out`)); }, 120000);
     });
   }
   const host = { connected: false, capabilities: {}, context: {} };
@@ -191,7 +193,23 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
     if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
     if (state.loading) byId("foot").append(el("span", "", "refreshing"));
-    renderDetail(); reportSize();
+    renderDetail(); pushModelContext(data); reportSize();
+  }
+  let lastContext = "";
+  function pushModelContext(data) {
+    if (!host.capabilities.updateModelContext) return;
+    const lines = [
+      `Forged Operations for ${data.scope?.repository || "all repositories"}: ${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)} matching`,
+      `${fmt(data.counts?.live)} live; ${fmt(data.counts?.queued)} queued; ${fmt(data.counts?.attention)} attention; ${fmt(data.counts?.reviewReady)} review-ready`,
+    ];
+    for (const group of arr(data.queue?.groups)) {
+      for (const entry of arr(group.entries).slice(0, 3)) lines.push(`- ${group.code}: ${entry.id} ${titleFor(entry)}`);
+    }
+    if (state.detail) lines.push(`selected ${state.detail.workRef?.kind || state.detail.kind} ${state.detail.id}: ${stateFor(state.detail)}`);
+    const text = lines.join("\n").slice(0, 3000);
+    if (text === lastContext) return;
+    lastContext = text;
+    request("ui/update-model-context", { content: [{ type: "text", text }] }).catch(() => {});
   }
   async function refresh() {
     if (!host.connected || !host.capabilities.serverTools || state.loading) return;
@@ -212,15 +230,15 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   window.addEventListener("message", event => {
     const message = event.data; if (!message || message.jsonrpc !== "2.0") return;
-    if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
+    if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); clearTimeout(p.timer); timers.delete(p.timer); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
     if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
     else if (message.method === "ui/notifications/tool-result") ingest(message.params);
     else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
     else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
-    else if (message.method === "ui/resource-teardown" && message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} });
+    else if (message.method === "ui/resource-teardown") { observer?.disconnect(); observer = null; for (const timer of timers) clearTimeout(timer); timers.clear(); pending.clear(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
   });
   request("ui/initialize", { protocolVersion: PROTOCOL_VERSION, appInfo: APP_INFO, appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } }).then(result => {
-    host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); new ResizeObserver(reportSize).observe(document.body);
+    host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); observer = new ResizeObserver(reportSize); observer.observe(document.body);
   }).catch(() => { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); });
   render();
 })();

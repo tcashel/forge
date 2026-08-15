@@ -241,6 +241,21 @@ fn all_forty_tools_match_their_cli_counterparts() {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Control Plane")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp/connectDomains"),
+        Some(&json!([])),
+        "Apps request no network connections"
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp/resourceDomains"),
+        Some(&json!([])),
+        "Apps load no external resources"
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({})),
+        "Apps request no camera, microphone, location, or clipboard permission"
+    );
     let app = mcp.read_resource("ui://forged/operations-overview.html");
     assert!(app
         .pointer("/contents/0/text")

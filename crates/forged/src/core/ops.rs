@@ -3590,6 +3590,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 },
             },
             "coverage": {
+                "total": matching_total,
                 "available": total,
                 "matching": matching_total,
                 "shown": shown_total,

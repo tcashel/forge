@@ -52,6 +52,36 @@ async fn live_plan_discovery_reports_n_plus_one_coverage_and_hydrates_one_batch(
 }
 
 #[test]
+fn malformed_hydration_fails_the_plan_source_closed_without_hiding_durable_work() {
+    let env = TestEnv::new("forged-operations-malformed-plan");
+    env.forged(&["init"]);
+    fabricate_run(&env, "durable-safe");
+    env.set_bead_field("plan-bad", "status", "open");
+    env.set_bead_field("plan-bad", "title", "Malformed dependencies");
+    env.set_bead_field("plan-bad", "dependencies", r#"{"not":"an array"}"#);
+
+    let before = env.bd_calls().len();
+    let (code, response) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "durable projection remains available: {response}");
+    assert_eq!(
+        response["result"]["sourceHealth"]["beads"]["state"],
+        json!("unavailable")
+    );
+    assert_eq!(
+        response["result"]["sourceHealth"]["plan"]["state"],
+        json!("unavailable")
+    );
+    let rows = entries(&response);
+    assert!(rows.contains_key("durable-safe"), "{response}");
+    assert!(!rows.contains_key("plan-bad"), "{response}");
+    assert_eq!(
+        env.bd_calls()[before..].len(),
+        2,
+        "malformed hydration is terminal, not retried per node"
+    );
+}
+
+#[test]
 fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     let env = TestEnv::new("forged-operations-plan");
     env.forged(&["init"]);
