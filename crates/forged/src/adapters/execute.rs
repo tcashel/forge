@@ -13,6 +13,7 @@ use forged_ledger::{EffectClass, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
+    ProviderStreamRenderModeV1, ProviderStreamRequestV1,
 };
 use forged_types::{
     Deliverable, ErrorCode, OperationRequest, Outcome, Stage, StageContract, WorkPacket,
@@ -936,19 +937,14 @@ async fn run_attempt(
     };
     let provider_session_candidate = invocation.session_hint.clone();
 
-    // 3. Prefix the pid capture (no exec — the host appends the sentinel to
-    // the same shell, and `$$` is that shell's pid either way) and spawn
-    // with PATH passed explicitly. A stale pid file from a prior attempt is
-    // removed first: absence means "spawn never happened", and only this
-    // attempt's shell may write the file back.
+    // 3. A stale pid file from a prior attempt is removed first: absence
+    // means "spawn never happened", and only this attempt's shell may write
+    // the file back. The exact private runner command is built only after
+    // host selection, because display is enabled solely for an owned Herdr
+    // provider pane.
     let pid_path = dirs.provider_pid();
     let _ = std::fs::remove_file(&pid_path);
     let _ = std::fs::remove_file(dirs.provider_lstart());
-    let shell_line = format!(
-        "echo $$ > {}; {}",
-        pid_path.to_string_lossy(),
-        invocation.shell_line
-    );
     let status_base = dirs.status();
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
@@ -1087,6 +1083,111 @@ async fn run_attempt(
     };
     let attach_hint =
         (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
+    let mut layout_mutation = layout_mutation;
+    let render_mode = if host_kind == "herdr" {
+        ProviderStreamRenderModeV1::OwnedHerdrPane
+    } else {
+        ProviderStreamRenderModeV1::Disabled
+    };
+    let provider_stream_request = match ProviderStreamRequestV1::for_attempt(
+        &packet,
+        &invocation,
+        &dirs,
+        &run_root,
+        attempt_id,
+        render_mode,
+    )
+    .map_err(Failure::from)
+    {
+        Ok(request) => request,
+        Err(failure) => {
+            crate::core::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                None,
+                Some(&failure.to_string()),
+            )
+            .await;
+            let note = format!("transport: private provider runner request failed: {failure}");
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "runner-request",
+            )
+            .await;
+        }
+    };
+    if let Err(failure) = crate::core::artifacts::materialize_provider_stream_request(
+        &run_root,
+        &dirs,
+        &provider_stream_request,
+    ) {
+        crate::core::herdr_layout::finish_mutation(
+            ctx,
+            layout_mutation.take(),
+            None,
+            Some(&failure.to_string()),
+        )
+        .await;
+        let note = format!("transport: private provider runner request was not durable: {failure}");
+        return fail_pre_spawn_transport(
+            ctx,
+            &packet,
+            attempt_id,
+            &claim_token,
+            note,
+            "runner-request",
+        )
+        .await;
+    }
+    let executable = match std::env::current_exe() {
+        Ok(executable) => executable,
+        Err(error) => {
+            crate::core::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                None,
+                Some(&error.to_string()),
+            )
+            .await;
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                "transport: exact Forged executable identity is unavailable".to_owned(),
+                "runner-executable",
+            )
+            .await;
+        }
+    };
+    let shell_line = match forged_provider::provider_stream_shell_line(&executable, &dirs)
+        .map_err(Failure::from)
+    {
+        Ok(shell_line) => shell_line,
+        Err(failure) => {
+            crate::core::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                None,
+                Some(&failure.to_string()),
+            )
+            .await;
+            let note = format!("transport: exact private provider runner is unsafe: {failure}");
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "runner-executable",
+            )
+            .await;
+        }
+    };
     // The bounded-orphan window (operator-adjudicated, accepted as a
     // residual): a crash between here and the shell writing `provider.pid`
     // leaves a provider no later process can identify, so no later process
@@ -1099,7 +1200,6 @@ async fn run_attempt(
     // `adapters::ports`: an attempt whose identity never materialized past
     // the grace window is failed as a transport failure, never an
     // unavailable port.
-    let mut layout_mutation = layout_mutation;
     failpoint::hit("provider.spawn.before");
     let prepared = match host.prepare(&packet.worktree, &shell_line, &env).await {
         Ok(prepared) => prepared,
@@ -1257,7 +1357,7 @@ async fn run_attempt(
         "boundary",
     )
     .await?;
-    let session_evidence = json!({
+    let mut session_evidence = json!({
         "host": host_kind,
         "sessionId": session.as_str(),
         "socketPath": socket_path,
@@ -1382,6 +1482,53 @@ async fn run_attempt(
         handle.abort();
     }
 
+    // The shell sentinel is the runner exit. Its closed status proves the
+    // provider termination/capture split without admitting renderer output
+    // into execution truth. A missing or mismatched status is transport on
+    // the natural terminal path; renderer-only degradation is diagnostic.
+    let provider_stream_transport = match liveness {
+        forged_host::Liveness::Exited(code) => {
+            match forged_provider::load_provider_stream_status(&provider_stream_request, code) {
+                Ok(status) => {
+                    let failure = status.transport_failure();
+                    if let Value::Object(metadata) = &mut session_evidence {
+                        metadata.insert(
+                            "providerStream".to_owned(),
+                            serde_json::to_value(&status).unwrap_or_else(|_| {
+                                json!({"status": "invalid", "errorClass": "status-serialization"})
+                            }),
+                        );
+                    }
+                    failure.map(|failure| {
+                        format!("transport: private provider runner {}", failure.as_str())
+                    })
+                }
+                Err(failure) => {
+                    if let Value::Object(metadata) = &mut session_evidence {
+                        metadata.insert(
+                            "providerStream".to_owned(),
+                            json!({"status": "invalid", "errorClass": failure.as_str()}),
+                        );
+                    }
+                    Some(format!(
+                        "transport: private provider runner {}",
+                        failure.as_str()
+                    ))
+                }
+            }
+        }
+        forged_host::Liveness::Vanished => {
+            if let Value::Object(metadata) = &mut session_evidence {
+                metadata.insert(
+                    "providerStream".to_owned(),
+                    json!({"status": "unavailable", "errorClass": "session-vanished"}),
+                );
+            }
+            None
+        }
+        forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
+    };
+
     // Provider output was streamed to private names. Publish those names
     // only after the provider is terminal; no successor shares this attempt
     // directory, and the manifest written below is the completion marker.
@@ -1406,18 +1553,22 @@ async fn run_attempt(
     .await;
 
     // 6. Harvest per the extraction contract.
-    let harvest = match liveness {
-        forged_host::Liveness::Vanished => {
-            Harvest::Transport("transport: session vanished".to_owned())
-        }
-        forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
-            "codex" => {
-                let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
-                harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
+    let harvest = if let Some(note) = provider_stream_transport {
+        Harvest::Transport(note)
+    } else {
+        match liveness {
+            forged_host::Liveness::Vanished => {
+                Harvest::Transport("transport: session vanished".to_owned())
             }
-            _ => harvest_claude(&out, &packet.result_schema, &packet_id),
-        },
-        forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
+            forged_host::Liveness::Exited(_code) => match packet.provider_hints.provider.as_str() {
+                "codex" => {
+                    let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
+                    harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
+                }
+                _ => harvest_claude(&out, &packet.result_schema, &packet_id),
+            },
+            forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
+        }
     };
 
     let (artifact_outcome, artifact_detail) = match &harvest {
@@ -1915,7 +2066,39 @@ mod settle_tests {
             );
             tokio::time::sleep(Duration::from_millis(20)).await;
         };
-        std::fs::write(packet_dir.join("out.jsonl"), capture).expect("stream capture");
+        let request: Value = serde_json::from_slice(
+            &std::fs::read(packet_dir.join(".provider-stream-request.json"))
+                .expect("private runner request"),
+        )
+        .expect("request json");
+        assert_eq!(
+            request["renderMode"], "owned-herdr-pane",
+            "Herdr-owned provider sessions must request the bounded renderer"
+        );
+        let capture_bytes = capture.len();
+        std::fs::write(packet_dir.join(".out.jsonl.incomplete"), capture).expect("stream capture");
+        std::fs::write(
+            packet_dir.join(".provider-stream-status.json"),
+            serde_json::to_vec_pretty(&json!({
+                "schema": "forged.provider-stream-status/1",
+                "runId": request["runId"],
+                "packetId": request["packetId"],
+                "attemptId": request["attemptId"],
+                "provider": "claude",
+                "termination": {"exitCode": 0, "signal": null},
+                "capture": "complete",
+                // The mock does not execute a terminal renderer. Degradation
+                // is presentation-only and must not change settlement.
+                "render": "degraded",
+                "capturedBytes": capture_bytes,
+                "rendererBytesRead": 0,
+                "emittedEvents": 0,
+                "droppedEvents": 0,
+                "failure": null,
+            }))
+            .expect("runner status json"),
+        )
+        .expect("runner status");
         std::fs::write(
             packet_dir.join("provider.pid"),
             exited_provider_pid().to_string(),

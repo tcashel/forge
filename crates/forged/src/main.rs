@@ -24,6 +24,9 @@ use crate::config::ForgedConfig;
 use crate::core::{Ctx, Failure};
 
 fn main() {
+    if let Some(code) = provider_stream_dispatch() {
+        std::process::exit(code);
+    }
     let args = cli::Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -39,6 +42,33 @@ fn main() {
     };
     let code = runtime.block_on(run(args));
     std::process::exit(code);
+}
+
+/// Detect the exact private runner argv before Clap, tracing, runtime,
+/// controller identity, config, ledger, migration, service, or MCP startup.
+/// It deliberately emits no `OperationResponse`.
+fn provider_stream_dispatch() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _executable = args.next()?;
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(forged_provider::PROVIDER_STREAM_ARG)) {
+        return None;
+    }
+    let Some(request_path) = args.next() else {
+        eprintln!("forged: private provider-stream request path is missing");
+        return Some(125);
+    };
+    if args.next().is_some() {
+        eprintln!("forged: private provider-stream argv is invalid");
+        return Some(125);
+    }
+    Some(
+        forged_provider::run_provider_stream(std::path::Path::new(&request_path)).unwrap_or_else(
+            |error| {
+                eprintln!("forged: private provider-stream runner failed: {error}");
+                125
+            },
+        ),
+    )
 }
 
 /// A failure BEFORE dispatch still owes stdout an `OperationResponse`: an

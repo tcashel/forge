@@ -7,7 +7,7 @@ use std::os::fd::OwnedFd;
 use std::path::{Component, Path};
 
 use forged_ledger::{AttemptArtifactRow, NewAttemptArtifact};
-use forged_provider::PacketDirs;
+use forged_provider::{PacketDirs, ProviderStreamRequestV1};
 use forged_types::{OperationRequest, OperationResponse, WorkPacket};
 use nix::errno::Errno;
 use nix::fcntl::{open, openat, AtFlags, OFlag};
@@ -427,6 +427,19 @@ pub(crate) fn materialize_prompt(
 ) -> Result<(), Failure> {
     let prompt = relative(run_root, &dirs.prompt())?;
     atomic_write_once_run(run_root, &prompt, bytes)
+}
+
+/// Publish the exact hidden-runner request through the same held run-root
+/// capability as immutable attempt evidence. The private control file is not
+/// part of the manifest inventory and carries no transcript or credential.
+pub(crate) fn materialize_provider_stream_request(
+    run_root: &Path,
+    dirs: &PacketDirs,
+    request: &ProviderStreamRequestV1,
+) -> Result<(), Failure> {
+    let relative = relative(run_root, &dirs.provider_stream_request())?;
+    let bytes = request.to_bytes().map_err(Failure::from)?;
+    atomic_write_once_run(run_root, &relative, &bytes)
 }
 
 /// Promote a provider's private streaming target after it is terminal. Every
