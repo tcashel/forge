@@ -27,7 +27,7 @@ pub(crate) const COLUMNS: &str = "ownership_id, schema, owner_kind, subject_kind
     cleanup_reason, cleanup_release, cleanup_token, cleanup_lease_until, \
     cleanup_retry_budget, cleanup_retry_used, next_cleanup_at, last_cleanup_error, \
     registered_at, command_started_at, cleanup_requested_at, \
-    last_cleanup_attempt_at, released_at, updated_at";
+    last_cleanup_attempt_at, released_at, updated_at, layout_id";
 
 fn unsigned_column<T>(row: &rusqlite::Row<'_>, index: usize, what: &str) -> rusqlite::Result<T>
 where
@@ -138,6 +138,7 @@ pub(crate) fn owned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedHerdrS
         last_cleanup_attempt_at: row.get(27)?,
         released_at: row.get(28)?,
         updated_at: row.get(29)?,
+        layout_id: row.get(30)?,
     })
 }
 
@@ -304,6 +305,43 @@ fn validate_registration_tx(
                     }
                 }
             }
+        }
+    }
+    if let Some(layout_id) = identity.layout_id.as_deref() {
+        validate_nonempty(layout_id, "layout id")?;
+        let subject = identity.owner.subject();
+        let layout: Option<(String, String, String, i64, String, String)> = conn
+            .query_row(
+                "SELECT subject_kind, subject_id, socket_path, protocol, \
+                        lifecycle_state, cleanup_state \
+                 FROM herdr_layouts WHERE layout_id = ?1",
+                [layout_id],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                        row.get(5)?,
+                    ))
+                },
+            )
+            .optional()?;
+        if layout
+            != Some((
+                subject.kind.as_str().to_owned(),
+                subject.id.clone(),
+                identity.socket_path.clone(),
+                i64::from(identity.protocol),
+                "registered".to_owned(),
+                "not-requested".to_owned(),
+            ))
+        {
+            return Err(refused(
+                ErrorCode::OperationInProgress,
+                "owned Herdr session does not join the exact active layout",
+            ));
         }
     }
     Ok(())
@@ -607,10 +645,10 @@ impl Ledger {
                    run_id, packet_id, attempt_id, claim_token, controller_generation,
                    pane_id, socket_path, protocol, sentinel_path, lifecycle_state,
                    cleanup_state, cleanup_retry_budget, cleanup_retry_used,
-                   registered_at, updated_at
+                   registered_at, updated_at, layout_id
                  ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10,
                            ?11, ?12, ?13, ?14, 'registered', 'not-requested',
-                           ?15, 0, ?16, ?16)",
+                           ?15, 0, ?16, ?16, ?17)",
                 rusqlite::params![
                     identity.ownership_id,
                     identity.schema,
@@ -628,6 +666,7 @@ impl Ledger {
                     identity.sentinel_path,
                     i64::from(OWNED_HERDR_CLEANUP_RETRY_BUDGET),
                     now,
+                    identity.layout_id,
                 ],
             );
             if let Err(error) = inserted {

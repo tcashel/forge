@@ -10,8 +10,8 @@ use std::collections::HashMap;
 use forged_types::{
     AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionRateLimitV1,
     AdmissionResourceClass, AdmissionSpendV1, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
-    ProviderHints, RunId, Stage,
+    HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, OwnedHerdrOwnerV1,
+    OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1, ProviderHints, RunId, Stage,
 };
 
 use crate::error::{refused, LedgerError};
@@ -532,6 +532,9 @@ pub struct OwnedHerdrSessionRow {
     pub last_cleanup_attempt_at: Option<String>,
     pub released_at: Option<String>,
     pub updated_at: String,
+    /// Nullable migration-017 join. Pre-layout and degraded placements have
+    /// no value and are never inferred from workspace/tab labels.
+    pub layout_id: Option<String>,
 }
 
 impl OwnedHerdrSessionRow {
@@ -580,6 +583,7 @@ impl OwnedHerdrSessionRow {
             socket_path: self.socket_path.clone(),
             protocol: self.protocol,
             sentinel_path: self.sentinel_path.clone(),
+            layout_id: self.layout_id.clone(),
         })
     }
 }
@@ -589,6 +593,278 @@ impl OwnedHerdrSessionRow {
 pub enum OwnedHerdrCleanupRetry {
     Scheduled(OwnedHerdrSessionRow),
     Exhausted(OwnedHerdrSessionRow),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutLifecycleState {
+    Creating,
+    Registered,
+    Degraded,
+    Replaced,
+}
+
+impl HerdrLayoutLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Registered => "registered",
+            Self::Degraded => "degraded",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutLifecycleState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "creating" => Ok(Self::Creating),
+            "registered" => Ok(Self::Registered),
+            "degraded" => Ok(Self::Degraded),
+            "replaced" => Ok(Self::Replaced),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout lifecycle state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutDegradationReason {
+    CreationAmbiguous,
+    RegistrationFailed,
+    VerificationMissing,
+    VerificationMismatch,
+    PlacementFailed,
+}
+
+impl HerdrLayoutDegradationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CreationAmbiguous => "creation-ambiguous",
+            Self::RegistrationFailed => "registration-failed",
+            Self::VerificationMissing => "verification-missing",
+            Self::VerificationMismatch => "verification-mismatch",
+            Self::PlacementFailed => "placement-failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutDegradationReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "creation-ambiguous" => Ok(Self::CreationAmbiguous),
+            "registration-failed" => Ok(Self::RegistrationFailed),
+            "verification-missing" => Ok(Self::VerificationMissing),
+            "verification-mismatch" => Ok(Self::VerificationMismatch),
+            "placement-failed" => Ok(Self::PlacementFailed),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout degradation reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Released,
+}
+
+impl HerdrLayoutCleanupState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupReason {
+    SubjectTerminal,
+    LayoutReplaced,
+    LayoutDegraded,
+}
+
+impl HerdrLayoutCleanupReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubjectTerminal => "subject-terminal",
+            Self::LayoutReplaced => "layout-replaced",
+            Self::LayoutDegraded => "layout-degraded",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "subject-terminal" => Ok(Self::SubjectTerminal),
+            "layout-replaced" => Ok(Self::LayoutReplaced),
+            "layout-degraded" => Ok(Self::LayoutDegraded),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupRelease {
+    Closed,
+    PaneNotFound,
+}
+
+impl HerdrLayoutCleanupRelease {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::PaneNotFound => "pane-not-found",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupRelease {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "closed" => Ok(Self::Closed),
+            "pane-not-found" => Ok(Self::PaneNotFound),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup release: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// One migration-017 row in DDL order. A creating or ambiguous row has no
+/// locator; [`HerdrLayoutRow::identity`] accepts registered locators only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrLayoutRow {
+    pub layout_id: String,
+    pub schema: String,
+    pub revision: u32,
+    pub subject_kind: HerdrLayoutSubjectKind,
+    pub subject_id: String,
+    pub socket_path: String,
+    pub protocol: u32,
+    pub workspace_id: String,
+    pub tab_id: Option<String>,
+    pub root_pane_id: Option<String>,
+    pub display_label: String,
+    pub lifecycle_state: HerdrLayoutLifecycleState,
+    pub degradation_reason: Option<HerdrLayoutDegradationReason>,
+    pub last_error: Option<String>,
+    pub creation_token: Option<String>,
+    pub creation_lease_until: Option<String>,
+    pub mutation_token: Option<String>,
+    pub mutation_lease_until: Option<String>,
+    pub cleanup_state: HerdrLayoutCleanupState,
+    pub cleanup_reason: Option<HerdrLayoutCleanupReason>,
+    pub cleanup_release: Option<HerdrLayoutCleanupRelease>,
+    pub cleanup_token: Option<String>,
+    pub cleanup_lease_until: Option<String>,
+    pub cleanup_retry_budget: u32,
+    pub cleanup_retry_used: u32,
+    pub next_cleanup_at: Option<String>,
+    pub last_cleanup_error: Option<String>,
+    pub predecessor_layout_id: Option<String>,
+    pub created_at: String,
+    pub registered_at: Option<String>,
+    pub replaced_at: Option<String>,
+    pub cleanup_requested_at: Option<String>,
+    pub last_cleanup_attempt_at: Option<String>,
+    pub released_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl HerdrLayoutRow {
+    pub fn identity(&self) -> Result<HerdrLayoutV1, LedgerError> {
+        let identity = HerdrLayoutV1 {
+            schema: self.schema.clone(),
+            layout_id: self.layout_id.clone(),
+            revision: self.revision,
+            subject: HerdrLayoutSubjectV1 {
+                kind: self.subject_kind,
+                id: self.subject_id.clone(),
+            },
+            socket_path: self.socket_path.clone(),
+            protocol: self.protocol,
+            workspace_id: self.workspace_id.clone(),
+            tab_id: self.tab_id.clone().ok_or_else(|| {
+                refused(
+                    ErrorCode::OperationInProgress,
+                    "Herdr layout has no tab locator",
+                )
+            })?,
+            root_pane_id: self.root_pane_id.clone().ok_or_else(|| {
+                refused(
+                    ErrorCode::OperationInProgress,
+                    "Herdr layout has no root-pane locator",
+                )
+            })?,
+            display_label: self.display_label.clone(),
+            predecessor_layout_id: self.predecessor_layout_id.clone(),
+        };
+        identity.validate().map_err(|error| {
+            refused(
+                ErrorCode::InvalidRequest,
+                format!("invalid stored Herdr layout identity: {error}"),
+            )
+        })?;
+        Ok(identity)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrLayoutCreation {
+    Reserved(HerdrLayoutRow),
+    Existing(HerdrLayoutRow),
+    Contended(HerdrLayoutRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupRetry {
+    Scheduled(HerdrLayoutRow),
+    Exhausted(HerdrLayoutRow),
 }
 
 /// A run's lifecycle state (`runs.state`).

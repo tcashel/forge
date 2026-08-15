@@ -8,8 +8,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use forged_host::{
-    Confirmed, HerdrCloseOutcome, HerdrControl, HerdrHost, HerdrSessionIdentity, HostError,
-    Liveness, SessionHost, HERDR_PROTOCOL_VERSION,
+    Confirmed, HerdrCloseOutcome, HerdrControl, HerdrHost, HerdrLayoutInspection,
+    HerdrLayoutTarget, HerdrSessionIdentity, HerdrTabCreateError, HostError, Liveness, SessionHost,
+    HERDR_PROTOCOL_VERSION,
 };
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
@@ -143,6 +144,16 @@ impl Mock {
             .unwrap_or(Value::Null)
     }
 
+    fn all_params_of(&self, method: &str) -> Vec<Value> {
+        self.requests
+            .lock()
+            .expect("requests lock")
+            .iter()
+            .filter(|(candidate, _)| candidate == method)
+            .map(|(_, params)| params.clone())
+            .collect()
+    }
+
     fn connection_count(&self) -> usize {
         self.connections.load(Ordering::SeqCst)
     }
@@ -173,11 +184,42 @@ fn pong(protocol: u32) -> Value {
 }
 
 fn pane_info(pane_id: &str) -> Value {
+    pane_info_at(pane_id, "ws-1", "tab-1")
+}
+
+fn pane_info_at(pane_id: &str, workspace_id: &str, tab_id: &str) -> Value {
     json!({"type": "pane_info", "pane": {
-        "pane_id": pane_id, "workspace_id": "ws-1", "tab_id": "tab-1",
+        "pane_id": pane_id, "workspace_id": workspace_id, "tab_id": tab_id,
         "terminal_id": "term-1", "focused": false, "agent_status": "idle",
         "revision": 1,
     }})
+}
+
+fn tab_created(workspace: &str, tab: &str, root: &str) -> Value {
+    json!({
+        "type": "tab_created",
+        "tab": {"workspace_id": workspace, "tab_id": tab},
+        "root_pane": {"pane_id": root},
+    })
+}
+
+fn pane_layout(workspace: &str, tab: &str, panes: &[(&str, u16, u16)]) -> Value {
+    json!({
+        "type": "pane_layout",
+        "layout": {
+            "workspace_id": workspace,
+            "tab_id": tab,
+            "zoomed": false,
+            "area": {"x": 0, "y": 0, "width": 200, "height": 100},
+            "focused_pane_id": panes.first().map_or("", |pane| pane.0),
+            "panes": panes.iter().map(|(id, width, height)| json!({
+                "pane_id": id,
+                "focused": false,
+                "rect": {"x": 0, "y": 0, "width": width, "height": height},
+            })).collect::<Vec<_>>(),
+            "splits": [],
+        }
+    })
 }
 
 /// A live pane with a ready shell and a DRAINED foreground.
@@ -1160,4 +1202,303 @@ async fn placement_failure_degrades_to_an_untargeted_split() {
         mock.params_of("pane.split").get("workspace_id").is_none(),
         "an unresolved workspace must leave the split untargeted"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Durable per-subject tabs and deterministic exact-owned-pane placement.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn tab_creation_is_unfocused_and_returns_exact_root_identity() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        "events.subscribe" => vec![Action::Respond(json!({"type": "ok"}))],
+        "tab.create" => vec![Action::Respond(tab_created(
+            "workspace:1",
+            "tab:7",
+            "pane:root",
+        ))],
+        other => panic!("unexpected request {other}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect");
+    let created = host
+        .create_layout_tab(
+            "workspace:1",
+            "Durable title [run:run-1]",
+            cwd.path(),
+            &HashMap::from([("SAFE".to_owned(), "value".to_owned())]),
+        )
+        .await
+        .expect("create tab");
+    assert_eq!(created.workspace_id, "workspace:1");
+    assert_eq!(created.tab_id, "tab:7");
+    assert_eq!(created.root_pane_id, "pane:root");
+    assert_eq!(
+        mock.params_of("tab.create"),
+        json!({
+            "workspace_id": "workspace:1",
+            "label": "Durable title [run:run-1]",
+            "cwd": cwd.path().to_str().expect("utf8"),
+            "env": {"SAFE": "value"},
+            "focus": false,
+        })
+    );
+    assert_eq!(mock.count_of("pane.send_input"), 0);
+}
+
+#[tokio::test]
+async fn lost_tab_create_response_is_typed_ambiguous_and_never_label_scanned() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        "events.subscribe" => vec![Action::Respond(json!({"type": "ok"}))],
+        "tab.create" => vec![Action::Hangup],
+        other => panic!("unexpected request {other}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect");
+    assert!(matches!(
+        host.create_layout_tab("workspace:1", "collision", cwd.path(), &HashMap::new())
+            .await,
+        Err(HerdrTabCreateError::Ambiguous(_))
+    ));
+    assert_eq!(
+        mock.methods(),
+        vec!["ping", "events.subscribe", "tab.create"]
+    );
+}
+
+#[tokio::test]
+async fn exact_layout_chooses_largest_owned_pane_ties_by_id_and_splits_larger_axis() {
+    const NEW_PANE: &str = "pane:new";
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.layout", 1) => vec![Action::Respond(pane_layout(
+            "workspace:1",
+            "tab:1",
+            &[
+                ("pane:root", 20, 20),
+                ("pane:b", 80, 20),
+                ("pane:a", 40, 40),
+                ("pane:foreign-huge", 200, 100),
+            ],
+        ))],
+        ("pane.split", 1) => vec![Action::Respond(pane_info_at(
+            NEW_PANE,
+            "workspace:1",
+            "tab:1",
+        ))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(NEW_PANE))],
+        ("pane.send_input", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let target = HerdrLayoutTarget::new(
+        "layout:1",
+        "workspace:1",
+        "tab:1",
+        "pane:root",
+        ["pane:a".to_owned(), "pane:b".to_owned()],
+    )
+    .expect("target");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_layout(target);
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("prepare");
+    assert_eq!(prepared.herdr_layout_id(), Some("layout:1"));
+    assert_eq!(prepared.herdr_layout_degradation(), None);
+    assert_eq!(mock.count_of("pane.send_input"), 0);
+    let split = mock.params_of("pane.split");
+    assert_eq!(split["workspace_id"], "workspace:1");
+    assert_eq!(
+        split["target_pane_id"], "pane:a",
+        "equal area ties by opaque id"
+    );
+    assert_eq!(split["direction"], "right");
+    assert_eq!(split["ratio"], json!(0.5));
+    assert_eq!(split["focus"], json!(false));
+    host.start(prepared).await.expect("start");
+}
+
+#[tokio::test]
+async fn disappearing_target_refreshes_once_under_the_same_layout() {
+    const NEW_PANE: &str = "pane:retry";
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.layout", 1) => vec![Action::Respond(pane_layout(
+            "workspace:1",
+            "tab:1",
+            &[("pane:root", 40, 40), ("pane:a", 100, 20)],
+        ))],
+        ("pane.split", 1) => vec![PANE_NOT_FOUND],
+        ("pane.layout", 2) => vec![Action::Respond(pane_layout(
+            "workspace:1",
+            "tab:1",
+            &[("pane:root", 20, 100)],
+        ))],
+        ("pane.split", 2) => vec![Action::Respond(pane_info_at(
+            NEW_PANE,
+            "workspace:1",
+            "tab:1",
+        ))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(NEW_PANE))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_layout(
+            HerdrLayoutTarget::new(
+                "layout:retry",
+                "workspace:1",
+                "tab:1",
+                "pane:root",
+                ["pane:a".to_owned()],
+            )
+            .expect("target"),
+        );
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("prepare");
+    assert_eq!(prepared.herdr_layout_id(), Some("layout:retry"));
+    let splits = mock.all_params_of("pane.split");
+    assert_eq!(splits.len(), 2);
+    assert_eq!(splits[0]["target_pane_id"], "pane:a");
+    assert_eq!(splits[1]["target_pane_id"], "pane:root");
+    assert_eq!(splits[1]["direction"], "down");
+}
+
+#[tokio::test]
+async fn missing_layout_falls_back_without_changing_the_selected_herdr_host() {
+    const FALLBACK_PANE: &str = "pane:fallback";
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.layout", 1) => vec![PANE_NOT_FOUND],
+        ("pane.split", 1) => vec![Action::Respond(pane_info(FALLBACK_PANE))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(FALLBACK_PANE))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_layout(
+            HerdrLayoutTarget::new(
+                "layout:missing",
+                "workspace:1",
+                "tab:1",
+                "pane:root",
+                Vec::<String>::new(),
+            )
+            .expect("target"),
+        );
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("fallback prepare");
+    assert_eq!(prepared.herdr_layout_id(), None);
+    assert!(prepared
+        .herdr_layout_degradation()
+        .is_some_and(|detail| detail.contains("root anchor is missing")));
+    let fallback = mock.params_of("pane.split");
+    assert!(fallback.get("target_pane_id").is_none());
+    assert!(fallback.get("ratio").is_none());
+    assert_eq!(fallback["focus"], json!(false));
+}
+
+#[tokio::test]
+async fn split_response_outside_durable_layout_is_closed_before_fallback() {
+    const WRONG_PANE: &str = "pane:wrong-layout";
+    const FALLBACK_PANE: &str = "pane:fallback-after-mismatch";
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.layout", 1) => vec![Action::Respond(pane_layout(
+            "workspace:1",
+            "tab:1",
+            &[("pane:root", 100, 40)],
+        ))],
+        ("pane.split", 1) => vec![Action::Respond(pane_info_at(
+            WRONG_PANE,
+            "workspace:foreign",
+            "tab:foreign",
+        ))],
+        ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.split", 2) => vec![Action::Respond(pane_info(FALLBACK_PANE))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(FALLBACK_PANE))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let cwd = tempfile::tempdir().expect("cwd");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect")
+        .with_layout(
+            HerdrLayoutTarget::new(
+                "layout:mismatch",
+                "workspace:1",
+                "tab:1",
+                "pane:root",
+                Vec::<String>::new(),
+            )
+            .expect("target"),
+        );
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("fallback prepare");
+    assert_eq!(prepared.herdr_layout_id(), None);
+    assert!(prepared
+        .herdr_layout_degradation()
+        .is_some_and(|detail| detail.contains("outside the durable layout")));
+    assert_eq!(mock.params_of("pane.close")["pane_id"], WRONG_PANE);
+    let splits = mock.all_params_of("pane.split");
+    assert_eq!(splits.len(), 2);
+    assert_eq!(splits[0]["target_pane_id"], "pane:root");
+    assert!(splits[1].get("target_pane_id").is_none());
+    assert_eq!(mock.count_of("pane.send_input"), 0);
+}
+
+#[tokio::test]
+async fn layout_inspection_distinguishes_exact_missing_from_unknown_failure() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.layout", 1) => vec![PANE_NOT_FOUND],
+        ("pane.layout", 2) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "temporary",
+        }],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("base");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect");
+    assert_eq!(
+        host.inspect_layout("pane:missing").await.expect("missing"),
+        HerdrLayoutInspection::Missing
+    );
+    assert!(matches!(
+        host.inspect_layout("pane:unknown").await,
+        Err(HostError::Unavailable { .. })
+    ));
 }

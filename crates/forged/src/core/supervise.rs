@@ -665,6 +665,9 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
     let cleanup = super::herdr_ownership::reconcile(ctx).await?;
+    // Root anchors are eligible only after every exact linked pane cleanup
+    // has converged, so this pass deliberately follows pane reconciliation.
+    let layout_cleanup = super::herdr_layout::reconcile(ctx).await;
     let orphaned = {
         let now = started_at.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -815,11 +818,11 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     })
     .await?;
     let cleanup_wake_at = super::herdr_ownership::earliest_wake(ctx, &wake_now).await?;
-    let next_wake_at = match (desired_wake_at, cleanup_wake_at) {
-        (Some(desired), Some(cleanup)) => Some(desired.min(cleanup)),
-        (Some(wake), None) | (None, Some(wake)) => Some(wake),
-        (None, None) => None,
-    };
+    let layout_wake_at = super::herdr_layout::earliest_wake(ctx, &wake_now).await;
+    let next_wake_at = [desired_wake_at, cleanup_wake_at, layout_wake_at]
+        .into_iter()
+        .flatten()
+        .min();
     Ok(json!({
         "schema": REPORT_SCHEMA,
         "tickId": tick_id,
@@ -830,6 +833,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "orphanedReservations": orphaned.iter().map(|row| &row.reservation_id).collect::<Vec<_>>(),
         "subjects": subjects,
         "cleanup": cleanup,
+        "layoutCleanup": layout_cleanup,
         "nextWakeAt": next_wake_at,
     }))
 }

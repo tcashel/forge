@@ -11,6 +11,7 @@ mod claimnext;
 mod drive;
 mod epic;
 pub(crate) mod handoff;
+pub(crate) mod herdr_layout;
 pub(crate) mod herdr_ownership;
 mod history;
 mod observe;

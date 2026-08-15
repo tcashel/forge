@@ -13,7 +13,10 @@ mod identity;
 mod process;
 mod sentinel;
 
-pub use herdr::{HerdrCloseOutcome, HerdrControl, HerdrHost, PaneSnapshot};
+pub use herdr::{
+    HerdrCloseOutcome, HerdrControl, HerdrCreatedTab, HerdrHost, HerdrLayoutInspection,
+    HerdrLayoutPane, HerdrLayoutSnapshot, HerdrLayoutTarget, HerdrTabCreateError, PaneSnapshot,
+};
 pub use process::ProcessHost;
 
 use std::collections::HashMap;
@@ -122,6 +125,8 @@ pub struct PreparedSession {
     id: HostSessionId,
     sentinel_path: PathBuf,
     herdr: Option<HerdrSessionIdentity>,
+    herdr_layout_id: Option<String>,
+    herdr_layout_degradation: Option<String>,
     issuer: u64,
     token: u64,
 }
@@ -137,6 +142,8 @@ impl PreparedSession {
             id,
             sentinel_path,
             herdr,
+            herdr_layout_id: None,
+            herdr_layout_degradation: None,
             issuer,
             token: next_prepared_token(),
         }
@@ -155,6 +162,26 @@ impl PreparedSession {
     /// Durable Herdr coordinates, or `None` for a plain process session.
     pub fn herdr_identity(&self) -> Option<&HerdrSessionIdentity> {
         self.herdr.as_ref()
+    }
+
+    /// Durable layout joined by this pane when targeted placement succeeded.
+    pub fn herdr_layout_id(&self) -> Option<&str> {
+        self.herdr_layout_id.as_deref()
+    }
+
+    /// Bounded diagnostic when layout placement degraded to the legacy
+    /// repository-workspace split. This never changes host selection.
+    pub fn herdr_layout_degradation(&self) -> Option<&str> {
+        self.herdr_layout_degradation.as_deref()
+    }
+
+    pub(crate) fn set_herdr_layout_outcome(
+        &mut self,
+        layout_id: Option<String>,
+        degradation: Option<String>,
+    ) {
+        self.herdr_layout_id = layout_id;
+        self.herdr_layout_degradation = degradation;
     }
 
     pub(crate) fn issued_by(&self, issuer: u64) -> bool {

@@ -982,41 +982,6 @@ pub(super) async fn spawn(
     let _ = std::fs::remove_file(&drive_exit_path);
     let status_base = dir.join("status").join(generation.to_string());
 
-    let (host, host_kind, socket_path): (Box<dyn SessionHost>, &str, Option<String>) =
-        match host_policy {
-            HostPolicy::Off => (Box::new(ProcessHost::new(&status_base)), "process", None),
-            HostPolicy::Preferred | HostPolicy::Required => match herdr_socket.as_ref() {
-                None if host_policy == HostPolicy::Required => {
-                    return Err(Failure::refused(
-                        ErrorCode::HostUnavailable,
-                        "Herdr is required but no socket is configured",
-                    ));
-                }
-                None => {
-                    record_fallback(ctx, id, scope, generation, "no Herdr socket is configured")
-                        .await?;
-                    (Box::new(ProcessHost::new(&status_base)), "process", None)
-                }
-                Some(socket) => match HerdrHost::connect(socket, &status_base).await {
-                    Ok(host) => (
-                        Box::new(
-                            match crate::adapters::execute::workspace_label_for_repo(repo) {
-                                Some(label) => host.with_workspace(label),
-                                None => host,
-                            },
-                        ),
-                        "herdr",
-                        Some(socket.to_string_lossy().into_owned()),
-                    ),
-                    Err(error) if host_policy == HostPolicy::Preferred => {
-                        record_fallback(ctx, id, scope, generation, &error.to_string()).await?;
-                        (Box::new(ProcessHost::new(&status_base)), "process", None)
-                    }
-                    Err(error) => return Err(error.into()),
-                },
-            },
-        };
-
     let exe = PathBuf::from(&runtime_admission.binary().path);
     let binary = serde_json::to_value(runtime_admission.binary()).map_err(|error| {
         Failure::internal(format!(
@@ -1029,12 +994,6 @@ pub(super) async fn spawn(
         scope.noun(),
         scope.noun(),
         shell_quote(id),
-    );
-    let shell_line = controller_shell_line(
-        &command,
-        &output_path,
-        &drive_exit_path,
-        host_kind == "herdr",
     );
     let mut env = HashMap::new();
     if let Ok(path) = std::env::var("PATH") {
@@ -1074,15 +1033,117 @@ pub(super) async fn spawn(
         }
     }
 
-    let prepared = host.prepare(Path::new(repo), &shell_line, &env).await?;
+    let layout_subject = forged_types::HerdrLayoutSubjectV1 {
+        kind: match scope {
+            Scope::Run => forged_types::HerdrLayoutSubjectKind::Run,
+            Scope::Epic => forged_types::HerdrLayoutSubjectKind::Epic,
+        },
+        id: id.to_owned(),
+    };
+    let (host, host_kind, socket_path, layout_mutation): (
+        Box<dyn SessionHost>,
+        &str,
+        Option<String>,
+        Option<super::herdr_layout::MutationLease>,
+    ) = match host_policy {
+        HostPolicy::Off => (
+            Box::new(ProcessHost::new(&status_base)),
+            "process",
+            None,
+            None,
+        ),
+        HostPolicy::Preferred | HostPolicy::Required => match herdr_socket.as_ref() {
+            None if host_policy == HostPolicy::Required => {
+                return Err(Failure::refused(
+                    ErrorCode::HostUnavailable,
+                    "Herdr is required but no socket is configured",
+                ));
+            }
+            None => {
+                record_fallback(ctx, id, scope, generation, "no Herdr socket is configured")
+                    .await?;
+                (
+                    Box::new(ProcessHost::new(&status_base)),
+                    "process",
+                    None,
+                    None,
+                )
+            }
+            Some(socket) => match HerdrHost::connect(socket, &status_base).await {
+                Ok(host) => {
+                    let (host, mutation) =
+                        match crate::adapters::execute::workspace_label_for_repo(repo) {
+                            Some(label) => {
+                                let host = host.with_workspace(label.clone());
+                                super::herdr_layout::configure(
+                                    ctx,
+                                    host,
+                                    &label,
+                                    layout_subject,
+                                    Path::new(repo),
+                                    &env,
+                                )
+                                .await
+                            }
+                            None => (host, None),
+                        };
+                    (
+                        Box::new(host),
+                        "herdr",
+                        Some(socket.to_string_lossy().into_owned()),
+                        mutation,
+                    )
+                }
+                Err(error) if host_policy == HostPolicy::Preferred => {
+                    record_fallback(ctx, id, scope, generation, &error.to_string()).await?;
+                    (
+                        Box::new(ProcessHost::new(&status_base)),
+                        "process",
+                        None,
+                        None,
+                    )
+                }
+                Err(error) => return Err(error.into()),
+            },
+        },
+    };
+    let shell_line = controller_shell_line(
+        &command,
+        &output_path,
+        &drive_exit_path,
+        host_kind == "herdr",
+    );
+
+    let mut layout_mutation = layout_mutation;
+    let prepared = match host.prepare(Path::new(repo), &shell_line, &env).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            super::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                None,
+                Some(&error.to_string()),
+            )
+            .await;
+            return Err(error.into());
+        }
+    };
     let status_path = prepared.sentinel_path().to_path_buf();
     let ownership = super::herdr_ownership::controller_identity(&prepared, scope, id, generation)?;
     if let Some(identity) = ownership.as_ref() {
         if let Err(error) = super::herdr_ownership::register(ctx, identity.clone()).await {
+            super::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                Some(&prepared),
+                None,
+            )
+            .await;
             host.rollback_prepared(prepared).await;
             return Err(error);
         }
     }
+    super::herdr_layout::finish_mutation(ctx, layout_mutation.take(), Some(&prepared), None).await;
     crate::failpoint::hit("controller.ownership.register.after");
 
     // The start effect is not idempotent and an error can be ambiguous (for
@@ -1144,6 +1205,7 @@ pub(super) async fn spawn(
         "lstartPath": lstart_path,
         "statusPath": status_path,
         "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
+        "layoutId": ownership.as_ref().and_then(|identity| identity.layout_id.as_deref()),
         "outputPath": output_path,
         "submittedAt": now_iso(),
     });

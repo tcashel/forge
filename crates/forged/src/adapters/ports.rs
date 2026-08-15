@@ -1052,6 +1052,7 @@ mod tests {
             socket_path: "/tmp/not-contacted.sock".to_owned(),
             protocol: 19,
             sentinel_path: exact.to_string_lossy().into_owned(),
+            layout_id: None,
         };
         ledger
             .register_owned_herdr_session(&identity)

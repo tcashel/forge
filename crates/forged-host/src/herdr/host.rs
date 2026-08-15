@@ -2,7 +2,7 @@
 //! treating panes as dumb terminals (the `agent.*` surface is never
 //! consulted).
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -13,7 +13,10 @@ use nix::unistd::Pid;
 use serde_json::json;
 use tokio::time::Instant;
 
-use super::wire::{PaneInfoResult, PaneReadResponse, Pong, ProcessInfo, ProcessInfoResponse};
+use super::wire::{
+    PaneInfoResult, PaneLayoutResult, PaneReadResponse, Pong, ProcessInfo, ProcessInfoResponse,
+    TabCreatedResult,
+};
 use super::{CallError, Connection};
 use crate::identity::ProcessIdentity;
 use crate::{
@@ -29,6 +32,99 @@ pub enum HerdrCloseOutcome {
     /// Herdr returned the exact protocol-19 `PANE_NOT_FOUND` code, proving
     /// the opaque pane id is already absent.
     AlreadyMissing,
+}
+
+/// Exact coordinates returned by one successful `tab.create` response.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrCreatedTab {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub root_pane_id: String,
+}
+
+/// A pane rectangle from one exact `pane.layout` snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrLayoutPane {
+    pub pane_id: String,
+    pub width: u16,
+    pub height: u16,
+}
+
+/// Exact layout facts returned for a durable root-pane query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrLayoutSnapshot {
+    pub workspace_id: String,
+    pub tab_id: String,
+    pub panes: Vec<HerdrLayoutPane>,
+}
+
+/// `PANE_NOT_FOUND` is the only missing result; every other error remains
+/// unknown and must not authorize replacement or cleanup.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrLayoutInspection {
+    Present(HerdrLayoutSnapshot),
+    Missing,
+}
+
+/// Immutable durable layout and exact pane allow-list for one prepare call.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrLayoutTarget {
+    layout_id: String,
+    workspace_id: String,
+    tab_id: String,
+    root_pane_id: String,
+    eligible_pane_ids: BTreeSet<String>,
+}
+
+impl HerdrLayoutTarget {
+    pub fn new(
+        layout_id: impl Into<String>,
+        workspace_id: impl Into<String>,
+        tab_id: impl Into<String>,
+        root_pane_id: impl Into<String>,
+        eligible_pane_ids: impl IntoIterator<Item = String>,
+    ) -> Result<Self, HostError> {
+        let layout_id = layout_id.into();
+        let workspace_id = workspace_id.into();
+        let tab_id = tab_id.into();
+        let root_pane_id = root_pane_id.into();
+        if [
+            layout_id.as_str(),
+            workspace_id.as_str(),
+            tab_id.as_str(),
+            root_pane_id.as_str(),
+        ]
+        .into_iter()
+        .any(str::is_empty)
+        {
+            return Err(HostError::spawn_failed(
+                "Herdr layout target contains an empty exact id",
+            ));
+        }
+        let mut eligible_pane_ids = eligible_pane_ids.into_iter().collect::<BTreeSet<_>>();
+        eligible_pane_ids.insert(root_pane_id.clone());
+        Ok(Self {
+            layout_id,
+            workspace_id,
+            tab_id,
+            root_pane_id,
+            eligible_pane_ids,
+        })
+    }
+
+    pub fn layout_id(&self) -> &str {
+        &self.layout_id
+    }
+}
+
+/// A tab-create refusal proves no effect; an ambiguous transport or malformed
+/// response cannot prove whether an unidentifiable empty tab was created.
+#[derive(Debug, thiserror::Error)]
+pub enum HerdrTabCreateError {
+    #[error("tab.create refused before creating a usable layout: {0}")]
+    Refused(HostError),
+    #[error("tab.create outcome is ambiguous: {0}")]
+    Ambiguous(HostError),
 }
 
 // Phase budgets are WALL-CLOCK deadlines, not iteration counts: each poll
@@ -66,6 +162,8 @@ struct PreparedSeat {
     shell_line: String,
     status_path: PathBuf,
     identity: HerdrSessionIdentity,
+    layout_id: Option<String>,
+    layout_degradation: Option<String>,
 }
 
 /// Map Herdr's opaque pane id to a collision-free shell-safe directory name.
@@ -107,6 +205,9 @@ pub struct HerdrHost {
     /// The resolved id for [`Self::workspace_label`], memoized after the
     /// first successful lookup.
     workspace: Mutex<Option<String>>,
+    /// Exact durable layout placement. Its ids, never labels, grant targeting
+    /// authority. `None` preserves the legacy repository-workspace split.
+    layout: Option<HerdrLayoutTarget>,
 }
 
 /// A controller connection for durable pane ids recorded by forged. Unlike
@@ -283,6 +384,7 @@ impl HerdrHost {
             sessions: Mutex::new(HashMap::new()),
             workspace_label: None,
             workspace: Mutex::new(None),
+            layout: None,
         })
     }
 
@@ -295,6 +397,17 @@ impl HerdrHost {
     pub fn with_workspace(mut self, label: impl Into<String>) -> Self {
         self.workspace_label = Some(label.into());
         self
+    }
+
+    /// Target one exact durable layout for subsequent pane preparation.
+    pub fn with_layout(mut self, target: HerdrLayoutTarget) -> Self {
+        self.layout = Some(target);
+        self
+    }
+
+    /// Exact protocol-pinned socket selected for this host.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
     }
 
     /// The workspace id seats are placed in, resolved once and memoized.
@@ -311,7 +424,7 @@ impl HerdrHost {
         if let Some(id) = self.workspace.lock().expect("workspace lock").clone() {
             return Some(id);
         }
-        let id = self.resolve_workspace(label).await?;
+        let id = self.resolve_workspace(label).await.ok()?;
         *self.workspace.lock().expect("workspace lock") = Some(id.clone());
         Some(id)
     }
@@ -321,8 +434,12 @@ impl HerdrHost {
     /// `focus: false` is load-bearing: creating a workspace must never move
     /// the operator's focus, and a run that starts while they are working
     /// elsewhere has to stay invisible until they go looking for it.
-    async fn resolve_workspace(&self, label: &str) -> Option<String> {
-        let listed = self.conn.call("workspace.list", json!({})).await.ok()?;
+    async fn resolve_workspace(&self, label: &str) -> Result<String, HostError> {
+        let listed = self
+            .conn
+            .call("workspace.list", json!({}))
+            .await
+            .map_err(CallError::into_host_error)?;
         let existing = listed
             .get("workspaces")
             .and_then(serde_json::Value::as_array)
@@ -335,18 +452,116 @@ impl HerdrHost {
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned);
         if let Some(id) = existing {
-            return Some(id);
+            return Ok(id);
         }
         let created = self
             .conn
             .call("workspace.create", json!({"label": label, "focus": false}))
             .await
-            .ok()?;
+            .map_err(CallError::into_host_error)?;
         created
             .get("workspace")
             .and_then(|workspace| workspace.get("workspace_id"))
             .and_then(serde_json::Value::as_str)
             .map(str::to_owned)
+            .filter(|id| !id.is_empty())
+            .ok_or_else(|| HostError::unavailable("malformed workspace.create result from herdr"))
+    }
+
+    /// Resolve or create the existing repository workspace without hiding a
+    /// protocol failure. Layout setup uses this strict form; ordinary
+    /// placement retains its historical best-effort behavior.
+    pub async fn ensure_workspace(&self, label: &str) -> Result<String, HostError> {
+        if label.trim().is_empty() {
+            return Err(HostError::spawn_failed("workspace label must not be empty"));
+        }
+        if let Some(id) = self.workspace.lock().expect("workspace lock").clone() {
+            return Ok(id);
+        }
+        let id = self.resolve_workspace(label).await?;
+        *self.workspace.lock().expect("workspace lock") = Some(id.clone());
+        Ok(id)
+    }
+
+    /// Create one unfocused tab and return its exact root anchor. Only an RPC
+    /// refusal is known pre-effect; connection loss or malformed success is
+    /// ambiguous and must never be recovered by matching the label.
+    pub async fn create_layout_tab(
+        &self,
+        workspace_id: &str,
+        label: &str,
+        cwd: &Path,
+        env: &HashMap<String, String>,
+    ) -> Result<HerdrCreatedTab, HerdrTabCreateError> {
+        let cwd = cwd.to_str().ok_or_else(|| {
+            HerdrTabCreateError::Refused(HostError::spawn_failed("cwd is not valid UTF-8"))
+        })?;
+        let value = match self
+            .conn
+            .call(
+                "tab.create",
+                json!({
+                    "workspace_id": workspace_id,
+                    "label": label,
+                    "cwd": cwd,
+                    "env": env,
+                    "focus": false,
+                }),
+            )
+            .await
+        {
+            Ok(value) => value,
+            Err(CallError::Rpc(error)) => {
+                return Err(HerdrTabCreateError::Refused(HostError::spawn_failed(
+                    format!("tab.create refused: {}", error.message),
+                )))
+            }
+            Err(other) => return Err(HerdrTabCreateError::Ambiguous(other.into_host_error())),
+        };
+        let response: TabCreatedResult = serde_json::from_value(value).map_err(|_| {
+            HerdrTabCreateError::Ambiguous(HostError::unavailable(
+                "malformed tab.create result from herdr",
+            ))
+        })?;
+        Ok(HerdrCreatedTab {
+            workspace_id: response.tab.workspace_id,
+            tab_id: response.tab.tab_id,
+            root_pane_id: response.root_pane.pane_id,
+        })
+    }
+
+    /// Inspect the exact tab containing `root_pane_id`.
+    pub async fn inspect_layout(
+        &self,
+        root_pane_id: &str,
+    ) -> Result<HerdrLayoutInspection, HostError> {
+        let value = match self
+            .conn
+            .call("pane.layout", json!({"pane_id": root_pane_id}))
+            .await
+        {
+            Ok(value) => value,
+            Err(CallError::Rpc(error)) if error.is_pane_not_found() => {
+                return Ok(HerdrLayoutInspection::Missing)
+            }
+            Err(other) => return Err(other.into_host_error()),
+        };
+        let response: PaneLayoutResult = serde_json::from_value(value)
+            .map_err(|_| HostError::unavailable("malformed pane.layout result from herdr"))?;
+        Ok(HerdrLayoutInspection::Present(HerdrLayoutSnapshot {
+            workspace_id: response.layout.workspace_id,
+            tab_id: response.layout.tab_id,
+            panes: response
+                .layout
+                .panes
+                .into_iter()
+                .map(|pane| HerdrLayoutPane {
+                    pane_id: pane.pane_id,
+                    width: pane.rect.width,
+                    height: pane.rect.height,
+                })
+                .collect(),
+        }))
     }
 
     /// `$HOME/.config/herdr/herdr.sock`.
@@ -437,6 +652,141 @@ impl HerdrHost {
         Ok(status_path)
     }
 
+    async fn legacy_split(
+        &self,
+        cwd: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<PaneInfoResult, HostError> {
+        let mut split = json!({"direction": "right", "cwd": cwd, "env": env, "focus": false});
+        if let Some(workspace) = self.workspace_id().await {
+            split["workspace_id"] = json!(workspace);
+        }
+        let value = self
+            .conn
+            .call("pane.split", split)
+            .await
+            .map_err(|error| match error {
+                CallError::Rpc(error) => {
+                    HostError::spawn_failed(format!("pane.split refused: {}", error.message))
+                }
+                other => other.into_host_error(),
+            })?;
+        serde_json::from_value(value)
+            .map_err(|_| HostError::unavailable("malformed pane.split result from herdr"))
+    }
+
+    fn select_layout_target<'a>(
+        target: &HerdrLayoutTarget,
+        snapshot: &'a HerdrLayoutSnapshot,
+    ) -> Result<(&'a str, &'static str), HostError> {
+        if snapshot.workspace_id != target.workspace_id || snapshot.tab_id != target.tab_id {
+            return Err(HostError::spawn_failed(
+                "pane.layout did not match the durable workspace/tab",
+            ));
+        }
+        if !snapshot
+            .panes
+            .iter()
+            .any(|pane| pane.pane_id == target.root_pane_id)
+        {
+            return Err(HostError::spawn_failed(
+                "durable layout root anchor is absent from pane.layout",
+            ));
+        }
+        let mut best: Option<(&HerdrLayoutPane, u64)> = None;
+        for pane in snapshot
+            .panes
+            .iter()
+            .filter(|pane| target.eligible_pane_ids.contains(&pane.pane_id))
+        {
+            let area = u64::from(pane.width) * u64::from(pane.height);
+            if best.is_none_or(|(current, current_area)| {
+                area > current_area || (area == current_area && pane.pane_id < current.pane_id)
+            }) {
+                best = Some((pane, area));
+            }
+        }
+        let (pane, _) = best.ok_or_else(|| {
+            HostError::spawn_failed("pane.layout contains no exact eligible owned pane")
+        })?;
+        let direction = if pane.width >= pane.height {
+            "right"
+        } else {
+            "down"
+        };
+        Ok((&pane.pane_id, direction))
+    }
+
+    async fn layout_split(
+        &self,
+        target: &HerdrLayoutTarget,
+        cwd: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<PaneInfoResult, HostError> {
+        // The selected target may disappear between layout inspection and
+        // split. Refresh exactly once under the caller's durable mutation
+        // lease; no other failure is retried.
+        for attempt in 0..2 {
+            let snapshot = match self.inspect_layout(&target.root_pane_id).await? {
+                HerdrLayoutInspection::Present(snapshot) => snapshot,
+                HerdrLayoutInspection::Missing => {
+                    return Err(HostError::spawn_failed(
+                        "durable layout root anchor is missing",
+                    ))
+                }
+            };
+            let (pane_id, direction) = Self::select_layout_target(target, &snapshot)?;
+            let value = self
+                .conn
+                .call(
+                    "pane.split",
+                    json!({
+                        "workspace_id": target.workspace_id,
+                        "target_pane_id": pane_id,
+                        "direction": direction,
+                        "ratio": 0.5,
+                        "cwd": cwd,
+                        "env": env,
+                        "focus": false,
+                    }),
+                )
+                .await;
+            match value {
+                Ok(value) => {
+                    let response: PaneInfoResult = serde_json::from_value(value).map_err(|_| {
+                        HostError::unavailable("malformed pane.split result from herdr")
+                    })?;
+                    if response.pane.pane_id.is_empty()
+                        || response.pane.workspace_id != target.workspace_id
+                        || response.pane.tab_id != target.tab_id
+                    {
+                        // A syntactically valid response gives us exact
+                        // authority to remove the empty pane, but never to
+                        // register it under a layout whose coordinates do not
+                        // match. The caller then takes the normal placement
+                        // fallback without sending a command to this pane.
+                        if !response.pane.pane_id.is_empty() {
+                            self.best_effort_close(&response.pane.pane_id).await;
+                        }
+                        return Err(HostError::spawn_failed(
+                            "targeted pane.split returned a pane outside the durable layout",
+                        ));
+                    }
+                    return Ok(response);
+                }
+                Err(CallError::Rpc(error)) if error.is_pane_not_found() && attempt == 0 => {}
+                Err(CallError::Rpc(error)) => {
+                    return Err(HostError::spawn_failed(format!(
+                        "targeted pane.split refused: {}",
+                        error.message
+                    )))
+                }
+                Err(other) => return Err(other.into_host_error()),
+            }
+        }
+        unreachable!("bounded layout split loop returns on its final attempt")
+    }
+
     /// Poll until every captured foreground identity reads dead, within a
     /// wall-clock `budget`. `Ok(true)` when all are verified dead;
     /// `Ok(false)` when the deadline passes first; `Err` when an identity
@@ -487,22 +837,18 @@ impl SessionHost for HerdrHost {
         // `HostSessionId`, which the reclaim saga is fenced on. Relocating a
         // pane afterwards would therefore invalidate a live session identity
         // and break confirmed-death verification.
-        let mut split = json!({"direction": "right", "cwd": cwd, "env": env, "focus": false});
-        if let Some(workspace) = self.workspace_id().await {
-            split["workspace_id"] = json!(workspace);
-        }
-        let split_result = self
-            .conn
-            .call("pane.split", split)
-            .await
-            .map_err(|e| match e {
-                CallError::Rpc(e) => {
-                    HostError::spawn_failed(format!("pane.split refused: {}", e.message))
-                }
-                other => other.into_host_error(),
-            })?;
-        let pane: PaneInfoResult = serde_json::from_value(split_result)
-            .map_err(|_| HostError::unavailable("malformed pane.split result from herdr"))?;
+        let (pane, layout_id, layout_degradation) = if let Some(target) = self.layout.as_ref() {
+            match self.layout_split(target, cwd, env).await {
+                Ok(pane) => (pane, Some(target.layout_id.clone()), None),
+                Err(error) => (
+                    self.legacy_split(cwd, env).await?,
+                    None,
+                    Some(error.to_string()),
+                ),
+            }
+        } else {
+            (self.legacy_split(cwd, env).await?, None, None)
+        };
         let pane_id = pane.pane.pane_id;
         // Feed the replay gate the pane_id we now own.
         self.conn.register_own_pane(&pane_id);
@@ -515,12 +861,13 @@ impl SessionHost for HerdrHost {
                     self.socket_path.clone(),
                     HERDR_PROTOCOL_VERSION,
                 );
-                let prepared = PreparedSession::new(
+                let mut prepared = PreparedSession::new(
                     id.clone(),
                     status_path.clone(),
                     Some(identity.clone()),
                     self.instance,
                 );
+                prepared.set_herdr_layout_outcome(layout_id.clone(), layout_degradation.clone());
                 self.prepared.lock().expect("prepared lock").insert(
                     id,
                     PreparedSeat {
@@ -528,6 +875,8 @@ impl SessionHost for HerdrHost {
                         shell_line: shell_line.to_string(),
                         status_path,
                         identity,
+                        layout_id,
+                        layout_degradation,
                     },
                 );
                 Ok(prepared)
@@ -550,6 +899,8 @@ impl SessionHost for HerdrHost {
                 seat.token == prepared.token()
                     && seat.status_path == prepared.sentinel_path()
                     && prepared.herdr_identity() == Some(&seat.identity)
+                    && prepared.herdr_layout_id() == seat.layout_id.as_deref()
+                    && prepared.herdr_layout_degradation() == seat.layout_degradation.as_deref()
             });
             if !matches {
                 return Err(HostError::session_not_found(&id));
@@ -605,6 +956,8 @@ impl SessionHost for HerdrHost {
                 seat.token == prepared.token()
                     && seat.status_path == prepared.sentinel_path()
                     && prepared.herdr_identity() == Some(&seat.identity)
+                    && prepared.herdr_layout_id() == seat.layout_id.as_deref()
+                    && prepared.herdr_layout_degradation() == seat.layout_degradation.as_deref()
             });
             if matches {
                 seats.remove(&id)

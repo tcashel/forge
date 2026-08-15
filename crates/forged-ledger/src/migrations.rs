@@ -570,6 +570,158 @@ CREATE INDEX events_run_event ON events(run_id, event_id)
   WHERE run_id IS NOT NULL;
 ";
 
+/// Migration 017: one durable, exact Herdr tab/root layout per active work
+/// subject and frozen endpoint. Creation, mutation, replacement, and cleanup
+/// are separate CAS leases; labels are stored presentation and never keys.
+const MIGRATION_017: &str = "
+CREATE TABLE herdr_layouts (
+  layout_id             TEXT PRIMARY KEY CHECK (length(trim(layout_id)) > 0),
+  schema                TEXT NOT NULL CHECK (schema = 'forged.herdr-layout/1'),
+  revision              INTEGER NOT NULL CHECK (revision > 0),
+  subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id            TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  socket_path           TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol              INTEGER NOT NULL CHECK (protocol = 19),
+  workspace_id          TEXT NOT NULL CHECK (length(workspace_id) > 0),
+  tab_id                TEXT,
+  root_pane_id          TEXT,
+  display_label         TEXT NOT NULL CHECK
+                        (length(trim(display_label)) > 0 AND length(CAST(display_label AS BLOB)) <= 160),
+  lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN
+                        ('creating','registered','degraded','replaced')),
+  degradation_reason    TEXT CHECK (degradation_reason IN
+                        ('creation-ambiguous','registration-failed','verification-missing',
+                         'verification-mismatch','placement-failed')),
+  last_error            TEXT,
+  creation_token        TEXT,
+  creation_lease_until  TEXT,
+  mutation_token        TEXT,
+  mutation_lease_until  TEXT,
+  cleanup_state         TEXT NOT NULL CHECK (cleanup_state IN
+                        ('not-requested','pending','leased','retry-wait','attention','released')),
+  cleanup_reason        TEXT CHECK (cleanup_reason IN
+                        ('subject-terminal','layout-replaced','layout-degraded')),
+  cleanup_release       TEXT CHECK (cleanup_release IN ('closed','pane-not-found')),
+  cleanup_token         TEXT,
+  cleanup_lease_until   TEXT,
+  cleanup_retry_budget  INTEGER NOT NULL CHECK (cleanup_retry_budget > 0),
+  cleanup_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                        (cleanup_retry_used >= 0 AND cleanup_retry_used <= cleanup_retry_budget),
+  next_cleanup_at       TEXT,
+  last_cleanup_error    TEXT,
+  predecessor_layout_id TEXT REFERENCES herdr_layouts(layout_id),
+  created_at            TEXT NOT NULL,
+  registered_at         TEXT,
+  replaced_at           TEXT,
+  cleanup_requested_at  TEXT,
+  last_cleanup_attempt_at TEXT,
+  released_at           TEXT,
+  updated_at            TEXT NOT NULL,
+  UNIQUE (subject_kind, subject_id, socket_path, protocol, revision),
+  CHECK ((tab_id IS NULL) = (root_pane_id IS NULL)),
+  CHECK (
+    (lifecycle_state = 'creating' AND tab_id IS NULL AND root_pane_id IS NULL
+      AND creation_token IS NOT NULL AND creation_lease_until IS NOT NULL
+      AND registered_at IS NULL AND degradation_reason IS NULL)
+    OR
+    (lifecycle_state = 'registered' AND tab_id IS NOT NULL AND root_pane_id IS NOT NULL
+      AND creation_token IS NULL AND creation_lease_until IS NULL
+      AND registered_at IS NOT NULL
+      AND (degradation_reason IS NULL OR degradation_reason = 'placement-failed'))
+    OR
+    (lifecycle_state = 'degraded' AND creation_token IS NULL
+      AND creation_lease_until IS NULL AND degradation_reason IS NOT NULL)
+    OR
+    (lifecycle_state = 'replaced' AND tab_id IS NOT NULL AND root_pane_id IS NOT NULL
+      AND creation_token IS NULL AND creation_lease_until IS NULL
+      AND degradation_reason IS NOT NULL AND replaced_at IS NOT NULL)
+  ),
+  CHECK (
+    (mutation_token IS NULL AND mutation_lease_until IS NULL)
+    OR
+    (mutation_token IS NOT NULL AND mutation_lease_until IS NOT NULL
+      AND lifecycle_state = 'registered' AND cleanup_state = 'not-requested')
+  ),
+  CHECK (
+    (cleanup_state = 'not-requested' AND cleanup_reason IS NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'pending' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NOT NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'leased' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NOT NULL AND cleanup_lease_until IS NOT NULL
+      AND next_cleanup_at IS NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'retry-wait' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NOT NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'attention' AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NULL AND last_cleanup_error IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'released' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NOT NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX one_active_herdr_layout
+  ON herdr_layouts(subject_kind, subject_id, socket_path, protocol)
+  WHERE lifecycle_state IN ('creating','registered');
+CREATE UNIQUE INDEX herdr_layout_exact_tab
+  ON herdr_layouts(socket_path, protocol, tab_id) WHERE tab_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_exact_root
+  ON herdr_layouts(socket_path, protocol, root_pane_id) WHERE root_pane_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_creation_token
+  ON herdr_layouts(creation_token) WHERE creation_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_mutation_token
+  ON herdr_layouts(mutation_token) WHERE mutation_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_cleanup_token
+  ON herdr_layouts(cleanup_token) WHERE cleanup_token IS NOT NULL;
+CREATE INDEX herdr_layout_cleanup_wake
+  ON herdr_layouts(cleanup_state, next_cleanup_at, cleanup_lease_until)
+  WHERE cleanup_state IN ('pending','leased','retry-wait');
+
+CREATE TRIGGER herdr_layout_identity_immutable
+BEFORE UPDATE OF layout_id, schema, revision, subject_kind, subject_id,
+                 socket_path, protocol, workspace_id, display_label,
+                 predecessor_layout_id, created_at
+ON herdr_layouts
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr layout identity is immutable');
+END;
+
+CREATE TRIGGER herdr_layout_locator_once
+BEFORE UPDATE OF tab_id, root_pane_id ON herdr_layouts
+WHEN OLD.lifecycle_state != 'creating' OR NEW.lifecycle_state NOT IN ('registered','degraded')
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr layout locator may only register once');
+END;
+
+ALTER TABLE owned_herdr_sessions
+  ADD COLUMN layout_id TEXT REFERENCES herdr_layouts(layout_id);
+CREATE INDEX owned_herdr_layout
+  ON owned_herdr_sessions(layout_id, cleanup_state) WHERE layout_id IS NOT NULL;
+CREATE TRIGGER owned_herdr_layout_immutable
+BEFORE UPDATE OF layout_id ON owned_herdr_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'owned Herdr layout join is immutable');
+END;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -588,6 +740,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_014,
     MIGRATION_015,
     MIGRATION_016,
+    MIGRATION_017,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -710,7 +863,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 16);
+        assert_eq!(pragmas.user_version, 17);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -736,6 +889,7 @@ mod tests {
             "admission_reservations",
             "owned_herdr_sessions",
             "work_identities",
+            "herdr_layouts",
         ] {
             let found: String = conn
                 .query_row(
@@ -765,11 +919,28 @@ mod tests {
             event_index,
             "CREATE INDEX events_run_event ON events(run_id, event_id)\n  WHERE run_id IS NOT NULL"
         );
+        let layout_join: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('owned_herdr_sessions') \
+                 WHERE name = 'layout_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("layout join column");
+        assert_eq!(layout_join, 1);
+        let active_layout_index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = ?1",
+                ["one_active_herdr_layout"],
+                |row| row.get(0),
+            )
+            .expect("active layout index");
+        assert_eq!(active_layout_index, "one_active_herdr_layout");
     }
 
     #[test]
-    fn representative_v10_v12_and_v15_upgrades_preserve_rows_and_reach_v16() {
-        for version in [10usize, 12, 15] {
+    fn representative_v10_v12_v15_and_exact_v16_upgrades_preserve_rows_and_reach_v17() {
+        for version in [10usize, 12, 15, 16] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(format!("state-v{version}.db"));
             {
@@ -794,7 +965,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -829,7 +1000,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
         ledger.close().expect("close");
     }
 
@@ -890,7 +1061,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -933,7 +1104,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

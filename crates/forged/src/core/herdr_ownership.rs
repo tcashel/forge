@@ -337,8 +337,26 @@ pub(crate) fn attempt_identity(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<(Option<OwnedHerdrSessionV1>, Option<u32>), Failure> {
+    let (subject, controller_generation) = attempt_subject(run_id)?;
+    let identity = identity(
+        prepared,
+        OwnedHerdrOwnerV1::Attempt {
+            subject,
+            run_id: run_id.to_owned(),
+            packet_id: packet_id.to_owned(),
+            attempt_id,
+            claim_token: claim_token.to_owned(),
+            controller_generation,
+        },
+    )?;
+    Ok((identity, controller_generation))
+}
+
+/// Exact work subject that owns a provider attempt. Detached epic children
+/// inherit their epic controller subject; direct drives remain run-scoped.
+pub(crate) fn attempt_subject(run_id: &str) -> Result<(OwnedHerdrSubjectV1, Option<u32>), Failure> {
     let context = super::handoff::controller_context_for_attempt(run_id)?;
-    let (subject, controller_generation) = match context {
+    Ok(match context {
         Some((scope, id, generation)) => (
             OwnedHerdrSubjectV1 {
                 kind: match scope {
@@ -356,19 +374,7 @@ pub(crate) fn attempt_identity(
             },
             None,
         ),
-    };
-    let identity = identity(
-        prepared,
-        OwnedHerdrOwnerV1::Attempt {
-            subject,
-            run_id: run_id.to_owned(),
-            packet_id: packet_id.to_owned(),
-            attempt_id,
-            claim_token: claim_token.to_owned(),
-            controller_generation,
-        },
-    )?;
-    Ok((identity, controller_generation))
+    })
 }
 
 fn identity(
@@ -387,6 +393,7 @@ fn identity(
         socket_path: herdr.socket_path().to_string_lossy().into_owned(),
         protocol: herdr.protocol(),
         sentinel_path: prepared.sentinel_path().to_string_lossy().into_owned(),
+        layout_id: prepared.herdr_layout_id().map(str::to_owned),
     }))
 }
 
@@ -572,6 +579,7 @@ mod tests {
             socket_path: socket.to_string_lossy().into_owned(),
             protocol: 19,
             sentinel_path: format!("/tmp/exact/{ownership_id}/status"),
+            layout_id: None,
         };
         ledger
             .register_owned_herdr_session(&identity)
@@ -664,6 +672,7 @@ mod tests {
                 .join("exact unsafe $ path/status")
                 .to_string_lossy()
                 .into_owned(),
+            layout_id: None,
         };
         ledger
             .register_owned_herdr_session(&identity)
@@ -724,6 +733,7 @@ mod tests {
                 .join("controller exact/status")
                 .to_string_lossy()
                 .into_owned(),
+            layout_id: None,
         };
         ledger
             .register_owned_herdr_session(&identity)

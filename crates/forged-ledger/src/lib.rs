@@ -22,6 +22,7 @@ mod attempts;
 mod desired;
 mod error;
 mod events;
+mod herdr_layouts;
 mod history;
 mod inventory;
 mod ledger;
@@ -38,6 +39,7 @@ mod usage;
 mod work_identity;
 
 pub use error::LedgerError;
+pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
 pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
 pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
@@ -51,10 +53,13 @@ pub use types::{
     AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
     AttemptArtifactRow, AttemptRow, AttemptState, ClaimedAttempt, DesiredReconcileOutcome,
     DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
-    DesiredWorkRow, EffectClass, EventRow, MergeSlotRow, NewAttemptArtifact, NewPacket, NewRun,
-    NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState, OperationTicket,
-    OwnedHerdrCleanupReason, OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry,
-    OwnedHerdrCleanupState, OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow,
-    PacketRow, Pragmas, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
-    RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    DesiredWorkRow, EffectClass, EventRow, HerdrLayoutCleanupReason, HerdrLayoutCleanupRelease,
+    HerdrLayoutCleanupRetry, HerdrLayoutCleanupState, HerdrLayoutCreation,
+    HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow, MergeSlotRow,
+    NewAttemptArtifact, NewPacket, NewRun, NewRunDefinition, NewUsage, OperationOutcome,
+    OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
+    OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
+    OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow, Pragmas,
+    RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow,
+    RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };

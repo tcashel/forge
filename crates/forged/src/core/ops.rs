@@ -606,6 +606,14 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
             super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
+        let herdr_layout = super::herdr_layout::status(
+            ctx,
+            forged_types::HerdrLayoutSubjectV1 {
+                kind: forged_types::HerdrLayoutSubjectKind::Run,
+                id: run_id.to_owned(),
+            },
+        )
+        .await;
         let expected_assignee = crate::core::run_holder(&view.run.bead_id);
         let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
             Ok(issue) => {
@@ -749,6 +757,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
             "run": {
                 "runId": view.run.run_id,
                 "identity": identity,
+                "herdrLayout": herdr_layout,
                 "beadId": view.run.bead_id,
                 "repo": view.run.repo,
                 "baseRef": view.run.base_ref,

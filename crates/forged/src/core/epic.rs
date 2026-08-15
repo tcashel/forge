@@ -1058,6 +1058,14 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
                 view.config.epic_id
             ))
         })?;
+    let herdr_layout = super::herdr_layout::status(
+        ctx,
+        forged_types::HerdrLayoutSubjectV1 {
+            kind: forged_types::HerdrLayoutSubjectKind::Epic,
+            id: view.config.epic_id.clone(),
+        },
+    )
+    .await;
     let (live, live_error) =
         match forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await {
             Ok(live) => (live, None),
@@ -1230,6 +1238,7 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
         "identity": identity,
+        "herdrLayout": herdr_layout,
         "title": view.config.title,
         "repo": view.config.repo,
         "specPath": view.config.spec_path,

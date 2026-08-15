@@ -40,6 +40,7 @@ struct SessionRecord {
     socket_path: Option<String>,
     status_path: Option<String>,
     controller_generation: Option<u32>,
+    layout_id: Option<String>,
     attach_hint: Option<String>,
 }
 
@@ -52,6 +53,7 @@ pub(crate) struct SessionStarted<'a> {
     pub socket_path: Option<&'a str>,
     pub status_path: &'a str,
     pub controller_generation: Option<u32>,
+    pub layout_id: Option<&'a str>,
     pub attach_hint: Option<&'a str>,
 }
 
@@ -106,6 +108,10 @@ fn session_records(events: &[forged_ledger::EventRow]) -> Vec<SessionRecord> {
                     .get("controllerGeneration")
                     .and_then(Value::as_u64)
                     .and_then(|value| u32::try_from(value).ok()),
+                layout_id: payload
+                    .get("layoutId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 attach_hint: payload
                     .get("attachHint")
                     .and_then(Value::as_str)
@@ -131,6 +137,7 @@ pub(crate) async fn record_session_started(
         "socketPath": started.socket_path,
         "statusPath": started.status_path,
         "controllerGeneration": started.controller_generation,
+        "layoutId": started.layout_id,
         "attachHint": started.attach_hint,
     });
     on_ledger(&ctx.ledger, move |ledger| {
@@ -265,6 +272,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "socketPath": record.socket_path,
                 "statusPath": record.status_path,
                 "controllerGeneration": record.controller_generation,
+                "layoutId": record.layout_id,
                 "identity": identity.clone(),
                 // The hint is durable, but terminal pane cleanup is an
                 // independent supervisor effect. `Running` and `Revoking`

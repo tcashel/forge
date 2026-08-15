@@ -72,6 +72,7 @@ fn attempt_identity(
         socket_path: "/tmp/herdr socket.sock".to_owned(),
         protocol: 19,
         sentinel_path: "/tmp/sentinel dir/$opaque/status".to_owned(),
+        layout_id: None,
     }
 }
 
@@ -90,6 +91,7 @@ fn controller_identity(id: &str, run: &str, generation: u32) -> OwnedHerdrSessio
         socket_path: "/tmp/herdr.sock".to_owned(),
         protocol: 19,
         sentinel_path: format!("/tmp/exact controller/{generation}/status"),
+        layout_id: None,
     }
 }
 

@@ -949,13 +949,45 @@ async fn run_attempt(
         invocation.shell_line
     );
     let status_base = dirs.status();
+    let mut env = HashMap::new();
+    if let Ok(path) = std::env::var("PATH") {
+        env.insert("PATH".to_owned(), path);
+    }
+    // Serialize every Herdr layout/spawn effect against pause, stop, and
+    // settlement. A control transition that wins this fence makes the
+    // admission stale before workspace/tab creation can occur.
+    let submit_guard =
+        crate::core::handoff::acquire_packet_submit(ctx, &packet_id, &run_id).await?;
+    {
+        let claim_token = claim_token.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.assert_admitted_attempt_live(&claim_token)
+        })
+        .await?;
+    }
+    let (owned_subject, _) = crate::core::herdr_ownership::attempt_subject(&run_id)?;
+    let layout_subject = forged_types::HerdrLayoutSubjectV1 {
+        kind: match owned_subject.kind {
+            forged_types::OwnedHerdrSubjectKind::Run => forged_types::HerdrLayoutSubjectKind::Run,
+            forged_types::OwnedHerdrSubjectKind::Epic => forged_types::HerdrLayoutSubjectKind::Epic,
+        },
+        id: owned_subject.id,
+    };
     // Herdr is the preferred visibility adapter. The ledger records the
     // actual host selection, so a missing socket can never masquerade as a
     // Herdr-backed session.
-    let (host, host_kind, socket_path): (Arc<dyn SessionHost>, &str, Option<String>) = match exec
-        .host_policy
-    {
-        HostPolicy::Off => (Arc::new(ProcessHost::new(&status_base)), "process", None),
+    let (host, host_kind, socket_path, layout_mutation): (
+        Arc<dyn SessionHost>,
+        &str,
+        Option<String>,
+        Option<crate::core::herdr_layout::MutationLease>,
+    ) = match exec.host_policy {
+        HostPolicy::Off => (
+            Arc::new(ProcessHost::new(&status_base)),
+            "process",
+            None,
+            None,
+        ),
         HostPolicy::Preferred | HostPolicy::Required => match exec.herdr_socket.as_ref() {
             None => {
                 if exec.host_policy == HostPolicy::Required {
@@ -981,17 +1013,37 @@ async fn run_attempt(
                     return settle_host_fallback(ctx, &packet, attempt_id, &claim_token, failure)
                         .await;
                 }
-                (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                (
+                    Arc::new(ProcessHost::new(&status_base)),
+                    "process",
+                    None,
+                    None,
+                )
             }
             Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
-                Ok(herdr) => (
-                    Arc::new(match workspace_label(ctx, &run_id).await {
-                        Some(label) => herdr.with_workspace(label),
-                        None => herdr,
-                    }),
-                    "herdr",
-                    Some(sock.to_string_lossy().into_owned()),
-                ),
+                Ok(herdr) => {
+                    let (herdr, mutation) = match workspace_label(ctx, &run_id).await {
+                        Some(label) => {
+                            let herdr = herdr.with_workspace(label.clone());
+                            crate::core::herdr_layout::configure(
+                                ctx,
+                                herdr,
+                                &label,
+                                layout_subject,
+                                &packet.worktree,
+                                &env,
+                            )
+                            .await
+                        }
+                        None => (herdr, None),
+                    };
+                    (
+                        Arc::new(herdr),
+                        "herdr",
+                        Some(sock.to_string_lossy().into_owned()),
+                        mutation,
+                    )
+                }
                 Err(error) if exec.host_policy == HostPolicy::Preferred => {
                     if let Err(failure) = crate::core::sessions::record_host_fallback(
                         ctx,
@@ -1011,7 +1063,12 @@ async fn run_attempt(
                         )
                         .await;
                     }
-                    (Arc::new(ProcessHost::new(&status_base)), "process", None)
+                    (
+                        Arc::new(ProcessHost::new(&status_base)),
+                        "process",
+                        None,
+                        None,
+                    )
                 }
                 Err(error) => {
                     return fail_pre_spawn_transport(
@@ -1029,10 +1086,6 @@ async fn run_attempt(
     };
     let attach_hint =
         (host_kind == "herdr").then(|| format!("forged session read --attempt {attempt_id}"));
-    let mut env = HashMap::new();
-    if let Ok(path) = std::env::var("PATH") {
-        env.insert("PATH".to_owned(), path);
-    }
     // The bounded-orphan window (operator-adjudicated, accepted as a
     // residual): a crash between here and the shell writing `provider.pid`
     // leaves a provider no later process can identify, so no later process
@@ -1045,23 +1098,18 @@ async fn run_attempt(
     // `adapters::ports`: an attempt whose identity never materialized past
     // the grace window is failed as a transport failure, never an
     // unavailable port.
-    // Serialize the final authorization check and spawn publication against
-    // pause/stop/settlement. A control transition that wins this fence makes
-    // the reservation stale; one that follows waits until session identity
-    // is durable and then uses the existing confirmed-death path.
-    let submit_guard =
-        crate::core::handoff::acquire_packet_submit(ctx, &packet_id, &run_id).await?;
-    {
-        let claim_token = claim_token.clone();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.assert_admitted_attempt_live(&claim_token)
-        })
-        .await?;
-    }
+    let mut layout_mutation = layout_mutation;
     failpoint::hit("provider.spawn.before");
     let prepared = match host.prepare(&packet.worktree, &shell_line, &env).await {
         Ok(prepared) => prepared,
         Err(error) => {
+            crate::core::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                None,
+                Some(&error.to_string()),
+            )
+            .await;
             let note = format!("transport: provider prepare failed: {error}");
             return fail_pre_spawn_transport(
                 ctx,
@@ -1084,6 +1132,13 @@ async fn run_attempt(
     )?;
     if let Some(identity) = ownership.as_ref() {
         if let Err(failure) = crate::core::herdr_ownership::register(ctx, identity.clone()).await {
+            crate::core::herdr_layout::finish_mutation(
+                ctx,
+                layout_mutation.take(),
+                Some(&prepared),
+                None,
+            )
+            .await;
             host.rollback_prepared(prepared).await;
             let transport = format!("transport: provider ownership registration failed: {failure}");
             let refusal = format!("unspawned: provider ownership registration refused: {failure}");
@@ -1102,6 +1157,8 @@ async fn run_attempt(
             .await;
         }
     }
+    crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), Some(&prepared), None)
+        .await;
     failpoint::hit("provider.ownership.register.after");
     let spawned = host.start(prepared).await;
     failpoint::hit("provider.spawn.after");
@@ -1165,6 +1222,9 @@ async fn run_attempt(
             socket_path: socket_path.as_deref(),
             status_path: &status_path,
             controller_generation,
+            layout_id: ownership
+                .as_ref()
+                .and_then(|identity| identity.layout_id.as_deref()),
             attach_hint: attach_hint.as_deref(),
         },
     )
@@ -1193,6 +1253,7 @@ async fn run_attempt(
         "statusPath": status_path,
         "controllerGeneration": controller_generation,
         "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
+        "layoutId": ownership.as_ref().and_then(|identity| identity.layout_id.as_deref()),
         "attachHint": attach_hint,
     });
     ports
@@ -1678,6 +1739,20 @@ mod settle_tests {
                                 "type": "workspace_list", "workspaces": []}}),
                             "workspace.create" => json!({"id": id, "result": {"workspace": {
                                 "workspace_id": "ws-1", "label": "forged-test"}}}),
+                            "tab.create" => json!({"id": id, "result": {
+                                "type": "tab_created",
+                                "tab": {"workspace_id": "ws-1", "tab_id": "tab-1"},
+                                "root_pane": {"pane_id": "root-1"}}}),
+                            "pane.layout" => json!({"id": id, "result": {
+                                "type": "pane_layout", "layout": {
+                                    "workspace_id": "ws-1", "tab_id": "tab-1",
+                                    "zoomed": false,
+                                    "area": {"x": 0, "y": 0, "width": 160, "height": 48},
+                                    "focused_pane_id": "root-1",
+                                    "panes": [{"pane_id": "root-1", "focused": false,
+                                        "rect": {"x": 0, "y": 0,
+                                            "width": 160, "height": 48}}],
+                                    "splits": []}}}),
                             "pane.split" => json!({"id": id, "result": {"type": "pane_info",
                                 "pane": {"pane_id": PANE_ID, "workspace_id": "ws-1",
                                 "tab_id": "tab-1", "terminal_id": "term-1", "focused": false,
@@ -1986,6 +2061,19 @@ mod settle_tests {
             owned.cleanup_state,
             forged_ledger::OwnedHerdrCleanupState::Pending
         );
+        let layout_id = owned
+            .layout_id
+            .as_deref()
+            .expect("required-Herdr attempt joins its durable layout");
+        let layout = fixture
+            .ledger
+            .get_herdr_layout(layout_id)
+            .expect("layout lookup")
+            .expect("durable layout");
+        assert_eq!(
+            layout.lifecycle_state,
+            forged_ledger::HerdrLayoutLifecycleState::Registered
+        );
         assert!(
             !seen
                 .lock()
@@ -2057,6 +2145,7 @@ mod settle_tests {
             settled["attachHint"].is_null(),
             "a settled attempt must advertise no attach command: {settled}"
         );
+        assert_eq!(settled["layoutId"], layout_id);
     }
 
     #[tokio::test]
@@ -2120,6 +2209,10 @@ mod settle_tests {
         assert_eq!(
             owned.cleanup_state,
             forged_ledger::OwnedHerdrCleanupState::NotRequested
+        );
+        assert!(
+            owned.layout_id.is_some(),
+            "ambiguous command retains layout join"
         );
     }
 }

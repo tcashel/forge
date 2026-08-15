@@ -93,6 +93,10 @@ pub struct OwnedHerdrSessionV1 {
     pub protocol: u32,
     /// Exact host-selected sentinel path; never derived from `pane_id`.
     pub sentinel_path: String,
+    /// Exact durable layout used for placement. Legacy, degraded, and plain
+    /// workspace placements deliberately carry no join.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub layout_id: Option<String>,
 }
 
 #[cfg(test)]

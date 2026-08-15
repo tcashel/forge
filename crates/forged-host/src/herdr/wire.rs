@@ -1,8 +1,8 @@
 //! Serde types for the protocol-19 subset forged-host speaks: `ping`,
-//! `events.subscribe`, `pane.split`, `pane.send_input`, `pane.process_info`,
-//! `pane.close`, and the `pane_created` / `pane_exited` / `pane_closed`
-//! events. Unknown response/event fields are tolerated (ignored), never
-//! round-tripped.
+//! `events.subscribe`, `tab.create`, `pane.layout`, `pane.split`,
+//! `pane.send_input`, `pane.process_info`, `pane.close`, and the
+//! `pane_created` / `pane_exited` / `pane_closed` events. Unknown
+//! response/event fields are tolerated (ignored), never round-tripped.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -43,6 +43,51 @@ pub(crate) struct PaneInfoResult {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PaneInfo {
     pub(crate) pane_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+}
+
+/// `tab.create` result with the exact tab and otherwise-idle root pane.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TabCreatedResult {
+    pub(crate) tab: TabInfo,
+    pub(crate) root_pane: RootPaneInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RootPaneInfo {
+    pub(crate) pane_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TabInfo {
+    pub(crate) tab_id: String,
+    pub(crate) workspace_id: String,
+}
+
+/// `pane.layout` result wrapper.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutResult {
+    pub(crate) layout: PaneLayoutSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutSnapshot {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) panes: Vec<PaneLayoutPane>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutPane {
+    pub(crate) pane_id: String,
+    pub(crate) rect: PaneLayoutRect,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutRect {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 /// `pane.read` result wrapper.

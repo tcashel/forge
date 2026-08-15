@@ -5,7 +5,10 @@
 mod host;
 pub(crate) mod wire;
 
-pub use host::{HerdrCloseOutcome, HerdrControl, HerdrHost, PaneSnapshot};
+pub use host::{
+    HerdrCloseOutcome, HerdrControl, HerdrCreatedTab, HerdrHost, HerdrLayoutInspection,
+    HerdrLayoutPane, HerdrLayoutSnapshot, HerdrLayoutTarget, HerdrTabCreateError, PaneSnapshot,
+};
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
