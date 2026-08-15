@@ -2623,7 +2623,29 @@ async fn operator_queue(
     let groups: Vec<Value> = QUEUE_GROUPS
         .iter()
         .map(|name| {
-            let items = grouped.remove(name).unwrap_or_default();
+            let mut items = grouped.remove(name).unwrap_or_default();
+            items.sort_by(|left, right| {
+                let lp = left
+                    .get("priority")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MAX);
+                let rp = right
+                    .get("priority")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MAX);
+                lp.cmp(&rp)
+                    .then_with(|| {
+                        right
+                            .get("updatedAt")
+                            .and_then(Value::as_str)
+                            .cmp(&left.get("updatedAt").and_then(Value::as_str))
+                    })
+                    .then_with(|| {
+                        left.get("id")
+                            .and_then(Value::as_str)
+                            .cmp(&right.get("id").and_then(Value::as_str))
+                    })
+            });
             json!({"name": name, "count": items.len(), "entries": items})
         })
         .collect();
@@ -3220,6 +3242,7 @@ fn enrich_operations_facts(
         } else {
             WorkIdentitySubjectKind::Run
         };
+        let is_plan = entry.get("source").and_then(Value::as_str) == Some("live-plan");
         let desired = snapshot
             .desired_work
             .iter()
@@ -3275,26 +3298,115 @@ fn enrich_operations_facts(
         let object = entry
             .as_object_mut()
             .ok_or_else(|| Failure::internal("operator entry is not an object"))?;
-        object.insert("desired".to_owned(), desired);
+        object.insert(
+            "desired".to_owned(),
+            if is_plan {
+                json!({"source": "none", "value": Value::Null})
+            } else {
+                desired
+            },
+        );
         object.insert(
             "admission".to_owned(),
-            json!({
-                "source": "ledger",
-                "decisions": decisions,
-                "reservations": reservations,
-            }),
+            if is_plan {
+                json!({"source": "none", "decisions": [], "reservations": []})
+            } else {
+                json!({
+                    "source": "ledger",
+                    "decisions": decisions,
+                    "reservations": reservations,
+                })
+            },
         );
         object.insert(
             "attentionItems".to_owned(),
-            json!({"source": "ledger", "items": attention_items}),
+            json!({"source": "projection", "items": attention_items}),
         );
-        object.insert("execution".to_owned(), execution);
+        object.insert(
+            "execution".to_owned(),
+            if is_plan {
+                json!({"source": "none", "state": "not-started"})
+            } else {
+                execution
+            },
+        );
         object.insert(
             "deliveryFact".to_owned(),
-            json!({"source": "ledger", "value": delivery}),
+            if is_plan {
+                json!({"source": "none", "value": Value::Null})
+            } else {
+                json!({"source": "ledger", "value": delivery})
+            },
         );
     }
     Ok(())
+}
+
+fn desired_only_entries(
+    snapshot: &InventorySnapshot,
+    entries: &[Value],
+) -> Result<Vec<Value>, Failure> {
+    let represented = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_owned();
+            let kind = if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+                WorkIdentitySubjectKind::Epic
+            } else {
+                WorkIdentitySubjectKind::Run
+            };
+            Some((kind, id))
+        })
+        .collect::<BTreeSet<_>>();
+    snapshot
+        .desired_work
+        .iter()
+        .filter_map(|desired| {
+            let kind = match desired.subject_kind {
+                forged_ledger::DesiredSubjectKind::Run => WorkIdentitySubjectKind::Run,
+                forged_ledger::DesiredSubjectKind::Epic => WorkIdentitySubjectKind::Epic,
+            };
+            (!represented.contains(&(kind, desired.subject_id.clone()))).then_some((kind, desired))
+        })
+        .map(|(kind, desired)| {
+            let identity = snapshot
+                .work_identities
+                .get(&(kind, desired.subject_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    Failure::internal(format!(
+                        "desired {} {:?} has no durable work identity",
+                        kind.as_str(),
+                        desired.subject_id
+                    ))
+                })?;
+            let repository = identity.repository.as_ref().map(|value| value.path.clone());
+            Ok(json!({
+                "id": desired.subject_id,
+                "kind": if kind == WorkIdentitySubjectKind::Epic { "epic" } else { "slice" },
+                "identity": identity,
+                "beadId": identity.bead.id,
+                "repo": repository,
+                "baseRef": Value::Null,
+                "branch": Value::Null,
+                "state": "desired",
+                "stopReason": Value::Null,
+                "outcome": Value::Null,
+                "delivery": Value::Null,
+                "supersededBy": Value::Null,
+                "createdAt": desired.created_at,
+                "updatedAt": desired.updated_at,
+                "lastProgressAt": desired.last_progress_at.as_ref().unwrap_or(&desired.updated_at),
+                "liveSeats": 0,
+                "currentStage": Value::Null,
+                "currentSeat": Value::Null,
+                "currentAgent": Value::Null,
+                "costUsdKnown": 0.0,
+                "rowsMissingCost": 0,
+                "desiredOnly": true,
+            }))
+        })
+        .collect()
 }
 
 /// `operations overview` — the bounded, read-only operator surface.
@@ -3354,6 +3466,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         .await?;
         let ledger_captured_at = now_iso();
         let mut entries = project_entries(&snapshot, Spend::Include)?;
+        entries.extend(desired_only_entries(&snapshot, &entries)?);
         if let Some(repository) = repository.as_deref() {
             entries.retain(|entry| {
                 entry
@@ -3390,7 +3503,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         )
         .await;
         let beads_captured_at = now_iso();
-        let (plans, plan_truncated, plan_discovered, bead_error) = match plan_read {
+        let (mut plans, plan_truncated, plan_discovered, mut bead_error) = match plan_read {
             Ok(inventory) => (
                 inventory.issues,
                 inventory.truncated,
@@ -3399,6 +3512,68 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             ),
             Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
         };
+        let represented: BTreeSet<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut plan_entries = Vec::new();
+        if bead_error.is_none() {
+            let mut conversion_error = None;
+            for plan in plans
+                .iter()
+                .filter(|plan| !represented.contains(&plan.issue.id))
+            {
+                match live_plan_entry(plan, &beads_captured_at) {
+                    Ok(entry) => plan_entries.push(entry),
+                    Err(error) => {
+                        conversion_error = Some(format!(
+                            "live plan identity for {:?} was unsafe: {}",
+                            plan.issue.id, error.message
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = conversion_error {
+                bead_error = Some(error);
+                plan_entries.clear();
+                plans.clear();
+            }
+        }
+
+        if bead_error.is_none() {
+            let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
+                .iter()
+                .map(|plan| (plan.issue.id.as_str(), plan))
+                .collect();
+            for entry in &mut entries {
+                let bead_id = entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.insert("priority".to_owned(), json!(plan.issue.priority));
+                        object.insert(
+                            "plan".to_owned(),
+                            json!({
+                                "source": "beads",
+                                "status": plan.issue.status,
+                                "readiness": plan_readiness(plan),
+                                "priority": plan.issue.priority,
+                                "assignee": plan.issue.assignee,
+                                "issueType": plan.issue.issue_type,
+                                "revision": plan.issue.revision,
+                                "parent": plan.parent,
+                                "dependencies": plan.dependencies,
+                            }),
+                        );
+                    }
+                }
+            }
+            entries.extend(plan_entries);
+        }
+
         let bead_summaries: Vec<forged_beads::IssueSummary> =
             plans.iter().map(|plan| plan.issue.clone()).collect();
         let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
@@ -3409,46 +3584,6 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 })
             })
             .collect::<Result<Vec<_>, _>>()?;
-
-        let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
-            .iter()
-            .map(|plan| (plan.issue.id.as_str(), plan))
-            .collect();
-        let represented: BTreeSet<String> = entries
-            .iter()
-            .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        for entry in &mut entries {
-            let bead_id = entry
-                .get("beadId")
-                .and_then(Value::as_str)
-                .map(str::to_owned);
-            if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
-                if let Some(object) = entry.as_object_mut() {
-                    object.insert("priority".to_owned(), json!(plan.issue.priority));
-                    object.insert(
-                        "plan".to_owned(),
-                        json!({
-                            "source": "beads",
-                            "status": plan.issue.status,
-                            "readiness": plan_readiness(plan),
-                            "priority": plan.issue.priority,
-                            "assignee": plan.issue.assignee,
-                            "issueType": plan.issue.issue_type,
-                            "revision": plan.issue.revision,
-                            "parent": plan.parent,
-                            "dependencies": plan.dependencies,
-                        }),
-                    );
-                }
-            }
-        }
-        for plan in &plans {
-            if !represented.contains(&plan.issue.id) {
-                entries.push(live_plan_entry(plan, &beads_captured_at)?);
-            }
-        }
-
         enrich_operations_facts(&snapshot, &attention, &mut entries)?;
 
         let bead_read = match bead_error.as_ref() {
@@ -3489,18 +3624,6 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             if let Some(source) = source_filter.as_deref() {
                 rows.retain(|entry| entry.get("source").and_then(Value::as_str) == Some(source));
             }
-            rows.sort_by(|left, right| {
-                let lp = left.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX);
-                let rp = right.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX);
-                lp.cmp(&rp)
-                    .then_with(|| {
-                        right
-                            .get("updatedAt")
-                            .and_then(Value::as_str)
-                            .cmp(&left.get("updatedAt").and_then(Value::as_str))
-                    })
-                    .then_with(|| left.get("id").and_then(Value::as_str).cmp(&right.get("id").and_then(Value::as_str)))
-            });
             let total = rows.len();
             matching_total += total;
             let shown: Vec<Value> = rows.into_iter().take(remaining).collect();
@@ -3614,7 +3737,6 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             },
             "queue": {"groups": groups, "total": matching_total},
             "attention": attention,
-            "admission": snapshot.admission_decisions,
             "spend": {
                 "costUsdKnown": cost_usd_known,
                 "rowsMissingCost": rows_missing_cost,
