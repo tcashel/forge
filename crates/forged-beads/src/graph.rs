@@ -65,10 +65,140 @@ pub struct IssueSummary {
 pub struct PlanDependency {
     /// Canonical dependency Bead id.
     pub id: String,
-    /// Native dependency edge type (`blocks`, `parent-child`, ...).
-    pub dependency_type: String,
+    /// Native dependency edge type from the pinned bd contract.
+    pub dependency_type: PlanDependencyType,
     /// Current dependency status when the hydrated response carries it.
-    pub status: Option<String>,
+    pub status: Option<PlanDependencyStatus>,
+}
+
+/// Closed subset of pinned bd dependency kinds supported by plan inventory.
+///
+/// Only `blocks` affects scheduling readiness. The other three coordinates
+/// remain visible to consumers as hierarchy, context, or provenance without
+/// being promoted into blockers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanDependencyType {
+    /// A hard scheduling prerequisite.
+    Blocks,
+    /// A structural child-to-parent edge.
+    ParentChild,
+    /// A non-scheduling contextual link.
+    Related,
+    /// A non-scheduling provenance link.
+    DiscoveredFrom,
+}
+
+impl PlanDependencyType {
+    /// The native bd spelling retained on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Blocks => "blocks",
+            Self::ParentChild => "parent-child",
+            Self::Related => "related",
+            Self::DiscoveredFrom => "discovered-from",
+        }
+    }
+
+    /// Whether this edge can prevent the issue from being ready.
+    pub const fn blocks_readiness(self) -> bool {
+        matches!(self, Self::Blocks)
+    }
+}
+
+impl TryFrom<&str> for PlanDependencyType {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "blocks" => Ok(Self::Blocks),
+            "parent-child" => Ok(Self::ParentChild),
+            "related" => Ok(Self::Related),
+            "discovered-from" => Ok(Self::DiscoveredFrom),
+            other => Err(format!("unknown dependency type {other:?}")),
+        }
+    }
+}
+
+/// Closed issue statuses carried by dependency summaries from pinned bd.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanDependencyStatus {
+    /// The prerequisite has not started.
+    Open,
+    /// The prerequisite is currently claimed.
+    InProgress,
+    /// The prerequisite is explicitly blocked.
+    Blocked,
+    /// The prerequisite is deferred.
+    Deferred,
+    /// The prerequisite is complete.
+    Closed,
+    /// The prerequisite is intentionally persistent.
+    Pinned,
+    /// The prerequisite is actively hooked by a worker.
+    Hooked,
+}
+
+impl PlanDependencyStatus {
+    /// The native bd spelling retained on the wire.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::InProgress => "in_progress",
+            Self::Blocked => "blocked",
+            Self::Deferred => "deferred",
+            Self::Closed => "closed",
+            Self::Pinned => "pinned",
+            Self::Hooked => "hooked",
+        }
+    }
+
+    /// Whether this dependency is complete.
+    pub const fn is_closed(self) -> bool {
+        matches!(self, Self::Closed)
+    }
+}
+
+impl std::ops::Deref for PlanDependencyStatus {
+    type Target = str;
+
+    fn deref(&self) -> &Self::Target {
+        self.as_str()
+    }
+}
+
+impl TryFrom<&str> for PlanDependencyStatus {
+    type Error = String;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "open" => Ok(Self::Open),
+            "in_progress" => Ok(Self::InProgress),
+            "blocked" => Ok(Self::Blocked),
+            "deferred" => Ok(Self::Deferred),
+            "closed" => Ok(Self::Closed),
+            "pinned" => Ok(Self::Pinned),
+            "hooked" => Ok(Self::Hooked),
+            other => Err(format!("unknown dependency status {other:?}")),
+        }
+    }
+}
+
+/// Readiness supported by one hydrated plan row's current facts.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PlanReadiness {
+    /// Every hard prerequisite is known closed.
+    Ready,
+    /// The issue or a hard prerequisite is known blocked.
+    Blocked,
+    /// The issue is already claimed and all hard prerequisites are closed.
+    Claimed,
+    /// The issue is explicitly deferred and all hard prerequisites are closed.
+    Deferred,
+    /// A hard prerequisite omitted the status needed to decide readiness.
+    Unknown,
 }
 
 /// One current, nonterminal Beads plan row.
@@ -82,6 +212,43 @@ pub struct PlanIssue {
     pub parent: Option<String>,
     /// Bounded dependency summaries from the single hydrate call.
     pub dependencies: Vec<PlanDependency>,
+}
+
+impl PlanIssue {
+    /// Derive only readiness established by the hydrated dependency facts.
+    ///
+    /// A known non-closed `blocks` edge is conclusive even if another blocker
+    /// omitted its status. If no known blocker proves the issue blocked, any
+    /// missing hard-blocker status keeps the result unknown. Structural and
+    /// informational edges never affect readiness.
+    pub fn readiness(&self) -> PlanReadiness {
+        if self.issue.status == "blocked" {
+            return PlanReadiness::Blocked;
+        }
+
+        let blockers = self
+            .dependencies
+            .iter()
+            .filter(|dependency| dependency.dependency_type.blocks_readiness());
+        let mut missing_status = false;
+        for blocker in blockers {
+            match blocker.status {
+                Some(status) if !status.is_closed() => return PlanReadiness::Blocked,
+                Some(_) => {}
+                None => missing_status = true,
+            }
+        }
+        if missing_status {
+            return PlanReadiness::Unknown;
+        }
+
+        match self.issue.status.as_str() {
+            "open" => PlanReadiness::Ready,
+            "in_progress" => PlanReadiness::Claimed,
+            "deferred" => PlanReadiness::Deferred,
+            _ => PlanReadiness::Unknown,
+        }
+    }
 }
 
 /// The bounded live-plan inventory and its coverage truth.
@@ -177,21 +344,33 @@ fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
     let object = value
         .as_object()
         .ok_or_else(|| "hydrated issue is not an object".to_owned())?;
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "hydrated issue has no non-empty string status".to_owned())?;
+    if !matches!(status, "open" | "in_progress" | "blocked" | "deferred") {
+        return Err(format!(
+            "hydrated issue has unexpected nonterminal status {status:?}"
+        ));
+    }
+    object
+        .get("issue_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "hydrated issue has no non-empty string issue_type".to_owned())?;
+    if object.get("revision").is_some_and(|value| {
+        !matches!(value, Value::Null | Value::Number(_))
+            && !matches!(value, Value::String(text) if !text.trim().is_empty())
+    }) {
+        return Err("hydrated issue has a malformed revision".to_owned());
+    }
     let issue = issue(value).ok_or_else(|| "hydrated issue has no string id".to_owned())?;
     if issue.id.trim().is_empty() {
         return Err("hydrated issue has an empty id".to_owned());
     }
     if !object.get("title").is_some_and(Value::is_string) {
         return Err(format!("hydrated issue {:?} has no string title", issue.id));
-    }
-    if !matches!(
-        issue.status.as_str(),
-        "open" | "in_progress" | "blocked" | "deferred"
-    ) {
-        return Err(format!(
-            "hydrated issue {:?} has unexpected nonterminal status {:?}",
-            issue.id, issue.status
-        ));
     }
     if object.get("priority").is_some_and(|value| !value.is_i64()) {
         return Err(format!(
@@ -260,11 +439,24 @@ fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
                             "hydrated issue {:?} dependency {:?} has no type",
                             issue.id, id
                         )
-                    })?
-                    .to_owned();
+                    })?;
+                let dependency_type =
+                    PlanDependencyType::try_from(dependency_type).map_err(|detail| {
+                        format!(
+                            "hydrated issue {:?} dependency {:?} has {detail}",
+                            issue.id, id
+                        )
+                    })?;
                 let status = match object.get("status") {
                     None | Some(Value::Null) => None,
-                    Some(Value::String(value)) if !value.trim().is_empty() => Some(value.clone()),
+                    Some(Value::String(value)) if !value.trim().is_empty() => Some(
+                        PlanDependencyStatus::try_from(value.as_str()).map_err(|detail| {
+                            format!(
+                                "hydrated issue {:?} dependency {:?} has {detail}",
+                                issue.id, id
+                            )
+                        })?,
+                    ),
                     Some(_) => {
                         return Err(format!(
                             "hydrated issue {:?} dependency {:?} has malformed status",
@@ -291,6 +483,73 @@ fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
         parent,
         dependencies,
     })
+}
+
+fn selected_discovery_ids(rows: &[Value], limit: usize) -> Result<Vec<String>, String> {
+    let maximum = limit.saturating_add(1);
+    if rows.len() > maximum {
+        return Err(format!(
+            "discovery returned {} rows beyond the N+1 bound {maximum}",
+            rows.len()
+        ));
+    }
+
+    let mut seen = BTreeSet::new();
+    let mut discovered = Vec::with_capacity(rows.len());
+    for row in rows {
+        let id = row
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| "discovery row has no non-empty string id".to_owned())?;
+        if !seen.insert(id.to_owned()) {
+            return Err(format!("discovery returned duplicate issue id {id:?}"));
+        }
+        discovered.push(id.to_owned());
+    }
+    discovered.truncate(limit);
+    Ok(discovered)
+}
+
+fn hydrated_plan_rows(
+    rows: &[Value],
+    requested_ids: &[String],
+    repository: Option<&str>,
+) -> Result<Vec<PlanIssue>, String> {
+    let requested: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
+    if requested.len() != requested_ids.len() {
+        return Err("selected discovery ids are not unique".to_owned());
+    }
+
+    let mut by_id = BTreeMap::new();
+    for row in rows {
+        let item = plan_issue(row)?;
+        let id = item.issue.id.clone();
+        if !requested.contains(id.as_str()) {
+            return Err(format!("hydrate returned unrequested issue id {id:?}"));
+        }
+        if by_id.insert(id.clone(), item).is_some() {
+            return Err(format!("hydrate returned duplicate issue id {id:?}"));
+        }
+    }
+
+    requested_ids
+        .iter()
+        .map(|id| {
+            let item = by_id
+                .remove(id)
+                .ok_or_else(|| format!("hydrate omitted selected issue {id:?}"))?;
+            if let Some(expected) = repository {
+                let actual = item.issue.metadata.get("repository").map(String::as_str);
+                if actual != Some(expected) {
+                    return Err(format!(
+                        "selected issue {id:?} repository changed during hydration"
+                    ));
+                }
+            }
+            Ok(item)
+        })
+        .collect()
 }
 
 fn list(value: &Value) -> Vec<IssueSummary> {
@@ -399,28 +658,11 @@ pub async fn plan_inventory(
         envelope::as_list(&discovered_json).unwrap_or_else(|| vec![discovered_json.clone()]);
     let discovered = discovered_rows.len();
     let truncated = discovered > limit;
-    let mut seen_ids = BTreeSet::new();
-    let ids: Vec<String> = discovered_rows
-        .iter()
-        .take(limit)
-        .map(|value| {
-            let id = value
-                .get("id")
-                .and_then(Value::as_str)
-                .filter(|value| !value.trim().is_empty())
-                .ok_or_else(|| BdError::Envelope {
-                    context: "bd list live plan".to_owned(),
-                    detail: "discovery row has no non-empty string id".to_owned(),
-                })?;
-            if !seen_ids.insert(id.to_owned()) {
-                return Err(BdError::Envelope {
-                    context: "bd list live plan".to_owned(),
-                    detail: format!("discovery returned duplicate issue id {id:?}"),
-                });
-            }
-            Ok(id.to_owned())
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let ids =
+        selected_discovery_ids(&discovered_rows, limit).map_err(|detail| BdError::Envelope {
+            context: "bd list live plan".to_owned(),
+            detail,
+        })?;
     if ids.is_empty() {
         return Ok(PlanInventory {
             issues: Vec::new(),
@@ -437,46 +679,12 @@ pub async fn plan_inventory(
     let hydrated_json = invoke::read(cfg, &show_args).await?;
     let hydrated_rows =
         envelope::as_list(&hydrated_json).unwrap_or_else(|| vec![hydrated_json.clone()]);
-    let mut by_id = BTreeMap::new();
-    for row in &hydrated_rows {
-        let item = plan_issue(row).map_err(|detail| BdError::Envelope {
+    let issues = hydrated_plan_rows(&hydrated_rows, &ids, repository).map_err(|detail| {
+        BdError::Envelope {
             context: "bd show live plan".to_owned(),
             detail,
-        })?;
-        if by_id.insert(item.issue.id.clone(), item).is_some() {
-            return Err(BdError::Envelope {
-                context: "bd show live plan".to_owned(),
-                detail: "hydrate returned a duplicate issue id".to_owned(),
-            });
         }
-    }
-    if by_id.keys().any(|id| !seen_ids.contains(id)) {
-        return Err(BdError::Envelope {
-            context: "bd show live plan".to_owned(),
-            detail: "hydrate returned an unrequested issue id".to_owned(),
-        });
-    }
-    let issues = ids
-        .iter()
-        .map(|id| {
-            let item = by_id.remove(id).ok_or_else(|| BdError::Envelope {
-                context: "bd show live plan".to_owned(),
-                detail: format!("hydrate omitted selected issue {id:?}"),
-            })?;
-            if let Some(expected) = repository {
-                let actual = item.issue.metadata.get("repository").map(String::as_str);
-                if actual != Some(expected) {
-                    return Err(BdError::Envelope {
-                        context: "bd show live plan".to_owned(),
-                        detail: format!(
-                            "selected issue {id:?} repository changed during hydration"
-                        ),
-                    });
-                }
-            }
-            Ok(item)
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    })?;
     Ok(PlanInventory {
         issues,
         truncated,
@@ -739,6 +947,16 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    fn hydrated(id: &str, status: &str, dependencies: Value) -> Value {
+        json!({
+            "id": id,
+            "title": format!("Plan {id}"),
+            "status": status,
+            "issue_type": "task",
+            "dependencies": dependencies,
+        })
+    }
+
     #[test]
     fn issue_projection_defaults_optional_copy() {
         assert_eq!(
@@ -821,5 +1039,222 @@ mod tests {
             issue(&json!({"id": "b-3"})).expect("projects").revision,
             None
         );
+    }
+
+    #[test]
+    fn plan_hydration_requires_closed_issue_and_dependency_fields() {
+        for malformed in [
+            json!({"id":"plan-a","title":"Plan A","issue_type":"task"}),
+            json!({"id":"plan-a","title":"Plan A","status":"open"}),
+            json!({
+                "id":"plan-a",
+                "title":"Plan A",
+                "status":"custom",
+                "issue_type":"task"
+            }),
+            json!({
+                "id":"plan-a",
+                "title":"Plan A",
+                "status":"open",
+                "issue_type":"task",
+                "revision": {}
+            }),
+            hydrated(
+                "plan-a",
+                "open",
+                json!([{"id":"dep-a","dependency_type":"waits-for","status":"open"}]),
+            ),
+            hydrated(
+                "plan-a",
+                "open",
+                json!([{"id":"dep-a","dependency_type":"blocks","status":"custom"}]),
+            ),
+        ] {
+            assert!(
+                plan_issue(&malformed).is_err(),
+                "malformed plan row was accepted: {malformed}"
+            );
+        }
+    }
+
+    #[test]
+    fn pinned_dependency_kinds_round_trip_without_inventing_blockers() {
+        let item = plan_issue(&hydrated(
+            "plan-a",
+            "open",
+            json!([
+                {"id":"hard","dependency_type":"blocks","status":"closed"},
+                {"id":"parent","dependency_type":"parent-child","status":"open"},
+                {"id":"context","dependency_type":"related","status":"in_progress"},
+                {"id":"origin","dependency_type":"discovered-from"}
+            ]),
+        ))
+        .expect("the four pinned dependency kinds");
+
+        assert_eq!(item.readiness(), PlanReadiness::Ready);
+        assert_eq!(
+            item.dependencies
+                .iter()
+                .map(|dependency| dependency.dependency_type)
+                .collect::<Vec<_>>(),
+            vec![
+                PlanDependencyType::Blocks,
+                PlanDependencyType::ParentChild,
+                PlanDependencyType::Related,
+                PlanDependencyType::DiscoveredFrom,
+            ]
+        );
+        assert_eq!(
+            serde_json::to_value(&item.dependencies).expect("serialize dependencies"),
+            json!([
+                {"id":"hard","dependencyType":"blocks","status":"closed"},
+                {"id":"parent","dependencyType":"parent-child","status":"open"},
+                {"id":"context","dependencyType":"related","status":"in_progress"},
+                {"id":"origin","dependencyType":"discovered-from","status":null}
+            ])
+        );
+    }
+
+    #[test]
+    fn readiness_is_unknown_only_when_a_hard_blocker_lacks_status() {
+        let missing = plan_issue(&hydrated(
+            "plan-a",
+            "open",
+            json!([{"id":"hard","dependency_type":"blocks"}]),
+        ))
+        .expect("missing dependency status is bounded unknown evidence");
+        assert_eq!(missing.readiness(), PlanReadiness::Unknown);
+
+        let known_open = plan_issue(&hydrated(
+            "plan-a",
+            "open",
+            json!([
+                {"id":"unknown","dependency_type":"blocks"},
+                {"id":"open","dependency_type":"blocks","status":"open"}
+            ]),
+        ))
+        .expect("known and unknown blocker evidence");
+        assert_eq!(known_open.readiness(), PlanReadiness::Blocked);
+
+        let structural = plan_issue(&hydrated(
+            "plan-a",
+            "open",
+            json!([{"id":"epic","dependency_type":"parent-child"}]),
+        ))
+        .expect("parent-child status is not scheduling evidence");
+        assert_eq!(structural.readiness(), PlanReadiness::Ready);
+    }
+
+    #[test]
+    fn dependency_status_decoding_matches_the_pinned_bd_schema() {
+        for status in [
+            "open",
+            "in_progress",
+            "blocked",
+            "deferred",
+            "closed",
+            "pinned",
+            "hooked",
+        ] {
+            let item = plan_issue(&hydrated(
+                "plan-a",
+                "open",
+                json!([{"id":"hard","dependency_type":"blocks","status":status}]),
+            ))
+            .unwrap_or_else(|error| panic!("pinned status {status:?} was rejected: {error}"));
+            let expected = if status == "closed" {
+                PlanReadiness::Ready
+            } else {
+                PlanReadiness::Blocked
+            };
+            assert_eq!(item.readiness(), expected, "status {status:?}");
+        }
+    }
+
+    #[test]
+    fn discovery_validates_the_n_plus_one_sentinel_before_truncating() {
+        let rows = vec![json!({"id":"a"}), json!({"id":"b"}), json!({"id":"c"})];
+        assert_eq!(
+            selected_discovery_ids(&rows, 2).expect("valid N+1 discovery"),
+            vec!["a".to_owned(), "b".to_owned()]
+        );
+
+        for malformed in [
+            vec![
+                json!({"id":"a"}),
+                json!({"id":"b"}),
+                json!({"title":"sentinel"}),
+            ],
+            vec![json!({"id":"a"}), json!({"id":"b"}), json!({"id":"b"})],
+            vec![json!({"id":"a"}), json!({"id":"b"}), json!({"id":" "})],
+        ] {
+            assert!(
+                selected_discovery_ids(&malformed, 2).is_err(),
+                "malformed sentinel was ignored: {malformed:?}"
+            );
+        }
+        assert!(selected_discovery_ids(
+            &[
+                json!({"id":"a"}),
+                json!({"id":"b"}),
+                json!({"id":"c"}),
+                json!({"id":"d"}),
+            ],
+            2,
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn hydration_is_an_exact_complete_join_in_discovery_order() {
+        let requested = vec!["a".to_owned(), "b".to_owned()];
+        let reversed = vec![
+            hydrated("b", "open", json!([])),
+            hydrated("a", "open", json!([])),
+        ];
+        assert_eq!(
+            hydrated_plan_rows(&reversed, &requested, None)
+                .expect("complete exact hydrate")
+                .into_iter()
+                .map(|item| item.issue.id)
+                .collect::<Vec<_>>(),
+            requested
+        );
+
+        let cases = [
+            (
+                vec![
+                    hydrated("a", "open", json!([])),
+                    hydrated("a", "open", json!([])),
+                ],
+                "duplicate issue id",
+            ),
+            (
+                vec![
+                    hydrated("a", "open", json!([])),
+                    hydrated("", "open", json!([])),
+                ],
+                "empty id",
+            ),
+            (
+                vec![
+                    hydrated("a", "open", json!([])),
+                    hydrated("sentinel", "open", json!([])),
+                ],
+                "unrequested issue id",
+            ),
+            (
+                vec![hydrated("a", "open", json!([]))],
+                "omitted selected issue",
+            ),
+        ];
+        for (rows, expected) in cases {
+            let error = hydrated_plan_rows(&rows, &requested, None)
+                .expect_err("inexact hydration must fail closed");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
     }
 }
