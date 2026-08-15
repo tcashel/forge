@@ -20,7 +20,7 @@ if [ "$*" != "show issue-a issue-b --brief-deps --json" ]; then
   printf 'unexpected argv: %s\n' "$*" >&2
   exit 9
 fi
-printf '%s\n' '{"schema_version":1,"data":[{"id":"issue-b","title":"Issue B","status":"in_progress","priority":2,"issue_type":"task","metadata":{"repository":"/tmp/repository"},"revision":-6192208415116251521},{"id":"issue-a","title":"Issue A","status":"open","priority":0,"issue_type":"bug","metadata":{"repository":"/tmp/repository"},"revision":9146914492635073757}]}'
+printf '%s\n' '{"schema_version":1,"data":[{"id":"issue-b","title":"Issue B","status":"awaiting_review","priority":2,"issue_type":"task","metadata":{"repository":"/tmp/repository"},"revision":-6192208415116251521},{"id":"issue-a","title":"Issue A","status":"open","priority":0,"issue_type":"bug","metadata":{"repository":"/tmp/repository"},"revision":9146914492635073757}]}'
 "#,
     )
     .expect("write bd shim");
@@ -36,7 +36,7 @@ printf '%s\n' '{"schema_version":1,"data":[{"id":"issue-b","title":"Issue B","st
     assert_eq!(issues[0].priority, Some(0));
     assert_eq!(issues[0].revision.as_deref(), Some("9146914492635073757"));
     assert_eq!(issues[1].id, "issue-b");
-    assert_eq!(issues[1].status, "in_progress");
+    assert_eq!(issues[1].status, "awaiting_review");
     assert_eq!(issues[1].priority, Some(2));
     assert_eq!(issues[1].revision.as_deref(), Some("-6192208415116251521"));
     assert!(issues.iter().all(|issue| {

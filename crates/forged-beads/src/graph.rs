@@ -524,13 +524,11 @@ fn exact_issue(value: &Value) -> Result<IssueSummary, String> {
     if !object.get("title").is_some_and(Value::is_string) {
         return Err(format!("hydrated issue {id:?} has no string title"));
     }
-    let status = object
+    object
         .get("status")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("hydrated issue {id:?} has no non-empty string status"))?;
-    PlanDependencyStatus::try_from(status)
-        .map_err(|detail| format!("hydrated issue {id:?} has {detail}"))?;
     object
         .get("issue_type")
         .and_then(Value::as_str)

@@ -464,6 +464,74 @@ fn show_hydrated_revision_admits_controller_and_packet() {
 }
 
 #[test]
+fn custom_status_defers_only_that_row_in_a_mixed_admission_batch() {
+    let env = TestEnv::new("adm-custom-status");
+    let custom = "adm-awaiting-review";
+    let open = "adm-open";
+    start_run(&env, custom);
+    start_run(&env, open);
+    env.set_bead_field(custom, "status", "awaiting_review");
+    env.set_bead_field(custom, "priority", "0");
+    env.set_bead_field(open, "priority", "1");
+    env.authorize_run(custom);
+    env.authorize_run(open);
+    env.set_scenario("implement", "hang", 1);
+    let calls_before = env.bd_calls().len();
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "mixed admission tick: {tick}");
+    wait_until("open peer provider start", || {
+        provider_starts(&env, "implementation")
+            .iter()
+            .any(|start| start.starts_with(&format!("{open}/")))
+    });
+
+    let ledger = env.ledger();
+    let decisions = ledger
+        .latest_admission_decisions(Some(AdmissionSubjectKind::Run), None)
+        .expect("run admission decisions")
+        .into_iter()
+        .filter(|decision| decision.subject_id == custom || decision.subject_id == open)
+        .collect::<Vec<_>>();
+    let custom_decision = decisions
+        .iter()
+        .find(|decision| decision.subject_id == custom)
+        .expect("custom-status decision");
+    assert_eq!(custom_decision.outcome, AdmissionOutcome::Deferred);
+    assert_eq!(custom_decision.reason, AdmissionReason::BeadNotRunnable);
+    let open_decision = decisions
+        .iter()
+        .find(|decision| decision.subject_id == open)
+        .expect("open decision");
+    assert_eq!(open_decision.outcome, AdmissionOutcome::Admitted);
+    assert_eq!(open_decision.reason, AdmissionReason::CapacityAvailable);
+    assert_eq!(
+        custom_decision.batch_id, open_decision.batch_id,
+        "both rows must be evaluated from one exact hydration batch"
+    );
+    ledger.close().expect("close ledger");
+
+    let starts = provider_starts(&env, "implementation");
+    assert!(
+        starts
+            .iter()
+            .all(|start| start.starts_with(&format!("{open}/"))),
+        "the custom-status row is retained but never runnable: {starts:?}"
+    );
+    let calls = &env.bd_calls()[calls_before..];
+    assert!(
+        calls
+            .iter()
+            .any(|call| { call == &format!("show {custom} {open} --brief-deps --json") }),
+        "the mixed batch must use one native exact hydrate: {calls:?}"
+    );
+
+    stop_run(&env, open);
+    stop_run(&env, custom);
+    no_live_reservations(&env);
+}
+
+#[test]
 fn missing_packet_revision_defers_without_reservation_or_provider_effect() {
     let env = TestEnv::new("adm-null");
     let run = "adm-null";
