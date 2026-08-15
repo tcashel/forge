@@ -21,7 +21,7 @@ use crate::types::{
 pub const OWNED_HERDR_CLEANUP_RETRY_BUDGET: u32 = 8;
 const MAX_CLEANUP_BACKOFF_SECONDS: u64 = 300;
 
-const COLUMNS: &str = "ownership_id, schema, owner_kind, subject_kind, subject_id, \
+pub(crate) const COLUMNS: &str = "ownership_id, schema, owner_kind, subject_kind, subject_id, \
     run_id, packet_id, attempt_id, claim_token, controller_generation, pane_id, \
     socket_path, protocol, sentinel_path, lifecycle_state, cleanup_state, \
     cleanup_reason, cleanup_release, cleanup_token, cleanup_lease_until, \
@@ -94,10 +94,22 @@ fn subject_kind_column(
     }
 }
 
-fn owned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedHerdrSessionRow> {
+pub(crate) fn owned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedHerdrSessionRow> {
+    let schema: String = row.get(1)?;
+    if schema != OWNED_HERDR_SESSION_SCHEMA_V1 {
+        return Err(column_decode_error(1, "owned Herdr schema", &schema));
+    }
+    let protocol: u32 = unsigned_column(row, 12, "Herdr protocol")?;
+    if protocol != 19 {
+        return Err(rusqlite::Error::FromSqlConversionFailure(
+            12,
+            rusqlite::types::Type::Integer,
+            format!("unknown owned Herdr protocol in database: {protocol}").into(),
+        ));
+    }
     Ok(OwnedHerdrSessionRow {
         ownership_id: row.get(0)?,
-        schema: row.get(1)?,
+        schema,
         owner_kind: enum_column(row, 2, "owned Herdr owner kind")?,
         subject_kind: subject_kind_column(row, 3)?,
         subject_id: row.get(4)?,
@@ -108,7 +120,7 @@ fn owned_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<OwnedHerdrSessionRow> 
         controller_generation: optional_u32(row, 9, "controller generation")?,
         pane_id: row.get(10)?,
         socket_path: row.get(11)?,
-        protocol: unsigned_column(row, 12, "Herdr protocol")?,
+        protocol,
         sentinel_path: row.get(13)?,
         lifecycle_state: enum_column(row, 14, "owned Herdr lifecycle state")?,
         cleanup_state: enum_column(row, 15, "owned Herdr cleanup state")?,

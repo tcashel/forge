@@ -26,11 +26,13 @@ use crate::error::{internal, refused, LedgerError};
 use crate::events::event_row;
 use crate::ledger::Ledger;
 use crate::operations::{operation_row, OPERATION_COLUMNS};
+use crate::owned_herdr::{owned_row, COLUMNS as OWNED_HERDR_COLUMNS};
 use crate::packets::{packet_row, PACKET_COLUMNS};
 use crate::runs::{run_row, RUN_COLUMNS};
 use crate::types::{
     AdmissionReservationRow, AttemptArtifactCompactionRow, AttemptArtifactRow, AttemptRow,
-    DesiredWorkRow, EventRow, OperationRow, PacketRow, RunRow, UsageRecord, UsageTotals,
+    DesiredWorkRow, EventRow, OperationRow, OwnedHerdrSessionRow, PacketRow, RunRow, UsageRecord,
+    UsageTotals,
 };
 use crate::usage::{totals_of, usage_row, Sums, TOTAL_SUMS, USAGE_COLUMNS};
 use crate::work_identity::{get_work_identity_tx, identity_row, IDENTITY_COLUMNS};
@@ -94,6 +96,9 @@ pub struct WorkObservationSnapshot {
     pub usage_totals: BTreeMap<String, UsageTotals>,
     /// Only operations which still retain effect custody.
     pub inflight_operations: Vec<OperationRow>,
+    /// Durable metadata for controllers and provider attempts owned by this
+    /// subject or one of its selected child runs, including released rows.
+    pub owned_herdr_sessions: Vec<OwnedHerdrSessionRow>,
     pub events: WorkObservationEvents,
 }
 
@@ -430,6 +435,27 @@ fn inflight_operations_tx(
         .collect())
 }
 
+fn owned_herdr_sessions_tx(
+    conn: &Connection,
+    epic_id: Option<&str>,
+    run_scope: &str,
+) -> Result<Vec<OwnedHerdrSessionRow>, LedgerError> {
+    let mut statement = conn.prepare(&format!(
+        "SELECT {OWNED_HERDR_COLUMNS} FROM owned_herdr_sessions \
+         WHERE (owner_kind = 'controller' AND ( \
+           (subject_kind = 'run' AND subject_id IN \
+             (SELECT CAST(value AS TEXT) FROM json_each(?1))) \
+           OR (?2 IS NOT NULL AND subject_kind = 'epic' AND subject_id = ?2) \
+         )) OR (owner_kind = 'attempt' AND \
+           run_id IN (SELECT CAST(value AS TEXT) FROM json_each(?1)) \
+           AND packet_id IN (SELECT packet_id FROM packets WHERE run_id IN \
+             (SELECT CAST(value AS TEXT) FROM json_each(?1))) \
+         ) ORDER BY ownership_id"
+    ))?;
+    let rows = statement.query_map(rusqlite::params![run_scope, epic_id], owned_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn subject_events_tx(
     conn: &Connection,
     subject_id: &str,
@@ -579,6 +605,7 @@ impl Ledger {
                 usage_rows: usage_rows_tx(&tx, &run_scope)?,
                 usage_totals: usage_totals_tx(&tx, &run_ids, &run_scope)?,
                 inflight_operations: inflight_operations_tx(&tx, &subject_scope, &run_scope)?,
+                owned_herdr_sessions: owned_herdr_sessions_tx(&tx, epic_id, &run_scope)?,
                 events: subject_events_tx(&tx, &subject_id, after_event_id, event_limit)?,
             };
             tx.commit()?;
@@ -741,6 +768,196 @@ mod tests {
                 Ok(())
             })
             .expect("seed admission");
+    }
+
+    fn seed_owned_controller(
+        ledger: &Ledger,
+        ownership_id: &str,
+        subject_kind: &str,
+        subject_id: &str,
+    ) {
+        let ownership_id = ownership_id.to_owned();
+        let subject_kind = subject_kind.to_owned();
+        let subject_id = subject_id.to_owned();
+        ledger
+            .submit(move |conn| {
+                conn.execute(
+                    "INSERT INTO owned_herdr_sessions (ownership_id, schema, owner_kind, \
+                     subject_kind, subject_id, controller_generation, pane_id, socket_path, \
+                     protocol, sentinel_path, lifecycle_state, cleanup_state, \
+                     cleanup_retry_budget, cleanup_retry_used, registered_at, updated_at) \
+                     VALUES (?1, 'forged.owned-herdr-session/1', 'controller', ?2, ?3, 1, \
+                     ?4, ?5, 19, ?6, 'registered', 'not-requested', 8, 0, ?7, ?7)",
+                    rusqlite::params![
+                        ownership_id,
+                        subject_kind,
+                        subject_id,
+                        format!("pane-{ownership_id}"),
+                        format!("/socket/{ownership_id}"),
+                        format!("sentinel/{ownership_id}"),
+                        NOW,
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed owned controller");
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn seed_owned_attempt(
+        ledger: &Ledger,
+        ownership_id: &str,
+        subject_kind: &str,
+        subject_id: &str,
+        run_id: &str,
+        packet_id: &str,
+        attempt_id: i64,
+        controller_generation: Option<u32>,
+    ) {
+        let ownership_id = ownership_id.to_owned();
+        let subject_kind = subject_kind.to_owned();
+        let subject_id = subject_id.to_owned();
+        let run_id = run_id.to_owned();
+        let packet_id = packet_id.to_owned();
+        ledger
+            .submit(move |conn| {
+                conn.execute(
+                    "INSERT INTO owned_herdr_sessions (ownership_id, schema, owner_kind, \
+                     subject_kind, subject_id, run_id, packet_id, attempt_id, claim_token, \
+                     controller_generation, pane_id, socket_path, protocol, sentinel_path, \
+                     lifecycle_state, cleanup_state, cleanup_retry_budget, cleanup_retry_used, \
+                     registered_at, updated_at) VALUES (?1, 'forged.owned-herdr-session/1', \
+                     'attempt', ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, 19, ?11, 'registered', \
+                     'not-requested', 8, 0, ?12, ?12)",
+                    rusqlite::params![
+                        ownership_id,
+                        subject_kind,
+                        subject_id,
+                        run_id,
+                        packet_id,
+                        attempt_id,
+                        format!("claim-{attempt_id}"),
+                        controller_generation.map(i64::from),
+                        format!("pane-{ownership_id}"),
+                        format!("/socket/{ownership_id}"),
+                        format!("sentinel/{ownership_id}"),
+                        NOW,
+                    ],
+                )?;
+                Ok(())
+            })
+            .expect("seed owned attempt");
+    }
+
+    #[test]
+    fn run_snapshot_bulk_reads_only_its_controller_and_provider_ownership() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        seed_run(&ledger, "owned-run", None);
+        seed_run(&ledger, "owned-outsider", None);
+        let packet = seed_packet(&ledger, "owned-run", 1);
+        let outsider_packet = seed_packet(&ledger, "owned-outsider", 1);
+        seed_owned_controller(&ledger, "z-run-controller", "run", "owned-run");
+        seed_owned_attempt(
+            &ledger,
+            "a-run-provider",
+            "run",
+            "owned-run",
+            "owned-run",
+            &packet,
+            11,
+            None,
+        );
+        seed_owned_controller(&ledger, "outsider-controller", "run", "owned-outsider");
+        seed_owned_attempt(
+            &ledger,
+            "outsider-provider",
+            "run",
+            "owned-outsider",
+            "owned-outsider",
+            &outsider_packet,
+            12,
+            None,
+        );
+
+        let snapshot = ledger
+            .work_observation_snapshot(WorkIdentitySubjectKind::Run, "owned-run", 0, 10)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .owned_herdr_sessions
+                .iter()
+                .map(|row| row.ownership_id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["a-run-provider", "z-run-controller"]
+        );
+    }
+
+    #[test]
+    fn epic_snapshot_bulk_reads_parent_child_and_provider_ownership() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        seed_epic(&ledger, "owned-epic");
+        seed_run(&ledger, "owned-child-a", Some("owned-epic"));
+        seed_run(&ledger, "owned-child-b", Some("owned-epic"));
+        seed_run(&ledger, "owned-epic-outsider", None);
+        let packet_a = seed_packet(&ledger, "owned-child-a", 1);
+        let packet_b = seed_packet(&ledger, "owned-child-b", 1);
+        ledger
+            .append_event(
+                Some("owned-epic"),
+                EPIC_CHILD_STARTED,
+                json!({"childId": "bead-a", "runId": "owned-child-a"}),
+            )
+            .expect("child a");
+        ledger
+            .append_event(
+                Some("owned-epic"),
+                EPIC_CHILD_STARTED,
+                json!({"childId": "bead-b", "runId": "owned-child-b"}),
+            )
+            .expect("child b");
+
+        seed_owned_controller(&ledger, "epic-controller", "epic", "owned-epic");
+        seed_owned_controller(&ledger, "run-controller", "run", "owned-child-a");
+        seed_owned_attempt(
+            &ledger,
+            "provider-a",
+            "epic",
+            "owned-epic",
+            "owned-child-a",
+            &packet_a,
+            21,
+            Some(1),
+        );
+        seed_owned_attempt(
+            &ledger,
+            "provider-b",
+            "run",
+            "owned-child-b",
+            "owned-child-b",
+            &packet_b,
+            22,
+            None,
+        );
+        seed_owned_controller(&ledger, "outsider-controller", "run", "owned-epic-outsider");
+
+        let snapshot = ledger
+            .work_observation_snapshot(WorkIdentitySubjectKind::Epic, "owned-epic", 0, 10)
+            .expect("snapshot");
+        assert_eq!(
+            snapshot
+                .owned_herdr_sessions
+                .iter()
+                .map(|row| row.ownership_id.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "epic-controller",
+                "provider-a",
+                "provider-b",
+                "run-controller",
+            ]
+        );
     }
 
     #[test]
