@@ -275,6 +275,439 @@ if (seen.size !== expected.size) process.exit(1);
 NODE
 }
 
+check_manage_work_host_parity_contract() {
+  node - "$1" <<'NODE'
+'use strict';
+
+const fs = require('fs');
+const path = require('path');
+const crypto = require('crypto');
+
+const parityPathArgument = process.argv[2];
+const repoRoot = fs.realpathSync('.');
+
+function invariant(condition, message) {
+  if (!condition) throw new Error(message);
+}
+
+function stable(value) {
+  if (Array.isArray(value)) return value.map(stable);
+  if (value && typeof value === 'object') {
+    return Object.fromEntries(Object.keys(value).sort().map((key) => [key, stable(value[key])]));
+  }
+  return value;
+}
+
+function stableJson(value) {
+  return JSON.stringify(stable(value));
+}
+
+function exactKeys(value, expected, label) {
+  invariant(value && typeof value === 'object' && !Array.isArray(value), `${label} must be an object`);
+  invariant(
+    stableJson(Object.keys(value).sort()) === stableJson([...expected].sort()),
+    `${label} has an unexpected key set`,
+  );
+}
+
+function readJson(file, label) {
+  let value;
+  try {
+    value = JSON.parse(fs.readFileSync(file, 'utf8'));
+  } catch (error) {
+    throw new Error(`${label} is not readable strict JSON: ${error.message}`);
+  }
+  return value;
+}
+
+function isInside(root, candidate) {
+  const relative = path.relative(root, candidate);
+  return relative === '' || (!relative.startsWith(`..${path.sep}`) && relative !== '..' && !path.isAbsolute(relative));
+}
+
+function resolveInside(root, relativePath, expectedKind, label) {
+  invariant(typeof relativePath === 'string' && relativePath.length > 0, `${label} path is missing`);
+  invariant(!path.isAbsolute(relativePath) && !relativePath.includes('\0'), `${label} path must be relative`);
+  const lexical = path.resolve(root, relativePath);
+  invariant(isInside(root, lexical), `${label} path escapes its root`);
+  const real = fs.realpathSync(lexical);
+  invariant(isInside(root, real), `${label} symlink escapes its root`);
+  const stat = fs.statSync(real);
+  invariant(
+    expectedKind === 'file' ? stat.isFile() : stat.isDirectory(),
+    `${label} is not a ${expectedKind}`,
+  );
+  return real;
+}
+
+function sha256(content) {
+  return crypto.createHash('sha256').update(content).digest('hex');
+}
+
+function inventorySkills(skillsRoot) {
+  const files = [];
+  const activeDirectories = new Set();
+
+  function walk(logicalDirectory) {
+    const realDirectory = fs.realpathSync(logicalDirectory);
+    invariant(isInside(skillsRoot, realDirectory), 'skill directory symlink escapes the shared skill root');
+    invariant(!activeDirectories.has(realDirectory), 'skill directory symlink creates a cycle');
+    activeDirectories.add(realDirectory);
+    for (const name of fs.readdirSync(logicalDirectory).sort()) {
+      const logicalChild = path.join(logicalDirectory, name);
+      const realChild = fs.realpathSync(logicalChild);
+      invariant(isInside(skillsRoot, realChild), 'skill file symlink escapes the shared skill root');
+      const stat = fs.statSync(realChild);
+      if (stat.isDirectory()) {
+        walk(logicalChild);
+      } else if (stat.isFile()) {
+        const relative = path.relative(skillsRoot, logicalChild).split(path.sep).join('/');
+        files.push({path: relative, sha256: sha256(fs.readFileSync(logicalChild))});
+      } else {
+        throw new Error('shared skill tree contains a non-file entry');
+      }
+    }
+    activeDirectories.delete(realDirectory);
+  }
+
+  walk(skillsRoot);
+  files.sort((left, right) => left.path < right.path ? -1 : left.path > right.path ? 1 : 0);
+  const entrypoints = files
+    .map((entry) => entry.path)
+    .filter((relative) => /^[^/]+\/SKILL\.md$/.test(relative));
+  const expectedEntrypoints = [
+    'adjudicate/SKILL.md',
+    'critique/SKILL.md',
+    'dispatch/SKILL.md',
+    'manage-work/SKILL.md',
+    'plan/SKILL.md',
+    'run-epic/SKILL.md',
+    'setup/SKILL.md',
+  ];
+  invariant(stableJson(entrypoints) === stableJson(expectedEntrypoints), 'shared skill entrypoint inventory moved');
+  return {files, digest: sha256(Buffer.from(stableJson(files)))};
+}
+
+const commonManifestKeys = [
+  'author', 'description', 'homepage', 'license', 'name', 'repository', 'skills', 'version',
+];
+
+function validateCommonManifest(manifest, label) {
+  invariant(manifest.name === 'forged', `${label} plugin identity moved`);
+  invariant(typeof manifest.version === 'string' && manifest.version.length > 0, `${label} version is missing`);
+  invariant(typeof manifest.description === 'string' && manifest.description.trim(), `${label} description is missing`);
+  invariant(manifest.skills === './skills/', `${label} shared skill path moved`);
+  invariant(manifest.author?.name === 'Tripp Cashel', `${label} author moved`);
+  exactKeys(manifest.author, ['name'], `${label} author`);
+  for (const key of ['homepage', 'repository', 'license']) {
+    invariant(typeof manifest[key] === 'string' && manifest[key].trim(), `${label} ${key} is missing`);
+  }
+}
+
+function loadHost(host) {
+  const isClaude = host === 'claude';
+  const marketplaceRelative = isClaude
+    ? '.claude-plugin/marketplace.json'
+    : '.agents/plugins/marketplace.json';
+  const manifestRelative = isClaude
+    ? '.claude-plugin/plugin.json'
+    : '.codex-plugin/plugin.json';
+  const marketplacePath = resolveInside(repoRoot, marketplaceRelative, 'file', `${host} marketplace`);
+  const marketplace = readJson(marketplacePath, `${host} marketplace`);
+
+  invariant(marketplace.name === 'forge', `${host} marketplace identity moved`);
+  invariant(Array.isArray(marketplace.plugins), `${host} marketplace plugins are missing`);
+  const entries = marketplace.plugins.filter((entry) => entry?.name === 'forged');
+  invariant(entries.length === 1, `${host} marketplace must contain one forged entry`);
+  const entry = entries[0];
+  let source;
+
+  if (isClaude) {
+    exactKeys(marketplace, ['description', 'name', 'owner', 'plugins'], 'Claude marketplace');
+    exactKeys(marketplace.owner, ['name'], 'Claude marketplace owner');
+    invariant(marketplace.owner.name === 'Tripp Cashel', 'Claude marketplace owner moved');
+    invariant(typeof marketplace.description === 'string' && marketplace.description.trim(), 'Claude marketplace description is missing');
+    exactKeys(entry, ['description', 'name', 'source'], 'Claude marketplace forged entry');
+    invariant(typeof entry.description === 'string' && entry.description.trim(), 'Claude marketplace plugin description is missing');
+    invariant(typeof entry.source === 'string', 'Claude marketplace source must be a relative string');
+    source = entry.source;
+  } else {
+    exactKeys(marketplace, ['interface', 'name', 'plugins'], 'Codex marketplace');
+    exactKeys(marketplace.interface, ['displayName'], 'Codex marketplace interface');
+    invariant(typeof marketplace.interface.displayName === 'string' && marketplace.interface.displayName.trim(), 'Codex marketplace display name is missing');
+    exactKeys(entry, ['category', 'name', 'policy', 'source'], 'Codex marketplace forged entry');
+    exactKeys(entry.source, ['path', 'source'], 'Codex marketplace source');
+    exactKeys(entry.policy, ['authentication', 'installation'], 'Codex marketplace policy');
+    invariant(entry.source.source === 'local', 'Codex marketplace source must be local');
+    invariant(entry.policy.installation === 'AVAILABLE', 'Codex marketplace installation policy moved');
+    invariant(entry.policy.authentication === 'ON_INSTALL', 'Codex marketplace authentication policy moved');
+    invariant(typeof entry.category === 'string' && entry.category.trim(), 'Codex marketplace category is missing');
+    source = entry.source.path;
+  }
+
+  const pluginRoot = resolveInside(repoRoot, source, 'directory', `${host} plugin source`);
+  const manifestPath = resolveInside(pluginRoot, manifestRelative, 'file', `${host} manifest`);
+  const manifest = readJson(manifestPath, `${host} manifest`);
+  const expectedManifestKeys = isClaude
+    ? commonManifestKeys
+    : [...commonManifestKeys, 'interface', 'keywords'];
+  exactKeys(manifest, expectedManifestKeys, `${host} manifest`);
+  validateCommonManifest(manifest, `${host} manifest`);
+
+  if (!isClaude) {
+    invariant(
+      stableJson(manifest.keywords) === stableJson(['forged', 'planning', 'code-review', 'beads', 'orchestration']),
+      'Codex manifest discovery keywords moved',
+    );
+    exactKeys(
+      manifest.interface,
+      ['capabilities', 'category', 'defaultPrompt', 'developerName', 'displayName', 'longDescription', 'shortDescription'],
+      'Codex manifest interface',
+    );
+    for (const key of ['category', 'developerName', 'displayName', 'longDescription', 'shortDescription']) {
+      invariant(typeof manifest.interface[key] === 'string' && manifest.interface[key].trim(), `Codex interface ${key} is missing`);
+    }
+    invariant(
+      Array.isArray(manifest.interface.capabilities) &&
+        manifest.interface.capabilities.length > 0 &&
+        manifest.interface.capabilities.every((value) => typeof value === 'string' && value.trim()),
+      'Codex interface capabilities are malformed',
+    );
+    invariant(
+      Array.isArray(manifest.interface.defaultPrompt) &&
+        manifest.interface.defaultPrompt.length >= 1 &&
+        manifest.interface.defaultPrompt.length <= 3 &&
+        manifest.interface.defaultPrompt.every((value) => typeof value === 'string' && value.trim() && value.length <= 128),
+      'Codex interface default prompts are malformed',
+    );
+  }
+
+  const skillsRoot = resolveInside(pluginRoot, manifest.skills, 'directory', `${host} skill root`);
+  const inventory = inventorySkills(skillsRoot);
+  const parityRelative = path.relative(skillsRoot, fs.realpathSync(parityPathArgument)).split(path.sep).join('/');
+  invariant(parityRelative === 'manage-work/host-parity-fixtures.json', `${host} parity fixture is outside the shared skill root`);
+  const parityPath = resolveInside(skillsRoot, parityRelative, 'file', `${host} parity fixture`);
+
+  return {
+    host,
+    pluginRoot,
+    skillsRoot,
+    manifest,
+    commonManifest: Object.fromEntries(commonManifestKeys.map((key) => [key, manifest[key]])),
+    marketplacePluginName: entry.name,
+    inventory,
+    parity: readJson(parityPath, `${host} parity fixture`),
+  };
+}
+
+const expectedAllowedDifferences = [
+  'manifest-filename',
+  'codex-manifest-discovery-metadata',
+  'host-marketplace-envelope-and-source-metadata',
+];
+const expectedForbiddenDifferences = [
+  'plugin-identity',
+  'version',
+  'resolved-plugin-root',
+  'skills-root-or-bytes',
+  'workflow-route',
+  'delegate',
+  'confirmation-class',
+  'authority',
+  'postcondition',
+  'effect-budget',
+  'tool-inventory',
+  'result-schema',
+  'resource-uri',
+  'compatibility-metadata',
+  'fallback-contract',
+];
+const expectedForbiddenEffects = [
+  'process-spawn',
+  'network-access',
+  'filesystem-write',
+  'beads-access',
+  'ledger-access',
+  'operator-state-access',
+  'forged-cli-call',
+  'forged-mcp-call',
+  'provider-call',
+  'service-call',
+  'git-call',
+  'github-call',
+  'plugin-install',
+  'plugin-cache-access',
+];
+const expectedTools = [
+  'artifact_compact', 'artifact_verify', 'attention_acknowledge', 'attention_reopen',
+  'attention_resolve', 'claim_next', 'definition_validate', 'doctor', 'epic_advance',
+  'epic_drive', 'epic_pause', 'epic_resolve', 'epic_resume', 'epic_revise_roster',
+  'epic_start', 'epic_status', 'epic_submit', 'events_tail', 'operations_overview',
+  'overview', 'packet_claim', 'packet_complete', 'packet_fail', 'reconcile',
+  'review_publish', 'run_accept_risk', 'run_advance', 'run_revise_roster', 'run_start',
+  'run_status', 'run_stop', 'run_submit', 'session_inventory', 'session_list',
+  'session_message', 'session_read', 'session_stop', 'usage_ingest', 'usage_report',
+  'work_detail', 'work_history', 'work_list', 'work_map',
+];
+const surfaceShared = {
+  structuredContent: 'required',
+  jsonTextFallback: 'identical',
+  resourceMetadataKeys: ['_meta.ui.resourceUri', 'ui/resourceUri'],
+  resourceMimeType: 'text/html;profile=mcp-app',
+};
+const expectedSurfaces = [
+  {
+    role: 'portfolio-queue',
+    tool: 'operations_overview',
+    resultSchema: 'forged.operations-overview/1',
+    resourceUri: 'ui://forged/operations-overview.html',
+    selectionRule: 'ordinary portfolio, repository, queue, or needs-me read',
+    ...surfaceShared,
+  },
+  {
+    role: 'durable-subject',
+    tool: 'work_detail',
+    resultSchema: 'forged.work-detail/1',
+    resourceUri: 'ui://forged/work-detail.html',
+    selectionRule: 'exact canonical run or epic only',
+    ...surfaceShared,
+  },
+  {
+    role: 'topology',
+    tool: 'work_map',
+    resultSchema: 'forged.work-map/1',
+    resourceUri: 'ui://forged/work-map.html',
+    selectionRule: 'explicit dependency or topology request only',
+    ...surfaceShared,
+  },
+  {
+    role: 'provider-diagnostics',
+    tool: 'session_inventory',
+    resultSchema: 'forged.provider-session-inventory/1',
+    resourceUri: 'ui://forged/agent-sessions.html',
+    selectionRule: 'explicit provider diagnostic request only',
+    ...surfaceShared,
+  },
+  {
+    role: 'compatibility',
+    tool: 'overview',
+    resultSchema: 'forged.overview/1',
+    resourceUri: 'ui://forged/overview.html',
+    selectionRule: 'compatibility smoke only, never the normal modern choice',
+    ...surfaceShared,
+  },
+];
+
+function validateContractSource(host, manageWorkRoot, label, contract, expected) {
+  exactKeys(contract, ['caseCount', 'caseIds', 'comparisonFields', 'path', 'schema'], `${label} contract`);
+  invariant(contract.path === expected.path, `${label} fixture path moved`);
+  invariant(contract.schema === expected.schema, `${label} fixture schema moved`);
+  invariant(contract.caseCount === expected.caseCount, `${label} fixture count moved`);
+  invariant(stableJson(contract.comparisonFields) === stableJson(expected.comparisonFields), `${label} comparison fields moved`);
+  invariant(
+    Array.isArray(contract.caseIds) &&
+      contract.caseIds.length === contract.caseCount &&
+      new Set(contract.caseIds).size === contract.caseCount,
+    `${label} case ids must be complete and unique`,
+  );
+  const sourcePath = resolveInside(manageWorkRoot, contract.path, 'file', `${host} ${label} source`);
+  const source = readJson(sourcePath, `${host} ${label} source`);
+  invariant(source.schema === contract.schema && Array.isArray(source.cases), `${host} ${label} source contract moved`);
+  invariant(
+    stableJson(source.cases.map((entry) => entry?.id)) === stableJson(contract.caseIds),
+    `${host} ${label} source omits, duplicates, or reorders cases`,
+  );
+  const comparedCases = source.cases.map((entry) => {
+    const result = {id: entry.id};
+    for (const field of contract.comparisonFields) {
+      invariant(Object.prototype.hasOwnProperty.call(entry, field), `${host} ${label} case ${entry.id} lacks ${field}`);
+      result[field] = entry[field];
+    }
+    return result;
+  });
+  return {schema: source.schema, cases: comparedCases};
+}
+
+function validateParityFixture(registration) {
+  const fixture = registration.parity;
+  exactKeys(
+    fixture,
+    [
+      'allowedHostDifferences', 'contracts', 'evidenceScope', 'forbiddenEffects',
+      'forbiddenHostDifferences', 'purpose', 'schema', 'surfaces', 'tools',
+    ],
+    `${registration.host} host parity fixture`,
+  );
+  invariant(fixture.schema === 'forged.manage-work-host-parity-fixtures/1', 'host parity fixture schema moved');
+  invariant(fixture.purpose === 'validation-only', 'host parity fixture purpose moved');
+  invariant(fixture.evidenceScope === 'declarative-contract-parity-only', 'host parity evidence scope is overstated');
+  invariant(stableJson(fixture.allowedHostDifferences) === stableJson(expectedAllowedDifferences), 'allowed host differences moved');
+  invariant(stableJson(fixture.forbiddenHostDifferences) === stableJson(expectedForbiddenDifferences), 'forbidden host differences moved');
+  invariant(stableJson(fixture.forbiddenEffects) === stableJson(expectedForbiddenEffects), 'forbidden validation effects moved');
+  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 43-tool declaration moved');
+  invariant(fixture.tools.length === 43 && new Set(fixture.tools).size === 43, 'tool declaration must contain 43 unique tools');
+  invariant(stableJson(fixture.surfaces) === stableJson(expectedSurfaces), 'exact five-surface declaration moved');
+  invariant(fixture.surfaces.length === 5, 'surface declaration must contain five resources');
+  exactKeys(fixture.contracts, ['intent', 'portfolioControl'], 'host parity contracts');
+  const manageWorkRoot = resolveInside(registration.skillsRoot, 'manage-work', 'directory', `${registration.host} manage-work root`);
+  return {
+    intent: validateContractSource(
+      registration.host,
+      manageWorkRoot,
+      'intent',
+      fixture.contracts.intent,
+      {
+        path: 'intent-fixtures.json',
+        schema: 'forged.manage-work-intent-fixtures/1',
+        caseCount: 14,
+        comparisonFields: ['decision', 'delegate', 'result', 'routerMutationBudget'],
+      },
+    ),
+    portfolioControl: validateContractSource(
+      registration.host,
+      manageWorkRoot,
+      'portfolio-control',
+      fixture.contracts.portfolioControl,
+      {
+        path: 'portfolio-control-fixtures.json',
+        schema: 'forged.manage-work-portfolio-control-fixtures/1',
+        caseCount: 31,
+        comparisonFields: ['route', 'confirmation', 'postcondition', 'effectBudget'],
+      },
+    ),
+  };
+}
+
+try {
+  invariant(typeof parityPathArgument === 'string', 'host parity fixture argument is missing');
+  const parityReal = fs.realpathSync(parityPathArgument);
+  invariant(isInside(repoRoot, parityReal), 'host parity fixture argument escapes the repository');
+
+  const claude = loadHost('claude');
+  const codex = loadHost('codex');
+  invariant(claude.pluginRoot === codex.pluginRoot, 'host marketplaces resolve different plugin roots');
+  invariant(claude.skillsRoot === codex.skillsRoot, 'host manifests resolve different skill roots');
+  invariant(claude.marketplacePluginName === codex.marketplacePluginName, 'host marketplace plugin identities differ');
+  invariant(stableJson(claude.commonManifest) === stableJson(codex.commonManifest), 'canonical host manifest registrations differ');
+  invariant(stableJson(claude.inventory) === stableJson(codex.inventory), 'complete shared skill inventories differ');
+  invariant(stableJson(claude.parity) === stableJson(codex.parity), 'host parity declarations differ');
+
+  const claudeContracts = validateParityFixture(claude);
+  const codexContracts = validateParityFixture(codex);
+  invariant(stableJson(claudeContracts) === stableJson(codexContracts), 'host workflow/effect contracts differ');
+
+  console.log(
+    `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
+      `version=${claude.manifest.version} skills=7 inventorySha256=${claude.inventory.digest} ` +
+      `cases=14+31 tools=43 surfaces=5 evidence=declarative-contract-only`,
+  );
+} catch (error) {
+  console.error(`host parity validation failed: ${error.message}`);
+  process.exit(1);
+}
+NODE
+}
+
 check_marketplaces() {
   node - <<'NODE'
 const fs = require('fs');
@@ -355,6 +788,7 @@ required=(
   "$plugin/skills/plan/checklist.md"
   "$plugin/skills/manage-work/intent-fixtures.json"
   "$plugin/skills/manage-work/portfolio-control-fixtures.json"
+  "$plugin/skills/manage-work/host-parity-fixtures.json"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] && pass "required companion $path" || fail "required companion $path"
@@ -378,6 +812,10 @@ check "manage-work portfolio/control fixture JSON" check_json \
 check "manage-work portfolio/control contract" check_manage_work_portfolio_contract \
   "$plugin/skills/manage-work/SKILL.md" \
   "$plugin/skills/manage-work/portfolio-control-fixtures.json"
+check "manage-work host-parity fixture JSON" check_json \
+  "$plugin/skills/manage-work/host-parity-fixtures.json"
+check "manage-work dual-host registration and contract parity" check_manage_work_host_parity_contract \
+  "$plugin/skills/manage-work/host-parity-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 7 ]] && pass "exactly seven skills" || fail "exactly seven skills"
