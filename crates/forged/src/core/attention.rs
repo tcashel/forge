@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use forged_beads::IssueSummary;
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, DesiredState, EffectClass,
-    InventorySnapshot,
+    InventorySnapshot, InventoryUsage,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
@@ -259,7 +259,16 @@ fn collect_domain_sources(
     snapshot: &InventorySnapshot,
     entries_slice: &[Value],
     beads: &[IssueSummary],
-) -> Vec<RawAttention> {
+) -> Result<Vec<RawAttention>, Failure> {
+    let InventoryUsage::Included {
+        totals: usage_totals,
+        latest_missing,
+    } = &snapshot.usage
+    else {
+        return Err(Failure::internal(
+            "attention projection requires included inventory usage",
+        ));
+    };
     let entries: BTreeMap<String, &Value> = entries_slice
         .iter()
         .filter_map(|entry| Some((entry.get("id")?.as_str()?.to_owned(), entry)))
@@ -556,9 +565,8 @@ fn collect_domain_sources(
     }
 
     // Partial spend uses the latest unpriced usage row as the occurrence.
-    for (id, (usage_id, observed_at)) in &snapshot.latest_missing_usage {
-        let count = snapshot
-            .usage_totals
+    for (id, (usage_id, observed_at)) in latest_missing {
+        let count = usage_totals
             .get(id)
             .map_or(0, |totals| totals.rows_missing_cost);
         if count == 0 {
@@ -958,7 +966,7 @@ fn collect_domain_sources(
         );
     }
 
-    raw
+    Ok(raw)
 }
 
 struct TransitionState {
@@ -1078,7 +1086,7 @@ pub(crate) fn project_all(
     entries: &[Value],
     beads: &[IssueSummary],
 ) -> Result<Vec<AttentionItemV1>, Failure> {
-    let raw = collect_domain_sources(snapshot, entries, beads);
+    let raw = collect_domain_sources(snapshot, entries, beads)?;
     let mut buckets: BTreeMap<
         (AttentionSubjectKind, String, AttentionCondition),
         Vec<RawAttention>,
@@ -1192,7 +1200,7 @@ pub(crate) fn project_active(
 mod tests {
     use super::*;
     use forged_ledger::{
-        AdmissionReservationRow, DesiredSubjectKind, DesiredWorkRow, EventRow, UsageTotals,
+        AdmissionReservationRow, DesiredSubjectKind, DesiredWorkRow, EventRow, InventoryUsage,
     };
     use forged_types::{
         AdmissionCapacityV1, AdmissionDecisionV1, AdmissionResourceClass, AdmissionSubjectKind,
@@ -1204,8 +1212,10 @@ mod tests {
             runs: Vec::new(),
             live_attempts: Vec::new(),
             attempts_missing_artifacts: Vec::new(),
-            usage_totals: BTreeMap::<String, UsageTotals>::new(),
-            latest_missing_usage: BTreeMap::new(),
+            usage: InventoryUsage::Included {
+                totals: BTreeMap::new(),
+                latest_missing: BTreeMap::new(),
+            },
             latest_event: BTreeMap::new(),
             events_by_kind: BTreeMap::new(),
             desired_work: Vec::new(),
@@ -1382,5 +1392,14 @@ mod tests {
             .expect("project")
             .iter()
             .all(|item| item.condition != AttentionCondition::ReviewerDisagreement));
+    }
+
+    #[test]
+    fn attention_refuses_a_snapshot_that_omitted_usage_evidence() {
+        let mut snapshot = snapshot();
+        snapshot.usage = InventoryUsage::Omitted;
+        let error = project_active(&snapshot, &[entry("run-usage")], &[])
+            .expect_err("attention cannot interpret omitted usage as no missing cost");
+        assert!(error.message.contains("requires included inventory usage"));
     }
 }

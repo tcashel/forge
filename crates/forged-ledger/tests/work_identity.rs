@@ -1,7 +1,7 @@
 use std::collections::{BTreeMap, HashMap};
 use std::fmt::Write as _;
 
-use forged_ledger::{Ledger, NewRun, NewRunDefinition};
+use forged_ledger::{InventoryUsageSelection, Ledger, NewRun, NewRunDefinition};
 use forged_types::{
     canonical_json_bytes, repository_label, work_display_title, ErrorCode, ExecutionPackageV1,
     ExecutionPolicyV1, HostPolicyV1, ProfileDefinitionV1, ProfileRef, ProtocolRef,
@@ -132,7 +132,9 @@ fn low_level_run_creation_always_gets_atomic_fallback_identity() {
         stored.repository, None,
         "relative legacy repo is not invented"
     );
-    let snapshot = ledger.inventory_snapshot(&[]).expect("snapshot");
+    let snapshot = ledger
+        .inventory_snapshot(&[], InventoryUsageSelection::Omit)
+        .expect("snapshot");
     assert_eq!(
         snapshot
             .work_identities
@@ -292,6 +294,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         conn.execute_batch(
             r#"DROP TRIGGER work_identity_immutable;
              DROP TABLE work_identities;
+             DROP INDEX events_run_event;
              PRAGMA user_version=14;
              INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, created_at, updated_at)
                VALUES ('child-run', 'child-bead', '/Users/tripp/repositories/./forge', 'main',
@@ -310,7 +313,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

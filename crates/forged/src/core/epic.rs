@@ -7,8 +7,8 @@ use std::path::Path;
 use std::time::Duration;
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState,
-    RunOutcome, RunState, SlotOutcome,
+    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass,
+    InventoryUsageSelection, Ledger, OperationState, RunOutcome, RunState, SlotOutcome,
 };
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
@@ -1042,7 +1042,10 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     // probes; the epic controller's existing top-level projection remains a
     // single backwards-compatible liveness probe.
     let snapshot = on_ledger(&ctx.ledger, |ledger| {
-        ledger.inventory_snapshot(&["proto.pr", "forged.controller.started"])
+        ledger.inventory_snapshot(
+            &["proto.pr", "forged.controller.started"],
+            InventoryUsageSelection::Omit,
+        )
     })
     .await?;
     let identity = snapshot

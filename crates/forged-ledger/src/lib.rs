@@ -36,7 +36,7 @@ mod usage;
 mod work_identity;
 
 pub use error::LedgerError;
-pub use inventory::InventorySnapshot;
+pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
 pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;
 pub use types::{

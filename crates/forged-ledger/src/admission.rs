@@ -2318,7 +2318,7 @@ mod tests {
         assert_eq!(latest[0].batch_id, "batch-appended-second");
         assert_eq!(
             ledger
-                .inventory_snapshot(&[])
+                .inventory_snapshot(&[], crate::InventoryUsageSelection::Omit)
                 .expect("same-snapshot admission")
                 .admission_decisions[0]
                 .batch_id,

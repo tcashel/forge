@@ -559,6 +559,17 @@ BEGIN
 END;
 ";
 
+/// Migration 016: run-major access for the complete latest-event projection.
+///
+/// The existing kind-major index remains the right access path for lifecycle
+/// scans. This partial index gives the independent newest-event-per-subject
+/// query one ordered group per non-null run id, so SQLite does not build a
+/// temporary grouping B-tree over the append-only event history.
+const MIGRATION_016: &str = "
+CREATE INDEX events_run_event ON events(run_id, event_id)
+  WHERE run_id IS NOT NULL;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -576,6 +587,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_013,
     MIGRATION_014,
     MIGRATION_015,
+    MIGRATION_016,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -683,7 +695,7 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
-    use super::MIGRATION_001;
+    use super::{MIGRATIONS, MIGRATION_001};
     use crate::Ledger;
 
     #[test]
@@ -698,7 +710,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 15);
+        assert_eq!(pragmas.user_version, 16);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -742,6 +754,70 @@ mod tests {
             )
             .expect("partial index missing");
         assert_eq!(index, "one_live_attempt_per_packet");
+        let event_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                ["events_run_event"],
+                |row| row.get(0),
+            )
+            .expect("run-major event index missing");
+        assert_eq!(
+            event_index,
+            "CREATE INDEX events_run_event ON events(run_id, event_id)\n  WHERE run_id IS NOT NULL"
+        );
+    }
+
+    #[test]
+    fn representative_v10_v12_and_v15_upgrades_preserve_rows_and_reach_v16() {
+        for version in [10usize, 12, 15] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(format!("state-v{version}.db"));
+            {
+                let conn = rusqlite::Connection::open(&path).expect("raw database");
+                for migration in MIGRATIONS.iter().take(version) {
+                    conn.execute_batch(migration).expect("seed migration");
+                }
+                conn.execute_batch(
+                    "INSERT INTO events (ts, run_id, kind, payload_json) VALUES
+                       ('earlier-ts', 'legacy-subject', 'legacy.progress', '{\"n\":1}'),
+                       ('later-ts', NULL, 'global.note', '{\"n\":2}');
+                     INSERT INTO usage (
+                       run_id, provider, model, input_tokens, output_tokens, cost_usd, ts
+                     ) VALUES (
+                       'legacy-subject', 'codex', 'legacy-model', 7, 11, 0.25, 'usage-ts'
+                     );",
+                )
+                .expect("seed representative rows");
+                conn.execute_batch(&format!("PRAGMA user_version={version};"))
+                    .expect("mark schema version");
+            }
+
+            let ledger = Ledger::open(&path)
+                .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
+            assert_eq!(
+                ledger
+                    .list_events_by_kind("legacy.progress")
+                    .expect("events")
+                    .len(),
+                1,
+                "v{version} event row was lost"
+            );
+            let totals = ledger.usage_totals("legacy-subject").expect("usage");
+            assert_eq!(totals.input_tokens, 7, "v{version} usage row was lost");
+            assert_eq!(totals.output_tokens, 11, "v{version} usage row was lost");
+            ledger.close().expect("close");
+
+            let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
+            let index: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                    ["events_run_event"],
+                    |row| row.get(0),
+                )
+                .expect("migration 016 index");
+            assert!(index.contains("WHERE run_id IS NOT NULL"));
+        }
     }
 
     #[test]
@@ -753,7 +829,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
         ledger.close().expect("close");
     }
 
@@ -814,7 +890,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -857,7 +933,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 16);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

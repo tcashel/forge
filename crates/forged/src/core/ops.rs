@@ -7,7 +7,8 @@ use std::path::{Component, Path, PathBuf};
 
 use forged_gate::GateRequest;
 use forged_ledger::{
-    EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState, RunState,
+    EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
+    NewRunDefinition, OperationState, RunState,
 };
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
@@ -1914,7 +1915,14 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
     // the lifecycle kinds are folded into a single entry each, and reading
     // them across separate transactions would let an epic's start event and
     // its pause land on opposite sides of a concurrent write.
-    let snapshot = on_ledger(&ctx.ledger, |l| l.inventory_snapshot(&LIFECYCLE_KINDS)).await?;
+    let usage_selection = match spend {
+        Spend::Include => InventoryUsageSelection::Include,
+        Spend::Omit => InventoryUsageSelection::Omit,
+    };
+    let snapshot = on_ledger(&ctx.ledger, move |l| {
+        l.inventory_snapshot(&LIFECYCLE_KINDS, usage_selection)
+    })
+    .await?;
     project_entries(&snapshot, spend)
 }
 
@@ -2005,7 +2013,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "currentAgent": current.get(&run.run_id).map(|(_, _, claimant)| claimant),
         });
         add_lifecycle(snapshot, &run.run_id, &mut entry);
-        add_spend(snapshot, &spend, &run.run_id, &mut entry);
+        add_spend(&snapshot.usage, &spend, &run.run_id, &mut entry)?;
         inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
     }
     // Whatever is left has a start event and no run row: a real epic.
@@ -2052,7 +2060,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "currentAgent": current.get(&epic_id).map(|(_, _, claimant)| claimant),
         });
         add_lifecycle(snapshot, &epic_id, &mut entry);
-        add_spend(snapshot, &spend, &epic_id, &mut entry);
+        add_spend(&snapshot.usage, &spend, &epic_id, &mut entry)?;
         inventory.push((ts, epic_id, entry));
     }
     inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
@@ -2127,24 +2135,74 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
 
 /// Stamp one entry's spend, when the caller asked for it.
 ///
-/// Read from the snapshot's own `usage_totals` — the single grouped scan
+/// Read from the snapshot's included usage payload — the single grouped scan
 /// taken inside the snapshot transaction — never a `usage_totals` query per
-/// entry: an uncapped inventory would otherwise put one job per row through
+/// entry. An uncapped inventory would otherwise put one job per row through
 /// the single ledger writer, and a figure read after the snapshot could
-/// describe a state the entries and the rail never jointly held.
+/// describe a state the entries and the rail never jointly held. An omitted
+/// payload is refused instead of being projected as measured zero.
 ///
 /// A run with no usage rows is ABSENT from that map, and absent is zero:
 /// spend not incurred, not spend unmeasured.
-fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut Value) {
+fn add_spend(
+    usage: &InventoryUsage,
+    spend: &Spend,
+    id: &str,
+    entry: &mut Value,
+) -> Result<(), Failure> {
     let Spend::Include = spend else {
-        return;
+        return Ok(());
     };
-    let totals = snapshot.usage_totals.get(id);
+    let InventoryUsage::Included { totals, .. } = usage else {
+        return Err(Failure::internal(
+            "spend projection requires included inventory usage",
+        ));
+    };
+    let totals = totals.get(id);
     let cost_usd_known = totals.map_or(0.0, |t| t.cost_usd_known);
     let rows_missing_cost = totals.map_or(0, |t| t.rows_missing_cost);
     if let Some(object) = entry.as_object_mut() {
         object.insert("costUsdKnown".to_owned(), json!(cost_usd_known));
         object.insert("rowsMissingCost".to_owned(), json!(rows_missing_cost));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod spend_projection_tests {
+    use super::*;
+
+    #[test]
+    fn included_empty_usage_is_measured_zero_but_omission_cannot_impersonate_it() {
+        let included = InventoryUsage::Included {
+            totals: BTreeMap::new(),
+            latest_missing: BTreeMap::new(),
+        };
+        let mut measured = json!({});
+        add_spend(&included, &Spend::Include, "run-a", &mut measured).expect("measured spend");
+        assert_eq!(measured["costUsdKnown"], json!(0.0));
+        assert_eq!(measured["rowsMissingCost"], json!(0));
+
+        let mut omitted = json!({});
+        add_spend(
+            &InventoryUsage::Omitted,
+            &Spend::Omit,
+            "run-a",
+            &mut omitted,
+        )
+        .expect("explicit omission");
+        assert!(omitted.get("costUsdKnown").is_none());
+        assert!(omitted.get("rowsMissingCost").is_none());
+
+        let mut inconsistent = json!({});
+        add_spend(
+            &InventoryUsage::Omitted,
+            &Spend::Include,
+            "run-a",
+            &mut inconsistent,
+        )
+        .expect_err("omitted usage cannot project measured zero");
+        assert!(inconsistent.as_object().expect("object").is_empty());
     }
 }
 
@@ -2184,7 +2242,10 @@ async fn portfolio_for_repository(
         .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
         .copied()
         .collect();
-    let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
+    let snapshot = on_ledger(&ctx.ledger, move |l| {
+        l.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+    })
+    .await?;
     let mut entries = project_entries(&snapshot, Spend::Include)?;
     let bead_ids: Vec<String> = entries
         .iter()
@@ -2852,7 +2913,10 @@ async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
         .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
         .copied()
         .collect();
-    let snapshot = on_ledger(&ctx.ledger, move |ledger| ledger.inventory_snapshot(&kinds)).await?;
+    let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+    })
+    .await?;
     let entries = project_entries(&snapshot, Spend::Include)?;
     let bead_ids: Vec<String> = entries
         .iter()

@@ -2,7 +2,8 @@
 //! slots, usage totals, and deterministic close.
 
 use forged_ledger::{
-    EffectClass, Ledger, NewPacket, NewRun, NewUsage, OperationOutcome, SlotOutcome, SpecFence,
+    EffectClass, InventoryUsage, InventoryUsageSelection, Ledger, NewPacket, NewRun, NewUsage,
+    OperationOutcome, SlotOutcome, SpecFence,
 };
 use forged_types::{ErrorCode, OpError, OperationRequest, OperationResponse, RunId, Stage};
 use serde_json::json;
@@ -213,6 +214,32 @@ fn latest_event_per_run_reports_the_newest_append_per_run() {
     ledger.close().expect("close");
 }
 
+#[test]
+fn latest_event_order_ignores_timestamps_and_excludes_runless_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    Ledger::open(&path)
+        .expect("migrate")
+        .close()
+        .expect("close");
+    let conn = rusqlite::Connection::open(&path).expect("raw database");
+    conn.execute_batch(
+        "INSERT INTO events (ts, run_id, kind, payload_json) VALUES
+           ('9999-12-31T23:59:59Z', 'subject-a', 'older-id', '{}'),
+           ('0001-01-01T00:00:00Z', 'subject-a', 'newer-id', '{}'),
+           ('9999-12-31T23:59:59Z', NULL, 'runless-newest', '{}');",
+    )
+    .expect("events");
+    drop(conn);
+
+    let ledger = Ledger::open(&path).expect("reopen");
+    let latest = ledger.latest_event_per_run().expect("latest events");
+    assert_eq!(latest.len(), 1, "run-less subjects must stay excluded");
+    assert_eq!(latest["subject-a"].kind, "newer-id");
+    assert_eq!(latest["subject-a"].ts, "0001-01-01T00:00:00Z");
+    ledger.close().expect("close");
+}
+
 /// The snapshot is the projection's ONLY read, so it must agree — source
 /// for source — with the per-source calls it replaces.
 #[test]
@@ -247,7 +274,10 @@ fn inventory_snapshot_agrees_with_the_calls_it_replaces() {
         .expect("paused");
 
     let snapshot = ledger
-        .inventory_snapshot(&["forged.epic.paused", "forged.epic.resumed"])
+        .inventory_snapshot(
+            &["forged.epic.paused", "forged.epic.resumed"],
+            InventoryUsageSelection::Include,
+        )
         .expect("snapshot");
     assert_eq!(snapshot.runs, ledger.list_runs().expect("runs"));
     assert_eq!(
@@ -268,12 +298,15 @@ fn inventory_snapshot_agrees_with_the_calls_it_replaces() {
     // snapshot was never asked for reads the same way.
     assert!(snapshot.events("forged.epic.resumed").is_empty());
     assert!(snapshot.events("forged.epic.pr").is_empty());
+    let InventoryUsage::Included { totals, .. } = &snapshot.usage else {
+        panic!("usage was requested but omitted");
+    };
     assert_eq!(
-        snapshot.usage_totals.get(&run),
+        totals.get(&run),
         Some(&ledger.usage_totals(&run).expect("totals"))
     );
     // Absent, not zero-valued: a run with no usage rows has no group.
-    assert_eq!(snapshot.usage_totals.get(&bare), None);
+    assert_eq!(totals.get(&bare), None);
     assert_eq!(
         ledger
             .usage_totals(&bare)
@@ -329,12 +362,24 @@ fn inventory_snapshot_never_tears_under_a_concurrent_writer() {
     // Read until enough snapshots have caught a lifecycle event — the bound
     // is a backstop, not the target, so a slow writer costs reads, not a
     // false pass.
-    let mut observed = 0usize;
-    for _ in 0..2_000 {
-        if observed >= 100 {
+    let mut observed = [0usize; 2];
+    for read in 0..4_000 {
+        if observed.iter().all(|count| *count >= 50) {
             break;
         }
-        let snapshot = ledger.inventory_snapshot(&KINDS).expect("snapshot");
+        let selection = if read % 2 == 0 {
+            InventoryUsageSelection::Include
+        } else {
+            InventoryUsageSelection::Omit
+        };
+        let snapshot = ledger
+            .inventory_snapshot(&KINDS, selection)
+            .expect("snapshot");
+        assert_eq!(
+            matches!(snapshot.usage, InventoryUsage::Omitted),
+            selection == InventoryUsageSelection::Omit,
+            "usage selection was not represented exactly"
+        );
         let Some(latest) = snapshot.latest_event.get(&run) else {
             // `create_run` appends nothing, so the very first reads can
             // legitimately precede the writer's first append.
@@ -354,7 +399,7 @@ fn inventory_snapshot_never_tears_under_a_concurrent_writer() {
         // ...and once the newest event IS a lifecycle kind, the scans must
         // contain that very row. A torn read is exactly its absence.
         if KINDS.contains(&latest.kind.as_str()) {
-            observed += 1;
+            observed[usize::from(selection == InventoryUsageSelection::Omit)] += 1;
             assert_eq!(
                 scanned,
                 Some(latest.event_id),
@@ -371,7 +416,10 @@ fn inventory_snapshot_never_tears_under_a_concurrent_writer() {
         appended.load(Ordering::Relaxed) > 0,
         "the writer never raced the reader"
     );
-    assert!(observed > 0, "no snapshot ever saw a lifecycle event");
+    assert!(
+        observed.iter().all(|count| *count > 0),
+        "both included and omitted snapshots must observe consistent lifecycle events: {observed:?}"
+    );
     ledger.close().expect("close");
 }
 
