@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
     render_dispatch_without_server_tools, render_resolution,
-    render_resolution_without_server_tools, require_node,
+    render_resolution_without_server_tools, require_node, run_split_app_host,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -692,4 +692,100 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let html = std::fs::read_to_string(operations).expect("read Operations App");
     assert!(html.contains("entry.detailTarget"));
     assert!(html.contains("host.capabilities.serverTools"));
+}
+
+#[test]
+fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+
+    for (name, operations) in [
+        ("operations-overview.html", true),
+        ("work-detail.html", false),
+    ] {
+        let report = run_split_app_host(&node, &root.join(name));
+        assert_eq!(report["operations"], json!(operations), "{name}: {report}");
+        assert_eq!(report["initialTheme"], json!("dark"), "{name}: {report}");
+        assert_eq!(
+            report["initialVariable"],
+            json!("violet"),
+            "{name}: {report}"
+        );
+        assert_eq!(report["changedTheme"], json!("light"), "{name}: {report}");
+        assert_eq!(report["changedVariable"], json!("teal"), "{name}: {report}");
+        assert!(
+            report["sizeNotifications"]
+                .as_array()
+                .is_some_and(|notifications| notifications.iter().any(|notification| {
+                    notification.pointer("/params/width") == Some(&json!(720))
+                        && notification.pointer("/params/height") == Some(&json!(640))
+                })),
+            "{name} reports changed host size: {report}"
+        );
+
+        assert_eq!(report["innerHTMLWrites"], json!(0), "{name}: {report}");
+        assert_eq!(report["injected"], json!(false), "{name}: {report}");
+        assert!(
+            report["text"]
+                .as_array()
+                .is_some_and(|texts| texts.contains(&report["malicious"])),
+            "{name} preserves hostile tool text as text: {report}"
+        );
+        assert_eq!(
+            report["toolCalls"],
+            json!(0),
+            "{name} cannot call tools without serverTools: {report}"
+        );
+
+        assert!(
+            report
+                .pointer("/beforeTeardown/timers")
+                .and_then(Value::as_u64)
+                > Some(0),
+            "{name} has a real pending request to cancel: {report}"
+        );
+        assert!(
+            report
+                .pointer("/beforeTeardown/frames")
+                .and_then(Value::as_u64)
+                > Some(0),
+            "{name} has a real pending size frame to cancel: {report}"
+        );
+        assert_eq!(
+            report.pointer("/beforeTeardown/observer"),
+            Some(&json!(true))
+        );
+        assert_eq!(report.pointer("/afterTeardown/timers"), Some(&json!(0)));
+        assert_eq!(report.pointer("/afterTeardown/frames"), Some(&json!(0)));
+        assert_eq!(
+            report.pointer("/afterTeardown/observerDisconnected"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            report.pointer("/afterTeardown/messageListeners"),
+            Some(&json!(0))
+        );
+        assert_eq!(report["teardownAck"], json!(true), "{name}: {report}");
+
+        if operations {
+            let rows = report["rows"].as_array().expect("Operations rows");
+            assert_eq!(rows.len(), 2, "both Operations rows render: {report}");
+            assert_eq!(rows[0]["disabled"], json!(true));
+            assert_eq!(
+                rows[0]["title"],
+                json!("Plan-only work has no durable detail yet")
+            );
+            assert_eq!(rows[1]["disabled"], json!(true));
+            assert_eq!(
+                rows[1]["title"],
+                json!("Exact detail target run:run-1; this host cannot call server tools")
+            );
+            assert!(
+                report["text"]
+                    .as_array()
+                    .is_some_and(|texts| texts.contains(&json!("run:run-1"))),
+                "Operations visibly renders the canonical exact selector: {report}"
+            );
+        }
+    }
 }

@@ -91,7 +91,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   const pending = new Map();
   const timers = new Set();
   let observer = null;
+  let sizeFrame = null;
+  let tornDown = false;
   function request(method, params = {}) {
+    if (tornDown) return Promise.reject(new Error("resource torn down"));
     const id = `forged-operations-${++rpcId}`;
     return new Promise((resolve, reject) => {
       const timer = setTimeout(() => { timers.delete(timer); if (pending.delete(id)) reject(new Error(`${method} timed out`)); }, 120000);
@@ -162,6 +165,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     renderDetail(); reportSize();
   }
   function render() {
+    if (tornDown) return;
     byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
     byId("refresh").disabled = state.loading || !host.capabilities.serverTools;
     if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
@@ -190,7 +194,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
           : !canDetail
             ? `Exact detail target ${selector}; this host cannot call server tools`
             : `Open exact work detail for ${selector}`;
-        row.append(el("span", "id", entry.id)); row.append(el("span", "title", titleFor(entry))); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
+        row.append(el("span", "id", selector || entry.id)); row.append(el("span", "title", titleFor(entry))); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
         if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
       }
       section.append(rows); groups.append(section);
@@ -233,20 +237,44 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   let lastSize = "";
   function reportSize() {
-    requestAnimationFrame(() => { const size = `${window.innerWidth}:${document.documentElement.scrollHeight}`; if (size === lastSize) return; lastSize = size; notify("ui/notifications/size-changed", { width: Math.ceil(window.innerWidth), height: Math.ceil(document.documentElement.scrollHeight) }); });
+    if (tornDown || sizeFrame !== null) return;
+    sizeFrame = requestAnimationFrame(() => {
+      sizeFrame = null;
+      if (tornDown) return;
+      const size = `${window.innerWidth}:${document.documentElement.scrollHeight}`;
+      if (size === lastSize) return;
+      lastSize = size;
+      notify("ui/notifications/size-changed", { width: Math.ceil(window.innerWidth), height: Math.ceil(document.documentElement.scrollHeight) });
+    });
   }
-  window.addEventListener("message", event => {
+  function teardown() {
+    if (tornDown) return;
+    tornDown = true;
+    observer?.disconnect(); observer = null;
+    if (sizeFrame !== null) { cancelAnimationFrame(sizeFrame); sizeFrame = null; }
+    for (const [id, request] of pending) {
+      clearTimeout(request.timer); timers.delete(request.timer); pending.delete(id);
+      request.reject(new Error("resource torn down"));
+    }
+    for (const timer of timers) clearTimeout(timer);
+    timers.clear(); pending.clear();
+    byId("refresh").removeEventListener("click", refresh);
+    window.removeEventListener("message", onMessage);
+  }
+  function onMessage(event) {
     const message = event.data; if (!message || message.jsonrpc !== "2.0") return;
     if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); clearTimeout(p.timer); timers.delete(p.timer); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
     if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
     else if (message.method === "ui/notifications/tool-result") ingest(message.params);
     else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
     else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
-    else if (message.method === "ui/resource-teardown") { observer?.disconnect(); observer = null; for (const timer of timers) clearTimeout(timer); timers.clear(); pending.clear(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
-  });
+    else if (message.method === "ui/resource-teardown") { teardown(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
+  }
+  window.addEventListener("message", onMessage);
   request("ui/initialize", { protocolVersion: PROTOCOL_VERSION, appInfo: APP_INFO, appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } }).then(result => {
+    if (tornDown) return;
     host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); observer = new ResizeObserver(reportSize); observer.observe(document.body);
-  }).catch(() => { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); });
+  }).catch(() => { if (!tornDown) { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); } });
   render();
 })();
 </script>

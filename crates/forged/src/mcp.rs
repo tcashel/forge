@@ -223,7 +223,7 @@ impl OverviewArgs {
 /// repository selector this discovery operation accepts.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
-#[serde(rename_all = "camelCase")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkListArgs {
     /// Envelope schema version; always 1.
     #[serde(default = "default_schema_version")]
@@ -242,6 +242,7 @@ pub struct WorkListArgs {
 /// Optional repository scope for `work_list`.
 #[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkListParams {
     /// Exact repository identity from Bead `metadata.repository`.
     #[serde(
@@ -886,18 +887,15 @@ impl ServerHandler for ForgedServer {
             Resource::new(OVERVIEW_URI, "forged-overview")
                 .with_title("Forged Control Plane")
                 .with_description("Compatibility view of Forged slice and epic execution.")
-                .with_mime_type(APP_MIME)
-                .with_meta(app_resource_meta()),
+                .with_mime_type(APP_MIME),
             Resource::new(OPERATIONS_OVERVIEW_URI, "forged-operations-overview")
                 .with_title("Forged Operations")
                 .with_description("Bounded planned, queued, active, blocked, and mergeable work.")
-                .with_mime_type(APP_MIME)
-                .with_meta(app_resource_meta()),
+                .with_mime_type(APP_MIME),
             Resource::new(WORK_DETAIL_URI, "forged-work-detail")
                 .with_title("Forged Work Detail")
                 .with_description("Exact read-only projection of one Forged run or epic.")
-                .with_mime_type(APP_MIME)
-                .with_meta(app_resource_meta()),
+                .with_mime_type(APP_MIME),
         ]))
     }
 

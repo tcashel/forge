@@ -1754,6 +1754,25 @@ pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
     )
 }
 
+/// Execute a split App through a deterministic MCP Apps host lifecycle.
+pub fn run_split_app_host(node: &str, asset: &Path) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let out = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref()])
+        .output()
+        .expect("spawn the split App host harness");
+    assert!(
+        out.status.success(),
+        "the split App host harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("the split App harness prints one JSON object")
+}
+
 fn render(node: &str, harness: &str, data: &Value) -> Rendered {
     let rendered = harness_output(node, harness, data);
     Rendered {
@@ -1946,6 +1965,19 @@ impl McpClient {
             .filter_map(|resource| resource.get("uri").and_then(Value::as_str))
             .map(str::to_owned)
             .collect()
+    }
+
+    /// One declared resource, including any extension metadata.
+    pub fn resource(&mut self, uri: &str) -> Value {
+        let reply = self.request("resources/list", json!({}));
+        reply
+            .pointer("/result/resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|resource| resource.get("uri").and_then(Value::as_str) == Some(uri))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// Read one text resource.

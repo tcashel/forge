@@ -223,6 +223,48 @@ fn all_forty_tools_match_their_cli_counterparts() {
             "work_detail advertises params.{param}: {detail_properties}"
         );
     }
+    for (name, tool) in [
+        ("work_list", &work_list),
+        ("operations_overview", &operations),
+        ("work_detail", &detail),
+    ] {
+        assert_eq!(
+            tool.pointer("/inputSchema/additionalProperties"),
+            Some(&json!(false)),
+            "{name} rejects unknown envelope fields"
+        );
+        assert_eq!(
+            tool.pointer("/inputSchema/properties/params/additionalProperties"),
+            Some(&json!(false)),
+            "{name} rejects unknown nested params"
+        );
+    }
+
+    for (name, tool, uri) in [
+        ("overview", &overview_tool, "ui://forged/overview.html"),
+        (
+            "operations_overview",
+            &operations,
+            "ui://forged/operations-overview.html",
+        ),
+        ("work_detail", &detail, "ui://forged/work-detail.html"),
+    ] {
+        assert_eq!(
+            tool.pointer("/_meta/ui/resourceUri"),
+            Some(&json!(uri)),
+            "{name} advertises the standard App resource key"
+        );
+        assert_eq!(
+            tool.pointer("/_meta/ui~1resourceUri"),
+            Some(&json!(uri)),
+            "{name} preserves the compatibility App resource key"
+        );
+        assert!(
+            tool.pointer("/_meta/ui/csp").is_none()
+                && tool.pointer("/_meta/ui/permissions").is_none(),
+            "{name} tool metadata must not carry resource policy: {tool}"
+        );
+    }
 
     assert_eq!(
         mcp.list_resources(),
@@ -232,6 +274,17 @@ fn all_forty_tools_match_their_cli_counterparts() {
             "ui://forged/work-detail.html".to_owned(),
         ]
     );
+    for uri in [
+        "ui://forged/overview.html",
+        "ui://forged/operations-overview.html",
+        "ui://forged/work-detail.html",
+    ] {
+        let descriptor = mcp.resource(uri);
+        assert!(
+            descriptor.get("_meta").is_none(),
+            "resource policy lives on contents, not the {uri} descriptor: {descriptor}"
+        );
+    }
     let app = mcp.read_resource("ui://forged/overview.html");
     assert_eq!(
         app.pointer("/contents/0/mimeType"),
@@ -241,31 +294,58 @@ fn all_forty_tools_match_their_cli_counterparts() {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Control Plane")));
-    assert_eq!(
-        app.pointer("/contents/0/_meta/ui/csp/connectDomains"),
-        Some(&json!([])),
-        "Apps request no network connections"
-    );
-    assert_eq!(
-        app.pointer("/contents/0/_meta/ui/csp/resourceDomains"),
-        Some(&json!([])),
-        "Apps load no external resources"
-    );
+    for domain in [
+        "baseUriDomains",
+        "connectDomains",
+        "frameDomains",
+        "resourceDomains",
+    ] {
+        assert_eq!(
+            app.pointer(&format!("/contents/0/_meta/ui/csp/{domain}")),
+            Some(&json!([])),
+            "Apps deny every {domain} capability"
+        );
+    }
     assert_eq!(
         app.pointer("/contents/0/_meta/ui/permissions"),
-        Some(&json!({})),
-        "Apps request no camera, microphone, location, or clipboard permission"
+        Some(&json!({}))
     );
     let app = mcp.read_resource("ui://forged/operations-overview.html");
     assert!(app
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Operations") && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
     let app = mcp.read_resource("ui://forged/work-detail.html");
     assert!(app
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Work Detail") && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
@@ -892,6 +972,54 @@ fn work_list_refuses_present_non_string_repository_scopes() {
         assert!(
             serde_json::from_str::<Value>(text).is_err(),
             "transport refusal is not an unfiltered operation envelope: {text}"
+        );
+    }
+}
+
+#[test]
+fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
+    let env = TestEnv::new("forged-split-app-unknown-fields");
+    env.forged(&["init"]);
+    let mut mcp = McpClient::new(&env);
+
+    for (tool, arguments) in [
+        (
+            "work_list",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
+        ),
+        (
+            "work_list",
+            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
+        ),
+        (
+            "operations_overview",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
+        ),
+        (
+            "operations_overview",
+            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
+        ),
+        (
+            "work_detail",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {"subjectKind": "run", "subjectId": "absent"}}),
+        ),
+        (
+            "work_detail",
+            json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "absent", "unexpected": true}}),
+        ),
+    ] {
+        let refusal = mcp.call_tool_error_result(tool, arguments.clone());
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters") && text.contains("unknown field"),
+            "{tool} must reject unknown fields before dispatch: {arguments}: {refusal}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "transport refusal is not an operation envelope: {text}"
         );
     }
 }
