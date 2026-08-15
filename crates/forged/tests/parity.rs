@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-two public core functions, the CLI path and the MCP tool path produce
+//! the forty-three public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -68,7 +68,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_two_tools_match_their_cli_counterparts() {
+fn all_forty_three_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -125,7 +125,7 @@ fn all_forty_two_tools_match_their_cli_counterparts() {
         "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-two tools, exactly");
+    assert_eq!(tools, expected, "the forty-three tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
