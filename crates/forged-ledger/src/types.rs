@@ -1485,6 +1485,100 @@ pub struct OperationRow {
     pub updated_at: String,
 }
 
+/// Immutable key for one exact review-finding delivery row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingDeliveryKey {
+    pub run_id: String,
+    pub repository_slug: String,
+    pub pr_number: u64,
+    pub review_epoch_kind: forged_types::ReviewEpochKind,
+    pub review_epoch: u64,
+    pub snapshot_sha256: String,
+    pub finding_id: String,
+}
+
+/// Closed durable lifecycle of one review-finding delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryState {
+    Pending,
+    Uncertain,
+    Retryable,
+    Delivered,
+}
+
+impl ReviewFindingDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Uncertain => "uncertain",
+            Self::Retryable => "retryable",
+            Self::Delivered => "delivered",
+        }
+    }
+}
+
+/// Exact external outcome proving a delivered marker-bearing comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryOutcome {
+    Posted,
+    AlreadyPresent,
+}
+
+impl ReviewFindingDeliveryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Posted => "posted",
+            Self::AlreadyPresent => "already-present",
+        }
+    }
+}
+
+/// Immutable intent inserted before a review comment may be posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewReviewFindingDelivery {
+    pub key: ReviewFindingDeliveryKey,
+    pub pr_url: String,
+    pub canonical_finding_json: String,
+    pub finding_sha256: String,
+}
+
+/// Fully decoded migration-019 review-finding delivery row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingDeliveryRow {
+    pub key: ReviewFindingDeliveryKey,
+    pub schema: String,
+    pub pr_url: String,
+    pub canonical_finding_json: String,
+    pub finding_sha256: String,
+    pub state: ReviewFindingDeliveryState,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+    pub external_outcome: Option<ReviewFindingDeliveryOutcome>,
+    pub delivered_evidence: Option<String>,
+    pub delivery_token: Option<String>,
+    pub delivery_lease_until: Option<String>,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Result of atomically claiming one undelivered finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryClaim {
+    Delivered(ReviewFindingDeliveryRow),
+    Busy(ReviewFindingDeliveryRow),
+    Claimed(ReviewFindingDeliveryRow),
+}
+
+/// One bounded ledger snapshot used to select review-publication content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewPublicationSource {
+    pub definition_backed: bool,
+    pub packets: Vec<PacketRow>,
+    pub completed_attempts: Vec<AttemptRow>,
+    pub draft_pr_operation: Option<OperationRow>,
+}
+
 /// One row of `merge_slots`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeSlotRow {

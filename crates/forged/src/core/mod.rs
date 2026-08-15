@@ -17,6 +17,7 @@ pub(crate) mod herdr_projection;
 mod history;
 mod observe;
 mod ops;
+mod review;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
 pub(crate) mod spec;
@@ -795,6 +796,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,
+        "review_publish" => review::review_publish(ctx, &mut req).await,
         "usage_report" => ops::usage_report(ctx, &req).await,
         "usage_ingest" => ops::usage_ingest(ctx, &mut req).await,
         "events_tail" => ops::events_tail(ctx, &req).await,

@@ -32,6 +32,7 @@ mod observation;
 mod operations;
 mod owned_herdr;
 mod packets;
+mod review_delivery;
 mod runs;
 mod slots;
 mod time;
@@ -59,10 +60,12 @@ pub use types::{
     HerdrLayoutCleanupRetry, HerdrLayoutCleanupState, HerdrLayoutCreation,
     HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow,
     HerdrPaneProjectionRow, HerdrProjectionChannel, HerdrProjectionPublicationState, MergeSlotRow,
-    NewAttemptArtifact, NewPacket, NewRun, NewRunDefinition, NewUsage, OperationOutcome,
-    OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
+    NewAttemptArtifact, NewPacket, NewReviewFindingDelivery, NewRun, NewRunDefinition, NewUsage,
+    OperationOutcome, OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
     OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow, Pragmas,
-    RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow,
-    RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome,
+    ReviewFindingDeliveryRow, ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope,
+    RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement,
+    RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };

@@ -45,6 +45,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PacketCmd,
     },
+    /// Durable review-result delivery.
+    Review {
+        /// Review delivery subcommand.
+        #[command(subcommand)]
+        command: ReviewCmd,
+    },
     /// Immutable attempt-artifact operations.
     Artifact {
         #[command(subcommand)]
@@ -466,6 +472,13 @@ pub struct RunScoped {
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
+}
+
+/// `review` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ReviewCmd {
+    /// Publish the latest exact durable review snapshot to its slice PR.
+    Publish(RunScoped),
 }
 
 /// `packet` subcommands.
@@ -1177,6 +1190,9 @@ pub fn command_name(command: &Command) -> &'static str {
             PacketCmd::Fail(_) => "packet_fail",
             PacketCmd::Heartbeat(_) => "packet_heartbeat",
         },
+        Command::Review { command } => match command {
+            ReviewCmd::Publish(_) => "review_publish",
+        },
         Command::Artifact { command } => match command {
             ArtifactCmd::Verify(_) => "artifact_verify",
             ArtifactCmd::Compact(_) => "artifact_compact",
@@ -1453,6 +1469,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "attempt": a.attempt,
                         "claimToken": a.claim_token,
                     }),
+                ),
+            ),
+        },
+        Command::Review { command } => match command {
+            ReviewCmd::Publish(a) => (
+                "review_publish",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
                 ),
             ),
         },

@@ -296,6 +296,62 @@ pub(crate) fn settle_operation(
 }
 
 impl Ledger {
+    /// Reclaim a stale in-progress `review_publish` ObserveOnly wrapper.
+    ///
+    /// Per-finding migration-019 leases remain the effect fence; this lease
+    /// only prevents two callers from trying to finish the same wrapper at
+    /// once. A terminal operation is never reopened.
+    pub fn resume_stale_review_publish_operation(
+        &self,
+        operation_id: &str,
+        request_sha256: &str,
+        stale_before: &str,
+        now: &str,
+    ) -> Result<(), LedgerError> {
+        let operation_id = operation_id.to_owned();
+        let request_sha256 = request_sha256.to_owned();
+        let stale_before = stale_before.to_owned();
+        let now = now.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let row = get_operation_tx(&tx, &operation_id)?;
+            if row.name != "review_publish"
+                || row.effect_class != EffectClass::ObserveOnly
+                || row.request_sha256 != request_sha256
+            {
+                return Err(refused(
+                    ErrorCode::IdempotencyConflict,
+                    "review publication resume does not match the stored operation",
+                ));
+            }
+            if row.state == OperationState::Terminal {
+                return Err(refused(
+                    ErrorCode::IdempotencyConflict,
+                    "terminal review publication cannot be reopened",
+                ));
+            }
+            if row.updated_at.as_str() > stale_before.as_str() {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "review publication is still inside its reconciliation lease",
+                ));
+            }
+            let changed = tx.execute(
+                "UPDATE operations SET updated_at = ?1 WHERE operation_id = ?2
+                 AND state = 'in_progress' AND updated_at <= ?3",
+                rusqlite::params![now, operation_id, stale_before],
+            )?;
+            if changed != 1 {
+                return Err(refused(
+                    ErrorCode::OperationInProgress,
+                    "review publication was concurrently resumed",
+                ));
+            }
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
     /// Atomically record one ledger-only event effect and its terminal
     /// idempotency receipt.
     ///

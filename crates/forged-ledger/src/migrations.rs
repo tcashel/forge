@@ -872,6 +872,64 @@ BEGIN
 END;
 ";
 
+/// Migration 019: exact-snapshot, per-finding review-publication truth.
+///
+/// The snapshot digest is part of the primary identity: a later same-round
+/// result is new work rather than an update to an older delivery row.
+const MIGRATION_019: &str = "
+CREATE TABLE review_finding_deliveries (
+  schema                 TEXT NOT NULL
+                         CHECK (schema = 'forged.review-finding-delivery/1'),
+  run_id                 TEXT NOT NULL REFERENCES runs(run_id),
+  repository_slug        TEXT NOT NULL CHECK (length(trim(repository_slug)) > 0),
+  pr_number              INTEGER NOT NULL CHECK (pr_number > 0),
+  pr_url                 TEXT NOT NULL CHECK (length(trim(pr_url)) > 0),
+  review_epoch_kind      TEXT NOT NULL
+                         CHECK (review_epoch_kind IN ('semantic-round','legacy-seq')),
+  review_epoch           INTEGER NOT NULL CHECK (review_epoch >= 0),
+  snapshot_sha256        TEXT NOT NULL
+                         CHECK (length(snapshot_sha256) = 64
+                                AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'),
+  finding_id             TEXT NOT NULL
+                         CHECK (length(finding_id) = 64
+                                AND finding_id NOT GLOB '*[^0-9a-f]*'),
+  finding_sha256         TEXT NOT NULL
+                         CHECK (length(finding_sha256) = 64
+                                AND finding_sha256 NOT GLOB '*[^0-9a-f]*'),
+  canonical_finding_json TEXT NOT NULL,
+  state                  TEXT NOT NULL
+                         CHECK (state IN ('pending','uncertain','retryable','delivered')),
+  attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_error             TEXT CHECK (last_error IS NULL OR length(CAST(last_error AS BLOB)) <= 2048),
+  external_outcome       TEXT CHECK (external_outcome IN ('posted','already-present')),
+  delivered_evidence     TEXT,
+  delivery_token         TEXT,
+  delivery_lease_until   TEXT,
+  delivered_at           TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  PRIMARY KEY (
+    run_id, repository_slug, pr_number, review_epoch_kind, review_epoch,
+    snapshot_sha256, finding_id
+  ),
+  CHECK (finding_sha256 = finding_id),
+  CHECK ((delivery_token IS NULL) = (delivery_lease_until IS NULL)),
+  CHECK (
+    (state = 'delivered' AND external_outcome IS NOT NULL
+      AND delivered_evidence IS NOT NULL AND delivered_at IS NOT NULL
+      AND last_error IS NULL AND delivery_token IS NULL)
+    OR
+    (state != 'delivered' AND external_outcome IS NULL
+      AND delivered_evidence IS NULL AND delivered_at IS NULL)
+  ),
+  CHECK ((state IN ('retryable','uncertain')) OR last_error IS NULL)
+);
+CREATE UNIQUE INDEX review_finding_delivery_token
+  ON review_finding_deliveries(delivery_token) WHERE delivery_token IS NOT NULL;
+CREATE INDEX review_finding_delivery_state
+  ON review_finding_deliveries(run_id, snapshot_sha256, state, delivery_lease_until);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -892,6 +950,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_016,
     MIGRATION_017,
     MIGRATION_018,
+    MIGRATION_019,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1014,7 +1073,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 18);
+        assert_eq!(pragmas.user_version, 19);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1042,6 +1101,7 @@ mod tests {
             "work_identities",
             "herdr_layouts",
             "herdr_pane_projections",
+            "review_finding_deliveries",
         ] {
             let found: String = conn
                 .query_row(
@@ -1091,8 +1151,8 @@ mod tests {
     }
 
     #[test]
-    fn representative_v10_v12_v15_v16_and_exact_v17_upgrades_preserve_rows_and_reach_v18() {
-        for version in [10usize, 12, 15, 16, 17] {
+    fn representative_v10_v12_v15_v16_v17_and_exact_v18_upgrades_preserve_rows_and_reach_v19() {
+        for version in [10usize, 12, 15, 16, 17, 18] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(format!("state-v{version}.db"));
             {
@@ -1117,7 +1177,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1152,7 +1212,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         ledger.close().expect("close");
     }
 
@@ -1213,7 +1273,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -1256,7 +1316,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

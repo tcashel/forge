@@ -13,6 +13,7 @@ pub mod herdr_ownership;
 pub mod herdr_projection;
 pub mod ids;
 pub mod packet;
+pub mod review_publication;
 pub mod work_history;
 pub mod work_identity;
 pub mod work_map;
@@ -60,6 +61,11 @@ pub use packet::{
     AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
     ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
     WorkPacket,
+};
+pub use review_publication::{
+    github_repository_from_pr_url, ReviewEpochKind, ReviewEpochV1, ReviewPublicationFindingStatus,
+    ReviewPublicationFindingV1, ReviewPublicationNoop, ReviewPublicationTargetV1,
+    ReviewPublicationV1, REVIEW_PUBLICATION_SCHEMA_V1,
 };
 pub use work_history::{
     WorkHistoryBucket, WorkHistoryBucketV1, WorkHistoryCoverageV1, WorkHistoryFiltersV1,

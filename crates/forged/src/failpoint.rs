@@ -45,6 +45,10 @@
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use
 //! the durable bundle without consulting Beads again.
+//! `review.publish.probe.before` and `review.publish.probe.after` bracket the
+//! exact-marker observation. `review.publish.post.before` is after uncertain
+//! intent is durable but before GitHub is called; `review.publish.post.after`
+//! is the response-lost seam after GitHub returns and before delivery settles.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

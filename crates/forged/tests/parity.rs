@@ -65,7 +65,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_one_tools_match_their_cli_counterparts() {
+fn all_forty_two_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -101,6 +101,7 @@ fn all_forty_one_tools_match_their_cli_counterparts() {
         "packet_complete",
         "packet_fail",
         "reconcile",
+        "review_publish",
         "run_advance",
         "run_accept_risk",
         "run_revise_roster",
@@ -120,7 +121,7 @@ fn all_forty_one_tools_match_their_cli_counterparts() {
         "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-one tools, exactly");
+    assert_eq!(tools, expected, "the forty-two tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -441,6 +442,19 @@ fn all_forty_one_tools_match_their_cli_counterparts() {
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
+
+    let cli = env
+        .forged(&["review", "publish", "--run", "par-repository"])
+        .1;
+    let tool = mcp.call_tool(
+        "review_publish",
+        json!({
+            "schemaVersion": 1,
+            "runId": "par-repository",
+            "params": {"run": "par-repository"}
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "review_publish parity");
 
     let cli = env
         .forged(&[

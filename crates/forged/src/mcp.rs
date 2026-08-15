@@ -841,6 +841,15 @@ impl ForgedServer {
         self.call("packet_fail", args.0).await
     }
 
+    /// Publish the latest exact durable review snapshot to its slice PR.
+    #[tool(
+        name = "review_publish",
+        description = "Publish an exact durable review snapshot to its recorded slice pull request. params.run is required."
+    )]
+    pub async fn review_publish(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("review_publish", args.0).await
+    }
+
     /// Verify one immutable attempt manifest without repairing it.
     #[tool(
         name = "artifact_verify",

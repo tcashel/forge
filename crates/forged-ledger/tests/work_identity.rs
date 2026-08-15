@@ -292,7 +292,8 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
     {
         let conn = rusqlite::Connection::open(&path).expect("raw");
         conn.execute_batch(
-            r#"DROP TRIGGER herdr_projection_identity_immutable;
+            r#"DROP TABLE review_finding_deliveries;
+             DROP TRIGGER herdr_projection_identity_immutable;
              DROP INDEX herdr_projection_lifecycle_wake;
              DROP INDEX herdr_projection_metadata_wake;
              DROP INDEX herdr_projection_lifecycle_token;
@@ -334,7 +335,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")
