@@ -2451,6 +2451,8 @@ async fn operator_queue(
             || entry["state"] == json!("stopped");
         let dead_controller = !controller.is_null()
             && matches!(controller_state, Some("dead" | "vanished" | "exited"));
+        let unverified_controller_is_blocker =
+            matches!(liveness, QueueLiveness::Probed) && controller_state == Some("unknown");
         let stale = claim_status == Some("in_progress")
             && (holder_mismatch
                 || (!awaiting_delivery
@@ -2500,12 +2502,14 @@ async fn operator_queue(
             })
             .or_else(|| stale.then(|| json!(claim_detail)))
             .or_else(|| {
-                matches!(controller_state, Some("dead" | "vanished" | "unknown")).then(|| {
-                    json!(format!(
-                        "detached controller is {}",
-                        controller_state.unwrap_or("unknown")
-                    ))
-                })
+                (matches!(controller_state, Some("dead" | "vanished"))
+                    || unverified_controller_is_blocker)
+                    .then(|| {
+                        json!(format!(
+                            "detached controller is {}",
+                            controller_state.unwrap_or("unknown")
+                        ))
+                    })
             })
             .unwrap_or(Value::Null);
         let recorded_pr = pr_records.remove(&id).map(|(_, record)| record);
@@ -2549,7 +2553,7 @@ async fn operator_queue(
             || stale
             || claim_status == Some("closed")
             || dead_controller
-            || controller_state == Some("unknown")
+            || unverified_controller_is_blocker
             || entry["state"] == json!("stopped")
         {
             "Stalled or recoverable"

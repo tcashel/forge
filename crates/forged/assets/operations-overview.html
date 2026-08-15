@@ -182,7 +182,14 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       const rows = el("div", "rows");
       if (!arr(group.entries).length) rows.append(el("div", "empty", "None"));
       for (const entry of arr(group.entries)) {
-        const row = el("button", "row"); row.type = "button"; row.disabled = !canDetail || !entry.detailTarget; row.title = row.disabled ? "Plan-only work has no durable detail yet" : "Open exact work detail";
+        const target = entry.detailTarget;
+        const selector = target ? `${target.subjectKind}:${target.subjectId}` : null;
+        const row = el("button", "row"); row.type = "button"; row.disabled = !canDetail || !target;
+        row.title = !target
+          ? "Plan-only work has no durable detail yet"
+          : !canDetail
+            ? `Exact detail target ${selector}; this host cannot call server tools`
+            : `Open exact work detail for ${selector}`;
         row.append(el("span", "id", entry.id)); row.append(el("span", "title", titleFor(entry))); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
         if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
       }
