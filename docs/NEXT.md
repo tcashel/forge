@@ -243,12 +243,18 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
-Start with `overview` or `work list`. Both carry the same operator queue;
-`work list` additionally serves the uncapped raw inventory. Neither needs an
-id. `work list` can narrow that same projection to one exact repository
-identity from the canonical Bead metadata:
+Start with `operations overview`. It is the bounded operator surface over
+durable work plus the current nonterminal Beads plan. `work list` remains the
+compatibility inventory and `overview` remains the compatibility reconnect
+facade. Exact subject detail requires both kind and canonical id; it never
+guesses or widens by prefix:
 
 ```sh
+forged operations overview
+forged operations overview --repo /absolute/path/to/repository
+forged operations overview --group needs-me --limit 50
+forged work detail --subject-kind run --subject-id <run-id>
+forged work detail --subject-kind epic --subject-id <epic-id>
 forged work list
 forged work list --repo /absolute/path/to/repository
 forged overview                    # no scope: the whole portfolio
@@ -264,6 +270,23 @@ forged attention resolve --subject <id> --attention-id <id> \
 forged attention reopen --subject <id> --attention-id <id> \
   --occurrence-id <id> --actor <identity>
 ```
+
+`operations overview` returns `forged.operations-overview/1` and renders
+through `ui://forged/operations-overview.html`. Its stable groups are **Needs
+me**, **Ready to merge**, **Running**, **Stalled or recoverable**, and
+**Planned**. The live-plan adapter uses exactly one bounded N+1 native Beads
+discovery and one batched exact-id hydrate; it never parses `bd graph`, calls
+`bd ready`, claims work, or performs a per-node subprocess. Durable rows win
+when a Bead also has execution history. A Beads outage keeps the durable
+projection and marks plan coverage unavailable. The hot path reports
+controller liveness only from its one ledger snapshot, so it performs no
+per-row process or controller-file probe.
+
+`work detail` returns `forged.work-detail/1` and renders through
+`ui://forged/work-detail.html`. The Operations App may open it as a read-only
+drawer when the host supports server tool calls; otherwise the exact CLI/MCP
+command remains visible to the lead agent. Plan-only rows deliberately have
+no detail target until durable execution exists.
 
 The repository selector performs one native, id-bounded
 `metadata.repository` Beads query and reuses its rows for claim-health and
@@ -322,7 +345,7 @@ detail), so abandoned Bead ownership is visible instead of silently trusted.
 A clean or accepted-risk run deliberately retains its claim while its reviewed
 PR awaits delivery and is reported as awaiting delivery, not as stale.
 
-The overview aggregates status/topology, controller and provider sessions,
+The compatibility overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the
 outcome each seat landed, artifacts, interventions, roster revisions, per-seat priced usage,
 and events. The MCP `overview` tool returns the identical structured
@@ -361,7 +384,7 @@ recorded `billed` or `imputed_api_rate` provenance, while unknown cost remains
 null and contributes to `rowsMissingCost`. Live plans are intentionally
 excluded until they have a durable identity.
 
-That MCP App draws one projection five ways, and never invents a state the
+That compatibility MCP App draws one projection five ways, and never invents a state the
 ledger did not record:
 
 | View | What it answers |

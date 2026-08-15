@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use forged_types::{OperationRequest, OperationResponse};
 use serde_json::{json, Map, Value};
 
-use crate::core::{on_ledger, param_opt_str, read_only, Ctx, Failure};
+use crate::core::{on_ledger, param_opt_str, param_str, read_only, Ctx, Failure};
 
 fn request(run_id: &str, params: Value) -> OperationRequest {
     OperationRequest {
@@ -638,6 +638,55 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             },
             _ => unreachable!(),
         }
+    })
+    .await
+}
+
+/// Exact work projection used by the Work Detail App.
+///
+/// Unlike [`overview`], this surface never resolves a bare id or widens to a
+/// portfolio. The caller must supply the canonical kind and id it learned
+/// from Operations, so a stale or malformed drawer target fails closed.
+pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("work_detail", req, || async {
+        let kind = param_str(&req.params, "subjectKind")?;
+        let id = param_str(&req.params, "subjectId")?;
+        let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
+        if after < 0 {
+            return Err(Failure::invalid("work detail after must be non-negative"));
+        }
+        let limit = req
+            .params
+            .get("limit")
+            .and_then(Value::as_u64)
+            .unwrap_or(100);
+        if limit == 0 || limit > 1_000 {
+            return Err(Failure::invalid(
+                "work detail limit must be between 1 and 1000",
+            ));
+        }
+
+        let mut projection = match kind {
+            "run" | "slice" => run_overview(ctx, id, after, limit).await?,
+            "epic" => epic_overview(ctx, id, after, limit).await?,
+            other => {
+                return Err(Failure::invalid(format!(
+                    "work detail kind must be \"run\" or \"epic\", got {other:?}"
+                )))
+            }
+        };
+        let object = projection
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("work detail projection was not an object"))?;
+        object.insert("schema".to_owned(), json!("forged.work-detail/1"));
+        object.insert(
+            "workRef".to_owned(),
+            json!({
+                "kind": if kind == "epic" { "epic" } else { "run" },
+                "id": id,
+            }),
+        );
+        Ok(projection)
     })
     .await
 }

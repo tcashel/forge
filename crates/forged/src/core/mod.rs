@@ -775,6 +775,8 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
         "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
+        "operations_overview" => ops::operations_overview(ctx, &req).await,
+        "work_detail" => observe::work_detail(ctx, &req).await,
         "supervise" => supervise::supervise(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,

@@ -649,10 +649,13 @@ issue_json() {
   repository=$(cat "$state/default-repository" 2>/dev/null || true)
   metadata=$(cat "$state/$id.metadata" 2>/dev/null || printf '{"repository":"%s"}' "$repository")
   priority=$(cat "$state/$id.priority" 2>/dev/null || echo 2)
+  parent=$(cat "$state/$id.parent" 2>/dev/null || true)
+  if [ -n "$parent" ]; then parent_json="\"$parent\""; else parent_json=null; fi
+  dependencies=$(cat "$state/$id.dependencies" 2>/dev/null || echo '[]')
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s,"updated_at":"2026-08-14T00:00:00Z"}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s,"updated_at":"2026-08-14T00:00:00Z","parent":%s,"dependencies":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision" "$parent_json" "$dependencies"
 }
 case "$cmd" in
   version)
@@ -736,7 +739,6 @@ case "$cmd" in
       printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
     fi ;;
   show)
-    id=$2
     # Simulated bd outage: `show` is the read the spec fence depends on.
     if [ -f "$state/show.unreachable" ]; then
       printf 'bd: connection refused\n' >&2
@@ -746,8 +748,15 @@ case "$cmd" in
     # fixture by hand. Remember every shown issue so `bd ready` can expose
     # open ones when no explicit frontier was seeded. Tests that exercise a
     # competing frontier still seed it and therefore keep exact control.
-    : > "$state/$id.seen"
-    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+    first=1; printf '{"schema_version":1,"data":['
+    shift
+    for id in "$@"; do
+      [ "$id" = "--json" ] && continue
+      case "$id" in --*) continue ;; esac
+      : > "$state/$id.seen"
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done
+    printf ']}\n' ;;
   comments)
     id=$2; text=$(cat "$state/$id.comment" 2>/dev/null || true)
     if [ -n "$text" ]; then
@@ -764,11 +773,25 @@ case "$cmd" in
       exit 1
     fi
     ids=$(val --id "$@")
+    statuses=$(val --status "$@")
+    limit=$(val --limit "$@")
     metadata_filter=$(val --metadata-field "$@")
+    if [ -z "$ids" ]; then
+      ids=$(for field in "$state"/*.status; do
+        [ -e "$field" ] || continue
+        printf '%s,' "$(basename "$field" .status)"
+      done)
+      ids=${ids%,}
+    fi
     first=1; printf '{"schema_version":1,"data":['
     oldifs=$IFS; IFS=,
+    shown=0
     for id in $ids; do
       [ -n "$id" ] || continue
+      if [ -n "$statuses" ]; then
+        current_status=$(cat "$state/$id.status" 2>/dev/null || echo open)
+        case ",$statuses," in *",$current_status,"*) ;; *) continue ;; esac
+      fi
       if [ -n "$metadata_filter" ]; then
         case "$metadata_filter" in
           repository=*) expected_repository=${metadata_filter#repository=} ;;
@@ -777,7 +800,11 @@ case "$cmd" in
         repository=$(cat "$state/$id.repository" 2>/dev/null || true)
         [ "$repository" = "$expected_repository" ] || continue
       fi
+      if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ "$shown" -ge "$limit" ]; then
+        continue
+      fi
       [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      shown=$((shown + 1))
     done
     IFS=$oldifs
     printf ']}\n' ;;

@@ -73,6 +73,12 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Bounded operator-facing operations projection.
+    Operations {
+        /// Operations subcommand.
+        #[command(subcommand)]
+        command: OperationsCmd,
+    },
     /// Reconcile operator-authorized desired work.
     Supervise(SuperviseArgs),
     /// Install and operate the operator-scoped supervisor service.
@@ -738,6 +744,33 @@ pub struct OverviewArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `operations` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum OperationsCmd {
+    /// Show planned, queued, active, blocked, and mergeable work.
+    Overview(OperationsOverviewArgs),
+}
+
+/// `operations overview` flags.
+#[derive(Debug, Args)]
+pub struct OperationsOverviewArgs {
+    /// Exact durable repository identity.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// One queue group code, such as `needs-me` or `running`.
+    #[arg(long)]
+    pub group: Option<String>,
+    /// One source: `durable` or `live-plan`.
+    #[arg(long)]
+    pub source: Option<String>,
+    /// Maximum rows across all groups (default 200, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
@@ -745,6 +778,8 @@ pub enum WorkCmd {
     List(WorkListArgs),
     /// Project bounded cross-run lifecycle, rework, and spend history.
     History(WorkHistoryArgs),
+    /// Project one exact run or epic for the Work Detail App.
+    Detail(WorkDetailArgs),
 }
 
 /// `work list` flags.
@@ -798,6 +833,24 @@ impl WorkHistoryGroupArg {
     }
 }
 
+/// Exact durable work kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkDetailKind {
+    /// One slice run.
+    Run,
+    /// One epic.
+    Epic,
+}
+
+impl WorkDetailKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Epic => "epic",
+        }
+    }
+}
+
 /// `work history` flags. Omitted bounds default to the 30 days ending at
 /// the operation's single `asOf`.
 #[derive(Debug, Args)]
@@ -829,6 +882,26 @@ pub struct WorkHistoryArgs {
     /// Opaque continuation cursor from the preceding page.
     #[arg(long)]
     pub cursor: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work detail` flags.
+#[derive(Debug, Args)]
+pub struct WorkDetailArgs {
+    /// Exact durable subject kind.
+    #[arg(long, value_enum)]
+    pub subject_kind: WorkDetailKind,
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject_id: String,
+    /// Return event rows after this event id.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Maximum event rows (default 100, maximum 1000).
+    #[arg(long)]
+    pub limit: Option<u64>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1011,11 +1084,15 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Operations { command } => match command {
+            OperationsCmd::Overview(_) => "operations_overview",
+        },
         Command::Supervise(_) => "supervise",
         Command::Service { command } => command.operation_name(),
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
             WorkCmd::History(_) => "work_history",
+            WorkCmd::Detail(_) => "work_detail",
         },
         Command::Attention { command } => match command {
             AttentionCmd::Acknowledge(_) => "attention_acknowledge",
@@ -1400,6 +1477,23 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
+        Command::Operations { command } => match command {
+            OperationsCmd::Overview(a) => {
+                let mut params = Map::new();
+                for (key, value) in [("repo", a.repo), ("group", a.group), ("source", a.source)] {
+                    if let Some(value) = value {
+                        params.insert(key.to_owned(), json!(value));
+                    }
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "operations_overview",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+        },
         Command::Supervise(a) => (
             "supervise",
             request(
@@ -1451,6 +1545,25 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 (
                     "work_history",
                     request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Detail(a) => {
+                let mut params = Map::new();
+                params.insert("subjectKind".to_owned(), json!(a.subject_kind.as_str()));
+                params.insert("subjectId".to_owned(), json!(a.subject_id));
+                if let Some(after) = a.after {
+                    params.insert("after".to_owned(), json!(after));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                let run_id = params
+                    .get("subjectId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                (
+                    "work_detail",
+                    request(a.idempotency_key, run_id, Value::Object(params)),
                 )
             }
         },

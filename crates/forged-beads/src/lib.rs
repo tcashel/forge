@@ -33,8 +33,9 @@ pub use config::BdConfig;
 pub use doctor::{run_doctor, DoctorConfig, ProbeResult};
 pub use graph::{
     close_held_issue, close_issue, comment_once, epic_children, list_issues,
-    list_issues_for_repository, ready_issues, release_issue, release_unresolved_issue,
-    reopen_issue, show_issue, IssueSummary,
+    list_issues_for_repository, plan_inventory, ready_issues, release_issue,
+    release_unresolved_issue, reopen_issue, show_issue, IssueSummary, PlanDependency,
+    PlanInventory, PlanIssue,
 };
 pub use guardian::{run_guardian, GuardianConfig, GuardianExit};
 pub use lease::{

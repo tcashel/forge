@@ -13,8 +13,8 @@ use forged_ledger::{
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionItemV1, AttentionResolutionDisposition, AttentionState, ErrorCode,
-    ExecutionPackageV1, OperationRequest, OperationResponse, RunId, WorkIdentitySubjectKind,
-    WorkPacket,
+    ExecutionPackageV1, OperationRequest, OperationResponse, RunId, WorkIdentityContextV1,
+    WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
@@ -2285,6 +2285,24 @@ async fn portfolio_for_repository(
             .await
             .map_err(|error| error.to_string())
     };
+    finish_portfolio(ctx, snapshot, entries, bead_read, QueueLiveness::Probed).await
+}
+
+#[derive(Clone, Copy)]
+enum QueueLiveness {
+    /// Compatibility projection: verify controller files and OS identity.
+    Probed,
+    /// Operations hot path: report only durable evidence and explicit unknown.
+    Durable,
+}
+
+async fn finish_portfolio(
+    ctx: &Ctx,
+    snapshot: InventorySnapshot,
+    mut entries: Vec<Value>,
+    bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
+    liveness: QueueLiveness,
+) -> Result<Portfolio, Failure> {
     let attention = super::attention::project_active(
         &snapshot,
         &entries,
@@ -2296,7 +2314,15 @@ async fn portfolio_for_repository(
             .map_err(|error| Failure::internal(format!("serializing attention item: {error}")))
     })
     .collect::<Result<Vec<_>, _>>()?;
-    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention, bead_read).await;
+    let queue = operator_queue(
+        ctx,
+        &snapshot,
+        &mut entries,
+        &attention,
+        bead_read,
+        liveness,
+    )
+    .await;
     let admission = snapshot.admission_decisions.clone();
     Ok(Portfolio {
         entries,
@@ -2325,6 +2351,7 @@ async fn operator_queue(
     entries: &mut [Value],
     attention: &[Value],
     bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
+    liveness: QueueLiveness,
 ) -> Value {
     let bead_error = bead_read.as_ref().err().cloned();
     let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
@@ -2381,13 +2408,19 @@ async fn operator_queue(
     for entry in entries.iter_mut() {
         let id = entry["id"].as_str().unwrap_or_default().to_owned();
         let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
-        let controller = super::handoff::controller_status_from_snapshot(
-            ctx,
-            &id,
-            controller_records.remove(&id).map(|(_, record)| record),
-            snapshot.latest_event.get(&id),
-        )
-        .await;
+        let record = controller_records.remove(&id).map(|(_, record)| record);
+        let controller = match liveness {
+            QueueLiveness::Probed => {
+                super::handoff::controller_status_from_snapshot(
+                    ctx,
+                    &id,
+                    record,
+                    snapshot.latest_event.get(&id),
+                )
+                .await
+            }
+            QueueLiveness::Durable => durable_controller_status(snapshot, &id, record),
+        };
         let issue = beads.get(&bead_id);
         // Human-readable identity is frozen with the work. The bounded
         // Beads read below remains authoritative for claim health and
@@ -2561,6 +2594,9 @@ async fn operator_queue(
                         .unwrap_or("unknown"),
                 }),
             );
+            if let Some(execution) = object.get_mut("execution").and_then(Value::as_object_mut) {
+                execution.insert("controller".to_owned(), controller.clone());
+            }
             object.insert("controller".to_owned(), controller);
             object.insert("claimHealth".to_owned(), claim_health);
             object.insert("blocker".to_owned(), blocker);
@@ -2592,6 +2628,64 @@ async fn operator_queue(
         })
         .collect();
     json!({"groups": groups, "total": entries.len(), "asOf": as_of})
+}
+
+/// Controller evidence which never consults controller files or the OS.
+///
+/// A durable `running` desire is authorization, not liveness, so the state is
+/// deliberately `unknown` unless a live attempt independently proves useful
+/// execution. Operations can show that authorization and the last supervisor
+/// outcome without turning a process probe into one job per row.
+fn durable_controller_status(
+    snapshot: &InventorySnapshot,
+    id: &str,
+    record: Option<Value>,
+) -> Value {
+    let desired = snapshot
+        .desired_work
+        .iter()
+        .find(|row| row.subject_id == id);
+    let Some(desired) = desired else {
+        return record.map_or(Value::Null, |record| {
+            json!({
+                "state": "unknown",
+                "verified": false,
+                "source": "durable-event",
+                "record": record,
+                "detail": "controller event exists but no desired-work row proves current liveness",
+                "lastProgressAt": snapshot.latest_event.get(id).map(|row| &row.ts),
+                "lastProgressKind": snapshot.latest_event.get(id).map(|row| &row.kind),
+                "lastProgressEventId": snapshot.latest_event.get(id).map(|row| row.event_id),
+            })
+        });
+    };
+    let state = match desired.desired_state {
+        forged_ledger::DesiredState::Stopped => "stopped",
+        forged_ledger::DesiredState::Paused => "paused",
+        forged_ledger::DesiredState::Running => "unknown",
+    };
+    json!({
+        "state": state,
+        "verified": false,
+        "source": "desired-work",
+        "desiredState": desired.desired_state.as_str(),
+        "generation": desired.controller_generation,
+        "controlRevision": desired.control_revision,
+        "restartBudget": desired.restart_budget,
+        "restartUsed": desired.restart_used,
+        "nextWakeAt": desired.next_wake_at,
+        "lastOutcome": desired.last_outcome.map(|value| value.as_str()),
+        "lastError": desired.last_error,
+        "record": record,
+        "detail": if state == "unknown" {
+            "durable authorization exists; current process liveness was not probed"
+        } else {
+            "durable desired-work state is authoritative"
+        },
+        "lastProgressAt": snapshot.latest_event.get(id).map(|row| &row.ts),
+        "lastProgressKind": snapshot.latest_event.get(id).map(|row| &row.kind),
+        "lastProgressEventId": snapshot.latest_event.get(id).map(|row| row.event_id),
+    })
 }
 
 /// Fold one snapshot into the attention rail.
@@ -2860,18 +2954,18 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
 /// must not silently turn a stored identity into another one. Non-path
 /// identities are retained as exact strings so a future remote identity can
 /// use this same public selector.
-fn repository_selector(req: &OperationRequest) -> Result<Option<String>, Failure> {
+fn repository_selector(req: &OperationRequest, operation: &str) -> Result<Option<String>, Failure> {
     let Some(value) = req.params.get("repo") else {
         return Ok(None);
     };
     let raw = value
         .as_str()
-        .ok_or_else(|| Failure::invalid("work_list repo must be a non-empty string"))?;
+        .ok_or_else(|| Failure::invalid(format!("{operation} repo must be a non-empty string")))?;
     let trimmed = raw.trim();
     if trimmed.is_empty() {
-        return Err(Failure::invalid(
-            "work_list repo must be a non-empty string",
-        ));
+        return Err(Failure::invalid(format!(
+            "{operation} repo must be a non-empty string"
+        )));
     }
     let path = Path::new(trimmed);
     if !path.is_absolute() {
@@ -2884,7 +2978,7 @@ fn repository_selector(req: &OperationRequest) -> Result<Option<String>, Failure
             Component::ParentDir => {
                 if !normalized.pop() {
                     return Err(Failure::invalid(format!(
-                        "work_list repo cannot escape its absolute root: {trimmed:?}"
+                        "{operation} repo cannot escape its absolute root: {trimmed:?}"
                     )));
                 }
             }
@@ -2903,13 +2997,628 @@ fn repository_selector(req: &OperationRequest) -> Result<Option<String>, Failure
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let repository = repository_selector(req)?;
+        let repository = repository_selector(req, "work_list")?;
         let portfolio = portfolio_for_repository(ctx, repository.as_deref()).await?;
         Ok(json!({
             "runs": portfolio.entries,
             "queue": portfolio.queue,
             "attentionTotal": portfolio.attention.len(),
             "attention": portfolio.attention,
+        }))
+    })
+    .await
+}
+
+const OPERATIONS_DEFAULT_LIMIT: u64 = 200;
+const OPERATIONS_MAX_LIMIT: u64 = 500;
+const LIVE_PLAN_LIMIT: usize = 500;
+
+fn queue_code(label: &str) -> Option<&'static str> {
+    match label {
+        "Needs me" => Some("needs-me"),
+        "Ready to merge" => Some("ready-to-merge"),
+        "Running" => Some("running"),
+        "Stalled or recoverable" => Some("stalled-or-recoverable"),
+        "Planned" => Some("planned"),
+        _ => None,
+    }
+}
+
+fn operations_filter(req: &OperationRequest, key: &str) -> Result<Option<String>, Failure> {
+    let Some(value) = req.params.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Failure::invalid(format!(
+                "operations_overview {key} must be a non-empty string"
+            ))
+        })?;
+    Ok(Some(value.to_owned()))
+}
+
+fn work_ref(kind: WorkRefKind, id: &str) -> Result<Value, Failure> {
+    let reference = WorkRefV1::new(kind, id).map_err(|error| {
+        Failure::internal(format!("constructing operator work reference: {error}"))
+    })?;
+    serde_json::to_value(reference)
+        .map_err(|error| Failure::internal(format!("serializing operator work reference: {error}")))
+}
+
+fn plan_readiness(plan: &forged_beads::PlanIssue) -> &'static str {
+    if plan.issue.status == "blocked"
+        || plan.dependencies.iter().any(|dependency| {
+            dependency
+                .status
+                .as_deref()
+                .is_some_and(|status| status != "closed")
+        })
+    {
+        "blocked"
+    } else {
+        match plan.issue.status.as_str() {
+            "open" => "ready",
+            "in_progress" => "claimed",
+            "deferred" => "deferred",
+            _ => "unknown",
+        }
+    }
+}
+
+fn live_plan_entry(plan: &forged_beads::PlanIssue, captured_at: &str) -> Result<Value, Failure> {
+    let repository = plan
+        .issue
+        .metadata
+        .get("repository")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let kind = if plan.issue.issue_type == "epic" {
+        WorkIdentitySubjectKind::Epic
+    } else {
+        WorkIdentitySubjectKind::Run
+    };
+    let epic = plan.parent.as_ref().map(|id| WorkIdentityContextV1 {
+        id: id.clone(),
+        title: None,
+    });
+    let captured_at = plan.issue.updated_at.as_deref().unwrap_or(captured_at);
+    let identity = super::work_identity::live_plan_identity(
+        kind,
+        &plan.issue.id,
+        &plan.issue.id,
+        Some(&plan.issue.title),
+        plan.issue.revision.as_deref(),
+        repository,
+        None,
+        epic,
+        captured_at,
+    )?;
+    let reference = work_ref(WorkRefKind::Plan, &plan.issue.id)?;
+    Ok(json!({
+        "id": plan.issue.id,
+        "kind": if kind == WorkIdentitySubjectKind::Epic { "epic" } else { "plan" },
+        "source": "live-plan",
+        "workRef": reference,
+        "detailTarget": Value::Null,
+        "identity": identity,
+        "beadId": plan.issue.id,
+        "repo": repository,
+        "baseRef": Value::Null,
+        "branch": Value::Null,
+        "state": "planned",
+        "stopReason": Value::Null,
+        "outcome": Value::Null,
+        "delivery": Value::Null,
+        "supersededBy": Value::Null,
+        "createdAt": captured_at,
+        "updatedAt": captured_at,
+        "lastProgressAt": captured_at,
+        "liveSeats": 0,
+        "currentStage": Value::Null,
+        "currentSeat": Value::Null,
+        "currentAgent": Value::Null,
+        "costUsdKnown": 0.0,
+        "rowsMissingCost": 0,
+        "priority": plan.issue.priority,
+        "plan": {
+            "source": "beads",
+            "status": plan.issue.status,
+            "readiness": plan_readiness(plan),
+            "priority": plan.issue.priority,
+            "assignee": plan.issue.assignee,
+            "issueType": plan.issue.issue_type,
+            "revision": plan.issue.revision,
+            "parent": plan.parent,
+            "dependencies": plan.dependencies,
+        },
+    }))
+}
+
+fn operations_subject_matches(
+    kind: WorkIdentitySubjectKind,
+    id: &str,
+    subject_kind: forged_types::AdmissionSubjectKind,
+    subject_id: &str,
+) -> bool {
+    match subject_kind {
+        forged_types::AdmissionSubjectKind::Run => {
+            kind == WorkIdentitySubjectKind::Run && subject_id == id
+        }
+        forged_types::AdmissionSubjectKind::Epic => {
+            kind == WorkIdentitySubjectKind::Epic && subject_id == id
+        }
+        forged_types::AdmissionSubjectKind::Packet => {
+            kind == WorkIdentitySubjectKind::Run
+                && split_packet_key(subject_id).is_ok_and(|(run_id, _, _)| run_id == id)
+        }
+    }
+}
+
+fn desired_fact(row: &forged_ledger::DesiredWorkRow) -> Value {
+    json!({
+        "source": "ledger",
+        "subjectKind": row.subject_kind.as_str(),
+        "subjectId": row.subject_id,
+        "state": row.desired_state.as_str(),
+        "controlRevision": row.control_revision,
+        "controllerGeneration": row.controller_generation,
+        "predecessorGeneration": row.predecessor_generation,
+        "restartBudget": row.restart_budget,
+        "restartUsed": row.restart_used,
+        "nextWakeAt": row.next_wake_at,
+        "lastProgressAt": row.last_progress_at,
+        "lastOutcome": row.last_outcome.map(|value| value.as_str()),
+        "lastError": row.last_error,
+        "exhaustedAt": row.exhausted_at,
+        "updatedAt": row.updated_at,
+    })
+}
+
+fn reservation_fact(row: &forged_ledger::AdmissionReservationRow) -> Value {
+    json!({
+        "reservationId": row.reservation_id,
+        "decisionId": row.decision_id,
+        "subjectKind": match row.subject_kind {
+            forged_types::AdmissionSubjectKind::Run => "run",
+            forged_types::AdmissionSubjectKind::Epic => "epic",
+            forged_types::AdmissionSubjectKind::Packet => "packet",
+        },
+        "subjectId": row.subject_id,
+        "controlRevision": row.control_revision,
+        "repository": row.repository,
+        "provider": row.provider,
+        "model": row.model,
+        "resourceClass": match row.resource_class {
+            forged_types::AdmissionResourceClass::Read => "read",
+            forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+        },
+        "state": row.state.as_str(),
+        "ownerKind": row.owner_kind,
+        "ownerId": row.owner_id,
+        "recoveryDeadline": row.recovery_deadline,
+        "lastError": row.last_error,
+        "updatedAt": row.updated_at,
+    })
+}
+
+fn enrich_operations_facts(
+    snapshot: &InventorySnapshot,
+    attention: &[Value],
+    entries: &mut [Value],
+) -> Result<(), Failure> {
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::internal("operator entry has no canonical id"))?
+            .to_owned();
+        let kind = if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+            WorkIdentitySubjectKind::Epic
+        } else {
+            WorkIdentitySubjectKind::Run
+        };
+        let desired = snapshot
+            .desired_work
+            .iter()
+            .find(|row| {
+                row.subject_id == id
+                    && row.subject_kind.as_str()
+                        == if kind == WorkIdentitySubjectKind::Epic {
+                            "epic"
+                        } else {
+                            "run"
+                        }
+            })
+            .map(desired_fact)
+            .unwrap_or(Value::Null);
+        let decisions = snapshot
+            .admission_decisions
+            .iter()
+            .filter(|decision| {
+                operations_subject_matches(kind, &id, decision.subject_kind, &decision.subject_id)
+            })
+            .map(|decision| {
+                serde_json::to_value(decision).map_err(|error| {
+                    Failure::internal(format!("serializing admission decision: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let reservations = snapshot
+            .admission_reservations
+            .iter()
+            .filter(|reservation| {
+                operations_subject_matches(
+                    kind,
+                    &id,
+                    reservation.subject_kind,
+                    &reservation.subject_id,
+                )
+            })
+            .map(reservation_fact)
+            .collect::<Vec<_>>();
+        let attention_items = attention
+            .iter()
+            .filter(|item| item.get("subjectId").and_then(Value::as_str) == Some(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let delivery = entry.get("delivery").cloned().unwrap_or(Value::Null);
+        let execution = json!({
+            "source": "ledger",
+            "liveSeats": entry.get("liveSeats").cloned().unwrap_or(json!(0)),
+            "currentStage": entry.get("currentStage").cloned().unwrap_or(Value::Null),
+            "currentSeat": entry.get("currentSeat").cloned().unwrap_or(Value::Null),
+            "currentAgent": entry.get("currentAgent").cloned().unwrap_or(Value::Null),
+        });
+        let object = entry
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("operator entry is not an object"))?;
+        object.insert("desired".to_owned(), desired);
+        object.insert(
+            "admission".to_owned(),
+            json!({
+                "source": "ledger",
+                "decisions": decisions,
+                "reservations": reservations,
+            }),
+        );
+        object.insert(
+            "attentionItems".to_owned(),
+            json!({"source": "ledger", "items": attention_items}),
+        );
+        object.insert("execution".to_owned(), execution);
+        object.insert(
+            "deliveryFact".to_owned(),
+            json!({"source": "ledger", "value": delivery}),
+        );
+    }
+    Ok(())
+}
+
+/// `operations overview` — the bounded, read-only operator surface.
+///
+/// One ledger snapshot supplies every durable fact. Beads contributes one
+/// bounded N+1 discovery and one exact-id hydrate; an outage retains durable
+/// rows and is reported as degraded instead of widening scope or inventing
+/// plan truth. Unlike the compatibility queue this hot path never performs a
+/// controller-file or OS liveness probe per row.
+pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("operations_overview", req, || async {
+        let repository = repository_selector(req, "operations_overview")?;
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Failure::invalid("operations_overview limit must be an unsigned integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(OPERATIONS_DEFAULT_LIMIT);
+        if !(1..=OPERATIONS_MAX_LIMIT).contains(&limit) {
+            return Err(Failure::invalid(format!(
+                "operations_overview limit must be between 1 and {OPERATIONS_MAX_LIMIT}"
+            )));
+        }
+        let group_filter = operations_filter(req, "group")?;
+        if group_filter
+            .as_deref()
+            .is_some_and(|value| !QUEUE_GROUPS.iter().filter_map(|label| queue_code(label)).any(|code| code == value))
+        {
+            return Err(Failure::invalid(format!(
+                "unknown operations_overview group {:?}",
+                group_filter.as_deref().unwrap_or_default()
+            )));
+        }
+        let source_filter = operations_filter(req, "source")?;
+        if source_filter
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "durable" | "live-plan"))
+        {
+            return Err(Failure::invalid(format!(
+                "unknown operations_overview source {:?}",
+                source_filter.as_deref().unwrap_or_default()
+            )));
+        }
+
+        let kinds: Vec<&str> = LIFECYCLE_KINDS
+            .iter()
+            .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
+            .copied()
+            .collect();
+        let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+        })
+        .await?;
+        let ledger_captured_at = now_iso();
+        let mut entries = project_entries(&snapshot, Spend::Include)?;
+        if let Some(repository) = repository.as_deref() {
+            entries.retain(|entry| {
+                entry
+                    .pointer("/identity/repository/path")
+                    .and_then(Value::as_str)
+                    == Some(repository)
+            });
+        }
+        for entry in &mut entries {
+            if let Some(object) = entry.as_object_mut() {
+                let (kind, kind_name) = if object.get("kind").and_then(Value::as_str) == Some("epic") {
+                    (WorkRefKind::Epic, "epic")
+                } else {
+                    (WorkRefKind::Run, "run")
+                };
+                let id = object
+                    .get("id")
+                    .and_then(Value::as_str)
+                    .ok_or_else(|| Failure::internal("durable operator row has no id"))?
+                    .to_owned();
+                object.insert("source".to_owned(), json!("durable"));
+                object.insert("workRef".to_owned(), work_ref(kind, &id)?);
+                object.insert(
+                    "detailTarget".to_owned(),
+                    json!({"subjectKind": kind_name, "subjectId": id}),
+                );
+            }
+        }
+
+        let plan_read = forged_beads::plan_inventory(
+            &ctx.config.bd_config(),
+            repository.as_deref(),
+            LIVE_PLAN_LIMIT,
+        )
+        .await;
+        let beads_captured_at = now_iso();
+        let (plans, plan_truncated, plan_discovered, bead_error) = match plan_read {
+            Ok(inventory) => (
+                inventory.issues,
+                inventory.truncated,
+                inventory.discovered,
+                None,
+            ),
+            Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
+        };
+        let bead_summaries: Vec<forged_beads::IssueSummary> =
+            plans.iter().map(|plan| plan.issue.clone()).collect();
+        let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
+            .into_iter()
+            .map(|item| {
+                serde_json::to_value(item).map_err(|error| {
+                    Failure::internal(format!("serializing attention item: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+
+        let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
+            .iter()
+            .map(|plan| (plan.issue.id.as_str(), plan))
+            .collect();
+        let represented: BTreeSet<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        for entry in &mut entries {
+            let bead_id = entry
+                .get("beadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("priority".to_owned(), json!(plan.issue.priority));
+                    object.insert(
+                        "plan".to_owned(),
+                        json!({
+                            "source": "beads",
+                            "status": plan.issue.status,
+                            "readiness": plan_readiness(plan),
+                            "priority": plan.issue.priority,
+                            "assignee": plan.issue.assignee,
+                            "issueType": plan.issue.issue_type,
+                            "revision": plan.issue.revision,
+                            "parent": plan.parent,
+                            "dependencies": plan.dependencies,
+                        }),
+                    );
+                }
+            }
+        }
+        for plan in &plans {
+            if !represented.contains(&plan.issue.id) {
+                entries.push(live_plan_entry(plan, &beads_captured_at)?);
+            }
+        }
+
+        enrich_operations_facts(&snapshot, &attention, &mut entries)?;
+
+        let bead_read = match bead_error.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(bead_summaries),
+        };
+        let mut queue = operator_queue(
+            ctx,
+            &snapshot,
+            &mut entries,
+            &attention,
+            bead_read,
+            QueueLiveness::Durable,
+        )
+        .await;
+        let mut remaining = limit as usize;
+        let mut shown_total = 0usize;
+        let mut matching_total = 0usize;
+        let mut groups = Vec::new();
+        for group in queue
+            .get_mut("groups")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let label = group.get("name").and_then(Value::as_str).unwrap_or_default();
+            let Some(code) = queue_code(label) else {
+                continue;
+            };
+            if group_filter.as_deref().is_some_and(|filter| filter != code) {
+                continue;
+            }
+            let mut rows = group
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(source) = source_filter.as_deref() {
+                rows.retain(|entry| entry.get("source").and_then(Value::as_str) == Some(source));
+            }
+            rows.sort_by(|left, right| {
+                let lp = left.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX);
+                let rp = right.get("priority").and_then(Value::as_i64).unwrap_or(i64::MAX);
+                lp.cmp(&rp)
+                    .then_with(|| {
+                        right
+                            .get("updatedAt")
+                            .and_then(Value::as_str)
+                            .cmp(&left.get("updatedAt").and_then(Value::as_str))
+                    })
+                    .then_with(|| left.get("id").and_then(Value::as_str).cmp(&right.get("id").and_then(Value::as_str)))
+            });
+            let total = rows.len();
+            matching_total += total;
+            let shown: Vec<Value> = rows.into_iter().take(remaining).collect();
+            remaining = remaining.saturating_sub(shown.len());
+            shown_total += shown.len();
+            groups.push(json!({
+                "code": code,
+                "label": label,
+                "total": total,
+                "shown": shown.len(),
+                "entries": shown,
+            }));
+        }
+        let total = entries.len();
+        let cost_usd_known: f64 = entries
+            .iter()
+            .filter_map(|entry| entry.get("costUsdKnown").and_then(Value::as_f64))
+            .sum();
+        let rows_missing_cost: u64 = entries
+            .iter()
+            .filter_map(|entry| entry.get("rowsMissingCost").and_then(Value::as_u64))
+            .sum();
+        let live = entries
+            .iter()
+            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
+            .count();
+        let admitted = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .pointer("/admission/decisions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|decision| {
+                            decision.get("outcome").and_then(Value::as_str) == Some("admitted")
+                        })
+                    })
+                    || entry
+                        .pointer("/admission/reservations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|reservations| !reservations.is_empty())
+            })
+            .count();
+        let queued = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .pointer("/admission/decisions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|decision| {
+                            decision.get("outcome").and_then(Value::as_str) == Some("deferred")
+                        })
+                    })
+            })
+            .count();
+        let review_ready = entries
+            .iter()
+            .filter(|entry| entry.get("queueGroup").and_then(Value::as_str) == Some("Ready to merge"))
+            .count();
+        let recent = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("source").and_then(Value::as_str) == Some("durable")
+                    && (entry.get("state").and_then(Value::as_str) == Some("stopped")
+                        || entry.get("outcome").is_some_and(|value| !value.is_null()))
+            })
+            .count();
+        Ok(json!({
+            "schema": "forged.operations-overview/1",
+            "scope": {"repository": repository},
+            "capturedAt": {
+                "ledger": ledger_captured_at,
+                "beads": beads_captured_at,
+            },
+            "sourceHealth": {
+                "ledger": {"state": "available"},
+                "beads": {
+                    "state": if bead_error.is_some() { "unavailable" } else { "available" },
+                    "error": bead_error,
+                },
+                "plan": {
+                    "state": if bead_error.is_some() { "unavailable" } else if plan_truncated { "partial" } else { "available" },
+                    "discovered": plan_discovered,
+                    "limit": LIVE_PLAN_LIMIT,
+                    "truncated": plan_truncated,
+                },
+            },
+            "coverage": {
+                "available": total,
+                "matching": matching_total,
+                "shown": shown_total,
+                "limit": limit,
+                "filteredOut": total.saturating_sub(matching_total),
+                "truncated": shown_total < matching_total || plan_truncated,
+            },
+            "counts": {
+                "live": live,
+                "admitted": admitted,
+                "queued": queued,
+                "reviewReady": review_ready,
+                "recent": recent,
+                "attention": attention.len(),
+                "planOnly": entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("source").and_then(Value::as_str) == Some("live-plan")
+                    })
+                    .count(),
+            },
+            "queue": {"groups": groups, "total": matching_total},
+            "attention": attention,
+            "admission": snapshot.admission_decisions,
+            "spend": {
+                "costUsdKnown": cost_usd_known,
+                "rowsMissingCost": rows_missing_cost,
+                "complete": rows_missing_cost == 0,
+            },
         }))
     })
     .await

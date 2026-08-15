@@ -1,0 +1,229 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forged Operations</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--color-background-primary, light-dark(#fbfbfa, #141519));
+  --panel: var(--color-background-secondary, light-dark(#f4f4f1, #1b1d22));
+  --ink: var(--color-text-primary, light-dark(#17191e, #eceef1));
+  --muted: var(--color-text-secondary, light-dark(#626773, #a3a8b2));
+  --line: var(--color-border-primary, light-dark(#deddd7, #30333a));
+  --good: var(--color-text-success, light-dark(#287a43, #6bc27e));
+  --warn: var(--color-text-warning, light-dark(#8b6313, #ddb04d));
+  --bad: var(--color-text-danger, light-dark(#b43c31, #e87b70));
+  --accent: light-dark(#167b72, #42c9b7);
+  --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+* { box-sizing: border-box; min-width: 0; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 var(--sans); }
+button, select { font: inherit; color: inherit; }
+button { cursor: pointer; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button:hover:not(:disabled) { background: var(--panel); }
+button:disabled { cursor: default; opacity: .55; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#app { padding: 16px; display: grid; gap: 14px; }
+.top { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; flex-wrap: wrap; }
+h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
+.sub, .muted { color: var(--muted); }
+.sub { margin-top: 4px; font-family: var(--mono); font-size: 11px; }
+.controls { display: flex; gap: 6px; align-items: center; }
+.health { display: flex; gap: 6px; flex-wrap: wrap; }
+.pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font-size: 11px; }
+.pill--ok { color: var(--good); }.pill--warn { color: var(--warn); }.pill--bad { color: var(--bad); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit,minmax(120px,1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.stat { padding: 11px 12px; border-left: 1px solid var(--line); }
+.stat:first-child { border-left: 0; }
+.stat b { display: block; font: 600 18px/1.2 var(--mono); }
+.stat span { color: var(--muted); font-size: 11px; }
+.rail { display: grid; gap: 6px; }
+.attention { border-left: 3px solid var(--bad); background: var(--panel); padding: 8px 10px; border-radius: 4px; }
+.attention b { font-family: var(--mono); font-size: 11px; }
+.attention span { margin-left: 8px; color: var(--muted); }
+.groups { display: grid; gap: 12px; }
+.group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.group__head { padding: 9px 11px; background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
+.group__head b { font-size: 12px; }.group__head span { color: var(--muted); font-family: var(--mono); font-size: 11px; }
+.rows { display: grid; }
+.row { appearance: none; width: 100%; border: 0; border-radius: 0; border-top: 1px solid var(--line); padding: 10px 11px; text-align: left; display: grid; grid-template-columns: minmax(105px,.65fr) minmax(180px,1.5fr) minmax(90px,.6fr) minmax(100px,.7fr); gap: 10px; align-items: baseline; }
+.row:first-child { border-top: 0; }
+.row:hover:not(:disabled) { background: var(--panel); }
+.id { font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
+.title { font-weight: 500; }.meta { color: var(--muted); font-size: 11px; }
+.source { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+.empty, .error { border: 1px dashed var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }
+.error { color: var(--bad); border-color: currentColor; }
+.drawer { border: 1px solid var(--line); border-radius: 9px; padding: 12px; display: grid; gap: 10px; }
+.drawer[hidden] { display: none; }
+.drawer__head { display: flex; justify-content: space-between; gap: 10px; align-items: flex-start; }
+.drawer h2 { margin: 0; font: 600 15px/1.3 var(--mono); }
+.kv { display: grid; grid-template-columns: 105px 1fr; gap: 5px 10px; margin: 0; }
+.kv dt { color: var(--muted); }.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.foot { color: var(--muted); font: 10px/1.4 var(--mono); display: flex; gap: 12px; flex-wrap: wrap; }
+@media(max-width:620px) { .row { grid-template-columns: 1fr; gap: 3px; }.stat { border-top: 1px solid var(--line); border-left: 0; }.stats { grid-template-columns: 1fr 1fr; } }
+</style>
+</head>
+<body>
+<main id="app">
+  <header class="top">
+    <div><h1>Operations</h1><div class="sub" id="scope">Waiting for projection</div></div>
+    <div class="controls"><button type="button" id="refresh">Refresh</button></div>
+  </header>
+  <div class="health" id="health"></div>
+  <section class="stats" id="stats"></section>
+  <section class="rail" id="attention"></section>
+  <section class="groups" id="groups"><div class="empty">Waiting for work.</div></section>
+  <aside class="drawer" id="drawer" hidden></aside>
+  <footer class="foot" id="foot"></footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const PROTOCOL_VERSION = "2026-01-26";
+  const APP_INFO = { name: "forged-operations-overview", version: "1.0.0" };
+  const post = message => window.parent.postMessage(message, "*");
+  const notify = (method, params = {}) => post({ jsonrpc: "2.0", method, params });
+  let rpcId = 0;
+  const pending = new Map();
+  function request(method, params = {}) {
+    const id = `forged-operations-${++rpcId}`;
+    return new Promise((resolve, reject) => {
+      pending.set(id, { resolve, reject });
+      post({ jsonrpc: "2.0", id, method, params });
+      setTimeout(() => { if (pending.delete(id)) reject(new Error(`${method} timed out`)); }, 120000);
+    });
+  }
+  const host = { connected: false, capabilities: {}, context: {} };
+  const state = { data: null, error: null, args: null, loading: false, detail: null, detailError: null };
+  const byId = id => document.getElementById(id);
+  const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; };
+  const arr = value => Array.isArray(value) ? value : [];
+  const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const fmt = value => Math.round(num(value)).toLocaleString();
+
+  function envelopeFrom(params) {
+    let value = params?.structuredContent;
+    if (!value) {
+      const text = arr(params?.content).find(block => block.type === "text")?.text;
+      try { value = JSON.parse(text); } catch { value = null; }
+    }
+    return value;
+  }
+  function ingest(params) {
+    const envelope = envelopeFrom(params);
+    if (envelope?.ok === false) { state.error = envelope.error || { message: "Operation failed" }; state.data = null; render(); return; }
+    const data = envelope?.result ?? envelope;
+    if (!data || data.schema !== "forged.operations-overview/1") {
+      state.error = { message: "The host returned an unsupported Operations payload." }; state.data = null; render(); return;
+    }
+    state.error = null; state.data = data; render();
+  }
+  function healthPill(name, source) {
+    const status = source?.state || "unknown";
+    const cls = status === "available" ? "pill pill--ok" : status === "partial" ? "pill pill--warn" : "pill pill--bad";
+    return el("span", cls, `${name} ${status}`);
+  }
+  function titleFor(entry) { return entry?.identity?.displayTitle || entry?.beadId || "Untitled work"; }
+  function stateFor(detail) { return detail?.status?.state || detail?.status?.status || detail?.state || "unknown"; }
+  function renderDetail() {
+    const box = byId("drawer"); box.replaceChildren();
+    if (!state.detail && !state.detailError) { box.hidden = true; return; }
+    box.hidden = false;
+    const head = el("div", "drawer__head");
+    head.append(el("h2", "", state.detail ? `${state.detail.workRef?.kind || state.detail.kind} · ${state.detail.id}` : "Detail unavailable"));
+    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; renderDetail(); }); head.append(close); box.append(head);
+    if (state.detailError) { box.append(el("div", "error", state.detailError.message || String(state.detailError))); return; }
+    const dl = el("dl", "kv");
+    const add = (key, value) => { dl.append(el("dt", "", key)); dl.append(el("dd", "", value == null ? "—" : value)); };
+    add("state", stateFor(state.detail));
+    add("repository", state.detail.identity?.repository?.path);
+    add("workers", arr(state.detail.workers?.sessions).length);
+    add("findings", arr(state.detail.reviews?.latestFindings).length);
+    add("known spend", `$${num(state.detail.usage?.totals?.costUsdKnown).toFixed(2)}`);
+    box.append(dl);
+  }
+  async function openDetail(entry) {
+    if (!host.capabilities.serverTools || !entry?.detailTarget) return;
+    state.detail = null; state.detailError = null; renderDetail();
+    try {
+      const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
+      const envelope = envelopeFrom(result);
+      if (envelope?.ok === false) throw new Error(envelope.error?.message || "Detail failed");
+      const detail = envelope?.result ?? envelope;
+      if (!detail || detail.schema !== "forged.work-detail/1") throw new Error("Unsupported Work Detail payload");
+      state.detail = detail;
+    } catch (error) { state.detailError = { message: String(error.message || error) }; }
+    renderDetail(); reportSize();
+  }
+  function render() {
+    byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
+    byId("refresh").disabled = state.loading || !host.capabilities.serverTools;
+    if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
+    const data = state.data;
+    if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
+    byId("scope").textContent = data.scope?.repository || "All repositories";
+    const health = byId("health"); health.append(healthPill("ledger", data.sourceHealth?.ledger)); health.append(healthPill("beads", data.sourceHealth?.beads)); health.append(healthPill("plan", data.sourceHealth?.plan));
+    const stats = byId("stats");
+    for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[`$${num(data.spend?.costUsdKnown).toFixed(2)}`,"known spend"]]) {
+      const cell = el("div", "stat"); cell.append(el("b", "", typeof value === "string" ? value : fmt(value))); cell.append(el("span", "", label)); stats.append(cell);
+    }
+    const rail = byId("attention");
+    for (const item of arr(data.attention).slice(0, 8)) { const row = el("div", "attention"); row.append(el("b", "", item.condition || "attention")); row.append(el("span", "", `${item.subjectId || item.id || ""} · ${item.detail || item.recommendedAction?.text || "Needs attention"}`)); rail.append(row); }
+    const groups = byId("groups");
+    const canDetail = !!host.capabilities.serverTools;
+    for (const group of arr(data.queue?.groups)) {
+      const section = el("section", "group"); const head = el("div", "group__head"); head.append(el("b", "", group.label || group.code)); head.append(el("span", "", `${fmt(group.shown)} / ${fmt(group.total)}`)); section.append(head);
+      const rows = el("div", "rows");
+      if (!arr(group.entries).length) rows.append(el("div", "empty", "None"));
+      for (const entry of arr(group.entries)) {
+        const row = el("button", "row"); row.type = "button"; row.disabled = !canDetail || !entry.detailTarget; row.title = row.disabled ? "Plan-only work has no durable detail yet" : "Open exact work detail";
+        row.append(el("span", "id", entry.id)); row.append(el("span", "title", titleFor(entry))); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
+        if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
+      }
+      section.append(rows); groups.append(section);
+    }
+    if (!arr(data.queue?.groups).length) groups.append(el("div", "empty", "No work matches this bounded view."));
+    byId("foot").append(el("span", "", data.schema));
+    byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
+    if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
+    if (state.loading) byId("foot").append(el("span", "", "refreshing"));
+    renderDetail(); reportSize();
+  }
+  async function refresh() {
+    if (!host.connected || !host.capabilities.serverTools || state.loading) return;
+    state.loading = true; render();
+    try { ingest(await request("tools/call", { name: "operations_overview", arguments: state.args || { schemaVersion: 1, params: {} } })); }
+    catch (error) { state.error = { message: String(error.message || error) }; }
+    finally { state.loading = false; render(); }
+  }
+  byId("refresh").addEventListener("click", refresh);
+  function applyContext(context = {}) {
+    host.context = { ...host.context, ...context };
+    if (context.theme) document.documentElement.style.colorScheme = context.theme;
+    for (const [key, value] of Object.entries(context.styles?.variables || {})) document.documentElement.style.setProperty(key, value);
+  }
+  let lastSize = "";
+  function reportSize() {
+    requestAnimationFrame(() => { const size = `${window.innerWidth}:${document.documentElement.scrollHeight}`; if (size === lastSize) return; lastSize = size; notify("ui/notifications/size-changed", { width: Math.ceil(window.innerWidth), height: Math.ceil(document.documentElement.scrollHeight) }); });
+  }
+  window.addEventListener("message", event => {
+    const message = event.data; if (!message || message.jsonrpc !== "2.0") return;
+    if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
+    if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
+    else if (message.method === "ui/notifications/tool-result") ingest(message.params);
+    else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
+    else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
+    else if (message.method === "ui/resource-teardown" && message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} });
+  });
+  request("ui/initialize", { protocolVersion: PROTOCOL_VERSION, appInfo: APP_INFO, appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } }).then(result => {
+    host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); new ResizeObserver(reportSize).observe(document.body);
+  }).catch(() => { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); });
+  render();
+})();
+</script>
+</body>
+</html>

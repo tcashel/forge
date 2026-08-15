@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Thirty-seven tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -28,22 +28,32 @@ use forged_types::OperationRequest;
 use crate::core::{dispatch, Ctx};
 
 const OVERVIEW_URI: &str = "ui://forged/overview.html";
+const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
+const WORK_DETAIL_URI: &str = "ui://forged/work-detail.html";
 const APP_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_HTML: &str = include_str!("../assets/overview.html");
+const OPERATIONS_OVERVIEW_HTML: &str = include_str!("../assets/operations-overview.html");
+const WORK_DETAIL_HTML: &str = include_str!("../assets/work-detail.html");
 
-fn overview_tool_meta() -> MetaObject {
+fn app_tool_meta(uri: &str) -> MetaObject {
     let mut meta = MetaObject::new();
-    meta.insert(
-        "ui".to_owned(),
-        serde_json::json!({"resourceUri": OVERVIEW_URI}),
-    );
+    meta.insert("ui".to_owned(), serde_json::json!({"resourceUri": uri}));
     // Pre-standard hosts used this flat spelling. Keeping both is harmless
     // and lets the same binary progressively enhance older Apps clients.
-    meta.insert(
-        "ui/resourceUri".to_owned(),
-        Value::String(OVERVIEW_URI.to_owned()),
-    );
+    meta.insert("ui/resourceUri".to_owned(), Value::String(uri.to_owned()));
     meta
+}
+
+fn overview_tool_meta() -> MetaObject {
+    app_tool_meta(OVERVIEW_URI)
+}
+
+fn operations_overview_tool_meta() -> MetaObject {
+    app_tool_meta(OPERATIONS_OVERVIEW_URI)
+}
+
+fn work_detail_tool_meta() -> MetaObject {
+    app_tool_meta(WORK_DETAIL_URI)
 }
 
 /// The operation envelope as a tool input — one envelope type on every
@@ -323,6 +333,141 @@ impl WorkHistoryArgs {
     }
 }
 
+/// Typed envelope for the bounded Operations App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationsOverviewArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:operations_overview:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Operations projection parameters.
+    #[serde(default)]
+    pub params: OperationsOverviewParams,
+}
+
+/// Filters accepted by `operations_overview`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationsOverviewParams {
+    /// Exact durable repository identity.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+    /// Queue group code: needs-me, ready-to-merge, running,
+    /// stalled-or-recoverable, or planned.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group: Option<String>,
+    /// Source code: durable or live-plan.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source: Option<String>,
+    /// Maximum rows across all groups, 1..=500 (default 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl OperationsOverviewArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Closed durable subject kind accepted by `work_detail`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkDetailKind {
+    /// One slice run.
+    Run,
+    /// One epic.
+    Epic,
+}
+
+/// Typed envelope for the exact Work Detail App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkDetailArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_detail:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Exact detail target and event page.
+    pub params: WorkDetailParams,
+}
+
+/// Required exact target for `work_detail`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkDetailParams {
+    /// Durable subject kind.
+    pub subject_kind: WorkDetailKind,
+    /// Canonical run or epic id.
+    #[serde(deserialize_with = "named_string")]
+    pub subject_id: String,
+    /// Return event rows after this event id (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    /// Maximum event rows, 1..=1000 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+fn named_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: rmcp::serde::Deserializer<'de>,
+{
+    use rmcp::serde::Deserialize as _;
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(rmcp::serde::de::Error::custom("must name a subject"));
+    }
+    Ok(value)
+}
+
+impl WorkDetailArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let run_id = Some(self.params.subject_id.clone());
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id,
+            params,
+        }
+    }
+}
+
 /// The forged MCP server: a thin adapter over the shared core.
 #[derive(Clone)]
 pub struct ForgedServer {
@@ -506,6 +651,20 @@ impl ForgedServer {
             .await
     }
 
+    /// Bounded operator queue and live-plan projection.
+    #[tool(
+        name = "operations_overview",
+        description = "Project bounded planned, queued, active, blocked, and mergeable work. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input.",
+        meta = operations_overview_tool_meta()
+    )]
+    pub async fn operations_overview(
+        &self,
+        args: Parameters<OperationsOverviewArgs>,
+    ) -> CallToolResult {
+        self.call_structured("operations_overview", args.0.into_envelope())
+            .await
+    }
+
     /// Claim one packet.
     #[tool(name = "packet_claim", description = "Claim a packet for execution.")]
     pub async fn packet_claim(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -636,6 +795,17 @@ impl ForgedServer {
         self.call("work_history", args.0.into_envelope()).await
     }
 
+    /// Exact durable subject projection for the Work Detail App.
+    #[tool(
+        name = "work_detail",
+        description = "Project one exact durable run or epic. params.subjectKind and params.subjectId are required; params.after and params.limit page its event tail.",
+        meta = work_detail_tool_meta()
+    )]
+    pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {
+        self.call_structured("work_detail", args.0.into_envelope())
+            .await
+    }
+
     /// Record custody of an exact active attention occurrence.
     #[tool(
         name = "attention_acknowledge",
@@ -694,13 +864,20 @@ impl ServerHandler for ForgedServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
-            OVERVIEW_URI,
-            "forged-overview",
-        )
-        .with_title("Forged Control Plane")
-        .with_description("View-only projection of Forged slice and epic execution.")
-        .with_mime_type(APP_MIME)]))
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(OVERVIEW_URI, "forged-overview")
+                .with_title("Forged Control Plane")
+                .with_description("Compatibility view of Forged slice and epic execution.")
+                .with_mime_type(APP_MIME),
+            Resource::new(OPERATIONS_OVERVIEW_URI, "forged-operations-overview")
+                .with_title("Forged Operations")
+                .with_description("Bounded planned, queued, active, blocked, and mergeable work.")
+                .with_mime_type(APP_MIME),
+            Resource::new(WORK_DETAIL_URI, "forged-work-detail")
+                .with_title("Forged Work Detail")
+                .with_description("Exact read-only projection of one Forged run or epic.")
+                .with_mime_type(APP_MIME),
+        ]))
     }
 
     async fn read_resource(
@@ -708,14 +885,19 @@ impl ServerHandler for ForgedServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if request.uri != OVERVIEW_URI {
-            return Err(ErrorData::resource_not_found(
-                format!("unknown forged resource {:?}", request.uri),
-                None,
-            ));
-        }
+        let html = match request.uri.as_str() {
+            OVERVIEW_URI => OVERVIEW_HTML,
+            OPERATIONS_OVERVIEW_URI => OPERATIONS_OVERVIEW_HTML,
+            WORK_DETAIL_URI => WORK_DETAIL_HTML,
+            _ => {
+                return Err(ErrorData::resource_not_found(
+                    format!("unknown forged resource {:?}", request.uri),
+                    None,
+                ))
+            }
+        };
         Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(OVERVIEW_HTML, OVERVIEW_URI).with_mime_type(APP_MIME)
+            ResourceContents::text(html, request.uri).with_mime_type(APP_MIME)
         ])
         .into())
     }

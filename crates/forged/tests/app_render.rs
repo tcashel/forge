@@ -10,6 +10,8 @@
 
 mod support;
 
+use std::process::Command;
+
 use serde_json::{json, Value};
 use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
@@ -633,4 +635,61 @@ fn a_host_without_server_tools_gets_candidates_it_cannot_click() {
         "and says why they cannot be opened: {}",
         limited.text
     );
+}
+
+#[test]
+fn split_apps_are_dependency_free_safe_and_javascript_valid() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let operations = root.join("operations-overview.html");
+    let detail = root.join("work-detail.html");
+
+    for (path, schema, tool) in [
+        (
+            &operations,
+            "forged.operations-overview/1",
+            "operations_overview",
+        ),
+        (&detail, "forged.work-detail/1", "work_detail"),
+    ] {
+        let html = std::fs::read_to_string(path).expect("read split App");
+        for required in [
+            schema,
+            tool,
+            "ui/initialize",
+            "ui/notifications/tool-result",
+            "ui/notifications/size-changed",
+            "hostCapabilities",
+        ] {
+            assert!(
+                html.contains(required),
+                "{} contains its {required} contract",
+                path.display()
+            );
+        }
+        assert!(
+            !html.contains("innerHTML"),
+            "{} never renders tool data as HTML",
+            path.display()
+        );
+
+        let output = Command::new(&node)
+            .args([
+                "-e",
+                "const fs=require('fs');const h=fs.readFileSync(process.argv[1],'utf8');const m=h.match(/<script>([\\s\\S]*?)<\\/script>/);if(!m)throw Error('missing script');new Function(m[1]);",
+            ])
+            .arg(path)
+            .output()
+            .expect("parse App JavaScript");
+        assert!(
+            output.status.success(),
+            "{} JavaScript parses: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let html = std::fs::read_to_string(operations).expect("read Operations App");
+    assert!(html.contains("entry.detailTarget"));
+    assert!(html.contains("host.capabilities.serverTools"));
 }

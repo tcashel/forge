@@ -14,6 +14,7 @@ pub mod ids;
 pub mod packet;
 pub mod work_history;
 pub mod work_identity;
+pub mod work_ref;
 
 pub use admission::{
     AdmissionCandidateV1, AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1,
@@ -63,3 +64,4 @@ pub use work_identity::{
     WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
     WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError, WORK_IDENTITY_SCHEMA_V1,
 };
+pub use work_ref::{WorkRefKind, WorkRefV1, WorkRefValidationError, WORK_REF_SCHEMA_V1};
