@@ -7,6 +7,8 @@ import { readFileSync } from "node:fs";
 
 const asset = process.argv[2];
 if (!asset) throw new Error("usage: split_app_host.mjs <split-app.html>");
+const scenarioMode = process.argv[3] === "--scenario";
+const scenario = scenarioMode ? JSON.parse(readFileSync(0, "utf8")) : null;
 const interactive = process.argv[3] === "--interactive";
 const operations = asset.endsWith("operations-overview.html");
 const workMap = asset.endsWith("work-map.html");
@@ -28,12 +30,32 @@ function element(tag) {
     hidden: false,
     disabled: false,
     kids: [],
+    get firstChild() { return node.kids[0]; },
+    classList: {
+      add(...names) {
+        const current = new Set(node.className.split(/\s+/).filter(Boolean));
+        for (const name of names) current.add(name);
+        node.className = [...current].join(" ");
+      },
+      toggle(name) {
+        const current = new Set(node.className.split(/\s+/).filter(Boolean));
+        const enabled = !current.has(name);
+        if (enabled) current.add(name); else current.delete(name);
+        node.className = [...current].join(" ");
+        return enabled;
+      },
+    },
     style: {
       values: {},
       setProperty(key, value) { this.values[key] = value; },
     },
     append(...kids) { node.kids.push(...kids); },
     replaceChildren(...kids) { node.kids = [...kids]; },
+    querySelector() { return null; },
+    querySelectorAll() { return []; },
+    getBoundingClientRect() { return { width: 720, height: node.scrollHeight || 480 }; },
+    focus() {},
+    remove() {},
     setAttribute(name, value) { node.attributes[name] = String(value); },
     addEventListener(type, listener) {
       if (!listeners.has(type)) listeners.set(type, new Set());
@@ -55,15 +77,23 @@ function element(tag) {
 const registry = new Map();
 const documentElement = element("html");
 documentElement.scrollHeight = 480;
+const documentListeners = new Map();
 const document = {
   documentElement,
   body: element("body"),
+  head: element("head"),
+  visibilityState: "visible",
   createElement: element,
   createTextNode(text) { const node = element("#text"); node.textContent = String(text); return node; },
   getElementById(id) {
     if (!registry.has(id)) registry.set(id, element(id === "refresh" ? "button" : "div"));
     return registry.get(id);
   },
+  addEventListener(type, listener) {
+    if (!documentListeners.has(type)) documentListeners.set(type, new Set());
+    documentListeners.get(type).add(listener);
+  },
+  removeEventListener(type, listener) { documentListeners.get(type)?.delete(listener); },
 };
 
 const posted = [];
@@ -105,6 +135,7 @@ class ResizeObserverShim {
 Object.assign(globalThis, {
   document,
   window,
+  Node: Object,
   ResizeObserver: ResizeObserverShim,
   setTimeout: setTimeoutShim,
   clearTimeout: clearTimeoutShim,
@@ -121,8 +152,8 @@ dispatch({
   result: {
     // The default lifecycle pass deliberately omits serverTools. A separate
     // interactive Agent Sessions pass opts in explicitly.
-    hostCapabilities: { updateModelContext: true, ...(interactive ? { serverTools: true } : {}) },
-    hostContext: { theme: "dark", styles: { variables: { "--host-accent": "violet" } } },
+    hostCapabilities: scenario?.hostCapabilities || { updateModelContext: true, ...(interactive ? { serverTools: true } : {}) },
+    hostContext: scenario?.hostContext || { theme: "dark", styles: { variables: { "--host-accent": "violet" } } },
   },
 });
 await Promise.resolve();
@@ -217,17 +248,50 @@ const payload = operations
       events: { events: [] },
       usage: { totals: { costUsdKnown: 0 } },
     };
-if (agentSessions) {
+if (scenario?.toolInput) {
+  dispatch({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-input",
+    params: { arguments: scenario.toolInput },
+  });
+} else if (agentSessions) {
   dispatch({
     jsonrpc: "2.0",
     method: "ui/notifications/tool-input",
     params: { arguments: { schemaVersion: 1, params: { repository: "/repo", provider: "codex", limit: 25 } } },
   });
 }
-dispatch({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: { structuredContent: { ok: true, result: payload } } });
+function resultParams(result, transport) {
+  if (!result) return { structuredContent: { ok: true, result: payload } };
+  if (transport === "text") return { content: result.content || [], isError: !!result.isError };
+  return result;
+}
+dispatch({
+  jsonrpc: "2.0",
+  method: "ui/notifications/tool-result",
+  params: resultParams(scenario?.toolResult, scenario?.transport),
+});
 await Promise.resolve();
 documentElement.scrollHeight = 640;
 flushFrames();
+
+for (const action of scenario?.actions || []) {
+  if (action.type === "tool-result") {
+    dispatch({
+      jsonrpc: "2.0",
+      method: "ui/notifications/tool-result",
+      params: resultParams(action.toolResult, action.transport),
+    });
+  } else if (action.type === "tool-cancelled") {
+    dispatch({ jsonrpc: "2.0", method: "ui/notifications/tool-cancelled", params: action.params || {} });
+  } else if (action.type === "host-context") {
+    dispatch({ jsonrpc: "2.0", method: "ui/notifications/host-context-changed", params: action.params || {} });
+  } else {
+    throw new Error(`unknown scenario action ${JSON.stringify(action)}`);
+  }
+  await Promise.resolve();
+  flushFrames();
+}
 
 dispatch({
   jsonrpc: "2.0",
@@ -296,6 +360,14 @@ if (interactive) {
   });
 }
 
+const allowedTools = new Set(scenario?.allowedTools || []);
+for (const call of posted.filter((message) => message.method === "tools/call")) {
+  const name = call?.params?.name;
+  if (!allowedTools.has(name) && !interactive) {
+    throw new Error(`unexpected tools/call ${JSON.stringify(call.params)}`);
+  }
+}
+
 // Leave one frame and the update-model-context request pending so teardown
 // must cancel real scheduled work, not merely pass with empty collections.
 resizeObserver.callback();
@@ -327,6 +399,7 @@ process.stdout.write(JSON.stringify({
   operations,
   workMap,
   agentSessions,
+  scenarioMode,
   rows,
   mapNodes,
   sessionRows,

@@ -1778,6 +1778,41 @@ pub fn run_split_app_host(node: &str, asset: &Path) -> Value {
     serde_json::from_slice(&out.stdout).expect("the split App harness prints one JSON object")
 }
 
+/// Execute one split App against an exact captured MCP tool result and an
+/// explicit host scenario. The scenario crosses stdin so large structured
+/// envelopes are never re-encoded as shell arguments. Each invocation owns a
+/// fresh Node process and therefore a fresh resource context.
+pub fn run_split_app_host_scenario(node: &str, asset: &Path, scenario: &Value) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let mut child = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref(), "--scenario"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the scenario split App host harness");
+    serde_json::to_writer(
+        child.stdin.as_mut().expect("scenario harness stdin"),
+        scenario,
+    )
+    .expect("write split App host scenario");
+    drop(child.stdin.take());
+    let out = child
+        .wait_with_output()
+        .expect("wait for the scenario split App host harness");
+    assert!(
+        out.status.success(),
+        "the scenario split App host harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout)
+        .expect("the scenario split App harness prints one JSON object")
+}
+
 /// Exercise the Agent Sessions App's explicit read-only controls through the
 /// same deterministic host, with `serverTools` deliberately enabled.
 pub fn run_agent_sessions_host(node: &str, asset: &Path) -> Value {
