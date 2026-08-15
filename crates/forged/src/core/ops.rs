@@ -2227,7 +2227,7 @@ const QUEUE_GROUPS: [&str; 5] = [
 /// Beads is queried once for exactly the ids in the ledger. Controller
 /// records and progress events come from the already-open inventory
 /// snapshot, avoiding a ledger projection per row.
-async fn operator_queue(
+fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
@@ -3320,10 +3320,11 @@ fn desired_only_entries(
 /// `operations overview` — the bounded, read-only operator surface.
 ///
 /// One ledger snapshot supplies every durable fact. Beads contributes one
-/// bounded N+1 discovery and one exact-id hydrate; an outage retains durable
-/// rows and is reported as degraded instead of widening scope or inventing
-/// plan truth. Unlike the compatibility queue this hot path never performs a
-/// controller-file or OS liveness probe per row.
+/// exact claim/membership batch alongside one bounded N+1 plan discovery and
+/// one exact-id dependency hydrate. An outage retains unscoped durable rows
+/// and is reported as degraded instead of widening scope or inventing plan
+/// truth. This hot path never performs a controller-file or OS liveness probe
+/// per row.
 pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("operations_overview", req, || async {
         let repository = repository_selector(req, "operations_overview")?;
@@ -3540,7 +3541,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             Some(error) => Err(error.clone()),
             None => Ok(bead_summaries),
         };
-        let mut queue = operator_queue(&snapshot, &mut entries, &attention, bead_read).await;
+        let mut queue = operator_queue(&snapshot, &mut entries, &attention, bead_read);
         let mut remaining = limit as usize;
         let mut shown_total = 0usize;
         let mut matching_total = 0usize;
