@@ -1,16 +1,18 @@
 # forged lead-agent plugin
 
-**Talk to one agent. Keep the specification in Beads. Hand execution off.**
+**Talk to one agent. Keep the specification in Beads. Manage durable work.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
 It gives Claude and Codex the same seven capabilities through one shared skill
 tree: automatic conversational routing, planning, proportional critique,
-adjudication, operator setup, slice dispatch, and epic handoff.
+adjudication, operator setup, slice dispatch, and epic handoff. The shared
+router also projects the bounded operator portfolio and invokes landed,
+target-scoped controls without adding another state store.
 
 ## Ownership
 
-- **Lead agent/plugin:** conversation, planning, critique, adjudication, and
-  explicit submission after operator approval.
+- **Lead agent/plugin:** conversation, planning, critique, adjudication,
+  portfolio presentation, control authorization, and explicit submission.
 - **Beads:** native specification fields, parent/dependency graph, readiness,
   statuses, and leases.
 - **Forged:** immutable execution packages, provider dispatch, attempts, gates,
@@ -54,9 +56,17 @@ codex plugin add forged@forge
 ```
 
 After installation, run `/forged:setup`. Then talk normally: ask the lead agent
-to explore an idea, plan or revise work, critique or adjudicate a Bead, inspect
-status, or prepare one exact ready subject for execution approval. The shared
-`manage-work` skill routes that intent without requiring a command name.
+to explore an idea, plan or revise work, critique or adjudicate a Bead, ask
+what needs attention, explain one run's blocker or spend, reprioritize a Bead,
+or safely pause, resume, or cancel exact existing work. It can also prepare one
+ready subject for explicit execution approval. The shared `manage-work` skill
+routes that intent without requiring a command name or machine id.
+
+Portfolio answers come from headless Operations Overview and exact Work Detail
+projections. Their Apps are optional views over the same data. Every mutation
+uses a canonical id, one bounded authority decision, one typed operation, and
+a durable readback; titles, panes, processes, and visible App state are never
+mutation selectors.
 
 Named skills remain available as explicit power-user and debugging surfaces:
 

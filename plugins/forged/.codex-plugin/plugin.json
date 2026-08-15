@@ -1,7 +1,7 @@
 {
   "name": "forged",
   "version": "0.2.0",
-  "description": "Forge-owned conversational work management over native Beads and typed Forged handoff.",
+  "description": "Forge-owned conversational planning and portfolio control over native Beads and typed Forged operations.",
   "author": {
     "name": "Tripp Cashel"
   },
@@ -12,15 +12,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "forged",
-    "shortDescription": "Manage work conversationally through Beads and Forged",
-    "longDescription": "Use ordinary language to inspect, plan, critique, adjudicate, and explicitly submit native Bead work through one shared plugin and the durable Forged control plane.",
+    "shortDescription": "Plan, inspect, and safely control Beads and Forged work",
+    "longDescription": "Use ordinary language to plan native Bead work, inspect the bounded Forged portfolio, resolve human references, and invoke exact authorized submission or lifecycle controls.",
     "developerName": "Tripp Cashel",
     "category": "Development",
     "capabilities": ["Interactive", "Write"],
     "defaultPrompt": [
       "Help me turn this request into managed work.",
-      "Show me this repository's work without changing anything.",
-      "Prepare this ready Bead for explicit execution approval."
+      "Show me what needs attention in this repository.",
+      "Safely control this exact existing run or epic and verify the durable result."
     ]
   }
 }

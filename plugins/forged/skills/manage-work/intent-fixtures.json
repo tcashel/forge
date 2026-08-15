@@ -1,7 +1,7 @@
 {
   "schema": "forged.manage-work-intent-fixtures/1",
   "purpose": "validation-only",
-  "budgetScope": "manage-work router only; delegated sibling skills enforce their own contracts",
+  "budgetScope": "base intent classification only; delegated skills and portfolio-control-fixtures enforce their own contracts",
   "cases": [
     {
       "id": "observe",
@@ -101,10 +101,10 @@
     },
     {
       "id": "control",
-      "request": "Pause this existing epic.",
+      "request": "Control this existing epic without treating it as new execution.",
       "decision": "control",
       "delegate": "none",
-      "result": "defer",
+      "result": "portfolio-control",
       "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {

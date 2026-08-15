@@ -87,7 +87,7 @@ if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
 
 if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
     fixture.purpose !== 'validation-only' ||
-    fixture.budgetScope !== 'manage-work router only; delegated sibling skills enforce their own contracts' ||
+    fixture.budgetScope !== 'base intent classification only; delegated skills and portfolio-control-fixtures enforce their own contracts' ||
     !Array.isArray(fixture.cases)) process.exit(1);
 if (Object.keys(fixture).sort().join('\n') !== ['budgetScope', 'cases', 'purpose', 'schema'].join('\n')) process.exit(1);
 
@@ -104,7 +104,7 @@ const expected = new Map(Object.entries({
   'ambiguous-approval': ['ambiguous-approval', 'none', 'refuse'],
   'stale-approval': ['stale-approval', 'none', 'refuse'],
   status: ['status', 'none', 'read-only'],
-  control: ['control', 'none', 'defer'],
+  control: ['control', 'none', 'portfolio-control'],
   'external-context': ['external-context', 'none', 'discuss'],
 }));
 const effectKeys = [
@@ -132,6 +132,144 @@ for (const entry of fixture.cases) {
   for (const key of effectKeys) {
     if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
   }
+}
+if (seen.size !== expected.size) process.exit(1);
+NODE
+}
+
+check_manage_work_portfolio_contract() {
+  node - "$1" "$2" <<'NODE'
+const fs = require('fs');
+const [skillPath, fixturePath] = process.argv.slice(2);
+const skill = fs.readFileSync(skillPath, 'utf8');
+const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+
+const requiredSkillText = [
+  'forged operations overview',
+  'forged work detail',
+  'forged.operations-overview/1',
+  'forged.work-detail/1',
+  'forged.work-identity/1',
+  'forged.attention-item/1',
+  'forged.attention-transition/1',
+  'forged.attention-transition-result/1',
+  'ui://forged/operations-overview.html',
+  'ui://forged/work-detail.html',
+  'detailTarget.subjectKind',
+  'detailTarget.subjectId',
+  'forged epic pause',
+  'forged epic resume',
+  'forged run stop',
+  '--outcome cancelled',
+  'forged run accept-risk',
+  'forged attention acknowledge',
+  'forged attention resolve',
+  'forged attention reopen',
+  'bd update',
+  '--priority',
+  '--if-status',
+  '--if-assignee',
+  'lower numbers win',
+  'never preempts active work',
+  'accepted-unknown',
+  'session stop',
+  'portfolio-control-fixtures.json',
+];
+if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
+
+if (fixture.schema !== 'forged.manage-work-portfolio-control-fixtures/1' ||
+    fixture.purpose !== 'validation-only' ||
+    !Array.isArray(fixture.cases) ||
+    Object.keys(fixture).sort().join('\n') !==
+      ['cases', 'isolation', 'purpose', 'schema', 'schemas'].join('\n')) process.exit(1);
+
+const expectedIsolation = {
+  requiredTemporaryEnv: ['HOME', 'ANVIL_HOME', 'BEADS_DIR'],
+  fakeBoundaries: ['bd', 'forged-cli', 'forged-mcp', 'service', 'provider', 'git', 'github', 'app-host'],
+  liveEffects: 'forbidden',
+};
+if (JSON.stringify(fixture.isolation) !== JSON.stringify(expectedIsolation)) process.exit(1);
+const expectedSchemas = {
+  operationsOverview: 'forged.operations-overview/1',
+  workDetail: 'forged.work-detail/1',
+  workIdentity: 'forged.work-identity/1',
+  attentionItem: 'forged.attention-item/1',
+  attentionTransition: 'forged.attention-transition/1',
+  attentionTransitionResult: 'forged.attention-transition-result/1',
+};
+if (JSON.stringify(fixture.schemas) !== JSON.stringify(expectedSchemas)) process.exit(1);
+
+const expected = new Map(Object.entries({
+  'status-unscoped': ['operations-overview', 'none', 'bounded-portfolio'],
+  'status-repository': ['operations-overview', 'none', 'exact-repository-only'],
+  'needs-me': ['operations-overview', 'none', 'needs-me-group'],
+  'app-unavailable': ['operations-overview', 'none', 'structured-fallback'],
+  'detail-exact': ['work-detail', 'none', 'exact-work-ref'],
+  'title-unique': ['operations-then-detail', 'none', 'unique-canonical-target'],
+  'title-zero': ['refuse', 'not-applicable', 'not-found-no-mutation'],
+  'title-ambiguous': ['refuse', 'bounded-target', 'disambiguate-no-mutation'],
+  'blocker-explanation': ['work-detail', 'none', 'evidence-and-next-action'],
+  'spend-known': ['work-detail', 'none', 'known-spend'],
+  'spend-unknown': ['work-detail', 'none', 'unknown-not-zero'],
+  'plan-only-detail': ['refuse', 'not-applicable', 'plan-summary-only'],
+  'priority-change': ['bd-priority', 'none', 'priority-only-lower-wins-later-no-preemption',
+    {beadPriorityUpdates: 1}],
+  'epic-pause': ['epic-pause', 'none', 'paused-readback', {epicPauses: 1}],
+  'epic-resume': ['epic-resume', 'none', 'active-readback-no-submit', {epicResumes: 1}],
+  'input-required-resume': ['work-detail', 'not-applicable', 'resolve-domain-first'],
+  'slice-cancel': ['run-stop-cancelled', 'destructive', 'cancelled-terminal-readback',
+    {runStops: 1}],
+  'slice-pause-unsupported': ['refuse', 'not-applicable', 'unsupported-no-session-stop'],
+  'epic-stop-unsupported': ['refuse', 'not-applicable', 'offer-pause-boundary'],
+  'stale-precondition': ['refuse', 'not-applicable', 'stale-input-required'],
+  'duplicate-response': ['refuse', 'not-applicable', 'readback-no-retry'],
+  'attention-acknowledge-lead': ['attention-acknowledge', 'none',
+    'acknowledged-still-active', {attentionAcknowledgements: 1}],
+  'attention-resolve-lead': ['attention-resolve', 'none',
+    'accepted-unknown-readback', {attentionResolutions: 1}],
+  'attention-resolve-human': ['attention-resolve', 'human-decision',
+    'resolved-after-domain-evidence', {attentionResolutions: 1}],
+  'attention-source-backed': ['refuse', 'not-applicable', 'domain-transition-only'],
+  'attention-stale-occurrence': ['refuse', 'not-applicable',
+    'stale-occurrence-no-mutation'],
+  'attention-reopen': ['attention-reopen', 'none', 'open-new-decision-required',
+    {attentionReopens: 1}],
+  'review-risk-acceptance': ['run-accept-risk', 'human-decision',
+    'accepted-risk-readback', {riskAcceptances: 1}],
+  'merge-approval': ['refuse', 'human-decision', 'human-github-boundary'],
+  'session-diagnostic': ['session-diagnostic', 'none', 'read-only-attempt-detail'],
+  'session-stop-substitution': ['refuse', 'not-applicable', 'work-control-required'],
+}));
+const effectKeys = [
+  'beadClaims', 'beadPriorityUpdates', 'beadOtherWrites',
+  'epicPauses', 'epicResumes', 'runStops', 'riskAcceptances',
+  'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens',
+  'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits', 'sessionStops',
+  'serviceMutations', 'providerCalls', 'repositoryWrites', 'githubWrites',
+].sort();
+const alwaysZero = [
+  'beadClaims', 'beadOtherWrites', 'runStarts', 'runSubmits', 'epicStarts',
+  'epicSubmits', 'sessionStops', 'serviceMutations', 'providerCalls',
+  'repositoryWrites', 'githubWrites',
+];
+const seen = new Set();
+for (const entry of fixture.cases) {
+  if (!entry || typeof entry !== 'object' || seen.has(entry.id) || !expected.has(entry.id)) process.exit(1);
+  if (Object.keys(entry).sort().join('\n') !==
+      ['confirmation', 'effectBudget', 'id', 'postcondition', 'request', 'route'].join('\n')) process.exit(1);
+  seen.add(entry.id);
+  if (typeof entry.request !== 'string' || !entry.request.trim()) process.exit(1);
+  const [route, confirmation, postcondition, nonzero = {}] = expected.get(entry.id);
+  if (entry.route !== route || entry.confirmation !== confirmation ||
+      entry.postcondition !== postcondition) process.exit(1);
+  const budget = entry.effectBudget;
+  if (!budget || Object.keys(budget).sort().join('\n') !== effectKeys.join('\n')) process.exit(1);
+  if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0 && value <= 1)) process.exit(1);
+  for (const key of effectKeys) {
+    if (budget[key] !== (nonzero[key] || 0)) process.exit(1);
+  }
+  if (!alwaysZero.every((key) => budget[key] === 0)) process.exit(1);
+  if (Object.values(budget).reduce((sum, value) => sum + value, 0) > 1) process.exit(1);
 }
 if (seen.size !== expected.size) process.exit(1);
 NODE
@@ -216,6 +354,7 @@ required=(
   "$plugin/skills/plan/epic.md"
   "$plugin/skills/plan/checklist.md"
   "$plugin/skills/manage-work/intent-fixtures.json"
+  "$plugin/skills/manage-work/portfolio-control-fixtures.json"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] && pass "required companion $path" || fail "required companion $path"
@@ -234,6 +373,11 @@ check "manage-work intent fixture JSON" check_json \
 check "manage-work authority and mutation contract" check_manage_work_contract \
   "$plugin/skills/manage-work/SKILL.md" \
   "$plugin/skills/manage-work/intent-fixtures.json"
+check "manage-work portfolio/control fixture JSON" check_json \
+  "$plugin/skills/manage-work/portfolio-control-fixtures.json"
+check "manage-work portfolio/control contract" check_manage_work_portfolio_contract \
+  "$plugin/skills/manage-work/SKILL.md" \
+  "$plugin/skills/manage-work/portfolio-control-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 7 ]] && pass "exactly seven skills" || fail "exactly seven skills"

@@ -8,7 +8,7 @@
     {
       "name": "forged",
       "source": "./plugins/forged",
-      "description": "Manage native Bead work conversationally, then explicitly submit durable slice or epic execution to Forged."
+      "description": "Plan native Bead work, inspect the Forged portfolio, and safely invoke exact authorized submissions or lifecycle controls."
     }
   ]
 }
