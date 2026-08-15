@@ -335,6 +335,7 @@ impl SupervisorStatus {
 
 #[derive(Debug, Clone)]
 struct RuntimePaths {
+    home: PathBuf,
     root: PathBuf,
     bin: PathBuf,
     manifest: PathBuf,
@@ -372,6 +373,7 @@ impl RuntimePaths {
         let label = format!("dev.forged.supervisor.{}", &suffix[..12]);
         let root = canonical.join("runtime");
         Ok(Self {
+            home: canonical_home.clone(),
             bin: root.join("bin"),
             manifest: root.join("manifest.json"),
             current: root.join("current"),
@@ -893,8 +895,12 @@ fn xml_escape(value: &str) -> String {
         .replace('\'', "&apos;")
 }
 
-fn launchd_environment(manifest: &RuntimeManifest) -> BTreeMap<String, String> {
+fn launchd_environment(
+    paths: &RuntimePaths,
+    manifest: &RuntimeManifest,
+) -> BTreeMap<String, String> {
     let mut env = BTreeMap::from([
+        ("HOME".to_owned(), paths.home.to_string_lossy().into_owned()),
         ("ANVIL_HOME".to_owned(), manifest.anvil_home.clone()),
         ("FORGED_CONFIG".to_owned(), manifest.config_path.clone()),
         ("BEADS_DIR".to_owned(), manifest.beads_dir.clone()),
@@ -927,7 +933,7 @@ fn launchd_environment(manifest: &RuntimeManifest) -> BTreeMap<String, String> {
 }
 
 fn render_plist(paths: &RuntimePaths, manifest: &RuntimeManifest) -> String {
-    let env = launchd_environment(manifest)
+    let env = launchd_environment(paths, manifest)
         .into_iter()
         .map(|(key, value)| {
             format!(
@@ -2937,6 +2943,34 @@ mod tests {
         )
         .expect("old plist");
         manifest
+    }
+
+    #[test]
+    fn launchd_environment_preserves_canonical_home_authority() {
+        let (root, config, paths) = setup();
+        let manifest = seed_old_install(root.path(), &config, &paths);
+        let environment = launchd_environment(&paths, &manifest);
+
+        assert_eq!(
+            environment.get("HOME").map(String::as_str),
+            Some(paths.home.to_string_lossy().as_ref())
+        );
+        let reconstructed = RuntimePaths::new(
+            Path::new(environment.get("ANVIL_HOME").expect("ANVIL_HOME")),
+            Path::new(environment.get("HOME").expect("HOME")),
+            501,
+        )
+        .expect("reconstruct launchd runtime paths");
+        assert_eq!(reconstructed.root, paths.root);
+        assert_eq!(reconstructed.plist, paths.plist);
+        assert_eq!(reconstructed.label, paths.label);
+        assert_eq!(reconstructed.domain, paths.domain);
+
+        let plist = render_plist(&paths, &manifest);
+        assert!(plist.contains(&format!(
+            "<key>HOME</key><string>{}</string>",
+            xml_escape(&paths.home.to_string_lossy())
+        )));
     }
 
     fn keyed(value: &str) -> KeyOnly {
