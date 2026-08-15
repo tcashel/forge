@@ -107,19 +107,49 @@ fn fabricate_run_in_repository(env: &TestEnv, run_id: &str, repository: &str) {
 
 fn fabricate_epic_in_repository(env: &TestEnv, epic_id: &str, repository: &str) {
     let ledger = env.ledger();
+    let repository = forged_types::normalize_repository_path(repository).expect("canonical repo");
+    let label = forged_types::repository_label(&repository).expect("repo label");
+    let title = format!("Epic {epic_id}");
+    let identity = forged_types::WorkIdentityV1 {
+        schema: forged_types::WORK_IDENTITY_SCHEMA_V1.to_owned(),
+        subject: forged_types::WorkIdentitySubjectV1 {
+            kind: forged_types::WorkIdentitySubjectKind::Epic,
+            id: epic_id.to_owned(),
+        },
+        bead: forged_types::WorkIdentityBeadV1 {
+            id: epic_id.to_owned(),
+            title: Some(title.clone()),
+            revision: None,
+        },
+        repository: Some(forged_types::WorkIdentityRepositoryV1 {
+            path: repository.clone(),
+            label: label.clone(),
+        }),
+        project: None,
+        epic: None,
+        display_title: forged_types::work_display_title(
+            epic_id,
+            Some(&title),
+            Some(&label),
+            None,
+            None,
+        ),
+        captured_at: "2026-01-01T00:00:00.000000000Z".to_owned(),
+        source: forged_types::WorkIdentitySource::Durable,
+    };
     ledger
-        .append_event(
-            Some(epic_id),
-            "forged.epic.started",
+        .append_epic_started_with_identity(
+            epic_id,
             json!({
                 "schema": "forged.epic/1",
                 "epicId": epic_id,
-                "title": format!("Epic {epic_id}"),
+                "title": title,
                 "repo": repository,
                 "baseRef": "main",
                 "integrationBranch": format!("forged/epic-{epic_id}"),
                 "children": [],
             }),
+            identity,
         )
         .expect("epic started event");
     ledger.close().expect("close");
@@ -266,7 +296,12 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
     assert_eq!(stalled["claimHealth"]["staleInProgress"], json!(true));
     assert!(stalled["blocker"].as_str().is_some());
     let planned = in_group("Planned", "q-planned");
-    assert_eq!(planned["title"], json!("Prepare the operator queue"));
+    assert_eq!(planned["title"], planned["identity"]["displayTitle"]);
+    assert_ne!(
+        planned["title"],
+        json!("Prepare the operator queue"),
+        "a live Beads rename cannot rewrite legacy durable identity"
+    );
     assert_eq!(planned["ci"]["status"], json!("unknown"));
     for key in [
         "outcome",

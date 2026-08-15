@@ -34,6 +34,10 @@
 //! `epic.resolve.desired.after` is the inverse seam: the identified
 //! INPUT_RESOLVED event and due wake are committed, but the safe-effect
 //! operation has not yet been settled.
+//! `run.start.bundle.after` and `epic.start.bundle.after` sit after the
+//! creation record, compatibility event, and WorkIdentityV1 commit in one
+//! transaction but before the operation response is settled; replay must use
+//! the durable bundle without consulting Beads again.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

@@ -19,6 +19,7 @@ pub(crate) mod settlement;
 pub(crate) mod spec;
 mod supervise;
 pub(crate) mod usage;
+pub(crate) mod work_identity;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;

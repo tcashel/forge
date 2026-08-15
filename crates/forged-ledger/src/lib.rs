@@ -33,6 +33,7 @@ mod slots;
 mod time;
 mod types;
 mod usage;
+mod work_identity;
 
 pub use error::LedgerError;
 pub use inventory::InventorySnapshot;

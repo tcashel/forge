@@ -13,6 +13,8 @@
 
 use std::collections::BTreeMap;
 
+use forged_types::{AdmissionDecisionV1, WorkIdentitySubjectKind, WorkIdentityV1};
+
 use crate::admission::{latest_admission_decisions_tx, live_reservations};
 use crate::attempts::{list_attempts_missing_artifacts_tx, list_live_attempts_tx};
 use crate::desired::list_desired_work_tx;
@@ -26,7 +28,7 @@ use crate::types::{
     UsageTotals,
 };
 use crate::usage::{latest_missing_usage_per_run_tx, usage_totals_per_run_tx};
-use forged_types::AdmissionDecisionV1;
+use crate::work_identity::list_work_identities_tx;
 
 /// Everything [`Ledger::inventory_snapshot`] read, all of it from the same
 /// point in the ledger's history.
@@ -58,6 +60,9 @@ pub struct InventorySnapshot {
     pub admission_decisions: Vec<AdmissionDecisionV1>,
     /// Every capacity-bearing reservation.
     pub admission_reservations: Vec<AdmissionReservationRow>,
+    /// Frozen display identity for every durable run/epic, keyed only by its
+    /// canonical subject kind and id.
+    pub work_identities: BTreeMap<(WorkIdentitySubjectKind, String), WorkIdentityV1>,
 }
 
 impl InventorySnapshot {
@@ -101,6 +106,7 @@ impl Ledger {
                 inflight_operations: list_inflight_operations_tx(&tx)?,
                 admission_decisions: latest_admission_decisions_tx(&tx)?,
                 admission_reservations: live_reservations(&tx)?,
+                work_identities: list_work_identities_tx(&tx)?,
             };
             tx.commit()?;
             Ok(snapshot)

@@ -507,6 +507,58 @@ BEGIN
 END;
 ";
 
+/// Migration 015: immutable human-readable identity captured from durable
+/// launch evidence. Planned Beads are deliberately absent: `live-plan` is a
+/// projection-only source and the table's closed source vocabulary rejects
+/// it. Existing rows are populated by Rust immediately after this DDL inside
+/// the same migration transaction so path/title derivation uses the shared
+/// pure helpers rather than a second SQL implementation.
+const MIGRATION_015: &str = "
+CREATE TABLE work_identities (
+  schema            TEXT NOT NULL CHECK (schema = 'forged.work-identity/1'),
+  subject_kind      TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id        TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  bead_id           TEXT NOT NULL CHECK (length(trim(bead_id)) > 0),
+  bead_title        TEXT CHECK (bead_title IS NULL OR length(trim(bead_title)) > 0),
+  bead_revision     TEXT CHECK (bead_revision IS NULL OR length(trim(bead_revision)) > 0),
+  repository_path  TEXT,
+  repository_label TEXT,
+  project_id        TEXT,
+  project_title     TEXT,
+  epic_id           TEXT,
+  epic_title        TEXT,
+  display_title     TEXT NOT NULL CHECK (length(trim(display_title)) > 0),
+  captured_at       TEXT NOT NULL CHECK (length(trim(captured_at)) > 0),
+  source            TEXT NOT NULL CHECK (source IN ('durable','legacy-fallback')),
+  PRIMARY KEY (subject_kind, subject_id),
+  CHECK (
+    (repository_path IS NULL AND repository_label IS NULL)
+    OR
+    (repository_path IS NOT NULL AND length(trim(repository_path)) > 0
+      AND repository_label IS NOT NULL AND length(trim(repository_label)) > 0)
+  ),
+  CHECK (
+    (project_id IS NULL AND project_title IS NULL)
+    OR
+    (project_id IS NOT NULL AND length(trim(project_id)) > 0
+      AND (project_title IS NULL OR length(trim(project_title)) > 0))
+  ),
+  CHECK (
+    (epic_id IS NULL AND epic_title IS NULL)
+    OR
+    (epic_id IS NOT NULL AND length(trim(epic_id)) > 0
+      AND (epic_title IS NULL OR length(trim(epic_title)) > 0))
+  )
+);
+CREATE INDEX work_identities_bead ON work_identities(bead_id, subject_kind, subject_id);
+
+CREATE TRIGGER work_identity_immutable
+BEFORE UPDATE ON work_identities
+BEGIN
+  SELECT RAISE(ABORT, 'work identity is immutable');
+END;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -523,6 +575,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_012,
     MIGRATION_013,
     MIGRATION_014,
+    MIGRATION_015,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -587,6 +640,9 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), LedgerError> {
         let index = idx as i64 + 1;
         if index > applied {
             tx.execute_batch(ddl)?;
+            if index == 15 {
+                crate::work_identity::backfill_work_identities_tx(&tx)?;
+            }
         }
     }
     if applied < embedded {
@@ -642,7 +698,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 14);
+        assert_eq!(pragmas.user_version, 15);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -667,6 +723,7 @@ mod tests {
             "admission_decisions",
             "admission_reservations",
             "owned_herdr_sessions",
+            "work_identities",
         ] {
             let found: String = conn
                 .query_row(
@@ -696,7 +753,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
         ledger.close().expect("close");
     }
 
@@ -757,7 +814,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -800,7 +857,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 15);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

@@ -369,6 +369,7 @@ mod tests {
             spec_id: None,
             metadata: Default::default(),
             revision: Some("-6192208415116251521".to_owned()),
+            updated_at: None,
         }
     }
 

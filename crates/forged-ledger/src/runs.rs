@@ -3,8 +3,9 @@
 use std::fmt::Write as _;
 
 use forged_types::{
-    canonical_json_bytes, AcceptedRisk, ErrorCode, ExecutionPackageV1, ExecutionPolicyV1,
-    ResolvedRosterV1, EXECUTION_PACKAGE_SCHEMA_V1,
+    canonical_json_bytes, normalize_repository_path, AcceptedRisk, ErrorCode, ExecutionPackageV1,
+    ExecutionPolicyV1, ResolvedRosterV1, WorkIdentitySource, WorkIdentitySubjectKind,
+    WorkIdentityV1, EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -18,6 +19,9 @@ use crate::time::now_iso;
 use crate::types::{
     DesiredReconcileOutcome, DesiredSubjectKind, NewRun, NewRunDefinition, RosterRevisionBatch,
     RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement, RunState,
+};
+use crate::work_identity::{
+    get_work_identity_tx, identity_replay_matches, insert_work_identity_tx, legacy_run_identity,
 };
 
 fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
@@ -157,6 +161,14 @@ fn canonical<T: Serialize>(value: &T) -> Result<(String, String), LedgerError> {
     let text = String::from_utf8(bytes)
         .map_err(|error| crate::error::internal(format!("canonical JSON is not UTF-8: {error}")))?;
     Ok((text, hex))
+}
+
+fn event_revision(value: Option<&serde_json::Value>) -> Option<String> {
+    match value? {
+        serde_json::Value::String(value) if !value.trim().is_empty() => Some(value.clone()),
+        serde_json::Value::Number(value) => Some(value.to_string()),
+        _ => None,
+    }
 }
 
 fn insert_run(
@@ -352,6 +364,7 @@ impl Ledger {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let now = now_iso();
             let row = insert_run(&tx, &new_run, &now)?;
+            insert_work_identity_tx(&tx, &legacy_run_identity(&new_run, &now))?;
             tx.commit()?;
             Ok(row)
         })
@@ -430,8 +443,223 @@ impl Ledger {
                  roster_json, reason, created_at) VALUES (?1, 1, ?2, ?3, ?4, 'run-created', ?5)",
                 rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
             )?;
+            insert_work_identity_tx(&tx, &legacy_run_identity(&new_run, &now))?;
             // Keep the canonicalized profile alive as an explicit integrity
             // input above even though the full package stores it.
+            drop(profile_json);
+            tx.commit()?;
+            Ok(row)
+        })
+    }
+
+    /// Atomically create the complete run launch bundle: run row, immutable
+    /// execution definition, roster revision 1, compatibility spec-source
+    /// event, and frozen work identity. An exact retry returns the standing
+    /// run; partial or conflicting bundles fail closed.
+    pub fn create_run_with_identity(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+    ) -> Result<RunRow, LedgerError> {
+        self.submit(move |conn| {
+            identity.validate_for_storage().map_err(|error| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    format!("invalid run work identity: {error}"),
+                )
+            })?;
+            if identity.source != WorkIdentitySource::Durable
+                || identity.subject.kind != WorkIdentitySubjectKind::Run
+                || identity.subject.id != new_run.run_id.as_str()
+                || identity.bead.id != new_run.bead_id
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "run launch requires a durable matching run identity",
+                ));
+            }
+            let normalized_repo = normalize_repository_path(&new_run.repo).ok_or_else(|| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    "run launch repository must be an absolute lexical path",
+                )
+            })?;
+            if identity
+                .repository
+                .as_ref()
+                .map(|value| value.path.as_str())
+                != Some(normalized_repo.as_str())
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "run launch repository does not match its identity",
+                ));
+            }
+            if spec_event.get("runId").and_then(serde_json::Value::as_str)
+                != Some(new_run.run_id.as_str())
+                || spec_event
+                    .get("beadTitle")
+                    .and_then(serde_json::Value::as_str)
+                    != identity.bead.title.as_deref()
+                || spec_event
+                    .get("beadId")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|value| value != identity.bead.id)
+                || event_revision(spec_event.get("beadRevision")) != identity.bead.revision
+                || spec_event
+                    .get("repo")
+                    .and_then(serde_json::Value::as_str)
+                    .and_then(normalize_repository_path)
+                    .as_deref()
+                    != identity
+                        .repository
+                        .as_ref()
+                        .map(|value| value.path.as_str())
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "run spec event does not match its identity",
+                ));
+            }
+
+            let package = &definition.package;
+            if package.schema != EXECUTION_PACKAGE_SCHEMA_V1 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("unsupported execution package schema {:?}", package.schema),
+                ));
+            }
+            if package.roster_ref != package.roster.roster_ref {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package roster ref does not match resolved roster",
+                ));
+            }
+            let (profile_json, profile_sha256) = canonical(&package.profile)?;
+            let (roster_json, roster_sha256) = canonical(&package.roster)?;
+            let (package_json, package_sha256) = canonical(package)?;
+            if profile_sha256 != package.profile_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package profile digest mismatch",
+                ));
+            }
+            if roster_sha256 != package.roster_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package roster digest mismatch",
+                ));
+            }
+            if package_sha256 != definition.package_sha256 {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    "execution package digest mismatch",
+                ));
+            }
+            let (protocol_ref_json, _) = canonical(&package.protocol_ref)?;
+            let (profile_ref_json, _) = canonical(&package.profile_ref)?;
+            let (roster_ref_json, _) = canonical(&package.roster_ref)?;
+            let (compatibility_roster_json, _) = canonical(&definition.compatibility_roster)?;
+
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let run_id = new_run.run_id.as_str();
+            let existing = {
+                let sql = format!("SELECT {RUN_COLUMNS} FROM runs WHERE run_id = ?1");
+                tx.query_row(&sql, [run_id], run_row).optional()?
+            };
+            if let Some(row) = existing {
+                let immutable_run_matches = row.bead_id == new_run.bead_id
+                    && row.repo == new_run.repo
+                    && row.base_ref == new_run.base_ref
+                    && row.branch == new_run.branch;
+                let stored_definition = tx
+                    .query_row(
+                        "SELECT run_id, protocol_ref_json, profile_ref_json, roster_ref_json, \
+                         package_sha256, profile_sha256, roster_sha256, package_json, \
+                         compatibility_roster_json, created_at FROM run_definitions \
+                         WHERE run_id = ?1",
+                        [run_id],
+                        definition_row,
+                    )
+                    .optional()?;
+                let definition_matches = stored_definition.is_some_and(|stored| {
+                    stored.protocol_ref_json == protocol_ref_json
+                        && stored.profile_ref_json == profile_ref_json
+                        && stored.roster_ref_json == roster_ref_json
+                        && stored.package_sha256 == package_sha256
+                        && stored.profile_sha256 == profile_sha256
+                        && stored.roster_sha256 == roster_sha256
+                        && stored.package_json == package_json
+                        && stored.compatibility_roster_json == compatibility_roster_json
+                });
+                let revision_matches: bool = tx.query_row(
+                    "SELECT EXISTS(SELECT 1 FROM roster_revisions WHERE run_id = ?1 \
+                         AND revision = 1 AND roster_ref_json = ?2 AND roster_sha256 = ?3 \
+                         AND roster_json = ?4 AND reason = 'run-created')",
+                    rusqlite::params![run_id, roster_ref_json, roster_sha256, roster_json],
+                    |row| row.get(0),
+                )?;
+                let stored_events = {
+                    let mut statement = tx.prepare(
+                        "SELECT payload_json FROM events WHERE run_id = ?1 \
+                         AND kind = 'forged.run.spec' ORDER BY event_id",
+                    )?;
+                    let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let event_matches = match stored_events.as_slice() {
+                    [payload] => serde_json::from_str::<serde_json::Value>(payload)
+                        .is_ok_and(|stored| stored == spec_event),
+                    _ => false,
+                };
+                let identity_matches =
+                    get_work_identity_tx(&tx, WorkIdentitySubjectKind::Run, run_id)?
+                        .is_some_and(|standing| identity_replay_matches(&standing, &identity));
+                if !immutable_run_matches
+                    || !definition_matches
+                    || !revision_matches
+                    || !event_matches
+                    || !identity_matches
+                {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!("run {run_id:?} launch replay conflicts with durable bundle"),
+                    ));
+                }
+                tx.commit()?;
+                drop(profile_json);
+                return Ok(row);
+            }
+
+            let now = now_iso();
+            let row = insert_run(&tx, &new_run, &now)?;
+            tx.execute(
+                "INSERT INTO run_definitions (run_id, protocol_ref_json, profile_ref_json, \
+                 roster_ref_json, package_sha256, profile_sha256, roster_sha256, package_json, \
+                 compatibility_roster_json, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+                rusqlite::params![
+                    row.run_id,
+                    protocol_ref_json,
+                    profile_ref_json,
+                    roster_ref_json,
+                    package_sha256,
+                    profile_sha256,
+                    roster_sha256,
+                    package_json,
+                    compatibility_roster_json,
+                    now,
+                ],
+            )?;
+            tx.execute(
+                "INSERT INTO roster_revisions (run_id, revision, roster_ref_json, roster_sha256, \
+                 roster_json, reason, created_at) VALUES (?1, 1, ?2, ?3, ?4, 'run-created', ?5)",
+                rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
+            )?;
+            append_event_tx(&tx, Some(&row.run_id), "forged.run.spec", &spec_event)?;
+            insert_work_identity_tx(&tx, &identity)?;
             drop(profile_json);
             tx.commit()?;
             Ok(row)

@@ -732,6 +732,14 @@ fn interventions_cross_a_durable_boundary_and_sessions_stay_observable() {
     assert!(sessions
         .iter()
         .all(|session| session["attachHint"].is_null()));
+    assert!(
+        sessions.iter().all(|session| {
+            session["identity"] == listed["result"]["identity"]
+                && session["identity"]["subject"]["id"] == json!("bead-session")
+                && session["identity"]["source"] == json!("durable")
+        }),
+        "every provider session inherits the run's exact durable identity: {listed}"
+    );
 
     let (_, events) = env.forged(&["events", "--run", "bead-session", "--limit", "1000"]);
     let kinds: Vec<&str> = events["result"]["events"]

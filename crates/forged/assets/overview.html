@@ -1706,8 +1706,9 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       top.append(el("span", "bead__id", entry.id));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
       card.append(top);
-      card.append(el("div", "bead__title", entry.title || entry.beadId || ""));
-      if (entry.beadId && entry.title) card.append(el("div", "muted", entry.beadId));
+      const displayTitle = (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || "";
+      card.append(el("div", "bead__title", displayTitle));
+      if (entry.beadId && displayTitle) card.append(el("div", "muted", entry.beadId));
       const foot = el("div", "bead__foot");
       foot.append(el("span", "", entry.state || "unknown"));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));

@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use forged_ledger::{AttemptState, EffectClass, RevokeScope};
-use forged_types::{Capability, OperationRequest, OperationResponse, WorkPacket};
+use forged_types::{
+    Capability, OperationRequest, OperationResponse, WorkIdentitySubjectKind, WorkPacket,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -245,6 +247,8 @@ fn param_attempt(params: &serde_json::Map<String, Value>) -> Result<i64, Failure
 pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("session_list", req, || async {
         let run_id = param_str(&req.params, "run")?;
+        let identity =
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
         let events = run_events(ctx, run_id).await?;
         let mut sessions = Vec::new();
         for record in session_records(&events) {
@@ -261,6 +265,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "socketPath": record.socket_path,
                 "statusPath": record.status_path,
                 "controllerGeneration": record.controller_generation,
+                "identity": identity.clone(),
                 // The hint is durable, but terminal pane cleanup is an
                 // independent supervisor effect. `Running` and `Revoking`
                 // are the only states in which attachment remains useful;
@@ -274,7 +279,12 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             }));
         }
         let pending = pending_interventions(ctx, run_id).await?;
-        Ok(json!({"runId": run_id, "sessions": sessions, "pendingInterventions": pending.len()}))
+        Ok(json!({
+            "runId": run_id,
+            "identity": identity,
+            "sessions": sessions,
+            "pendingInterventions": pending.len()
+        }))
     })
     .await
 }

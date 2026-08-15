@@ -652,7 +652,7 @@ issue_json() {
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s,"updated_at":"2026-08-14T00:00:00Z"}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
 }
 case "$cmd" in
   version)
@@ -1442,20 +1442,51 @@ pub fn fabricate_run(env: &TestEnv, run_id: &str) {
 /// nothing about epic discovery.
 pub fn fabricate_epic(env: &TestEnv, epic_id: &str) {
     let ledger = env.ledger();
+    let repo = forged_types::normalize_repository_path(&env.repos.repo.to_string_lossy())
+        .expect("canonical fixture repo");
+    let label = forged_types::repository_label(&repo).expect("fixture repo label");
+    let title = format!("Epic {epic_id}");
+    let identity = forged_types::WorkIdentityV1 {
+        schema: forged_types::WORK_IDENTITY_SCHEMA_V1.to_owned(),
+        subject: forged_types::WorkIdentitySubjectV1 {
+            kind: forged_types::WorkIdentitySubjectKind::Epic,
+            id: epic_id.to_owned(),
+        },
+        bead: forged_types::WorkIdentityBeadV1 {
+            id: epic_id.to_owned(),
+            title: Some(title.clone()),
+            revision: None,
+        },
+        repository: Some(forged_types::WorkIdentityRepositoryV1 {
+            path: repo.clone(),
+            label: label.clone(),
+        }),
+        project: None,
+        epic: None,
+        display_title: forged_types::work_display_title(
+            epic_id,
+            Some(&title),
+            Some(&label),
+            None,
+            None,
+        ),
+        captured_at: "2026-01-01T00:00:00.000000000Z".to_owned(),
+        source: forged_types::WorkIdentitySource::Durable,
+    };
     ledger
-        .append_event(
-            Some(epic_id),
-            "forged.epic.started",
+        .append_epic_started_with_identity(
+            epic_id,
             json!({
                 "schema": "forged.epic/1",
                 "epicId": epic_id,
-                "title": format!("Epic {epic_id}"),
-                "repo": env.repos.repo.to_string_lossy(),
+                "title": title,
+                "repo": repo,
                 "specPath": env.spec.to_string_lossy(),
                 "baseRef": env.repos.base,
                 "integrationBranch": format!("forged/epic-{epic_id}"),
                 "children": [],
             }),
+            identity,
         )
         .expect("epic started event");
     ledger.close().expect("close");

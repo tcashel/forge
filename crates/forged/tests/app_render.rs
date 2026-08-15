@@ -379,7 +379,8 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
         "id": "queue-run",
         "kind": "slice",
         "beadId": "bead-queue-run",
-        "title": "Make work legible",
+        "title": "Renamed live title",
+        "identity": {"displayTitle": "Make work legible [repositories/forge]"},
         "state": "active",
         "nextAction": "Submit a detached controller when this work should start",
     });
@@ -401,7 +402,7 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
         "Running",
         "Stalled or recoverable",
         "Planned",
-        "Make work legible",
+        "Make work legible [repositories/forge]",
         "Next: Submit a detached controller",
     ] {
         assert!(
@@ -410,6 +411,11 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
             dispatched.text
         );
     }
+    assert!(
+        !dispatched.text.contains("Renamed live title"),
+        "the App prefers the durable display identity: {}",
+        dispatched.text
+    );
 }
 
 /// The rail is the answer to "what needs a human", so it has to be drawn

@@ -12,15 +12,16 @@ use forged_ledger::{
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionItemV1, AttentionResolutionDisposition, AttentionState, ErrorCode,
-    OperationRequest, OperationResponse, RunId, WorkPacket,
+    ExecutionPackageV1, OperationRequest, OperationResponse, RunId, WorkIdentitySubjectKind,
+    WorkPacket,
 };
 use serde_json::{json, Value};
 
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
-    default_key, derive_key, epic, err_response, fenced, key_absent, on_ledger, param_opt_str,
-    param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
+    default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
+    param_opt_str, param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -329,16 +330,16 @@ pub(crate) async fn run_start_with_definition(
         "packageSha256".to_owned(),
         Value::String(compiled.package_sha256.clone()),
     );
+    match recover_applied_run_start(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
     let params = req.params.clone();
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
-        move |_op| async move {
-            let repo = param_str(&params, "repo")?.to_owned();
+        move |operation_id| async move {
+            let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
             let spec = param_opt_str(&params, "spec").map(str::to_owned);
-            if !Path::new(&repo).is_absolute() {
-                return Err(Failure::invalid(format!(
-                    "--repo must be an absolute path, got {repo:?}"
-                )));
-            }
             let issue = ready_slice_bead(ctx, &bead).await?;
             // The spec source is settled BEFORE the run row exists: a bead
             // with no spec, or a spec path that is not there, must never
@@ -381,38 +382,57 @@ pub(crate) async fn run_start_with_definition(
                 package_sha256: compiled.package_sha256,
                 compatibility_roster: compiled.compatibility_roster,
             };
-            let row = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.create_run_with_definition(new_run, definition)
-            })
-            .await?;
             // Persist the spec SOURCE for packet building — the run row has
             // no spec column, and every process must resolve the same one.
             // `specPath` stays in the payload for the deprecated file route,
             // so an in-flight run started by an older binary still reads.
-            let run_for_event = row.run_id.clone();
+            let project = super::work_identity::context_from_params(&params, "project");
+            let epic = super::work_identity::context_from_params(&params, "epic");
+            let identity = super::work_identity::durable_identity(
+                WorkIdentitySubjectKind::Run,
+                run_id.as_str(),
+                &bead,
+                Some(&issue.title),
+                issue.revision.as_deref(),
+                Some(&repo),
+                project,
+                epic,
+            )?;
             let payload = match &source {
                 super::spec::SpecSource::File(path) => json!({
-                    "runId": row.run_id,
+                    "runId": run_id.as_str(),
                     "source": "file",
                     "specPath": path,
                     "deprecated": true,
-                    "beadTitle": issue.title,
+                    "beadId": bead,
+                    "beadTitle": identity.bead.title.clone(),
+                    "beadRevision": issue.revision,
+                    "repo": repo,
+                    "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
+                    "project": identity.project.clone(),
+                    "epic": identity.epic.clone(),
                 }),
                 super::spec::SpecSource::Bead(bead_id) => json!({
-                    "runId": row.run_id,
+                    "runId": run_id.as_str(),
                     "source": "bead",
                     "beadId": bead_id,
-                    "beadTitle": issue.title,
+                    "beadTitle": identity.bead.title.clone(),
+                    "beadRevision": issue.revision,
+                    "repo": repo,
+                    "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
+                    "project": identity.project.clone(),
+                    "epic": identity.epic.clone(),
                 }),
             };
-            on_ledger(&ctx.ledger, move |l| {
-                l.append_event(Some(&run_for_event), "forged.run.spec", payload)
+            let row = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.create_run_with_identity(new_run, definition, payload, identity)
             })
             .await?;
+            crate::failpoint::hit("run.start.bundle.after");
             Ok(json!({
                 "run_id": row.run_id,
                 "bead_id": row.bead_id,
@@ -428,6 +448,108 @@ pub(crate) async fn run_start_with_definition(
         }
     })
     .await
+}
+
+async fn recover_applied_run_start(
+    ctx: &Ctx,
+    request: &OperationRequest,
+    run_id: &RunId,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "run_start".to_owned();
+    let key = request.idempotency_key.clone();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let hash = request_sha256(request)
+        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
+    if row.request_sha256 != hash {
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            "run start key was stored with a different request",
+        ));
+    }
+    let Some(result) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
+        return Ok(None);
+    };
+    let response = ok_response(&row.operation_id, false, result);
+    let operation_id = row.operation_id;
+    let stored = response.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.resolve_interrupted_operation(&operation_id, &stored)
+    })
+    .await?;
+    let mut replayed = response;
+    replayed.reused = true;
+    Ok(Some(replayed))
+}
+
+/// Recover the applied side of an interrupted atomic run creation without
+/// consulting Beads. The operation id is written into `forged.run.spec` in
+/// the same transaction as the run and identity, so a matching event proves
+/// this exact safe-retry operation committed its effect.
+async fn replay_atomic_run_start(
+    ctx: &Ctx,
+    run_id: &RunId,
+    operation_id: &str,
+) -> Result<Option<Value>, Failure> {
+    let run_name = run_id.as_str().to_owned();
+    let operation_id = operation_id.to_owned();
+    let events = on_ledger(&ctx.ledger, {
+        let run_name = run_name.clone();
+        move |ledger| ledger.list_events(Some(&run_name), 0, 4096)
+    })
+    .await?;
+    let landed = events.iter().any(|event| {
+        event.kind == "forged.run.spec"
+            && serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("operationId")
+                        .and_then(Value::as_str)
+                        .map(|stored| stored == operation_id)
+                })
+                .unwrap_or(false)
+    });
+    if !landed {
+        return Ok(None);
+    }
+    let identity = on_ledger(&ctx.ledger, {
+        let run_name = run_name.clone();
+        move |ledger| ledger.get_work_identity(WorkIdentitySubjectKind::Run, &run_name)
+    })
+    .await?
+    .ok_or_else(|| Failure::internal("atomic run creation event has no durable identity"))?;
+    identity
+        .validate_for_storage()
+        .map_err(|error| Failure::internal(format!("stored work identity is invalid: {error}")))?;
+    let (run, definition) = on_ledger(&ctx.ledger, move |ledger| {
+        Ok((
+            ledger.get_run(&run_name)?,
+            ledger.get_run_definition(&run_name)?,
+        ))
+    })
+    .await?;
+    let definition = definition
+        .ok_or_else(|| Failure::internal("atomic run creation has no durable definition"))?;
+    let package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
+        .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
+    Ok(Some(json!({
+        "run_id": run.run_id,
+        "bead_id": run.bead_id,
+        "branch": run.branch,
+        "base_ref": run.base_ref,
+        "protocol_ref": package.protocol_ref,
+        "profile_ref": package.profile_ref,
+        "roster_ref": package.roster_ref,
+        "package_sha256": definition.package_sha256,
+        "profile_sha256": definition.profile_sha256,
+        "roster_sha256": definition.roster_sha256,
+    })))
 }
 
 /// The repo's default branch, from its `origin/HEAD` symref; falls back to
@@ -481,6 +603,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
+        let identity =
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
         let expected_assignee = crate::core::run_holder(&view.run.bead_id);
         let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
             Ok(issue) => {
@@ -623,6 +747,7 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         Ok(json!({
             "run": {
                 "runId": view.run.run_id,
+                "identity": identity,
                 "beadId": view.run.bead_id,
                 "repo": view.run.repo,
                 "baseRef": view.run.base_ref,
@@ -1835,9 +1960,26 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         Vec::with_capacity(snapshot.runs.len() + epics.len());
     for run in &snapshot.runs {
         let epic = epics.remove(&run.run_id).is_some();
+        let identity_kind = if epic {
+            WorkIdentitySubjectKind::Epic
+        } else {
+            WorkIdentitySubjectKind::Run
+        };
+        let identity = snapshot
+            .work_identities
+            .get(&(identity_kind, run.run_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                Failure::internal(format!(
+                    "{} {:?} has no durable work identity",
+                    identity_kind.as_str(),
+                    run.run_id
+                ))
+            })?;
         let mut entry = json!({
             "id": run.run_id.clone(),
             "kind": if epic { "epic" } else { "slice" },
+            "identity": identity,
             "beadId": run.bead_id.clone(),
             "repo": run.repo.clone(),
             "baseRef": run.base_ref.clone(),
@@ -1868,6 +2010,13 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
     }
     // Whatever is left has a start event and no run row: a real epic.
     for (epic_id, (ts, payload)) in epics {
+        let identity = snapshot
+            .work_identities
+            .get(&(WorkIdentitySubjectKind::Epic, epic_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                Failure::internal(format!("epic {epic_id:?} has no durable work identity"))
+            })?;
         let field = |name: &str| match payload.get(name) {
             Some(value @ Value::String(_)) => value.clone(),
             _ => Value::Null,
@@ -1885,6 +2034,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         let mut entry = json!({
             "id": epic_id,
             "kind": "epic",
+            "identity": identity,
             "beadId": bead_id,
             "repo": field("repo"),
             "baseRef": field("baseRef"),
@@ -2168,16 +2318,15 @@ async fn operator_queue(
         )
         .await;
         let issue = beads.get(&bead_id);
-        let title = issue
-            .map(|issue| issue.title.trim())
-            .filter(|title| !title.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "Legacy {} {bead_id}",
-                    entry["kind"].as_str().unwrap_or("work")
-                )
-            });
+        // Human-readable identity is frozen with the work. The bounded
+        // Beads read below remains authoritative for claim health and
+        // repository membership, but a later rename or outage must not
+        // rewrite historical display state.
+        let title = entry
+            .pointer("/identity/displayTitle")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let expected = crate::core::run_holder(&bead_id);
         let controller_state = controller.get("state").and_then(Value::as_str);
         let controller_live = controller_state == Some("running");
@@ -2330,7 +2479,7 @@ async fn operator_queue(
             _ => "Submit a detached controller when this work should start".to_owned(),
         };
         if let Some(object) = entry.as_object_mut() {
-            object.insert("title".to_owned(), json!(title));
+            object.insert("title".to_owned(), Value::String(title));
             object.insert(
                 "repositoryScope".to_owned(),
                 json!({

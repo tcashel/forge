@@ -11,6 +11,7 @@ pub mod error;
 pub mod herdr_ownership;
 pub mod ids;
 pub mod packet;
+pub mod work_identity;
 
 pub use admission::{
     AdmissionCandidateV1, AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1,
@@ -44,4 +45,9 @@ pub use packet::{
     AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
     ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
     WorkPacket,
+};
+pub use work_identity::{
+    normalize_repository_path, repository_label, work_display_title, WorkIdentityBeadV1,
+    WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
+    WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError, WORK_IDENTITY_SCHEMA_V1,
 };

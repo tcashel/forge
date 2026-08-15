@@ -50,6 +50,10 @@ pub struct IssueSummary {
     /// it is compared for equality and nothing else — never ordered, parsed,
     /// incremented, or assumed positive (bd 1.2.1 emits negative values).
     pub revision: Option<String>,
+    /// Authoritative Beads update time when the read shape carries it. Live
+    /// plan identity uses this stable source timestamp instead of making an
+    /// otherwise read-only projection vary with the wall clock.
+    pub updated_at: Option<String>,
 }
 
 /// A `revision` exactly as bd wrote it. A JSON number is rendered back to its
@@ -120,6 +124,12 @@ fn issue(value: &Value) -> Option<IssueSummary> {
             .map(str::to_owned),
         metadata: metadata(value),
         revision: revision(value),
+        updated_at: value
+            .get("updated_at")
+            .or_else(|| value.get("updatedAt"))
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned),
     })
 }
 
@@ -458,6 +468,7 @@ mod tests {
                 spec_id: None,
                 metadata: BTreeMap::new(),
                 revision: None,
+                updated_at: None,
             })
         );
     }
@@ -473,6 +484,7 @@ mod tests {
             "notes": "commit as you go",
             "spec_id": "spec-42",
             "metadata": {"gates": "cargo test", "rounds": 2},
+            "updated_at": "2026-08-14T00:00:00Z",
         }))
         .expect("projects");
         assert_eq!(projected.description, "## Context\nwhy");
@@ -481,6 +493,10 @@ mod tests {
         assert_eq!(projected.design, "touch points");
         assert_eq!(projected.notes, "commit as you go");
         assert_eq!(projected.spec_id.as_deref(), Some("spec-42"));
+        assert_eq!(
+            projected.updated_at.as_deref(),
+            Some("2026-08-14T00:00:00Z")
+        );
         assert_eq!(
             projected.metadata.get("gates").map(String::as_str),
             Some("cargo test")
