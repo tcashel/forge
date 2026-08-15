@@ -30,7 +30,7 @@ use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, SpecFence};
 
-const ATTEMPT_COLUMNS: &str =
+pub(crate) const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, revoke_scope, \
      fail_note, result_json, started_at, updated_at, last_heartbeat_at, ended_at";
 

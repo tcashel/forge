@@ -24,7 +24,7 @@ use crate::types::{
 const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
 const MACHINE_ADMITTED: &str = "forged.machine.admitted";
 
-const OPERATION_COLUMNS: &str =
+pub(crate) const OPERATION_COLUMNS: &str =
     "operation_id, name, idempotency_key, request_sha256, effect_class, run_id, \
      claim_token, state, response_json, created_at, updated_at";
 
@@ -51,7 +51,7 @@ fn operation_state_from_db(idx: usize, s: &str) -> Result<OperationState, rusqli
     }
 }
 
-fn operation_row(row: &rusqlite::Row<'_>) -> Result<OperationRow, rusqlite::Error> {
+pub(crate) fn operation_row(row: &rusqlite::Row<'_>) -> Result<OperationRow, rusqlite::Error> {
     Ok(OperationRow {
         operation_id: row.get(0)?,
         name: row.get(1)?,

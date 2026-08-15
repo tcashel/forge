@@ -63,7 +63,7 @@ fn as_u64(value: i64, what: &str) -> Result<u64, LedgerError> {
 
 /// The six aggregate columns every totals query selects, in the order
 /// [`sum_row`] decodes them.
-const TOTAL_SUMS: &str = "COALESCE(SUM(input_tokens), 0), \
+pub(crate) const TOTAL_SUMS: &str = "COALESCE(SUM(input_tokens), 0), \
      COALESCE(SUM(output_tokens), 0), \
      COALESCE(SUM(COALESCE(cache_read_tokens, 0)), 0), \
      COALESCE(SUM(COALESCE(cache_write_tokens, 0)), 0), \
@@ -71,7 +71,7 @@ const TOTAL_SUMS: &str = "COALESCE(SUM(input_tokens), 0), \
      COALESCE(SUM(CASE WHEN cost_usd IS NULL THEN 1 ELSE 0 END), 0)";
 
 /// The raw sums, still in SQLite's own types.
-type Sums = (i64, i64, i64, i64, f64, i64);
+pub(crate) type Sums = (i64, i64, i64, i64, f64, i64);
 
 fn sum_row(row: &rusqlite::Row<'_>) -> Result<Sums, rusqlite::Error> {
     Ok((
@@ -84,7 +84,7 @@ fn sum_row(row: &rusqlite::Row<'_>) -> Result<Sums, rusqlite::Error> {
     ))
 }
 
-fn totals_of(sums: Sums) -> Result<UsageTotals, LedgerError> {
+pub(crate) fn totals_of(sums: Sums) -> Result<UsageTotals, LedgerError> {
     let (input, output, cache_read, cache_write, cost_known, missing) = sums;
     Ok(UsageTotals {
         input_tokens: as_u64(input, "input_tokens")?,
@@ -94,6 +94,58 @@ fn totals_of(sums: Sums) -> Result<UsageTotals, LedgerError> {
         cost_usd_known: cost_known,
         rows_missing_cost: u32::try_from(missing)
             .map_err(|_| internal("rows_missing_cost overflows u32"))?,
+    })
+}
+
+pub(crate) const USAGE_COLUMNS: &str = "run_id, packet_id, attempt_id, provider, model, \
+    input_tokens, output_tokens, cache_read_tokens, cache_write_tokens, cost_usd, pricing_basis, \
+    rate_limit_used_percent, ts, web_search_requests";
+
+fn unsigned_row_value(row: &rusqlite::Row<'_>, index: usize, what: &str) -> rusqlite::Result<u64> {
+    let raw = row.get::<_, i64>(index)?;
+    u64::try_from(raw).map_err(|error| {
+        rusqlite::Error::FromSqlConversionFailure(
+            index,
+            rusqlite::types::Type::Integer,
+            format!("invalid {what} {raw}: {error}").into(),
+        )
+    })
+}
+
+fn optional_unsigned_row_value(
+    row: &rusqlite::Row<'_>,
+    index: usize,
+    what: &str,
+) -> rusqlite::Result<Option<u64>> {
+    row.get::<_, Option<i64>>(index)?
+        .map(|raw| {
+            u64::try_from(raw).map_err(|error| {
+                rusqlite::Error::FromSqlConversionFailure(
+                    index,
+                    rusqlite::types::Type::Integer,
+                    format!("invalid {what} {raw}: {error}").into(),
+                )
+            })
+        })
+        .transpose()
+}
+
+pub(crate) fn usage_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<UsageRecord> {
+    Ok(UsageRecord {
+        run_id: row.get(0)?,
+        packet_id: row.get(1)?,
+        attempt_id: row.get(2)?,
+        provider: row.get(3)?,
+        model: row.get(4)?,
+        input_tokens: unsigned_row_value(row, 5, "input_tokens")?,
+        output_tokens: unsigned_row_value(row, 6, "output_tokens")?,
+        cache_read_tokens: optional_unsigned_row_value(row, 7, "cache_read_tokens")?,
+        cache_write_tokens: optional_unsigned_row_value(row, 8, "cache_write_tokens")?,
+        cost_usd: row.get(9)?,
+        pricing_basis: row.get(10)?,
+        rate_limit_used_percent: row.get(11)?,
+        ts: row.get(12)?,
+        web_search_requests: optional_unsigned_row_value(row, 13, "web_search_requests")?,
     })
 }
 
@@ -232,18 +284,11 @@ impl Ledger {
     pub fn list_usage(&self, run_id: &str) -> Result<Vec<UsageRecord>, LedgerError> {
         let run_id = run_id.to_owned();
         self.submit(move |conn| {
-            let mut stmt = conn.prepare(
-                "SELECT run_id, packet_id, attempt_id, provider, model, \
-                        input_tokens, output_tokens, cache_read_tokens, \
-                        cache_write_tokens, cost_usd, pricing_basis, \
-                        rate_limit_used_percent, ts, web_search_requests \
-                 FROM usage WHERE run_id = ?1 ORDER BY usage_id",
-            )?;
-            let rows = stmt
-                .query_map([&run_id], usage_record_row)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(Into::into);
-            rows
+            let mut stmt = conn.prepare(&format!(
+                "SELECT {USAGE_COLUMNS} FROM usage WHERE run_id = ?1 ORDER BY usage_id"
+            ))?;
+            let rows = stmt.query_map([&run_id], usage_row)?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
         })
     }
 }

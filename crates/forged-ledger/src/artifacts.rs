@@ -3,41 +3,62 @@
 use rusqlite::{OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{refused, LedgerError};
+use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{AttemptArtifactCompactionRow, AttemptArtifactRow, NewAttemptArtifact};
 use forged_types::ErrorCode;
 
-const COLUMNS: &str = "attempt_id, run_id, packet_id, manifest_schema, manifest_path, \
+pub(crate) const COLUMNS: &str = "attempt_id, run_id, packet_id, manifest_schema, manifest_path, \
                        manifest_sha256, retention_class, created_at";
 
-fn row(value: &rusqlite::Row<'_>) -> Result<AttemptArtifactRow, rusqlite::Error> {
+pub(crate) fn row(value: &rusqlite::Row<'_>) -> Result<AttemptArtifactRow, rusqlite::Error> {
+    let manifest_schema: String = value.get(3)?;
+    if manifest_schema != "forged.attempt-artifacts/1" {
+        return Err(column_decode_error(
+            3,
+            "attempt artifact schema",
+            &manifest_schema,
+        ));
+    }
+    let retention_class: String = value.get(6)?;
+    if !matches!(retention_class.as_str(), "retain" | "compactable-success") {
+        return Err(column_decode_error(
+            6,
+            "attempt artifact retention class",
+            &retention_class,
+        ));
+    }
     Ok(AttemptArtifactRow {
         attempt_id: value.get(0)?,
         run_id: value.get(1)?,
         packet_id: value.get(2)?,
-        manifest_schema: value.get(3)?,
+        manifest_schema,
         manifest_path: value.get(4)?,
         manifest_sha256: value.get(5)?,
-        retention_class: value.get(6)?,
+        retention_class,
         created_at: value.get(7)?,
     })
 }
 
-const COMPACTION_COLUMNS: &str = "attempt_id, operation_id, tombstone_path, tombstone_sha256, \
+pub(crate) const COMPACTION_COLUMNS: &str =
+    "attempt_id, operation_id, tombstone_path, tombstone_sha256, \
                                   state, bytes_removed, created_at, completed_at";
 
-fn compaction_row(
+pub(crate) fn compaction_row(
     value: &rusqlite::Row<'_>,
 ) -> Result<AttemptArtifactCompactionRow, rusqlite::Error> {
+    let state: String = value.get(4)?;
+    if !matches!(state.as_str(), "in-progress" | "completed") {
+        return Err(column_decode_error(4, "artifact compaction state", &state));
+    }
     Ok(AttemptArtifactCompactionRow {
         attempt_id: value.get(0)?,
         operation_id: value.get(1)?,
         tombstone_path: value.get(2)?,
         tombstone_sha256: value.get(3)?,
-        state: value.get(4)?,
+        state,
         bytes_removed: value.get(5)?,
         created_at: value.get(6)?,
         completed_at: value.get(7)?,

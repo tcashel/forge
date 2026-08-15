@@ -12,7 +12,7 @@ use serde::Serialize;
 use serde_json::json;
 use sha2::{Digest, Sha256};
 
-use crate::error::{refused, LedgerError};
+use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
@@ -24,7 +24,8 @@ use crate::work_identity::{
     get_work_identity_tx, identity_replay_matches, insert_work_identity_tx, legacy_run_identity,
 };
 
-fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
+pub(crate) fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
+    let state = row.get::<_, String>(6)?;
     Ok(RunRow {
         run_id: row.get(0)?,
         bead_id: row.get(1)?,
@@ -32,10 +33,8 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
         base_ref: row.get(3)?,
         branch: row.get(4)?,
         protocol: row.get(5)?,
-        state: match row.get::<_, String>(6)?.as_str() {
-            "stopped" => RunState::Stopped,
-            _ => RunState::Active,
-        },
+        state: RunState::try_from(state.as_str())
+            .map_err(|_| column_decode_error(6, "run state", &state))?,
         stop_reason: row.get(7)?,
         created_at: row.get(8)?,
         updated_at: row.get(9)?,
@@ -67,7 +66,7 @@ fn run_row(row: &rusqlite::Row<'_>) -> Result<RunRow, rusqlite::Error> {
     })
 }
 
-const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
+pub(crate) const RUN_COLUMNS: &str = "run_id, bead_id, repo, base_ref, branch, protocol, state, \
                            stop_reason, created_at, updated_at, terminal_outcome, delivery_pr, \
                            delivery_sha, superseded_by";
 

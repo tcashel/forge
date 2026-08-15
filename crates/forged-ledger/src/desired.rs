@@ -19,7 +19,7 @@ use forged_types::{ErrorCode, OperationResponse};
 /// Finite default; an operator can re-authorize with a fresh submit.
 pub const DEFAULT_RESTART_BUDGET: u32 = 5;
 
-const COLUMNS: &str = "subject_kind, subject_id, desired_state, control_revision, \
+pub(crate) const COLUMNS: &str = "subject_kind, subject_id, desired_state, control_revision, \
     controller_generation, predecessor_generation, restart_budget, restart_used, \
     next_wake_at, last_progress_at, last_outcome, last_error, exhausted_at, \
     reconcile_token, reconcile_lease_until, created_at, updated_at";
@@ -60,7 +60,7 @@ where
         .transpose()
 }
 
-fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
+pub(crate) fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
     Ok(DesiredWorkRow {
         subject_kind: enum_column(row, 0, "desired-work subject kind")?,
         subject_id: row.get(1)?,

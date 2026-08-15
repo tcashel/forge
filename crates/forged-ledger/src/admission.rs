@@ -26,7 +26,8 @@ use crate::types::{
     AdmissionReservationRow, AdmissionReservationState, DesiredState, DesiredSubjectKind,
 };
 
-const RESERVATION_COLUMNS: &str = "reservation_id, decision_id, work_key, subject_kind, \
+pub(crate) const RESERVATION_COLUMNS: &str =
+    "reservation_id, decision_id, work_key, subject_kind, \
     subject_id, control_revision, repository, provider, model, resource_class, state, \
     owner_kind, owner_id, recovery_deadline, last_error, created_at, updated_at, released_at";
 const RESERVATION_COLUMNS_R: &str = "r.reservation_id, r.decision_id, r.work_key, r.subject_kind, \
@@ -97,8 +98,21 @@ fn resource_class(index: usize, raw: &str) -> rusqlite::Result<AdmissionResource
     }
 }
 
-fn reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdmissionReservationRow> {
+pub(crate) fn reservation_row(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AdmissionReservationRow> {
     let state_raw: String = row.get(10)?;
+    let owner_kind: Option<String> = row.get(11)?;
+    if owner_kind
+        .as_deref()
+        .is_some_and(|value| !matches!(value, "controller" | "attempt"))
+    {
+        return Err(column_decode_error(
+            11,
+            "admission reservation owner kind",
+            owner_kind.as_deref().unwrap_or_default(),
+        ));
+    }
     Ok(AdmissionReservationRow {
         reservation_id: row.get(0)?,
         decision_id: row.get(1)?,
@@ -118,7 +132,7 @@ fn reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdmissionReserva
         resource_class: resource_class(9, &row.get::<_, String>(9)?)?,
         state: AdmissionReservationState::try_from(state_raw.as_str())
             .map_err(|_| column_decode_error(10, "admission reservation state", &state_raw))?,
-        owner_kind: row.get(11)?,
+        owner_kind,
         owner_id: row.get(12)?,
         recovery_deadline: row.get(13)?,
         last_error: row.get(14)?,
@@ -156,9 +170,20 @@ pub(crate) fn latest_admission_decisions_tx(
     let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     let mut out = Vec::new();
     for raw in rows {
-        out.push(serde_json::from_str(&raw?)?);
+        out.push(decode_admission_decision(&raw?)?);
     }
     Ok(out)
+}
+
+pub(crate) fn decode_admission_decision(raw: &str) -> Result<AdmissionDecisionV1, LedgerError> {
+    let decision: AdmissionDecisionV1 = serde_json::from_str(raw)?;
+    if decision.schema != ADMISSION_DECISION_SCHEMA_V1 {
+        return Err(internal(format!(
+            "unsupported stored admission decision schema {:?}",
+            decision.schema
+        )));
+    }
+    Ok(decision)
 }
 
 fn packet_resource(body: &str) -> Result<(String, String, AdmissionResourceClass), LedgerError> {
@@ -896,7 +921,7 @@ fn snapshot_tx(
             [&reservation.decision_id],
             |row| row.get(0),
         )?;
-        reservation_decisions.push(serde_json::from_str(&raw)?);
+        reservation_decisions.push(decode_admission_decision(&raw)?);
     }
     Ok(AdmissionLedgerSnapshot {
         as_of: now_iso(),
@@ -1419,7 +1444,7 @@ impl Ledger {
                 stmt.query_map(rusqlite::params![kind, id], |row| row.get::<_, String>(0))?;
             let mut out = Vec::new();
             for raw in rows {
-                out.push(serde_json::from_str(&raw?)?);
+                out.push(decode_admission_decision(&raw?)?);
             }
             Ok(out)
         })

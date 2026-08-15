@@ -26,6 +26,7 @@ mod history;
 mod inventory;
 mod ledger;
 mod migrations;
+mod observation;
 mod operations;
 mod owned_herdr;
 mod packets;
@@ -40,6 +41,10 @@ pub use error::LedgerError;
 pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
 pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
+pub use observation::{
+    EpicChildRunLink, WorkObservationEvents, WorkObservationSnapshot,
+    WORK_OBSERVATION_MAX_EVENT_LIMIT,
+};
 pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;
 pub use types::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,

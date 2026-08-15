@@ -18,7 +18,7 @@ use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::types::NewRun;
 
-const IDENTITY_COLUMNS: &str = "schema, subject_kind, subject_id, bead_id, bead_title, \
+pub(crate) const IDENTITY_COLUMNS: &str = "schema, subject_kind, subject_id, bead_id, bead_title, \
     bead_revision, repository_path, repository_label, project_id, project_title, \
     epic_id, epic_title, display_title, captured_at, source";
 
@@ -65,7 +65,7 @@ fn optional_context(
     }
 }
 
-fn identity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkIdentityV1> {
+pub(crate) fn identity_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkIdentityV1> {
     let schema: String = row.get(0)?;
     if schema != WORK_IDENTITY_SCHEMA_V1 {
         return Err(column_decode_error(0, "work identity schema", &schema));
