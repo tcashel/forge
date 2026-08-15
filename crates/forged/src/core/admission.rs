@@ -583,10 +583,13 @@ async fn admit_once(
             decisions: decisions.clone(),
             recovery_deadline,
         };
-        on_ledger(&ctx.ledger, move |ledger| {
+        crate::failpoint::hit("admission.batch.commit.before");
+        let reservations = on_ledger(&ctx.ledger, move |ledger| {
             ledger.commit_admission_batch(write)
         })
-        .await?
+        .await?;
+        crate::failpoint::hit("admission.batch.commit.after");
+        reservations
     };
     let by_subject = reservations
         .into_iter()
@@ -776,6 +779,7 @@ async fn admit_packet_facts_once(
         .pop()
         .ok_or_else(|| Failure::internal("packet admission produced no decision"))?;
     let recovery_deadline = deadline_after(&now_iso(), RESERVATION_RECOVERY_SECONDS)?;
+    crate::failpoint::hit("admission.batch.commit.before");
     let reservations = on_ledger(&ctx.ledger, {
         let decision = decision.clone();
         move |ledger| {
@@ -787,6 +791,7 @@ async fn admit_packet_facts_once(
         }
     })
     .await?;
+    crate::failpoint::hit("admission.batch.commit.after");
     Ok(AdmissionResult {
         reservation: reservations.into_iter().next(),
         decision,

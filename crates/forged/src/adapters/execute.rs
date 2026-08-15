@@ -483,6 +483,7 @@ pub async fn execute_packet(
         })
         .await?
     };
+    failpoint::hit("admission.reservation.transfer.after");
     drop(admission_guard);
     run_attempt(
         ctx,
@@ -1352,6 +1353,7 @@ async fn run_attempt(
         &session_evidence,
     )
     .await?;
+    failpoint::hit("provider.result.recorded.after");
 
     // 7. Settle. Every arm BINDS rather than returns, so the three settle
     // paths share one exit and none of them can skip the release below.

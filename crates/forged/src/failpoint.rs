@@ -17,6 +17,13 @@
 //! `bd.claim.after`, `bd.reclaim.before`, `bd.reclaim.after`,
 //! `guardian.start`, `git.push.before`, `git.push.after`, `gh.call.before`,
 //! `gh.call.after`.
+//! `admission.batch.commit.before` and `admission.batch.commit.after` fence
+//! the atomic admission decision/reservation write; the latter represents a
+//! committed response that the caller has not yet observed.
+//! `admission.reservation.transfer.after` is the first boundary after an
+//! admitted reservation belongs to its controller or attempt.
+//! `provider.result.recorded.after` is after immutable provider evidence is
+//! joined to the attempt and before that attempt is settled.
 //! `packet.materialize.before` is the post-claim, pre-spawn boundary: the
 //! attempt row is `running` and nothing has been written to the packet
 //! directory yet, so a test paused there can make the materialization fail

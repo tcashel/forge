@@ -572,6 +572,7 @@ async fn reconcile_claimed(
         Ok(())
     })
     .await?;
+    crate::failpoint::hit("admission.reservation.transfer.after");
     match handoff::spawn(
         ctx,
         &reserved.subject_id,

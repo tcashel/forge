@@ -1276,6 +1276,7 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 })
                 .await?
             };
+            crate::failpoint::hit("admission.reservation.transfer.after");
             drop(admission_guard);
             // The claim is what fenced these bytes, so the body is written
             // only once it has succeeded. An external seat on the

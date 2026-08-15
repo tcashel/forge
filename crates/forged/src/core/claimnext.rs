@@ -281,6 +281,7 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             })
             .await?
         };
+        crate::failpoint::hit("admission.reservation.transfer.after");
         drop(admission_guard);
         // The claim fenced these bytes; write them where the packet contract
         // already tells the resuming seat to read them. An external seat

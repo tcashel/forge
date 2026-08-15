@@ -1715,6 +1715,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         {
             return err_response(&req.idempotency_key, &error);
         }
+        crate::failpoint::hit("admission.reservation.transfer.after");
     }
     let response = fenced_authorizing_desired(
         ctx,
