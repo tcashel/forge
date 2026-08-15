@@ -40,6 +40,7 @@ if (!Array.isArray(ui.capabilities) || !ui.capabilities.length ||
     !ui.capabilities.every((value) => typeof value === 'string' && value.trim())) process.exit(1);
 if (!Array.isArray(ui.defaultPrompt) || ui.defaultPrompt.length < 1 || ui.defaultPrompt.length > 3 ||
     !ui.defaultPrompt.every((value) => typeof value === 'string' && value.trim() && value.length <= 128)) process.exit(1);
+if (ui.defaultPrompt.some((value) => value.includes('/forged:'))) process.exit(1);
 NODE
 }
 
@@ -53,7 +54,86 @@ for (const manifest of [codex, claude]) {
   if (manifest.name !== 'forged' || typeof manifest.version !== 'string' || !manifest.version.trim()) process.exit(1);
   if (manifest.skills !== './skills/' || !manifest.description?.trim() || !manifest.author?.name?.trim()) process.exit(1);
 }
-if (codex.version !== claude.version) process.exit(1);
+for (const key of ['version', 'description', 'homepage', 'repository', 'license', 'skills']) {
+  if (codex[key] !== claude[key]) process.exit(1);
+}
+if (codex.author.name !== claude.author.name) process.exit(1);
+NODE
+}
+
+check_manage_work_contract() {
+  node - "$1" "$2" <<'NODE'
+const fs = require('fs');
+const [skillPath, fixturePath] = process.argv.slice(2);
+const skill = fs.readFileSync(skillPath, 'utf8');
+const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+
+const requiredSkillText = [
+  'name: manage-work',
+  '../plan/SKILL.md',
+  '../critique/SKILL.md',
+  '../adjudicate/SKILL.md',
+  '../dispatch/SKILL.md',
+  '../run-epic/SKILL.md',
+  'forged-execution-approval/1',
+  'forged definition validate',
+  'forged doctor',
+  'forged service status',
+  'bd comments add',
+  'metadata.repository',
+  'BEADS_DIR',
+];
+if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
+
+if (fixture.schema !== 'forged.manage-work-intent-fixtures/1' ||
+    fixture.purpose !== 'validation-only' ||
+    fixture.budgetScope !== 'manage-work router only; delegated sibling skills enforce their own contracts' ||
+    !Array.isArray(fixture.cases)) process.exit(1);
+if (Object.keys(fixture).sort().join('\n') !== ['budgetScope', 'cases', 'purpose', 'schema'].join('\n')) process.exit(1);
+
+const expected = new Map(Object.entries({
+  observe: ['observe', 'none', 'read-only'],
+  explore: ['explore', 'none', 'discuss'],
+  plan: ['plan', 'plan', 'delegate'],
+  revise: ['revise', 'plan', 'delegate'],
+  critique: ['critique', 'critique', 'delegate'],
+  adjudicate: ['adjudicate', 'adjudicate', 'delegate'],
+  'plan-approval': ['plan-approval', 'none', 'no-execution'],
+  'execute-slice': ['execute-slice', 'dispatch', 'execute-once'],
+  'execute-epic': ['execute-epic', 'run-epic', 'execute-once'],
+  'ambiguous-approval': ['ambiguous-approval', 'none', 'refuse'],
+  'stale-approval': ['stale-approval', 'none', 'refuse'],
+  status: ['status', 'none', 'read-only'],
+  control: ['control', 'none', 'defer'],
+  'external-context': ['external-context', 'none', 'discuss'],
+}));
+const effectKeys = [
+  'approvalComments', 'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits',
+  'controlCalls', 'serviceMutations', 'providerCalls', 'githubWrites',
+].sort();
+const seen = new Set();
+for (const entry of fixture.cases) {
+  if (!entry || typeof entry !== 'object' || seen.has(entry.id) || !expected.has(entry.id)) process.exit(1);
+  if (Object.keys(entry).sort().join('\n') !==
+      ['decision', 'delegate', 'id', 'request', 'result', 'routerMutationBudget'].join('\n')) process.exit(1);
+  seen.add(entry.id);
+  if (typeof entry.request !== 'string' || !entry.request.trim()) process.exit(1);
+  const [decision, delegate, result] = expected.get(entry.id);
+  if (entry.decision !== decision || entry.delegate !== delegate || entry.result !== result) process.exit(1);
+  const budget = entry.routerMutationBudget;
+  if (!budget || Object.keys(budget).sort().join('\n') !== effectKeys.join('\n')) process.exit(1);
+  if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
+
+  const expectedNonzero = entry.id === 'execute-slice'
+    ? {approvalComments: 1, runStarts: 1, runSubmits: 1}
+    : entry.id === 'execute-epic'
+      ? {approvalComments: 1, epicStarts: 1, epicSubmits: 1}
+      : {};
+  for (const key of effectKeys) {
+    if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
+  }
+}
+if (seen.size !== expected.size) process.exit(1);
 NODE
 }
 
@@ -135,6 +215,7 @@ required=(
   "$plugin/skills/plan/research.md"
   "$plugin/skills/plan/epic.md"
   "$plugin/skills/plan/checklist.md"
+  "$plugin/skills/manage-work/intent-fixtures.json"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] && pass "required companion $path" || fail "required companion $path"
@@ -148,9 +229,14 @@ check "Codex interface" check_codex_interface "$plugin/.codex-plugin/plugin.json
 check "dual-host manifest contract" check_manifest_contract
 check "marketplace source contract" check_marketplaces
 check "manifest/workspace version parity" check_version_parity
+check "manage-work intent fixture JSON" check_json \
+  "$plugin/skills/manage-work/intent-fixtures.json"
+check "manage-work authority and mutation contract" check_manage_work_contract \
+  "$plugin/skills/manage-work/SKILL.md" \
+  "$plugin/skills/manage-work/intent-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
-[[ ${#skill_files[@]} -eq 6 ]] && pass "exactly six skills" || fail "exactly six skills"
+[[ ${#skill_files[@]} -eq 7 ]] && pass "exactly seven skills" || fail "exactly seven skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"

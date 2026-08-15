@@ -1,0 +1,119 @@
+{
+  "schema": "forged.manage-work-intent-fixtures/1",
+  "purpose": "validation-only",
+  "budgetScope": "manage-work router only; delegated sibling skills enforce their own contracts",
+  "cases": [
+    {
+      "id": "observe",
+      "request": "What ready work belongs to this repository?",
+      "decision": "observe",
+      "delegate": "none",
+      "result": "read-only",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "explore",
+      "request": "Help me think through this idea without recording it yet.",
+      "decision": "explore",
+      "delegate": "none",
+      "result": "discuss",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "plan",
+      "request": "Capture this as work we can execute.",
+      "decision": "plan",
+      "delegate": "plan",
+      "result": "delegate",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "revise",
+      "request": "Revise the acceptance criteria on this Bead.",
+      "decision": "revise",
+      "delegate": "plan",
+      "result": "delegate",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "critique",
+      "request": "Critique this Bead before anyone implements it.",
+      "decision": "critique",
+      "delegate": "critique",
+      "result": "delegate",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "adjudicate",
+      "request": "Resolve the recorded critique findings for this Bead.",
+      "decision": "adjudicate",
+      "delegate": "adjudicate",
+      "result": "delegate",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "plan-approval",
+      "request": "That plan looks good.",
+      "decision": "plan-approval",
+      "delegate": "none",
+      "result": "no-execution",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "execute-slice",
+      "request": "Execute the exact slice in the confirmation tuple.",
+      "decision": "execute-slice",
+      "delegate": "dispatch",
+      "result": "execute-once",
+      "routerMutationBudget": {"approvalComments": 1, "runStarts": 1, "runSubmits": 1, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "execute-epic",
+      "request": "Execute the exact epic in the confirmation tuple.",
+      "decision": "execute-epic",
+      "delegate": "run-epic",
+      "result": "execute-once",
+      "routerMutationBudget": {"approvalComments": 1, "runStarts": 0, "runSubmits": 0, "epicStarts": 1, "epicSubmits": 1, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "ambiguous-approval",
+      "request": "Do it, but there are two possible Beads in scope.",
+      "decision": "ambiguous-approval",
+      "delegate": "none",
+      "result": "refuse",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "stale-approval",
+      "request": "Use my earlier approval after the Bead changed.",
+      "decision": "stale-approval",
+      "delegate": "none",
+      "result": "refuse",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "status",
+      "request": "What is happening with this run?",
+      "decision": "status",
+      "delegate": "none",
+      "result": "read-only",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "control",
+      "request": "Pause this existing epic.",
+      "decision": "control",
+      "delegate": "none",
+      "result": "defer",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
+      "id": "external-context",
+      "request": "Use this supplied ticket summary to explore options without recording work.",
+      "decision": "external-context",
+      "delegate": "none",
+      "result": "discuss",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    }
+  ]
+}

@@ -1,7 +1,7 @@
 {
   "name": "forged",
   "version": "0.2.0",
-  "description": "Forge-owned lead-agent planning, critique, adjudication, setup, and typed handoff to Forged.",
+  "description": "Forge-owned conversational work management over native Beads and typed Forged handoff.",
   "author": {
     "name": "Tripp Cashel"
   },
@@ -12,15 +12,15 @@
   "skills": "./skills/",
   "interface": {
     "displayName": "forged",
-    "shortDescription": "Plan and adjudicate, then hand execution to Forged",
-    "longDescription": "Maintain native Bead specifications with one lead agent, critique and adjudicate them proportionally, then submit approved slices and epics to Forged for durable provider-neutral execution.",
+    "shortDescription": "Manage work conversationally through Beads and Forged",
+    "longDescription": "Use ordinary language to inspect, plan, critique, adjudicate, and explicitly submit native Bead work through one shared plugin and the durable Forged control plane.",
     "developerName": "Tripp Cashel",
     "category": "Development",
     "capabilities": ["Interactive", "Write"],
     "defaultPrompt": [
-      "Plan this work as a native Bead before execution.",
-      "Critique and adjudicate this Bead specification.",
-      "Submit the next ready Bead through Forged."
+      "Help me turn this request into managed work.",
+      "Show me this repository's work without changing anything.",
+      "Prepare this ready Bead for explicit execution approval."
     ]
   }
 }

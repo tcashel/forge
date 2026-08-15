@@ -1,11 +1,11 @@
 # forged lead-agent plugin
 
-**Plan with one agent. Keep the specification in Beads. Hand execution off.**
+**Talk to one agent. Keep the specification in Beads. Hand execution off.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
-It gives Claude and Codex the same six capabilities through one shared skill
-tree: planning, proportional critique, adjudication, operator setup, slice
-dispatch, and epic handoff.
+It gives Claude and Codex the same seven capabilities through one shared skill
+tree: automatic conversational routing, planning, proportional critique,
+adjudication, operator setup, slice dispatch, and epic handoff.
 
 ## Ownership
 
@@ -53,8 +53,14 @@ codex plugin marketplace add /absolute/path/to/forge
 codex plugin add forged@forge
 ```
 
-After installation, run `/forged:setup`. Then use:
+After installation, run `/forged:setup`. Then talk normally: ask the lead agent
+to explore an idea, plan or revise work, critique or adjudicate a Bead, inspect
+status, or prepare one exact ready subject for execution approval. The shared
+`manage-work` skill routes that intent without requiring a command name.
 
+Named skills remain available as explicit power-user and debugging surfaces:
+
+- `/forged:manage-work`
 - `/forged:plan`
 - `/forged:critique`
 - `/forged:adjudicate`
