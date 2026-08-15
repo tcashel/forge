@@ -36,6 +36,7 @@ const TRANSITION_SCHEMA: &str = "forged.runtime-transition/1";
 const SUPERVISOR_STATUS_SCHEMA: &str = "forged.supervisor-status/1";
 const RUNTIME_STATUS_SCHEMA: &str = "forged.runtime-status/1";
 const RUNTIME_OPERATION_SCHEMA: &str = "forged.runtime-operation/1";
+#[cfg(target_os = "macos")]
 const READY_TIMEOUT: Duration = Duration::from_secs(15);
 const STATUS_STALE_AFTER: Duration = Duration::from_secs(20);
 
@@ -391,6 +392,7 @@ impl RuntimePaths {
         })
     }
 
+    #[cfg(any(target_os = "macos", test))]
     fn target(&self) -> String {
         format!("{}/{}", self.domain, self.label)
     }
@@ -982,6 +984,7 @@ struct LaunchdObservation {
 }
 
 impl LaunchdObservation {
+    #[cfg(any(target_os = "macos", test))]
     fn absent(detail: impl Into<String>) -> Self {
         Self {
             loaded: false,
@@ -1082,6 +1085,7 @@ trait ServiceHost: Send + Sync {
 
 struct LaunchdHost;
 
+#[cfg(any(target_os = "macos", test))]
 fn launchd_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     text.lines().find_map(|line| {
         let trimmed = line.trim();
@@ -1092,6 +1096,7 @@ fn launchd_field<'a>(text: &'a str, name: &str) -> Option<&'a str> {
     })
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn launchd_arguments(text: &str) -> Vec<String> {
     let mut inside = false;
     let mut values = Vec::new();
@@ -1115,6 +1120,7 @@ fn launchd_arguments(text: &str) -> Vec<String> {
     values
 }
 
+#[cfg(any(target_os = "macos", test))]
 fn parse_launchd_print(
     paths: &RuntimePaths,
     success: bool,
