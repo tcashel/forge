@@ -49,6 +49,12 @@ pub(crate) async fn record_controller_identity_from_env() -> Result<(), String> 
     handoff::record_driver_identity_from_env().await
 }
 
+/// Hold a newly detached controller behind the exact desired-work generation
+/// that its submitter commits only after the child identity is durable.
+pub(crate) async fn await_controller_authorization_from_env(ctx: &Ctx) -> Result<(), Failure> {
+    handoff::await_controller_authorization_from_env(ctx).await
+}
+
 /// Upgrade durable state that predates frozen execution policy.
 ///
 /// This is the sole compatibility boundary for definition-backed runs and

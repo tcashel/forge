@@ -1139,6 +1139,104 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
 }
 
 #[test]
+fn detached_controller_waits_for_atomic_desired_authorization() {
+    let env = TestEnv::new("km-controller-desired-barrier");
+    start_run(&env, "bead-kdesired");
+    env.set_scenario("implement", "hang", 2);
+    let fp = env.root.join("fp-controller-desired-barrier");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let reached = fp.join("submit.desired.before.reached");
+    let submitter = env
+        .forged_cmd(&["run", "submit", "--run", "bead-kdesired"])
+        .env("FORGED_FAILPOINT", "submit.desired.before")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("submitter spawns");
+    wait_until("submitter pre-authorization boundary", || reached.exists());
+
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(
+            env.anvil
+                .join("runs/bead-kdesired/controller/controller.json"),
+        )
+        .expect("controller record before desired commit"),
+    )
+    .expect("controller record JSON");
+    let controller = record["driver"]["pid"]
+        .as_i64()
+        .and_then(|value| i32::try_from(value).ok())
+        .expect("controller pid");
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        process_group_alive(controller),
+        "controller waits alive for its exact desired epoch"
+    );
+    assert!(
+        env.provider_log()
+            .iter()
+            .all(|line| !line.starts_with("bead-kdesired/implementation/0")
+                || !line.contains(" start ")),
+        "no provider effect starts before desired authorization"
+    );
+    let ledger = env.ledger();
+    assert!(ledger
+        .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "bead-kdesired")
+        .expect("desired query")
+        .is_none());
+    ledger.close().expect("close");
+
+    std::fs::write(fp.join("submit.desired.before.release"), b"").expect("release desired commit");
+    let output = submitter.wait_with_output().expect("submitter exits");
+    assert!(
+        output.status.success(),
+        "submit failed: stdout={} stderr={} controller={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+        std::fs::read_to_string(
+            env.anvil
+                .join("runs/bead-kdesired/controller/controller-1.log")
+        )
+        .unwrap_or_default(),
+    );
+    wait_until("one authorized provider start", || {
+        env.provider_log()
+            .iter()
+            .filter(|line| {
+                line.starts_with("bead-kdesired/implementation/0") && line.contains(" start ")
+            })
+            .count()
+            == 1
+    });
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(forged_ledger::DesiredSubjectKind::Run, "bead-kdesired")
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.desired_state, forged_ledger::DesiredState::Running);
+    assert_eq!(desired.controller_generation, 1);
+    assert_eq!(desired.restart_used, 0);
+    ledger.close().expect("close");
+
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "bead-kdesired",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop: {stopped}");
+    wait_until("controller group cleanup", || {
+        !process_group_alive(controller)
+    });
+}
+
+#[test]
 fn confirmed_dead_controller_restarts_with_a_fresh_truthful_generation() {
     let env = TestEnv::new("km-controller-restart");
     start_run(&env, "bead-krestart");

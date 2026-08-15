@@ -223,6 +223,22 @@ fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
 fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
     let _serial = serialize_process_fixture();
     let env = TestEnv::new("supervise-restart-singleton");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read restart admission config"),
+    )
+    .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 8,
+        "providerActive": 4,
+        "repositoryWriteActive": 2,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize restart admission config"),
+    )
+    .expect("write restart admission config");
     start_run(&env, "run-supervised");
     env.set_scenario("implement", "hang", 2);
     let (code, submitted) = env.forged(&["run", "submit", "--run", "run-supervised"]);
@@ -237,6 +253,12 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
     assert_eq!(desired.desired_state, DesiredState::Running);
     assert_eq!(desired.controller_generation, 1);
     ledger.close().expect("close");
+
+    // The live provider now occupies the default repository-write slot.
+    // Adoption is observation and must still precede replacement admission.
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, "run-supervised") == 1
+    });
 
     let (code, adopted) = env.forged(&["supervise", "--once"]);
     assert_eq!(code, 0, "adopt tick: {adopted}");
@@ -321,7 +343,76 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
         .as_i64()
         .and_then(|pid| i32::try_from(pid).ok())
         .expect("second controller pid");
-    let _ = killpg(Pid::from_raw(second_pid), Signal::SIGKILL);
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-supervised",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "restart singleton test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop restart fixture: {cleanup}");
+    wait_until("second controller group death", || {
+        !process_group_alive(second_pid)
+    });
+}
+
+#[test]
+fn live_controller_adoption_bypasses_full_repository_capacity() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-adopt-full-capacity");
+    start_run(&env, "run-adopt-full");
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-adopt-full"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    wait_until("provider fills repository capacity", || {
+        implementation_starts(&env, "run-adopt-full") == 1
+    });
+
+    let (code, adopted) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "adopt tick: {adopted}");
+    assert_eq!(adopted["result"]["subjects"][0]["action"], json!("adopted"));
+    assert_eq!(
+        adopted["result"]["subjects"][0]["desiredWork"]["controllerGeneration"],
+        json!(1)
+    );
+    assert_eq!(implementation_starts(&env, "run-adopt-full"), 1);
+
+    let ledger = env.ledger();
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, "run-adopt-full", 2)
+        .expect("advance desired generation without replacing the live controller");
+    ledger.close().expect("close");
+    let (code, mismatch) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "mismatched-generation tick: {mismatch}");
+    assert_eq!(
+        mismatch["result"]["subjects"][0]["action"],
+        json!("attention")
+    );
+    assert_eq!(
+        mismatch["result"]["subjects"][0]["desiredWork"]["controllerGeneration"],
+        json!(2),
+        "an older live generation must never roll durable authority backward"
+    );
+    assert_eq!(implementation_starts(&env, "run-adopt-full"), 1);
+
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-adopt-full",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "full-capacity adoption test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop adoption fixture: {cleanup}");
+    wait_until("adoption fixture controller group death", || {
+        !process_group_alive(controller)
+    });
 }
 
 #[test]
@@ -458,7 +549,20 @@ fn foreground_mode_exits_cleanly_on_sigterm() {
     assert!(response["result"]["ticks"]
         .as_u64()
         .is_some_and(|ticks| ticks >= 1));
-    let _ = killpg(Pid::from_raw(controller), Signal::SIGKILL);
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-sigterm",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "SIGTERM test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop SIGTERM fixture: {cleanup}");
+    wait_until("SIGTERM fixture controller group death", || {
+        !process_group_alive(controller)
+    });
 }
 
 #[test]

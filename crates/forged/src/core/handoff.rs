@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
 use forged_ledger::{
-    DesiredSubjectKind, EffectClass, Ledger, OperationState, OwnedHerdrCleanupState, SlotOutcome,
+    DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState, OwnedHerdrCleanupState,
+    SlotOutcome,
 };
 use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
@@ -26,6 +27,10 @@ const CONTROLLER_FALLBACK: &str = "forged.controller.host.fallback";
 const CONTROLLER_RECOVERED: &str = "forged.controller.recovered";
 const RECORD_FILE: &str = "controller.json";
 const SUBMIT_LOCK_WAIT: Duration = Duration::from_secs(30);
+const CONTROLLER_AUTHORIZATION_WAIT: Duration = Duration::from_secs(30);
+const CONTROLLER_AUTHORIZATION_POLL: Duration = Duration::from_millis(25);
+const DRIVER_IDENTITY_ATTEMPTS: usize = 20;
+const DRIVER_IDENTITY_POLL: Duration = Duration::from_millis(50);
 const DRIVER_PID_ENV: &str = "FORGED_CONTROLLER_PID_PATH";
 const DRIVER_LSTART_ENV: &str = "FORGED_CONTROLLER_LSTART_PATH";
 const CONTROLLER_SCOPE_ENV: &str = "FORGED_CONTROLLER_SCOPE";
@@ -111,7 +116,7 @@ pub(crate) async fn record_driver_identity_from_env() -> Result<(), String> {
     }
     let pid = i32::try_from(std::process::id())
         .map_err(|_| "detached controller pid does not fit i32".to_owned())?;
-    let lstart = crate::adapters::ports::lstart_of(pid)
+    let lstart = await_lstart(pid)
         .await
         .ok_or_else(|| format!("cannot verify detached controller pid {pid}"))?;
     let pid_value = nix::unistd::Pid::from_raw(pid);
@@ -131,6 +136,16 @@ pub(crate) async fn record_driver_identity_from_env() -> Result<(), String> {
     std::fs::write(&pid_path, format!("{pid}\n"))
         .map_err(|error| format!("writing detached controller pid: {error}"))?;
     Ok(())
+}
+
+async fn await_lstart(pid: i32) -> Option<String> {
+    for _ in 0..DRIVER_IDENTITY_ATTEMPTS {
+        if let Some(lstart) = crate::adapters::ports::lstart_of(pid).await {
+            return Some(lstart);
+        }
+        tokio::time::sleep(DRIVER_IDENTITY_POLL).await;
+    }
+    None
 }
 
 fn controller_dir(ctx: &Ctx, id: &str) -> PathBuf {
@@ -355,17 +370,28 @@ fn parse_controller_context(
     id: Option<String>,
     generation: Option<String>,
 ) -> Result<Option<(Scope, String, u32)>, Failure> {
+    let Some((scope, id, generation)) = parse_controller_subject(scope, id, generation)? else {
+        return Ok(None);
+    };
+    if matches!(scope, Scope::Run) && id != run_id {
+        return Err(Failure::internal(format!(
+            "run controller {id} cannot own an attempt for run {run_id}"
+        )));
+    }
+    Ok(Some((scope, id, generation)))
+}
+
+fn parse_controller_subject(
+    scope: Option<String>,
+    id: Option<String>,
+    generation: Option<String>,
+) -> Result<Option<(Scope, String, u32)>, Failure> {
     match (scope, id, generation) {
         (None, None, None) => Ok(None),
         (Some(scope), Some(id), Some(generation)) => {
             let scope = match scope.as_str() {
-                "run" if id == run_id => Scope::Run,
+                "run" => Scope::Run,
                 "epic" => Scope::Epic,
-                "run" => {
-                    return Err(Failure::internal(format!(
-                        "run controller {id} cannot own an attempt for run {run_id}"
-                    )))
-                }
                 other => {
                     return Err(Failure::internal(format!(
                         "unknown detached controller scope {other:?}"
@@ -388,6 +414,74 @@ fn parse_controller_context(
             "detached controller ownership environment is incomplete",
         )),
     }
+}
+
+async fn wait_for_controller_authorization(
+    ledger: &Ledger,
+    scope: Scope,
+    id: &str,
+    generation: u32,
+    wait: Duration,
+) -> Result<(), Failure> {
+    let started = Instant::now();
+    loop {
+        let desired = ledger.get_desired_work(scope.desired_kind(), id)?;
+        match desired {
+            Some(row)
+                if row.desired_state == DesiredState::Running
+                    && row.controller_generation == generation
+                    && row.exhausted_at.is_none() =>
+            {
+                return Ok(())
+            }
+            Some(row) if row.controller_generation > generation => {
+                return Err(Failure::refused(
+                    ErrorCode::StaleClaimToken,
+                    format!(
+                        "detached {} controller {id} generation {generation} was superseded by generation {}",
+                        scope.noun(),
+                        row.controller_generation
+                    ),
+                ))
+            }
+            _ => {}
+        }
+        if started.elapsed() >= wait {
+            return Err(Failure {
+                code: ErrorCode::OperationInProgress,
+                message: format!(
+                    "detached {} controller {id} generation {generation} timed out waiting for durable desired-work authorization",
+                    scope.noun()
+                ),
+                recoverable: true,
+            });
+        }
+        tokio::time::sleep(CONTROLLER_AUTHORIZATION_POLL).await;
+    }
+}
+
+/// A detached child publishes its process identity before the submitter can
+/// atomically settle the submit operation and desired-work row. Do not let
+/// that child reach packet admission (or any later machine effect) during
+/// this necessary two-phase handoff. A submitter crash can still be recovered
+/// by another exact submit while the bounded child waits.
+pub(crate) async fn await_controller_authorization_from_env(ctx: &Ctx) -> Result<(), Failure> {
+    let Some((scope, id, generation)) = parse_controller_subject(
+        std::env::var(CONTROLLER_SCOPE_ENV).ok(),
+        std::env::var(CONTROLLER_ID_ENV).ok(),
+        std::env::var(CONTROLLER_GENERATION_ENV).ok(),
+    )?
+    else {
+        return Ok(());
+    };
+    wait_for_controller_authorization(
+        &ctx.ledger,
+        scope,
+        &id,
+        generation,
+        CONTROLLER_AUTHORIZATION_WAIT,
+    )
+    .await
 }
 
 /// Resolve the latest durable run-controller identity while the caller owns
@@ -454,21 +548,29 @@ fn controller_fence_target_from_record(
     }))
 }
 
-fn process_group_alive(group: i32) -> bool {
-    matches!(
-        nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None),
-        Ok(()) | Err(nix::errno::Errno::EPERM)
-    )
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProcessGroupState {
+    Alive,
+    Absent,
+    Unknown,
+}
+
+fn process_group_state(group: i32) -> ProcessGroupState {
+    match nix::sys::signal::kill(nix::unistd::Pid::from_raw(-group), None) {
+        Ok(()) | Err(nix::errno::Errno::EPERM) => ProcessGroupState::Alive,
+        Err(nix::errno::Errno::ESRCH) => ProcessGroupState::Absent,
+        Err(_) => ProcessGroupState::Unknown,
+    }
 }
 
 async fn await_process_group_death(group: i32, attempts: usize) -> bool {
     for _ in 0..attempts {
-        if !process_group_alive(group) {
+        if process_group_state(group) == ProcessGroupState::Absent {
             return true;
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    !process_group_alive(group)
+    process_group_state(group) == ProcessGroupState::Absent
 }
 
 /// Confirm a fenced controller cannot retain an effect-capable descendant.
@@ -481,8 +583,19 @@ pub(super) async fn kill_controller_confirmed(
     if target.owned_by_current_process {
         return Ok(false);
     }
-    if !process_group_alive(target.pid) {
-        return Ok(false);
+    match process_group_state(target.pid) {
+        ProcessGroupState::Absent => return Ok(false),
+        ProcessGroupState::Alive => {}
+        ProcessGroupState::Unknown => {
+            return Err(Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                    "controller generation {} process group {} liveness is unverifiable",
+                    target.generation, target.pid
+                ),
+                recoverable: true,
+            })
+        }
     }
     let current = crate::adapters::ports::lstart_of(target.pid).await;
     if current.as_deref() != Some(target.lstart.as_str()) {
@@ -646,18 +759,28 @@ pub(super) async fn recover_reserved_record(
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    if !pid_alive(pid) {
-        return Ok(None);
+    match process_group_state(pid) {
+        ProcessGroupState::Absent => return Ok(None),
+        ProcessGroupState::Alive => {}
+        ProcessGroupState::Unknown => {
+            return Err(Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                "{} {id} generation {reserved_generation} has unverifiable process-group liveness",
+                scope.noun()
+            ),
+                recoverable: true,
+            })
+        }
     }
     let current = crate::adapters::ports::lstart_of(pid).await;
     match (expected.as_deref(), current.as_deref()) {
         (Some(expected), Some(current)) if expected == current => {}
-        (Some(_), Some(_)) => return Ok(None), // PID reuse proves the controller dead.
         _ => {
             return Err(Failure {
                 code: ErrorCode::HostUnavailable,
                 message: format!(
-                    "{} {id} generation {reserved_generation} has an unverifiable pending identity",
+                    "{} {id} generation {reserved_generation} has a live process group but an unverifiable leader identity",
                     scope.noun()
                 ),
                 recoverable: true,
@@ -716,23 +839,28 @@ fn controller_state(
     pid: Option<i32>,
     expected: Option<&str>,
     current: Option<&str>,
-    pid_is_alive: bool,
+    group_state: ProcessGroupState,
 ) -> &'static str {
     if exit_code.is_some() {
-        return "exited";
+        return match (pid, expected, group_state) {
+            (Some(_), Some(_), ProcessGroupState::Absent) => "exited",
+            _ => "unknown",
+        };
     }
-    match (pid, expected, current) {
+    match (pid, expected, current, group_state) {
         // A record with no driver identity is not evidence of death and can
         // never authorize a replacement.
-        (None, _, _) => "unknown",
-        (Some(_), Some(expected), Some(current)) if expected == current && pid_is_alive => {
+        (None, _, _, _) => "unknown",
+        (Some(_), None, _, _) => "unknown",
+        (Some(_), Some(expected), Some(current), ProcessGroupState::Alive)
+            if expected == current =>
+        {
             "running"
         }
         // No identity answer proves neither life nor permission to duplicate
         // the controller. Say unknown, never "running".
-        (Some(_), _, None) if pid_is_alive => "unknown",
-        (Some(_), None, Some(_)) if pid_is_alive => "unknown",
-        _ => "vanished",
+        (Some(_), Some(_), _, ProcessGroupState::Alive | ProcessGroupState::Unknown) => "unknown",
+        (Some(_), Some(_), _, ProcessGroupState::Absent) => "vanished",
     }
 }
 
@@ -775,7 +903,8 @@ pub(super) async fn status_for(record: &Value) -> Value {
         pid,
         expected.as_deref(),
         current.as_deref(),
-        pid.is_some_and(pid_alive),
+        pid.map(process_group_state)
+            .unwrap_or(ProcessGroupState::Unknown),
     );
     let mut status = record.clone();
     if let Some(object) = status.as_object_mut() {
@@ -1174,7 +1303,7 @@ pub(super) async fn spawn(
         .ok()
         .map(|value| value.trim().to_owned())
         .filter(|value| !value.is_empty());
-    let current_lstart = crate::adapters::ports::lstart_of(pid).await;
+    let current_lstart = await_lstart(pid).await;
     if lstart.is_none() || lstart != current_lstart {
         if host.kill_confirmed(&session).await.is_ok() {
             runtime_admission.cancelled_after_confirmed_death()?;
@@ -1843,7 +1972,7 @@ pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 mod tests {
     use super::{
         controller_shell_line, controller_state, parse_controller_context, shell_quote, status_for,
-        Scope,
+        ProcessGroupState, Scope,
     };
     use serde_json::{json, Value};
     use std::path::Path;
@@ -1922,16 +2051,40 @@ mod tests {
     }
 
     #[test]
-    fn a_recycled_pid_is_never_projected_as_running() {
+    fn a_live_group_with_a_recycled_leader_is_unknown_not_dead() {
         assert_eq!(
             controller_state(
                 None,
                 Some(42),
                 Some("Thu Jan  1 00:00:00 1970"),
                 Some("Fri Jan  2 00:00:00 1970"),
-                true,
+                ProcessGroupState::Alive,
             ),
-            "vanished"
+            "unknown"
+        );
+    }
+
+    #[test]
+    fn terminal_status_clears_only_after_the_controller_group_is_absent() {
+        assert_eq!(
+            controller_state(
+                Some(0),
+                Some(42),
+                Some("Thu Jan  1 00:00:00 1970"),
+                None,
+                ProcessGroupState::Alive,
+            ),
+            "unknown"
+        );
+        assert_eq!(
+            controller_state(
+                Some(0),
+                Some(42),
+                Some("Thu Jan  1 00:00:00 1970"),
+                None,
+                ProcessGroupState::Absent,
+            ),
+            "exited"
         );
     }
 

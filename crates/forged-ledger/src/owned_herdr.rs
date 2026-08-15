@@ -223,10 +223,27 @@ fn validate_registration_tx(
                     |row| Ok((row.get(0)?, row.get(1)?)),
                 )
                 .optional()?;
-            if desired != Some((i64::from(*generation), "running".to_owned())) {
+            // An initial submit cannot publish desired_work until AFTER the
+            // non-idempotent pane start returns. The exact active controller
+            // reservation is the pre-spawn authority for registering that
+            // pane; the detached child independently waits for the matching
+            // running desired epoch before it can dispatch any machine
+            // effect. Restarts normally already have the desired epoch.
+            let owner_id = format!("{}:{}:{generation}", subject.kind.as_str(), subject.id);
+            let reserved: bool = conn.query_row(
+                "SELECT EXISTS(
+                   SELECT 1 FROM admission_reservations
+                   WHERE subject_kind = ?1 AND subject_id = ?2
+                     AND state = 'active' AND owner_kind = 'controller'
+                     AND owner_id = ?3
+                 )",
+                rusqlite::params![subject.kind.as_str(), subject.id, owner_id],
+                |row| row.get(0),
+            )?;
+            if desired != Some((i64::from(*generation), "running".to_owned())) && !reserved {
                 return Err(refused(
                     ErrorCode::OperationInProgress,
-                    "owned controller is not the exact running desired epoch",
+                    "owned controller has neither the exact running desired epoch nor its active spawn reservation",
                 ));
             }
         }
