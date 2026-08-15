@@ -1,12 +1,12 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the thirty-four public core functions, the CLI path and the MCP tool path produce
+//! the forty-three public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
 mod support;
 
 use serde_json::{json, Value};
-use support::{McpClient, TestEnv};
+use support::{fabricate_run, McpClient, TestEnv};
 
 /// Normalize the minted operationId (a per-call uuid) out of an envelope;
 /// derived and read-default ids are deterministic and stay.
@@ -18,6 +18,38 @@ fn normalized(mut envelope: Value) -> Value {
     }
     if envelope["result"]["queue"]["asOf"].is_string() {
         envelope["result"]["queue"]["asOf"] = json!("<sampled>");
+    }
+    if envelope["result"]["schema"] == json!("forged.work-history/1") {
+        envelope["result"]["asOf"] = json!("<sampled>");
+    }
+    if envelope["result"]["schema"] == json!("forged.provider-session-inventory/1") {
+        envelope["result"]["asOf"] = json!("<sampled>");
+    }
+    if envelope["result"]["capturedAt"]["ledger"].is_string() {
+        envelope["result"]["capturedAt"]["ledger"] = json!("<sampled>");
+    }
+    if envelope["result"]["capturedAt"]["beads"].is_string() {
+        envelope["result"]["capturedAt"]["beads"] = json!("<sampled>");
+    }
+    if envelope["result"]["capturedAt"]["history"].is_string() {
+        envelope["result"]["capturedAt"]["history"] = json!("<sampled>");
+    }
+    if let Some(entries) = envelope["result"]["runs"].as_array_mut() {
+        for entry in entries {
+            if entry["progressAgeInput"]["asOf"].is_string() {
+                entry["progressAgeInput"]["asOf"] = json!("<sampled>");
+            }
+        }
+    }
+    if let Some(groups) = envelope["result"]["queue"]["groups"].as_array_mut() {
+        for entry in groups
+            .iter_mut()
+            .flat_map(|group| group["entries"].as_array_mut().into_iter().flatten())
+        {
+            if entry["progressAgeInput"]["asOf"].is_string() {
+                entry["progressAgeInput"]["asOf"] = json!("<sampled>");
+            }
+        }
     }
     envelope
 }
@@ -36,9 +68,12 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_thirty_four_tools_match_their_cli_counterparts() {
+fn all_forty_three_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
+    fabricate_run(&env, "par-repository");
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    env.set_bead_repository("bead-par-repository", &repository);
     let mut mcp = McpClient::new(&env);
 
     // The server declares exactly the public operation tools.
@@ -48,9 +83,13 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
         "claim_next",
         "artifact_verify",
         "artifact_compact",
+        "attention_acknowledge",
+        "attention_reopen",
+        "attention_resolve",
         "doctor",
         "definition_validate",
         "events_tail",
+        "operations_overview",
         "overview",
         "epic_advance",
         "epic_drive",
@@ -65,6 +104,7 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
         "packet_complete",
         "packet_fail",
         "reconcile",
+        "review_publish",
         "run_advance",
         "run_accept_risk",
         "run_revise_roster",
@@ -73,15 +113,19 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
         "run_stop",
         "run_submit",
         "session_list",
+        "session_inventory",
         "session_message",
         "session_read",
         "session_stop",
         "usage_ingest",
         "usage_report",
+        "work_detail",
         "work_list",
+        "work_history",
+        "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the thirty-four tools, exactly");
+    assert_eq!(tools, expected, "the forty-three tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -125,11 +169,193 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
         description.contains("Takes no id"),
         "work_list must state that it takes no id: {description}"
     );
+    assert!(
+        description.contains("params.repo"),
+        "work_list must describe its optional repository selector: {description}"
+    );
+    let repository_schema = work_list
+        .pointer("/inputSchema/properties/params/properties/repo")
+        .cloned()
+        .unwrap_or(Value::Null);
+    assert!(
+        repository_schema.to_string().contains("string"),
+        "work_list advertises params.repo as a string: {repository_schema}"
+    );
+    let work_history = mcp.tool("work_history");
+    let history_schema = work_history
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "hour",
+        "day",
+        "week",
+        "repository",
+        "epic",
+        "stage",
+        "provider",
+    ] {
+        assert!(
+            history_schema.contains(value),
+            "work_history advertises closed value {value}: {history_schema}"
+        );
+    }
+    let session_inventory = mcp.tool("session_inventory");
+    assert_eq!(
+        session_inventory.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/agent-sessions.html"))
+    );
+    let inventory_schema = session_inventory
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "running",
+        "revoking",
+        "completed",
+        "failed",
+        "reclaimed",
+        "stopped",
+    ] {
+        assert!(
+            inventory_schema.contains(value),
+            "session_inventory advertises closed activity {value}: {inventory_schema}"
+        );
+    }
+
+    let operations = mcp.tool("operations_overview");
+    assert_eq!(
+        operations.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/operations-overview.html"))
+    );
+    let operation_properties = operations
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for param in ["repo", "group", "source", "limit"] {
+        assert!(
+            operation_properties.get(param).is_some(),
+            "operations_overview advertises params.{param}: {operation_properties}"
+        );
+    }
+    let detail = mcp.tool("work_detail");
+    assert_eq!(
+        detail.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/work-detail.html"))
+    );
+    let detail_properties = detail
+        .pointer("/inputSchema/properties/params/properties")
+        .cloned()
+        .unwrap_or(Value::Null);
+    for param in ["subjectKind", "subjectId", "after", "limit"] {
+        assert!(
+            detail_properties.get(param).is_some(),
+            "work_detail advertises params.{param}: {detail_properties}"
+        );
+    }
+    let work_map = mcp.tool("work_map");
+    assert_eq!(
+        work_map.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/work-map.html"))
+    );
+    let map_schema = work_map
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "operator",
+        "repository",
+        "epic",
+        "needs-me",
+        "ready-to-merge",
+        "stalled-or-recoverable",
+        "durable",
+        "live-plan",
+        "maxNodes",
+        "focus",
+    ] {
+        assert!(
+            map_schema.contains(value),
+            "work_map advertises closed value or parameter {value}: {map_schema}"
+        );
+    }
+    for (name, tool) in [
+        ("work_list", &work_list),
+        ("operations_overview", &operations),
+        ("work_detail", &detail),
+        ("work_map", &work_map),
+        ("session_inventory", &session_inventory),
+    ] {
+        assert_eq!(
+            tool.pointer("/inputSchema/additionalProperties"),
+            Some(&json!(false)),
+            "{name} rejects unknown envelope fields"
+        );
+        assert_eq!(
+            tool.pointer("/inputSchema/properties/params/additionalProperties"),
+            Some(&json!(false)),
+            "{name} rejects unknown nested params"
+        );
+    }
+
+    for (name, tool, uri) in [
+        ("overview", &overview_tool, "ui://forged/overview.html"),
+        (
+            "operations_overview",
+            &operations,
+            "ui://forged/operations-overview.html",
+        ),
+        ("work_detail", &detail, "ui://forged/work-detail.html"),
+        ("work_map", &work_map, "ui://forged/work-map.html"),
+        (
+            "session_inventory",
+            &session_inventory,
+            "ui://forged/agent-sessions.html",
+        ),
+    ] {
+        assert_eq!(
+            tool.pointer("/_meta/ui/resourceUri"),
+            Some(&json!(uri)),
+            "{name} advertises the standard App resource key"
+        );
+        assert_eq!(
+            tool.pointer("/_meta/ui~1resourceUri"),
+            Some(&json!(uri)),
+            "{name} preserves the compatibility App resource key"
+        );
+        assert!(
+            tool.pointer("/_meta/ui/csp").is_none()
+                && tool.pointer("/_meta/ui/permissions").is_none(),
+            "{name} tool metadata must not carry resource policy: {tool}"
+        );
+    }
 
     assert_eq!(
         mcp.list_resources(),
-        vec!["ui://forged/overview.html".to_owned()]
+        vec![
+            "ui://forged/overview.html".to_owned(),
+            "ui://forged/operations-overview.html".to_owned(),
+            "ui://forged/work-detail.html".to_owned(),
+            "ui://forged/work-map.html".to_owned(),
+            "ui://forged/agent-sessions.html".to_owned(),
+        ]
     );
+    for uri in [
+        "ui://forged/overview.html",
+        "ui://forged/operations-overview.html",
+        "ui://forged/work-detail.html",
+        "ui://forged/work-map.html",
+        "ui://forged/agent-sessions.html",
+    ] {
+        let descriptor = mcp.resource(uri);
+        assert!(
+            descriptor.get("_meta").is_none(),
+            "resource policy lives on contents, not the {uri} descriptor: {descriptor}"
+        );
+    }
     let app = mcp.read_resource("ui://forged/overview.html");
     assert_eq!(
         app.pointer("/contents/0/mimeType"),
@@ -139,6 +365,99 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Control Plane")));
+    for domain in [
+        "baseUriDomains",
+        "connectDomains",
+        "frameDomains",
+        "resourceDomains",
+    ] {
+        assert_eq!(
+            app.pointer(&format!("/contents/0/_meta/ui/csp/{domain}")),
+            Some(&json!([])),
+            "Apps deny every {domain} capability"
+        );
+    }
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/agent-sessions.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Agent Sessions")
+            && html.contains("forged.provider-session-inventory/1")
+            && html.contains("session_inventory")
+            && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/operations-overview.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Operations") && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/work-detail.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Work Detail") && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/work-map.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Work Map")
+            && html.contains("work_map")
+            && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
 
     let envelope = |params: Value| json!({"schemaVersion": 1, "params": params});
 
@@ -181,6 +500,19 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     assert_eq!(normalized(cli), normalized(tool), "run_status parity");
 
     let cli = env
+        .forged(&["review", "publish", "--run", "par-repository"])
+        .1;
+    let tool = mcp.call_tool(
+        "review_publish",
+        json!({
+            "schemaVersion": 1,
+            "runId": "par-repository",
+            "params": {"run": "par-repository"}
+        }),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "review_publish parity");
+
+    let cli = env
         .forged(&[
             "run",
             "stop",
@@ -215,6 +547,91 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     let structured = mcp.call_tool_result(
         "overview",
         json!({"schemaVersion": 1, "runId": "absent", "params": {"run": "absent"}}),
+    );
+    assert!(structured["structuredContent"].is_object());
+    assert_eq!(structured["structuredContent"]["ok"], json!(false));
+
+    let cli = env
+        .forged(&[
+            "work",
+            "map",
+            "--scope",
+            "repository",
+            "--repository",
+            &repository,
+            "--source",
+            "durable",
+            "--from",
+            "2020-01-01T00:00:00Z",
+            "--to",
+            "2020-01-02T00:00:00Z",
+            "--max-nodes",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_map",
+        envelope(json!({
+            "scope": "repository",
+            "repository": repository,
+            "source": "durable",
+            "from": "2020-01-01T00:00:00Z",
+            "to": "2020-01-02T00:00:00Z",
+            "maxNodes": 25
+        })),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "work_map parity");
+    let structured = mcp.call_tool_result(
+        "work_map",
+        envelope(json!({"scope": "operator", "source": "durable"})),
+    );
+    assert!(structured["structuredContent"].is_object());
+
+    let cli = env
+        .forged(&[
+            "operations",
+            "overview",
+            "--repo",
+            &repository,
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "operations_overview",
+        envelope(json!({"repo": repository, "limit": 25})),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "operations_overview parity"
+    );
+    let structured = mcp.call_tool_result(
+        "operations_overview",
+        envelope(json!({"repo": repository, "limit": 25})),
+    );
+    assert!(structured["structuredContent"].is_object());
+
+    let cli = env
+        .forged(&[
+            "work",
+            "detail",
+            "--subject-kind",
+            "run",
+            "--subject-id",
+            "absent",
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_detail",
+        envelope(json!({"subjectKind": "run", "subjectId": "absent", "limit": 25})),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "work_detail parity");
+    let structured = mcp.call_tool_result(
+        "work_detail",
+        envelope(json!({"subjectKind": "run", "subjectId": "absent", "limit": 25})),
     );
     assert!(structured["structuredContent"].is_object());
     assert_eq!(structured["structuredContent"]["ok"], json!(false));
@@ -484,6 +901,54 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     );
     assert_eq!(normalized(cli), normalized(tool), "session_list parity");
 
+    let cli = env
+        .forged(&[
+            "session",
+            "inventory",
+            "--repository",
+            &repository,
+            "--provider",
+            "codex",
+            "--activity",
+            "running",
+            "--limit",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "session_inventory",
+        envelope(json!({
+            "repository": repository,
+            "provider": "codex",
+            "activity": "running",
+            "limit": 25,
+        })),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "session_inventory parity"
+    );
+    let structured = mcp.call_tool_result(
+        "session_inventory",
+        envelope(json!({
+            "repository": repository,
+            "provider": "codex",
+            "activity": "running",
+            "limit": 25,
+        })),
+    );
+    assert!(structured["structuredContent"].is_object());
+    assert_eq!(
+        structured["structuredContent"],
+        serde_json::from_str::<Value>(
+            structured["content"][0]["text"]
+                .as_str()
+                .expect("session_inventory text fallback"),
+        )
+        .expect("session_inventory JSON text fallback")
+    );
+
     let cli = env.forged(&["session", "read", "--attempt", "1"]).1;
     let tool = mcp.call_tool(
         "session_read",
@@ -579,11 +1044,45 @@ fn all_thirty_four_tools_match_their_cli_counterparts() {
     let tool = mcp.call_tool("events_tail", envelope(json!({})));
     assert_eq!(normalized(cli), normalized(tool), "events_tail parity");
 
-    // work_list: the discovery surface takes no id on either surface.
+    // work_list: no selector and the exact repository selector are the same
+    // shared operation on both surfaces.
     let cli = env.forged(&["work", "list"]).1;
     let tool = mcp.call_tool("work_list", envelope(json!({})));
     assert_eq!(tool["operationId"], json!("op:work_list:read"));
     assert_eq!(normalized(cli), normalized(tool), "work_list parity");
+    let cli = env.forged(&["work", "list", "--repo", &repository]).1;
+    let tool = mcp.call_tool("work_list", envelope(json!({"repo": repository})));
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "repository-scoped work_list parity"
+    );
+
+    let cli = env
+        .forged(&[
+            "work",
+            "history",
+            "--from",
+            "2026-08-01T00:00:00Z",
+            "--to",
+            "2026-09-01T00:00:00Z",
+            "--bucket",
+            "day",
+            "--group-by",
+            "repository",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_history",
+        envelope(json!({
+            "from": "2026-08-01T00:00:00Z",
+            "to": "2026-09-01T00:00:00Z",
+            "bucket": "day",
+            "groupBy": "repository",
+        })),
+    );
+    assert_eq!(tool["operationId"], json!("op:work_history:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_history parity");
 
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.
@@ -656,5 +1155,124 @@ fn overview_refuses_wrong_typed_paging_at_the_transport() {
         assert_eq!(tool["ok"], json!(false), "{params}: {tool}");
         assert_eq!(tool["error"]["code"], json!("INVALID_REQUEST"), "{tool}");
         assert_eq!(tool["error"]["message"], json!(message), "{tool}");
+    }
+}
+
+#[test]
+fn work_list_refuses_present_non_string_repository_scopes() {
+    let env = TestEnv::new("forged-work-list-mcp-params");
+    env.forged(&["init"]);
+    fabricate_run(&env, "mcp-repository-widening-guard");
+    let mut mcp = McpClient::new(&env);
+
+    for repository in [Value::Null, json!(7), json!({"path": "/repo"})] {
+        let refusal = mcp.call_tool_error_result(
+            "work_list",
+            json!({"schemaVersion": 1, "params": {"repo": repository.clone()}}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "present non-string repo is refused before dispatch: {repository}: {refusal}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "transport refusal is not an unfiltered operation envelope: {text}"
+        );
+    }
+}
+
+#[test]
+fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
+    let env = TestEnv::new("forged-split-app-unknown-fields");
+    env.forged(&["init"]);
+    let mut mcp = McpClient::new(&env);
+
+    for (tool, arguments) in [
+        (
+            "work_list",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
+        ),
+        (
+            "work_list",
+            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
+        ),
+        (
+            "operations_overview",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
+        ),
+        (
+            "operations_overview",
+            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
+        ),
+        (
+            "work_detail",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {"subjectKind": "run", "subjectId": "absent"}}),
+        ),
+        (
+            "work_detail",
+            json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "absent", "unexpected": true}}),
+        ),
+    ] {
+        let refusal = mcp.call_tool_error_result(tool, arguments.clone());
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters") && text.contains("unknown field"),
+            "{tool} must reject unknown fields before dispatch: {arguments}: {refusal}"
+        );
+        assert!(
+            serde_json::from_str::<Value>(text).is_err(),
+            "transport refusal is not an operation envelope: {text}"
+        );
+    }
+}
+
+#[test]
+fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
+    let env = TestEnv::new("forged-split-app-mcp-params");
+    env.forged(&["init"]);
+    let mut mcp = McpClient::new(&env);
+
+    for params in [
+        json!({"repo": null}),
+        json!({"group": 7}),
+        json!({"source": {"kind": "durable"}}),
+        json!({"limit": "25"}),
+    ] {
+        let refusal = mcp.call_tool_error_result(
+            "operations_overview",
+            json!({"schemaVersion": 1, "params": params.clone()}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "malformed Operations params are a transport refusal: {params}: {refusal}"
+        );
+    }
+
+    for arguments in [
+        json!({"schemaVersion": 1}),
+        json!({"schemaVersion": 1, "params": {"subjectKind": "plan", "subjectId": "x"}}),
+        json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": " "}}),
+        json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "x", "after": "0"}}),
+    ] {
+        let refusal = mcp.call_tool_error_result("work_detail", arguments.clone());
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "malformed Work Detail target is refused before dispatch: {arguments}: {refusal}"
+        );
     }
 }

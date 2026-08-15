@@ -1,0 +1,267 @@
+{
+  "schema": "forged.manage-work-portfolio-control-fixtures/1",
+  "purpose": "validation-only",
+  "isolation": {
+    "requiredTemporaryEnv": ["HOME", "ANVIL_HOME", "BEADS_DIR"],
+    "fakeBoundaries": ["bd", "forged-cli", "forged-mcp", "service", "provider", "git", "github", "app-host"],
+    "liveEffects": "forbidden"
+  },
+  "schemas": {
+    "operationsOverview": "forged.operations-overview/1",
+    "workDetail": "forged.work-detail/1",
+    "workIdentity": "forged.work-identity/1",
+    "attentionItem": "forged.attention-item/1",
+    "attentionTransition": "forged.attention-transition/1",
+    "attentionTransitionResult": "forged.attention-transition-result/1"
+  },
+  "cases": [
+    {
+      "id": "status-unscoped",
+      "request": "What work is planned, running, blocked, or ready across my portfolio?",
+      "route": "operations-overview",
+      "confirmation": "none",
+      "postcondition": "bounded-portfolio",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "status-repository",
+      "request": "What is happening in this exact repository?",
+      "route": "operations-overview",
+      "confirmation": "none",
+      "postcondition": "exact-repository-only",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "needs-me",
+      "request": "What needs me right now?",
+      "route": "operations-overview",
+      "confirmation": "none",
+      "postcondition": "needs-me-group",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "app-unavailable",
+      "request": "Show portfolio status even though this host cannot render the App.",
+      "route": "operations-overview",
+      "confirmation": "none",
+      "postcondition": "structured-fallback",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "detail-exact",
+      "request": "Explain the blocker and next action for this exact run.",
+      "route": "work-detail",
+      "confirmation": "none",
+      "postcondition": "exact-work-ref",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "title-unique",
+      "request": "Within this repository, explain the uniquely matching work title.",
+      "route": "operations-then-detail",
+      "confirmation": "none",
+      "postcondition": "unique-canonical-target",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "title-zero",
+      "request": "Control a title that has no match in the bounded repository result.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "not-found-no-mutation",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "title-ambiguous",
+      "request": "Pause the work called cleanup when two bounded matches remain.",
+      "route": "refuse",
+      "confirmation": "bounded-target",
+      "postcondition": "disambiguate-no-mutation",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "blocker-explanation",
+      "request": "Why is this exact epic blocked and what evidence supports that?",
+      "route": "work-detail",
+      "confirmation": "none",
+      "postcondition": "evidence-and-next-action",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "spend-known",
+      "request": "How much known spend does this exact run have?",
+      "route": "work-detail",
+      "confirmation": "none",
+      "postcondition": "known-spend",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "spend-unknown",
+      "request": "Explain spend when one or more usage rows have no price.",
+      "route": "work-detail",
+      "confirmation": "none",
+      "postcondition": "unknown-not-zero",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "plan-only-detail",
+      "request": "Open Work Detail for a planned row with no durable detail target.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "plan-summary-only",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "priority-change",
+      "request": "Set exact Bead beads-a to priority 1 while its observed guards still hold.",
+      "route": "bd-priority",
+      "confirmation": "none",
+      "postcondition": "priority-only-lower-wins-later-no-preemption",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 1, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "epic-pause",
+      "request": "Pause exact active epic epic-a for the stated audit reason.",
+      "route": "epic-pause",
+      "confirmation": "none",
+      "postcondition": "paused-readback",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 1, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "epic-resume",
+      "request": "Resume exact paused epic epic-a for the stated audit reason.",
+      "route": "epic-resume",
+      "confirmation": "none",
+      "postcondition": "active-readback-no-submit",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 1, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "input-required-resume",
+      "request": "Resume an input-required epic without resolving its named action.",
+      "route": "work-detail",
+      "confirmation": "not-applicable",
+      "postcondition": "resolve-domain-first",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "slice-cancel",
+      "request": "Cancel exact active slice run-a for this reason.",
+      "route": "run-stop-cancelled",
+      "confirmation": "destructive",
+      "postcondition": "cancelled-terminal-readback",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 1, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "slice-pause-unsupported",
+      "request": "Pause this slice run.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "unsupported-no-session-stop",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "epic-stop-unsupported",
+      "request": "Stop this epic permanently.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "offer-pause-boundary",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "stale-precondition",
+      "request": "Apply the control even though the lifecycle or Bead guards changed.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "stale-input-required",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "duplicate-response",
+      "request": "The control response was duplicated or ambiguous; retry it.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "readback-no-retry",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-acknowledge-lead",
+      "request": "Acknowledge custody of this exact lead-agent-owned occurrence.",
+      "route": "attention-acknowledge",
+      "confirmation": "none",
+      "postcondition": "acknowledged-still-active",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 1, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-resolve-lead",
+      "request": "Accept unknown pricing on this exact lead-owned missing-cost occurrence.",
+      "route": "attention-resolve",
+      "confirmation": "none",
+      "postcondition": "accepted-unknown-readback",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 1, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-resolve-human",
+      "request": "Resolve this exact human-owned adjudicable occurrence with my stated disposition.",
+      "route": "attention-resolve",
+      "confirmation": "human-decision",
+      "postcondition": "resolved-after-domain-evidence",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 1, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-source-backed",
+      "request": "Mark a controller-dead item resolved without recovering its domain state.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "domain-transition-only",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-stale-occurrence",
+      "request": "Resolve an old occurrence after newer causal evidence appeared.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "stale-occurrence-no-mutation",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "attention-reopen",
+      "request": "Reopen the exact resolved occurrence from prior durable transition evidence.",
+      "route": "attention-reopen",
+      "confirmation": "none",
+      "postcondition": "open-new-decision-required",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 1, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "review-risk-acceptance",
+      "request": "Accept these exact deduplicated review findings with my rationale.",
+      "route": "run-accept-risk",
+      "confirmation": "human-decision",
+      "postcondition": "accepted-risk-readback",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 1, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "merge-approval",
+      "request": "Resolve merge approval by merging the default branch for me.",
+      "route": "refuse",
+      "confirmation": "human-decision",
+      "postcondition": "human-github-boundary",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "session-diagnostic",
+      "request": "Inspect the provider attempt for this exact run.",
+      "route": "session-diagnostic",
+      "confirmation": "none",
+      "postcondition": "read-only-attempt-detail",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    },
+    {
+      "id": "session-stop-substitution",
+      "request": "Stop the active attempt as a substitute for cancelling its run.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "work-control-required",
+      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+    }
+  ]
+}

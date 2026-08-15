@@ -52,7 +52,10 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     env.set_bead_field(
         "bead-sourced",
         "metadata",
-        r#"{"repository":"/tmp/example","qualityGates":["cargo test"]}"#,
+        &format!(
+            r#"{{"repository":"{}","qualityGates":["cargo test"]}}"#,
+            env.repos.repo.to_string_lossy()
+        ),
     );
     let repo = env.repos.repo.to_string_lossy().into_owned();
 
@@ -69,6 +72,7 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     ]);
     assert_eq!(code, 0, "bead-sourced run start: {started}");
     assert_eq!(started["result"]["run_id"], json!("bead-sourced"));
+    env.authorize_run("bead-sourced");
 
     // The packet is bead-sourced — it carries a revision where a file-sourced
     // one carries none — and its spec path is the body materialized inside
@@ -90,7 +94,10 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
         "Bead title: Bead bead-sourced",
         "Bead issue type: task",
         "Bead metadata qualityGates: [\"cargo test\"]",
-        "Bead metadata repository: /tmp/example",
+        &format!(
+            "Bead metadata repository: {}",
+            env.repos.repo.to_string_lossy()
+        ),
     ] {
         assert!(
             notes.iter().any(|note| note == expected),
@@ -290,6 +297,7 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-edited");
 
     let packet = advance_to_open_packet(&env, "bead-edited");
     let pinned_revision = packet.spec_revision.clone().expect("a bead-sourced packet");
@@ -363,6 +371,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body()
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-recovered");
 
     let packet = advance_to_open_packet(&env, "bead-recovered");
     let opened_at = packet.spec_sha256.clone();
@@ -421,6 +430,7 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-adopted");
 
     // Claim without ever spawning a provider: exactly the crashed shape.
     let packet = advance_to_open_packet(&env, "bead-adopted");
@@ -515,6 +525,7 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-repinned");
 
     let mut edited = false;
     let mut later: Option<forged_ledger::PacketRow> = None;
@@ -600,6 +611,7 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-cycled");
 
     let packet = advance_to_open_packet(&env, "bead-cycled");
     let opened_at = packet.spec_sha256.clone();
@@ -686,6 +698,7 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-guarded");
     let packet = advance_to_open_packet(&env, "bead-guarded");
 
     // A LIVE ATTEMPT refuses the re-pin: a seat's spec must never move
@@ -772,6 +785,7 @@ fn a_spec_file_edited_under_an_open_packet_is_still_refused() {
         "main",
     ]);
     assert_eq!(code, 0, "file-sourced run start: {started}");
+    env.authorize_run("bead-file-edit");
 
     let packet = advance_to_open_packet(&env, "bead-file-edit");
     assert_eq!(
@@ -867,6 +881,7 @@ fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-outage");
     let packet = advance_to_open_packet(&env, "bead-outage");
 
     // bd goes away. The claim cannot read the fence, which says NOTHING
@@ -960,6 +975,7 @@ fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-recovers");
     let packet = advance_to_open_packet(&env, "bead-recovers");
 
     // One outage, charged: the budget of three is now one down.

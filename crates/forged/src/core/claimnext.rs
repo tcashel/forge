@@ -29,9 +29,9 @@ struct Resumable {
     stage_key: String,
     logical_seq: i64,
     stage_budget_s: u64,
-    /// The packet's own provider hint — the `<provider>` segment of the
-    /// attempt claimant this resume mints.
-    provider: String,
+    /// Exact packet identity whose provider is resolved transactionally by
+    /// admission before this resume mints an attempt claimant.
+    admission: super::admission::PacketAdmission,
 }
 
 /// What a reclaim outcome plus the bead's current lease holder mean for one
@@ -118,24 +118,6 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
             .find(|p| p.packet_id == packet_id)
             .cloned();
         let Some(packet) = packet else { continue };
-        // The stored body carries the hints the packet was opened with; the
-        // roster is the same source `build_packet` read, and is the fallback
-        // when a body predates them.
-        let provider = if view.execution_package.is_some() {
-            crate::core::drive::stored_packet_for_attempt(&view, &packet_id)?
-                .provider_hints
-                .provider
-        } else {
-            view.roster
-                .get(&packet.stage)
-                .map(|hints| hints.provider.clone())
-                .ok_or_else(|| {
-                    Failure::invalid(format!(
-                        "legacy roster has no provider for {:?}",
-                        packet.stage
-                    ))
-                })?
-        };
         let (_, stage_key, logical_seq) = crate::core::split_packet_key(&packet_id)?;
         let stage_budget_s = view
             .policy
@@ -143,6 +125,11 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
             .get(&packet.stage)
             .copied()
             .ok_or_else(|| Failure::internal("run policy has no stage budget"))?;
+        let admission = super::admission::PacketAdmission {
+            packet_id: packet_id.clone(),
+            run_id: run.run_id.clone(),
+            bead_id: run.bead_id.clone(),
+        };
         resumables.push(Resumable {
             run_id: run.run_id,
             bead_id: run.bead_id,
@@ -151,7 +138,7 @@ async fn find_resumables(ctx: &Ctx) -> Result<Vec<Resumable>, Failure> {
             stage_key,
             logical_seq,
             stage_budget_s,
-            provider,
+            admission,
         });
     }
     Ok(resumables)
@@ -175,6 +162,9 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
     // 1. Resume from forged's own ledger first — every resumable candidate
     //    in ledger order, until one of them actually resumes.
     for candidate in find_resumables(ctx).await? {
+        let admission_guard =
+            super::handoff::acquire_packet_submit(ctx, &candidate.packet_id, &candidate.run_id)
+                .await?;
         // The ONE lease identity for this run: whatever forged already holds
         // the bead under, else the derived holder. Never a second, differing
         // identity of our own making.
@@ -213,6 +203,30 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
             forged_beads::claim_specific(&bd, &candidate.bead_id, &run_holder_id).await?;
             failpoint::hit("bd.claim.after");
         }
+        // Allocate only after the lease decision. A foreign live lease is a
+        // skipped candidate, not capacity ownership; reserving before that
+        // decision would leak an ownerless slot and could block the next
+        // resumable run in this same scan.
+        let admission = super::admission::admit_packet_facts(ctx, &candidate.admission).await?;
+        if admission.decision.outcome != forged_types::AdmissionOutcome::Admitted {
+            return Err(Failure {
+                code: forged_types::ErrorCode::OperationInProgress,
+                message: format!(
+                    "packet {} deferred by admission: {:?}",
+                    candidate.packet_id, admission.decision.reason
+                ),
+                recoverable: true,
+            });
+        }
+        let reservation_id = admission
+            .reservation
+            .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
+            .reservation_id;
+        let provider = admission
+            .packet_provider_hints
+            .as_ref()
+            .map(|hints| hints.provider.clone())
+            .ok_or_else(|| Failure::internal("packet admission omitted provider facts"))?;
         // 2. Hand back the reopened packet of that same run — never a fresh
         // one. One spec read per claim, fencing on whatever the packet pins.
         //
@@ -261,12 +275,14 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         let fence = resolved.fence.clone();
         let claimed = {
             let packet_id = candidate.packet_id.clone();
-            let claimant = session_claimant(&candidate.packet_id, &candidate.provider);
+            let claimant = session_claimant(&candidate.packet_id, &provider);
             on_ledger(&ctx.ledger, move |l| {
-                l.claim_packet(&packet_id, &claimant, &fence)
+                l.claim_packet_with_admission(&packet_id, &claimant, &fence, &reservation_id)
             })
             .await?
         };
+        crate::failpoint::hit("admission.reservation.transfer.after");
+        drop(admission_guard);
         // The claim fenced these bytes; write them where the packet contract
         // already tells the resuming seat to read them. An external seat
         // never enters `run_attempt`, so nothing else would.

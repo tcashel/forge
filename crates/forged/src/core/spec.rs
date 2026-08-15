@@ -360,6 +360,7 @@ mod tests {
             title: "a slice".to_owned(),
             description: "## Context\n\nwhy this exists".to_owned(),
             status: "open".to_owned(),
+            priority: Some(1),
             assignee: None,
             issue_type: "task".to_owned(),
             acceptance_criteria: "- it works".to_owned(),
@@ -368,6 +369,7 @@ mod tests {
             spec_id: None,
             metadata: Default::default(),
             revision: Some("-6192208415116251521".to_owned()),
+            updated_at: None,
         }
     }
 

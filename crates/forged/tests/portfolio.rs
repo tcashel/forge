@@ -349,23 +349,21 @@ fn the_rail_names_every_condition_with_the_evidence_for_it() {
 
     let revoking = item(&value, "pf-revoking", "revoking");
     assert_eq!(revoking["kind"], json!("slice"));
-    assert_eq!(revoking["evidence"]["count"], json!(1));
     assert_eq!(
-        revoking["evidence"]["newest"]["reason"],
+        revoking["evidence"]["reason"],
         json!("the seat stopped heartbeating")
     );
     assert_eq!(
-        revoking["evidence"]["newest"]["packetId"],
+        revoking["evidence"]["packetId"],
         json!("pf-revoking/implement/0")
     );
 
     let quarantined = item(&value, "pf-quarantined", "quarantined");
-    assert_eq!(quarantined["evidence"]["count"], json!(1));
     assert_eq!(
-        quarantined["evidence"]["newest"]["reason"],
+        quarantined["evidence"]["reason"],
         json!("claim token is no longer live")
     );
-    assert_eq!(quarantined["evidence"]["newest"]["attemptId"], json!(7));
+    assert_eq!(quarantined["evidence"]["attemptId"], json!(7));
 
     // Spend is measured: the unpriced row is surfaced on the entry, in the
     // rail, and in the portfolio total, so a partial figure never reads as
@@ -380,8 +378,8 @@ fn the_rail_names_every_condition_with_the_evidence_for_it() {
     assert_eq!(entry["rowsMissingCost"], json!(1));
     assert_eq!(entry["costUsdKnown"], json!(0.0));
 
-    // Severity, not alphabet: what blocks work is reported before what only
-    // makes a figure partial.
+    // Closed severity order: critical custody, high human input, medium
+    // automated reclaim, then low partial-spend evidence.
     let conditions: Vec<Value> = attention(&value)
         .iter()
         .map(|item| item["condition"].clone())
@@ -389,9 +387,9 @@ fn the_rail_names_every_condition_with_the_evidence_for_it() {
     assert_eq!(
         conditions,
         vec![
+            json!("quarantined"),
             json!("input-required"),
             json!("revoking"),
-            json!("quarantined"),
             json!("missing-cost"),
         ],
         "{value}"
@@ -453,13 +451,30 @@ fn settled_slices_remain_visible_at_the_operator_boundary() {
         json!("blocked")
     );
     assert_eq!(
-        item(&value, "pf-ready", "awaiting-delivery")["evidence"]["pr"],
+        item(&value, "pf-ready", "merge-approval")["evidence"]["pr"],
         json!(88)
     );
     assert_eq!(
         item(&value, "pf-beads-pending", "beads-settlement-pending")["evidence"]["error"],
         json!("team Beads server is unavailable")
     );
+
+    append(
+        &env,
+        "pf-beads-pending",
+        "run.bead-settlement.succeeded",
+        json!({
+            "schema": "forged.bead-settlement/1",
+            "beadId": "bead-pf-beads-pending",
+            "outcome": "blocked",
+            "settled": true,
+        }),
+    );
+    let reconciled = portfolio(&env);
+    assert_eq!(reconciled["attentionTotal"], json!(2), "{reconciled}");
+    assert!(attention(&reconciled)
+        .iter()
+        .all(|item| item["condition"] != json!("beads-settlement-pending")));
 }
 
 /// An epic that got its answer is no longer holding: the LATER of the two

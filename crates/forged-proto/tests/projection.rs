@@ -149,6 +149,7 @@ fn every_proto_event_kind_round_trips_through_the_ledger() {
         ProtoEvent::Pr {
             number: 7,
             is_draft: true,
+            base_ref_name: Some("main".to_owned()),
             url: "https://github.com/octo/demo/pull/7".to_owned(),
         },
         ProtoEvent::Retry {

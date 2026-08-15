@@ -4,18 +4,28 @@
 //! that is what makes the CLI/MCP parity criterion achievable rather than a
 //! coincidence.
 
+pub(crate) mod admission;
 pub(crate) mod artifacts;
+pub(crate) mod attention;
 mod claimnext;
 mod drive;
 mod epic;
-mod handoff;
+pub(crate) mod handoff;
+pub(crate) mod herdr_layout;
+pub(crate) mod herdr_ownership;
+pub(crate) mod herdr_projection;
+mod history;
 mod observe;
 mod ops;
+mod review;
+mod session_inventory;
 pub(crate) mod sessions;
 pub(crate) mod settlement;
 pub(crate) mod spec;
 mod supervise;
 pub(crate) mod usage;
+pub(crate) mod work_identity;
+mod work_map;
 
 use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, LedgerError, OperationOutcome};
 use forged_proto::ProtoError;
@@ -478,6 +488,8 @@ pub(crate) struct DesiredAuthorization {
     pub(crate) kind: DesiredSubjectKind,
     pub(crate) id: String,
     pub(crate) generation: u32,
+    pub(crate) queued_until: Option<String>,
+    pub(crate) admission_reason: Option<String>,
 }
 
 impl OnEffectError {
@@ -695,12 +707,14 @@ where
                 let resp = resp.clone();
                 let authorization = desired_authorization.clone();
                 on_ledger(&ctx.ledger, move |l| match authorization {
-                    Some(authorization) => l.complete_operation_authorizing_desired(
+                    Some(authorization) => l.complete_operation_authorizing_desired_with_admission(
                         &operation_id,
                         &resp,
                         authorization.kind,
                         &authorization.id,
                         authorization.generation,
+                        authorization.queued_until,
+                        authorization.admission_reason,
                     ),
                     None => l.complete_operation(&operation_id, &resp),
                 })
@@ -765,6 +779,9 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "epic_resolve" => epic::epic_resolve(ctx, &mut req).await,
         "epic_revise_roster" => epic::epic_revise_roster(ctx, &mut req).await,
         "overview" => observe::overview(ctx, &req).await,
+        "operations_overview" => ops::operations_overview(ctx, &req).await,
+        "work_detail" => observe::work_detail(ctx, &req).await,
+        "work_map" => work_map::work_map(ctx, &req).await,
         "supervise" => supervise::supervise(ctx, &req).await,
         "packet_show" => ops::packet_show(ctx, &req).await,
         "packet_claim" => ops::packet_claim(ctx, &mut req).await,
@@ -774,16 +791,22 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "artifact_verify" => artifacts::artifact_verify(ctx, &req).await,
         "artifact_compact" => artifacts::artifact_compact(ctx, &mut req).await,
         "session_list" => sessions::session_list(ctx, &req).await,
+        "session_inventory" => session_inventory::session_inventory(ctx, &req).await,
         "session_read" => sessions::session_read(ctx, &req).await,
         "session_message" => sessions::session_message(ctx, &mut req).await,
         "session_stop" => sessions::session_stop(ctx, &mut req).await,
         "claim_next" => claimnext::claim_next(ctx, &req).await,
         "gate_run" => ops::gate_run(ctx, &mut req).await,
         "reconcile" => ops::reconcile(ctx, &mut req).await,
+        "review_publish" => review::review_publish(ctx, &mut req).await,
         "usage_report" => ops::usage_report(ctx, &req).await,
         "usage_ingest" => ops::usage_ingest(ctx, &mut req).await,
         "events_tail" => ops::events_tail(ctx, &req).await,
         "work_list" => ops::work_list(ctx, &req).await,
+        "work_history" => history::work_history(ctx, &req).await,
+        "attention_acknowledge" => ops::attention_acknowledge(ctx, &mut req).await,
+        "attention_resolve" => ops::attention_resolve(ctx, &mut req).await,
+        "attention_reopen" => ops::attention_reopen(ctx, &mut req).await,
         "worktree_retire" => ops::worktree_retire(ctx, &req).await,
         other => err_response(
             &read_key(other),

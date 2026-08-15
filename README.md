@@ -111,7 +111,7 @@ codex plugin add forged@forge
 
 Then invoke `/forged:setup` in the host. It preserves explicit `ANVIL_HOME`
 and `BEADS_DIR` values and proves that setup added nothing to the target
-repository. The manifest remains version-aligned with the current 0.2.0
+repository. The manifest remains version-aligned with the current 0.3.0
 workspace; availability begins with the next release that contains this tree.
 These commands are installation instructions only; repository validation and
 CI do not install the plugin.

@@ -378,7 +378,7 @@ checksum = "77ce24cb58228fbb8aa041425bb1050850ac19177686ea6e0f41a70416f56fdb"
 
 [[package]]
 name = "forged"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "clap",
@@ -390,6 +390,7 @@ dependencies = [
  "forged-proto",
  "forged-provider",
  "forged-types",
+ "fs2",
  "jiff",
  "nix",
  "rmcp",
@@ -408,7 +409,7 @@ dependencies = [
 
 [[package]]
 name = "forged-beads"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "fs2",
  "serde",
@@ -418,7 +419,7 @@ dependencies = [
 
 [[package]]
 name = "forged-gate"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "forged-types",
  "nix",
@@ -430,7 +431,7 @@ dependencies = [
 
 [[package]]
 name = "forged-git"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "forged-types",
  "serde",
@@ -442,7 +443,7 @@ dependencies = [
 
 [[package]]
 name = "forged-host"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "forged-types",
@@ -458,7 +459,7 @@ dependencies = [
 
 [[package]]
 name = "forged-ledger"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "forged-types",
  "jiff",
@@ -473,7 +474,7 @@ dependencies = [
 
 [[package]]
 name = "forged-proto"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "async-trait",
  "forged-ledger",
@@ -489,10 +490,11 @@ dependencies = [
 
 [[package]]
 name = "forged-provider"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "forged-types",
  "minijinja",
+ "nix",
  "serde",
  "serde_json",
  "tempfile",
@@ -502,7 +504,7 @@ dependencies = [
 
 [[package]]
 name = "forged-types"
-version = "0.2.0"
+version = "0.3.0"
 dependencies = [
  "proptest",
  "serde",

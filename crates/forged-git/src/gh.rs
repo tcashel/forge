@@ -255,6 +255,26 @@ impl GhClient {
         finding_id: &str,
         body: &str,
     ) -> Result<CommentOutcome, GhError> {
+        if self
+            .finding_comment_present(repo, pr_number, finding_id)
+            .await?
+        {
+            return Ok(CommentOutcome::AlreadyPresent);
+        }
+        self.post_finding_comment(repo, pr_number, finding_id, body)
+            .await?;
+        Ok(CommentOutcome::Posted)
+    }
+
+    /// Observe whether the exact generated marker is the FIRST line of an
+    /// existing issue comment. Later body lines are untrusted presentation,
+    /// never delivery evidence.
+    pub async fn finding_comment_present(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        finding_id: &str,
+    ) -> Result<bool, GhError> {
         let marker = format!("<!-- anvil-finding id={finding_id} -->");
         let path = format!("repos/{repo}/issues/{pr_number}/comments");
 
@@ -283,19 +303,41 @@ impl GhClient {
         }
         let already_present = comments
             .iter()
-            .any(|comment| comment.body.lines().any(|line| line == marker));
-        if already_present {
-            return Ok(CommentOutcome::AlreadyPresent);
-        }
+            .any(|comment| comment.body.lines().next() == Some(marker.as_str()));
+        Ok(already_present)
+    }
 
-        let body_field = format!("body={marker}\n{body}");
+    /// Post one marker-bearing issue comment. Marker-shaped lines in the
+    /// presentation body are quoted so they cannot impersonate another
+    /// finding if this body is later inspected independently.
+    pub async fn post_finding_comment(
+        &self,
+        repo: &str,
+        pr_number: u64,
+        finding_id: &str,
+        body: &str,
+    ) -> Result<(), GhError> {
+        let marker = format!("<!-- anvil-finding id={finding_id} -->");
+        let path = format!("repos/{repo}/issues/{pr_number}/comments");
+        let safe_body = body
+            .lines()
+            .map(|line| {
+                if line.starts_with("<!-- anvil-finding id=") && line.ends_with(" -->") {
+                    format!("> {line}")
+                } else {
+                    line.to_owned()
+                }
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        let body_field = format!("body={marker}\n{safe_body}");
         let stdout = self
             .run(&["api", "--method", "POST", &path, "-f", &body_field])
             .await?;
         // The POST reply is the created comment; parse it so a malformed
         // response is GhError::Json, never a blind `Posted`.
         let _created: CommentBody = parse_json(&stdout)?;
-        Ok(CommentOutcome::Posted)
+        Ok(())
     }
 
     /// Run gh with `args` and classify the outcome. Returns raw stdout bytes

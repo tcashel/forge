@@ -25,6 +25,7 @@ pub enum ErrorCode {
     BeadsContention,
     BeadLeaseHeld,
     BeadsError,
+    GraphScopeTooLarge,
     GhError,
     Internal,
 }
@@ -33,7 +34,7 @@ pub enum ErrorCode {
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 18] = [
+    const ALL: [(ErrorCode, &str); 19] = [
         (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
         (ErrorCode::RunNotFound, "RUN_NOT_FOUND"),
         (ErrorCode::PacketNotClaimable, "PACKET_NOT_CLAIMABLE"),
@@ -53,13 +54,14 @@ mod tests {
         (ErrorCode::BeadsContention, "BEADS_CONTENTION"),
         (ErrorCode::BeadLeaseHeld, "BEAD_LEASE_HELD"),
         (ErrorCode::BeadsError, "BEADS_ERROR"),
+        (ErrorCode::GraphScopeTooLarge, "GRAPH_SCOPE_TOO_LARGE"),
         (ErrorCode::GhError, "GH_ERROR"),
         (ErrorCode::Internal, "INTERNAL"),
     ];
 
     #[test]
-    fn serializes_to_exactly_the_eighteen_screaming_snake_strings() {
-        assert_eq!(ALL.len(), 18);
+    fn serializes_to_exactly_the_nineteen_screaming_snake_strings() {
+        assert_eq!(ALL.len(), 19);
         for (code, expected) in ALL {
             let json = serde_json::to_value(code).expect("serializes");
             assert_eq!(json, serde_json::Value::String(expected.to_owned()));

@@ -165,6 +165,7 @@ async fn full_slice_v1_lifecycle_in_process() {
                         ProtoEvent::Pr {
                             number: 7,
                             is_draft: true,
+                            base_ref_name: Some("main".to_owned()),
                             url: "https://github.com/octo/demo/pull/7".to_owned(),
                         },
                     )

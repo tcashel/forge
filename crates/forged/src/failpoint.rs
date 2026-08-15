@@ -17,6 +17,13 @@
 //! `bd.claim.after`, `bd.reclaim.before`, `bd.reclaim.after`,
 //! `guardian.start`, `git.push.before`, `git.push.after`, `gh.call.before`,
 //! `gh.call.after`.
+//! `admission.batch.commit.before` and `admission.batch.commit.after` fence
+//! the atomic admission decision/reservation write; the latter represents a
+//! committed response that the caller has not yet observed.
+//! `admission.reservation.transfer.after` is the first boundary after an
+//! admitted reservation belongs to its controller or attempt.
+//! `provider.result.recorded.after` is after immutable provider evidence is
+//! joined to the attempt and before that attempt is settled.
 //! `packet.materialize.before` is the post-claim, pre-spawn boundary: the
 //! attempt row is `running` and nothing has been written to the packet
 //! directory yet, so a test paused there can make the materialization fail
@@ -34,6 +41,14 @@
 //! `epic.resolve.desired.after` is the inverse seam: the identified
 //! INPUT_RESOLVED event and due wake are committed, but the safe-effect
 //! operation has not yet been settled.
+//! `run.start.bundle.after` and `epic.start.bundle.after` sit after the
+//! creation record, compatibility event, and WorkIdentityV1 commit in one
+//! transaction but before the operation response is settled; replay must use
+//! the durable bundle without consulting Beads again.
+//! `review.publish.probe.before` and `review.publish.probe.after` bracket the
+//! exact-marker observation. `review.publish.post.before` is after uncertain
+//! intent is durable but before GitHub is called; `review.publish.post.after`
+//! is the response-lost seam after GitHub returns and before delivery settles.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

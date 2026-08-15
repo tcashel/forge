@@ -1,8 +1,8 @@
 //! Serde types for the protocol-19 subset forged-host speaks: `ping`,
-//! `events.subscribe`, `pane.split`, `pane.send_input`, `pane.process_info`,
-//! `pane.close`, and the `pane_created` / `pane_exited` / `pane_closed`
-//! events. Unknown response/event fields are tolerated (ignored), never
-//! round-tripped.
+//! `events.subscribe`, `tab.create`, `pane.layout`, `pane.split`,
+//! `pane.send_input`, `pane.process_info`, `pane.close`, and the
+//! `pane_created` / `pane_exited` / `pane_closed` events. Unknown
+//! response/event fields are tolerated (ignored), never round-tripped.
 
 use serde::Deserialize;
 use serde_json::Value;
@@ -17,26 +17,14 @@ pub(crate) struct WireError {
 }
 
 impl WireError {
-    /// Whether this error says THE PANE is not found. herdr pane ids are
-    /// never reused, so an id that no longer resolves can only mean that
-    /// pane is gone — pane-not-found IS proof of pane death. Any other
-    /// error proves nothing, so the match is deliberately tight: the
-    /// documented `PANE_NOT_FOUND` code compared exactly (normalized), plus
-    /// a few pane-specific message phrases. A bare "not found" (workspace
-    /// not found, method not found, ...) must NEVER read as pane death.
+    /// Whether this is the exact protocol-19 `pane_not_found` code.
+    ///
+    /// Herdr pane ids are never reused, so this one documented code proves
+    /// the pane is gone. Messages are diagnostics only: accepting a phrase
+    /// such as "pane not found" under another or absent code would turn an
+    /// ambiguous refusal into destructive cleanup authority.
     pub(crate) fn is_pane_not_found(&self) -> bool {
-        let normalize = |s: &str| s.to_ascii_lowercase().replace(['_', '-'], " ");
-        let code = match &self.code {
-            Value::String(s) => normalize(s),
-            other => normalize(&other.to_string()),
-        };
-        if code == "pane not found" {
-            return true;
-        }
-        let message = normalize(&self.message);
-        ["pane not found", "no such pane", "unknown pane"]
-            .iter()
-            .any(|phrase| message.contains(phrase))
+        matches!(&self.code, Value::String(code) if code == "pane_not_found")
     }
 }
 
@@ -55,6 +43,51 @@ pub(crate) struct PaneInfoResult {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PaneInfo {
     pub(crate) pane_id: String,
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+}
+
+/// `tab.create` result with the exact tab and otherwise-idle root pane.
+#[derive(Debug, Deserialize)]
+pub(crate) struct TabCreatedResult {
+    pub(crate) tab: TabInfo,
+    pub(crate) root_pane: RootPaneInfo,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct RootPaneInfo {
+    pub(crate) pane_id: String,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct TabInfo {
+    pub(crate) tab_id: String,
+    pub(crate) workspace_id: String,
+}
+
+/// `pane.layout` result wrapper.
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutResult {
+    pub(crate) layout: PaneLayoutSnapshot,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutSnapshot {
+    pub(crate) workspace_id: String,
+    pub(crate) tab_id: String,
+    pub(crate) panes: Vec<PaneLayoutPane>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutPane {
+    pub(crate) pane_id: String,
+    pub(crate) rect: PaneLayoutRect,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct PaneLayoutRect {
+    pub(crate) width: u16,
+    pub(crate) height: u16,
 }
 
 /// `pane.read` result wrapper.

@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forged Work Detail</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--color-background-primary, light-dark(#fbfbfa,#141519));
+  --panel: var(--color-background-secondary, light-dark(#f4f4f1,#1b1d22));
+  --ink: var(--color-text-primary, light-dark(#17191e,#eceef1));
+  --muted: var(--color-text-secondary, light-dark(#626773,#a3a8b2));
+  --line: var(--color-border-primary, light-dark(#deddd7,#30333a));
+  --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
+  --accent: light-dark(#167b72,#42c9b7);
+  --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+* { box-sizing: border-box; min-width: 0; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 var(--sans); }
+button { font: inherit; color: inherit; cursor: pointer; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button:disabled { opacity: .55; cursor: default; } button:hover:not(:disabled) { background: var(--panel); } button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#app { padding: 16px; display: grid; gap: 14px; }
+.top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
+.sub { margin-top: 4px; color: var(--muted); font-size: 11px; }
+.state { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font: 11px/1.3 var(--mono); }
+.summary { display: grid; grid-template-columns: repeat(auto-fit,minmax(130px,1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.summary div { padding: 10px 12px; border-left: 1px solid var(--line); }.summary div:first-child { border-left: 0; }
+.summary b { display: block; font: 600 17px/1.2 var(--mono); }.summary span { color: var(--muted); font-size: 11px; }
+.grid { display: grid; grid-template-columns: repeat(auto-fit,minmax(270px,1fr)); gap: 12px; align-items: start; }
+.panel { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.panel h2 { margin: 0; padding: 9px 11px; background: var(--panel); border-bottom: 1px solid var(--line); font-size: 12px; }
+.body { padding: 10px 11px; display: grid; gap: 7px; }
+.kv { display: grid; grid-template-columns: 105px 1fr; gap: 5px 9px; margin: 0; }.kv dt { color: var(--muted); }.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.item { padding-top: 7px; border-top: 1px solid var(--line); }.item:first-child { padding-top: 0; border-top: 0; }
+.item b { font-family: var(--mono); font-size: 11px; }.item p { margin: 3px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.empty,.error { border: 1px dashed var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }.error { color: var(--bad); border-color: currentColor; }
+.foot { color: var(--muted); font: 10px/1.4 var(--mono); display: flex; gap: 12px; flex-wrap: wrap; }
+@media(max-width:560px) { .summary { grid-template-columns: 1fr 1fr; }.summary div { border-top: 1px solid var(--line); border-left: 0; } }
+</style>
+</head>
+<body>
+<main id="app">
+  <header class="top"><div><h1 id="title">Work detail</h1><div class="sub" id="subtitle">Waiting for an exact subject.</div></div><div><span class="state" id="state">unknown</span> <button type="button" id="refresh">Refresh</button></div></header>
+  <section class="summary" id="summary"></section>
+  <section class="grid" id="grid"><div class="empty">Waiting for detail.</div></section>
+  <footer class="foot" id="foot"></footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const PROTOCOL_VERSION = "2026-01-26";
+  const APP_INFO = { name: "forged-work-detail", version: "1.0.0" };
+  const post = message => window.parent.postMessage(message, "*");
+  const notify = (method, params = {}) => post({ jsonrpc: "2.0", method, params });
+  let rpcId = 0; const pending = new Map(); const timers = new Set(); let observer = null; let sizeFrame = null; let tornDown = false;
+  function request(method, params = {}) { if(tornDown)return Promise.reject(new Error("resource torn down"));const id = `forged-detail-${++rpcId}`; return new Promise((resolve,reject) => { const timer=setTimeout(() => { timers.delete(timer); if (pending.delete(id)) reject(new Error(`${method} timed out`)); },120000); timers.add(timer);pending.set(id,{resolve,reject,timer});post({jsonrpc:"2.0",id,method,params}); }); }
+  const host = { connected:false, capabilities:{} };
+  const state = { data:null, error:null, args:null, loading:false };
+  const byId = id => document.getElementById(id);
+  const el = (tag,cls,text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!=null)n.textContent=String(text); return n; };
+  const arr = value => Array.isArray(value) ? value : [];
+  const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  function envelopeFrom(params) { let value=params?.structuredContent; if(!value){const text=arr(params?.content).find(block=>block.type==="text")?.text; try{value=JSON.parse(text);}catch{value=null;}} return value; }
+  function ingest(params) { const envelope=envelopeFrom(params); if(envelope?.ok===false){state.error=envelope.error||{message:"Operation failed"};state.data=null;render();return;} const data=envelope?.result??envelope; if(!data||data.schema!=="forged.work-detail/1"){state.error={message:"The host returned an unsupported Work Detail payload."};state.data=null;render();return;} state.error=null;state.data=data;render(); }
+  function panel(title) { const box=el("section","panel"); box.append(el("h2","",title)); const body=el("div","body"); box.append(body); return {box,body}; }
+  function item(body,title,detail) { const row=el("div","item"); row.append(el("b","",title||"unknown")); if(detail)row.append(el("p","",detail)); body.append(row); }
+  function subjectState(data) { return data?.status?.state || data?.status?.status || data?.state || "unknown"; }
+  function render() {
+    if(tornDown)return;
+    const summary=byId("summary"),grid=byId("grid"),foot=byId("foot"); summary.replaceChildren();grid.replaceChildren();foot.replaceChildren();byId("refresh").disabled=state.loading||!host.capabilities.serverTools;
+    if(state.error){byId("title").textContent="Work detail";byId("subtitle").textContent="Projection unavailable";byId("state").textContent="error";grid.append(el("div","error",state.error.message||String(state.error)));reportSize();return;}
+    const data=state.data; if(!data){grid.append(el("div","empty","Waiting for detail."));reportSize();return;}
+    byId("title").textContent=data.identity?.displayTitle||data.id||"Work detail"; byId("subtitle").textContent=`${data.workRef?.kind||data.kind} · ${data.id}`; byId("state").textContent=subjectState(data);
+    const workers=arr(data.workers?.sessions),findings=arr(data.reviews?.latestFindings),events=arr(data.events?.events),artifacts=arr(data.artifacts);
+    for(const [value,label] of [[workers.length,"workers"],[findings.length,"findings"],[artifacts.length,"artifact groups"],[events.length,"events"],[`$${num(data.usage?.totals?.costUsdKnown).toFixed(2)}`,"known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
+    const identity=panel("Identity"),dl=el("dl","kv"); const add=(k,v)=>{dl.append(el("dt","",k));dl.append(el("dd","",v==null?"—":v));}; add("canonical id",data.id);add("bead",data.identity?.bead?.id);add("repository",data.identity?.repository?.path);add("base",data.identity?.baseRef);identity.body.append(dl);grid.append(identity.box);
+    const work=panel("Workers"); if(!workers.length)work.body.append(el("div","empty","No provider session is live.")); for(const worker of workers)item(work.body,worker.seat||worker.provider||worker.sessionId,`${worker.state||"unknown"}${worker.model?` · ${worker.model}`:""}`);grid.append(work.box);
+    const review=panel("Review"); if(!findings.length)review.body.append(el("div","empty","No current findings.")); for(const finding of findings.slice(0,20))item(review.body,finding.severity||finding.verdict||"finding",finding.summary||finding.message||finding.detail);grid.append(review.box);
+    const evidence=panel("Evidence"); if(!artifacts.length)evidence.body.append(el("div","empty","No attempt artifact groups.")); for(const artifact of artifacts.slice(0,20))item(evidence.body,artifact.packetId||artifact.attemptId,`${arr(artifact.attempts).length} attempt records`);grid.append(evidence.box);
+    const ledger=panel("Recent events"); if(!events.length)ledger.body.append(el("div","empty","No events in this page.")); for(const event of events.slice(-30).reverse())item(ledger.body,`${event.eventId||"?"} · ${event.kind||"event"}`,event.ts||event.createdAt);grid.append(ledger.box);
+    foot.append(el("span","",data.schema)); if(data.cursor!=null)foot.append(el("span","",`cursor ${data.cursor}`)); if(state.loading)foot.append(el("span","","refreshing")); pushModelContext(data);reportSize();
+  }
+  let lastContext="";function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const text=[`Forged ${data.workRef?.kind||data.kind} ${data.id}: ${subjectState(data)}`,`bead ${data.identity?.bead?.id||"unknown"}; repository ${data.identity?.repository?.path||"unknown"}`,`${arr(data.workers?.sessions).length} workers; ${arr(data.reviews?.latestFindings).length} findings; ${arr(data.events?.events).length} events in page`].join("\n").slice(0,2000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
+  async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading||!state.args)return;state.loading=true;render();try{ingest(await request("tools/call",{name:"work_detail",arguments:state.args}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
+  byId("refresh").addEventListener("click",refresh);
+  function applyContext(context={}){if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);}
+  let lastSize="";function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,request] of pending){clearTimeout(request.timer);timers.delete(request.timer);pending.delete(id);request.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();byId("refresh").removeEventListener("click",refresh);window.removeEventListener("message",onMessage);}
+  function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const p=pending.get(message.id);pending.delete(message.id);clearTimeout(p.timer);timers.delete(p.timer);message.error?p.reject(new Error(message.error.message||"request failed")):p.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=message.params?.arguments||state.args;else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error={message:message.params?.reason||"Cancelled"};render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
+  window.addEventListener("message",onMessage);
+  request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error={message:"The host did not complete the MCP Apps handshake."};render();}});
+  render();
+})();
+</script>
+</body>
+</html>

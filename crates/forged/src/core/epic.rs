@@ -4,15 +4,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::future::Future;
 use std::hash::{DefaultHasher, Hash, Hasher};
 use std::path::Path;
+use std::time::Duration;
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass, Ledger, OperationState,
-    SlotOutcome,
+    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass,
+    InventoryUsageSelection, Ledger, OperationState, RunOutcome, RunState, SlotOutcome,
 };
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
-    ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity,
-    Verdict,
+    AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
+    OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
+    WorkIdentityContextV1, WorkIdentitySubjectKind,
 };
 use serde_json::{json, Map, Value};
 
@@ -41,6 +43,7 @@ pub(super) const EPIC_PR: &str = "forged.epic.pr";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
 const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
 const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
+const EPIC_POLL: Duration = Duration::from_millis(250);
 
 #[derive(Debug, Clone)]
 struct FrozenChild {
@@ -62,6 +65,9 @@ struct EpicConfig {
     spec_path: Option<String>,
     base_ref: String,
     integration_branch: String,
+    /// Frozen per-epic window. Events written before fan-out existed replay
+    /// sequentially instead of silently inheriting a wider current config.
+    max_active_children: u32,
     execution_package: ExecutionPackageV1,
     children: Vec<FrozenChild>,
 }
@@ -137,6 +143,12 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             .map(str::to_owned),
         base_ref: string(value, "baseRef")?,
         integration_branch: string(value, "integrationBranch")?,
+        max_active_children: value
+            .get("maxActiveChildren")
+            .and_then(Value::as_u64)
+            .and_then(|value| u32::try_from(value).ok())
+            .filter(|value| *value > 0)
+            .unwrap_or(1),
         execution_package: serde_json::from_value(
             value
                 .get("executionPackage")
@@ -453,9 +465,15 @@ async fn append_stop_event(
     .await
 }
 
-async fn append_resolution_event(ctx: &Ctx, epic: &str, event: Value) -> Result<(), Failure> {
-    let _submit_guard =
-        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
+/// Append a resolved-input transition while the caller holds the parent
+/// epic submit fence. Resolution may happen while paused; clearing the input
+/// rail must not silently turn the paused desired state back to running.
+async fn append_resolution_event(
+    ctx: &Ctx,
+    epic: &str,
+    event: Value,
+    paused: bool,
+) -> Result<(), Failure> {
     let epic = epic.to_owned();
     on_ledger(&ctx.ledger, move |ledger| {
         ledger.append_event_settling_desired(
@@ -463,9 +481,17 @@ async fn append_resolution_event(ctx: &Ctx, epic: &str, event: Value) -> Result<
             &epic,
             INPUT_RESOLVED,
             event,
-            DesiredState::Running,
-            DesiredReconcileOutcome::Authorized,
-            true,
+            if paused {
+                DesiredState::Paused
+            } else {
+                DesiredState::Running
+            },
+            if paused {
+                DesiredReconcileOutcome::Paused
+            } else {
+                DesiredReconcileOutcome::Authorized
+            },
+            !paused,
             None,
             Some("resolutionId"),
         )
@@ -695,6 +721,66 @@ async fn recover_applied_epic_resolution(
     Ok(None)
 }
 
+/// Settle the applied side of an interrupted atomic epic creation before
+/// any current Beads read. The start event carries this exact operation id
+/// and commits with the identity, so together they are sufficient recovery
+/// evidence rather than a reason to rebuild from mutable authoring state.
+async fn recover_applied_epic_start(
+    ctx: &Ctx,
+    key: &str,
+    epic: &str,
+    params: &Map<String, Value>,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "epic_start".to_owned();
+    let key_owned = key.to_owned();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key_owned)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let request = OperationRequest {
+        schema_version: 1,
+        idempotency_key: key.to_owned(),
+        run_id: Some(epic.to_owned()),
+        params: params.clone(),
+    };
+    let hash = forged_types::request_sha256(&request)
+        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
+    if row.request_sha256 != hash {
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            "epic start key was stored with a different request",
+        ));
+    }
+    let events = epic_events(ctx, epic).await?;
+    let Some(landed) = events
+        .iter()
+        .find(|event| event.kind == STARTED)
+        .map(payload)
+        .transpose()?
+        .filter(|value| {
+            value.get("operationId").and_then(Value::as_str) == Some(row.operation_id.as_str())
+        })
+    else {
+        return Ok(None);
+    };
+    // Absence is a torn/corrupt bundle. Never fall through to current Beads
+    // and silently manufacture a different display identity.
+    super::work_identity::load(ctx, WorkIdentitySubjectKind::Epic, epic).await?;
+    let response = ok_response(&row.operation_id, false, landed);
+    let operation_id = row.operation_id;
+    let stored = response.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.resolve_interrupted_operation(&operation_id, &stored)
+    })
+    .await?;
+    let mut replayed = response;
+    replayed.reused = true;
+    Ok(Some(replayed))
+}
+
 /// Freeze the Beads inventory and child execution defaults.
 pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
     let epic = match param_str(&req.params, "epic") {
@@ -711,6 +797,11 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     };
     let params = req.params.clone();
     let key = req.idempotency_key.clone();
+    match recover_applied_epic_start(ctx, &key, &epic, &params).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&key, &error),
+    }
     let result = safe_effect(
         ctx,
         "epic_start",
@@ -719,16 +810,23 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Value::Object(params.clone()),
         {
             let epic = epic.clone();
-            move |_operation| async move {
+            move |operation_id| async move {
                 let existing_events = epic_events(ctx, &epic).await?;
-                if existing_events.iter().any(|row| row.kind == STARTED) {
+                if let Some(started) = existing_events.iter().find(|row| row.kind == STARTED) {
+                    let landed = payload(started)?;
+                    if landed.get("operationId").and_then(Value::as_str)
+                        == Some(operation_id.as_str())
+                    {
+                        // The start event and identity commit together. A
+                        // response lost after that commit replays from those
+                        // durable bytes without re-reading a renamed, deleted,
+                        // or unavailable Bead.
+                        return Ok(landed);
+                    }
                     return status_json(ctx, project(ctx, &epic).await?).await;
                 }
-                let repo = param_str(&params, "repo")?.to_owned();
+                let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
                 let legacy_spec = param_opt_str(&params, "spec").map(str::to_owned);
-                if !Path::new(&repo).is_absolute() {
-                    return Err(Failure::invalid("epic --repo must be an absolute path"));
-                }
                 if let Some(spec) = legacy_spec.as_deref() {
                     if !Path::new(spec).is_absolute() || !Path::new(spec).exists() {
                         return Err(Failure::invalid(format!(
@@ -802,11 +900,22 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     None => super::ops::default_branch_of(&repo).await,
                 };
                 let integration_branch = format!("forged/epic-{epic}");
+                let identity = super::work_identity::durable_identity(
+                    WorkIdentitySubjectKind::Epic,
+                    &epic,
+                    &epic,
+                    Some(&issue.title),
+                    issue.revision.as_deref(),
+                    Some(&repo),
+                    super::work_identity::context_from_params(&params, "project"),
+                    None,
+                )?;
                 let event = json!({
                     "schema": "forged.epic/1",
                     "epicId": epic,
                     "title": issue.title,
                     "repo": repo,
+                    "operationId": operation_id,
                     "specSource": "bead",
                     "specRevision": issue.revision,
                     "specSha256": epic_spec.sha256,
@@ -814,13 +923,24 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "deprecatedSpecPath": legacy_spec,
                     "baseRef": base_ref,
                     "integrationBranch": integration_branch,
+                    "maxActiveChildren": ctx.config.admission.epic_fanout,
                     "profile": compiled.package.profile_ref.name,
                     "roster": compiled.package.roster_ref.name,
                     "packageSha256": compiled.package_sha256,
                     "executionPackage": compiled.package,
                     "children": children,
                 });
-                append(ctx, &epic, STARTED, event.clone()).await?;
+                let epic_for_store = epic.clone();
+                let event_for_store = event.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_epic_started_with_identity(
+                        &epic_for_store,
+                        event_for_store,
+                        identity,
+                    )
+                })
+                .await?;
+                crate::failpoint::hit("epic.start.bundle.after");
                 Ok(event)
             }
         },
@@ -832,9 +952,46 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     }
 }
 
-fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str) -> Value {
+fn desired_json(row: Option<&forged_ledger::DesiredWorkRow>) -> Value {
+    row.map_or(Value::Null, |row| {
+        json!({
+            "state": row.desired_state.as_str(),
+            "controlRevision": row.control_revision,
+            "controllerGeneration": row.controller_generation,
+            "nextWakeAt": row.next_wake_at,
+            "lastOutcome": row.last_outcome.map(DesiredReconcileOutcome::as_str),
+            "lastError": row.last_error,
+            "restartUsed": row.restart_used,
+            "restartBudget": row.restart_budget,
+        })
+    })
+}
+
+struct ChildDurable<'a> {
+    run: Option<&'a forged_ledger::RunRow>,
+    desired: Option<&'a forged_ledger::DesiredWorkRow>,
+    admission: Option<&'a AdmissionDecisionV1>,
+    controller: Option<&'a Value>,
+    pr: Option<&'a Value>,
+}
+
+fn child_json(
+    child: &FrozenChild,
+    state: Option<&ChildState>,
+    bead_status: &str,
+    identity: Value,
+    durable: ChildDurable<'_>,
+) -> Value {
+    let ChildDurable {
+        run,
+        desired,
+        admission,
+        controller,
+        pr,
+    } = durable;
     json!({
         "id": child.id,
+        "identity": identity,
         "title": child.title,
         "issueType": child.issue_type,
         "specPath": child.spec_path,
@@ -842,6 +999,15 @@ fn child_json(child: &FrozenChild, state: Option<&ChildState>, bead_status: &str
         "runId": state.map(|value| value.run_id.as_str()),
         "wave": state.map(|value| value.wave),
         "generation": state.map(|value| value.generation),
+        "runState": run.map(|value| value.state.as_str()),
+        "terminalOutcome": run.and_then(|value| value.terminal_outcome.map(RunOutcome::as_str)),
+        "desired": desired_json(desired),
+        "controller": controller,
+        "admission": admission,
+        "nextWakeAt": desired
+            .and_then(|value| value.next_wake_at.as_deref())
+            .or_else(|| admission.and_then(|value| value.next_eligible_wake_at.as_deref())),
+        "pr": pr,
         "merged": state.and_then(|value| value.merged.as_ref()),
     })
 }
@@ -870,34 +1036,229 @@ fn active_compiled_definition(
 async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
     let active_definition = active_compiled_definition(&view)?;
     let controller = super::handoff::controller_status(ctx, &view.config.epic_id).await?;
-    let live = forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await?;
-    let statuses: BTreeMap<_, _> = live
+    // One durable snapshot supplies every child run, identity, desired state,
+    // admission decision, in-flight operation, and latest PR/controller
+    // record. Child status never fans out into process-table or filesystem
+    // probes; the epic controller's existing top-level projection remains a
+    // single backwards-compatible liveness probe.
+    let snapshot = on_ledger(&ctx.ledger, |ledger| {
+        ledger.inventory_snapshot(
+            &["proto.pr", "forged.controller.started"],
+            InventoryUsageSelection::Omit,
+        )
+    })
+    .await?;
+    let identity = snapshot
+        .work_identities
+        .get(&(WorkIdentitySubjectKind::Epic, view.config.epic_id.clone()))
+        .cloned()
+        .ok_or_else(|| {
+            Failure::internal(format!(
+                "epic {:?} has no durable work identity",
+                view.config.epic_id
+            ))
+        })?;
+    let herdr_layout = super::herdr_layout::status(
+        ctx,
+        forged_types::HerdrLayoutSubjectV1 {
+            kind: forged_types::HerdrLayoutSubjectKind::Epic,
+            id: view.config.epic_id.clone(),
+        },
+    )
+    .await;
+    let (live, live_error) =
+        match forged_beads::epic_children(&ctx.config.bd_config(), &view.config.epic_id).await {
+            Ok(live) => (live, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+    let live: BTreeMap<_, _> = live
         .into_iter()
-        .map(|issue| (issue.id, issue.status))
+        .map(|issue| (issue.id.clone(), issue))
         .collect();
-    let children = view
-        .config
-        .children
+    let runs = snapshot
+        .runs
         .iter()
-        .map(|child| {
-            child_json(
-                child,
-                view.children.get(&child.id),
-                statuses
-                    .get(&child.id)
-                    .map(String::as_str)
-                    .unwrap_or("unknown"),
+        .map(|run| (run.run_id.as_str(), run))
+        .collect::<BTreeMap<_, _>>();
+    let desired = snapshot
+        .desired_work
+        .iter()
+        .filter(|row| row.subject_kind == DesiredSubjectKind::Run)
+        .map(|row| (row.subject_id.as_str(), row))
+        .collect::<BTreeMap<_, _>>();
+    let admissions = snapshot
+        .admission_decisions
+        .iter()
+        .filter(|decision| decision.subject_kind == AdmissionSubjectKind::Run)
+        .map(|decision| (decision.subject_id.as_str(), decision))
+        .collect::<BTreeMap<_, _>>();
+    let latest_payloads = |kind: &str| -> Result<BTreeMap<String, Value>, Failure> {
+        let mut values = BTreeMap::new();
+        for event in snapshot.events(kind) {
+            let Some(run_id) = event.run_id.as_ref() else {
+                continue;
+            };
+            let value: Value = serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::internal(format!(
+                    "malformed {kind} event {}: {error}",
+                    event.event_id
+                ))
+            })?;
+            values.insert(run_id.clone(), value);
+        }
+        Ok(values)
+    };
+    let controllers = latest_payloads("forged.controller.started")?;
+    let prs = latest_payloads("proto.pr")?;
+    let slot_name = format!("epic:{}", view.config.epic_id);
+    let integration_owner = on_ledger(&ctx.ledger, {
+        let slot_name = slot_name.clone();
+        move |ledger| ledger.read_merge_slot(&slot_name)
+    })
+    .await?;
+    let integration_operation = snapshot.inflight_operations.iter().rev().find(|row| {
+        row.run_id.as_deref() == Some(view.config.epic_id.as_str())
+            && matches!(
+                row.name.as_str(),
+                "epic_child_ready" | "epic_child_merge" | "epic_child_close" | "epic_pr"
             )
-        })
-        .collect::<Vec<_>>();
+    });
+
+    let mut counts = BTreeMap::from([
+        ("active", 0u64),
+        ("queuedDeferred", 0),
+        ("terminal", 0),
+        ("held", 0),
+        ("merged", 0),
+    ]);
+    let mut next_wakes = Vec::new();
+    let epic_context = WorkIdentityContextV1 {
+        id: view.config.epic_id.clone(),
+        title: identity.bead.title.clone(),
+    };
+    let mut children = Vec::with_capacity(view.config.children.len());
+    for child in &view.config.children {
+        let state = view.children.get(&child.id);
+        let run_id = state.map(|state| state.run_id.as_str());
+        let run = run_id.and_then(|run_id| runs.get(run_id).copied());
+        let desired = run_id.and_then(|run_id| desired.get(run_id).copied());
+        let admission = run_id.and_then(|run_id| admissions.get(run_id).copied());
+        let terminal =
+            run.is_some_and(|run| run.state == RunState::Stopped || run.terminal_outcome.is_some());
+        let merged = state.is_some_and(|state| state.merged.is_some());
+        let held = run
+            .and_then(|run| run.terminal_outcome)
+            .is_some_and(|outcome| !matches!(outcome, RunOutcome::Clean | RunOutcome::Landed))
+            || admission.is_some_and(|decision| decision.outcome == AdmissionOutcome::Ineligible)
+            || desired.is_some_and(|row| {
+                matches!(
+                    row.last_outcome,
+                    Some(DesiredReconcileOutcome::Attention | DesiredReconcileOutcome::Exhausted)
+                )
+            });
+        let queued = state.is_some()
+            && !terminal
+            && (desired.is_none()
+                || admission
+                    .is_some_and(|decision| decision.outcome == AdmissionOutcome::Deferred)
+                || desired
+                    .is_some_and(|row| row.last_outcome == Some(DesiredReconcileOutcome::Backoff)));
+        if terminal {
+            *counts.get_mut("terminal").expect("terminal counter") += 1;
+        }
+        if merged {
+            *counts.get_mut("merged").expect("merged counter") += 1;
+        }
+        if held {
+            *counts.get_mut("held").expect("held counter") += 1;
+        }
+        if queued {
+            *counts.get_mut("queuedDeferred").expect("queue counter") += 1;
+        }
+        if state.is_some() && !terminal && !queued && !held {
+            *counts.get_mut("active").expect("active counter") += 1;
+        }
+        if let Some(wake) = desired
+            .and_then(|row| row.next_wake_at.as_deref())
+            .or_else(|| admission.and_then(|row| row.next_eligible_wake_at.as_deref()))
+        {
+            next_wakes.push(wake.to_owned());
+        }
+        let live_issue = live.get(&child.id);
+        let child_identity = if let Some(state) = state {
+            serde_json::to_value(
+                snapshot
+                    .work_identities
+                    .get(&(WorkIdentitySubjectKind::Run, state.run_id.clone()))
+                    .ok_or_else(|| {
+                        Failure::internal(format!(
+                            "run {:?} has no durable work identity",
+                            state.run_id
+                        ))
+                    })?,
+            )
+            .map_err(|error| Failure::internal(format!("serialize work identity: {error}")))?
+        } else if let Some(issue) = live_issue {
+            serde_json::to_value(super::work_identity::live_plan_identity(
+                WorkIdentitySubjectKind::Run,
+                &child.id,
+                &child.id,
+                Some(&issue.title),
+                issue.revision.as_deref(),
+                Some(&view.config.repo),
+                identity.project.clone(),
+                Some(epic_context.clone()),
+                issue.updated_at.as_deref().unwrap_or(&identity.captured_at),
+            )?)
+            .map_err(|error| Failure::internal(format!("serialize work identity: {error}")))?
+        } else {
+            Value::Null
+        };
+        let pr = run_id
+            .and_then(|run_id| prs.get(run_id))
+            .or_else(|| state.and_then(|state| state.merged.as_ref()));
+        children.push(child_json(
+            child,
+            state,
+            live_issue
+                .map(|issue| issue.status.as_str())
+                .unwrap_or("unknown"),
+            child_identity,
+            ChildDurable {
+                run,
+                desired,
+                admission,
+                controller: run_id.and_then(|run_id| controllers.get(run_id)),
+                pr,
+            },
+        ));
+    }
+    next_wakes.sort();
     Ok(json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
+        "identity": identity,
+        "herdrLayout": herdr_layout,
         "title": view.config.title,
         "repo": view.config.repo,
         "specPath": view.config.spec_path,
         "baseRef": view.config.base_ref,
         "integrationBranch": view.config.integration_branch,
+        "maxActiveChildren": view.config.max_active_children,
+        "counts": counts,
+        "nextCoordinatorWakeAt": next_wakes.first(),
+        "integrationOwner": integration_owner.map(|row| json!({
+            "slot": row.slot,
+            "holder": row.holder,
+            "acquiredAt": row.acquired_at,
+        })),
+        "integrationOperation": integration_operation.map(|row| json!({
+            "operationId": row.operation_id,
+            "name": row.name,
+            "idempotencyKey": row.idempotency_key,
+            "state": "in-progress",
+            "updatedAt": row.updated_at,
+        })),
         "profile": view.config.execution_package.profile_ref.name,
         "roster": view.roster_revisions.last()
             .map(|revision| revision.roster_ref.name.as_str())
@@ -912,6 +1273,10 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "paused": view.paused,
         "finalPr": view.pr,
         "controller": controller,
+        "beadsInventory": {
+            "available": live_error.is_none(),
+            "detail": live_error,
+        },
     }))
 }
 
@@ -1148,7 +1513,14 @@ fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
 
 enum Step {
     Progress(Value),
+    Wait(Value),
     Stop(Value),
+}
+
+struct PendingWave {
+    number: u32,
+    members: BTreeSet<String>,
+    launch_order: BTreeMap<String, usize>,
 }
 
 async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Failure> {
@@ -1198,6 +1570,8 @@ async fn start_child(
             "repo": config.repo,
             "spec": child.spec_path,
             "baseRef": config.integration_branch,
+            "epicId": config.epic_id,
+            "epicTitle": config.title,
         }) {
             Value::Object(map) => map,
             _ => Map::new(),
@@ -1215,6 +1589,49 @@ async fn start_child(
     });
     append(ctx, &config.epic_id, CHILD_STARTED, event.clone()).await?;
     Ok(event)
+}
+
+/// Authorize and detach a child through the same run submission boundary a
+/// lead session uses. The epic never calls a provider or a run driver: an
+/// admitted controller owns the child from this point forward, while a
+/// deferred response leaves durable desired work for the supervisor.
+async fn submit_child(
+    ctx: &Ctx,
+    epic: &str,
+    child: &FrozenChild,
+    run_id: &str,
+) -> Result<Value, Failure> {
+    // Parent before child is the lock order used by packet launch too.
+    // Pause/stop either wins before this bounded submit (and no child is
+    // authorized) or waits until its controller identity/queued decision is
+    // durable. Detached children are deliberately not killed by a later
+    // parent pause.
+    let _parent_guard =
+        super::handoff::acquire_submit(ctx, epic, super::handoff::Scope::Epic).await?;
+    let parent = project(ctx, epic).await?;
+    if parent.paused.is_some() || parent.input.is_some() || parent.pr.is_some() {
+        return Ok(json!({
+            "childId": child.id,
+            "runId": run_id,
+            "submitted": false,
+            "parentStopped": true,
+        }));
+    }
+    let mut request = OperationRequest {
+        schema_version: 1,
+        idempotency_key: String::new(),
+        run_id: Some(run_id.to_owned()),
+        params: match json!({"run": run_id}) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        },
+    };
+    let submitted = response(super::handoff::run_submit(ctx, &mut request).await)?;
+    Ok(json!({
+        "childId": child.id,
+        "runId": run_id,
+        "submission": submitted,
+    }))
 }
 
 async fn merge_child(
@@ -1395,7 +1812,7 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
     Ok(Step::Stop(json!({"finalPr": value})))
 }
 
-async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, Failure> {
+async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
     let view = project(ctx, epic).await?;
     if let Some(pr) = view.pr {
         return Ok(Step::Stop(json!({"finalPr": pr})));
@@ -1410,7 +1827,53 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
         return Ok(Step::Progress(ensure_integration(ctx, &view.config).await?));
     }
 
-    // Resume or settle an already-bound child before opening more work.
+    let live = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
+    let issues = live
+        .into_iter()
+        .map(|issue| (issue.id.clone(), issue))
+        .collect::<BTreeMap<_, _>>();
+    let statuses = issues
+        .iter()
+        .map(|(id, issue)| (id.as_str(), issue.status.as_str()))
+        .collect::<BTreeMap<_, _>>();
+
+    let accounted = |child: &FrozenChild| {
+        child.initially_closed
+            || statuses
+                .get(child.id.as_str())
+                .is_some_and(|status| *status == "closed")
+            || view
+                .children
+                .get(&child.id)
+                .is_some_and(|state| state.merged.is_some())
+    };
+    if view.config.children.iter().all(accounted) {
+        return final_pr(ctx, &view).await;
+    }
+
+    let desired = on_ledger(&ctx.ledger, |ledger| ledger.list_desired_work())
+        .await?
+        .into_iter()
+        .filter(|row| row.subject_kind == DesiredSubjectKind::Run)
+        .map(|row| (row.subject_id.clone(), row))
+        .collect::<BTreeMap<_, _>>();
+    let admissions = on_ledger(&ctx.ledger, |ledger| {
+        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Run), None)
+    })
+    .await?
+    .into_iter()
+    .map(|decision| (decision.subject_id.clone(), decision))
+    .collect::<BTreeMap<_, _>>();
+
+    let mut clean_children = Vec::new();
+    let mut held = Vec::<(String, &'static str, String)>::new();
+    let mut missing_submission = Vec::new();
+    let mut nonterminal = 0usize;
+    let mut safe_nonterminal = false;
+    let mut next_wakes = Vec::new();
+
+    // Reconcile every started child from durable run state. No child is ever
+    // advanced inline: its independent run controller owns protocol work.
     for child in &view.config.children {
         let Some(state) = view.children.get(&child.id) else {
             continue;
@@ -1420,173 +1883,347 @@ async fn advance_once(ctx: &Ctx, epic: &str, drive_child: bool) -> Result<Step, 
         }
         let run = super::drive::project(ctx, &state.run_id).await?;
         if matches!(forged_proto::advance(&run), NextAction::Stop(_)) {
-            let (clean, evidence) = clean_slice(&run);
-            if !clean {
+            let (is_clean, evidence) = clean_slice(&run);
+            if is_clean {
+                clean_children.push((state.wave, child.id.clone(), run, evidence));
+            } else {
+                held.push((
+                    child.id.clone(),
+                    "child-not-clean",
+                    format!("slice requires adjudication: {evidence}"),
+                ));
+            }
+            continue;
+        }
+
+        nonterminal = nonterminal.saturating_add(1);
+        let desired_row = desired.get(&state.run_id);
+        let decision = admissions.get(&state.run_id);
+        if let Some(wake) = desired_row
+            .and_then(|row| row.next_wake_at.as_ref())
+            .or_else(|| decision.and_then(|row| row.next_eligible_wake_at.as_ref()))
+        {
+            next_wakes.push(wake.clone());
+        }
+        if desired_row.is_none() {
+            missing_submission.push(child.id.clone());
+            continue;
+        }
+        let durable_hold = decision
+            .is_some_and(|decision| decision.outcome == AdmissionOutcome::Ineligible)
+            || desired_row.is_some_and(|row| {
+                row.desired_state != DesiredState::Running
+                    || matches!(
+                        row.last_outcome,
+                        Some(
+                            DesiredReconcileOutcome::Attention | DesiredReconcileOutcome::Exhausted
+                        )
+                    )
+            });
+        if durable_hold {
+            held.push((
+                child.id.clone(),
+                "child-controller-held",
+                format!(
+                    "detached child cannot progress: desired={:?}, admission={:?}",
+                    desired_row.and_then(|row| row.last_outcome),
+                    decision.map(|row| (row.outcome, row.reason))
+                ),
+            ));
+        } else {
+            safe_nonterminal = true;
+        }
+    }
+
+    // The existing epic slot plus the child-specific SafeRetry operation
+    // serializes this complete ready/merge/close chain. Choose exactly one
+    // clean child per tick in deterministic wave/id order.
+    clean_children.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+    if let Some((_, child_id, run, evidence)) = clean_children.into_iter().next() {
+        let child = view
+            .config
+            .children
+            .iter()
+            .find(|child| child.id == child_id)
+            .ok_or_else(|| Failure::internal(format!("frozen child {child_id:?} vanished")))?;
+        return merge_child(ctx, &view.config, child, &run, evidence).await;
+    }
+
+    // Crash recovery: CHILD_STARTED is durable before submit. Re-enter the
+    // shared submit operation for one such child before opening another
+    // slot. The deterministic run id and submit key make this idempotent.
+    missing_submission.sort();
+    if let Some(child_id) = missing_submission.first() {
+        let current = project(ctx, epic).await?;
+        if let Some(paused) = current.paused {
+            return Ok(Step::Stop(json!({"paused": paused})));
+        }
+        let child = view
+            .config
+            .children
+            .iter()
+            .find(|child| child.id == *child_id)
+            .ok_or_else(|| Failure::internal(format!("frozen child {child_id:?} vanished")))?;
+        let state = view
+            .children
+            .get(child_id)
+            .ok_or_else(|| Failure::internal(format!("started child {child_id:?} vanished")))?;
+        return Ok(Step::Progress(
+            submit_child(ctx, epic, child, &state.run_id).await?,
+        ));
+    }
+
+    // A wave is immutable once recorded. Only after every member joins may
+    // the coordinator read and freeze a later global frontier.
+    let pending_wave = view
+        .waves
+        .last()
+        .map(|wave| -> Result<Option<PendingWave>, Failure> {
+            let number = wave
+                .get("wave")
+                .and_then(Value::as_u64)
+                .and_then(|value| u32::try_from(value).ok())
+                .ok_or_else(|| Failure::internal("epic wave event has no valid wave"))?;
+            let member_order = wave
+                .get("children")
+                .and_then(Value::as_array)
+                .ok_or_else(|| Failure::internal("epic wave event has no children"))?
+                .iter()
+                .map(|value| {
+                    value
+                        .as_str()
+                        .map(str::to_owned)
+                        .ok_or_else(|| Failure::internal("epic wave child is not a string"))
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            let members = member_order.iter().cloned().collect::<BTreeSet<_>>();
+            let frozen_order = match wave.get("priorityOrder") {
+                Some(value) => value
+                    .as_array()
+                    .ok_or_else(|| Failure::internal("epic wave priority order is not an array"))?
+                    .iter()
+                    .map(|entry| {
+                        entry
+                            .get("childId")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                            .ok_or_else(|| {
+                                Failure::internal("epic wave priority entry has no child id")
+                            })
+                    })
+                    .collect::<Result<Vec<_>, _>>()?,
+                None => member_order,
+            };
+            if frozen_order.iter().cloned().collect::<BTreeSet<_>>() != members
+                || frozen_order.len() != members.len()
+            {
+                return Err(Failure::internal(
+                    "epic wave priority order does not match its frozen membership",
+                ));
+            }
+            let launch_order = frozen_order
+                .into_iter()
+                .enumerate()
+                .map(|(rank, child)| (child, rank))
+                .collect::<BTreeMap<_, _>>();
+            let joined = view
+                .config
+                .children
+                .iter()
+                .filter(|child| members.contains(&child.id))
+                .all(&accounted);
+            Ok((!joined).then_some(PendingWave {
+                number,
+                members,
+                launch_order,
+            }))
+        })
+        .transpose()?
+        .flatten();
+
+    let (wave, members, launch_order) = match pending_wave {
+        Some(value) => (value.number, value.members, value.launch_order),
+        None => {
+            let ready = forged_beads::ready_issues(&ctx.config.bd_config())
+                .await?
+                .into_iter()
+                .map(|issue| (issue.id.clone(), issue))
+                .collect::<BTreeMap<_, _>>();
+            let mut frontier = view
+                .config
+                .children
+                .iter()
+                .filter(|child| !accounted(child))
+                .filter(|child| !view.children.contains_key(&child.id))
+                .filter(|child| ready.contains_key(&child.id))
+                .collect::<Vec<_>>();
+            frontier.sort_by(|left, right| {
+                ready
+                    .get(&left.id)
+                    .and_then(|issue| issue.priority)
+                    .unwrap_or(i64::MAX)
+                    .cmp(
+                        &ready
+                            .get(&right.id)
+                            .and_then(|issue| issue.priority)
+                            .unwrap_or(i64::MAX),
+                    )
+                    .then_with(|| left.id.cmp(&right.id))
+            });
+            if frontier.is_empty() {
+                let unresolved = view
+                    .config
+                    .children
+                    .iter()
+                    .filter(|child| !accounted(child))
+                    .map(|child| child.id.clone())
+                    .collect::<Vec<_>>();
                 let input = require_input(
                     ctx,
                     epic,
-                    "child-not-clean",
-                    Some(&child.id),
-                    format!("slice requires adjudication: {evidence}"),
+                    "no-ready-children",
+                    None,
+                    format!(
+                        "Beads frontier contains none of the unresolved children: {unresolved:?}"
+                    ),
                 )
                 .await?;
                 return Ok(Step::Stop(input));
             }
-            return merge_child(ctx, &view.config, child, &run, evidence).await;
+            let wave = u32::try_from(view.waves.len())
+                .unwrap_or(u32::MAX)
+                .saturating_add(1);
+            let order = frontier
+                .iter()
+                .map(|child| {
+                    json!({
+                        "childId": child.id,
+                        "priority": ready.get(&child.id).and_then(|issue| issue.priority),
+                    })
+                })
+                .collect::<Vec<_>>();
+            let member_order = frontier
+                .iter()
+                .map(|child| child.id.clone())
+                .collect::<Vec<_>>();
+            // This commit is intentionally a distinct scheduler action. A
+            // crash cannot leave the first child visible without the whole
+            // deterministic frontier already durable.
+            let wave_event = json!({
+                "wave": wave,
+                "children": member_order,
+                "priorityOrder": order,
+            });
+            append(ctx, epic, WAVE_STARTED, wave_event.clone()).await?;
+            return Ok(Step::Progress(wave_event));
         }
-        let request = OperationRequest {
-            schema_version: 1,
-            idempotency_key: String::new(),
-            run_id: Some(state.run_id.clone()),
-            params: match json!({"run": state.run_id}) {
-                Value::Object(map) => map,
-                _ => Map::new(),
-            },
-        };
-        let result = if drive_child {
-            super::drive::run_drive(ctx, &request).await
-        } else {
-            super::drive::run_advance(ctx, &request).await
-        };
-        if !result.ok {
-            let detail = result
-                .error
-                .as_ref()
-                .map(|error| error.message.clone())
-                .unwrap_or_else(|| "child run failed".to_owned());
-            let input =
-                require_input(ctx, epic, "child-run-failed", Some(&child.id), detail).await?;
-            return Ok(Step::Stop(input));
-        }
-        return Ok(Step::Progress(
-            json!({"child": child.id, "run": result.result}),
+    };
+
+    let mut pending = view
+        .config
+        .children
+        .iter()
+        .filter(|child| members.contains(&child.id))
+        .filter(|child| !accounted(child))
+        .filter(|child| !view.children.contains_key(&child.id))
+        .collect::<Vec<_>>();
+    pending.sort_by(|left, right| {
+        launch_order
+            .get(&left.id)
+            .unwrap_or(&usize::MAX)
+            .cmp(launch_order.get(&right.id).unwrap_or(&usize::MAX))
+            .then_with(|| left.id.cmp(&right.id))
+    });
+
+    for child in pending.iter().filter(|child| is_no_diff(&child.issue_type)) {
+        held.push((
+            child.id.clone(),
+            "non-code-child",
+            format!(
+                "{} is a no-diff {} Bead; complete it directly in Beads, then resolve this hold",
+                child.id, child.issue_type
+            ),
         ));
     }
 
-    let live = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
-    let statuses: BTreeMap<_, _> = live
-        .into_iter()
-        .map(|issue| (issue.id, issue.status))
-        .collect();
-    let all_accounted = view.config.children.iter().all(|child| {
-        child.initially_closed
-            || statuses
+    let available = usize::try_from(view.config.max_active_children)
+        .unwrap_or(usize::MAX)
+        .saturating_sub(nonterminal);
+    let launchable = pending
+        .iter()
+        .copied()
+        .filter(|child| !is_no_diff(&child.issue_type))
+        .take(available)
+        .collect::<Vec<_>>();
+    if !launchable.is_empty() {
+        let compiled = active_compiled_definition(&view)?;
+        let mut launched = Vec::new();
+        for child in launchable {
+            // Pause is out-of-band. Observe it before each new child so at
+            // most the current start/submit effect crosses the boundary.
+            let current = project(ctx, epic).await?;
+            if current.paused.is_some() || current.input.is_some() || current.pr.is_some() {
+                break;
+            }
+            let generation = view
+                .child_generations
                 .get(&child.id)
-                .is_some_and(|status| status == "closed")
-            || view
-                .children
-                .get(&child.id)
-                .is_some_and(|state| state.merged.is_some())
-    });
-    if all_accounted {
-        return final_pr(ctx, &view).await;
+                .copied()
+                .unwrap_or(0)
+                .saturating_add(1);
+            let started =
+                start_child(ctx, &view.config, child, wave, generation, compiled.clone()).await?;
+            let run_id = string(&started, "runId")?;
+            let current = project(ctx, epic).await?;
+            let submission = if current.paused.is_some() {
+                Value::Null
+            } else {
+                submit_child(ctx, epic, child, &run_id).await?
+            };
+            launched.push(json!({"started": started, "submitted": submission}));
+        }
+        if !launched.is_empty() {
+            return Ok(Step::Progress(json!({"launched": launched})));
+        }
+        let current = project(ctx, epic).await?;
+        if let Some(paused) = current.paused {
+            return Ok(Step::Stop(json!({"paused": paused})));
+        }
     }
 
-    let ready: BTreeSet<String> = forged_beads::ready_issues(&ctx.config.bd_config())
-        .await?
-        .into_iter()
-        .map(|issue| issue.id)
-        .collect();
-    let pending_wave = view.waves.last().and_then(|wave| {
-        let number = wave.get("wave")?.as_u64()? as u32;
-        let children: BTreeSet<&str> = wave
-            .get("children")?
-            .as_array()?
-            .iter()
-            .filter_map(Value::as_str)
-            .collect();
-        let pending = view
-            .config
-            .children
-            .iter()
-            .filter(|child| children.contains(child.id.as_str()))
-            .filter(|child| !view.children.contains_key(&child.id))
-            .filter(|child| {
-                statuses
-                    .get(&child.id)
-                    .is_none_or(|status| status != "closed")
-            })
-            .filter(|child| ready.contains(&child.id))
-            .collect::<Vec<_>>();
-        (!pending.is_empty()).then_some((number, pending))
-    });
-    let mut frontier: Vec<&FrozenChild> = pending_wave
-        .as_ref()
-        .map(|(_, children)| children.clone())
-        .unwrap_or_else(|| {
-            view.config
-                .children
-                .iter()
-                .filter(|child| !child.initially_closed)
-                .filter(|child| !view.children.contains_key(&child.id))
-                .filter(|child| {
-                    statuses
-                        .get(&child.id)
-                        .is_none_or(|status| status != "closed")
-                })
-                .filter(|child| ready.contains(&child.id))
-                .collect()
-        });
-    frontier.sort_by(|a, b| a.id.cmp(&b.id));
-    if frontier.is_empty() {
-        let unresolved = view
-            .config
-            .children
-            .iter()
-            .filter(|child| {
-                !child.initially_closed
-                    && !view.children.contains_key(&child.id)
-                    && statuses
-                        .get(&child.id)
-                        .is_none_or(|status| status != "closed")
-            })
-            .map(|child| child.id.clone())
-            .collect::<Vec<_>>();
-        let input = require_input(
-            ctx,
-            epic,
-            "no-ready-children",
-            None,
-            format!("Beads frontier contains none of the unresolved children: {unresolved:?}"),
-        )
-        .await?;
+    // Terminal failures and direct-action children wait until independent
+    // controllers have finished or reached their durable wake. Only then is
+    // the lowest child id promoted into the singular resolution rail.
+    if safe_nonterminal {
+        next_wakes.sort();
+        return Ok(Step::Wait(json!({
+            "reason": "children-running-or-deferred",
+            "nextWakeAt": next_wakes.first(),
+            "activeOrQueued": nonterminal,
+        })));
+    }
+    held.sort_by(|left, right| left.0.cmp(&right.0));
+    if let Some((child, code, detail)) = held.into_iter().next() {
+        let input = require_input(ctx, epic, code, Some(&child), detail).await?;
         return Ok(Step::Stop(input));
     }
-    let wave = pending_wave
-        .as_ref()
-        .map(|(number, _)| *number)
-        .unwrap_or_else(|| u32::try_from(view.waves.len()).unwrap_or(u32::MAX) + 1);
-    if pending_wave.is_none() {
-        let wave_event = json!({
-            "wave": wave,
-            "children": frontier.iter().map(|child| child.id.as_str()).collect::<Vec<_>>(),
-        });
-        append(ctx, epic, WAVE_STARTED, wave_event).await?;
+
+    if nonterminal > 0 {
+        return Ok(Step::Wait(json!({
+            "reason": "children-awaiting-reconciliation",
+            "activeOrQueued": nonterminal,
+        })));
     }
-    if is_no_diff(&frontier[0].issue_type) {
-        let input = require_input(
-            ctx,
-            epic,
-            "non-code-child",
-            Some(&frontier[0].id),
-            format!(
-                "{} is a no-diff {} Bead; complete it directly in Beads, then resolve this hold",
-                frontier[0].id, frontier[0].issue_type
-            ),
-        )
-        .await?;
-        return Ok(Step::Stop(input));
-    }
-    let generation = view
-        .child_generations
-        .get(&frontier[0].id)
-        .copied()
-        .unwrap_or(0)
-        .saturating_add(1);
-    let compiled = active_compiled_definition(&view)?;
-    Ok(Step::Progress(
-        start_child(ctx, &view.config, frontier[0], wave, generation, compiled).await?,
-    ))
+
+    let input = require_input(
+        ctx,
+        epic,
+        "wave-stalled",
+        None,
+        format!("wave {wave} has no safe launch, integration, or resolution candidate"),
+    )
+    .await?;
+    Ok(Step::Stop(input))
 }
 
 async fn record_desired_stop(ctx: &Ctx, epic: &str, stop: &Value) -> Result<(), Failure> {
@@ -1639,8 +2276,9 @@ pub async fn epic_advance(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
         Ok(guard) => guard,
         Err(error) => return err_response(&key, &error),
     };
-    match advance_once(ctx, &epic, false).await {
+    match advance_once(ctx, &epic).await {
         Ok(Step::Progress(value)) => ok_response(&key, false, json!({"progress": value})),
+        Ok(Step::Wait(value)) => ok_response(&key, false, json!({"waiting": value})),
         Ok(Step::Stop(value)) => match record_desired_stop(ctx, &epic, &value).await {
             Ok(()) => ok_response(&key, false, json!({"stopped": value})),
             Err(error) => err_response(&key, &error),
@@ -1656,13 +2294,20 @@ pub async fn epic_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         Err(error) => return err_response(&derive_key("epic_drive", None, None, None), &error),
     };
     let key = derive_key("epic_drive", Some(&epic), None, None);
-    let _guard = match acquire_driver(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&key, &error),
-    };
     loop {
-        match advance_once(ctx, &epic, true).await {
+        // Ownership covers one bounded reconciliation tick only. In
+        // particular, no merge slot or SQLite transaction survives the
+        // poll below, so manual/replacement ticks and pause can linearize.
+        let step = {
+            let _guard = match acquire_driver(ctx, &epic).await {
+                Ok(guard) => guard,
+                Err(error) => return err_response(&key, &error),
+            };
+            advance_once(ctx, &epic).await
+        };
+        match step {
             Ok(Step::Progress(_)) => continue,
+            Ok(Step::Wait(_)) => tokio::time::sleep(EPIC_POLL).await,
             Ok(Step::Stop(value)) => {
                 if let Err(error) = record_desired_stop(ctx, &epic, &value).await {
                     return err_response(&key, &error);
@@ -1842,6 +2487,12 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 return Err(Failure::internal("epic resolution event is not an object"));
             };
             resolved_object.insert("resolutionId".to_owned(), json!(operation));
+            // Parent then child is the control order shared with launch. The
+            // child fence joins any still-running terminal settlement before
+            // reopening its Bead, preventing the old generation from
+            // re-blocking it after resolution has already landed.
+            let _parent_guard =
+                super::handoff::acquire_submit(ctx, &epic, super::handoff::Scope::Epic).await?;
             let view = project(ctx, &epic).await?;
             if !view.config.children.iter().any(|item| item.id == child) {
                 return Err(Failure::invalid(format!(
@@ -1865,6 +2516,13 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     "epic {epic:?} input requirement does not target child {child:?}"
                 )));
             }
+            let previous = view.children.get(&child).cloned();
+            let _child_guard = match previous.as_ref() {
+                Some(previous) => {
+                    Some(super::handoff::acquire_run_submit(ctx, &previous.run_id).await?)
+                }
+                None => None,
+            };
             let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
             if issue.status != "closed" && issue.status != "open" {
                 forged_beads::reopen_issue(
@@ -1874,7 +2532,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 )
                 .await?;
             }
-            if let Some(previous) = view.children.get(&child) {
+            if let Some(previous) = previous {
                 append(
                     ctx,
                     &epic,
@@ -1888,7 +2546,8 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 )
                 .await?;
             }
-            append_resolution_event(ctx, &epic, resolved_event.clone()).await?;
+            append_resolution_event(ctx, &epic, resolved_event.clone(), view.paused.is_some())
+                .await?;
             crate::failpoint::hit("epic.resolve.desired.after");
             Ok(resolved_event)
         }

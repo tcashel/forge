@@ -50,6 +50,10 @@ fn start_run(env: &TestEnv, bead: &str) {
 
 /// Spawn `run drive` as a real child, optionally armed with a failpoint.
 fn spawn_drive(env: &TestEnv, run: &str, failpoint: Option<(&str, &str, &Path)>) -> Child {
+    // These schedules intentionally exercise the controller body directly.
+    // Establish the operator authorization that production obtains through
+    // `run submit`; ready-but-unsubmitted work must otherwise stay inert.
+    env.authorize_run(run);
     let mut cmd = env.forged_cmd(&["run", "drive", "--run", run]);
     if let Some((site, mode, dir)) = failpoint {
         cmd.env("FORGED_FAILPOINT", site)
@@ -118,6 +122,7 @@ fn start_epic(env: &TestEnv, epic: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "epic start: {started}");
+    env.authorize_epic(epic);
 }
 
 fn spawn_epic_drive(env: &TestEnv, epic: &str, failpoint: (&str, &str, &Path)) -> Child {
@@ -780,6 +785,11 @@ fn epic_terminal_and_input_stops_serialize_with_supervisor_spawn() {
             .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic, 0)
             .expect("authorize desired epic");
         ledger.close().expect("close");
+        if case == "input" {
+            let (code, wave) = env.forged(&["epic", "advance", "--epic", &epic]);
+            assert_eq!(code, 0, "commit complete input wave: {wave}");
+            assert!(wave["result"]["progress"]["wave"].is_number());
+        }
 
         // The stop transition wins the shared fence but pauses before its
         // atomic event+desired commit, so the supervisor can complete its
@@ -931,6 +941,9 @@ fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
         )
         .expect("authorize desired epic");
     ledger.close().expect("close");
+    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "commit complete wave: {wave}");
+    assert!(wave["result"]["progress"]["wave"].is_number());
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
     assert_eq!(code, 0, "input stop: {held}");
     assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));
@@ -1067,6 +1080,13 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
             .exists(),
         "the detached identity reached disk before the crash"
     );
+    let admission = env
+        .anvil
+        .join("runs/bead-khandoff/controller/runtime-admission.json");
+    assert!(
+        admission.exists(),
+        "the lifecycle fence survives the record-before-completion crash"
+    );
 
     // A new lead session recovers the exact same controller and settles the
     // interrupted submit operation. It never starts a second controller.
@@ -1074,6 +1094,10 @@ fn controller_recorded_then_submitter_crashes_is_adopted_without_duplicate() {
     assert_eq!(code, 0, "recover submit: {recovered}");
     assert_eq!(recovered["result"]["submitted"], json!(true));
     assert_eq!(recovered["result"]["alreadyRunning"], json!(false));
+    assert!(
+        !admission.exists(),
+        "matching durable controller identity completes the admission"
+    );
     {
         let ledger = env.ledger();
         let operation = ledger
@@ -1392,6 +1416,7 @@ fn codex_rate_limit_during_fix_spares_the_semantic_round() {
     let env = TestEnv::new("km7");
     env.write_config(Some("codex"));
     start_run(&env, "bead-k7");
+    env.authorize_run("bead-k7");
     env.set_scenario("fix", "rate-limit", 1);
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k7"]);
     assert_eq!(code, 0, "drive: {driven}");
@@ -1446,6 +1471,7 @@ fn a_crashed_reconcile_never_wedges_the_next_one() {
     let env = TestEnv::new("km8");
     env.write_config(None);
     start_run(&env, "bead-k8");
+    env.authorize_run("bead-k8");
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-k8"]);
     assert_eq!(code, 0, "drive: {driven}");
 
@@ -1565,6 +1591,7 @@ fn start_bead_run(env: &TestEnv, bead: &str) {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run(bead);
 }
 
 /// Advance until the run's first packet row exists and no further.
@@ -1682,6 +1709,7 @@ fn start_bead_run_with_implementation_hint(env: &TestEnv, bead: &str, provider: 
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run(bead);
 }
 
 #[test]
@@ -1803,6 +1831,7 @@ fn a_required_herdr_host_settles_before_the_spawn_rather_than_propagating() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    env.authorize_run("bead-k9c");
 
     let packet = advance_to_open_packet(&env, "bead-k9c");
     let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-k9c"]);

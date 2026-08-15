@@ -10,11 +10,14 @@
 
 mod support;
 
+use std::process::Command;
+
 use serde_json::{json, Value};
 use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
     render_dispatch_without_server_tools, render_resolution,
-    render_resolution_without_server_tools, require_node,
+    render_resolution_without_server_tools, require_node, run_agent_sessions_host,
+    run_split_app_host,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -379,7 +382,8 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
         "id": "queue-run",
         "kind": "slice",
         "beadId": "bead-queue-run",
-        "title": "Make work legible",
+        "title": "Renamed live title",
+        "identity": {"displayTitle": "Make work legible [repositories/forge]"},
         "state": "active",
         "nextAction": "Submit a detached controller when this work should start",
     });
@@ -401,7 +405,7 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
         "Running",
         "Stalled or recoverable",
         "Planned",
-        "Make work legible",
+        "Make work legible [repositories/forge]",
         "Next: Submit a detached controller",
     ] {
         assert!(
@@ -410,6 +414,11 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
             dispatched.text
         );
     }
+    assert!(
+        !dispatched.text.contains("Renamed live title"),
+        "the App prefers the durable display identity: {}",
+        dispatched.text
+    );
 }
 
 /// The rail is the answer to "what needs a human", so it has to be drawn
@@ -626,5 +635,292 @@ fn a_host_without_server_tools_gets_candidates_it_cannot_click() {
         limited.text.contains("does not proxy tool calls"),
         "and says why they cannot be opened: {}",
         limited.text
+    );
+}
+
+#[test]
+fn split_apps_are_dependency_free_safe_and_javascript_valid() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let operations = root.join("operations-overview.html");
+    let detail = root.join("work-detail.html");
+    let map = root.join("work-map.html");
+    let sessions = root.join("agent-sessions.html");
+
+    for (path, schema, tool) in [
+        (
+            &operations,
+            "forged.operations-overview/1",
+            "operations_overview",
+        ),
+        (&detail, "forged.work-detail/1", "work_detail"),
+        (&map, "forged.work-map/1", "work_map"),
+        (
+            &sessions,
+            "forged.provider-session-inventory/1",
+            "session_inventory",
+        ),
+    ] {
+        let html = std::fs::read_to_string(path).expect("read split App");
+        for required in [
+            schema,
+            tool,
+            "ui/initialize",
+            "ui/notifications/tool-result",
+            "ui/notifications/size-changed",
+            "hostCapabilities",
+        ] {
+            assert!(
+                html.contains(required),
+                "{} contains its {required} contract",
+                path.display()
+            );
+        }
+        assert!(
+            !html.contains("innerHTML"),
+            "{} never renders tool data as HTML",
+            path.display()
+        );
+
+        let output = Command::new(&node)
+            .args([
+                "-e",
+                "const fs=require('fs');const h=fs.readFileSync(process.argv[1],'utf8');const m=h.match(/<script>([\\s\\S]*?)<\\/script>/);if(!m)throw Error('missing script');new Function(m[1]);",
+            ])
+            .arg(path)
+            .output()
+            .expect("parse App JavaScript");
+        assert!(
+            output.status.success(),
+            "{} JavaScript parses: {}",
+            path.display(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    let html = std::fs::read_to_string(operations).expect("read Operations App");
+    assert!(html.contains("entry.detailTarget"));
+    assert!(html.contains("host.capabilities.serverTools"));
+    let html = std::fs::read_to_string(map).expect("read Work Map App");
+    assert!(html.contains("node.detailTarget"));
+    assert!(html.contains("subjectKind"));
+    assert!(html.contains("ArrowDown") && html.contains("ArrowUp"));
+    let html = std::fs::read_to_string(sessions).expect("read Agent Sessions App");
+    assert!(html.contains("detailTarget(row)"));
+    assert!(html.contains("name:\"work_detail\""));
+    assert!(html.contains("name:\"session_inventory\""));
+    for forbidden in [
+        "session_read",
+        "session_message",
+        "session_stop",
+        "localStorage",
+        "sessionStorage",
+        "fetch(",
+        "idempotencyKey",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "Agent Sessions contains forbidden capability {forbidden}"
+        );
+    }
+}
+
+#[test]
+fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+
+    for (name, operations, work_map, agent_sessions) in [
+        ("operations-overview.html", true, false, false),
+        ("work-detail.html", false, false, false),
+        ("work-map.html", false, true, false),
+        ("agent-sessions.html", false, false, true),
+    ] {
+        let report = run_split_app_host(&node, &root.join(name));
+        assert_eq!(report["operations"], json!(operations), "{name}: {report}");
+        assert_eq!(report["workMap"], json!(work_map), "{name}: {report}");
+        assert_eq!(
+            report["agentSessions"],
+            json!(agent_sessions),
+            "{name}: {report}"
+        );
+        assert_eq!(report["initialTheme"], json!("dark"), "{name}: {report}");
+        assert_eq!(
+            report["initialVariable"],
+            json!("violet"),
+            "{name}: {report}"
+        );
+        assert_eq!(report["changedTheme"], json!("light"), "{name}: {report}");
+        assert_eq!(report["changedVariable"], json!("teal"), "{name}: {report}");
+        assert!(
+            report["sizeNotifications"]
+                .as_array()
+                .is_some_and(|notifications| notifications.iter().any(|notification| {
+                    notification.pointer("/params/width") == Some(&json!(720))
+                        && notification.pointer("/params/height") == Some(&json!(640))
+                })),
+            "{name} reports changed host size: {report}"
+        );
+
+        assert_eq!(report["innerHTMLWrites"], json!(0), "{name}: {report}");
+        assert_eq!(report["injected"], json!(false), "{name}: {report}");
+        assert!(
+            report["text"]
+                .as_array()
+                .is_some_and(|texts| texts.contains(&report["malicious"])),
+            "{name} preserves hostile tool text as text: {report}"
+        );
+        assert_eq!(
+            report["toolCalls"],
+            json!(0),
+            "{name} cannot call tools without serverTools: {report}"
+        );
+
+        assert!(
+            report
+                .pointer("/beforeTeardown/timers")
+                .and_then(Value::as_u64)
+                > Some(0),
+            "{name} has a real pending request to cancel: {report}"
+        );
+        assert!(
+            report
+                .pointer("/beforeTeardown/frames")
+                .and_then(Value::as_u64)
+                > Some(0),
+            "{name} has a real pending size frame to cancel: {report}"
+        );
+        assert_eq!(
+            report.pointer("/beforeTeardown/observer"),
+            Some(&json!(true))
+        );
+        assert_eq!(report.pointer("/afterTeardown/timers"), Some(&json!(0)));
+        assert_eq!(report.pointer("/afterTeardown/frames"), Some(&json!(0)));
+        assert_eq!(
+            report.pointer("/afterTeardown/observerDisconnected"),
+            Some(&json!(true))
+        );
+        assert_eq!(
+            report.pointer("/afterTeardown/messageListeners"),
+            Some(&json!(0))
+        );
+        assert_eq!(report["teardownAck"], json!(true), "{name}: {report}");
+
+        if operations {
+            let rows = report["rows"].as_array().expect("Operations rows");
+            assert_eq!(rows.len(), 2, "both Operations rows render: {report}");
+            assert_eq!(rows[0]["disabled"], json!(true));
+            assert_eq!(
+                rows[0]["title"],
+                json!("Plan-only work has no durable detail yet")
+            );
+            assert_eq!(rows[1]["disabled"], json!(true));
+            assert_eq!(
+                rows[1]["title"],
+                json!("Exact detail target run:run-1; this host cannot call server tools")
+            );
+            assert!(
+                report["text"]
+                    .as_array()
+                    .is_some_and(|texts| texts.contains(&json!("run:run-1"))),
+                "Operations visibly renders the canonical exact selector: {report}"
+            );
+        } else if work_map {
+            let rows = report["mapNodes"].as_array().expect("Work Map nodes");
+            assert_eq!(rows.len(), 2, "both Work Map nodes render: {report}");
+            assert!(
+                report["text"]
+                    .as_array()
+                    .is_some_and(|texts| texts.contains(&json!("run-1"))
+                        && texts.contains(&report["malicious"])),
+                "Work Map safely renders exact ids and hostile titles as text: {report}"
+            );
+        } else if agent_sessions {
+            assert_eq!(
+                report["sessionRows"].as_array().map(Vec::len),
+                Some(1),
+                "Agent Sessions renders one server-ordered row: {report}"
+            );
+            let text = report["text"].to_string();
+            for allowed in [
+                "run-1",
+                "pane-1",
+                "candidate-1",
+                "provider-1",
+                "inspect-work",
+            ] {
+                assert!(
+                    text.contains(allowed),
+                    "Agent Sessions shows {allowed}: {report}"
+                );
+            }
+            for secret in [
+                "secret-claimant",
+                "secret-revoke",
+                "secret-failure",
+                "secret-desired-error",
+                "secret-cleanup-error",
+                "secret-claim-token",
+                "secret-metadata-error",
+                "secret-lifecycle-error",
+                "secret-provider-error",
+                "/secret/socket",
+                "/secret/sentinel",
+                "/secret/projection-socket",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "Agent Sessions must omit stored sensitive value {secret}: {report}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn agent_sessions_controls_are_bounded_exact_and_read_only() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("agent-sessions.html");
+    let report = run_agent_sessions_host(&node, &asset);
+
+    assert_eq!(report["automaticToolCalls"], json!(0), "{report}");
+    assert_eq!(report["toolCalls"], json!(4), "{report}");
+    assert_eq!(
+        report["interactiveCalls"],
+        json!([
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "limit": 25}}
+            },
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "includeHistorical": true, "limit": 25}}
+            },
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "cursor": "cursor-next", "includeHistorical": true, "limit": 25}}
+            },
+            {
+                "name": "work_detail",
+                "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-next"}}
+            }
+        ]),
+        "refresh is single-flight, history drops a prior cursor, next uses the exact request-bound cursor, and detail uses only the canonical run: {report}"
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("Next page work"),
+        "latest page renders: {report}"
+    );
+    assert!(
+        !text.contains(report["malicious"].as_str().unwrap_or_default()),
+        "page replacement does not accumulate the initial row: {report}"
+    );
+    assert_eq!(
+        report.pointer("/afterTeardown/timers"),
+        Some(&json!(0)),
+        "all explicit read and model-context requests tear down: {report}"
     );
 }

@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Thirty-four tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-three tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -28,20 +28,60 @@ use forged_types::OperationRequest;
 use crate::core::{dispatch, Ctx};
 
 const OVERVIEW_URI: &str = "ui://forged/overview.html";
+const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
+const WORK_DETAIL_URI: &str = "ui://forged/work-detail.html";
+const WORK_MAP_URI: &str = "ui://forged/work-map.html";
+const AGENT_SESSIONS_URI: &str = "ui://forged/agent-sessions.html";
 const APP_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_HTML: &str = include_str!("../assets/overview.html");
+const OPERATIONS_OVERVIEW_HTML: &str = include_str!("../assets/operations-overview.html");
+const WORK_DETAIL_HTML: &str = include_str!("../assets/work-detail.html");
+const WORK_MAP_HTML: &str = include_str!("../assets/work-map.html");
+const AGENT_SESSIONS_HTML: &str = include_str!("../assets/agent-sessions.html");
+
+fn app_tool_meta(uri: &str) -> MetaObject {
+    let mut meta = MetaObject::new();
+    meta.insert("ui".to_owned(), serde_json::json!({"resourceUri": uri}));
+    // Pre-standard hosts used this flat spelling. Keeping both is harmless
+    // and lets the same binary progressively enhance older Apps clients.
+    meta.insert("ui/resourceUri".to_owned(), Value::String(uri.to_owned()));
+    meta
+}
 
 fn overview_tool_meta() -> MetaObject {
+    app_tool_meta(OVERVIEW_URI)
+}
+
+fn operations_overview_tool_meta() -> MetaObject {
+    app_tool_meta(OPERATIONS_OVERVIEW_URI)
+}
+
+fn work_detail_tool_meta() -> MetaObject {
+    app_tool_meta(WORK_DETAIL_URI)
+}
+
+fn work_map_tool_meta() -> MetaObject {
+    app_tool_meta(WORK_MAP_URI)
+}
+
+fn agent_sessions_tool_meta() -> MetaObject {
+    app_tool_meta(AGENT_SESSIONS_URI)
+}
+
+fn app_resource_meta() -> MetaObject {
     let mut meta = MetaObject::new();
     meta.insert(
         "ui".to_owned(),
-        serde_json::json!({"resourceUri": OVERVIEW_URI}),
-    );
-    // Pre-standard hosts used this flat spelling. Keeping both is harmless
-    // and lets the same binary progressively enhance older Apps clients.
-    meta.insert(
-        "ui/resourceUri".to_owned(),
-        Value::String(OVERVIEW_URI.to_owned()),
+        serde_json::json!({
+            "csp": {
+                "baseUriDomains": [],
+                "connectDomains": [],
+                "frameDomains": [],
+                "resourceDomains": [],
+            },
+            "permissions": {},
+            "prefersBorder": true,
+        }),
     );
     meta
 }
@@ -186,6 +226,479 @@ impl OverviewArgs {
             schema_version: self.schema_version,
             idempotency_key: self.idempotency_key,
             run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// The `work_list` envelope: the shared envelope shape with the one typed
+/// repository selector this discovery operation accepts.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkListArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_list:read` when absent.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Work discovery has no run id; retained for envelope compatibility.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Discovery parameters.
+    #[serde(default)]
+    pub params: WorkListParams,
+}
+
+/// Optional repository scope for `work_list`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkListParams {
+    /// Exact repository identity from Bead `metadata.repository`.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+}
+
+impl WorkListArgs {
+    /// Project onto the shared envelope, omitting an absent repository so it
+    /// remains byte-compatible with the operator-wide request.
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// Closed attempt activity exposed in MCP discovery. These values are
+/// intentionally distinct from Herdr's `working`/`unknown` lifecycle.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum SessionInventoryActivityParam {
+    Running,
+    Revoking,
+    Completed,
+    Failed,
+    Reclaimed,
+    Stopped,
+}
+
+/// Typed MCP envelope for the bounded provider-session inventory.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInventoryArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Retained for envelope compatibility; inventory is operator-wide.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Canonical filters and keyset pagination.
+    #[serde(default)]
+    pub params: SessionInventoryParams,
+}
+
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct SessionInventoryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub run: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repository: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub activity: Option<SessionInventoryActivityParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub include_historical: Option<bool>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl SessionInventoryArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// Closed work-history bucket exposed in MCP discovery.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkHistoryBucketParam {
+    Hour,
+    Day,
+    Week,
+}
+
+/// Closed work-history grouping dimension exposed in MCP discovery.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkHistoryGroupParam {
+    None,
+    Repository,
+    Epic,
+    Stage,
+    Provider,
+}
+
+/// Typed MCP envelope for the bounded history projection.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkHistoryArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Retained for envelope compatibility; history is operator-wide.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Bounded history query.
+    #[serde(default)]
+    pub params: WorkHistoryParams,
+}
+
+/// Closed, bounded history parameters. Display titles are deliberately
+/// absent: every filter is a canonical id.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkHistoryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<WorkHistoryBucketParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<WorkHistoryGroupParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl WorkHistoryArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
+/// Typed envelope for the bounded Operations App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationsOverviewArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:operations_overview:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Operations projection parameters.
+    #[serde(default)]
+    pub params: OperationsOverviewParams,
+}
+
+/// Filters accepted by `operations_overview`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct OperationsOverviewParams {
+    /// Exact durable repository identity.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+    /// Queue group code: needs-me, ready-to-merge, running,
+    /// stalled-or-recoverable, or planned.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub group: Option<String>,
+    /// Source code: durable or live-plan.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub source: Option<String>,
+    /// Maximum rows across all groups, 1..=500 (default 200).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl OperationsOverviewArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Closed Work Map scope exposed in MCP discovery.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapScopeParam {
+    /// All operator-scoped work.
+    #[default]
+    Operator,
+    /// Work for one exact canonical repository path.
+    Repository,
+    /// Work for one exact epic id.
+    Epic,
+}
+
+/// Closed Operations group exposed by Work Map.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapGroupParam {
+    NeedsMe,
+    ReadyToMerge,
+    Running,
+    StalledOrRecoverable,
+    Planned,
+}
+
+/// Closed Work Map authority source.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapSourceParam {
+    Durable,
+    LivePlan,
+}
+
+/// Closed canonical Work Map reference kind.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkMapRefKindParam {
+    Plan,
+    Run,
+    Epic,
+}
+
+/// Complete canonical focus coordinate for Work Map.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapFocusParam {
+    /// Contract discriminator; must be `forged.work-ref/1`.
+    #[serde(deserialize_with = "named_string")]
+    pub schema: String,
+    /// Exact node kind.
+    pub kind: WorkMapRefKindParam,
+    /// Exact canonical node id.
+    #[serde(deserialize_with = "named_string")]
+    pub id: String,
+}
+
+/// Typed MCP envelope for the bounded Work Map App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Closed, bounded map query.
+    #[serde(default)]
+    pub params: WorkMapParams,
+}
+
+/// Closed parameters accepted by `work_map`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapParams {
+    /// Operator, repository, or epic scope.
+    #[serde(default)]
+    pub scope: WorkMapScopeParam,
+    /// Exact canonical repository path for repository scope.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repository: Option<String>,
+    /// Exact epic id for epic scope.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub epic_id: Option<String>,
+    /// Optional canonical Operations queue group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<WorkMapGroupParam>,
+    /// Optional authority source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<WorkMapSourceParam>,
+    /// Inclusive RFC3339 UTC history lower bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC history upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Maximum graph nodes, 1..=500 (default 250).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<u64>,
+    /// Optional complete canonical node focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<WorkMapFocusParam>,
+}
+
+impl WorkMapArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Closed durable subject kind accepted by `work_detail`.
+#[derive(Debug, Serialize, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkDetailKind {
+    /// One slice run.
+    Run,
+    /// One epic.
+    Epic,
+}
+
+/// Typed envelope for the exact Work Detail App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkDetailArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:work_detail:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Exact detail target and event page.
+    pub params: WorkDetailParams,
+}
+
+/// Required exact target for `work_detail`.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkDetailParams {
+    /// Durable subject kind.
+    pub subject_kind: WorkDetailKind,
+    /// Canonical run or epic id.
+    #[serde(deserialize_with = "named_string")]
+    pub subject_id: String,
+    /// Return event rows after this event id (default 0).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub after: Option<i64>,
+    /// Maximum event rows, 1..=1000 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+fn named_string<'de, D>(deserializer: D) -> Result<String, D::Error>
+where
+    D: rmcp::serde::Deserializer<'de>,
+{
+    use rmcp::serde::Deserialize as _;
+    let value = String::deserialize(deserializer)?;
+    if value.trim().is_empty() {
+        return Err(rmcp::serde::de::Error::custom("must name a subject"));
+    }
+    Ok(value)
+}
+
+impl WorkDetailArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let run_id = Some(self.params.subject_id.clone());
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id,
             params,
         }
     }
@@ -374,6 +887,20 @@ impl ForgedServer {
             .await
     }
 
+    /// Bounded operator queue and live-plan projection.
+    #[tool(
+        name = "operations_overview",
+        description = "Project bounded planned, queued, active, blocked, and mergeable work. Optional params.repo, params.group, params.source, and params.limit filters never widen on invalid input.",
+        meta = operations_overview_tool_meta()
+    )]
+    pub async fn operations_overview(
+        &self,
+        args: Parameters<OperationsOverviewArgs>,
+    ) -> CallToolResult {
+        self.call_structured("operations_overview", args.0.into_envelope())
+            .await
+    }
+
     /// Claim one packet.
     #[tool(name = "packet_claim", description = "Claim a packet for execution.")]
     pub async fn packet_claim(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
@@ -390,6 +917,15 @@ impl ForgedServer {
     #[tool(name = "packet_fail", description = "Report a packet failure.")]
     pub async fn packet_fail(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("packet_fail", args.0).await
+    }
+
+    /// Publish the latest exact durable review snapshot to its slice PR.
+    #[tool(
+        name = "review_publish",
+        description = "Publish an exact durable review snapshot to its recorded slice pull request. params.run is required."
+    )]
+    pub async fn review_publish(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("review_publish", args.0).await
     }
 
     /// Verify one immutable attempt manifest without repairing it.
@@ -417,6 +953,20 @@ impl ForgedServer {
     )]
     pub async fn session_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("session_list", args.0).await
+    }
+
+    /// Transaction-consistent provider-session inventory across durable work.
+    #[tool(
+        name = "session_inventory",
+        description = "Inventory durable provider attempts across runs and repositories. Read-only; pane ids and confirmed provider-session ids remain distinct.",
+        meta = agent_sessions_tool_meta()
+    )]
+    pub async fn session_inventory(
+        &self,
+        args: Parameters<SessionInventoryArgs>,
+    ) -> CallToolResult {
+        self.call_structured("session_inventory", args.0.into_envelope())
+            .await
     }
 
     /// Read recent output from a Herdr-backed session.
@@ -486,10 +1036,71 @@ impl ForgedServer {
         name = "work_list",
         description = "List all forged work — every slice run and every started epic, live and \
                        historical, each labelled slice or epic. Takes no id: this is how a \
-                       caller with no prior knowledge discovers the ids the other tools require."
+                       caller with no prior knowledge discovers the ids the other tools require. \
+                       Optional params.repo selects the exact Bead metadata.repository identity."
     )]
-    pub async fn work_list(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("work_list", args.0).await
+    pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
+        self.call("work_list", args.0.into_envelope()).await
+    }
+
+    /// Bounded historical lifecycle, rework, and spend trend.
+    #[tool(
+        name = "work_history",
+        description = "Project bounded durable cross-run history and spend. Accepts an optional \
+                       half-open UTC window, hour/day/week bucket, one closed grouping dimension, \
+                       exact canonical repo/epic/subject filters, and bounded cursor pagination."
+    )]
+    pub async fn work_history(&self, args: Parameters<WorkHistoryArgs>) -> CallToolResult {
+        self.call("work_history", args.0.into_envelope()).await
+    }
+
+    /// Bounded authority-preserving work graph for navigation.
+    #[tool(
+        name = "work_map",
+        description = "Project a bounded graph of current Beads plans and distinct durable run/epic executions. Accepts operator, exact repository, or exact epic scope; canonical queue/source filters; an optional half-open history window; maxNodes up to 500; and a complete forged.work-ref/1 focus.",
+        meta = work_map_tool_meta()
+    )]
+    pub async fn work_map(&self, args: Parameters<WorkMapArgs>) -> CallToolResult {
+        self.call_structured("work_map", args.0.into_envelope())
+            .await
+    }
+
+    /// Exact durable subject projection for the Work Detail App.
+    #[tool(
+        name = "work_detail",
+        description = "Project one exact durable run or epic. params.subjectKind and params.subjectId are required; params.after and params.limit page its event tail.",
+        meta = work_detail_tool_meta()
+    )]
+    pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {
+        self.call_structured("work_detail", args.0.into_envelope())
+            .await
+    }
+
+    /// Record custody of an exact active attention occurrence.
+    #[tool(
+        name = "attention_acknowledge",
+        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state."
+    )]
+    pub async fn attention_acknowledge(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_acknowledge", args.0).await
+    }
+
+    /// Resolve one explicitly adjudicable attention occurrence.
+    #[tool(
+        name = "attention_resolve",
+        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse."
+    )]
+    pub async fn attention_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_resolve", args.0).await
+    }
+
+    /// Reopen one exact resolved attention occurrence.
+    #[tool(
+        name = "attention_reopen",
+        description = "Reopen the exact current attention occurrence without changing domain state."
+    )]
+    pub async fn attention_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_reopen", args.0).await
     }
 }
 
@@ -523,13 +1134,30 @@ impl ServerHandler for ForgedServer {
         _request: Option<PaginatedRequestParams>,
         _context: RequestContext<RoleServer>,
     ) -> Result<ListResourcesResult, ErrorData> {
-        Ok(ListResourcesResult::with_all_items(vec![Resource::new(
-            OVERVIEW_URI,
-            "forged-overview",
-        )
-        .with_title("Forged Control Plane")
-        .with_description("View-only projection of Forged slice and epic execution.")
-        .with_mime_type(APP_MIME)]))
+        Ok(ListResourcesResult::with_all_items(vec![
+            Resource::new(OVERVIEW_URI, "forged-overview")
+                .with_title("Forged Control Plane")
+                .with_description("Compatibility view of Forged slice and epic execution.")
+                .with_mime_type(APP_MIME),
+            Resource::new(OPERATIONS_OVERVIEW_URI, "forged-operations-overview")
+                .with_title("Forged Operations")
+                .with_description("Bounded planned, queued, active, blocked, and mergeable work.")
+                .with_mime_type(APP_MIME),
+            Resource::new(WORK_DETAIL_URI, "forged-work-detail")
+                .with_title("Forged Work Detail")
+                .with_description("Exact read-only projection of one Forged run or epic.")
+                .with_mime_type(APP_MIME),
+            Resource::new(WORK_MAP_URI, "forged-work-map")
+                .with_title("Forged Work Map")
+                .with_description("Bounded plan, queue, execution, dependency, and history graph.")
+                .with_mime_type(APP_MIME),
+            Resource::new(AGENT_SESSIONS_URI, "forged-agent-sessions")
+                .with_title("Forged Agent Sessions")
+                .with_description(
+                    "Bounded read-only diagnostics for provider attempts across durable work.",
+                )
+                .with_mime_type(APP_MIME),
+        ]))
     }
 
     async fn read_resource(
@@ -537,16 +1165,25 @@ impl ServerHandler for ForgedServer {
         request: ReadResourceRequestParams,
         _context: RequestContext<RoleServer>,
     ) -> Result<ReadResourceResponse, ErrorData> {
-        if request.uri != OVERVIEW_URI {
-            return Err(ErrorData::resource_not_found(
-                format!("unknown forged resource {:?}", request.uri),
-                None,
-            ));
-        }
-        Ok(ReadResourceResult::new(vec![
-            ResourceContents::text(OVERVIEW_HTML, OVERVIEW_URI).with_mime_type(APP_MIME)
-        ])
-        .into())
+        let html = match request.uri.as_str() {
+            OVERVIEW_URI => OVERVIEW_HTML,
+            OPERATIONS_OVERVIEW_URI => OPERATIONS_OVERVIEW_HTML,
+            WORK_DETAIL_URI => WORK_DETAIL_HTML,
+            WORK_MAP_URI => WORK_MAP_HTML,
+            AGENT_SESSIONS_URI => AGENT_SESSIONS_HTML,
+            _ => {
+                return Err(ErrorData::resource_not_found(
+                    format!("unknown forged resource {:?}", request.uri),
+                    None,
+                ))
+            }
+        };
+        Ok(
+            ReadResourceResult::new(vec![ResourceContents::text(html, request.uri)
+                .with_mime_type(APP_MIME)
+                .with_meta(app_resource_meta())])
+            .into(),
+        )
     }
 }
 

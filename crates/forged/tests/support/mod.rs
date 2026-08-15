@@ -646,11 +646,16 @@ issue_json() {
   acceptance=$(cat "$state/$id.acceptance" 2>/dev/null || true)
   design=$(cat "$state/$id.design" 2>/dev/null || true)
   notes=$(cat "$state/$id.notes" 2>/dev/null || true)
-  metadata=$(cat "$state/$id.metadata" 2>/dev/null || echo '{}')
+  repository=$(cat "$state/default-repository" 2>/dev/null || true)
+  metadata=$(cat "$state/$id.metadata" 2>/dev/null || printf '{"repository":"%s"}' "$repository")
+  priority=$(cat "$state/$id.priority" 2>/dev/null || echo 2)
+  parent=$(cat "$state/$id.parent" 2>/dev/null || true)
+  if [ -n "$parent" ]; then parent_json="\"$parent\""; else parent_json=null; fi
+  dependencies=$(cat "$state/$id.dependencies" 2>/dev/null || echo '[]')
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s}' "$id" "$title" "$description" "$status" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision"
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s,"updated_at":"2026-08-14T00:00:00Z","parent":%s,"dependencies":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision" "$parent_json" "$dependencies"
 }
 case "$cmd" in
   version)
@@ -734,7 +739,6 @@ case "$cmd" in
       printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
     fi ;;
   show)
-    id=$2
     # Simulated bd outage: `show` is the read the spec fence depends on.
     if [ -f "$state/show.unreachable" ]; then
       printf 'bd: connection refused\n' >&2
@@ -744,8 +748,15 @@ case "$cmd" in
     # fixture by hand. Remember every shown issue so `bd ready` can expose
     # open ones when no explicit frontier was seeded. Tests that exercise a
     # competing frontier still seed it and therefore keep exact control.
-    : > "$state/$id.seen"
-    printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
+    first=1; printf '{"schema_version":1,"data":['
+    shift
+    for id in "$@"; do
+      [ "$id" = "--json" ] && continue
+      case "$id" in --*) continue ;; esac
+      : > "$state/$id.seen"
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+    done
+    printf ']}\n' ;;
   comments)
     id=$2; text=$(cat "$state/$id.comment" 2>/dev/null || true)
     if [ -n "$text" ]; then
@@ -757,12 +768,48 @@ case "$cmd" in
     id=$2; printf '%s' "$3" > "$state/$id.comment"
     printf '{"schema_version":1,"data":{"id":"%s"}}\n' "$id" ;;
   list)
+    if [ -f "$state/list.unreachable" ]; then
+      printf 'bd: connection refused\n' >&2
+      exit 1
+    fi
     ids=$(val --id "$@")
+    statuses=$(val --status "$@")
+    limit=$(val --limit "$@")
+    metadata_filter=$(val --metadata-field "$@")
+    parent_filter=$(val --parent "$@")
+    if [ -z "$ids" ]; then
+      ids=$(for field in "$state"/*.status; do
+        [ -e "$field" ] || continue
+        printf '%s,' "$(basename "$field" .status)"
+      done)
+      ids=${ids%,}
+    fi
     first=1; printf '{"schema_version":1,"data":['
     oldifs=$IFS; IFS=,
+    shown=0
     for id in $ids; do
       [ -n "$id" ] || continue
+      if [ -n "$statuses" ]; then
+        current_status=$(cat "$state/$id.status" 2>/dev/null || echo open)
+        case ",$statuses," in *",$current_status,"*) ;; *) continue ;; esac
+      fi
+      if [ -n "$metadata_filter" ]; then
+        case "$metadata_filter" in
+          repository=*) expected_repository=${metadata_filter#repository=} ;;
+          *) continue ;;
+        esac
+        repository=$(cat "$state/$id.repository" 2>/dev/null || true)
+        [ "$repository" = "$expected_repository" ] || continue
+      fi
+      if [ -n "$parent_filter" ]; then
+        current_parent=$(cat "$state/$id.parent" 2>/dev/null || true)
+        [ "$current_parent" = "$parent_filter" ] || continue
+      fi
+      if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ "$shown" -ge "$limit" ]; then
+        continue
+      fi
       [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      shown=$((shown + 1))
     done
     IFS=$oldifs
     printf ']}\n' ;;
@@ -869,6 +916,13 @@ impl TestEnv {
         write_shim(&shim_bin, "gh", GH_SHIM);
         let gh_log = root.join("gh-calls.log");
         let repos = setup_repos(&root, "main");
+        let shim_state = beads_dir.join("shim-state");
+        std::fs::create_dir_all(&shim_state).expect("creating bd shim state");
+        std::fs::write(
+            shim_state.join("default-repository"),
+            repos.repo.to_string_lossy().as_bytes(),
+        )
+        .expect("write default Bead repository metadata");
         let spec = root.join("spec.md");
         std::fs::write(&spec, "# test spec\nbuild the thing\n").expect("write spec");
         let env = TestEnv {
@@ -1207,6 +1261,23 @@ impl TestEnv {
         .expect("revision");
     }
 
+    /// Set the authoritative Beads `metadata.repository` identity used by
+    /// native repository-filter tests.
+    pub fn set_bead_repository(&self, bead: &str, repository: &str) {
+        self.set_bead_field(
+            bead,
+            "metadata",
+            &json!({"repository": repository}).to_string(),
+        );
+        std::fs::write(
+            self.beads_dir
+                .join("shim-state")
+                .join(format!("{bead}.repository")),
+            repository,
+        )
+        .expect("set bead repository");
+    }
+
     /// The revision the bd shim reports for a bead right now.
     pub fn bead_revision(&self, bead: &str) -> String {
         std::fs::read_to_string(
@@ -1232,6 +1303,19 @@ impl TestEnv {
         let marker = state.join("show.unreachable");
         if unreachable {
             std::fs::write(marker, "1").expect("set bd outage");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+
+    /// Make every `bd list` fail, the way an unreachable authoritative store
+    /// does during repository-scoped discovery.
+    pub fn set_bd_list_unreachable(&self, unreachable: bool) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        let marker = state.join("list.unreachable");
+        if unreachable {
+            std::fs::write(marker, "1").expect("set bd list outage");
         } else {
             let _ = std::fs::remove_file(marker);
         }
@@ -1272,6 +1356,28 @@ impl TestEnv {
     /// Open the environment's ledger (state.db) directly.
     pub fn ledger(&self) -> forged_ledger::Ledger {
         forged_ledger::Ledger::open(&self.anvil.join("state.db")).expect("open test ledger")
+    }
+
+    /// Mark a started run as operator-authorized when an integration test is
+    /// intentionally exercising a provider launch without going through the
+    /// detached `run submit` surface. Production admission must otherwise
+    /// refuse these ready-but-unsubmitted rows.
+    pub fn authorize_run(&self, run_id: &str) {
+        let ledger = self.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Run, run_id, 0)
+            .expect("authorize test run");
+        ledger.close().expect("close test ledger");
+    }
+
+    /// Authorize a directly-driven epic fixture without starting a detached
+    /// controller. Child packet admission delegates to this parent epoch.
+    pub fn authorize_epic(&self, epic_id: &str) {
+        let ledger = self.ledger();
+        ledger
+            .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, epic_id, 0)
+            .expect("authorize test epic");
+        ledger.close().expect("close test ledger");
     }
 
     /// The run's worktree path.
@@ -1368,20 +1474,51 @@ pub fn fabricate_run(env: &TestEnv, run_id: &str) {
 /// nothing about epic discovery.
 pub fn fabricate_epic(env: &TestEnv, epic_id: &str) {
     let ledger = env.ledger();
+    let repo = forged_types::normalize_repository_path(&env.repos.repo.to_string_lossy())
+        .expect("canonical fixture repo");
+    let label = forged_types::repository_label(&repo).expect("fixture repo label");
+    let title = format!("Epic {epic_id}");
+    let identity = forged_types::WorkIdentityV1 {
+        schema: forged_types::WORK_IDENTITY_SCHEMA_V1.to_owned(),
+        subject: forged_types::WorkIdentitySubjectV1 {
+            kind: forged_types::WorkIdentitySubjectKind::Epic,
+            id: epic_id.to_owned(),
+        },
+        bead: forged_types::WorkIdentityBeadV1 {
+            id: epic_id.to_owned(),
+            title: Some(title.clone()),
+            revision: None,
+        },
+        repository: Some(forged_types::WorkIdentityRepositoryV1 {
+            path: repo.clone(),
+            label: label.clone(),
+        }),
+        project: None,
+        epic: None,
+        display_title: forged_types::work_display_title(
+            epic_id,
+            Some(&title),
+            Some(&label),
+            None,
+            None,
+        ),
+        captured_at: "2026-01-01T00:00:00.000000000Z".to_owned(),
+        source: forged_types::WorkIdentitySource::Durable,
+    };
     ledger
-        .append_event(
-            Some(epic_id),
-            "forged.epic.started",
+        .append_epic_started_with_identity(
+            epic_id,
             json!({
                 "schema": "forged.epic/1",
                 "epicId": epic_id,
-                "title": format!("Epic {epic_id}"),
-                "repo": env.repos.repo.to_string_lossy(),
+                "title": title,
+                "repo": repo,
                 "specPath": env.spec.to_string_lossy(),
                 "baseRef": env.repos.base,
                 "integrationBranch": format!("forged/epic-{epic_id}"),
                 "children": [],
             }),
+            identity,
         )
         .expect("epic started event");
     ledger.close().expect("close");
@@ -1622,6 +1759,81 @@ pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
     )
 }
 
+/// Execute a split App through a deterministic MCP Apps host lifecycle.
+pub fn run_split_app_host(node: &str, asset: &Path) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let out = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref()])
+        .output()
+        .expect("spawn the split App host harness");
+    assert!(
+        out.status.success(),
+        "the split App host harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout).expect("the split App harness prints one JSON object")
+}
+
+/// Execute one split App against an exact captured MCP tool result and an
+/// explicit host scenario. The scenario crosses stdin so large structured
+/// envelopes are never re-encoded as shell arguments. Each invocation owns a
+/// fresh Node process and therefore a fresh resource context.
+pub fn run_split_app_host_scenario(node: &str, asset: &Path, scenario: &Value) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let mut child = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref(), "--scenario"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn the scenario split App host harness");
+    serde_json::to_writer(
+        child.stdin.as_mut().expect("scenario harness stdin"),
+        scenario,
+    )
+    .expect("write split App host scenario");
+    drop(child.stdin.take());
+    let out = child
+        .wait_with_output()
+        .expect("wait for the scenario split App host harness");
+    assert!(
+        out.status.success(),
+        "the scenario split App host harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout)
+        .expect("the scenario split App harness prints one JSON object")
+}
+
+/// Exercise the Agent Sessions App's explicit read-only controls through the
+/// same deterministic host, with `serverTools` deliberately enabled.
+pub fn run_agent_sessions_host(node: &str, asset: &Path) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let out = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref(), "--interactive"])
+        .output()
+        .expect("spawn the interactive Agent Sessions host harness");
+    assert!(
+        out.status.success(),
+        "the interactive Agent Sessions harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout)
+        .expect("the interactive Agent Sessions harness prints one JSON object")
+}
+
 fn render(node: &str, harness: &str, data: &Value) -> Rendered {
     let rendered = harness_output(node, harness, data);
     Rendered {
@@ -1814,6 +2026,19 @@ impl McpClient {
             .filter_map(|resource| resource.get("uri").and_then(Value::as_str))
             .map(str::to_owned)
             .collect()
+    }
+
+    /// One declared resource, including any extension metadata.
+    pub fn resource(&mut self, uri: &str) -> Value {
+        let reply = self.request("resources/list", json!({}));
+        reply
+            .pointer("/result/resources")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .find(|resource| resource.get("uri").and_then(Value::as_str) == Some(uri))
+            .cloned()
+            .unwrap_or(Value::Null)
     }
 
     /// Read one text resource.

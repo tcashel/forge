@@ -257,6 +257,24 @@ pub(crate) async fn settle(
             pending
         }
     };
+    if bead.get("settled").and_then(Value::as_bool) == Some(true) {
+        let event_run = run_id.to_owned();
+        let event = json!({
+            "schema": "forged.bead-settlement/1",
+            "beadId": run.bead_id,
+            "outcome": settlement.outcome.as_str(),
+            "settled": true,
+        });
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.append_event_once(
+                &event_run,
+                super::attention::BEAD_SETTLEMENT_SUCCEEDED,
+                event,
+            )?;
+            Ok(())
+        })
+        .await?;
+    }
 
     // Squash merge ancestry is deliberately irrelevant: a clean linked
     // worktree may retire once exact delivery evidence is stored. Dirt still

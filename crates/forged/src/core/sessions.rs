@@ -4,7 +4,9 @@
 use std::collections::{BTreeMap, BTreeSet};
 
 use forged_ledger::{AttemptState, EffectClass, RevokeScope};
-use forged_types::{Capability, OperationRequest, OperationResponse, WorkPacket};
+use forged_types::{
+    Capability, OperationRequest, OperationResponse, WorkIdentitySubjectKind, WorkPacket,
+};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
@@ -36,6 +38,9 @@ struct SessionRecord {
     host: String,
     session_id: String,
     socket_path: Option<String>,
+    status_path: Option<String>,
+    controller_generation: Option<u32>,
+    layout_id: Option<String>,
     attach_hint: Option<String>,
 }
 
@@ -46,6 +51,9 @@ pub(crate) struct SessionStarted<'a> {
     pub host: &'a str,
     pub session_id: &'a str,
     pub socket_path: Option<&'a str>,
+    pub status_path: &'a str,
+    pub controller_generation: Option<u32>,
+    pub layout_id: Option<&'a str>,
     pub attach_hint: Option<&'a str>,
 }
 
@@ -92,6 +100,18 @@ fn session_records(events: &[forged_ledger::EventRow]) -> Vec<SessionRecord> {
                     .get("socketPath")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                status_path: payload
+                    .get("statusPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                controller_generation: payload
+                    .get("controllerGeneration")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
+                layout_id: payload
+                    .get("layoutId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 attach_hint: payload
                     .get("attachHint")
                     .and_then(Value::as_str)
@@ -109,12 +129,15 @@ pub(crate) async fn record_session_started(
 ) -> Result<(), Failure> {
     let run_id = started.run_id.to_owned();
     let payload = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "attemptId": started.attempt_id,
         "packetId": started.packet_id,
         "host": started.host,
         "sessionId": started.session_id,
         "socketPath": started.socket_path,
+        "statusPath": started.status_path,
+        "controllerGeneration": started.controller_generation,
+        "layoutId": started.layout_id,
         "attachHint": started.attach_hint,
     });
     on_ledger(&ctx.ledger, move |ledger| {
@@ -231,12 +254,25 @@ fn param_attempt(params: &serde_json::Map<String, Value>) -> Result<i64, Failure
 pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("session_list", req, || async {
         let run_id = param_str(&req.params, "run")?;
+        let identity =
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
         let events = run_events(ctx, run_id).await?;
         let mut sessions = Vec::new();
         for record in session_records(&events) {
             let attempt_id = record.attempt_id;
             let attempt =
                 on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+            let claim_token = attempt.claim_token.clone();
+            let owned = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.find_owned_herdr_attempt(attempt_id, &claim_token)
+            })
+            .await?;
+            let projection = match owned {
+                Some(owned) => {
+                    super::herdr_projection::status_for_ownership(ctx, &owned.ownership_id).await
+                }
+                None => Value::Null,
+            };
             sessions.push(json!({
                 "attemptId": attempt.attempt_id,
                 "packetId": record.packet_id,
@@ -245,13 +281,16 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "host": record.host,
                 "sessionId": record.session_id,
                 "socketPath": record.socket_path,
-                // The hint is durable; the PANE is not. A settled attempt has
-                // had its terminal released (`SessionHost::release`), so
-                // repeating the stored `forged session read --attempt N` here
-                // would advertise a command that fails BECAUSE the release
-                // worked. `Running` and `Revoking` are the states in which a
-                // pane can still be there to attach to; every other state
-                // reports no hint rather than a broken one.
+                "statusPath": record.status_path,
+                "controllerGeneration": record.controller_generation,
+                "layoutId": record.layout_id,
+                "identity": identity.clone(),
+                "herdrProjection": projection,
+                // The hint is durable, but terminal pane cleanup is an
+                // independent supervisor effect. `Running` and `Revoking`
+                // are the only states in which attachment remains useful;
+                // every terminal state suppresses the hint even while cleanup
+                // is pending or retrying.
                 "attachHint": match attempt.state {
                     forged_ledger::AttemptState::Running
                     | forged_ledger::AttemptState::Revoking => record.attach_hint.clone(),
@@ -260,7 +299,12 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             }));
         }
         let pending = pending_interventions(ctx, run_id).await?;
-        Ok(json!({"runId": run_id, "sessions": sessions, "pendingInterventions": pending.len()}))
+        Ok(json!({
+            "runId": run_id,
+            "identity": identity,
+            "sessions": sessions,
+            "pendingInterventions": pending.len()
+        }))
     })
     .await
 }

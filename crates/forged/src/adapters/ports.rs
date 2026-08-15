@@ -57,6 +57,17 @@ use crate::failpoint;
 /// ids are valid only within the host instance that issued them.
 type OwnedSession = (Arc<dyn SessionHost>, HostSessionId);
 
+#[derive(Debug, Clone)]
+enum SentinelRoute {
+    /// Migration-014 ownership or a schema-v2 ProcessHost event.
+    Exact(PathBuf),
+    /// A pre-migration session event explicitly authorizes compatibility
+    /// scanning. New missing metadata never falls into this arm.
+    Legacy,
+    /// No durable status-path evidence exists.
+    Absent,
+}
+
 /// The concrete ports adapter.
 pub struct ForgedPorts {
     ledger: Ledger,
@@ -158,6 +169,52 @@ impl ForgedPorts {
         now.as_second().saturating_sub(anchor.as_second()) > IDENTITY_GRACE_S
     }
 
+    async fn sentinel_route(&self, attempt: &AttemptRow) -> Result<SentinelRoute, PortError> {
+        let attempt_id = attempt.attempt_id;
+        let claim_token = attempt.claim_token.clone();
+        if let Some(owned) = self
+            .on_ledger(move |ledger| ledger.find_owned_herdr_attempt(attempt_id, &claim_token))
+            .await?
+        {
+            return Ok(SentinelRoute::Exact(PathBuf::from(owned.sentinel_path)));
+        }
+
+        let (run_id, _, _) = crate::core::split_packet_key(&attempt.packet_id)
+            .map_err(|failure| PortError::Internal(failure.message))?;
+        let events = self
+            .on_ledger(move |ledger| ledger.list_events(Some(&run_id), 0, 65_536))
+            .await?;
+        let event = events.into_iter().rev().find_map(|row| {
+            if row.kind != "forged.session.started" {
+                return None;
+            }
+            let payload: Value = serde_json::from_str(&row.payload_json).ok()?;
+            (payload.get("attemptId").and_then(Value::as_i64) == Some(attempt.attempt_id))
+                .then_some(payload)
+        });
+        let Some(event) = event else {
+            return Ok(SentinelRoute::Absent);
+        };
+        match event.get("schemaVersion").and_then(Value::as_u64) {
+            None | Some(1) => Ok(SentinelRoute::Legacy),
+            Some(2) => event
+                .get("statusPath")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .map(|path| SentinelRoute::Exact(PathBuf::from(path)))
+                .ok_or_else(|| {
+                    PortError::Internal(format!(
+                        "post-migration attempt {} has no exact sentinel path",
+                        attempt.attempt_id
+                    ))
+                }),
+            Some(other) => Err(PortError::Internal(format!(
+                "attempt {} has unsupported session schema version {other}",
+                attempt.attempt_id
+            ))),
+        }
+    }
+
     /// Settle an attempt whose process identity was never established: fail
     /// it as a TRANSPORT failure with the pinned note, so the packet reopens
     /// on the transport-retry budget.
@@ -201,10 +258,11 @@ impl ForgedPorts {
             });
         }
         let dir = self.runtime_dir_of(attempt)?;
+        let sentinel = self.sentinel_route(attempt).await?;
         // The sentinel FIRST: it is the only exit truth, so a written status
         // file means Exited no matter what the pid reads as — a recycled pid
         // must never resurrect a session that already reported its code.
-        if let Some(code) = read_sentinel_code(&dir, attempt.attempt_id) {
+        if let Some(code) = read_routed_sentinel(&sentinel, &dir, attempt.attempt_id) {
             return Ok(SessionLiveness::Exited(code));
         }
         let Some(pid) = read_pid(&dir) else {
@@ -235,7 +293,7 @@ impl ForgedPorts {
         }
         // Dead with no status file seen: re-read ONCE before concluding
         // Vanished — the sentinel may have landed in between.
-        match read_sentinel_code(&dir, attempt.attempt_id) {
+        match read_routed_sentinel(&sentinel, &dir, attempt.attempt_id) {
             Some(code) => Ok(SessionLiveness::Exited(code)),
             None => Ok(SessionLiveness::Vanished),
         }
@@ -244,8 +302,14 @@ impl ForgedPorts {
     /// Whether this attempt's session is verifiably over: the sentinel
     /// landed, the pid is gone, or the pid now names a different process.
     /// Re-checked before every signal escalation.
-    async fn attempt_settled(&self, dir: &Path, attempt_id: i64, pid: i32) -> bool {
-        read_sentinel_code(dir, attempt_id).is_some()
+    async fn attempt_settled(
+        &self,
+        dir: &Path,
+        attempt_id: i64,
+        pid: i32,
+        sentinel: &SentinelRoute,
+    ) -> bool {
+        read_routed_sentinel(sentinel, dir, attempt_id).is_some()
             || !pid_alive(pid)
             || pid_identity(dir, pid).await == PidIdentity::Recycled
     }
@@ -262,10 +326,11 @@ impl ForgedPorts {
         }
         let dir = self.runtime_dir_of(attempt)?;
         let attempt_id = attempt.attempt_id;
+        let sentinel = self.sentinel_route(attempt).await?;
         // The sentinel FIRST, before any signal: a written status file means
         // the session already exited, so there is nothing to kill and the
         // recorded pid may since have been recycled onto a stranger.
-        if read_sentinel_code(&dir, attempt_id).is_some() {
+        if read_routed_sentinel(&sentinel, &dir, attempt_id).is_some() {
             return Ok(KillOutcome::AlreadyDead);
         }
         let Some(pid) = read_pid(&dir) else {
@@ -311,17 +376,17 @@ impl ForgedPorts {
         let pgid = Pid::from_raw(pid);
         let _ = killpg(pgid, Signal::SIGTERM);
         for _ in 0..50 {
-            if self.attempt_settled(&dir, attempt_id, pid).await {
+            if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
                 return Ok(KillOutcome::Killed);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
-        if self.attempt_settled(&dir, attempt_id, pid).await {
+        if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
             return Ok(KillOutcome::Killed);
         }
         let _ = killpg(pgid, Signal::SIGKILL);
         for _ in 0..20 {
-            if self.attempt_settled(&dir, attempt_id, pid).await {
+            if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
                 return Ok(KillOutcome::Killed);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -497,6 +562,18 @@ fn read_sentinel_code(runtime_dir: &Path, attempt_id: i64) -> Option<i32> {
         }
     }
     None
+}
+
+fn read_exact_sentinel(path: &Path) -> Option<i32> {
+    std::fs::read_to_string(path).ok()?.trim().parse().ok()
+}
+
+fn read_routed_sentinel(route: &SentinelRoute, runtime_dir: &Path, attempt_id: i64) -> Option<i32> {
+    match route {
+        SentinelRoute::Exact(path) => read_exact_sentinel(path),
+        SentinelRoute::Legacy => read_sentinel_code(runtime_dir, attempt_id),
+        SentinelRoute::Absent => None,
+    }
 }
 
 /// Derive the GitHub `owner/name` slug from a checkout's `origin` remote —
@@ -793,6 +870,7 @@ mod tests {
             host_policy: crate::config::HostPolicy::Off,
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
+            admission: crate::config::AdmissionPolicy::default(),
         };
         (config, ledger, attempt)
     }
@@ -897,6 +975,93 @@ mod tests {
             "a run-scoped lease holder is not a packet-scoped claimant"
         );
         assert_eq!(run_of_session(crate::core::FRONTIER_HOLDER), None);
+    }
+
+    #[test]
+    fn post_migration_process_session_uses_only_its_exact_durable_sentinel() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, attempt) = one_running_attempt(tmp.path());
+        let ports = ForgedPorts::new(ledger.clone(), config);
+        let runtime = ports.runtime_dir_of(&attempt).expect("runtime");
+        let decoy = runtime.join("status/convincing-foreign/status");
+        std::fs::create_dir_all(decoy.parent().expect("decoy parent")).expect("decoy dir");
+        std::fs::write(&decoy, "99\n").expect("decoy status");
+        let exact = tmp.path().join("opaque exact $ sentinel/status");
+        std::fs::create_dir_all(exact.parent().expect("exact parent")).expect("exact dir");
+        std::fs::write(&exact, "7\n").expect("exact status");
+        ledger
+            .append_event_once(
+                "run-orphan",
+                "forged.session.started",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "attemptId": attempt.attempt_id,
+                    "packetId": attempt.packet_id,
+                    "host": "process",
+                    "sessionId": "opaque/session",
+                    "socketPath": null,
+                    "statusPath": exact,
+                    "controllerGeneration": null,
+                    "attachHint": null,
+                }),
+            )
+            .expect("session event");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        assert_eq!(
+            rt.block_on(ports.attempt_liveness(&attempt))
+                .expect("liveness"),
+            SessionLiveness::Exited(7),
+            "the convincing scanned status must not override the exact path"
+        );
+    }
+
+    #[test]
+    fn post_migration_owned_herdr_session_uses_exact_row_and_missing_metadata_never_scans() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, attempt) = one_running_attempt(tmp.path());
+        let ports = ForgedPorts::new(ledger.clone(), config);
+        let runtime = ports.runtime_dir_of(&attempt).expect("runtime");
+        let decoy = runtime.join("status/foreign/status");
+        std::fs::create_dir_all(decoy.parent().expect("decoy parent")).expect("decoy dir");
+        std::fs::write(&decoy, "99\n").expect("decoy status");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        assert!(matches!(
+            rt.block_on(ports.sentinel_route(&attempt))
+                .expect("route without metadata"),
+            SentinelRoute::Absent
+        ));
+
+        let exact = tmp.path().join("owned exact/status");
+        std::fs::create_dir_all(exact.parent().expect("exact parent")).expect("exact dir");
+        std::fs::write(&exact, "3\n").expect("exact status");
+        let identity = forged_types::OwnedHerdrSessionV1 {
+            schema: forged_types::OWNED_HERDR_SESSION_SCHEMA_V1.to_owned(),
+            ownership_id: "owned-attempt".to_owned(),
+            owner: forged_types::OwnedHerdrOwnerV1::Attempt {
+                subject: forged_types::OwnedHerdrSubjectV1 {
+                    kind: forged_types::OwnedHerdrSubjectKind::Run,
+                    id: "run-orphan".to_owned(),
+                },
+                run_id: "run-orphan".to_owned(),
+                packet_id: attempt.packet_id.clone(),
+                attempt_id: attempt.attempt_id,
+                claim_token: attempt.claim_token.clone(),
+                controller_generation: None,
+            },
+            pane_id: "opaque:$ pane".to_owned(),
+            socket_path: "/tmp/not-contacted.sock".to_owned(),
+            protocol: 19,
+            sentinel_path: exact.to_string_lossy().into_owned(),
+            layout_id: None,
+        };
+        ledger
+            .register_owned_herdr_session(&identity)
+            .expect("register owned session");
+        assert_eq!(
+            rt.block_on(ports.attempt_liveness(&attempt))
+                .expect("liveness"),
+            SessionLiveness::Exited(3)
+        );
     }
 
     #[test]

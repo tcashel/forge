@@ -136,6 +136,16 @@ impl PacketDirs {
     pub fn status(&self) -> PathBuf {
         self.attempt_path().join("status")
     }
+
+    /// Private, immutable input for the exact hidden provider runner.
+    pub fn provider_stream_request(&self) -> PathBuf {
+        self.attempt_path().join(".provider-stream-request.json")
+    }
+
+    /// Private terminal control record written by the hidden provider runner.
+    pub fn provider_stream_status(&self) -> PathBuf {
+        self.attempt_path().join(".provider-stream-status.json")
+    }
 }
 
 /// One provider run, ready to hand to a host: the shell line (sentinel-free)

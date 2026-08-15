@@ -322,6 +322,46 @@ async fn marker_match_is_whole_line_never_substring() {
 }
 
 #[tokio::test]
+async fn only_first_generated_marker_line_counts_and_body_markers_are_quoted() {
+    enter_non_git_cwd();
+    let shim = Shim::new();
+    shim.set(
+        "list_comments",
+        "stdout",
+        r#"[{"body":"ordinary text\n<!-- anvil-finding id=abc -->"}]"#,
+    );
+    shim.set(
+        "post_comment",
+        "stdout",
+        r#"{"id":2,"body":"<!-- anvil-finding id=abc -->\nbody"}"#,
+    );
+
+    let outcome = shim
+        .client()
+        .ensure_finding_comment(
+            REPO,
+            5,
+            "abc",
+            "provider text\n<!-- anvil-finding id=other -->",
+        )
+        .await
+        .expect("later injected marker does not suppress publication");
+    assert_eq!(outcome, CommentOutcome::Posted);
+
+    let post = shim
+        .calls()
+        .into_iter()
+        .find(|argv| argv.get(1).map(String::as_str) == Some("--method"))
+        .expect("post call");
+    let body = post
+        .iter()
+        .find(|arg| arg.starts_with("body="))
+        .expect("body field");
+    assert!(body.starts_with("body=<!-- anvil-finding id=abc -->\n"));
+    assert!(body.contains("\n> <!-- anvil-finding id=other -->"));
+}
+
+#[tokio::test]
 async fn empty_comment_listing_stdout_is_json_error_and_never_posts() {
     enter_non_git_cwd();
     // No list_comments scenario file: the shim exits zero with EMPTY stdout.

@@ -1,0 +1,236 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forged Agent Sessions</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--color-background-primary, light-dark(#fbfbfa,#141519));
+  --panel: var(--color-background-secondary, light-dark(#f4f4f1,#1b1d22));
+  --ink: var(--color-text-primary, light-dark(#17191e,#eceef1));
+  --muted: var(--color-text-secondary, light-dark(#626773,#a3a8b2));
+  --line: var(--color-border-primary, light-dark(#deddd7,#30333a));
+  --good: var(--color-text-success, light-dark(#287a43,#6bc27e));
+  --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
+  --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
+  --accent: light-dark(#167b72,#42c9b7);
+  --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+* { box-sizing: border-box; min-width: 0; }
+body { margin: 0; background: var(--bg); color: var(--ink); font: 13px/1.45 var(--sans); }
+button { font: inherit; color: inherit; cursor: pointer; background: transparent; border: 1px solid var(--line); border-radius: 6px; padding: 6px 10px; }
+button:hover:not(:disabled) { background: var(--panel); }
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
+#app { padding: 16px; display: grid; gap: 14px; }
+.top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
+h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
+.sub,.muted { color: var(--muted); }.sub { margin-top: 4px; font: 11px/1.4 var(--mono); }
+.controls { display: flex; gap: 6px; flex-wrap: wrap; }
+.capability { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; color: var(--muted); }
+.stats { display: grid; grid-template-columns: repeat(auto-fit,minmax(110px,1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.stat { padding: 10px 12px; border-left: 1px solid var(--line); }.stat:first-child { border-left: 0; }
+.stat b { display: block; font: 600 17px/1.2 var(--mono); }.stat span { color: var(--muted); font-size: 11px; }
+.coverage { display: flex; gap: 6px; flex-wrap: wrap; }
+.pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font: 10px/1.3 var(--mono); }
+.sessions { display: grid; gap: 10px; }
+.session-row { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.session-head { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; padding: 10px 11px; background: var(--panel); }
+.session-title { font-weight: 600; overflow-wrap: anywhere; }.selector { color: var(--muted); font: 10px/1.4 var(--mono); overflow-wrap: anywhere; }
+.chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }.chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; font: 10px/1.3 var(--mono); }
+.chip--good { color: var(--good); }.chip--warn { color: var(--warn); }.chip--bad { color: var(--bad); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit,minmax(235px,1fr)); gap: 0; }
+.panel { padding: 10px 11px; border-top: 1px solid var(--line); border-left: 1px solid var(--line); }.panel:nth-child(3n+1) { border-left: 0; }
+.panel h2 { margin: 0 0 7px; font-size: 11px; }
+.kv { display: grid; grid-template-columns: 115px 1fr; gap: 4px 8px; margin: 0; }.kv dt { color: var(--muted); }.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
+.session-action { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 9px 11px; border-top: 1px solid var(--line); }
+.guidance { color: var(--muted); font-size: 11px; }.guidance b { color: var(--ink); font-family: var(--mono); }
+.empty,.error { border: 1px dashed var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }.error { color: var(--bad); border-color: currentColor; }
+.drawer { border: 1px solid var(--line); border-radius: 9px; padding: 12px; display: grid; gap: 9px; }.drawer[hidden] { display: none; }
+.drawer-head { display: flex; justify-content: space-between; gap: 10px; }.drawer h2 { margin: 0; font: 600 15px/1.3 var(--mono); }
+.foot { color: var(--muted); font: 10px/1.4 var(--mono); display: flex; gap: 12px; flex-wrap: wrap; }
+@media(max-width:720px) { .panel { border-left: 0; }.stats { grid-template-columns: 1fr 1fr; }.stat { border-top: 1px solid var(--line); border-left: 0; }.session-head,.session-action { flex-direction: column; }.chips { justify-content: flex-start; } }
+</style>
+</head>
+<body>
+<main id="app">
+  <header class="top">
+    <div><h1>Agent Sessions</h1><div class="sub" id="scope">Waiting for provider-attempt inventory</div></div>
+    <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="history">Show history</button><button type="button" id="next">Next page</button></div>
+  </header>
+  <div class="capability" id="capability">Connecting to the MCP Apps host.</div>
+  <section class="stats" id="stats"></section>
+  <section class="coverage" id="coverage"></section>
+  <section class="sessions" id="sessions"><div class="empty">Waiting for sessions.</div></section>
+  <aside class="drawer" id="drawer" hidden></aside>
+  <footer class="foot" id="foot"></footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const PROTOCOL_VERSION = "2026-01-26";
+  const APP_INFO = { name: "forged-agent-sessions", version: "1.0.0" };
+  const post = message => window.parent.postMessage(message, "*");
+  const notify = (method, params = {}) => post({ jsonrpc: "2.0", method, params });
+  let rpcId = 0; const pending = new Map(); const timers = new Set();
+  let observer = null; let sizeFrame = null; let tornDown = false; let dynamicListeners = [];
+  function request(method, params = {}) {
+    if (tornDown) return Promise.reject(new Error("resource torn down"));
+    const id = `forged-agent-sessions-${++rpcId}`;
+    return new Promise((resolve, reject) => {
+      const timer = setTimeout(() => { timers.delete(timer); if (pending.delete(id)) reject(new Error(`${method} timed out`)); }, 120000);
+      timers.add(timer); pending.set(id, { resolve, reject, timer });
+      post({ jsonrpc: "2.0", id, method, params });
+    });
+  }
+  const host = { connected: false, capabilities: {}, context: {} };
+  const state = { data: null, error: null, args: { schemaVersion: 1, params: {} }, loading: false, detail: null, detailError: false };
+  const byId = id => document.getElementById(id);
+  const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text != null) node.textContent = String(text); return node; };
+  const arr = value => Array.isArray(value) ? value : [];
+  const finite = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const shown = value => value == null || value === "" ? "—" : typeof value === "boolean" ? (value ? "yes" : "no") : String(value);
+  const fmt = value => Math.round(finite(value)).toLocaleString();
+  function listen(node, type, callback) { node.addEventListener(type, callback); dynamicListeners.push([node, type, callback]); }
+  function clearDynamicListeners() { for (const [node, type, callback] of dynamicListeners) node.removeEventListener(type, callback); dynamicListeners = []; }
+  function envelopeFrom(params) {
+    let value = params?.structuredContent;
+    if (!value) { const text = arr(params?.content).find(block => block.type === "text")?.text; try { value = JSON.parse(text); } catch { value = null; } }
+    return value;
+  }
+  function safeArguments(value) {
+    const source = value && typeof value === "object" ? value : {};
+    const raw = source.params && typeof source.params === "object" ? source.params : {};
+    const params = {};
+    for (const key of ["run","epic","repository","provider","model","activity","cursor"]) if (typeof raw[key] === "string" && raw[key]) params[key] = raw[key];
+    if (typeof raw.includeHistorical === "boolean") params.includeHistorical = raw.includeHistorical;
+    if (Number.isInteger(raw.limit) && raw.limit >= 1 && raw.limit <= 500) params.limit = raw.limit;
+    return { schemaVersion: 1, params };
+  }
+  function argsFromData(data) {
+    const filters = data?.filters || {}; const params = {};
+    if (filters.runId) params.run = filters.runId; if (filters.epicId) params.epic = filters.epicId;
+    for (const key of ["repository","provider","model","activity"]) if (filters[key]) params[key] = filters[key];
+    params.includeHistorical = filters.includeHistorical === true;
+    return { schemaVersion: 1, params };
+  }
+  function ingest(params) {
+    const envelope = envelopeFrom(params);
+    if (envelope?.ok === false) { state.error = "The inventory request failed."; state.data = null; render(); return false; }
+    const data = envelope?.result ?? envelope;
+    if (!data || data.schema !== "forged.provider-session-inventory/1") { state.error = "The host returned an unsupported Agent Sessions payload."; state.data = null; render(); return false; }
+    state.error = null; state.data = data;
+    if (!state.args || !state.args.params || Object.keys(state.args.params).length === 0) state.args = argsFromData(data);
+    render(); return true;
+  }
+  function add(dl, key, value) { dl.append(el("dt", "", key)); dl.append(el("dd", "", shown(value))); }
+  function panel(title, pairs) { const box = el("section", "panel"); box.append(el("h2", "", title)); const dl = el("dl", "kv"); for (const [key, value] of pairs) add(dl, key, value); box.append(dl); return box; }
+  function channelPairs(prefix, channel) { if (!channel) return []; return [[`${prefix} state`,channel.state],[`${prefix} next seq`,channel.nextSequence],[`${prefix} applied seq`,channel.appliedSequence],[`${prefix} revision`,channel.appliedRevision],[`${prefix} retry`,`${shown(channel.retryUsed)} / ${shown(channel.retryBudget)}`],[`${prefix} next wake`,channel.nextWakeAt],[`${prefix} attempted`,channel.lastAttemptAt],[`${prefix} applied`,channel.appliedAt]]; }
+  function guidance(code) {
+    return ({
+      "none":"No diagnostic follow-up is recommended.",
+      "inspect-work":"Inspect canonical Work Detail.",
+      "inspect-controller":"Inspect the durable controller evidence.",
+      "inspect-session":"Inspect the recorded session evidence.",
+      "inspect-projection":"Inspect projection publication state.",
+      "resolve-attention":"Resolve the durable attention condition."
+    })[code] || "Unknown diagnostic guidance.";
+  }
+  function detailTarget(row) {
+    const subject = row?.identity?.subject; const runId = row?.runId;
+    return subject?.kind === "run" && typeof subject.id === "string" && subject.id.length > 0 && subject.id === runId
+      ? { subjectKind: "run", subjectId: runId } : null;
+  }
+  function renderDetail() {
+    const box = byId("drawer"); box.replaceChildren();
+    if (!state.detail && !state.detailError) { box.hidden = true; return; }
+    box.hidden = false; const head = el("div", "drawer-head");
+    head.append(el("h2", "", state.detail ? `run · ${state.detail.id}` : "Work Detail unavailable"));
+    const close = el("button", "", "Close"); close.type = "button"; listen(close, "click", () => { state.detail = null; state.detailError = false; render(); }); head.append(close); box.append(head);
+    if (state.detailError) { box.append(el("div", "error", "The exact Work Detail request failed.")); return; }
+    const dl = el("dl", "kv"); add(dl,"state",state.detail?.status?.state || state.detail?.status?.status || state.detail?.state); add(dl,"canonical id",state.detail?.id); add(dl,"title",state.detail?.identity?.displayTitle); add(dl,"workers",arr(state.detail?.workers?.sessions).length); add(dl,"findings",arr(state.detail?.reviews?.latestFindings).length); box.append(dl);
+  }
+  function renderRow(row) {
+    const article = el("article", "session-row"); const head = el("div", "session-head"); const identity = el("div");
+    identity.append(el("div", "session-title", row?.identity?.displayTitle || row?.runId || "Untitled attempt"));
+    identity.append(el("div", "selector", `${shown(row?.identity?.subject?.kind)}:${shown(row?.identity?.subject?.id)} · run ${shown(row?.runId)} · packet ${shown(row?.packetId)} · attempt ${shown(row?.attemptId)}`));
+    const chips = el("div", "chips");
+    const activity = row?.attempt?.activity || "unknown"; const activityClass = activity === "running" ? "chip chip--good" : activity === "revoking" || row?.recovery === "attention" ? "chip chip--warn" : ["failed","stopped"].includes(activity) ? "chip chip--bad" : "chip";
+    chips.append(el("span",activityClass,activity)); chips.append(el("span","chip",`recovery ${shown(row?.recovery)}`)); chips.append(el("span","chip",shown(row?.hostMode))); head.append(identity); head.append(chips); article.append(head);
+    const facts = el("div", "facts");
+    facts.append(panel("Canonical work",[["repository",row?.repository],["epic",row?.epicId],["stage",row?.stage],["provider",row?.provider],["model",row?.model],["pending interventions",row?.pendingInterventions]]));
+    facts.append(panel("Attempt lifecycle",[["activity",row?.attempt?.activity],["started",row?.attempt?.startedAt],["updated",row?.attempt?.updatedAt],["heartbeat",row?.attempt?.lastHeartbeatAt],["ended",row?.attempt?.endedAt],["subject recovery",row?.recovery]]));
+    const desired = row?.desiredWork;
+    facts.append(panel("Desired work",desired ? [["subject",`${shown(desired.subjectKind)}:${shown(desired.subjectId)}`],["desired state",desired.desiredState],["control revision",desired.controlRevision],["controller generation",desired.controllerGeneration],["predecessor",desired.predecessorGeneration],["reconciliation",desired.reconciliationOutcome],["restart",`${shown(desired.restartUsed)} / ${shown(desired.restartBudget)}`],["next wake",desired.nextWakeAt],["last progress",desired.lastProgressAt],["exhausted",desired.exhaustedAt],["updated",desired.updatedAt]] : [["state","not recorded"]]));
+    const owned = row?.ownedHerdr;
+    facts.append(panel("Owned Herdr",owned ? [["ownership",owned.identity?.ownershipId],["pane locator",owned.identity?.paneId],["layout",owned.identity?.layoutId],["protocol",owned.identity?.protocol],["lifecycle",owned.mutable?.lifecycleState],["cleanup",owned.mutable?.cleanupState],["release",owned.mutable?.cleanupRelease],["cleanup retry",`${shown(owned.mutable?.cleanupRetryUsed)} / ${shown(owned.mutable?.cleanupRetryBudget)}`],["next cleanup",owned.mutable?.nextCleanupAt],["registered",owned.mutable?.registeredAt],["command started",owned.mutable?.commandStartedAt],["cleanup requested",owned.mutable?.cleanupRequestedAt],["cleanup attempted",owned.mutable?.lastCleanupAttemptAt],["released",owned.mutable?.releasedAt],["updated",owned.mutable?.updatedAt]] : [["mode",row?.hostMode === "process" ? "ProcessHost" : row?.hostMode === "legacy-herdr" ? "legacy Herdr" : "not owned"]]));
+    const projection = row?.projection; const evidence = projection?.mutable?.providerSession;
+    facts.append(panel("Projection",projection ? [["projection",projection.identity?.projectionId],["target",`${shown(projection.identity?.target?.kind)}:${shown(projection.identity?.target?.id)}`],["pane locator",projection.identity?.paneId],["protocol",projection.identity?.protocol],["metadata source",projection.identity?.metadataSource],["lifecycle source",projection.identity?.lifecycleSource],["lifecycle agent",projection.identity?.lifecycleAgent],["desired revision",projection.mutable?.desiredRevision],["desired lifecycle",projection.mutable?.desiredLifecycle],["desired release",projection.mutable?.desiredRelease],...channelPairs("metadata",projection.mutable?.metadata),...channelPairs("lifecycle",projection.mutable?.lifecycle)] : [["publication","not recorded"]]));
+    const pane = owned?.identity?.paneId || projection?.identity?.paneId || row?.legacyHerdr?.paneId;
+    facts.append(panel("Recorded identities",[["pane locator",pane],["provider candidate",evidence?.candidate],["confirmed provider id",row?.providerSessionId],["evidence source",evidence?.source],["observed",evidence?.observedAt],["legacy layout",row?.legacyHerdr?.layoutId],["legacy generation",row?.legacyHerdr?.controllerGeneration]]));
+    article.append(facts);
+    const action = el("div", "session-action"); const diagnostic = el("div", "guidance"); diagnostic.append(el("b", "", shown(row?.recommendedAction))); diagnostic.append(document.createTextNode(` · ${guidance(row?.recommendedAction)}`)); action.append(diagnostic);
+    const target = detailTarget(row); const open = el("button", "open-detail", "Open Work Detail"); open.type = "button"; open.disabled = state.loading || !host.capabilities.serverTools || !target;
+    open.title = !target ? "Identity is not an exact canonical run target" : !host.capabilities.serverTools ? `Exact detail target run:${target.subjectId}; this host cannot call server tools` : `Open exact Work Detail for run:${target.subjectId}`;
+    if (!open.disabled) listen(open,"click",()=>openDetail(row)); action.append(open); article.append(action); return article;
+  }
+  function render() {
+    if (tornDown) return; clearDynamicListeners();
+    for (const id of ["stats","coverage","sessions","foot"]) byId(id).replaceChildren();
+    const canCall = !!host.capabilities.serverTools; const data = state.data;
+    byId("refresh").disabled = state.loading || !canCall; byId("history").disabled = state.loading || !canCall; byId("next").disabled = state.loading || !canCall || !data?.nextCursor;
+    byId("history").textContent = data?.filters?.includeHistorical ? "Hide history" : "Show history";
+    byId("capability").textContent = canCall ? "Read-only controls use exact session_inventory and Work Detail selectors." : "This host cannot call server tools; exact selectors and the current bounded result remain diagnostic only.";
+    if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("sessions").append(el("div","error",state.error)); renderDetail(); reportSize(); return; }
+    if (!data) { byId("sessions").append(el("div","empty","Waiting for sessions.")); renderDetail(); reportSize(); return; }
+    const filters = data.filters || {}; const filterText = [filters.repository,filters.provider,filters.model,filters.activity].filter(Boolean).join(" · ");
+    byId("scope").textContent = `${filterText || "All durable work"} · as of ${shown(data.asOf)}`;
+    for (const [value,label] of [[data.summary?.returned,"shown"],[data.summary?.totalMatched,"matched"],[data.summary?.active,"active"],[data.summary?.historical,"historical"],[data.summary?.ownedHerdr,"owned Herdr"],[data.summary?.process,"process"]]) { const cell=el("div","stat");cell.append(el("b","",fmt(value)));cell.append(el("span","",label));byId("stats").append(cell); }
+    let coverageItems=0;
+    for (const [value,label] of [[data.coverage?.missingWorkIdentity,"missing identity"],[data.coverage?.missingRepository,"missing repository"],[data.coverage?.missingDesiredWork,"missing desired work"],[data.coverage?.missingOwnedProjection,"missing projection"],[data.coverage?.legacyHerdrRows,"legacy Herdr"],[data.coverage?.processRows,"process host"],[data.coverage?.unknownHostRows,"unknown host"]]) if (finite(value)>0) { byId("coverage").append(el("span","pill",`${fmt(value)} ${label}`)); coverageItems+=1; }
+    for(const fact of arr(data.coverage?.degradationFacts).slice(0,8)){byId("coverage").append(el("span","pill",`degraded ${fact}`));coverageItems+=1;}
+    if (!coverageItems) byId("coverage").append(el("span","pill","coverage complete for returned rows"));
+    for (const row of arr(data.rows)) byId("sessions").append(renderRow(row));
+    if (!arr(data.rows).length) byId("sessions").append(el("div","empty","No provider attempts match this bounded view."));
+    byId("foot").append(el("span","",data.schema)); byId("foot").append(el("span","",`${fmt(data.summary?.returned)} returned in server order`)); if(data.nextCursor)byId("foot").append(el("span","","another bounded page is available")); if(state.loading)byId("foot").append(el("span","","loading"));
+    renderDetail(); pushModelContext(data); reportSize();
+  }
+  function pushModelContext(data) {
+    if (!host.capabilities.updateModelContext) return;
+    const lines=[`Forged Agent Sessions: ${fmt(data.summary?.returned)} shown of ${fmt(data.summary?.totalMatched)} matching; ${fmt(data.summary?.active)} active`,`filters: repository ${data.filters?.repository||"all"}; provider ${data.filters?.provider||"all"}; model ${data.filters?.model||"all"}; activity ${data.filters?.activity||"all"}; history ${data.filters?.includeHistorical===true}`];
+    for(const row of arr(data.rows).slice(0,5))lines.push(`- run ${row.runId}: ${row.attempt?.activity||"unknown"}; recovery ${row.recovery||"unknown"}`);
+    const text=lines.join("\n").slice(0,3000);if(text===pushModelContext.last)return;pushModelContext.last=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});
+  }
+  pushModelContext.last="";
+  async function inventoryCall(argumentsValue) {
+    if (!host.connected || !host.capabilities.serverTools || state.loading) return;
+    const exact=safeArguments(argumentsValue); state.loading=true; render();
+    try { const result=await request("tools/call",{name:"session_inventory",arguments:exact}); if(ingest(result))state.args=exact; }
+    catch { state.error="The inventory request failed."; }
+    finally { state.loading=false; render(); }
+  }
+  async function openDetail(row) {
+    const target=detailTarget(row);if(!target||!host.connected||!host.capabilities.serverTools||state.loading)return;
+    state.loading=true;state.detail=null;state.detailError=false;render();
+    try { const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:target}});const envelope=envelopeFrom(result);const detail=envelope?.result??envelope;if(envelope?.ok===false||detail?.schema!=="forged.work-detail/1")throw new Error("detail failed");state.detail=detail; }
+    catch { state.detailError=true; }
+    finally { state.loading=false;render(); }
+  }
+  function refresh(){inventoryCall(state.args);}
+  function toggleHistory(){const next=safeArguments(state.args);next.params.includeHistorical=!(state.data?.filters?.includeHistorical===true);delete next.params.cursor;inventoryCall(next);}
+  function nextPage(){if(!state.data?.nextCursor)return;const next=safeArguments(state.args);next.params.cursor=state.data.nextCursor;inventoryCall(next);}
+  byId("refresh").addEventListener("click",refresh);byId("history").addEventListener("click",toggleHistory);byId("next").addEventListener("click",nextPage);
+  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);}
+  let lastSize="";function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,item] of pending){clearTimeout(item.timer);timers.delete(item.timer);pending.delete(id);item.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();clearDynamicListeners();byId("refresh").removeEventListener("click",refresh);byId("history").removeEventListener("click",toggleHistory);byId("next").removeEventListener("click",nextPage);window.removeEventListener("message",onMessage);}
+  function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const item=pending.get(message.id);pending.delete(message.id);clearTimeout(item.timer);timers.delete(item.timer);message.error?item.reject(new Error("request failed")):item.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=safeArguments(message.params?.arguments);else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error="The host cancelled the read-only request.";render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
+  window.addEventListener("message",onMessage);
+  request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error="The host did not complete the MCP Apps handshake.";render();}});
+  render();
+})();
+</script>
+</body>
+</html>

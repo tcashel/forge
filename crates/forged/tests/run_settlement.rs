@@ -96,6 +96,12 @@ fn landed_closes_releases_and_retires_with_exact_evidence() {
     );
     assert_eq!(row.delivery_pr, Some(121));
     assert_eq!(row.delivery_sha.as_deref(), Some(sha.as_str()));
+    let settlement_events = ledger
+        .list_events(Some(run), 0, 4096)
+        .expect("settlement events");
+    assert!(settlement_events
+        .iter()
+        .any(|event| event.kind == "run.bead-settlement.succeeded"));
     ledger.close().expect("close");
 
     let before = env.bd_calls().len();

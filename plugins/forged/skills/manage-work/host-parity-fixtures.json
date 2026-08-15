@@ -1,0 +1,233 @@
+{
+  "schema": "forged.manage-work-host-parity-fixtures/1",
+  "purpose": "validation-only",
+  "evidenceScope": "declarative-contract-parity-only",
+  "contracts": {
+    "intent": {
+      "path": "intent-fixtures.json",
+      "schema": "forged.manage-work-intent-fixtures/1",
+      "caseCount": 14,
+      "caseIds": [
+        "observe",
+        "explore",
+        "plan",
+        "revise",
+        "critique",
+        "adjudicate",
+        "plan-approval",
+        "execute-slice",
+        "execute-epic",
+        "ambiguous-approval",
+        "stale-approval",
+        "status",
+        "control",
+        "external-context"
+      ],
+      "comparisonFields": [
+        "decision",
+        "delegate",
+        "result",
+        "routerMutationBudget"
+      ]
+    },
+    "portfolioControl": {
+      "path": "portfolio-control-fixtures.json",
+      "schema": "forged.manage-work-portfolio-control-fixtures/1",
+      "caseCount": 31,
+      "caseIds": [
+        "status-unscoped",
+        "status-repository",
+        "needs-me",
+        "app-unavailable",
+        "detail-exact",
+        "title-unique",
+        "title-zero",
+        "title-ambiguous",
+        "blocker-explanation",
+        "spend-known",
+        "spend-unknown",
+        "plan-only-detail",
+        "priority-change",
+        "epic-pause",
+        "epic-resume",
+        "input-required-resume",
+        "slice-cancel",
+        "slice-pause-unsupported",
+        "epic-stop-unsupported",
+        "stale-precondition",
+        "duplicate-response",
+        "attention-acknowledge-lead",
+        "attention-resolve-lead",
+        "attention-resolve-human",
+        "attention-source-backed",
+        "attention-stale-occurrence",
+        "attention-reopen",
+        "review-risk-acceptance",
+        "merge-approval",
+        "session-diagnostic",
+        "session-stop-substitution"
+      ],
+      "comparisonFields": [
+        "route",
+        "confirmation",
+        "postcondition",
+        "effectBudget"
+      ]
+    }
+  },
+  "allowedHostDifferences": [
+    "manifest-filename",
+    "codex-manifest-discovery-metadata",
+    "host-marketplace-envelope-and-source-metadata"
+  ],
+  "forbiddenHostDifferences": [
+    "plugin-identity",
+    "version",
+    "resolved-plugin-root",
+    "skills-root-or-bytes",
+    "workflow-route",
+    "delegate",
+    "confirmation-class",
+    "authority",
+    "postcondition",
+    "effect-budget",
+    "tool-inventory",
+    "result-schema",
+    "resource-uri",
+    "compatibility-metadata",
+    "fallback-contract"
+  ],
+  "forbiddenEffects": [
+    "process-spawn",
+    "network-access",
+    "filesystem-write",
+    "beads-access",
+    "ledger-access",
+    "operator-state-access",
+    "forged-cli-call",
+    "forged-mcp-call",
+    "provider-call",
+    "service-call",
+    "git-call",
+    "github-call",
+    "plugin-install",
+    "plugin-cache-access"
+  ],
+  "tools": [
+    "artifact_compact",
+    "artifact_verify",
+    "attention_acknowledge",
+    "attention_reopen",
+    "attention_resolve",
+    "claim_next",
+    "definition_validate",
+    "doctor",
+    "epic_advance",
+    "epic_drive",
+    "epic_pause",
+    "epic_resolve",
+    "epic_resume",
+    "epic_revise_roster",
+    "epic_start",
+    "epic_status",
+    "epic_submit",
+    "events_tail",
+    "operations_overview",
+    "overview",
+    "packet_claim",
+    "packet_complete",
+    "packet_fail",
+    "reconcile",
+    "review_publish",
+    "run_accept_risk",
+    "run_advance",
+    "run_revise_roster",
+    "run_start",
+    "run_status",
+    "run_stop",
+    "run_submit",
+    "session_inventory",
+    "session_list",
+    "session_message",
+    "session_read",
+    "session_stop",
+    "usage_ingest",
+    "usage_report",
+    "work_detail",
+    "work_history",
+    "work_list",
+    "work_map"
+  ],
+  "surfaces": [
+    {
+      "role": "portfolio-queue",
+      "tool": "operations_overview",
+      "resultSchema": "forged.operations-overview/1",
+      "resourceUri": "ui://forged/operations-overview.html",
+      "selectionRule": "ordinary portfolio, repository, queue, or needs-me read",
+      "structuredContent": "required",
+      "jsonTextFallback": "identical",
+      "resourceMetadataKeys": [
+        "_meta.ui.resourceUri",
+        "ui/resourceUri"
+      ],
+      "resourceMimeType": "text/html;profile=mcp-app"
+    },
+    {
+      "role": "durable-subject",
+      "tool": "work_detail",
+      "resultSchema": "forged.work-detail/1",
+      "resourceUri": "ui://forged/work-detail.html",
+      "selectionRule": "exact canonical run or epic only",
+      "structuredContent": "required",
+      "jsonTextFallback": "identical",
+      "resourceMetadataKeys": [
+        "_meta.ui.resourceUri",
+        "ui/resourceUri"
+      ],
+      "resourceMimeType": "text/html;profile=mcp-app"
+    },
+    {
+      "role": "topology",
+      "tool": "work_map",
+      "resultSchema": "forged.work-map/1",
+      "resourceUri": "ui://forged/work-map.html",
+      "selectionRule": "explicit dependency or topology request only",
+      "structuredContent": "required",
+      "jsonTextFallback": "identical",
+      "resourceMetadataKeys": [
+        "_meta.ui.resourceUri",
+        "ui/resourceUri"
+      ],
+      "resourceMimeType": "text/html;profile=mcp-app"
+    },
+    {
+      "role": "provider-diagnostics",
+      "tool": "session_inventory",
+      "resultSchema": "forged.provider-session-inventory/1",
+      "resourceUri": "ui://forged/agent-sessions.html",
+      "selectionRule": "explicit provider diagnostic request only",
+      "structuredContent": "required",
+      "jsonTextFallback": "identical",
+      "resourceMetadataKeys": [
+        "_meta.ui.resourceUri",
+        "ui/resourceUri"
+      ],
+      "resourceMimeType": "text/html;profile=mcp-app"
+    },
+    {
+      "role": "compatibility",
+      "tool": "overview",
+      "resultSchema": "forged.overview/1",
+      "resourceUri": "ui://forged/overview.html",
+      "selectionRule": "compatibility smoke only, never the normal modern choice",
+      "structuredContent": "required",
+      "jsonTextFallback": "identical",
+      "resourceMetadataKeys": [
+        "_meta.ui.resourceUri",
+        "ui/resourceUri"
+      ],
+      "resourceMimeType": "text/html;profile=mcp-app"
+    }
+  ]
+}

@@ -27,7 +27,7 @@ pub(crate) fn append_event_tx(
     Ok(())
 }
 
-fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
+pub(crate) fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
     Ok(EventRow {
         event_id: row.get(0)?,
         ts: row.get(1)?,
@@ -37,17 +37,18 @@ fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
     })
 }
 
+const LATEST_EVENT_PER_RUN_SQL: &str =
+    "SELECT event_id, ts, run_id, kind, payload_json FROM events \
+     WHERE event_id IN \
+       (SELECT MAX(event_id) FROM events WHERE run_id IS NOT NULL GROUP BY run_id) \
+     ORDER BY event_id ASC";
+
 /// The newest event per run inside the caller's transaction — see
 /// [`Ledger::latest_event_per_run`] for the contract.
 pub(crate) fn latest_event_per_run_tx(
     conn: &Connection,
 ) -> Result<BTreeMap<String, EventRow>, LedgerError> {
-    let mut statement = conn.prepare(
-        "SELECT event_id, ts, run_id, kind, payload_json FROM events \
-         WHERE event_id IN \
-           (SELECT MAX(event_id) FROM events WHERE run_id IS NOT NULL GROUP BY run_id) \
-         ORDER BY event_id ASC",
-    )?;
+    let mut statement = conn.prepare(LATEST_EVENT_PER_RUN_SQL)?;
     let rows = statement.query_map([], event_row)?;
     let mut latest = BTreeMap::new();
     for row in rows {
@@ -257,5 +258,42 @@ impl Ledger {
     pub fn list_events_by_kind(&self, kind: &str) -> Result<Vec<EventRow>, LedgerError> {
         let kind = kind.to_owned();
         self.submit(move |conn| list_events_by_kind_tx(conn, &kind))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn latest_event_plan_uses_the_partial_run_major_index_without_temp_grouping() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        Ledger::open(&path)
+            .expect("migrate")
+            .close()
+            .expect("close");
+        let conn = Connection::open(path).expect("raw connection");
+        let mut statement = conn
+            .prepare(&format!("EXPLAIN QUERY PLAN {LATEST_EVENT_PER_RUN_SQL}"))
+            .expect("prepare plan");
+        let details = statement
+            .query_map([], |row| row.get::<_, String>(3))
+            .expect("query plan")
+            .collect::<Result<Vec<_>, _>>()
+            .expect("plan rows");
+
+        assert!(
+            details
+                .iter()
+                .any(|detail| detail.contains("events_run_event")),
+            "run-major index is absent from plan: {details:?}"
+        );
+        assert!(
+            details
+                .iter()
+                .all(|detail| !detail.contains("TEMP B-TREE FOR GROUP BY")),
+            "latest-event grouping still materializes a temporary B-tree: {details:?}"
+        );
     }
 }

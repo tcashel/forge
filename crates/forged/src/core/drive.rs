@@ -1035,6 +1035,7 @@ async fn machine_effect(
             let event = ProtoEvent::Pr {
                 number: pr.number,
                 is_draft: pr.is_draft,
+                base_ref_name: Some(pr.base_ref_name.clone()),
                 url: pr.url.clone(),
             };
             record_event(ctx, &run.run_id, event).await?;

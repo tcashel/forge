@@ -7,12 +7,19 @@
 
 use std::collections::HashMap;
 
-use forged_types::{ErrorCode, ExecutionPackageV1, ProviderHints, RunId, Stage};
+use forged_types::{
+    AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionRateLimitV1,
+    AdmissionResourceClass, AdmissionSpendV1, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
+    HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrPaneProjectionV1,
+    HerdrProjectionLifecycle, HerdrProjectionTargetKind, HerdrSessionEvidenceSource,
+    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
+    ProviderHints, RunId, Stage,
+};
 
 use crate::error::{refused, LedgerError};
 
 /// The canonical kind of one operator-authorized supervisor subject.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum DesiredSubjectKind {
     /// A slice run driven by `run drive`.
     Run,
@@ -187,8 +194,787 @@ pub struct DesiredReconcileUpdate {
     pub last_progress_at: Option<String>,
     /// Durable diagnostic for backoff or attention.
     pub last_error: Option<String>,
-    /// Whether this outcome is an explicit operator-attention condition.
-    pub attention: bool,
+    /// Closed supervisor attention reason to append, when this outcome needs
+    /// durable intervention evidence. `None` is an ordinary outcome.
+    pub attention_condition: Option<String>,
+}
+
+/// Closed lifecycle of one durable capacity reservation. Expiry moves a row
+/// to `Orphaned`; it never frees capacity by itself.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AdmissionReservationState {
+    Reserved,
+    Active,
+    Orphaned,
+    Released,
+}
+
+impl AdmissionReservationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Reserved => "reserved",
+            Self::Active => "active",
+            Self::Orphaned => "orphaned",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for AdmissionReservationState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "reserved" => Ok(Self::Reserved),
+            "active" => Ok(Self::Active),
+            "orphaned" => Ok(Self::Orphaned),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown admission reservation state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionReservationRow {
+    pub reservation_id: String,
+    pub decision_id: String,
+    pub work_key: String,
+    pub subject_kind: AdmissionSubjectKind,
+    pub subject_id: String,
+    pub control_revision: u64,
+    pub repository: String,
+    pub provider: String,
+    pub model: String,
+    pub resource_class: AdmissionResourceClass,
+    pub state: AdmissionReservationState,
+    pub owner_kind: Option<String>,
+    pub owner_id: Option<String>,
+    pub recovery_deadline: String,
+    pub last_error: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+    pub released_at: Option<String>,
+}
+
+/// Durable fields needed to project one scheduler candidate. The packet and
+/// package JSON are frozen ledger bytes, not filesystem reads.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionDurableCandidate {
+    pub subject_kind: DesiredSubjectKind,
+    pub subject_id: String,
+    pub desired_state: DesiredState,
+    pub control_revision: u64,
+    pub next_wake_at: Option<String>,
+    pub authorized_at: String,
+    pub exhausted: bool,
+    pub repository: Option<String>,
+    pub bead_id: Option<String>,
+    pub packet_id: Option<String>,
+    pub packet_body_json: Option<String>,
+    pub package_json: Option<String>,
+    pub epic_started_json: Option<String>,
+    pub epic_package_json: Option<String>,
+    /// When an epic controller launches a child packet, the child's run is
+    /// authorized by the parent epic's desired-work epoch rather than by an
+    /// independently supervised run controller.
+    pub delegated_run_id: Option<String>,
+    pub delegated_repository: Option<String>,
+}
+
+/// Exact durable launch facts for one packet requested by an admission
+/// snapshot. Provider fallback is already resolved against the active roster
+/// revision and terminal attempt history inside the snapshot transaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionPacketFacts {
+    pub packet_id: String,
+    pub run_id: String,
+    pub bead_id: String,
+    pub repository: String,
+    pub provider: String,
+    pub model: String,
+    pub effort: Option<String>,
+    pub resource_class: AdmissionResourceClass,
+}
+
+/// One transaction-consistent ledger read for the admission projector.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdmissionLedgerSnapshot {
+    pub as_of: String,
+    pub ledger_revision: String,
+    pub candidates: Vec<AdmissionDurableCandidate>,
+    pub packet_facts: Vec<AdmissionPacketFacts>,
+    pub capacity: AdmissionCapacityV1,
+    pub spend: Vec<AdmissionSpendV1>,
+    pub latest_rate_limits: Vec<AdmissionRateLimitV1>,
+    pub reservations: Vec<AdmissionReservationRow>,
+    pub reservation_decisions: Vec<AdmissionDecisionV1>,
+}
+
+/// Atomic batch write requested after pure policy evaluation.
+#[derive(Debug, Clone)]
+pub struct AdmissionBatchWrite {
+    pub inputs: AdmissionInputsV1,
+    pub decisions: Vec<AdmissionDecisionV1>,
+    pub recovery_deadline: String,
+}
+
+/// Which closed owner shape an owned Herdr row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrOwnerKind {
+    Controller,
+    Attempt,
+}
+
+impl OwnedHerdrOwnerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Attempt => "attempt",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrOwnerKind {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "controller" => Ok(Self::Controller),
+            "attempt" => Ok(Self::Attempt),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr owner kind: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Durable lifecycle evidence for the command in an owned pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrLifecycleState {
+    Registered,
+    CommandStarted,
+    OwnerTerminal,
+    OwnerDead,
+}
+
+impl OwnedHerdrLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::CommandStarted => "command-started",
+            Self::OwnerTerminal => "owner-terminal",
+            Self::OwnerDead => "owner-dead",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrLifecycleState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "registered" => Ok(Self::Registered),
+            "command-started" => Ok(Self::CommandStarted),
+            "owner-terminal" => Ok(Self::OwnerTerminal),
+            "owner-dead" => Ok(Self::OwnerDead),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr lifecycle state: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Durable cleanup state. Only the schedulable states participate in due and
+/// earliest-wake queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Released,
+}
+
+impl OwnedHerdrCleanupState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup state: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Why cleanup became eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupReason {
+    CommandNotStarted,
+    AttemptSettled,
+    ControllerTerminal,
+    ControllerDead,
+}
+
+impl OwnedHerdrCleanupReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandNotStarted => "command-not-started",
+            Self::AttemptSettled => "attempt-settled",
+            Self::ControllerTerminal => "controller-terminal",
+            Self::ControllerDead => "controller-dead",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "command-not-started" => Ok(Self::CommandNotStarted),
+            "attempt-settled" => Ok(Self::AttemptSettled),
+            "controller-terminal" => Ok(Self::ControllerTerminal),
+            "controller-dead" => Ok(Self::ControllerDead),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Verified close outcome. `PaneNotFound` is exact Herdr `pane_not_found`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupRelease {
+    Closed,
+    PaneNotFound,
+}
+
+impl OwnedHerdrCleanupRelease {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::PaneNotFound => "pane-not-found",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupRelease {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "closed" => Ok(Self::Closed),
+            "pane-not-found" => Ok(Self::PaneNotFound),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup release: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// One row of migration 014, in DDL order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedHerdrSessionRow {
+    pub ownership_id: String,
+    pub schema: String,
+    pub owner_kind: OwnedHerdrOwnerKind,
+    pub subject_kind: OwnedHerdrSubjectKind,
+    pub subject_id: String,
+    pub run_id: Option<String>,
+    pub packet_id: Option<String>,
+    pub attempt_id: Option<i64>,
+    pub claim_token: Option<String>,
+    pub controller_generation: Option<u32>,
+    pub pane_id: String,
+    pub socket_path: String,
+    pub protocol: u32,
+    pub sentinel_path: String,
+    pub lifecycle_state: OwnedHerdrLifecycleState,
+    pub cleanup_state: OwnedHerdrCleanupState,
+    pub cleanup_reason: Option<OwnedHerdrCleanupReason>,
+    pub cleanup_release: Option<OwnedHerdrCleanupRelease>,
+    pub cleanup_token: Option<String>,
+    pub cleanup_lease_until: Option<String>,
+    pub cleanup_retry_budget: u32,
+    pub cleanup_retry_used: u32,
+    pub next_cleanup_at: Option<String>,
+    pub last_cleanup_error: Option<String>,
+    pub registered_at: String,
+    pub command_started_at: Option<String>,
+    pub cleanup_requested_at: Option<String>,
+    pub last_cleanup_attempt_at: Option<String>,
+    pub released_at: Option<String>,
+    pub updated_at: String,
+    /// Nullable migration-017 join. Pre-layout and degraded placements have
+    /// no value and are never inferred from workspace/tab labels.
+    pub layout_id: Option<String>,
+}
+
+impl OwnedHerdrSessionRow {
+    /// Reconstruct the exact immutable host identity without deriving any
+    /// path or interpreting the opaque pane id.
+    pub fn identity(&self) -> Result<OwnedHerdrSessionV1, LedgerError> {
+        let subject = OwnedHerdrSubjectV1 {
+            kind: self.subject_kind,
+            id: self.subject_id.clone(),
+        };
+        let owner = match self.owner_kind {
+            OwnedHerdrOwnerKind::Controller => OwnedHerdrOwnerV1::Controller {
+                subject,
+                generation: self.controller_generation.ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        "controller owner has no generation",
+                    )
+                })?,
+            },
+            OwnedHerdrOwnerKind::Attempt => OwnedHerdrOwnerV1::Attempt {
+                subject,
+                run_id: self.run_id.clone().ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no run")
+                })?,
+                packet_id: self.packet_id.clone().ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no packet")
+                })?,
+                attempt_id: self.attempt_id.ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no attempt")
+                })?,
+                claim_token: self.claim_token.clone().ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        "attempt owner has no claim token",
+                    )
+                })?,
+                controller_generation: self.controller_generation,
+            },
+        };
+        Ok(OwnedHerdrSessionV1 {
+            schema: self.schema.clone(),
+            ownership_id: self.ownership_id.clone(),
+            owner,
+            pane_id: self.pane_id.clone(),
+            socket_path: self.socket_path.clone(),
+            protocol: self.protocol,
+            sentinel_path: self.sentinel_path.clone(),
+            layout_id: self.layout_id.clone(),
+        })
+    }
+}
+
+/// Result of persisting a transient cleanup failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupRetry {
+    Scheduled(OwnedHerdrSessionRow),
+    Exhausted(OwnedHerdrSessionRow),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutLifecycleState {
+    Creating,
+    Registered,
+    Degraded,
+    Replaced,
+}
+
+impl HerdrLayoutLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Creating => "creating",
+            Self::Registered => "registered",
+            Self::Degraded => "degraded",
+            Self::Replaced => "replaced",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutLifecycleState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "creating" => Ok(Self::Creating),
+            "registered" => Ok(Self::Registered),
+            "degraded" => Ok(Self::Degraded),
+            "replaced" => Ok(Self::Replaced),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout lifecycle state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutDegradationReason {
+    CreationAmbiguous,
+    RegistrationFailed,
+    VerificationMissing,
+    VerificationMismatch,
+    PlacementFailed,
+}
+
+impl HerdrLayoutDegradationReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CreationAmbiguous => "creation-ambiguous",
+            Self::RegistrationFailed => "registration-failed",
+            Self::VerificationMissing => "verification-missing",
+            Self::VerificationMismatch => "verification-mismatch",
+            Self::PlacementFailed => "placement-failed",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutDegradationReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "creation-ambiguous" => Ok(Self::CreationAmbiguous),
+            "registration-failed" => Ok(Self::RegistrationFailed),
+            "verification-missing" => Ok(Self::VerificationMissing),
+            "verification-mismatch" => Ok(Self::VerificationMismatch),
+            "placement-failed" => Ok(Self::PlacementFailed),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout degradation reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Released,
+}
+
+impl HerdrLayoutCleanupState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupReason {
+    SubjectTerminal,
+    LayoutReplaced,
+    LayoutDegraded,
+}
+
+impl HerdrLayoutCleanupReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SubjectTerminal => "subject-terminal",
+            Self::LayoutReplaced => "layout-replaced",
+            Self::LayoutDegraded => "layout-degraded",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "subject-terminal" => Ok(Self::SubjectTerminal),
+            "layout-replaced" => Ok(Self::LayoutReplaced),
+            "layout-degraded" => Ok(Self::LayoutDegraded),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupRelease {
+    Closed,
+    PaneNotFound,
+}
+
+impl HerdrLayoutCleanupRelease {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::PaneNotFound => "pane-not-found",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrLayoutCleanupRelease {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "closed" => Ok(Self::Closed),
+            "pane-not-found" => Ok(Self::PaneNotFound),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr layout cleanup release: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// One migration-017 row in DDL order. A creating or ambiguous row has no
+/// locator; [`HerdrLayoutRow::identity`] accepts registered locators only.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrLayoutRow {
+    pub layout_id: String,
+    pub schema: String,
+    pub revision: u32,
+    pub subject_kind: HerdrLayoutSubjectKind,
+    pub subject_id: String,
+    pub socket_path: String,
+    pub protocol: u32,
+    pub workspace_id: String,
+    pub tab_id: Option<String>,
+    pub root_pane_id: Option<String>,
+    pub display_label: String,
+    pub lifecycle_state: HerdrLayoutLifecycleState,
+    pub degradation_reason: Option<HerdrLayoutDegradationReason>,
+    pub last_error: Option<String>,
+    pub creation_token: Option<String>,
+    pub creation_lease_until: Option<String>,
+    pub mutation_token: Option<String>,
+    pub mutation_lease_until: Option<String>,
+    pub cleanup_state: HerdrLayoutCleanupState,
+    pub cleanup_reason: Option<HerdrLayoutCleanupReason>,
+    pub cleanup_release: Option<HerdrLayoutCleanupRelease>,
+    pub cleanup_token: Option<String>,
+    pub cleanup_lease_until: Option<String>,
+    pub cleanup_retry_budget: u32,
+    pub cleanup_retry_used: u32,
+    pub next_cleanup_at: Option<String>,
+    pub last_cleanup_error: Option<String>,
+    pub predecessor_layout_id: Option<String>,
+    pub created_at: String,
+    pub registered_at: Option<String>,
+    pub replaced_at: Option<String>,
+    pub cleanup_requested_at: Option<String>,
+    pub last_cleanup_attempt_at: Option<String>,
+    pub released_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl HerdrLayoutRow {
+    pub fn identity(&self) -> Result<HerdrLayoutV1, LedgerError> {
+        let identity = HerdrLayoutV1 {
+            schema: self.schema.clone(),
+            layout_id: self.layout_id.clone(),
+            revision: self.revision,
+            subject: HerdrLayoutSubjectV1 {
+                kind: self.subject_kind,
+                id: self.subject_id.clone(),
+            },
+            socket_path: self.socket_path.clone(),
+            protocol: self.protocol,
+            workspace_id: self.workspace_id.clone(),
+            tab_id: self.tab_id.clone().ok_or_else(|| {
+                refused(
+                    ErrorCode::OperationInProgress,
+                    "Herdr layout has no tab locator",
+                )
+            })?,
+            root_pane_id: self.root_pane_id.clone().ok_or_else(|| {
+                refused(
+                    ErrorCode::OperationInProgress,
+                    "Herdr layout has no root-pane locator",
+                )
+            })?,
+            display_label: self.display_label.clone(),
+            predecessor_layout_id: self.predecessor_layout_id.clone(),
+        };
+        identity.validate().map_err(|error| {
+            refused(
+                ErrorCode::InvalidRequest,
+                format!("invalid stored Herdr layout identity: {error}"),
+            )
+        })?;
+        Ok(identity)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrLayoutCreation {
+    Reserved(HerdrLayoutRow),
+    Existing(HerdrLayoutRow),
+    Contended(HerdrLayoutRow),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HerdrLayoutCleanupRetry {
+    Scheduled(HerdrLayoutRow),
+    Exhausted(HerdrLayoutRow),
+}
+
+/// Durable state of one independent projection publication channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProjectionPublicationState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Applied,
+    Missing,
+}
+
+impl HerdrProjectionPublicationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Applied => "applied",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrProjectionPublicationState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "applied" => Ok(Self::Applied),
+            "missing" => Ok(Self::Missing),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr projection publication state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProjectionChannel {
+    Metadata,
+    Lifecycle,
+}
+
+impl HerdrProjectionChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+/// Fully decoded migration-018 row.  Candidate and confirmation deliberately
+/// remain separate, and there is no provider-session path/native source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrPaneProjectionRow {
+    pub identity: HerdrPaneProjectionV1,
+    pub session_candidate: Option<String>,
+    pub session_confirmed: Option<String>,
+    pub session_evidence_source: Option<HerdrSessionEvidenceSource>,
+    pub session_evidence_at: Option<String>,
+    pub session_evidence_error: Option<String>,
+    pub desired_revision: u64,
+    pub desired_lifecycle: Option<HerdrProjectionLifecycle>,
+    pub desired_release: bool,
+    pub metadata_next_seq: u64,
+    pub metadata_applied_seq: Option<u64>,
+    pub metadata_applied_revision: Option<u64>,
+    pub metadata_state: HerdrProjectionPublicationState,
+    pub metadata_token: Option<String>,
+    pub metadata_lease_until: Option<String>,
+    pub metadata_retry_budget: u32,
+    pub metadata_retry_used: u32,
+    pub metadata_next_wake_at: Option<String>,
+    pub metadata_last_error: Option<String>,
+    pub metadata_last_attempt_at: Option<String>,
+    pub metadata_applied_at: Option<String>,
+    pub lifecycle_next_seq: u64,
+    pub lifecycle_applied_seq: Option<u64>,
+    pub lifecycle_applied_revision: Option<u64>,
+    pub lifecycle_state: HerdrProjectionPublicationState,
+    pub lifecycle_token: Option<String>,
+    pub lifecycle_lease_until: Option<String>,
+    pub lifecycle_retry_budget: u32,
+    pub lifecycle_retry_used: u32,
+    pub lifecycle_next_wake_at: Option<String>,
+    pub lifecycle_last_error: Option<String>,
+    pub lifecycle_last_attempt_at: Option<String>,
+    pub lifecycle_applied_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl HerdrPaneProjectionRow {
+    pub fn target_kind(&self) -> HerdrProjectionTargetKind {
+        self.identity.target.kind()
+    }
 }
 
 /// A run's lifecycle state (`runs.state`).
@@ -699,6 +1485,100 @@ pub struct OperationRow {
     pub updated_at: String,
 }
 
+/// Immutable key for one exact review-finding delivery row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingDeliveryKey {
+    pub run_id: String,
+    pub repository_slug: String,
+    pub pr_number: u64,
+    pub review_epoch_kind: forged_types::ReviewEpochKind,
+    pub review_epoch: u64,
+    pub snapshot_sha256: String,
+    pub finding_id: String,
+}
+
+/// Closed durable lifecycle of one review-finding delivery.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryState {
+    Pending,
+    Uncertain,
+    Retryable,
+    Delivered,
+}
+
+impl ReviewFindingDeliveryState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Uncertain => "uncertain",
+            Self::Retryable => "retryable",
+            Self::Delivered => "delivered",
+        }
+    }
+}
+
+/// Exact external outcome proving a delivered marker-bearing comment.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryOutcome {
+    Posted,
+    AlreadyPresent,
+}
+
+impl ReviewFindingDeliveryOutcome {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Posted => "posted",
+            Self::AlreadyPresent => "already-present",
+        }
+    }
+}
+
+/// Immutable intent inserted before a review comment may be posted.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewReviewFindingDelivery {
+    pub key: ReviewFindingDeliveryKey,
+    pub pr_url: String,
+    pub canonical_finding_json: String,
+    pub finding_sha256: String,
+}
+
+/// Fully decoded migration-019 review-finding delivery row.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReviewFindingDeliveryRow {
+    pub key: ReviewFindingDeliveryKey,
+    pub schema: String,
+    pub pr_url: String,
+    pub canonical_finding_json: String,
+    pub finding_sha256: String,
+    pub state: ReviewFindingDeliveryState,
+    pub attempt_count: u64,
+    pub last_error: Option<String>,
+    pub external_outcome: Option<ReviewFindingDeliveryOutcome>,
+    pub delivered_evidence: Option<String>,
+    pub delivery_token: Option<String>,
+    pub delivery_lease_until: Option<String>,
+    pub delivered_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// Result of atomically claiming one undelivered finding.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReviewFindingDeliveryClaim {
+    Delivered(ReviewFindingDeliveryRow),
+    Busy(ReviewFindingDeliveryRow),
+    Claimed(ReviewFindingDeliveryRow),
+}
+
+/// One bounded ledger snapshot used to select review-publication content.
+#[derive(Debug, Clone, PartialEq)]
+pub struct ReviewPublicationSource {
+    pub definition_backed: bool,
+    pub packets: Vec<PacketRow>,
+    pub completed_attempts: Vec<AttemptRow>,
+    pub draft_pr_operation: Option<OperationRow>,
+}
+
 /// One row of `merge_slots`, in DDL column order.
 #[derive(Debug, Clone, PartialEq)]
 pub struct MergeSlotRow {
@@ -928,4 +1808,18 @@ pub struct Pragmas {
     pub busy_timeout_ms: i64,
     /// `PRAGMA user_version` — the last applied migration index.
     pub user_version: i64,
+}
+
+#[cfg(test)]
+mod owned_herdr_type_tests {
+    use super::*;
+
+    #[test]
+    fn owned_herdr_vocabulary_has_no_permissive_fallback() {
+        assert!(OwnedHerdrOwnerKind::try_from("legacy").is_err());
+        assert!(OwnedHerdrLifecycleState::try_from("unknown").is_err());
+        assert!(OwnedHerdrCleanupState::try_from("closing-ish").is_err());
+        assert!(OwnedHerdrCleanupReason::try_from("title-match").is_err());
+        assert!(OwnedHerdrCleanupRelease::try_from("not-found").is_err());
+    }
 }

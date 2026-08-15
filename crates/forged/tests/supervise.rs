@@ -4,6 +4,7 @@
 mod support;
 
 use std::process::Stdio;
+use std::sync::{Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
 use forged_ledger::{DesiredReconcileOutcome, DesiredState, DesiredSubjectKind};
@@ -14,6 +15,15 @@ use serde_json::{json, Value};
 use support::TestEnv;
 
 const WAIT: Duration = Duration::from_secs(30);
+// These cases deliberately create and signal detached process groups. Keep
+// their OS-level fixtures disjoint while retaining production timing bounds.
+static PROCESS_FIXTURE_LOCK: Mutex<()> = Mutex::new(());
+
+fn serialize_process_fixture() -> MutexGuard<'static, ()> {
+    PROCESS_FIXTURE_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn start_run(env: &TestEnv, run: &str) {
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -66,6 +76,7 @@ fn implementation_starts(env: &TestEnv, run: &str) -> usize {
 
 #[test]
 fn never_submitted_and_failed_submissions_never_become_desired() {
+    let _serial = serialize_process_fixture();
     let env = TestEnv::new("supervise-authorization-boundary");
     start_run(&env, "run-never-submitted");
     let (code, report) = env.forged(&["supervise", "--once"]);
@@ -104,7 +115,113 @@ fn never_submitted_and_failed_submissions_never_become_desired() {
 }
 
 #[test]
+fn capacity_queued_submit_replays_by_key_and_fresh_key_retries_later() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-queued-submit-replay");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read config for admission limit"),
+    )
+    .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 1,
+        "providerActive": 4,
+        "repositoryWriteActive": 1,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+
+    start_run(&env, "run-capacity-holder");
+    start_run(&env, "run-capacity-queued");
+    env.set_scenario("implement", "hang", 2);
+    let (code, holder) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-holder",
+        "--idempotency-key",
+        "capacity-holder",
+    ]);
+    assert_eq!(code, 0, "holder submit: {holder}");
+    wait_until("holder attempt to consume capacity", || {
+        implementation_starts(&env, "run-capacity-holder") == 1
+    });
+
+    let queued_args = [
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-queued",
+        "--idempotency-key",
+        "capacity-queued",
+    ];
+    let (code, queued) = env.forged(&queued_args);
+    assert_eq!(code, 0, "capacity queue: {queued}");
+    assert_eq!(queued["result"]["queued"], json!(true));
+    assert_eq!(queued["result"]["controller"], Value::Null);
+    assert_eq!(queued["reused"], json!(false));
+
+    let (code, replayed) = env.forged(&queued_args);
+    assert_eq!(code, 0, "queued replay: {replayed}");
+    assert_eq!(replayed["operationId"], queued["operationId"]);
+    assert_eq!(replayed["result"], queued["result"]);
+    assert_eq!(replayed["reused"], json!(true));
+    assert_eq!(implementation_starts(&env, "run-capacity-queued"), 0);
+
+    let (code, stopped) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-capacity-holder",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "release admission capacity",
+    ]);
+    assert_eq!(code, 0, "stop holder: {stopped}");
+    wait_until("holder attempt capacity release", || {
+        let ledger = env.ledger();
+        let empty = ledger
+            .list_live_attempts(Some("run-capacity-holder"))
+            .expect("list holder attempts")
+            .is_empty();
+        ledger.close().expect("close holder ledger");
+        empty
+    });
+
+    let (code, retried) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        "run-capacity-queued",
+        "--idempotency-key",
+        "capacity-retry",
+    ]);
+    assert_eq!(code, 0, "fresh-key retry: {retried}");
+    assert_eq!(retried["result"]["submitted"], json!(true));
+    assert_ne!(retried["result"]["queued"], json!(true));
+    assert!(retried["result"]["controller"].is_object());
+    assert_ne!(retried["operationId"], queued["operationId"]);
+
+    let _ = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-capacity-queued",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+}
+
+#[test]
 fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
+    let _serial = serialize_process_fixture();
     let env = TestEnv::new("supervise-restart-singleton");
     start_run(&env, "run-supervised");
     env.set_scenario("implement", "hang", 2);
@@ -209,6 +326,7 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
 
 #[test]
 fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
+    let _serial = serialize_process_fixture();
     let env = TestEnv::new("supervise-foreground-signal");
     start_run(&env, "run-foreground");
     env.set_scenario("implement", "hang", 2);
@@ -279,11 +397,73 @@ fn foreground_mode_exits_cleanly_on_sigint_without_duplicate_effects() {
     ledger.close().expect("close");
     assert_eq!(implementation_starts(&env, "run-foreground"), 1);
 
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-foreground",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "foreground signal test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop foreground fixture: {cleanup}");
+    wait_until("foreground controller cleanup", || {
+        !process_group_alive(controller)
+    });
+}
+
+#[test]
+fn foreground_mode_exits_cleanly_on_sigterm() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-foreground-sigterm");
+    start_run(&env, "run-sigterm");
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-sigterm"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    let supervisor = env
+        .forged_cmd(&["supervise"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("foreground supervisor spawns");
+    let supervisor_pid = i32::try_from(supervisor.id()).expect("supervisor pid fits i32");
+
+    wait_until("SIGTERM handler is active after a completed tick", || {
+        let ledger = env.ledger();
+        let adopted = ledger
+            .get_desired_work(DesiredSubjectKind::Run, "run-sigterm")
+            .expect("desired query")
+            .is_some_and(|row| row.last_outcome == Some(DesiredReconcileOutcome::Adopted));
+        ledger.close().expect("close");
+        adopted
+    });
+    kill(Pid::from_raw(supervisor_pid), Signal::SIGTERM).expect("SIGTERM foreground supervisor");
+    let output = supervisor
+        .wait_with_output()
+        .expect("foreground supervisor exits");
+    assert!(
+        output.status.success(),
+        "supervisor failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let response: Value = serde_json::from_slice(&output.stdout).expect("supervisor response JSON");
+    assert_eq!(
+        response["result"]["schema"],
+        json!("forged.supervise.session/1")
+    );
+    assert_eq!(response["result"]["reason"], json!("sigterm"));
+    assert!(response["result"]["ticks"]
+        .as_u64()
+        .is_some_and(|ticks| ticks >= 1));
     let _ = killpg(Pid::from_raw(controller), Signal::SIGKILL);
 }
 
 #[test]
 fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
+    let _serial = serialize_process_fixture();
     let env = TestEnv::new("supervise-input-resolution");
     env.enable_dynamic_gh();
     env.seed_epic("epic-input", &[("direct-decision", &env.spec, true)]);
@@ -313,6 +493,9 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
         .authorize_desired_work(DesiredSubjectKind::Epic, "epic-input", 0)
         .expect("authorize desired epic");
     ledger.close().expect("close");
+    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
+    assert_eq!(code, 0, "commit complete wave: {wave}");
+    assert!(wave["result"]["progress"]["wave"].is_number());
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
     assert_eq!(code, 0, "input stop: {held}");
     assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));

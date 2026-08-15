@@ -45,6 +45,12 @@ pub enum Command {
         #[command(subcommand)]
         command: PacketCmd,
     },
+    /// Durable review-result delivery.
+    Review {
+        /// Review delivery subcommand.
+        #[command(subcommand)]
+        command: ReviewCmd,
+    },
     /// Immutable attempt-artifact operations.
     Artifact {
         #[command(subcommand)]
@@ -73,13 +79,31 @@ pub enum Command {
     Events(EventsArgs),
     /// Reconnect projection for one slice or epic (read-only).
     Overview(OverviewArgs),
+    /// Bounded operator-facing operations projection.
+    Operations {
+        /// Operations subcommand.
+        #[command(subcommand)]
+        command: OperationsCmd,
+    },
     /// Reconcile operator-authorized desired work.
     Supervise(SuperviseArgs),
+    /// Install and operate the operator-scoped supervisor service.
+    Service {
+        /// Service lifecycle command.
+        #[command(subcommand)]
+        command: ServiceCmd,
+    },
     /// Work inventory.
     Work {
         /// The work subcommand.
         #[command(subcommand)]
         command: WorkCmd,
+    },
+    /// Typed operator-attention custody controls.
+    Attention {
+        /// The attention subcommand.
+        #[command(subcommand)]
+        command: AttentionCmd,
     },
     /// Worktree lifecycle.
     Worktree {
@@ -106,6 +130,65 @@ pub struct SuperviseArgs {
     #[arg(long)]
     pub once: bool,
     /// Override the report operation identity.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+    /// Immutable installed-service generation. Set only by the LaunchAgent.
+    #[arg(long, hide = true)]
+    pub service_generation: Option<String>,
+}
+
+/// Supervisor service lifecycle. Mutations are intentionally CLI-only.
+#[derive(Debug, Subcommand)]
+pub enum ServiceCmd {
+    /// Install this exact executable, or reconcile/upgrade an installation.
+    Install(KeyOnly),
+    /// Start the installed supervisor.
+    Start(KeyOnly),
+    /// Stop the supervisor, optionally waiting for controllers to drain.
+    Stop(ServiceStopArgs),
+    /// Gracefully restart the installed supervisor.
+    Restart(KeyOnly),
+    /// Inspect manifest, launchd, process, binary, and tick identity.
+    Status(KeyOnly),
+    /// Remove the drained LaunchAgent while retaining immutable binaries.
+    Uninstall(KeyOnly),
+}
+
+impl ServiceCmd {
+    pub(crate) fn operation_name(&self) -> &'static str {
+        match self {
+            Self::Install(_) => "service_install",
+            Self::Start(_) => "service_start",
+            Self::Stop(_) => "service_stop",
+            Self::Restart(_) => "service_restart",
+            Self::Status(_) => "service_status",
+            Self::Uninstall(_) => "service_uninstall",
+        }
+    }
+
+    pub(crate) fn idempotency_key(&self) -> Option<&str> {
+        let key = match self {
+            Self::Install(args)
+            | Self::Start(args)
+            | Self::Restart(args)
+            | Self::Status(args)
+            | Self::Uninstall(args) => args.idempotency_key.as_deref(),
+            Self::Stop(args) => args.idempotency_key.as_deref(),
+        };
+        key.filter(|value| !value.is_empty())
+    }
+}
+
+/// `service stop` flags.
+#[derive(Debug, Args)]
+pub struct ServiceStopArgs {
+    /// After stopping scheduling, wait for all live controllers to finish.
+    #[arg(long)]
+    pub drain: bool,
+    /// Maximum drain wait. A timeout reports every remaining controller.
+    #[arg(long, default_value_t = 300)]
+    pub timeout_seconds: u64,
+    /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
 }
@@ -391,6 +474,13 @@ pub struct RunScoped {
     pub idempotency_key: Option<String>,
 }
 
+/// `review` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum ReviewCmd {
+    /// Publish the latest exact durable review snapshot to its slice PR.
+    Publish(RunScoped),
+}
+
 /// `packet` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum PacketCmd {
@@ -496,12 +586,73 @@ pub struct AttemptScoped {
 pub enum SessionCmd {
     /// List durable provider-session metadata for a run.
     List(RunScoped),
+    /// Inventory durable provider attempts across runs and repositories.
+    Inventory(SessionInventoryArgs),
     /// Read recent output from a Herdr-backed attempt.
     Read(SessionReadArgs),
     /// Queue an intervention, delivering live only when capability permits.
     Message(SessionMessageArgs),
     /// Revoke and confirmed-stop one attempt.
     Stop(SessionStopArgs),
+}
+
+/// Exact attempt activity accepted by `session inventory`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum SessionInventoryActivityArg {
+    Running,
+    Revoking,
+    Completed,
+    Failed,
+    Reclaimed,
+    Stopped,
+}
+
+impl SessionInventoryActivityArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Revoking => "revoking",
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Reclaimed => "reclaimed",
+            Self::Stopped => "stopped",
+        }
+    }
+}
+
+/// `session inventory` flags. Every selector is a canonical durable key.
+#[derive(Debug, Args)]
+pub struct SessionInventoryArgs {
+    /// Exact run id.
+    #[arg(long)]
+    pub run: Option<String>,
+    /// Exact epic id.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Exact canonical repository path.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Exact frozen packet provider.
+    #[arg(long)]
+    pub provider: Option<String>,
+    /// Exact frozen packet model.
+    #[arg(long)]
+    pub model: Option<String>,
+    /// Exact attempt activity (not Herdr lifecycle).
+    #[arg(long, value_enum)]
+    pub activity: Option<SessionInventoryActivityArg>,
+    /// Include every terminal attempt, not only unresolved owned Herdr rows.
+    #[arg(long)]
+    pub include_historical: bool,
+    /// Page size (default 100, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Opaque continuation cursor from the preceding page.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `session read` flags.
@@ -667,11 +818,361 @@ pub struct OverviewArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `operations` subcommands.
+#[derive(Debug, Subcommand)]
+pub enum OperationsCmd {
+    /// Show planned, queued, active, blocked, and mergeable work.
+    Overview(OperationsOverviewArgs),
+}
+
+/// `operations overview` flags.
+#[derive(Debug, Args)]
+pub struct OperationsOverviewArgs {
+    /// Exact durable repository identity.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// One queue group code, such as `needs-me` or `running`.
+    #[arg(long)]
+    pub group: Option<String>,
+    /// One source: `durable` or `live-plan`.
+    #[arg(long)]
+    pub source: Option<String>,
+    /// Maximum rows across all groups (default 200, maximum 500).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `work` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorkCmd {
-    /// List every slice run and started epic, with no id (read-only).
-    List(KeyOnly),
+    /// List slice runs and started epics, optionally scoped by repository.
+    List(WorkListArgs),
+    /// Project bounded cross-run lifecycle, rework, and spend history.
+    History(WorkHistoryArgs),
+    /// Project one exact run or epic for the Work Detail App.
+    Detail(WorkDetailArgs),
+    /// Project the bounded plan, queue, execution, and history graph.
+    Map(WorkMapArgs),
+}
+
+/// Closed scope accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapScopeArg {
+    Operator,
+    Repository,
+    Epic,
+}
+
+impl WorkMapScopeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Repository => "repository",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+/// Closed Operations queue group accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapGroupArg {
+    NeedsMe,
+    ReadyToMerge,
+    Running,
+    StalledOrRecoverable,
+    Planned,
+}
+
+impl WorkMapGroupArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsMe => "needs-me",
+            Self::ReadyToMerge => "ready-to-merge",
+            Self::Running => "running",
+            Self::StalledOrRecoverable => "stalled-or-recoverable",
+            Self::Planned => "planned",
+        }
+    }
+}
+
+/// Closed authority source accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapSourceArg {
+    Durable,
+    LivePlan,
+}
+
+impl WorkMapSourceArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::LivePlan => "live-plan",
+        }
+    }
+}
+
+/// Closed Work Map reference kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapRefKindArg {
+    Plan,
+    Run,
+    Epic,
+}
+
+impl WorkMapRefKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Run => "run",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+/// `work map` flags.
+#[derive(Debug, Args)]
+pub struct WorkMapArgs {
+    /// Graph scope (default operator).
+    #[arg(long, value_enum, default_value = "operator")]
+    pub scope: WorkMapScopeArg,
+    /// Exact canonical repository path for repository scope.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Exact epic id for epic scope.
+    #[arg(long)]
+    pub epic_id: Option<String>,
+    /// One canonical Operations queue group.
+    #[arg(long, value_enum)]
+    pub group: Option<WorkMapGroupArg>,
+    /// One authority source.
+    #[arg(long, value_enum)]
+    pub source: Option<WorkMapSourceArg>,
+    /// Inclusive RFC3339 UTC history lower bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC history upper bound.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Maximum graph nodes (default 250, maximum 500).
+    #[arg(long)]
+    pub max_nodes: Option<u64>,
+    /// Exact focus reference kind.
+    #[arg(long, value_enum, requires = "focus_id")]
+    pub focus_kind: Option<WorkMapRefKindArg>,
+    /// Exact focus reference id.
+    #[arg(long, requires = "focus_kind")]
+    pub focus_id: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work list` flags.
+#[derive(Debug, Args)]
+pub struct WorkListArgs {
+    /// Exact repository identity from Bead metadata.repository.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Closed time bucket accepted by `work history`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkHistoryBucketArg {
+    Hour,
+    Day,
+    Week,
+}
+
+impl WorkHistoryBucketArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// Closed grouping dimension accepted by `work history`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkHistoryGroupArg {
+    None,
+    Repository,
+    Epic,
+    Stage,
+    Provider,
+}
+
+impl WorkHistoryGroupArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Repository => "repository",
+            Self::Epic => "epic",
+            Self::Stage => "stage",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// Exact durable work kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkDetailKind {
+    /// One slice run.
+    Run,
+    /// One epic.
+    Epic,
+}
+
+impl WorkDetailKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Run => "run",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+/// `work history` flags. Omitted bounds default to the 30 days ending at
+/// the operation's single `asOf`.
+#[derive(Debug, Args)]
+pub struct WorkHistoryArgs {
+    /// Inclusive RFC3339 UTC lower bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC upper bound.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Fixed trend bucket.
+    #[arg(long, value_enum)]
+    pub bucket: Option<WorkHistoryBucketArg>,
+    /// One grouping dimension.
+    #[arg(long, value_enum)]
+    pub group_by: Option<WorkHistoryGroupArg>,
+    /// Exact canonical repository path.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Exact canonical epic id.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Exact canonical run or epic subject id.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// Subject page size (default 50, maximum 200).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Opaque continuation cursor from the preceding page.
+    #[arg(long)]
+    pub cursor: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `work detail` flags.
+#[derive(Debug, Args)]
+pub struct WorkDetailArgs {
+    /// Exact durable subject kind.
+    #[arg(long, value_enum)]
+    pub subject_kind: WorkDetailKind,
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject_id: String,
+    /// Return event rows after this event id.
+    #[arg(long)]
+    pub after: Option<i64>,
+    /// Maximum event rows (default 100, maximum 1000).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `attention` subcommands. These alter custody only; domain state is never
+/// changed by an attention control.
+#[derive(Debug, Subcommand)]
+pub enum AttentionCmd {
+    /// Record who has custody while leaving the item active.
+    Acknowledge(AttentionTargetArgs),
+    /// Resolve an explicitly adjudicable occurrence.
+    Resolve(AttentionResolveArgs),
+    /// Reopen the exact current occurrence.
+    Reopen(AttentionTargetArgs),
+}
+
+/// Exact occurrence address shared by attention controls.
+#[derive(Debug, Args)]
+pub struct AttentionTargetArgs {
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject: String,
+    /// Stable subject-condition identity from the projection.
+    #[arg(long)]
+    pub attention_id: String,
+    /// Current causal occurrence identity from the projection.
+    #[arg(long)]
+    pub occurrence_id: String,
+    /// Human or lead-agent identity taking the action.
+    #[arg(long)]
+    pub actor: String,
+    /// Override the deterministic occurrence-scoped key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Closed attention-resolution dispositions.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttentionDisposition {
+    Fixed,
+    AcceptedRisk,
+    AcceptedUnknown,
+    Superseded,
+    Automatic,
+}
+
+impl AttentionDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::AcceptedRisk => "accepted-risk",
+            Self::AcceptedUnknown => "accepted-unknown",
+            Self::Superseded => "superseded",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+/// `attention resolve` flags.
+#[derive(Debug, Args)]
+pub struct AttentionResolveArgs {
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject: String,
+    /// Stable subject-condition identity from the projection.
+    #[arg(long)]
+    pub attention_id: String,
+    /// Current causal occurrence identity from the projection.
+    #[arg(long)]
+    pub occurrence_id: String,
+    /// Human or lead-agent identity taking the action.
+    #[arg(long)]
+    pub actor: String,
+    /// Auditable disposition for this occurrence.
+    #[arg(long, value_enum)]
+    pub disposition: AttentionDisposition,
+    /// Bounded explanation of the disposition.
+    #[arg(long, default_value = "")]
+    pub note: String,
+    /// Override the deterministic occurrence-scoped key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `worktree` subcommands.
@@ -750,12 +1251,16 @@ pub fn command_name(command: &Command) -> &'static str {
             PacketCmd::Fail(_) => "packet_fail",
             PacketCmd::Heartbeat(_) => "packet_heartbeat",
         },
+        Command::Review { command } => match command {
+            ReviewCmd::Publish(_) => "review_publish",
+        },
         Command::Artifact { command } => match command {
             ArtifactCmd::Verify(_) => "artifact_verify",
             ArtifactCmd::Compact(_) => "artifact_compact",
         },
         Command::Session { command } => match command {
             SessionCmd::List(_) => "session_list",
+            SessionCmd::Inventory(_) => "session_inventory",
             SessionCmd::Read(_) => "session_read",
             SessionCmd::Message(_) => "session_message",
             SessionCmd::Stop(_) => "session_stop",
@@ -771,9 +1276,21 @@ pub fn command_name(command: &Command) -> &'static str {
         },
         Command::Events(_) => "events_tail",
         Command::Overview(_) => "overview",
+        Command::Operations { command } => match command {
+            OperationsCmd::Overview(_) => "operations_overview",
+        },
         Command::Supervise(_) => "supervise",
+        Command::Service { command } => command.operation_name(),
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
+            WorkCmd::History(_) => "work_history",
+            WorkCmd::Detail(_) => "work_detail",
+            WorkCmd::Map(_) => "work_map",
+        },
+        Command::Attention { command } => match command {
+            AttentionCmd::Acknowledge(_) => "attention_acknowledge",
+            AttentionCmd::Resolve(_) => "attention_resolve",
+            AttentionCmd::Reopen(_) => "attention_reopen",
         },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
@@ -1017,6 +1534,16 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 ),
             ),
         },
+        Command::Review { command } => match command {
+            ReviewCmd::Publish(a) => (
+                "review_publish",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({"run": a.run}),
+                ),
+            ),
+        },
         Command::Artifact { command } => match command {
             ArtifactCmd::Verify(a) => (
                 "artifact_verify",
@@ -1036,6 +1563,34 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     json!({"run": a.run}),
                 ),
             ),
+            SessionCmd::Inventory(a) => {
+                let mut params = Map::new();
+                for (name, value) in [
+                    ("run", a.run),
+                    ("epic", a.epic),
+                    ("repository", a.repository),
+                    ("provider", a.provider),
+                    ("model", a.model),
+                    ("cursor", a.cursor),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(activity) = a.activity {
+                    params.insert("activity".to_owned(), json!(activity.as_str()));
+                }
+                if a.include_historical {
+                    params.insert("includeHistorical".to_owned(), json!(true));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "session_inventory",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             SessionCmd::Read(a) => (
                 "session_read",
                 request(
@@ -1153,12 +1708,172 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(a.idempotency_key, scope, Value::Object(params)),
             )
         }
+        Command::Operations { command } => match command {
+            OperationsCmd::Overview(a) => {
+                let mut params = Map::new();
+                for (key, value) in [("repo", a.repo), ("group", a.group), ("source", a.source)] {
+                    if let Some(value) = value {
+                        params.insert(key.to_owned(), json!(value));
+                    }
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "operations_overview",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+        },
         Command::Supervise(a) => (
             "supervise",
-            request(a.idempotency_key, None, json!({"once": a.once})),
+            request(
+                a.idempotency_key,
+                None,
+                json!({
+                    "once": a.once,
+                    "serviceGeneration": a.service_generation,
+                }),
+            ),
         ),
+        Command::Service { .. } => {
+            unreachable!("service commands are handled before ledger initialization")
+        }
         Command::Work { command } => match command {
-            WorkCmd::List(a) => ("work_list", request(a.idempotency_key, None, json!({}))),
+            WorkCmd::List(a) => {
+                let mut params = Map::new();
+                if let Some(repo) = a.repo {
+                    params.insert("repo".to_owned(), json!(repo));
+                }
+                (
+                    "work_list",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::History(a) => {
+                let mut params = Map::new();
+                for (name, value) in [
+                    ("from", a.from),
+                    ("to", a.to),
+                    ("repo", a.repo),
+                    ("epic", a.epic),
+                    ("subject", a.subject),
+                    ("cursor", a.cursor),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(bucket) = a.bucket {
+                    params.insert("bucket".to_owned(), json!(bucket.as_str()));
+                }
+                if let Some(group_by) = a.group_by {
+                    params.insert("groupBy".to_owned(), json!(group_by.as_str()));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "work_history",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::Detail(a) => {
+                let mut params = Map::new();
+                params.insert("subjectKind".to_owned(), json!(a.subject_kind.as_str()));
+                params.insert("subjectId".to_owned(), json!(a.subject_id));
+                if let Some(after) = a.after {
+                    params.insert("after".to_owned(), json!(after));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                let run_id = params
+                    .get("subjectId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                (
+                    "work_detail",
+                    request(a.idempotency_key, run_id, Value::Object(params)),
+                )
+            }
+            WorkCmd::Map(a) => {
+                let mut params = Map::new();
+                params.insert("scope".to_owned(), json!(a.scope.as_str()));
+                for (name, value) in [
+                    ("repository", a.repository),
+                    ("epicId", a.epic_id),
+                    ("from", a.from),
+                    ("to", a.to),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(group) = a.group {
+                    params.insert("group".to_owned(), json!(group.as_str()));
+                }
+                if let Some(source) = a.source {
+                    params.insert("source".to_owned(), json!(source.as_str()));
+                }
+                if let Some(max_nodes) = a.max_nodes {
+                    params.insert("maxNodes".to_owned(), json!(max_nodes));
+                }
+                if let (Some(kind), Some(id)) = (a.focus_kind, a.focus_id) {
+                    params.insert(
+                        "focus".to_owned(),
+                        json!({
+                            "schema": "forged.work-ref/1",
+                            "kind": kind.as_str(),
+                            "id": id,
+                        }),
+                    );
+                }
+                (
+                    "work_map",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+        },
+        Command::Attention { command } => match command {
+            AttentionCmd::Acknowledge(a) => (
+                "attention_acknowledge",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                    }),
+                ),
+            ),
+            AttentionCmd::Resolve(a) => (
+                "attention_resolve",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                        "disposition": a.disposition.as_str(),
+                        "note": a.note,
+                    }),
+                ),
+            ),
+            AttentionCmd::Reopen(a) => (
+                "attention_reopen",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                    }),
+                ),
+            ),
         },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (

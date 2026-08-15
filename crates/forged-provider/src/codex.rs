@@ -16,7 +16,7 @@ use crate::usage::{
 /// The closed set of reasoning efforts the codex CLI accepts. The closed
 /// set is what makes the single-quoted TOML `-c` value safe to embed in a
 /// shell line.
-const EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
+pub(crate) const EFFORTS: [&str; 5] = ["minimal", "low", "medium", "high", "xhigh"];
 
 /// Runs one packet through the `codex` CLI.
 ///

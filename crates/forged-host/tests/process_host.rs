@@ -23,6 +23,81 @@ async fn wait_for_exit(host: &ProcessHost, id: &forged_host::HostSessionId) -> i
 }
 
 #[tokio::test]
+async fn prepared_process_exposes_exact_sentinel_and_starts_only_after_boundary() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let marker = cwd.path().join("started");
+    let host = ProcessHost::new(base.path());
+
+    let prepared = host
+        .prepare(cwd.path(), "touch started", &no_env())
+        .await
+        .expect("prepare");
+    let id = prepared.id().clone();
+    assert_eq!(
+        prepared.sentinel_path(),
+        base.path().join(id.as_str()).join("status")
+    );
+    assert!(prepared.herdr_identity().is_none());
+    assert!(!marker.exists(), "prepare must not start the command");
+    assert!(!prepared.sentinel_path().exists());
+
+    let started = host.start(prepared).await.expect("start");
+    assert_eq!(started, id);
+    assert_eq!(wait_for_exit(&host, &started).await, 0);
+    assert!(marker.exists());
+}
+
+#[tokio::test]
+async fn prepared_process_can_be_rolled_back_without_starting() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let marker = cwd.path().join("started");
+    let host = ProcessHost::new(base.path());
+    let prepared = host
+        .prepare(cwd.path(), "touch started", &no_env())
+        .await
+        .expect("prepare");
+    let session_dir = prepared
+        .sentinel_path()
+        .parent()
+        .expect("session directory")
+        .to_path_buf();
+
+    host.rollback_prepared(prepared).await;
+
+    assert!(!marker.exists());
+    assert!(
+        !session_dir.exists(),
+        "process rollback removes its empty reservation"
+    );
+}
+
+#[tokio::test]
+async fn foreign_process_host_refuses_a_prepared_handle() {
+    let base_a = tempfile::tempdir().expect("tempdir");
+    let base_b = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let marker = cwd.path().join("started");
+    let owner = ProcessHost::new(base_a.path());
+    let stranger = ProcessHost::new(base_b.path());
+    let prepared = owner
+        .prepare(cwd.path(), "touch started", &no_env())
+        .await
+        .expect("prepare");
+
+    let error = stranger
+        .start(prepared)
+        .await
+        .expect_err("foreign prepared handle");
+    assert!(matches!(error, HostError::SessionNotFound { .. }));
+    assert!(
+        !marker.exists(),
+        "foreign refusal must not start the command"
+    );
+}
+
+#[tokio::test]
 async fn round_trip_spawn_running_kill_verified() {
     // Criterion 2: spawn a sleep-based line, observe Running, and get a
     // VERIFIED kill — not one assumed from signal delivery.

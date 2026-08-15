@@ -19,7 +19,7 @@ use forged_types::{ErrorCode, OperationResponse};
 /// Finite default; an operator can re-authorize with a fresh submit.
 pub const DEFAULT_RESTART_BUDGET: u32 = 5;
 
-const COLUMNS: &str = "subject_kind, subject_id, desired_state, control_revision, \
+pub(crate) const COLUMNS: &str = "subject_kind, subject_id, desired_state, control_revision, \
     controller_generation, predecessor_generation, restart_budget, restart_used, \
     next_wake_at, last_progress_at, last_outcome, last_error, exhausted_at, \
     reconcile_token, reconcile_lease_until, created_at, updated_at";
@@ -60,7 +60,7 @@ where
         .transpose()
 }
 
-fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
+pub(crate) fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
     Ok(DesiredWorkRow {
         subject_kind: enum_column(row, 0, "desired-work subject kind")?,
         subject_id: row.get(1)?,
@@ -90,6 +90,13 @@ fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
         created_at: row.get(15)?,
         updated_at: row.get(16)?,
     })
+}
+
+pub(crate) fn list_desired_work_tx(conn: &Connection) -> Result<Vec<DesiredWorkRow>, LedgerError> {
+    let sql = format!("SELECT {COLUMNS} FROM desired_work ORDER BY subject_kind, subject_id");
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], desired_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
 }
 
 fn get_tx(
@@ -134,6 +141,12 @@ fn authorize_tx(
     id: &str,
     generation: u32,
 ) -> Result<(), LedgerError> {
+    crate::admission::release_subject_reservations_tx(
+        conn,
+        kind,
+        id,
+        "desired authorization advanced",
+    )?;
     let now = now_iso();
     conn.execute(
         "INSERT INTO desired_work (
@@ -238,6 +251,12 @@ fn append_event_transitioning_desired_tx(
             id,
         ],
     )?;
+    crate::admission::release_subject_reservations_tx(
+        conn,
+        kind,
+        id,
+        "desired control transition",
+    )?;
     Ok(())
 }
 
@@ -249,6 +268,7 @@ pub(crate) fn stop_desired_work_tx(
     id: &str,
     outcome: DesiredReconcileOutcome,
 ) -> Result<(), LedgerError> {
+    crate::admission::release_subject_reservations_tx(conn, kind, id, "desired subject stopped")?;
     let now = now_iso();
     conn.execute(
         "UPDATE desired_work SET desired_state = 'stopped',
@@ -274,13 +294,7 @@ impl Ledger {
 
     /// All authorized subjects in canonical order.
     pub fn list_desired_work(&self) -> Result<Vec<DesiredWorkRow>, LedgerError> {
-        self.submit(move |conn| {
-            let sql =
-                format!("SELECT {COLUMNS} FROM desired_work ORDER BY subject_kind, subject_id");
-            let mut statement = conn.prepare(&sql)?;
-            let rows = statement.query_map([], desired_row)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })
+        self.submit(|conn| list_desired_work_tx(conn))
     }
 
     /// Running, non-exhausted rows whose persisted wake deadline is due.
@@ -304,12 +318,21 @@ impl Ledger {
         let now = now.to_owned();
         self.submit(move |conn| {
             conn.query_row(
-                "SELECT MIN(CASE
-                   WHEN reconcile_token IS NOT NULL AND reconcile_lease_until > ?1
-                     THEN reconcile_lease_until
-                   ELSE next_wake_at END)
-                 FROM desired_work
-                 WHERE desired_state = 'running' AND exhausted_at IS NULL",
+                "SELECT MIN(wake_at) FROM (
+                   SELECT CASE
+                     WHEN reconcile_token IS NOT NULL AND reconcile_lease_until > ?1
+                       THEN reconcile_lease_until
+                     ELSE next_wake_at END AS wake_at
+                   FROM desired_work
+                   WHERE desired_state = 'running' AND exhausted_at IS NULL
+                   UNION ALL
+                   SELECT recovery_deadline AS wake_at FROM admission_reservations
+                   WHERE state IN ('reserved','active')
+                     AND NOT (owner_kind = 'attempt' AND EXISTS (
+                       SELECT 1 FROM attempts a
+                       WHERE CAST(a.attempt_id AS TEXT) = admission_reservations.owner_id
+                         AND a.state IN ('running','revoking')))
+                 )",
                 [now],
                 |row| row.get(0),
             )
@@ -365,6 +388,29 @@ impl Ledger {
         id: &str,
         generation: u32,
     ) -> Result<(), LedgerError> {
+        self.complete_operation_authorizing_desired_with_admission(
+            operation_id,
+            response,
+            kind,
+            id,
+            generation,
+            None,
+            None,
+        )
+    }
+
+    /// Atomic submit settlement with an optional persisted admission wake.
+    #[allow(clippy::too_many_arguments)]
+    pub fn complete_operation_authorizing_desired_with_admission(
+        &self,
+        operation_id: &str,
+        response: &OperationResponse,
+        kind: DesiredSubjectKind,
+        id: &str,
+        generation: u32,
+        queued_until: Option<String>,
+        admission_reason: Option<String>,
+    ) -> Result<(), LedgerError> {
         let operation_id = operation_id.to_owned();
         let response = response.clone();
         let id = id.to_owned();
@@ -372,6 +418,14 @@ impl Ledger {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             settle_operation(&tx, &operation_id, &response, true)?;
             authorize_tx(&tx, kind, &id, generation)?;
+            if let Some(wake) = queued_until {
+                let now = now_iso();
+                tx.execute(
+                    "UPDATE desired_work SET next_wake_at = ?1, last_error = ?2, updated_at = ?3 \
+                     WHERE subject_kind = ?4 AND subject_id = ?5",
+                    rusqlite::params![wake, admission_reason, now, kind.as_str(), id],
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -608,7 +662,7 @@ impl Ledger {
             let exhausted_at =
                 (update.outcome == DesiredReconcileOutcome::Exhausted).then_some(now.clone());
             let attention_detail = update.last_error.clone();
-            let should_append_attention = update.attention
+            let should_append_attention = update.attention_condition.is_some()
                 && (before.last_outcome != Some(update.outcome)
                     || before.last_error != attention_detail);
             let should_append_restart = update.outcome == DesiredReconcileOutcome::Restarted
@@ -639,6 +693,14 @@ impl Ledger {
                     token,
                 ],
             )?;
+            if state != DesiredState::Running {
+                crate::admission::release_subject_reservations_tx(
+                    &tx,
+                    kind,
+                    &id,
+                    "supervisor settled desired subject",
+                )?;
+            }
             if should_append_attention {
                 append_event_tx(
                     &tx,
@@ -648,7 +710,7 @@ impl Ledger {
                         "schemaVersion": 1,
                         "subjectKind": kind.as_str(),
                         "subjectId": id,
-                        "condition": update.outcome.as_str(),
+                        "condition": update.attention_condition,
                         "detail": attention_detail,
                         "controllerGeneration": generation,
                         "restartBudget": before.restart_budget,
@@ -715,6 +777,14 @@ impl Ledger {
                     id,
                 ],
             )?;
+            if state != DesiredState::Running {
+                crate::admission::release_subject_reservations_tx(
+                    &tx,
+                    kind,
+                    &id,
+                    "foreground settled desired subject",
+                )?;
+            }
             tx.commit()?;
             Ok(())
         })
@@ -821,7 +891,7 @@ mod tests {
                     next_wake_at: Some("2030-01-01T00:00:05.000000000Z".to_owned()),
                     last_progress_at: None,
                     last_error: Some("spawn failed".to_owned()),
-                    attention: false,
+                    attention_condition: None,
                 },
             )
             .expect("finish");
@@ -1025,7 +1095,7 @@ mod tests {
                     next_wake_at: None,
                     last_progress_at: None,
                     last_error: Some("stale input observation".to_owned()),
-                    attention: true,
+                    attention_condition: Some("controller-dead".to_owned()),
                 },
             )
             .is_err());

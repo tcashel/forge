@@ -13,6 +13,7 @@ mod core;
 mod failpoint;
 mod mcp;
 mod pricing;
+mod runtime;
 
 use std::sync::Arc;
 
@@ -23,6 +24,9 @@ use crate::config::ForgedConfig;
 use crate::core::{Ctx, Failure};
 
 fn main() {
+    if let Some(code) = provider_stream_dispatch() {
+        std::process::exit(code);
+    }
     let args = cli::Cli::parse();
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -38,6 +42,33 @@ fn main() {
     };
     let code = runtime.block_on(run(args));
     std::process::exit(code);
+}
+
+/// Detect the exact private runner argv before Clap, tracing, runtime,
+/// controller identity, config, ledger, migration, service, or MCP startup.
+/// It deliberately emits no `OperationResponse`.
+fn provider_stream_dispatch() -> Option<i32> {
+    let mut args = std::env::args_os();
+    let _executable = args.next()?;
+    if args.next().as_deref() != Some(std::ffi::OsStr::new(forged_provider::PROVIDER_STREAM_ARG)) {
+        return None;
+    }
+    let Some(request_path) = args.next() else {
+        eprintln!("forged: private provider-stream request path is missing");
+        return Some(125);
+    };
+    if args.next().is_some() {
+        eprintln!("forged: private provider-stream argv is invalid");
+        return Some(125);
+    }
+    Some(
+        forged_provider::run_provider_stream(std::path::Path::new(&request_path)).unwrap_or_else(
+            |error| {
+                eprintln!("forged: private provider-stream runner failed: {error}");
+                125
+            },
+        ),
+    )
 }
 
 /// A failure BEFORE dispatch still owes stdout an `OperationResponse`: an
@@ -73,6 +104,13 @@ async fn run(args: cli::Cli) -> i32 {
         // internal fault: the operator can fix the file.
         Err(message) => return pre_dispatch_failure(name, ErrorCode::InvalidRequest, message),
     };
+    let cli::Cli { command } = args;
+    let command = match command {
+        cli::Command::Service { command } => {
+            return emit_response(runtime::dispatch_service(&config, command).await)
+        }
+        command => command,
+    };
     let ledger = match forged_ledger::Ledger::open(&config.db_path) {
         Ok(ledger) => ledger,
         Err(e) => {
@@ -90,7 +128,7 @@ async fn run(args: cli::Cli) -> i32 {
         return code;
     }
 
-    if matches!(args.command, cli::Command::Mcp) {
+    if matches!(command, cli::Command::Mcp) {
         let result = mcp::serve(Arc::clone(&ctx)).await;
         let code = match result {
             Ok(()) => 0,
@@ -103,7 +141,7 @@ async fn run(args: cli::Cli) -> i32 {
         return code;
     }
 
-    let (name, request) = match cli::to_request(args.command) {
+    let (name, request) = match cli::to_request(command) {
         Ok(pair) => pair,
         Err(message) => {
             let code = pre_dispatch_failure(name, ErrorCode::InvalidRequest, message);
@@ -112,16 +150,21 @@ async fn run(args: cli::Cli) -> i32 {
         }
     };
     let response = core::dispatch(&ctx, name, request).await;
+    let code = emit_response(response);
+    close(&ctx);
+    code
+}
+
+fn emit_response(response: forged_types::OperationResponse) -> i32 {
+    let ok = response.ok;
     match serde_json::to_string(&response) {
         Ok(text) => println!("{text}"),
-        Err(e) => {
-            eprintln!("forged: cannot serialize response: {e}");
-            close(&ctx);
+        Err(error) => {
+            eprintln!("forged: cannot serialize response: {error}");
             return 1;
         }
     }
-    close(&ctx);
-    i32::from(!response.ok)
+    i32::from(!ok)
 }
 
 /// Close the ledger deliberately on exit paths, so crash cases in the kill

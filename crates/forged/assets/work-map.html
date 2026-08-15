@@ -1,0 +1,157 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Forged Work Map</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: var(--color-background-primary, light-dark(#fbfbfa,#141519));
+  --panel: var(--color-background-secondary, light-dark(#f4f4f1,#1b1d22));
+  --ink: var(--color-text-primary, light-dark(#17191e,#eceef1));
+  --muted: var(--color-text-secondary, light-dark(#626773,#a3a8b2));
+  --line: var(--color-border-primary, light-dark(#deddd7,#30333a));
+  --good: var(--color-text-success, light-dark(#287a43,#6bc27e));
+  --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
+  --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
+  --accent: light-dark(#167b72,#42c9b7);
+  --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
+  --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
+}
+* { box-sizing:border-box; min-width:0; }
+body { margin:0; background:var(--bg); color:var(--ink); font:13px/1.45 var(--sans); }
+button,select { color:inherit; font:inherit; }
+button { cursor:pointer; }
+button:focus-visible,select:focus-visible { outline:2px solid var(--accent); outline-offset:2px; }
+#app { display:grid; gap:13px; padding:16px; }
+.top { display:flex; flex-wrap:wrap; gap:12px; justify-content:space-between; align-items:flex-start; }
+h1 { margin:0; font-size:20px; line-height:1.2; }
+.sub,.muted,.foot { color:var(--muted); }
+.sub,.foot,.id,.kind { font-family:var(--mono); }
+.sub { margin-top:4px; font-size:11px; }
+.controls,.health { display:flex; flex-wrap:wrap; gap:6px; }
+.controls button,.controls select { border:1px solid var(--line); border-radius:6px; background:transparent; padding:6px 9px; }
+.pill { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:11px; }
+.ok { color:var(--good); }.warn { color:var(--warn); }.bad { color:var(--bad); }
+.stats { display:grid; grid-template-columns:repeat(auto-fit,minmax(95px,1fr)); border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+.stat { padding:9px 11px; border-left:1px solid var(--line); }
+.stat:first-child { border-left:0; }.stat b { display:block; font:600 17px/1.2 var(--mono); }.stat span { color:var(--muted); font-size:11px; }
+.layout { display:grid; grid-template-columns:minmax(270px,1.2fr) minmax(240px,.8fr); gap:12px; }
+.panel { border:1px solid var(--line); border-radius:9px; overflow:hidden; }
+.panel h2 { margin:0; padding:9px 11px; background:var(--panel); font-size:12px; }
+.rows { display:grid; }
+.node { appearance:none; width:100%; border:0; border-top:1px solid var(--line); background:transparent; padding:10px 11px; text-align:left; display:grid; grid-template-columns:65px minmax(100px,1fr) 120px; gap:8px; align-items:baseline; }
+.node:first-child { border-top:0; }.node:hover,.node[aria-current="true"] { background:var(--panel); }
+.node--context { opacity:.72; }.kind { color:var(--accent); font-size:10px; text-transform:uppercase; }.id { font-size:11px; overflow-wrap:anywhere; }.state { color:var(--muted); font-size:11px; text-align:right; }
+.edges { display:grid; max-height:420px; overflow:auto; }
+.edge { padding:8px 10px; border-top:1px solid var(--line); font:10px/1.4 var(--mono); overflow-wrap:anywhere; }
+.edge:first-child { border-top:0; }.edge b { color:var(--accent); }
+.empty,.error { margin:10px; border:1px dashed var(--line); border-radius:7px; padding:14px; color:var(--muted); }
+.error { color:var(--bad); border-color:currentColor; }
+.drawer { border:1px solid var(--line); border-radius:9px; padding:12px; display:grid; gap:9px; }
+.drawer[hidden] { display:none; }.drawer h2 { margin:0; font:600 14px/1.3 var(--mono); }.drawer__head { display:flex; justify-content:space-between; gap:8px; }.drawer button { border:1px solid var(--line); border-radius:6px; background:transparent; padding:5px 8px; }
+.kv { display:grid; grid-template-columns:105px 1fr; gap:5px 9px; margin:0; }.kv dt { color:var(--muted); }.kv dd { margin:0; font-family:var(--mono); overflow-wrap:anywhere; }
+.foot { display:flex; flex-wrap:wrap; gap:12px; font-size:10px; }
+@media(max-width:680px) { .layout { grid-template-columns:1fr; }.node { grid-template-columns:55px 1fr; }.state { grid-column:2; text-align:left; }.stat { border-top:1px solid var(--line); border-left:0; } }
+</style>
+</head>
+<body>
+<main id="app">
+  <header class="top">
+    <div><h1>Work Map</h1><div class="sub" id="scope">Waiting for projection</div></div>
+    <div class="controls">
+      <label><span class="muted">group </span><select id="group"><option value="">all</option><option>needs-me</option><option>ready-to-merge</option><option>running</option><option>stalled-or-recoverable</option><option>planned</option></select></label>
+      <label><span class="muted">source </span><select id="source"><option value="">all</option><option>durable</option><option>live-plan</option></select></label>
+      <button type="button" id="refresh">Refresh</button>
+    </div>
+  </header>
+  <section class="health" id="health" aria-label="Source health"></section>
+  <section class="stats" id="stats"></section>
+  <div class="layout">
+    <section class="panel"><h2>Nodes — arrow keys move focus; Enter inspects</h2><div class="rows" id="nodes"></div></section>
+    <section class="panel"><h2>Edges</h2><div class="edges" id="edges"></div></section>
+  </div>
+  <aside class="drawer" id="drawer" hidden aria-live="polite"></aside>
+  <footer class="foot" id="foot"></footer>
+</main>
+<script>
+(() => {
+  "use strict";
+  const PROTOCOL_VERSION = "2026-01-26";
+  const APP_INFO = { name: "forged-work-map", version: "1.0.0" };
+  const post = message => window.parent.postMessage(message, "*");
+  const notify = (method, params = {}) => post({ jsonrpc:"2.0", method, params });
+  let rpcId = 0, sizeFrame = null, observer = null, tornDown = false, lastSize = "", lastContext = "";
+  const pending = new Map(), timers = new Set();
+  const host = { connected:false, capabilities:{}, context:{} };
+  const state = { data:null, error:null, args:null, loading:false, selected:null, detail:null, detailError:null };
+  const byId = id => document.getElementById(id);
+  const arr = value => Array.isArray(value) ? value : [];
+  const el = (tag, cls, text) => { const node=document.createElement(tag); if(cls)node.className=cls; if(text!=null)node.textContent=String(text); return node; };
+  const key = ref => `${ref?.kind || "?"}:${ref?.id || "?"}`;
+  function request(method, params={}) {
+    if (tornDown) return Promise.reject(new Error("resource torn down"));
+    const id=`forged-work-map-${++rpcId}`;
+    return new Promise((resolve,reject)=>{ const timer=setTimeout(()=>{timers.delete(timer);if(pending.delete(id))reject(new Error(`${method} timed out`));},120000); timers.add(timer);pending.set(id,{resolve,reject,timer});post({jsonrpc:"2.0",id,method,params}); });
+  }
+  function envelopeFrom(params) {
+    let value=params?.structuredContent;
+    if(!value){const text=arr(params?.content).find(block=>block.type==="text")?.text;try{value=JSON.parse(text);}catch{value=null;}}
+    return value;
+  }
+  function ingest(params) {
+    const envelope=envelopeFrom(params);
+    if(envelope?.ok===false){state.error=envelope.error||{message:"Operation failed"};state.data=null;render();return;}
+    const data=envelope?.result??envelope;
+    if(!data||data.schema!=="forged.work-map/1"){state.error={message:"The host returned an unsupported Work Map payload."};state.data=null;render();return;}
+    state.error=null;state.data=data;state.selected=data.focus?key(data.focus):state.selected;byId("group").value=data.filters?.group||"";byId("source").value=data.filters?.source||"";render();
+  }
+  function healthPill(name,value){const status=value?.state||"unknown";return el("span",`pill ${status==="available"?"ok":status==="partial"||status==="degraded"?"warn":"bad"}`,`${name} ${status}`);}
+  function nodeState(node){return node.plan?.status||node.queue?.group||node.execution?.state||node.execution?.outcome||"unknown";}
+  function nodeTitle(node){return node.identity?.displayTitle||node.plan?.title||node.workRef?.id||"Untitled";}
+  async function openDetail(node){
+    state.selected=key(node.workRef);state.detail=null;state.detailError=null;render();
+    if(!node.detailTarget||Object.keys(node.detailTarget).length===0||!host.capabilities.serverTools)return;
+    try{const result=await request("tools/call",{name:"work_detail",arguments:{schemaVersion:1,params:node.detailTarget}});const envelope=envelopeFrom(result);if(envelope?.ok===false)throw new Error(envelope.error?.message||"Detail failed");const detail=envelope?.result??envelope;if(detail?.schema!=="forged.work-detail/1")throw new Error("Unsupported Work Detail payload");state.detail=detail;}catch(error){state.detailError={message:String(error.message||error)};}render();
+  }
+  function renderDrawer(node){
+    const box=byId("drawer");box.replaceChildren();if(!node&&!state.detailError){box.hidden=true;return;}box.hidden=false;
+    const head=el("div","drawer__head");head.append(el("h2","",node?key(node.workRef):"Detail unavailable"));const close=el("button","","Close");close.type="button";close.addEventListener("click",()=>{state.selected=null;state.detail=null;state.detailError=null;render();});head.append(close);box.append(head);
+    if(state.detailError){box.append(el("div","error",state.detailError.message));return;}
+    const dl=el("dl","kv");const add=(label,value)=>{dl.append(el("dt","",label));dl.append(el("dd","",value==null||value===""?"—":value));};
+    add("title",nodeTitle(node));add("source",node.source);add("repository",node.repository);add("epic",node.epicId);add("queue",node.queue?.group);add("execution",node.execution?.state||node.execution?.outcome);add("attention",arr(node.attention).length);add("history",node.history?"attached":"not attached");
+    if(node.workRef?.kind==="plan")add("detail","Plan facts only — no execution control");else add("detail",host.capabilities.serverTools?(state.detail?"Work Detail loaded":"Select to load Work Detail"):`${node.detailTarget?.subjectKind}:${node.detailTarget?.subjectId}`);
+    box.append(dl);
+  }
+  function render(){
+    if(tornDown)return;for(const id of ["health","stats","nodes","edges","foot"])byId(id).replaceChildren();byId("refresh").disabled=state.loading||!host.capabilities.serverTools;
+    if(state.error){byId("scope").textContent="Projection unavailable";byId("nodes").append(el("div","error",state.error.message||String(state.error)));renderDrawer(null);reportSize();return;}
+    const data=state.data;if(!data){byId("nodes").append(el("div","empty","Waiting for work."));renderDrawer(null);reportSize();return;}
+    const scope=data.scope?.kind==="repository"?data.scope.repository:data.scope?.kind==="epic"?data.scope.epicId:"All operator work";byId("scope").textContent=scope;
+    for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name,data.sourceHealth?.[name]));
+    for(const [value,label] of [[data.counts?.nodes,"nodes"],[data.counts?.edges,"edges"],[data.counts?.runs,"runs"],[data.counts?.epics,"epics"],[data.counts?.attention,"attention"],[data.counts?.historyUnattached,"history unknown"]]){const cell=el("div","stat");cell.append(el("b","",value??0));cell.append(el("span","",label));byId("stats").append(cell);}
+    const nodeRows=byId("nodes");const canTools=!!host.capabilities.serverTools;
+    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));button.append(el("span","kind",node.workRef?.kind));const identity=el("span","");identity.append(el("span","id",node.workRef?.id));identity.append(document.createTextNode(" · "));identity.append(el("span","title",nodeTitle(node)));button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
+    if(!arr(data.nodes).length)nodeRows.append(el("div","empty","No work matches this bounded view."));
+    for(const edge of arr(data.edges)){const row=el("div","edge");row.append(document.createTextNode(`${key(edge.source)} `));row.append(el("b","",edge.kind));row.append(document.createTextNode(` ${key(edge.target)}${edge.contextOnly?" · boundary":""}`));byId("edges").append(row);}
+    if(!arr(data.edges).length)byId("edges").append(el("div","empty","No edges in scope."));
+    const selected=arr(data.nodes).find(node=>key(node.workRef)===state.selected);renderDrawer(selected||null);
+    byId("foot").append(el("span","",data.schema));byId("foot").append(el("span","",data.graphHealth?.healthy?"graph healthy":"graph issues visible"));byId("foot").append(el("span","",`${data.capturedAt?.ledger||"?"} ledger`));if(state.loading)byId("foot").append(el("span","","refreshing"));
+    pushModelContext(data);reportSize();
+  }
+  function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const lines=[`Forged Work Map ${data.scope?.kind}: ${data.counts?.nodes||0} nodes, ${data.counts?.edges||0} edges`,`${data.counts?.attention||0} attention; ${data.counts?.historyUnattached||0} durable nodes without attached history`];for(const node of arr(data.nodes).slice(0,12))lines.push(`- ${key(node.workRef)} ${nodeTitle(node)} [${nodeState(node)}]`);const text=lines.join("\n").slice(0,3000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
+  async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading)return;state.loading=true;render();const base=state.args||{schemaVersion:1,params:{}};const params={...(base.params||{})};const group=byId("group").value,source=byId("source").value;if(group)params.group=group;else delete params.group;if(source)params.source=source;else delete params.source;try{ingest(await request("tools/call",{name:"work_map",arguments:{...base,params}}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
+  byId("refresh").addEventListener("click",refresh);byId("group").addEventListener("change",refresh);byId("source").addEventListener("change",refresh);
+  byId("nodes").addEventListener("keydown",event=>{if(!["ArrowDown","ArrowUp","Home","End"].includes(event.key))return;const rows=arr([...byId("nodes").querySelectorAll("button.node")]);if(!rows.length)return;event.preventDefault();const current=rows.indexOf(document.activeElement);const next=event.key==="Home"?0:event.key==="End"?rows.length-1:event.key==="ArrowDown"?Math.min(rows.length-1,current+1):Math.max(0,current-1);rows[next].focus();});
+  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [name,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(name,value);}
+  function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();if(sizeFrame!==null)cancelAnimationFrame(sizeFrame);for(const [id,item] of pending){clearTimeout(item.timer);item.reject(new Error("resource torn down"));pending.delete(id);}for(const timer of timers)clearTimeout(timer);timers.clear();window.removeEventListener("message",onMessage);}
+  function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const item=pending.get(message.id);pending.delete(message.id);clearTimeout(item.timer);timers.delete(item.timer);message.error?item.reject(new Error(message.error.message||"request failed")):item.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=message.params?.arguments||state.args;else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error={message:message.params?.reason||"Cancelled"};render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
+  window.addEventListener("message",onMessage);
+  request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error={message:"The host did not complete the MCP Apps handshake."};render();}});
+  render();
+})();
+</script>
+</body>
+</html>

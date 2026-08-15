@@ -13,12 +13,42 @@ mod identity;
 mod process;
 mod sentinel;
 
-pub use herdr::{HerdrControl, HerdrHost, PaneSnapshot};
+pub use herdr::{
+    HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl, HerdrCreatedTab,
+    HerdrHost, HerdrLayoutInspection, HerdrLayoutPane, HerdrLayoutSnapshot, HerdrLayoutTarget,
+    HerdrMetadataProjection, HerdrProjectionOutcome, HerdrTabCreateError, PaneSnapshot,
+};
 pub use process::ProcessHost;
 
 use std::collections::HashMap;
 use std::fmt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// The Herdr wire protocol supported by this crate.
+///
+/// It is part of a durable Herdr session identity: cleanup must reconnect to
+/// the same socket speaking this exact protocol before it may address the
+/// opaque pane id.
+pub const HERDR_PROTOCOL_VERSION: u32 = 19;
+
+static NEXT_HOST_INSTANCE: AtomicU64 = AtomicU64::new(1);
+static NEXT_PREPARED_TOKEN: AtomicU64 = AtomicU64::new(1);
+
+pub(crate) fn next_host_instance() -> u64 {
+    NEXT_HOST_INSTANCE.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) fn next_prepared_token() -> u64 {
+    NEXT_PREPARED_TOKEN.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Read the host sentinel using the same strict parser as every liveness
+/// backend. Only `Some(code)` is verified terminal truth; absent, empty, and
+/// malformed files return `None`, while I/O failures remain errors.
+pub fn read_exit_status(path: &Path) -> Result<Option<i32>, HostError> {
+    sentinel::read_status(path)
+}
 
 /// Host-scoped opaque session handle.
 ///
@@ -37,6 +67,130 @@ impl HostSessionId {
 impl fmt::Display for HostSessionId {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(&self.0)
+    }
+}
+
+/// Durable coordinates for one Herdr-backed session.
+///
+/// Pane ids are opaque transport values. Callers must persist all three
+/// fields exactly as returned; neither a sentinel path nor a socket may be
+/// reconstructed from the pane id later.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrSessionIdentity {
+    pane_id: String,
+    socket_path: PathBuf,
+    protocol: u32,
+}
+
+impl HerdrSessionIdentity {
+    /// Reconstitute coordinates previously persisted by the caller.
+    ///
+    /// Validation deliberately happens at the effect boundary so malformed
+    /// or stale stored values fail closed without issuing a Herdr request.
+    pub fn from_durable(
+        pane_id: impl Into<String>,
+        socket_path: impl Into<PathBuf>,
+        protocol: u32,
+    ) -> Self {
+        Self {
+            pane_id: pane_id.into(),
+            socket_path: socket_path.into(),
+            protocol,
+        }
+    }
+
+    /// Herdr's opaque pane id, preserved byte-for-byte.
+    pub fn pane_id(&self) -> &str {
+        &self.pane_id
+    }
+
+    /// Exact socket path selected by the spawning host.
+    pub fn socket_path(&self) -> &Path {
+        &self.socket_path
+    }
+
+    /// Pinned Herdr protocol for this identity.
+    pub fn protocol(&self) -> u32 {
+        self.protocol
+    }
+}
+
+/// A reserved session whose command has not been sent yet.
+///
+/// This handle is intentionally non-`Clone` and is accepted only by the host
+/// instance that issued it. It is the prepare/register/start handoff: callers
+/// can durably record the exact sentinel and Herdr coordinates, then consume
+/// the handle with [`SessionHost::start`].
+#[derive(Debug)]
+pub struct PreparedSession {
+    id: HostSessionId,
+    sentinel_path: PathBuf,
+    herdr: Option<HerdrSessionIdentity>,
+    herdr_layout_id: Option<String>,
+    herdr_layout_degradation: Option<String>,
+    issuer: u64,
+    token: u64,
+}
+
+impl PreparedSession {
+    pub(crate) fn new(
+        id: HostSessionId,
+        sentinel_path: PathBuf,
+        herdr: Option<HerdrSessionIdentity>,
+        issuer: u64,
+    ) -> Self {
+        Self {
+            id,
+            sentinel_path,
+            herdr,
+            herdr_layout_id: None,
+            herdr_layout_degradation: None,
+            issuer,
+            token: next_prepared_token(),
+        }
+    }
+
+    /// The host-scoped session id reserved by prepare.
+    pub fn id(&self) -> &HostSessionId {
+        &self.id
+    }
+
+    /// The exact host-selected sentinel path.
+    pub fn sentinel_path(&self) -> &Path {
+        &self.sentinel_path
+    }
+
+    /// Durable Herdr coordinates, or `None` for a plain process session.
+    pub fn herdr_identity(&self) -> Option<&HerdrSessionIdentity> {
+        self.herdr.as_ref()
+    }
+
+    /// Durable layout joined by this pane when targeted placement succeeded.
+    pub fn herdr_layout_id(&self) -> Option<&str> {
+        self.herdr_layout_id.as_deref()
+    }
+
+    /// Bounded diagnostic when layout placement degraded to the legacy
+    /// repository-workspace split. This never changes host selection.
+    pub fn herdr_layout_degradation(&self) -> Option<&str> {
+        self.herdr_layout_degradation.as_deref()
+    }
+
+    pub(crate) fn set_herdr_layout_outcome(
+        &mut self,
+        layout_id: Option<String>,
+        degradation: Option<String>,
+    ) {
+        self.herdr_layout_id = layout_id;
+        self.herdr_layout_degradation = degradation;
+    }
+
+    pub(crate) fn issued_by(&self, issuer: u64) -> bool {
+        self.issuer == issuer
+    }
+
+    pub(crate) fn token(&self) -> u64 {
+        self.token
     }
 }
 
@@ -149,14 +303,39 @@ impl HostError {
 /// reports success only after verified death, never on signal-send success.
 #[async_trait::async_trait]
 pub trait SessionHost: Send + Sync {
-    /// Start one shell line in `cwd` with `env` overlaid on the inherited
-    /// environment, sentinel appended.
+    /// Reserve the backend session and exact sentinel path without sending
+    /// the command. The returned handle is the caller's durable-registration
+    /// boundary.
+    async fn prepare(
+        &self,
+        cwd: &Path,
+        shell_line: &str,
+        env: &HashMap<String, String>,
+    ) -> Result<PreparedSession, HostError>;
+
+    /// Send the prepared command exactly once.
+    ///
+    /// The non-cloneable handle is consumed. Implementations reject handles
+    /// issued by another host before any backend effect and perform their own
+    /// best-effort rollback when start itself fails.
+    async fn start(&self, prepared: PreparedSession) -> Result<HostSessionId, HostError>;
+
+    /// Best-effort rollback when durable registration failed. A foreign or
+    /// stale handle is ignored and must not trigger a backend effect.
+    async fn rollback_prepared(&self, prepared: PreparedSession);
+
+    /// Compatibility convenience for callers that do not need durable Herdr
+    /// ownership. New controller/provider paths use prepare/register/start.
+    /// Start implementations roll their reservation back on failure.
     async fn spawn(
         &self,
         cwd: &Path,
         shell_line: &str,
         env: &HashMap<String, String>,
-    ) -> Result<HostSessionId, HostError>;
+    ) -> Result<HostSessionId, HostError> {
+        let prepared = self.prepare(cwd, shell_line, env).await?;
+        self.start(prepared).await
+    }
 
     /// Report the session's liveness: sentinel status file first, then the
     /// backend's process/pane facilities as accelerators.

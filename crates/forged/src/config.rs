@@ -54,6 +54,90 @@ pub struct ForgedConfig {
     /// Published API rates used to impute cost for providers that report
     /// tokens but not money. Seeded when the file omits it.
     pub pricing: RateCard,
+    /// Resolved, finite scheduler capacity and optional usage ceilings.
+    pub admission: AdmissionPolicy,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AdmissionPolicy {
+    pub total_active: u32,
+    pub provider_active: u32,
+    pub repository_write_active: u32,
+    /// Maximum number of non-terminal child runs one epic wave may hold.
+    ///
+    /// This is independently bounded from the global admission policy: the
+    /// epic selects a finite candidate window and admission remains the
+    /// authority for whether any selected child may execute.
+    #[serde(default = "default_epic_fanout")]
+    pub epic_fanout: u32,
+    pub defer_seconds: u64,
+    #[serde(default)]
+    pub provider_overrides: BTreeMap<String, u32>,
+    #[serde(default)]
+    pub model_overrides: BTreeMap<String, u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub token_ceiling: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub known_cost_ceiling_microusd: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_ceiling_millipercent: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rate_limit_fresh_seconds: Option<u64>,
+}
+
+impl Default for AdmissionPolicy {
+    fn default() -> Self {
+        Self {
+            total_active: 8,
+            provider_active: 4,
+            repository_write_active: 1,
+            epic_fanout: default_epic_fanout(),
+            defer_seconds: 60,
+            provider_overrides: BTreeMap::new(),
+            model_overrides: BTreeMap::new(),
+            token_ceiling: None,
+            known_cost_ceiling_microusd: None,
+            rate_limit_ceiling_millipercent: None,
+            rate_limit_fresh_seconds: None,
+        }
+    }
+}
+
+impl AdmissionPolicy {
+    fn validate(&self) -> Result<(), String> {
+        if self.total_active == 0
+            || self.provider_active == 0
+            || self.repository_write_active == 0
+            || self.epic_fanout == 0
+            || self.defer_seconds == 0
+            || self.provider_overrides.values().any(|limit| *limit == 0)
+            || self.model_overrides.values().any(|limit| *limit == 0)
+        {
+            return Err("admission limits and deferSeconds must be greater than zero".to_owned());
+        }
+        if self
+            .rate_limit_ceiling_millipercent
+            .is_some_and(|value| value > 100_000)
+        {
+            return Err(
+                "admission rateLimitCeilingMillipercent must be between 0 and 100000".to_owned(),
+            );
+        }
+        if self.rate_limit_ceiling_millipercent.is_some()
+            && self.rate_limit_fresh_seconds.unwrap_or(0) == 0
+        {
+            return Err(
+                "admission rateLimitFreshSeconds is required and non-zero with a rate-limit ceiling"
+                    .to_owned(),
+            );
+        }
+        Ok(())
+    }
+}
+
+const fn default_epic_fanout() -> u32 {
+    4
 }
 
 pub use forged_types::HostPolicyV1 as HostPolicy;
@@ -89,6 +173,8 @@ struct ConfigFile {
     herdr_sock: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pricing: Option<RateCard>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    admission: Option<AdmissionPolicy>,
 }
 
 fn hints(provider: &str, model: &str, effort: Option<&str>, sandbox: Sandbox) -> ProviderHints {
@@ -371,6 +457,8 @@ impl ForgedConfig {
                     .map(PathBuf::from)
                     .map(|home| home.join(".config/herdr/herdr.sock"))
             });
+        let admission = file.admission.unwrap_or_default();
+        admission.validate()?;
         Ok(ForgedConfig {
             runs_root: anvil_home.join("runs"),
             db_path: forged_ledger::default_db_path(),
@@ -396,6 +484,7 @@ impl ForgedConfig {
             pricing: file
                 .pricing
                 .unwrap_or_else(crate::pricing::default_rate_card),
+            admission,
             anvil_home,
         })
     }
@@ -599,6 +688,7 @@ impl ForgedConfig {
                 .as_ref()
                 .map(|path| path.to_string_lossy().into_owned()),
             pricing: Some(self.pricing.clone()),
+            admission: Some(self.admission.clone()),
         };
         if self
             .config_path
@@ -844,6 +934,7 @@ mod tests {
             host_policy: HostPolicy::Preferred,
             herdr_sock: None,
             pricing: crate::pricing::default_rate_card(),
+            admission: AdmissionPolicy::default(),
         }
     }
 
@@ -857,6 +948,60 @@ mod tests {
         let compiled = cfg.compile_definition(None, None).expect("compile");
         assert_eq!(compiled.package.profile_ref.name, "standard");
         assert_eq!(compiled.compatibility_roster.len(), 4);
+    }
+
+    #[test]
+    fn admission_defaults_are_bounded_and_legacy_omission_uses_them() {
+        let policy = AdmissionPolicy::default();
+        assert_eq!(policy.total_active, 8);
+        assert_eq!(policy.provider_active, 4);
+        assert_eq!(policy.repository_write_active, 1);
+        assert_eq!(policy.epic_fanout, 4);
+        assert_eq!(policy.defer_seconds, 60);
+        assert!(policy.validate().is_ok());
+
+        let parsed: ConfigFile = serde_yaml::from_str("defaultProfile: standard\n")
+            .expect("legacy config without admission");
+        assert!(parsed.admission.is_none());
+
+        let legacy_with_admission: ConfigFile = serde_yaml::from_str(
+            "admission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  deferSeconds: 60\n",
+        )
+        .expect("legacy admission without epicFanout");
+        assert_eq!(
+            legacy_with_admission
+                .admission
+                .expect("admission")
+                .epic_fanout,
+            4
+        );
+    }
+
+    #[test]
+    fn invalid_admission_policy_fails_closed() {
+        let policy = AdmissionPolicy {
+            total_active: 0,
+            ..AdmissionPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        let policy = AdmissionPolicy {
+            epic_fanout: 0,
+            ..AdmissionPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        let mut policy = AdmissionPolicy {
+            rate_limit_ceiling_millipercent: Some(50_000),
+            ..AdmissionPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        policy.rate_limit_fresh_seconds = Some(60);
+        assert!(policy.validate().is_ok());
+
+        policy.rate_limit_ceiling_millipercent = Some(100_001);
+        assert!(policy.validate().is_err());
     }
 
     #[test]

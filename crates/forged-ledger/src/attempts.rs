@@ -30,7 +30,7 @@ use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, SpecFence};
 
-const ATTEMPT_COLUMNS: &str =
+pub(crate) const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, revoke_scope, \
      fail_note, result_json, started_at, updated_at, last_heartbeat_at, ended_at";
 
@@ -63,7 +63,7 @@ fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, ru
     }
 }
 
-fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
+pub(crate) fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
     Ok(AttemptRow {
         attempt_id: row.get(0)?,
         packet_id: row.get(1)?,
@@ -102,6 +102,22 @@ pub(crate) fn list_live_attempts_tx(
     Ok(out)
 }
 
+/// Terminal attempts whose immutable artifact join is absent, inside the
+/// caller's observational transaction.
+pub(crate) fn list_attempts_missing_artifacts_tx(
+    conn: &Connection,
+) -> Result<Vec<AttemptRow>, LedgerError> {
+    let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
+         a.revoke_reason, a.revoke_scope, a.fail_note, a.result_json, a.started_at, \
+         a.updated_at, a.last_heartbeat_at, a.ended_at \
+         FROM attempts a WHERE a.state IN ('completed', 'failed') \
+         AND NOT EXISTS (SELECT 1 FROM attempt_artifacts aa WHERE aa.attempt_id = a.attempt_id) \
+         ORDER BY a.rowid";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], attempt_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub(crate) fn find_attempt_by_token_tx(
     conn: &Connection,
     claim_token: &str,
@@ -112,7 +128,10 @@ pub(crate) fn find_attempt_by_token_tx(
         .optional()?)
 }
 
-fn get_attempt_tx(conn: &Connection, attempt_id: i64) -> Result<AttemptRow, LedgerError> {
+pub(crate) fn get_attempt_tx(
+    conn: &Connection,
+    attempt_id: i64,
+) -> Result<AttemptRow, LedgerError> {
     let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE attempt_id = ?1");
     conn.query_row(&sql, [attempt_id], attempt_row)
         .optional()?
@@ -162,8 +181,101 @@ fn attempt_event(
     )
 }
 
+/// Terminal attempt settlement releases its transferred capacity in the
+/// same transaction as the attempt state. Older attempts simply match zero.
+fn release_attempt_reservation_tx(
+    conn: &Connection,
+    attempt_id: i64,
+    now: &str,
+) -> Result<(), LedgerError> {
+    conn.execute(
+        "UPDATE admission_reservations SET state = 'released', updated_at = ?1, \
+         released_at = COALESCE(released_at, ?1), last_error = NULL \
+         WHERE owner_kind = 'attempt' AND owner_id = ?2 AND state != 'released'",
+        rusqlite::params![now, attempt_id.to_string()],
+    )?;
+    Ok(())
+}
+
 fn stale_token() -> LedgerError {
     refused(ErrorCode::StaleClaimToken, "claim token is not running")
+}
+
+fn validate_packet_admission_tx(
+    conn: &Connection,
+    packet_id: &str,
+    reservation_id: &str,
+) -> Result<(), LedgerError> {
+    let facts = conn
+        .query_row(
+            "SELECT ar.subject_id, ar.control_revision, ar.repository, ar.provider, ar.model, \
+                    ar.resource_class, ar.state, ar.owner_kind, r.repo \
+             FROM admission_reservations ar \
+             JOIN packets p ON p.packet_id = ?1 \
+             JOIN runs r ON r.run_id = p.run_id \
+             WHERE ar.reservation_id = ?2 AND ar.subject_kind = 'packet'",
+            rusqlite::params![packet_id, reservation_id],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, String>(2)?,
+                    row.get::<_, String>(3)?,
+                    row.get::<_, String>(4)?,
+                    row.get::<_, String>(5)?,
+                    row.get::<_, String>(6)?,
+                    row.get::<_, Option<String>>(7)?,
+                    row.get::<_, String>(8)?,
+                ))
+            },
+        )
+        .optional()?
+        .ok_or_else(|| {
+            refused(
+                ErrorCode::OperationInProgress,
+                format!("packet {packet_id:?} has no matching admission reservation"),
+            )
+        })?;
+    let desired = match crate::admission::packet_authorization_subject_tx(conn, packet_id)? {
+        Some((kind, id)) => conn
+            .query_row(
+                "SELECT desired_state, control_revision, exhausted_at FROM desired_work \
+                 WHERE subject_kind = ?1 AND subject_id = ?2",
+                rusqlite::params![kind.as_str(), id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                    ))
+                },
+            )
+            .optional()?,
+        None => None,
+    };
+    let packet_facts = crate::admission::packet_effective_facts_tx(conn, packet_id)?;
+    let authorized = facts.0 == packet_id
+        && facts.2 == facts.8
+        && packet_facts.provider == facts.3
+        && packet_facts.model == facts.4
+        && match packet_facts.resource_class {
+            forged_types::AdmissionResourceClass::Read => "read",
+            forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+        } == facts.5
+        && matches!(facts.6.as_str(), "reserved" | "orphaned")
+        && facts.7.is_none()
+        && desired
+            .as_ref()
+            .is_some_and(|(state, revision, exhausted)| {
+                state == "running" && *revision == facts.1 && exhausted.is_none()
+            });
+    if !authorized {
+        return Err(refused(
+            ErrorCode::OperationInProgress,
+            format!("packet {packet_id:?} admission no longer matches running desired work"),
+        ));
+    }
+    Ok(())
 }
 
 /// Fetch the attempt for (`packet_id`, `claim_token`) and require `running`.
@@ -206,9 +318,33 @@ impl Ledger {
         claimant: &str,
         current: &SpecFence,
     ) -> Result<ClaimedAttempt, LedgerError> {
+        self.claim_packet_inner(packet_id, claimant, current, None)
+    }
+
+    /// Claim and atomically transfer an admission reservation to the new
+    /// attempt. There is no unowned gap and the capacity projector excludes
+    /// the linked reservation while this live attempt exists.
+    pub fn claim_packet_with_admission(
+        &self,
+        packet_id: &str,
+        claimant: &str,
+        current: &SpecFence,
+        reservation_id: &str,
+    ) -> Result<ClaimedAttempt, LedgerError> {
+        self.claim_packet_inner(packet_id, claimant, current, Some(reservation_id))
+    }
+
+    fn claim_packet_inner(
+        &self,
+        packet_id: &str,
+        claimant: &str,
+        current: &SpecFence,
+        reservation_id: Option<&str>,
+    ) -> Result<ClaimedAttempt, LedgerError> {
         let packet_id = packet_id.to_owned();
         let claimant = claimant.to_owned();
         let current = current.clone();
+        let reservation_id = reservation_id.map(str::to_owned);
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let stored: Option<(String, Option<String>, String)> = tx
@@ -231,6 +367,9 @@ impl Ledger {
                     ErrorCode::PacketNotClaimable,
                     format!("packet {packet_id:?} belongs to a stopped run"),
                 ));
+            }
+            if let Some(reservation_id) = reservation_id.as_deref() {
+                validate_packet_admission_tx(&tx, &packet_id, reservation_id)?;
             }
             let pinned = match spec_revision {
                 Some(revision) => SpecFence::Revision {
@@ -321,6 +460,23 @@ impl Ledger {
                 Err(err) => return Err(err.into()),
             }
             let attempt_id = tx.last_insert_rowid();
+            if let Some(reservation_id) = reservation_id {
+                let now = now_iso();
+                let affected = tx.execute(
+                    "UPDATE admission_reservations SET state = 'active', owner_kind = 'attempt', \
+                     owner_id = ?1, last_error = NULL, updated_at = ?2 \
+                     WHERE reservation_id = ?3 AND state != 'released' \
+                       AND subject_kind = 'packet' AND subject_id = ?4 \
+                       AND (owner_kind IS NULL OR (owner_kind = 'attempt' AND owner_id = ?1))",
+                    rusqlite::params![attempt_id.to_string(), now, reservation_id, packet_id],
+                )?;
+                if affected != 1 {
+                    return Err(refused(
+                        ErrorCode::OperationInProgress,
+                        format!("packet {packet_id:?} has no transferable admission reservation"),
+                    ));
+                }
+            }
             attempt_event(
                 &tx,
                 attempt_id,
@@ -358,6 +514,8 @@ impl Ledger {
                  updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
                 rusqlite::params![result_json, now, attempt.attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt.attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt.attempt_id, &now)?;
             attempt_event(
                 &tx,
                 attempt.attempt_id,
@@ -393,6 +551,8 @@ impl Ledger {
                  updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
                 rusqlite::params![note, now, attempt.attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt.attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt.attempt_id, &now)?;
             attempt_event(
                 &tx,
                 attempt.attempt_id,
@@ -563,6 +723,8 @@ impl Ledger {
                  WHERE attempt_id = ?2",
                 rusqlite::params![now, attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt_id, &now)?;
             attempt_event(
                 &tx,
                 attempt_id,
@@ -604,6 +766,8 @@ impl Ledger {
                  WHERE attempt_id = ?2",
                 rusqlite::params![now, attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt_id, &now)?;
             attempt_event(
                 &tx,
                 attempt_id,
@@ -626,6 +790,82 @@ impl Ledger {
         self.submit(move |conn| {
             let attempt = find_attempt_by_token_tx(conn, &claim_token)?.ok_or_else(stale_token)?;
             if attempt.state != AttemptState::Running {
+                return Err(stale_token());
+            }
+            Ok(())
+        })
+    }
+
+    /// Provider pre-spawn fence: the attempt token, transferred reservation,
+    /// and parent desired control epoch must all still agree.
+    pub fn assert_admitted_attempt_live(&self, claim_token: &str) -> Result<(), LedgerError> {
+        let claim_token = claim_token.to_owned();
+        self.submit(move |conn| {
+            // `next_wake_at` schedules supervisor observation; it is not an
+            // effect authorization bit. A live run controller may be parked
+            // for observation/attention while its already-admitted packet is
+            // still entitled to start. Control state, control revision, and
+            // exhaustion are the atomic pre-spawn revocation fences.
+            let attempt = find_attempt_by_token_tx(conn, &claim_token)?
+                .filter(|attempt| attempt.state == AttemptState::Running)
+                .ok_or_else(stale_token)?;
+            let reservation = conn
+                .query_row(
+                    "SELECT control_revision, repository, provider, model, resource_class \
+                     FROM admission_reservations \
+                     WHERE owner_kind = 'attempt' AND owner_id = ?1 \
+                       AND subject_kind = 'packet' AND subject_id = ?2 AND state = 'active'",
+                    rusqlite::params![attempt.attempt_id.to_string(), attempt.packet_id],
+                    |row| {
+                        Ok((
+                            row.get::<_, i64>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                            row.get::<_, String>(3)?,
+                            row.get::<_, String>(4)?,
+                        ))
+                    },
+                )
+                .optional()?;
+            let desired = match crate::admission::packet_authorization_subject_tx(
+                conn,
+                &attempt.packet_id,
+            )? {
+                Some((kind, id)) => conn
+                    .query_row(
+                        "SELECT desired_state, control_revision, exhausted_at FROM desired_work \
+                         WHERE subject_kind = ?1 AND subject_id = ?2",
+                        rusqlite::params![kind.as_str(), id],
+                        |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, i64>(1)?,
+                                row.get::<_, Option<String>>(2)?,
+                            ))
+                        },
+                    )
+                    .optional()?,
+                None => None,
+            };
+            let packet_facts =
+                crate::admission::packet_effective_facts_tx(conn, &attempt.packet_id)?;
+            let authorized = desired.as_ref().zip(reservation.as_ref()).is_some_and(
+                |((state, revision, exhausted), reservation)| {
+                    state == "running"
+                        && *revision == reservation.0
+                        && exhausted.is_none()
+                        && packet_facts.repository == reservation.1
+                        && packet_facts.provider == reservation.2
+                        && packet_facts.model == reservation.3
+                        && match packet_facts.resource_class {
+                            forged_types::AdmissionResourceClass::Read => "read",
+                            forged_types::AdmissionResourceClass::RepositoryWrite => {
+                                "repository-write"
+                            }
+                        } == reservation.4
+                },
+            );
+            if !authorized {
                 return Err(stale_token());
             }
             Ok(())

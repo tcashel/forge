@@ -56,6 +56,38 @@ forged doctor
 forged definition validate --profile standard --roster default
 ```
 
+### Optional macOS supervisor service
+
+After the CLI has been installed, macOS operators may run the desired-work
+supervisor as a per-user LaunchAgent:
+
+```sh
+forged service install
+forged service status
+forged service stop --drain --timeout-seconds 300
+forged service start
+forged service restart
+forged service uninstall
+```
+
+`install` copies the exact running executable to
+`$ANVIL_HOME/runtime/bin/<sha256>/forged`; launchd invokes that immutable path
+and its exact service generation, never a mutable `PATH` lookup. The manifest,
+transition journal, idempotency receipts, and generation-scoped health files
+are machine-local runtime state. They do not move or migrate the execution
+ledger. Every lifecycle mutation is serialized, repeated explicit
+`--idempotency-key` values replay their durable result, and an upgrade or
+uninstall refuses until incompatible live controllers drain. `status` verifies
+the manifest digest, `current` projection, on-disk plist, loaded launchd
+program/arguments, PID/process-start identity, generation, and fresh tick.
+
+The service passes only the explicit Anvil/Beads configuration and a bounded
+system path to launchd. Install/start/stop/restart/uninstall are typed
+unsupported operations on non-macOS hosts; `status` and `doctor` report that
+portable state without invoking launchctl. Normal tests use an isolated fake
+host. The real macOS smoke is ignored unless explicitly armed with
+`FORGED_SERVICE_SMOKE_TEST=1`.
+
 `BEADS_DIR` may point to an embedded store or to metadata for one central team
 Dolt SQL database. The collaborative setup, credential boundary, connectivity
 check, and the reasons active embedded work need not migrate are documented in
@@ -211,19 +243,81 @@ forged epic submit --epic <epic-id>
 
 ## Reconnect from any agent harness
 
-Start with `overview` or `work list`. Both carry the same operator queue;
-`work list` additionally serves the uncapped raw inventory. Neither needs an
-id.
+Start with `operations overview`. It is the bounded operator surface over
+durable work plus the current nonterminal Beads plan. `work list` remains the
+compatibility inventory and `overview` remains the compatibility reconnect
+facade. Exact subject detail requires both kind and canonical id; it never
+guesses or widens by prefix:
 
 ```sh
+forged operations overview
+forged operations overview --repo /absolute/path/to/repository
+forged operations overview --group needs-me --limit 50
+forged work map
+forged work map --scope repository --repository /absolute/path/to/repository
+forged work map --scope epic --epic-id <epic-id> --max-nodes 250
+forged work detail --subject-kind run --subject-id <run-id>
+forged work detail --subject-kind epic --subject-id <epic-id>
 forged work list
+forged work list --repo /absolute/path/to/repository
 forged overview                    # no scope: the whole portfolio
 forged overview --run <run-id>
 forged overview --epic <epic-id>
 forged overview --id <id>          # kind-blind: resolves either, or lists candidates
 forged session list --run <run-id>
 forged events --run <id> --limit 200
+forged attention acknowledge --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity>
+forged attention resolve --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity> --disposition <disposition> --note '<note>'
+forged attention reopen --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity>
 ```
+
+`operations overview` returns `forged.operations-overview/1` and renders
+through `ui://forged/operations-overview.html`. Its stable groups are **Needs
+me**, **Ready to merge**, **Running**, **Stalled or recoverable**, and
+**Planned**. The live-plan adapter uses exactly one bounded N+1 native Beads
+discovery and one batched exact-id hydrate; it never parses `bd graph`, calls
+`bd ready`, claims work, or performs a per-node subprocess. Durable rows win
+when a Bead also has execution history. A Beads outage keeps the durable
+projection and marks plan coverage unavailable. The hot path reports
+controller liveness only from its one ledger snapshot, so it performs no
+per-row process or controller-file probe.
+
+`work detail` returns `forged.work-detail/1` and renders through
+`ui://forged/work-detail.html`. The Operations App may open it as a read-only
+drawer when the host supports server tool calls; otherwise the exact CLI/MCP
+command remains visible to the lead agent. Plan-only rows deliberately have
+no detail target until durable execution exists.
+
+`work map` returns `forged.work-map/1` and renders through
+`ui://forged/work-map.html`. It keeps current Beads plans and durable run or
+epic executions as distinct nodes, joined by explicit `execution-of` edges;
+multiple executions of one Bead never overwrite each other. Native dependency
+edges run from dependent to prerequisite, parent edges run child to parent,
+and filtered or cross-scope coordinates are bounded `contextOnly` nodes.
+Cycles, missing blocker status, and genuinely unavailable targets remain
+visible in graph health. Operator and repository scope use at most two Beads
+processes; epic scope uses at most three. Graphs over `maxNodes` refuse with
+`GRAPH_SCOPE_TOO_LARGE` rather than returning a misleading partial graph.
+
+Queue and attention fields use the same pure classifier as Operations, while
+desired/admission facts remain on their exact durable subjects. Work Map adds
+one bounded history projection and reports unattached subjects explicitly;
+plan-only nodes never inherit execution spend. Ledger, Beads, plan, and
+history captures and health remain separate because the sources are not one
+cross-system transaction. Selecting a durable App node calls Work Detail with
+its exact `{subjectKind, subjectId}`; plan nodes expose no execution control.
+
+The repository selector performs one native, id-bounded
+`metadata.repository` Beads query and reuses its rows for claim-health and
+queue enrichment. Missing metadata and deleted or unreadable Beads are
+reported as `repositoryScope.known: false` in the operator-wide view and are
+never guessed into a scoped result; an unavailable authoritative read fails a
+scoped request closed. The operator-database storage and repository-identity
+decision is recorded in Bead `beads-zws.17`. The selector changes only the
+query projection: one operator-scoped Beads database remains authoritative.
 
 `overview` with no scope answers with the portfolio: `kind: "portfolio"` on
 the same `forged.overview/1` schema, carrying the inventory entries newest
@@ -232,15 +326,27 @@ truncated), the portfolio-wide `spend`, and one queue grouped in this stable
 order: **Needs me**, **Ready to merge**, **Running**, **Stalled or
 recoverable**, **Planned**. The App renders that same queue; it does not
 derive a second classification. The `attention` rail names each
-subject that needs a human and the durable evidence for it — an epic holding
-on `input.required`, a blocked/input-required slice, a clean or accepted-risk
-candidate awaiting delivery, a pending Beads settlement, an attempt marked
-`revoking` and not yet reclaimed, a result taken into custody by
-`proto.quarantine`, or usage rows carrying no cost. An empty rail means
-nothing needs attention; it is never omitted.
+active condition with a closed severity, owner (`human` or `lead-agent`),
+stable `attentionId`, occurrence-fenced `occurrenceId`, bounded durable
+evidence references, and a typed recommended action. The shared projector
+covers input and terminal blockers, Beads settlement, revocation and
+quarantine custody, merge approval, partial cost, controller/restart
+failure, abandoned gates/retries, typed provider degradation, ambiguous
+effects, missing attempt evidence, and reviewer disagreement. Routine
+capacity waits and healthy automatic recovery are not attention. The same
+typed array and order appear in `overview`, `work list`, CLI, MCP, and the
+App; an empty rail means nothing needs attention and is never omitted.
+
+Acknowledgement records custody and stays visible. Resolve is accepted only
+for explicitly adjudicable custody conditions; source-backed operational
+conditions clear through their own domain transition. A later causal source
+keeps the stable attention id but receives a new occurrence id, so a stale
+control cannot dismiss a recurrence. These controls never resume work,
+release capacity, retry an effect, settle Beads, or merge a PR.
 
 Each queue/inventory entry carries a live Bead title (with a deterministic
-legacy fallback), repository and base branch, current stage/seat, last
+legacy fallback), durable launch repository and base branch, authoritative
+`repositoryScope`, current stage/seat, last
 progress timestamp plus the clock used for age, exact blocker and next
 action, PR delivery, explicitly-known-or-unknown CI, spend, verified
 controller identity, and Bead `claimHealth`. Beads enrichment is one bounded
@@ -261,13 +367,46 @@ detail), so abandoned Bead ownership is visible instead of silently trusted.
 A clean or accepted-risk run deliberately retains its claim while its reviewed
 PR awaits delivery and is reported as awaiting delivery, not as stale.
 
-The overview aggregates status/topology, controller and provider sessions,
+The compatibility overview aggregates status/topology, controller and provider sessions,
 Herdr attach state, gates, findings, per-packet attempt history with the
 outcome each seat landed, artifacts, interventions, roster revisions, per-seat priced usage,
 and events. The MCP `overview` tool returns the identical structured
 projection and renders it through `ui://forged/overview.html`.
 
-That MCP App draws one projection five ways, and never invents a state the
+## Bounded work history
+
+`work history` projects durable cross-run throughput, rework, settlement, and
+spend without consulting Beads, the filesystem, providers, GitHub, or live
+services. The CLI and MCP tool return the same `forged.work-history/1`
+contract:
+
+```sh
+forged work history
+forged work history --from 2030-01-01T00:00:00Z \
+  --to 2030-02-01T00:00:00Z --bucket day --group-by repository
+forged work history --repo /absolute/path/to/repository --epic <epic-id>
+forged work history --subject <run-or-epic-id> --limit 50 --cursor <cursor>
+```
+
+Windows are UTC and half-open (`from <= timestamp < to`). The default is the
+30 days ending at the response's `asOf`; explicit windows are capped at 366
+days and 400 closed hour/day/week buckets. Repository, epic, and subject
+filters are exact canonical identifiers, never display-title guesses. Subject
+pagination uses an opaque request-bound cursor. Grouping is closed to `none`,
+`repository`, `epic`, `stage`, and `provider`; at most 50 series are returned,
+with overflow combined into an explicit `other` series and missing dimensions
+retained as `unknown`.
+
+Each call reads one SQLite snapshot and returns canonical nested
+`WorkIdentityV1` values. Attempt ordinals include earlier durable attempts, so
+repeat attempts and rework stay correct when the first attempt predates the
+window. Rates carry their denominator and are null when that denominator is
+zero. Spend totals preserve every raw usage row: known cost is summed by its
+recorded `billed` or `imputed_api_rate` provenance, while unknown cost remains
+null and contributes to `rowsMissingCost`. Live plans are intentionally
+excluded until they have a durable identity.
+
+That compatibility MCP App draws one projection five ways, and never invents a state the
 ledger did not record:
 
 | View | What it answers |

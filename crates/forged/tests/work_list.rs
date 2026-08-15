@@ -12,6 +12,8 @@
 
 mod support;
 
+use std::collections::BTreeSet;
+
 use serde_json::{json, Value};
 use support::{fabricate_epic, fabricate_run, TestEnv};
 
@@ -89,6 +91,87 @@ fn entry(envelope: &Value, run_id: &str) -> Value {
         .unwrap_or_else(|| panic!("work list lists {run_id}: {envelope}"))
 }
 
+fn fabricate_run_in_repository(env: &TestEnv, run_id: &str, repository: &str) {
+    let ledger = env.ledger();
+    ledger
+        .create_run(forged_ledger::NewRun {
+            run_id: forged_types::RunId::new(run_id).expect("run id"),
+            bead_id: format!("bead-{run_id}"),
+            repo: repository.to_owned(),
+            base_ref: "main".to_owned(),
+            branch: format!("forged/{run_id}"),
+        })
+        .expect("create run");
+    ledger.close().expect("close");
+}
+
+fn fabricate_epic_in_repository(env: &TestEnv, epic_id: &str, repository: &str) {
+    let ledger = env.ledger();
+    let repository = forged_types::normalize_repository_path(repository).expect("canonical repo");
+    let label = forged_types::repository_label(&repository).expect("repo label");
+    let title = format!("Epic {epic_id}");
+    let identity = forged_types::WorkIdentityV1 {
+        schema: forged_types::WORK_IDENTITY_SCHEMA_V1.to_owned(),
+        subject: forged_types::WorkIdentitySubjectV1 {
+            kind: forged_types::WorkIdentitySubjectKind::Epic,
+            id: epic_id.to_owned(),
+        },
+        bead: forged_types::WorkIdentityBeadV1 {
+            id: epic_id.to_owned(),
+            title: Some(title.clone()),
+            revision: None,
+        },
+        repository: Some(forged_types::WorkIdentityRepositoryV1 {
+            path: repository.clone(),
+            label: label.clone(),
+        }),
+        project: None,
+        epic: None,
+        display_title: forged_types::work_display_title(
+            epic_id,
+            Some(&title),
+            Some(&label),
+            None,
+            None,
+        ),
+        captured_at: "2026-01-01T00:00:00.000000000Z".to_owned(),
+        source: forged_types::WorkIdentitySource::Durable,
+    };
+    ledger
+        .append_epic_started_with_identity(
+            epic_id,
+            json!({
+                "schema": "forged.epic/1",
+                "epicId": epic_id,
+                "title": title,
+                "repo": repository,
+                "baseRef": "main",
+                "integrationBranch": format!("forged/epic-{epic_id}"),
+                "children": [],
+            }),
+            identity,
+        )
+        .expect("epic started event");
+    ledger.close().expect("close");
+}
+
+fn run_ids(envelope: &Value) -> BTreeSet<String> {
+    runs_of(envelope)
+        .into_iter()
+        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
+fn queue_ids(envelope: &Value) -> BTreeSet<String> {
+    envelope["result"]["queue"]["groups"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .filter_map(|entry| entry["id"].as_str().map(str::to_owned))
+        .collect()
+}
+
 #[test]
 fn an_empty_ledger_enumerates_to_an_empty_list() {
     let env = TestEnv::new("forged-work-list-empty");
@@ -146,6 +229,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
                 "schemaVersion": 1,
                 "number": 42,
                 "isDraft": true,
+                "baseRefName": "main",
                 "url": "https://example.invalid/pr/42",
             }),
         )
@@ -158,6 +242,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
                 "schemaVersion": 1,
                 "number": 43,
                 "isDraft": true,
+                "baseRefName": "main",
                 "url": "https://example.invalid/pr/43",
             }),
         )
@@ -211,7 +296,12 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
     assert_eq!(stalled["claimHealth"]["staleInProgress"], json!(true));
     assert!(stalled["blocker"].as_str().is_some());
     let planned = in_group("Planned", "q-planned");
-    assert_eq!(planned["title"], json!("Prepare the operator queue"));
+    assert_eq!(planned["title"], planned["identity"]["displayTitle"]);
+    assert_ne!(
+        planned["title"],
+        json!("Prepare the operator queue"),
+        "a live Beads rename cannot rewrite legacy durable identity"
+    );
     assert_eq!(planned["ci"]["status"], json!("unknown"));
     for key in [
         "outcome",
@@ -233,8 +323,191 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
             .lines()
             .filter(|line| line.starts_with("list "))
             .count(),
+        2,
+        "one exact claim batch plus one bounded plan discovery enrich the whole queue: {calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("show "))
+            .count(),
         1,
-        "one bounded Beads read enriches the whole queue: {calls}"
+        "plan dependency hydration remains one batch: {calls}"
+    );
+}
+
+#[test]
+fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checkouts() {
+    let env = TestEnv::new("forged-work-list-repository-scope");
+    env.forged(&["init"]);
+    let forge = "/Users/operator/repositories/forge";
+    let drover = "/Users/operator/repositories/drover";
+    let smithy = "/Users/operator/repositories/smithy";
+    let old_checkout = "/Users/operator/old/forge";
+    let renamed_checkout = "/Users/operator/new/forge";
+
+    fabricate_run_in_repository(&env, "repo-forge", forge);
+    fabricate_epic_in_repository(&env, "repo-drover", drover);
+    fabricate_run_in_repository(&env, "repo-smithy", smithy);
+    fabricate_run_in_repository(&env, "repo-unknown", "/legacy/guessed/repository");
+    fabricate_run_in_repository(&env, "repo-renamed", old_checkout);
+    env.set_bead_repository("bead-repo-forge", forge);
+    env.set_bead_repository("repo-drover", drover);
+    env.set_bead_repository("bead-repo-smithy", smithy);
+    // Override the shim's convenience default so this fixture really models
+    // a Bead with no authoritative repository metadata.
+    env.set_bead_field("bead-repo-unknown", "metadata", "{}");
+    // The renamed checkout proves membership comes from current canonical
+    // Bead metadata, not the launch-time repository column in the ledger.
+    env.set_bead_repository("bead-repo-renamed", renamed_checkout);
+
+    let scoped = |repository: &str| {
+        let (code, response) = env.forged(&["work", "list", "--repo", repository]);
+        assert_eq!(code, 0, "work list --repo {repository}: {response}");
+        assert_eq!(run_ids(&response), queue_ids(&response), "queue parity");
+        response
+    };
+
+    // Absolute path normalization is lexical and does not touch the live
+    // checkout: a trailing `.` still names the exact stored identity.
+    let forge_response = scoped(&format!("{forge}/."));
+    assert_eq!(
+        run_ids(&forge_response),
+        BTreeSet::from(["repo-forge".to_owned()])
+    );
+    assert_eq!(
+        entry(&forge_response, "repo-forge")["claimHealth"]["known"],
+        json!(true)
+    );
+    let calls = env.bd_calls();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with("list "))
+            .count(),
+        2,
+        "one exact membership batch plus one bounded plan discovery: {calls:?}"
+    );
+    let call = calls
+        .iter()
+        .find(|call| call.starts_with("list --id "))
+        .expect("exact metadata membership call");
+    for fragment in [
+        "--id ",
+        "--metadata-field repository=/Users/operator/repositories/forge",
+        "--limit 0",
+        "--brief",
+        "--flat",
+        "--json",
+    ] {
+        assert!(
+            call.contains(fragment),
+            "bounded native filter has {fragment:?}: {call}"
+        );
+    }
+
+    assert_eq!(
+        run_ids(&scoped(drover)),
+        BTreeSet::from(["repo-drover".to_owned()])
+    );
+    assert_eq!(
+        run_ids(&scoped(smithy)),
+        BTreeSet::from(["repo-smithy".to_owned()])
+    );
+    let renamed = scoped(renamed_checkout);
+    assert_eq!(
+        run_ids(&renamed),
+        BTreeSet::from(["repo-renamed".to_owned()])
+    );
+    assert_eq!(
+        entry(&renamed, "repo-renamed")["repo"],
+        json!(old_checkout),
+        "the selector does not rewrite durable launch history"
+    );
+
+    for no_match in [
+        old_checkout,
+        "/legacy/guessed/repository",
+        "/no/such/repository",
+    ] {
+        let response = scoped(no_match);
+        assert_eq!(response["result"]["runs"], json!([]));
+        assert_eq!(response["result"]["queue"]["total"], json!(0));
+    }
+
+    let (code, unfiltered) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "unfiltered work list: {unfiltered}");
+    assert_eq!(
+        run_ids(&unfiltered),
+        BTreeSet::from([
+            "repo-drover".to_owned(),
+            "repo-forge".to_owned(),
+            "repo-renamed".to_owned(),
+            "repo-smithy".to_owned(),
+            "repo-unknown".to_owned(),
+        ]),
+        "omitting --repo retains the operator-wide inventory, including an explicit unknown"
+    );
+    let unknown = entry(&unfiltered, "repo-unknown");
+    assert_eq!(unknown["claimHealth"]["known"], json!(true));
+    assert_eq!(unknown["repositoryScope"]["known"], json!(false));
+    assert_eq!(unknown["repositoryScope"]["identity"], Value::Null);
+    assert_eq!(
+        entry(&unfiltered, "repo-forge")["repositoryScope"],
+        json!({
+            "known": true,
+            "identity": forge,
+            "source": "beads.metadata.repository",
+        })
+    );
+}
+
+#[test]
+fn repository_scope_fails_closed_when_beads_cannot_establish_membership() {
+    let env = TestEnv::new("forged-work-list-repository-outage");
+    env.forged(&["init"]);
+    let forge = "/Users/operator/repositories/forge";
+    fabricate_run_in_repository(&env, "repo-outage", forge);
+    env.set_bead_repository("bead-repo-outage", forge);
+    env.set_bd_list_unreachable(true);
+
+    let (code, scoped) = env.forged(&["work", "list", "--repo", forge]);
+    assert_ne!(code, 0, "a scoped outage must not widen: {scoped}");
+    assert_eq!(scoped["ok"], json!(false));
+    assert_eq!(scoped["error"]["code"], json!("BEADS_ERROR"));
+    assert!(scoped["result"].is_null(), "no scoped rows leak: {scoped}");
+
+    // The no-selector path deliberately retains its established behavior:
+    // it can still show durable work and marks live Beads claim data unknown.
+    let (code, unfiltered) = env.forged(&["work", "list"]);
+    assert_eq!(code, 0, "unfiltered compatibility: {unfiltered}");
+    assert_eq!(
+        run_ids(&unfiltered),
+        BTreeSet::from(["repo-outage".to_owned()])
+    );
+    assert_eq!(
+        entry(&unfiltered, "repo-outage")["claimHealth"]["known"],
+        json!(false)
+    );
+    assert_eq!(
+        entry(&unfiltered, "repo-outage")["repositoryScope"],
+        json!({"known": false, "identity": null, "source": "unknown"})
+    );
+}
+
+#[test]
+fn an_empty_repository_selector_is_refused_instead_of_widening() {
+    let env = TestEnv::new("forged-work-list-empty-repository");
+    env.forged(&["init"]);
+    fabricate_run(&env, "repo-widening-guard");
+
+    let (code, response) = env.forged(&["work", "list", "--repo", "  "]);
+    assert_ne!(code, 0, "empty repository is invalid: {response}");
+    assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(response["result"].is_null());
+    assert!(
+        env.bd_calls().iter().all(|call| !call.starts_with("list ")),
+        "invalid scope is refused before Beads"
     );
 }
 

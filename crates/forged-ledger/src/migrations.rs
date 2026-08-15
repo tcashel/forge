@@ -327,6 +327,609 @@ CREATE TABLE attempt_artifact_compactions (
 );
 ";
 
+/// Migration 013: deterministic admission evidence and capacity ownership.
+///
+/// A recovery deadline is deliberately not an expiry. `reserved`, `active`,
+/// and `orphaned` rows all consume capacity until an observer either adopts a
+/// matching effect or confirms absence and writes `released`.
+const MIGRATION_013: &str = "
+CREATE TABLE admission_batches (
+  batch_id         TEXT PRIMARY KEY,
+  schema           TEXT NOT NULL CHECK (schema = 'forged.admission-inputs/1'),
+  policy_revision  TEXT NOT NULL,
+  ledger_revision  TEXT NOT NULL,
+  inputs_sha256    TEXT NOT NULL CHECK (length(inputs_sha256) = 64),
+  inputs_json      TEXT NOT NULL,
+  as_of            TEXT NOT NULL,
+  created_at       TEXT NOT NULL
+);
+
+CREATE TABLE admission_decisions (
+  decision_id          TEXT PRIMARY KEY,
+  batch_id             TEXT NOT NULL REFERENCES admission_batches(batch_id),
+  subject_kind         TEXT NOT NULL CHECK (subject_kind IN ('run','epic','packet')),
+  subject_id           TEXT NOT NULL,
+  control_revision     INTEGER NOT NULL CHECK (control_revision >= 0),
+  outcome              TEXT NOT NULL CHECK (outcome IN ('admitted','deferred','ineligible')),
+  reason               TEXT NOT NULL CHECK (reason IN
+                         ('capacity-available','total-capacity','provider-capacity',
+                          'repository-write-capacity','token-ceiling','known-cost-ceiling',
+                          'missing-cost','rate-limit-ceiling','stale-rate-limit',
+                          'bead-unavailable','bead-malformed','bead-not-runnable',
+                          'repository-mismatch','unauthorized','desired-not-running',
+                          'terminal','input-required','exhausted','superseded',
+                          'reservation-recovery')),
+  next_eligible_wake_at TEXT,
+  decision_json         TEXT NOT NULL,
+  created_at            TEXT NOT NULL,
+  UNIQUE (batch_id, subject_kind, subject_id)
+);
+CREATE INDEX admission_decisions_subject
+  ON admission_decisions(subject_kind, subject_id, created_at, decision_id);
+
+CREATE TABLE admission_reservations (
+  reservation_id   TEXT PRIMARY KEY,
+  decision_id      TEXT NOT NULL UNIQUE REFERENCES admission_decisions(decision_id),
+  work_key         TEXT NOT NULL,
+  subject_kind     TEXT NOT NULL CHECK (subject_kind IN ('run','epic','packet')),
+  subject_id       TEXT NOT NULL,
+  control_revision INTEGER NOT NULL CHECK (control_revision >= 0),
+  repository       TEXT NOT NULL,
+  provider         TEXT NOT NULL,
+  model            TEXT NOT NULL,
+  resource_class   TEXT NOT NULL CHECK (resource_class IN ('read','repository-write')),
+  state            TEXT NOT NULL CHECK (state IN ('reserved','active','orphaned','released')),
+  owner_kind       TEXT CHECK (owner_kind IN ('controller','attempt')),
+  owner_id         TEXT,
+  recovery_deadline TEXT NOT NULL,
+  last_error       TEXT,
+  created_at       TEXT NOT NULL,
+  updated_at       TEXT NOT NULL,
+  released_at      TEXT
+);
+CREATE UNIQUE INDEX one_live_admission_per_work
+  ON admission_reservations(work_key) WHERE state != 'released';
+CREATE INDEX admission_reservations_capacity
+  ON admission_reservations(state, provider, repository, resource_class);
+";
+
+/// Migration 014: durable ownership and convergent cleanup for new
+/// Forged-created Herdr panes. Identity columns are immutable after the
+/// prepare/register seam commits; lifecycle and cleanup columns remain the
+/// state machine's only update surface.
+const MIGRATION_014: &str = "
+CREATE TABLE owned_herdr_sessions (
+  ownership_id          TEXT PRIMARY KEY CHECK (length(ownership_id) > 0),
+  schema                TEXT NOT NULL CHECK (schema = 'forged.owned-herdr-session/1'),
+  owner_kind            TEXT NOT NULL CHECK (owner_kind IN ('controller','attempt')),
+  subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id            TEXT NOT NULL CHECK (length(subject_id) > 0),
+  run_id                TEXT,
+  packet_id             TEXT,
+  attempt_id            INTEGER,
+  claim_token           TEXT,
+  controller_generation INTEGER,
+  pane_id               TEXT NOT NULL CHECK (length(pane_id) > 0),
+  socket_path           TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol              INTEGER NOT NULL CHECK (protocol = 19),
+  sentinel_path         TEXT NOT NULL CHECK (length(sentinel_path) > 0),
+  lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN
+                         ('registered','command-started','owner-terminal','owner-dead')),
+  cleanup_state         TEXT NOT NULL CHECK (cleanup_state IN
+                         ('not-requested','pending','leased','retry-wait','attention','released')),
+  cleanup_reason        TEXT CHECK (cleanup_reason IN
+                         ('command-not-started','attempt-settled','controller-terminal','controller-dead')),
+  cleanup_release       TEXT CHECK (cleanup_release IN ('closed','pane-not-found')),
+  cleanup_token         TEXT,
+  cleanup_lease_until   TEXT,
+  cleanup_retry_budget  INTEGER NOT NULL CHECK (cleanup_retry_budget > 0),
+  cleanup_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                        (cleanup_retry_used >= 0 AND cleanup_retry_used <= cleanup_retry_budget),
+  next_cleanup_at       TEXT,
+  last_cleanup_error    TEXT,
+  registered_at         TEXT NOT NULL,
+  command_started_at    TEXT,
+  cleanup_requested_at  TEXT,
+  last_cleanup_attempt_at TEXT,
+  released_at           TEXT,
+  updated_at            TEXT NOT NULL,
+  UNIQUE (socket_path, protocol, pane_id),
+  UNIQUE (sentinel_path),
+  CHECK (
+    (owner_kind = 'controller' AND run_id IS NULL AND packet_id IS NULL
+      AND attempt_id IS NULL AND claim_token IS NULL
+      AND controller_generation IS NOT NULL AND controller_generation > 0)
+    OR
+    (owner_kind = 'attempt' AND run_id IS NOT NULL AND packet_id IS NOT NULL
+      AND attempt_id IS NOT NULL AND attempt_id > 0 AND claim_token IS NOT NULL
+      AND (controller_generation IS NULL OR controller_generation > 0)
+      AND (controller_generation IS NOT NULL
+           OR (subject_kind = 'run' AND subject_id = run_id)))
+  ),
+  CHECK (
+    (lifecycle_state = 'registered' AND command_started_at IS NULL)
+    OR (lifecycle_state = 'command-started' AND command_started_at IS NOT NULL)
+    OR lifecycle_state IN ('owner-terminal','owner-dead')
+  ),
+  CHECK (
+    (cleanup_state = 'not-requested' AND cleanup_reason IS NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'pending' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NOT NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'leased' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NOT NULL
+      AND cleanup_lease_until IS NOT NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'retry-wait' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NOT NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'attention' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND last_cleanup_error IS NOT NULL
+      AND cleanup_retry_used = cleanup_retry_budget AND released_at IS NULL)
+    OR
+    (cleanup_state = 'released' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NOT NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX owned_herdr_cleanup_token
+  ON owned_herdr_sessions(cleanup_token) WHERE cleanup_token IS NOT NULL;
+CREATE INDEX owned_herdr_cleanup_wake
+  ON owned_herdr_sessions(cleanup_state, next_cleanup_at, cleanup_lease_until)
+  WHERE cleanup_state IN ('pending','leased','retry-wait');
+CREATE UNIQUE INDEX owned_herdr_attempt_owner
+  ON owned_herdr_sessions(attempt_id, claim_token)
+  WHERE owner_kind = 'attempt';
+CREATE UNIQUE INDEX owned_herdr_controller_owner
+  ON owned_herdr_sessions(subject_kind, subject_id, controller_generation)
+  WHERE owner_kind = 'controller';
+
+CREATE TRIGGER owned_herdr_identity_immutable
+BEFORE UPDATE OF ownership_id, schema, owner_kind, subject_kind, subject_id,
+                 run_id, packet_id, attempt_id, claim_token,
+                 controller_generation, pane_id, socket_path, protocol,
+                 sentinel_path, registered_at
+ON owned_herdr_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'owned Herdr session identity is immutable');
+END;
+";
+
+/// Migration 015: immutable human-readable identity captured from durable
+/// launch evidence. Planned Beads are deliberately absent: `live-plan` is a
+/// projection-only source and the table's closed source vocabulary rejects
+/// it. Existing rows are populated by Rust immediately after this DDL inside
+/// the same migration transaction so path/title derivation uses the shared
+/// pure helpers rather than a second SQL implementation.
+const MIGRATION_015: &str = "
+CREATE TABLE work_identities (
+  schema            TEXT NOT NULL CHECK (schema = 'forged.work-identity/1'),
+  subject_kind      TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id        TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  bead_id           TEXT NOT NULL CHECK (length(trim(bead_id)) > 0),
+  bead_title        TEXT CHECK (bead_title IS NULL OR length(trim(bead_title)) > 0),
+  bead_revision     TEXT CHECK (bead_revision IS NULL OR length(trim(bead_revision)) > 0),
+  repository_path  TEXT,
+  repository_label TEXT,
+  project_id        TEXT,
+  project_title     TEXT,
+  epic_id           TEXT,
+  epic_title        TEXT,
+  display_title     TEXT NOT NULL CHECK (length(trim(display_title)) > 0),
+  captured_at       TEXT NOT NULL CHECK (length(trim(captured_at)) > 0),
+  source            TEXT NOT NULL CHECK (source IN ('durable','legacy-fallback')),
+  PRIMARY KEY (subject_kind, subject_id),
+  CHECK (
+    (repository_path IS NULL AND repository_label IS NULL)
+    OR
+    (repository_path IS NOT NULL AND length(trim(repository_path)) > 0
+      AND repository_label IS NOT NULL AND length(trim(repository_label)) > 0)
+  ),
+  CHECK (
+    (project_id IS NULL AND project_title IS NULL)
+    OR
+    (project_id IS NOT NULL AND length(trim(project_id)) > 0
+      AND (project_title IS NULL OR length(trim(project_title)) > 0))
+  ),
+  CHECK (
+    (epic_id IS NULL AND epic_title IS NULL)
+    OR
+    (epic_id IS NOT NULL AND length(trim(epic_id)) > 0
+      AND (epic_title IS NULL OR length(trim(epic_title)) > 0))
+  )
+);
+CREATE INDEX work_identities_bead ON work_identities(bead_id, subject_kind, subject_id);
+
+CREATE TRIGGER work_identity_immutable
+BEFORE UPDATE ON work_identities
+BEGIN
+  SELECT RAISE(ABORT, 'work identity is immutable');
+END;
+";
+
+/// Migration 016: run-major access for the complete latest-event projection.
+///
+/// The existing kind-major index remains the right access path for lifecycle
+/// scans. This partial index gives the independent newest-event-per-subject
+/// query one ordered group per non-null run id, so SQLite does not build a
+/// temporary grouping B-tree over the append-only event history.
+const MIGRATION_016: &str = "
+CREATE INDEX events_run_event ON events(run_id, event_id)
+  WHERE run_id IS NOT NULL;
+";
+
+/// Migration 017: one durable, exact Herdr tab/root layout per active work
+/// subject and frozen endpoint. Creation, mutation, replacement, and cleanup
+/// are separate CAS leases; labels are stored presentation and never keys.
+const MIGRATION_017: &str = "
+CREATE TABLE herdr_layouts (
+  layout_id             TEXT PRIMARY KEY CHECK (length(trim(layout_id)) > 0),
+  schema                TEXT NOT NULL CHECK (schema = 'forged.herdr-layout/1'),
+  revision              INTEGER NOT NULL CHECK (revision > 0),
+  subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id            TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  socket_path           TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol              INTEGER NOT NULL CHECK (protocol = 19),
+  workspace_id          TEXT NOT NULL CHECK (length(workspace_id) > 0),
+  tab_id                TEXT,
+  root_pane_id          TEXT,
+  display_label         TEXT NOT NULL CHECK
+                        (length(trim(display_label)) > 0 AND length(CAST(display_label AS BLOB)) <= 160),
+  lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN
+                        ('creating','registered','degraded','replaced')),
+  degradation_reason    TEXT CHECK (degradation_reason IN
+                        ('creation-ambiguous','registration-failed','verification-missing',
+                         'verification-mismatch','placement-failed')),
+  last_error            TEXT,
+  creation_token        TEXT,
+  creation_lease_until  TEXT,
+  mutation_token        TEXT,
+  mutation_lease_until  TEXT,
+  cleanup_state         TEXT NOT NULL CHECK (cleanup_state IN
+                        ('not-requested','pending','leased','retry-wait','attention','released')),
+  cleanup_reason        TEXT CHECK (cleanup_reason IN
+                        ('subject-terminal','layout-replaced','layout-degraded')),
+  cleanup_release       TEXT CHECK (cleanup_release IN ('closed','pane-not-found')),
+  cleanup_token         TEXT,
+  cleanup_lease_until   TEXT,
+  cleanup_retry_budget  INTEGER NOT NULL CHECK (cleanup_retry_budget > 0),
+  cleanup_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                        (cleanup_retry_used >= 0 AND cleanup_retry_used <= cleanup_retry_budget),
+  next_cleanup_at       TEXT,
+  last_cleanup_error    TEXT,
+  predecessor_layout_id TEXT REFERENCES herdr_layouts(layout_id),
+  created_at            TEXT NOT NULL,
+  registered_at         TEXT,
+  replaced_at           TEXT,
+  cleanup_requested_at  TEXT,
+  last_cleanup_attempt_at TEXT,
+  released_at           TEXT,
+  updated_at            TEXT NOT NULL,
+  UNIQUE (subject_kind, subject_id, socket_path, protocol, revision),
+  CHECK ((tab_id IS NULL) = (root_pane_id IS NULL)),
+  CHECK (
+    (lifecycle_state = 'creating' AND tab_id IS NULL AND root_pane_id IS NULL
+      AND creation_token IS NOT NULL AND creation_lease_until IS NOT NULL
+      AND registered_at IS NULL AND degradation_reason IS NULL)
+    OR
+    (lifecycle_state = 'registered' AND tab_id IS NOT NULL AND root_pane_id IS NOT NULL
+      AND creation_token IS NULL AND creation_lease_until IS NULL
+      AND registered_at IS NOT NULL
+      AND (degradation_reason IS NULL OR degradation_reason = 'placement-failed'))
+    OR
+    (lifecycle_state = 'degraded' AND creation_token IS NULL
+      AND creation_lease_until IS NULL AND degradation_reason IS NOT NULL)
+    OR
+    (lifecycle_state = 'replaced' AND tab_id IS NOT NULL AND root_pane_id IS NOT NULL
+      AND creation_token IS NULL AND creation_lease_until IS NULL
+      AND degradation_reason IS NOT NULL AND replaced_at IS NOT NULL)
+  ),
+  CHECK (
+    (mutation_token IS NULL AND mutation_lease_until IS NULL)
+    OR
+    (mutation_token IS NOT NULL AND mutation_lease_until IS NOT NULL
+      AND lifecycle_state = 'registered' AND cleanup_state = 'not-requested')
+  ),
+  CHECK (
+    (cleanup_state = 'not-requested' AND cleanup_reason IS NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'pending' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NOT NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'leased' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NOT NULL AND cleanup_lease_until IS NOT NULL
+      AND next_cleanup_at IS NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'retry-wait' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NOT NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'attention' AND cleanup_release IS NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NULL AND last_cleanup_error IS NOT NULL
+      AND released_at IS NULL)
+    OR
+    (cleanup_state = 'released' AND cleanup_reason IS NOT NULL
+      AND root_pane_id IS NOT NULL AND cleanup_release IS NOT NULL
+      AND cleanup_token IS NULL AND cleanup_lease_until IS NULL
+      AND next_cleanup_at IS NULL AND cleanup_requested_at IS NOT NULL
+      AND released_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX one_active_herdr_layout
+  ON herdr_layouts(subject_kind, subject_id, socket_path, protocol)
+  WHERE lifecycle_state IN ('creating','registered');
+CREATE UNIQUE INDEX herdr_layout_exact_tab
+  ON herdr_layouts(socket_path, protocol, tab_id) WHERE tab_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_exact_root
+  ON herdr_layouts(socket_path, protocol, root_pane_id) WHERE root_pane_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_creation_token
+  ON herdr_layouts(creation_token) WHERE creation_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_mutation_token
+  ON herdr_layouts(mutation_token) WHERE mutation_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_layout_cleanup_token
+  ON herdr_layouts(cleanup_token) WHERE cleanup_token IS NOT NULL;
+CREATE INDEX herdr_layout_cleanup_wake
+  ON herdr_layouts(cleanup_state, next_cleanup_at, cleanup_lease_until)
+  WHERE cleanup_state IN ('pending','leased','retry-wait');
+
+CREATE TRIGGER herdr_layout_identity_immutable
+BEFORE UPDATE OF layout_id, schema, revision, subject_kind, subject_id,
+                 socket_path, protocol, workspace_id, display_label,
+                 predecessor_layout_id, created_at
+ON herdr_layouts
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr layout identity is immutable');
+END;
+
+CREATE TRIGGER herdr_layout_locator_once
+BEFORE UPDATE OF tab_id, root_pane_id ON herdr_layouts
+WHEN OLD.lifecycle_state != 'creating' OR NEW.lifecycle_state NOT IN ('registered','degraded')
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr layout locator may only register once');
+END;
+
+ALTER TABLE owned_herdr_sessions
+  ADD COLUMN layout_id TEXT REFERENCES herdr_layouts(layout_id);
+CREATE INDEX owned_herdr_layout
+  ON owned_herdr_sessions(layout_id, cleanup_state) WHERE layout_id IS NOT NULL;
+CREATE TRIGGER owned_herdr_layout_immutable
+BEFORE UPDATE OF layout_id ON owned_herdr_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'owned Herdr layout join is immutable');
+END;
+";
+
+/// Migration 018: durable best-effort display and custom-lifecycle
+/// projections for exact post-migration Herdr ownership.  The table has no
+/// native session source/path column by design: confirmed provider ids are
+/// display metadata only.
+const MIGRATION_018: &str = "
+CREATE TABLE herdr_pane_projections (
+  projection_id          TEXT PRIMARY KEY CHECK (length(trim(projection_id)) > 0),
+  schema                 TEXT NOT NULL CHECK (schema = 'forged.herdr-pane-projection/1'),
+  target_kind            TEXT NOT NULL CHECK (target_kind IN ('anchor','controller','attempt')),
+  subject_kind           TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id             TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  ownership_id           TEXT REFERENCES owned_herdr_sessions(ownership_id),
+  layout_id              TEXT REFERENCES herdr_layouts(layout_id),
+  pane_id                TEXT NOT NULL CHECK (length(pane_id) > 0),
+  socket_path            TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol               INTEGER NOT NULL CHECK (protocol = 19),
+  controller_generation  INTEGER,
+  run_id                 TEXT,
+  packet_id              TEXT,
+  attempt_id             INTEGER,
+  claim_token            TEXT,
+  stage                  TEXT CHECK (stage IN ('implement','reviewclaude','reviewcodex','fix')),
+  provider               TEXT CHECK (provider IN ('claude','codex')),
+  model                  TEXT,
+  layout_revision        INTEGER,
+  metadata_source        TEXT NOT NULL CHECK
+                         (length(metadata_source) <= 80 AND metadata_source NOT LIKE 'herdr:%'),
+  lifecycle_source       TEXT CHECK
+                         (lifecycle_source IS NULL OR
+                          (length(lifecycle_source) <= 80 AND lifecycle_source NOT LIKE 'herdr:%')),
+  lifecycle_agent        TEXT CHECK (lifecycle_agent IN ('claude','codex')),
+  session_candidate      TEXT CHECK
+                         (session_candidate IS NULL OR
+                          (length(CAST(session_candidate AS BLOB)) BETWEEN 1 AND 256
+                           AND session_candidate NOT GLOB '*' || char(10) || '*'
+                           AND session_candidate NOT GLOB '*' || char(13) || '*')),
+  session_confirmed      TEXT CHECK
+                         (session_confirmed IS NULL OR
+                          (length(CAST(session_confirmed AS BLOB)) BETWEEN 1 AND 80
+                           AND session_confirmed NOT GLOB '*' || char(10) || '*'
+                           AND session_confirmed NOT GLOB '*' || char(13) || '*')),
+  session_evidence_source TEXT CHECK
+                         (session_evidence_source IN ('claude-output','codex-thread-started')),
+  session_evidence_at    TEXT,
+  session_evidence_error TEXT,
+  desired_revision       INTEGER NOT NULL CHECK (desired_revision > 0),
+  desired_lifecycle      TEXT CHECK (desired_lifecycle IN ('working','unknown')),
+  desired_release        INTEGER NOT NULL DEFAULT 0 CHECK (desired_release IN (0,1)),
+
+  metadata_next_seq      INTEGER NOT NULL DEFAULT 0 CHECK (metadata_next_seq >= 0),
+  metadata_applied_seq   INTEGER CHECK (metadata_applied_seq > 0),
+  metadata_applied_revision INTEGER CHECK (metadata_applied_revision > 0),
+  metadata_state         TEXT NOT NULL CHECK (metadata_state IN
+                         ('pending','leased','retry-wait','attention','applied','missing')),
+  metadata_token         TEXT,
+  metadata_lease_until   TEXT,
+  metadata_retry_budget  INTEGER NOT NULL CHECK (metadata_retry_budget > 0),
+  metadata_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                         (metadata_retry_used BETWEEN 0 AND metadata_retry_budget),
+  metadata_next_wake_at  TEXT,
+  metadata_last_error    TEXT,
+  metadata_last_attempt_at TEXT,
+  metadata_applied_at    TEXT,
+
+  lifecycle_next_seq     INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_next_seq >= 0),
+  lifecycle_applied_seq  INTEGER CHECK (lifecycle_applied_seq > 0),
+  lifecycle_applied_revision INTEGER CHECK (lifecycle_applied_revision > 0),
+  lifecycle_state        TEXT CHECK (lifecycle_state IN
+                         ('not-requested','pending','leased','retry-wait','attention','applied','missing')),
+  lifecycle_token        TEXT,
+  lifecycle_lease_until  TEXT,
+  lifecycle_retry_budget INTEGER NOT NULL CHECK (lifecycle_retry_budget > 0),
+  lifecycle_retry_used   INTEGER NOT NULL DEFAULT 0 CHECK
+                         (lifecycle_retry_used BETWEEN 0 AND lifecycle_retry_budget),
+  lifecycle_next_wake_at TEXT,
+  lifecycle_last_error   TEXT,
+  lifecycle_last_attempt_at TEXT,
+  lifecycle_applied_at   TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+
+  FOREIGN KEY (subject_kind, subject_id)
+    REFERENCES work_identities(subject_kind, subject_id),
+  UNIQUE (socket_path, protocol, pane_id, metadata_source),
+  CHECK (
+    (target_kind = 'anchor' AND layout_id IS NOT NULL AND ownership_id IS NULL
+      AND layout_revision IS NOT NULL AND layout_revision > 0
+      AND controller_generation IS NULL AND run_id IS NULL AND packet_id IS NULL
+      AND attempt_id IS NULL AND claim_token IS NULL AND stage IS NULL
+      AND provider IS NULL AND model IS NULL AND lifecycle_source IS NULL
+      AND lifecycle_agent IS NULL AND desired_lifecycle IS NULL
+      AND desired_release = 0 AND lifecycle_state = 'not-requested'
+      AND session_candidate IS NULL AND session_confirmed IS NULL
+      AND session_evidence_source IS NULL AND session_evidence_at IS NULL
+      AND session_evidence_error IS NULL)
+    OR
+    (target_kind = 'controller' AND ownership_id IS NOT NULL AND layout_id IS NULL
+      AND controller_generation IS NOT NULL AND controller_generation > 0
+      AND run_id IS NULL AND packet_id IS NULL AND attempt_id IS NULL
+      AND claim_token IS NULL AND stage IS NULL AND provider IS NULL AND model IS NULL
+      AND layout_revision IS NULL AND lifecycle_source IS NULL
+      AND lifecycle_agent IS NULL AND desired_lifecycle IS NULL
+      AND desired_release = 0 AND lifecycle_state = 'not-requested'
+      AND session_candidate IS NULL AND session_confirmed IS NULL
+      AND session_evidence_source IS NULL AND session_evidence_at IS NULL
+      AND session_evidence_error IS NULL)
+    OR
+    (target_kind = 'attempt' AND ownership_id IS NOT NULL AND layout_id IS NULL
+      AND run_id IS NOT NULL AND packet_id IS NOT NULL AND attempt_id IS NOT NULL
+      AND attempt_id > 0 AND claim_token IS NOT NULL AND stage IS NOT NULL
+      AND provider IS NOT NULL AND model IS NOT NULL AND layout_revision IS NULL
+      AND lifecycle_source IS NOT NULL AND lifecycle_agent = provider
+      AND lifecycle_state IS NOT NULL)
+  ),
+  CHECK ((session_confirmed IS NULL AND session_evidence_source IS NULL
+          AND session_evidence_at IS NULL)
+         OR (session_confirmed IS NOT NULL AND session_evidence_source IS NOT NULL
+             AND session_evidence_at IS NOT NULL)),
+  CHECK ((metadata_state = 'leased') =
+         (metadata_token IS NOT NULL AND metadata_lease_until IS NOT NULL)),
+  CHECK ((lifecycle_state = 'leased') =
+         (lifecycle_token IS NOT NULL AND lifecycle_lease_until IS NOT NULL))
+);
+CREATE UNIQUE INDEX herdr_projection_owned_target
+  ON herdr_pane_projections(ownership_id) WHERE ownership_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_layout_target
+  ON herdr_pane_projections(layout_id) WHERE layout_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_metadata_token
+  ON herdr_pane_projections(metadata_token) WHERE metadata_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_lifecycle_token
+  ON herdr_pane_projections(lifecycle_token) WHERE lifecycle_token IS NOT NULL;
+CREATE INDEX herdr_projection_metadata_wake
+  ON herdr_pane_projections(metadata_state, metadata_next_wake_at, metadata_lease_until)
+  WHERE metadata_state IN ('pending','leased','retry-wait');
+CREATE INDEX herdr_projection_lifecycle_wake
+  ON herdr_pane_projections(lifecycle_state, lifecycle_next_wake_at, lifecycle_lease_until)
+  WHERE lifecycle_state IN ('pending','leased','retry-wait');
+
+CREATE TRIGGER herdr_projection_identity_immutable
+BEFORE UPDATE OF projection_id, schema, target_kind, subject_kind, subject_id,
+                 ownership_id, layout_id, pane_id, socket_path, protocol,
+                 controller_generation, run_id, packet_id, attempt_id,
+                 claim_token, stage, provider, model, layout_revision,
+                 metadata_source, lifecycle_source, lifecycle_agent, created_at
+ON herdr_pane_projections
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr projection identity is immutable');
+END;
+";
+
+/// Migration 019: exact-snapshot, per-finding review-publication truth.
+///
+/// The snapshot digest is part of the primary identity: a later same-round
+/// result is new work rather than an update to an older delivery row.
+const MIGRATION_019: &str = "
+CREATE TABLE review_finding_deliveries (
+  schema                 TEXT NOT NULL
+                         CHECK (schema = 'forged.review-finding-delivery/1'),
+  run_id                 TEXT NOT NULL REFERENCES runs(run_id),
+  repository_slug        TEXT NOT NULL CHECK (length(trim(repository_slug)) > 0),
+  pr_number              INTEGER NOT NULL CHECK (pr_number > 0),
+  pr_url                 TEXT NOT NULL CHECK (length(trim(pr_url)) > 0),
+  review_epoch_kind      TEXT NOT NULL
+                         CHECK (review_epoch_kind IN ('semantic-round','legacy-seq')),
+  review_epoch           INTEGER NOT NULL CHECK (review_epoch >= 0),
+  snapshot_sha256        TEXT NOT NULL
+                         CHECK (length(snapshot_sha256) = 64
+                                AND snapshot_sha256 NOT GLOB '*[^0-9a-f]*'),
+  finding_id             TEXT NOT NULL
+                         CHECK (length(finding_id) = 64
+                                AND finding_id NOT GLOB '*[^0-9a-f]*'),
+  finding_sha256         TEXT NOT NULL
+                         CHECK (length(finding_sha256) = 64
+                                AND finding_sha256 NOT GLOB '*[^0-9a-f]*'),
+  canonical_finding_json TEXT NOT NULL,
+  state                  TEXT NOT NULL
+                         CHECK (state IN ('pending','uncertain','retryable','delivered')),
+  attempt_count          INTEGER NOT NULL DEFAULT 0 CHECK (attempt_count >= 0),
+  last_error             TEXT CHECK (last_error IS NULL OR length(CAST(last_error AS BLOB)) <= 2048),
+  external_outcome       TEXT CHECK (external_outcome IN ('posted','already-present')),
+  delivered_evidence     TEXT,
+  delivery_token         TEXT,
+  delivery_lease_until   TEXT,
+  delivered_at           TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+  PRIMARY KEY (
+    run_id, repository_slug, pr_number, review_epoch_kind, review_epoch,
+    snapshot_sha256, finding_id
+  ),
+  CHECK (finding_sha256 = finding_id),
+  CHECK ((delivery_token IS NULL) = (delivery_lease_until IS NULL)),
+  CHECK (
+    (state = 'delivered' AND external_outcome IS NOT NULL
+      AND delivered_evidence IS NOT NULL AND delivered_at IS NOT NULL
+      AND last_error IS NULL AND delivery_token IS NULL)
+    OR
+    (state != 'delivered' AND external_outcome IS NULL
+      AND delivered_evidence IS NULL AND delivered_at IS NULL)
+  ),
+  CHECK ((state IN ('retryable','uncertain')) OR last_error IS NULL)
+);
+CREATE UNIQUE INDEX review_finding_delivery_token
+  ON review_finding_deliveries(delivery_token) WHERE delivery_token IS NOT NULL;
+CREATE INDEX review_finding_delivery_state
+  ON review_finding_deliveries(run_id, snapshot_sha256, state, delivery_lease_until);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -341,6 +944,13 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_010,
     MIGRATION_011,
     MIGRATION_012,
+    MIGRATION_013,
+    MIGRATION_014,
+    MIGRATION_015,
+    MIGRATION_016,
+    MIGRATION_017,
+    MIGRATION_018,
+    MIGRATION_019,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -405,6 +1015,9 @@ fn apply_migrations(conn: &mut Connection) -> Result<(), LedgerError> {
         let index = idx as i64 + 1;
         if index > applied {
             tx.execute_batch(ddl)?;
+            if index == 15 {
+                crate::work_identity::backfill_work_identities_tx(&tx)?;
+            }
         }
     }
     if applied < embedded {
@@ -445,7 +1058,7 @@ impl Ledger {
 
 #[cfg(test)]
 mod tests {
-    use super::MIGRATION_001;
+    use super::{MIGRATIONS, MIGRATION_001};
     use crate::Ledger;
 
     #[test]
@@ -460,7 +1073,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 12);
+        assert_eq!(pragmas.user_version, 19);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -481,6 +1094,14 @@ mod tests {
             "desired_work",
             "attempt_artifacts",
             "attempt_artifact_compactions",
+            "admission_batches",
+            "admission_decisions",
+            "admission_reservations",
+            "owned_herdr_sessions",
+            "work_identities",
+            "herdr_layouts",
+            "herdr_pane_projections",
+            "review_finding_deliveries",
         ] {
             let found: String = conn
                 .query_row(
@@ -499,6 +1120,87 @@ mod tests {
             )
             .expect("partial index missing");
         assert_eq!(index, "one_live_attempt_per_packet");
+        let event_index: String = conn
+            .query_row(
+                "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                ["events_run_event"],
+                |row| row.get(0),
+            )
+            .expect("run-major event index missing");
+        assert_eq!(
+            event_index,
+            "CREATE INDEX events_run_event ON events(run_id, event_id)\n  WHERE run_id IS NOT NULL"
+        );
+        let layout_join: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pragma_table_info('owned_herdr_sessions') \
+                 WHERE name = 'layout_id'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("layout join column");
+        assert_eq!(layout_join, 1);
+        let active_layout_index: String = conn
+            .query_row(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name = ?1",
+                ["one_active_herdr_layout"],
+                |row| row.get(0),
+            )
+            .expect("active layout index");
+        assert_eq!(active_layout_index, "one_active_herdr_layout");
+    }
+
+    #[test]
+    fn representative_v10_v12_v15_v16_v17_and_exact_v18_upgrades_preserve_rows_and_reach_v19() {
+        for version in [10usize, 12, 15, 16, 17, 18] {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let path = dir.path().join(format!("state-v{version}.db"));
+            {
+                let conn = rusqlite::Connection::open(&path).expect("raw database");
+                for migration in MIGRATIONS.iter().take(version) {
+                    conn.execute_batch(migration).expect("seed migration");
+                }
+                conn.execute_batch(
+                    "INSERT INTO events (ts, run_id, kind, payload_json) VALUES
+                       ('earlier-ts', 'legacy-subject', 'legacy.progress', '{\"n\":1}'),
+                       ('later-ts', NULL, 'global.note', '{\"n\":2}');
+                     INSERT INTO usage (
+                       run_id, provider, model, input_tokens, output_tokens, cost_usd, ts
+                     ) VALUES (
+                       'legacy-subject', 'codex', 'legacy-model', 7, 11, 0.25, 'usage-ts'
+                     );",
+                )
+                .expect("seed representative rows");
+                conn.execute_batch(&format!("PRAGMA user_version={version};"))
+                    .expect("mark schema version");
+            }
+
+            let ledger = Ledger::open(&path)
+                .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
+            assert_eq!(
+                ledger
+                    .list_events_by_kind("legacy.progress")
+                    .expect("events")
+                    .len(),
+                1,
+                "v{version} event row was lost"
+            );
+            let totals = ledger.usage_totals("legacy-subject").expect("usage");
+            assert_eq!(totals.input_tokens, 7, "v{version} usage row was lost");
+            assert_eq!(totals.output_tokens, 11, "v{version} usage row was lost");
+            ledger.close().expect("close");
+
+            let conn = rusqlite::Connection::open(&path).expect("raw migrated database");
+            let index: String = conn
+                .query_row(
+                    "SELECT sql FROM sqlite_master WHERE type='index' AND name = ?",
+                    ["events_run_event"],
+                    |row| row.get(0),
+                )
+                .expect("migration 016 index");
+            assert!(index.contains("WHERE run_id IS NOT NULL"));
+        }
     }
 
     #[test]
@@ -510,8 +1212,46 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         ledger.close().expect("close");
+    }
+
+    #[test]
+    fn migration_014_closes_protocol_and_freezes_only_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        Ledger::open(&path)
+            .expect("migrate")
+            .close()
+            .expect("close");
+        let conn = rusqlite::Connection::open(&path).expect("raw");
+        let insert = |id: &str, protocol: i64| {
+            conn.execute(
+                "INSERT INTO owned_herdr_sessions (
+                   ownership_id, schema, owner_kind, subject_kind, subject_id,
+                   controller_generation, pane_id, socket_path, protocol, sentinel_path,
+                   lifecycle_state, cleanup_state, cleanup_retry_budget,
+                   cleanup_retry_used, registered_at, updated_at
+                 ) VALUES (?1, 'forged.owned-herdr-session/1', 'controller', 'run', 'run-1',
+                           1, ?2, '/tmp/herdr.sock', ?3, ?4,
+                           'registered', 'not-requested', 8, 0, 't', 't')",
+                rusqlite::params![id, format!("pane-{id}"), protocol, format!("/tmp/{id}")],
+            )
+        };
+        insert("bad-protocol", 18).expect_err("unknown protocol is closed");
+        insert("owned-1", 19).expect("valid identity");
+        conn.execute(
+            "UPDATE owned_herdr_sessions SET pane_id = 'foreign-pane' \
+             WHERE ownership_id = 'owned-1'",
+            [],
+        )
+        .expect_err("identity trigger rejects rewrites");
+        conn.execute(
+            "UPDATE owned_herdr_sessions SET lifecycle_state = 'owner-dead' \
+             WHERE ownership_id = 'owned-1'",
+            [],
+        )
+        .expect("lifecycle remains mutable without invented command-start evidence");
     }
 
     #[test]
@@ -533,7 +1273,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -576,7 +1316,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 12);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

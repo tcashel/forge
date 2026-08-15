@@ -3,24 +3,26 @@
 //! retire.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 use forged_gate::GateRequest;
 use forged_ledger::{
-    AttemptState, EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState,
-    RunState,
+    EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
+    NewRunDefinition, OperationState, RunState,
 };
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
-    request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
+    request_sha256, AttentionItemV1, AttentionResolutionDisposition, AttentionState, ErrorCode,
+    ExecutionPackageV1, OperationRequest, OperationResponse, RunId, WorkIdentityContextV1,
+    WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
 use crate::adapters::ports::{report_json, ForgedPorts};
 use crate::config::{now_iso, stage_str};
 use crate::core::{
-    default_key, derive_key, epic, err_response, fenced, key_absent, on_ledger, param_opt_str,
-    param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
+    default_key, derive_key, epic, err_response, fenced, key_absent, ok_response, on_ledger,
+    param_opt_str, param_str, read_only, session_claimant, split_packet_key, Ctx, Failure,
 };
 
 // ---------------------------------------------------------------- doctor
@@ -84,6 +86,12 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     ctx.config.config_path.display()
                 )
             },
+        }));
+        let (service_ok, service_detail) = crate::runtime::doctor_probe(&ctx.config).await;
+        probes.push(json!({
+            "name": "supervisor-service",
+            "ok": service_ok,
+            "detail": service_detail,
         }));
         Ok(json!({"probes": probes}))
     })
@@ -323,16 +331,16 @@ pub(crate) async fn run_start_with_definition(
         "packageSha256".to_owned(),
         Value::String(compiled.package_sha256.clone()),
     );
+    match recover_applied_run_start(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
     let params = req.params.clone();
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
-        move |_op| async move {
-            let repo = param_str(&params, "repo")?.to_owned();
+        move |operation_id| async move {
+            let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
             let spec = param_opt_str(&params, "spec").map(str::to_owned);
-            if !Path::new(&repo).is_absolute() {
-                return Err(Failure::invalid(format!(
-                    "--repo must be an absolute path, got {repo:?}"
-                )));
-            }
             let issue = ready_slice_bead(ctx, &bead).await?;
             // The spec source is settled BEFORE the run row exists: a bead
             // with no spec, or a spec path that is not there, must never
@@ -375,38 +383,57 @@ pub(crate) async fn run_start_with_definition(
                 package_sha256: compiled.package_sha256,
                 compatibility_roster: compiled.compatibility_roster,
             };
-            let row = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.create_run_with_definition(new_run, definition)
-            })
-            .await?;
             // Persist the spec SOURCE for packet building — the run row has
             // no spec column, and every process must resolve the same one.
             // `specPath` stays in the payload for the deprecated file route,
             // so an in-flight run started by an older binary still reads.
-            let run_for_event = row.run_id.clone();
+            let project = super::work_identity::context_from_params(&params, "project");
+            let epic = super::work_identity::context_from_params(&params, "epic");
+            let identity = super::work_identity::durable_identity(
+                WorkIdentitySubjectKind::Run,
+                run_id.as_str(),
+                &bead,
+                Some(&issue.title),
+                issue.revision.as_deref(),
+                Some(&repo),
+                project,
+                epic,
+            )?;
             let payload = match &source {
                 super::spec::SpecSource::File(path) => json!({
-                    "runId": row.run_id,
+                    "runId": run_id.as_str(),
                     "source": "file",
                     "specPath": path,
                     "deprecated": true,
-                    "beadTitle": issue.title,
+                    "beadId": bead,
+                    "beadTitle": identity.bead.title.clone(),
+                    "beadRevision": issue.revision,
+                    "repo": repo,
+                    "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
+                    "project": identity.project.clone(),
+                    "epic": identity.epic.clone(),
                 }),
                 super::spec::SpecSource::Bead(bead_id) => json!({
-                    "runId": row.run_id,
+                    "runId": run_id.as_str(),
                     "source": "bead",
                     "beadId": bead_id,
-                    "beadTitle": issue.title,
+                    "beadTitle": identity.bead.title.clone(),
+                    "beadRevision": issue.revision,
+                    "repo": repo,
+                    "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
+                    "project": identity.project.clone(),
+                    "epic": identity.epic.clone(),
                 }),
             };
-            on_ledger(&ctx.ledger, move |l| {
-                l.append_event(Some(&run_for_event), "forged.run.spec", payload)
+            let row = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.create_run_with_identity(new_run, definition, payload, identity)
             })
             .await?;
+            crate::failpoint::hit("run.start.bundle.after");
             Ok(json!({
                 "run_id": row.run_id,
                 "bead_id": row.bead_id,
@@ -422,6 +449,108 @@ pub(crate) async fn run_start_with_definition(
         }
     })
     .await
+}
+
+async fn recover_applied_run_start(
+    ctx: &Ctx,
+    request: &OperationRequest,
+    run_id: &RunId,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "run_start".to_owned();
+    let key = request.idempotency_key.clone();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
+        return Ok(None);
+    };
+    let hash = request_sha256(request)
+        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
+    if row.request_sha256 != hash {
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            "run start key was stored with a different request",
+        ));
+    }
+    let Some(result) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
+        return Ok(None);
+    };
+    let response = ok_response(&row.operation_id, false, result);
+    let operation_id = row.operation_id;
+    let stored = response.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.resolve_interrupted_operation(&operation_id, &stored)
+    })
+    .await?;
+    let mut replayed = response;
+    replayed.reused = true;
+    Ok(Some(replayed))
+}
+
+/// Recover the applied side of an interrupted atomic run creation without
+/// consulting Beads. The operation id is written into `forged.run.spec` in
+/// the same transaction as the run and identity, so a matching event proves
+/// this exact safe-retry operation committed its effect.
+async fn replay_atomic_run_start(
+    ctx: &Ctx,
+    run_id: &RunId,
+    operation_id: &str,
+) -> Result<Option<Value>, Failure> {
+    let run_name = run_id.as_str().to_owned();
+    let operation_id = operation_id.to_owned();
+    let events = on_ledger(&ctx.ledger, {
+        let run_name = run_name.clone();
+        move |ledger| ledger.list_events(Some(&run_name), 0, 4096)
+    })
+    .await?;
+    let landed = events.iter().any(|event| {
+        event.kind == "forged.run.spec"
+            && serde_json::from_str::<Value>(&event.payload_json)
+                .ok()
+                .and_then(|payload| {
+                    payload
+                        .get("operationId")
+                        .and_then(Value::as_str)
+                        .map(|stored| stored == operation_id)
+                })
+                .unwrap_or(false)
+    });
+    if !landed {
+        return Ok(None);
+    }
+    let identity = on_ledger(&ctx.ledger, {
+        let run_name = run_name.clone();
+        move |ledger| ledger.get_work_identity(WorkIdentitySubjectKind::Run, &run_name)
+    })
+    .await?
+    .ok_or_else(|| Failure::internal("atomic run creation event has no durable identity"))?;
+    identity
+        .validate_for_storage()
+        .map_err(|error| Failure::internal(format!("stored work identity is invalid: {error}")))?;
+    let (run, definition) = on_ledger(&ctx.ledger, move |ledger| {
+        Ok((
+            ledger.get_run(&run_name)?,
+            ledger.get_run_definition(&run_name)?,
+        ))
+    })
+    .await?;
+    let definition = definition
+        .ok_or_else(|| Failure::internal("atomic run creation has no durable definition"))?;
+    let package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
+        .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
+    Ok(Some(json!({
+        "run_id": run.run_id,
+        "bead_id": run.bead_id,
+        "branch": run.branch,
+        "base_ref": run.base_ref,
+        "protocol_ref": package.protocol_ref,
+        "profile_ref": package.profile_ref,
+        "roster_ref": package.roster_ref,
+        "package_sha256": definition.package_sha256,
+        "profile_sha256": definition.profile_sha256,
+        "roster_sha256": definition.roster_sha256,
+    })))
 }
 
 /// The repo's default branch, from its `origin/HEAD` symref; falls back to
@@ -475,6 +604,16 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
+        let identity =
+            super::work_identity::load(ctx, WorkIdentitySubjectKind::Run, run_id).await?;
+        let herdr_layout = super::herdr_layout::status(
+            ctx,
+            forged_types::HerdrLayoutSubjectV1 {
+                kind: forged_types::HerdrLayoutSubjectKind::Run,
+                id: run_id.to_owned(),
+            },
+        )
+        .await;
         let expected_assignee = crate::core::run_holder(&view.run.bead_id);
         let claim_health = match forged_beads::show_issue(&ctx.config.bd_config(), &view.run.bead_id).await {
             Ok(issue) => {
@@ -617,6 +756,8 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         Ok(json!({
             "run": {
                 "runId": view.run.run_id,
+                "identity": identity,
+                "herdrLayout": herdr_layout,
                 "beadId": view.run.bead_id,
                 "repo": view.run.repo,
                 "baseRef": view.run.base_ref,
@@ -792,6 +933,7 @@ pub async fn run_revise_roster(ctx: &Ctx, req: &mut OperationRequest) -> Operati
         None,
         {
             move |operation| async move {
+                let _submit_guard = super::handoff::acquire_run_submit(ctx, &run_id).await?;
                 let definition = {
                     let run_id = run_id.clone();
                     on_ledger(&ctx.ledger, move |ledger| {
@@ -1096,38 +1238,55 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 on_ledger(&ctx.ledger, move |l| l.get_packet(&packet_id)).await?
             };
             // The claimant is the PACKET-scoped session identity, not the
-            // run's bd lease holder — see `core::session_claimant`. The
-            // stored body carries the hints the packet was opened with.
+            // run's bd lease holder — see `core::session_claimant`.
             let view = super::drive::project(ctx, &row.run_id).await?;
+            let packet_admission = super::admission::PacketAdmission {
+                packet_id: packet_id.clone(),
+                run_id: row.run_id.clone(),
+                bead_id: view.run.bead_id.clone(),
+            };
+            let admission_guard = super::handoff::acquire_packet_submit(
+                ctx,
+                &packet_admission.packet_id,
+                &packet_admission.run_id,
+            )
+            .await?;
+            let admission = super::admission::admit_packet_facts(ctx, &packet_admission).await?;
+            if admission.decision.outcome != forged_types::AdmissionOutcome::Admitted {
+                return Err(Failure {
+                    code: ErrorCode::OperationInProgress,
+                    message: format!(
+                        "packet {packet_id} deferred by admission: {:?}",
+                        admission.decision.reason
+                    ),
+                    recoverable: true,
+                });
+            }
+            let reservation_id = admission
+                .reservation
+                .ok_or_else(|| Failure::internal("admitted packet has no capacity reservation"))?
+                .reservation_id;
             // ONE spec read for this claim: it answers both the fence the
             // ledger compares and the bytes the seat will read.
             let spec_ref = forged_proto::packet_spec(&row);
             let resolved =
                 super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
             let fence = resolved.fence.clone();
-            let provider = if view.execution_package.is_some() {
-                super::drive::stored_packet_for_attempt(&view, &packet_id)?
-                    .provider_hints
-                    .provider
-            } else {
-                view.roster
-                    .get(&row.stage)
-                    .map(|hints| hints.provider.clone())
-                    .ok_or_else(|| {
-                        Failure::invalid(format!(
-                            "legacy roster has no provider for {:?}",
-                            row.stage
-                        ))
-                    })?
-            };
+            let provider = admission
+                .packet_provider_hints
+                .as_ref()
+                .map(|hints| hints.provider.clone())
+                .ok_or_else(|| Failure::internal("packet admission omitted provider facts"))?;
             let claimant = session_claimant(&packet_id, &provider);
             let claimed = {
                 let packet_id = packet_id.clone();
                 on_ledger(&ctx.ledger, move |l| {
-                    l.claim_packet(&packet_id, &claimant, &fence)
+                    l.claim_packet_with_admission(&packet_id, &claimant, &fence, &reservation_id)
                 })
                 .await?
             };
+            crate::failpoint::hit("admission.reservation.transfer.after");
+            drop(admission_guard);
             // The claim is what fenced these bytes, so the body is written
             // only once it has succeeded. An external seat on the
             // `packet claim` -> `packet complete` path never enters
@@ -1638,7 +1797,7 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 const RUN_SETTLED: &str = "run.settled";
 const PROTO_PR: &str = "proto.pr";
 const CONTROLLER_STARTED: &str = "forged.controller.started";
-const LIFECYCLE_KINDS: [&str; 7] = [
+pub(super) const LIFECYCLE_KINDS: [&str; 7] = [
     epic::STARTED,
     epic::PAUSED,
     epic::RESUMED,
@@ -1766,7 +1925,14 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
     // the lifecycle kinds are folded into a single entry each, and reading
     // them across separate transactions would let an epic's start event and
     // its pause land on opposite sides of a concurrent write.
-    let snapshot = on_ledger(&ctx.ledger, |l| l.inventory_snapshot(&LIFECYCLE_KINDS)).await?;
+    let usage_selection = match spend {
+        Spend::Include => InventoryUsageSelection::Include,
+        Spend::Omit => InventoryUsageSelection::Omit,
+    };
+    let snapshot = on_ledger(&ctx.ledger, move |l| {
+        l.inventory_snapshot(&LIFECYCLE_KINDS, usage_selection)
+    })
+    .await?;
     project_entries(&snapshot, spend)
 }
 
@@ -1775,7 +1941,10 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
 /// The projection, separated from the read so the portfolio derives its
 /// entries and its attention rail from the SAME snapshot: two reads would
 /// let an attempt land between them and describe a run the entries do not.
-fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Value>, Failure> {
+pub(super) fn project_entries(
+    snapshot: &InventorySnapshot,
+    spend: Spend,
+) -> Result<Vec<Value>, Failure> {
     let lifecycles = epic_lifecycles(snapshot);
     // First start event per epic id; a payload that will not parse still
     // yields a discoverable id rather than hiding the epic.
@@ -1812,10 +1981,28 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         Vec::with_capacity(snapshot.runs.len() + epics.len());
     for run in &snapshot.runs {
         let epic = epics.remove(&run.run_id).is_some();
+        let identity_kind = if epic {
+            WorkIdentitySubjectKind::Epic
+        } else {
+            WorkIdentitySubjectKind::Run
+        };
+        let identity = snapshot
+            .work_identities
+            .get(&(identity_kind, run.run_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                Failure::internal(format!(
+                    "{} {:?} has no durable work identity",
+                    identity_kind.as_str(),
+                    run.run_id
+                ))
+            })?;
+        let bead_id = identity.bead.id.clone();
         let mut entry = json!({
             "id": run.run_id.clone(),
             "kind": if epic { "epic" } else { "slice" },
-            "beadId": run.bead_id.clone(),
+            "identity": identity,
+            "beadId": bead_id,
             "repo": run.repo.clone(),
             "baseRef": run.base_ref.clone(),
             "branch": run.branch.clone(),
@@ -1840,19 +2027,23 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "currentAgent": current.get(&run.run_id).map(|(_, _, claimant)| claimant),
         });
         add_lifecycle(snapshot, &run.run_id, &mut entry);
-        add_spend(snapshot, &spend, &run.run_id, &mut entry);
+        add_spend(&snapshot.usage, &spend, &run.run_id, &mut entry)?;
         inventory.push((run.created_at.clone(), run.run_id.clone(), entry));
     }
     // Whatever is left has a start event and no run row: a real epic.
     for (epic_id, (ts, payload)) in epics {
+        let identity = snapshot
+            .work_identities
+            .get(&(WorkIdentitySubjectKind::Epic, epic_id.clone()))
+            .cloned()
+            .ok_or_else(|| {
+                Failure::internal(format!("epic {epic_id:?} has no durable work identity"))
+            })?;
         let field = |name: &str| match payload.get(name) {
             Some(value @ Value::String(_)) => value.clone(),
             _ => Value::Null,
         };
-        let bead_id = match field("epicId") {
-            Value::Null => Value::from(epic_id.clone()),
-            value => value,
-        };
+        let bead_id = identity.bead.id.clone();
         let lifecycle = lifecycles.get(&epic_id);
         let updated_at = snapshot
             .latest_event
@@ -1862,6 +2053,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
         let mut entry = json!({
             "id": epic_id,
             "kind": "epic",
+            "identity": identity,
             "beadId": bead_id,
             "repo": field("repo"),
             "baseRef": field("baseRef"),
@@ -1879,7 +2071,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             "currentAgent": current.get(&epic_id).map(|(_, _, claimant)| claimant),
         });
         add_lifecycle(snapshot, &epic_id, &mut entry);
-        add_spend(snapshot, &spend, &epic_id, &mut entry);
+        add_spend(&snapshot.usage, &spend, &epic_id, &mut entry)?;
         inventory.push((ts, epic_id, entry));
     }
     inventory.sort_by(|left, right| (&left.0, &left.1).cmp(&(&right.0, &right.1)));
@@ -1919,6 +2111,11 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
         .and_then(|record| record.get("number"))
         .cloned()
         .unwrap_or(Value::Null);
+    let pr_base = pr
+        .as_ref()
+        .and_then(|record| record.get("baseRefName").or_else(|| record.get("base")))
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut delivery = settled_delivery.unwrap_or_else(|| {
         if pr_number.is_null() {
             Value::Null
@@ -1933,6 +2130,9 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
     if delivery.get("pr").is_some_and(Value::is_null) && !pr_number.is_null() {
         delivery["pr"] = pr_number;
     }
+    if let Some(object) = delivery.as_object_mut() {
+        object.insert("prBase".to_owned(), pr_base);
+    }
     if let Some(object) = entry.as_object_mut() {
         object.insert("outcome".to_owned(), outcome);
         object.insert("delivery".to_owned(), delivery);
@@ -1946,87 +2146,75 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
 
 /// Stamp one entry's spend, when the caller asked for it.
 ///
-/// Read from the snapshot's own `usage_totals` — the single grouped scan
+/// Read from the snapshot's included usage payload — the single grouped scan
 /// taken inside the snapshot transaction — never a `usage_totals` query per
-/// entry: an uncapped inventory would otherwise put one job per row through
+/// entry. An uncapped inventory would otherwise put one job per row through
 /// the single ledger writer, and a figure read after the snapshot could
-/// describe a state the entries and the rail never jointly held.
+/// describe a state the entries and the rail never jointly held. An omitted
+/// payload is refused instead of being projected as measured zero.
 ///
 /// A run with no usage rows is ABSENT from that map, and absent is zero:
 /// spend not incurred, not spend unmeasured.
-fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut Value) {
+fn add_spend(
+    usage: &InventoryUsage,
+    spend: &Spend,
+    id: &str,
+    entry: &mut Value,
+) -> Result<(), Failure> {
     let Spend::Include = spend else {
-        return;
+        return Ok(());
     };
-    let totals = snapshot.usage_totals.get(id);
+    let InventoryUsage::Included { totals, .. } = usage else {
+        return Err(Failure::internal(
+            "spend projection requires included inventory usage",
+        ));
+    };
+    let totals = totals.get(id);
     let cost_usd_known = totals.map_or(0.0, |t| t.cost_usd_known);
     let rows_missing_cost = totals.map_or(0, |t| t.rows_missing_cost);
     if let Some(object) = entry.as_object_mut() {
         object.insert("costUsdKnown".to_owned(), json!(cost_usd_known));
         object.insert("rowsMissingCost".to_owned(), json!(rows_missing_cost));
     }
+    Ok(())
 }
 
-/// The durable kinds the attention rail is folded from, on top of
-/// [`LIFECYCLE_KINDS`]. `proto.quarantine` is spelled here rather than
-/// imported because the ledger stores kind strings and the proto crate
-/// exposes the vocabulary only through its parsed variants.
-const ATTENTION_KINDS: [&str; 4] = [
-    epic::INPUT_REQUIRED,
-    epic::INPUT_RESOLVED,
-    "proto.quarantine",
-    "run.bead-settlement.pending",
-];
+#[cfg(test)]
+mod spend_projection_tests {
+    use super::*;
 
-/// One condition needing a human, in the order the rail reports them.
-///
-/// Severity, not alphabet: a subject holding for an answer or stuck
-/// mid-reclaim blocks work, custody of a refused result is evidence a human
-/// must adjudicate, and an unpriced usage row only makes a figure partial.
-const CONDITIONS: [&str; 7] = [
-    "input-required",
-    "blocked",
-    "beads-settlement-pending",
-    "revoking",
-    "quarantined",
-    "awaiting-delivery",
-    "missing-cost",
-];
+    #[test]
+    fn included_empty_usage_is_measured_zero_but_omission_cannot_impersonate_it() {
+        let included = InventoryUsage::Included {
+            totals: BTreeMap::new(),
+            latest_missing: BTreeMap::new(),
+        };
+        let mut measured = json!({});
+        add_spend(&included, &Spend::Include, "run-a", &mut measured).expect("measured spend");
+        assert_eq!(measured["costUsdKnown"], json!(0.0));
+        assert_eq!(measured["rowsMissingCost"], json!(0));
 
-/// The whole inventory and what needs a human, from ONE snapshot.
-pub struct Portfolio {
-    /// Every inventory entry, oldest first — [`inventory`]'s own order.
-    pub entries: Vec<Value>,
-    /// One entry per (subject, condition), most severe condition first.
-    pub attention: Vec<Value>,
-    /// The operator-facing grouping shared by `work list` and Overview.
-    pub queue: Value,
-}
+        let mut omitted = json!({});
+        add_spend(
+            &InventoryUsage::Omitted,
+            &Spend::Omit,
+            "run-a",
+            &mut omitted,
+        )
+        .expect("explicit omission");
+        assert!(omitted.get("costUsdKnown").is_none());
+        assert!(omitted.get("rowsMissingCost").is_none());
 
-/// The portfolio: [`inventory`] with spend, plus the attention rail folded
-/// from the same snapshot.
-///
-/// Costs ONE ledger job, exactly as `inventory` does: every condition the
-/// rail reports has a durable source already inside the snapshot — the epic
-/// input events, `proto.quarantine`, `attempts.state = 'revoking'` via
-/// `live_attempts`, and the `usage_totals` map the entries are stamped from.
-/// Neither spend nor any condition adds a query, so the entries, the spend
-/// and the rail describe ONE ledger rather than a state that never held.
-pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
-    let kinds: Vec<&str> = LIFECYCLE_KINDS
-        .iter()
-        .chain(ATTENTION_KINDS.iter())
-        .copied()
-        .collect();
-    let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
-    let mut entries = project_entries(&snapshot, Spend::Include)?;
-    let attention = attention_rail(&snapshot, &entries);
-    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention).await;
-    Ok(Portfolio {
-        entries,
-        attention,
-        queue,
-    })
+        let mut inconsistent = json!({});
+        add_spend(
+            &InventoryUsage::Omitted,
+            &Spend::Include,
+            "run-a",
+            &mut inconsistent,
+        )
+        .expect_err("omitted usage cannot project measured zero");
+        assert!(inconsistent.as_object().expect("object").is_empty());
+    }
 }
 
 const QUEUE_GROUPS: [&str; 5] = [
@@ -2042,18 +2230,13 @@ const QUEUE_GROUPS: [&str; 5] = [
 /// Beads is queried once for exactly the ids in the ledger. Controller
 /// records and progress events come from the already-open inventory
 /// snapshot, avoiding a ledger projection per row.
-async fn operator_queue(
-    ctx: &Ctx,
+pub(super) fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
+    bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
 ) -> Value {
-    let bead_ids: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-        .collect();
-    let bead_read = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await;
-    let bead_error = bead_read.as_ref().err().map(ToString::to_string);
+    let bead_error = bead_read.as_ref().err().cloned();
     let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
         .unwrap_or_default()
         .into_iter()
@@ -2108,24 +2291,18 @@ async fn operator_queue(
     for entry in entries.iter_mut() {
         let id = entry["id"].as_str().unwrap_or_default().to_owned();
         let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
-        let controller = super::handoff::controller_status_from_snapshot(
-            ctx,
-            &id,
-            controller_records.remove(&id).map(|(_, record)| record),
-            snapshot.latest_event.get(&id),
-        )
-        .await;
+        let record = controller_records.remove(&id).map(|(_, record)| record);
+        let controller = durable_controller_status(snapshot, &id, record);
         let issue = beads.get(&bead_id);
-        let title = issue
-            .map(|issue| issue.title.trim())
-            .filter(|title| !title.is_empty())
-            .map(str::to_owned)
-            .unwrap_or_else(|| {
-                format!(
-                    "Legacy {} {bead_id}",
-                    entry["kind"].as_str().unwrap_or("work")
-                )
-            });
+        // Human-readable identity is frozen with the work. The bounded
+        // Beads read below remains authoritative for claim health and
+        // repository membership, but a later rename or outage must not
+        // rewrite historical display state.
+        let title = entry
+            .pointer("/identity/displayTitle")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
         let expected = crate::core::run_holder(&bead_id);
         let controller_state = controller.get("state").and_then(Value::as_str);
         let controller_live = controller_state == Some("running");
@@ -2133,6 +2310,10 @@ async fn operator_queue(
         let claim_known = issue.is_some();
         let claim_status = issue.map(|issue| issue.status.as_str());
         let assignee = issue.and_then(|issue| issue.assignee.as_deref());
+        let repository_identity = issue
+            .and_then(|issue| issue.metadata.get("repository"))
+            .map(String::as_str)
+            .filter(|identity| !identity.is_empty());
         let holder_mismatch = assignee
             .is_some_and(|holder| holder != expected && holder != crate::core::FRONTIER_HOLDER);
         let outcome = entry["outcome"].as_str();
@@ -2142,6 +2323,7 @@ async fn operator_queue(
             || entry["state"] == json!("stopped");
         let dead_controller = !controller.is_null()
             && matches!(controller_state, Some("dead" | "vanished" | "exited"));
+        let unverified_controller_is_blocker = false;
         let stale = claim_status == Some("in_progress")
             && (holder_mismatch
                 || (!awaiting_delivery
@@ -2177,6 +2359,7 @@ async fn operator_queue(
         });
         let attention_item = attention_by_id.get(id.as_str()).copied();
         let attention_condition = attention_item.and_then(|item| item["condition"].as_str());
+        let attention_owner = attention_item.and_then(|item| item["owner"].as_str());
         let blocker = attention_item
             .map(|item| item["detail"].clone())
             .or_else(|| {
@@ -2190,12 +2373,14 @@ async fn operator_queue(
             })
             .or_else(|| stale.then(|| json!(claim_detail)))
             .or_else(|| {
-                matches!(controller_state, Some("dead" | "vanished" | "unknown")).then(|| {
-                    json!(format!(
-                        "detached controller is {}",
-                        controller_state.unwrap_or("unknown")
-                    ))
-                })
+                (matches!(controller_state, Some("dead" | "vanished"))
+                    || unverified_controller_is_blocker)
+                    .then(|| {
+                        json!(format!(
+                            "detached controller is {}",
+                            controller_state.unwrap_or("unknown")
+                        ))
+                    })
             })
             .unwrap_or(Value::Null);
         let recorded_pr = pr_records.remove(&id).map(|(_, record)| record);
@@ -2206,7 +2391,8 @@ async fn operator_queue(
                 Some(number @ Value::Number(_)) => json!({
                     "number": number,
                     "url": Value::Null,
-                    "baseBranch": entry["baseRef"],
+                    "baseBranch": entry.pointer("/delivery/prBase")
+                        .cloned().unwrap_or(Value::Null),
                     "isDraft": Value::Null,
                 }),
                 _ => Value::Null,
@@ -2215,38 +2401,44 @@ async fn operator_queue(
                 json!({
                     "number": record.get("number").cloned().unwrap_or(Value::Null),
                     "url": record.get("url").cloned().unwrap_or(Value::Null),
-                    "baseBranch": record.get("base").cloned()
-                        .unwrap_or_else(|| entry["baseRef"].clone()),
+                    "baseBranch": record.get("baseRefName")
+                        .or_else(|| record.get("base"))
+                        .cloned().unwrap_or(Value::Null),
                     "isDraft": record.get("isDraft").cloned().unwrap_or(Value::Null),
                 })
             },
         );
-        let has_pr = !pr.is_null();
-        let merge_actionable = awaiting_delivery && has_pr;
-        let needs_intervention =
-            attention_item.is_some() && attention_condition != Some("awaiting-delivery");
-        let group = if needs_intervention || claim_status == Some("blocked") {
+        let has_pr = pr.get("number").is_some_and(Value::is_number);
+        let exact_base = pr.get("baseBranch").and_then(Value::as_str)
+            == entry.get("baseRef").and_then(Value::as_str);
+        let merge_actionable = awaiting_delivery && has_pr && exact_base;
+        let merge_attention = attention_condition == Some("merge-approval") && has_pr && exact_base;
+        let group = if merge_attention || (merge_actionable && attention_item.is_none()) {
+            "Ready to merge"
+        } else if attention_owner == Some("human") || claim_status == Some("blocked") {
             "Needs me"
         } else if execution_live {
             "Running"
-        } else if merge_actionable {
-            "Ready to merge"
-        } else if attention_item.is_some() {
-            // A clean outcome without its promised PR is not mergeable.
-            "Needs me"
-        } else if !claim_known
+        } else if attention_owner == Some("lead-agent")
+            || !claim_known
             || stale
             || claim_status == Some("closed")
             || dead_controller
-            || controller_state == Some("unknown")
+            || unverified_controller_is_blocker
             || entry["state"] == json!("stopped")
         {
             "Stalled or recoverable"
         } else {
             "Planned"
         };
+        let projected_action = attention_item
+            .and_then(|item| item.pointer("/recommendedAction/text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let next_action = match group {
-            "Needs me" => "Resolve the recorded blocker, then resume execution".to_owned(),
+            "Needs me" => projected_action.unwrap_or_else(|| {
+                "Resolve the recorded blocker, then resume execution".to_owned()
+            }),
             "Ready to merge" => format!(
                 "Merge PR {} into {}",
                 pr.get("number")
@@ -2259,14 +2451,27 @@ async fn operator_queue(
                 || "Let the verified controller advance the workflow".to_owned(),
                 |stage| format!("Wait for {stage} to settle"),
             ),
-            "Stalled or recoverable" => {
+            "Stalled or recoverable" => projected_action.unwrap_or_else(|| {
                 "Inspect the blocker and resubmit only after controller death is verified"
                     .to_owned()
-            }
+            }),
             _ => "Submit a detached controller when this work should start".to_owned(),
         };
         if let Some(object) = entry.as_object_mut() {
-            object.insert("title".to_owned(), json!(title));
+            object.insert("title".to_owned(), Value::String(title));
+            object.insert(
+                "repositoryScope".to_owned(),
+                json!({
+                    "known": repository_identity.is_some(),
+                    "identity": repository_identity,
+                    "source": repository_identity
+                        .map(|_| "beads.metadata.repository")
+                        .unwrap_or("unknown"),
+                }),
+            );
+            if let Some(execution) = object.get_mut("execution").and_then(Value::as_object_mut) {
+                execution.insert("controller".to_owned(), controller.clone());
+            }
             object.insert("controller".to_owned(), controller);
             object.insert("claimHealth".to_owned(), claim_health);
             object.insert("blocker".to_owned(), blocker);
@@ -2293,11 +2498,91 @@ async fn operator_queue(
     let groups: Vec<Value> = QUEUE_GROUPS
         .iter()
         .map(|name| {
-            let items = grouped.remove(name).unwrap_or_default();
+            let mut items = grouped.remove(name).unwrap_or_default();
+            items.sort_by(|left, right| {
+                let lp = left
+                    .get("priority")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MAX);
+                let rp = right
+                    .get("priority")
+                    .and_then(Value::as_i64)
+                    .unwrap_or(i64::MAX);
+                lp.cmp(&rp)
+                    .then_with(|| {
+                        right
+                            .get("updatedAt")
+                            .and_then(Value::as_str)
+                            .cmp(&left.get("updatedAt").and_then(Value::as_str))
+                    })
+                    .then_with(|| {
+                        left.get("id")
+                            .and_then(Value::as_str)
+                            .cmp(&right.get("id").and_then(Value::as_str))
+                    })
+            });
             json!({"name": name, "count": items.len(), "entries": items})
         })
         .collect();
     json!({"groups": groups, "total": entries.len(), "asOf": as_of})
+}
+
+/// Controller evidence which never consults controller files or the OS.
+///
+/// A durable `running` desire is authorization, not liveness, so the state is
+/// deliberately `unknown` unless a live attempt independently proves useful
+/// execution. Operations can show that authorization and the last supervisor
+/// outcome without turning a process probe into one job per row.
+fn durable_controller_status(
+    snapshot: &InventorySnapshot,
+    id: &str,
+    record: Option<Value>,
+) -> Value {
+    let desired = snapshot
+        .desired_work
+        .iter()
+        .find(|row| row.subject_id == id);
+    let Some(desired) = desired else {
+        return record.map_or(Value::Null, |record| {
+            json!({
+                "state": "unknown",
+                "verified": false,
+                "source": "durable-event",
+                "record": record,
+                "detail": "controller event exists but no desired-work row proves current liveness",
+                "lastProgressAt": snapshot.latest_event.get(id).map(|row| &row.ts),
+                "lastProgressKind": snapshot.latest_event.get(id).map(|row| &row.kind),
+                "lastProgressEventId": snapshot.latest_event.get(id).map(|row| row.event_id),
+            })
+        });
+    };
+    let state = match desired.desired_state {
+        forged_ledger::DesiredState::Stopped => "stopped",
+        forged_ledger::DesiredState::Paused => "paused",
+        forged_ledger::DesiredState::Running => "unknown",
+    };
+    json!({
+        "state": state,
+        "verified": false,
+        "source": "desired-work",
+        "desiredState": desired.desired_state.as_str(),
+        "generation": desired.controller_generation,
+        "controlRevision": desired.control_revision,
+        "restartBudget": desired.restart_budget,
+        "restartUsed": desired.restart_used,
+        "nextWakeAt": desired.next_wake_at,
+        "lastOutcome": desired.last_outcome.map(|value| value.as_str()),
+        "lastError": desired.last_error,
+        "record": record,
+        "detail": if state == "unknown" {
+            "durable authorization exists; current process liveness was not probed"
+        } else {
+            "durable desired-work state is authoritative"
+        },
+        "lastProgressAt": snapshot.latest_event.get(id).map(|row| &row.ts),
+        "lastProgressKind": snapshot.latest_event.get(id).map(|row| &row.kind),
+        "lastProgressEventId": snapshot.latest_event.get(id).map(|row| row.event_id),
+    })
 }
 
 /// Fold one snapshot into the attention rail.
@@ -2309,6 +2594,7 @@ async fn operator_queue(
 ///
 /// `entries` supplies each subject's `kind` and the spend the rail's last
 /// condition reads, so no id is looked up twice.
+#[cfg(any())]
 fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value> {
     let kinds: BTreeMap<&str, &str> = entries
         .iter()
@@ -2558,16 +2844,1123 @@ fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value>
         .collect()
 }
 
-/// `work list` — the discovery surface, serving [`inventory`] whole.
+/// Normalize one repository identity without consulting the filesystem.
+///
+/// Existing absolute checkout paths are collapsed lexically (`//`, `.`, and
+/// `..`) but never canonicalized through the live checkout: a checkout rename
+/// must not silently turn a stored identity into another one. Non-path
+/// identities are retained as exact strings so a future remote identity can
+/// use this same public selector.
+fn repository_selector(req: &OperationRequest, operation: &str) -> Result<Option<String>, Failure> {
+    let Some(value) = req.params.get("repo") else {
+        return Ok(None);
+    };
+    let raw = value
+        .as_str()
+        .ok_or_else(|| Failure::invalid(format!("{operation} repo must be a non-empty string")))?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return Err(Failure::invalid(format!(
+            "{operation} repo must be a non-empty string"
+        )));
+    }
+    let path = Path::new(trimmed);
+    if !path.is_absolute() {
+        return Ok(Some(trimmed.to_owned()));
+    }
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                if !normalized.pop() {
+                    return Err(Failure::invalid(format!(
+                        "{operation} repo cannot escape its absolute root: {trimmed:?}"
+                    )));
+                }
+            }
+            Component::Prefix(_) | Component::RootDir | Component::Normal(_) => {
+                normalized.push(component.as_os_str());
+            }
+        }
+    }
+    Ok(Some(normalized.to_string_lossy().into_owned()))
+}
+
+/// `work list` — the discovery surface, serving [`inventory`] whole or the
+/// exact repository subset named by Bead metadata.
 ///
 /// The one entry point that takes no id, so a caller with no prior knowledge
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let portfolio = portfolio(ctx).await?;
-        Ok(json!({"runs": portfolio.entries, "queue": portfolio.queue}))
+        let projection = operations_projection(ctx, req).await?;
+        if req.params.contains_key("repo")
+            && projection.pointer("/sourceHealth/beads/state").and_then(Value::as_str)
+                != Some("available")
+        {
+            return Err(Failure {
+                code: ErrorCode::BeadsError,
+                message: "work_list repository membership is unavailable".to_owned(),
+                recoverable: false,
+            });
+        }
+        let groups = durable_compatibility_groups(&projection);
+        let runs = groups
+            .iter()
+            .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>();
+        let total = runs.len();
+        let attention = projection
+            .get("attention")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let total = projection
+            .pointer("/counts/durable")
+            .and_then(Value::as_u64)
+            .unwrap_or(total as u64);
+        Ok(json!({
+            "runs": runs,
+            "queue": {
+                "groups": groups,
+                "total": total,
+                "cap": projection.pointer("/coverage/limit").cloned().unwrap_or(json!(OPERATIONS_DEFAULT_LIMIT)),
+                "asOf": projection.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
+            },
+            "attentionTotal": attention.as_array().map_or(0, Vec::len),
+            "attention": attention,
+            "sourceHealth": projection.get("sourceHealth").cloned().unwrap_or(Value::Null),
+        }))
     })
     .await
+}
+
+/// Legacy discovery never included plan-only Beads. Preserve that boundary
+/// while sourcing its ordering and grouping from Operations.
+pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
+    projection
+        .pointer("/queue/groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|group| {
+            let entries = group
+                .get("entries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                .cloned()
+                .collect::<Vec<_>>();
+            json!({
+                "name": group.get("label").cloned().unwrap_or(Value::Null),
+                "count": entries.len(),
+                "entries": entries,
+            })
+        })
+        .collect()
+}
+
+const OPERATIONS_DEFAULT_LIMIT: u64 = 200;
+const OPERATIONS_MAX_LIMIT: u64 = 500;
+const LIVE_PLAN_LIMIT: usize = 500;
+
+pub(super) fn queue_code(label: &str) -> Option<&'static str> {
+    match label {
+        "Needs me" => Some("needs-me"),
+        "Ready to merge" => Some("ready-to-merge"),
+        "Running" => Some("running"),
+        "Stalled or recoverable" => Some("stalled-or-recoverable"),
+        "Planned" => Some("planned"),
+        _ => None,
+    }
+}
+
+fn operations_filter(req: &OperationRequest, key: &str) -> Result<Option<String>, Failure> {
+    let Some(value) = req.params.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Failure::invalid(format!(
+                "operations_overview {key} must be a non-empty string"
+            ))
+        })?;
+    Ok(Some(value.to_owned()))
+}
+
+fn work_ref(kind: WorkRefKind, id: &str) -> Result<Value, Failure> {
+    let reference = WorkRefV1::new(kind, id).map_err(|error| {
+        Failure::internal(format!("constructing operator work reference: {error}"))
+    })?;
+    serde_json::to_value(reference)
+        .map_err(|error| Failure::internal(format!("serializing operator work reference: {error}")))
+}
+
+pub(super) fn live_plan_entry(
+    plan: &forged_beads::PlanIssue,
+    captured_at: &str,
+) -> Result<Value, Failure> {
+    let repository = plan
+        .issue
+        .metadata
+        .get("repository")
+        .map(String::as_str)
+        .filter(|value| !value.trim().is_empty());
+    let kind = if plan.issue.issue_type == "epic" {
+        WorkIdentitySubjectKind::Epic
+    } else {
+        WorkIdentitySubjectKind::Run
+    };
+    let epic = plan.parent.as_ref().map(|id| WorkIdentityContextV1 {
+        id: id.clone(),
+        title: None,
+    });
+    let captured_at = plan.issue.updated_at.as_deref().unwrap_or(captured_at);
+    let identity = super::work_identity::live_plan_identity(
+        kind,
+        &plan.issue.id,
+        &plan.issue.id,
+        Some(&plan.issue.title),
+        plan.issue.revision.as_deref(),
+        repository,
+        None,
+        epic,
+        captured_at,
+    )?;
+    let reference = work_ref(WorkRefKind::Plan, &plan.issue.id)?;
+    Ok(json!({
+        "id": plan.issue.id,
+        "kind": if kind == WorkIdentitySubjectKind::Epic { "epic" } else { "plan" },
+        "source": "live-plan",
+        "workRef": reference,
+        "detailTarget": Value::Null,
+        "identity": identity,
+        "beadId": plan.issue.id,
+        "repo": repository,
+        "baseRef": Value::Null,
+        "branch": Value::Null,
+        "state": "planned",
+        "stopReason": Value::Null,
+        "outcome": Value::Null,
+        "delivery": Value::Null,
+        "supersededBy": Value::Null,
+        "createdAt": captured_at,
+        "updatedAt": captured_at,
+        "lastProgressAt": captured_at,
+        "liveSeats": 0,
+        "currentStage": Value::Null,
+        "currentSeat": Value::Null,
+        "currentAgent": Value::Null,
+        "costUsdKnown": 0.0,
+        "rowsMissingCost": 0,
+        "priority": plan.issue.priority,
+        "plan": {
+            "source": "beads",
+            "status": plan.issue.status,
+            "readiness": plan.readiness(),
+            "priority": plan.issue.priority,
+            "assignee": plan.issue.assignee,
+            "issueType": plan.issue.issue_type,
+            "revision": plan.issue.revision,
+            "parent": plan.parent,
+            "dependencies": plan.dependencies,
+        },
+    }))
+}
+
+fn operations_subject_matches(
+    kind: WorkIdentitySubjectKind,
+    id: &str,
+    subject_kind: forged_types::AdmissionSubjectKind,
+    subject_id: &str,
+) -> bool {
+    match subject_kind {
+        forged_types::AdmissionSubjectKind::Run => {
+            kind == WorkIdentitySubjectKind::Run && subject_id == id
+        }
+        forged_types::AdmissionSubjectKind::Epic => {
+            kind == WorkIdentitySubjectKind::Epic && subject_id == id
+        }
+        forged_types::AdmissionSubjectKind::Packet => {
+            kind == WorkIdentitySubjectKind::Run
+                && split_packet_key(subject_id).is_ok_and(|(run_id, _, _)| run_id == id)
+        }
+    }
+}
+
+fn desired_fact(row: &forged_ledger::DesiredWorkRow) -> Value {
+    json!({
+        "source": "ledger",
+        "subjectKind": row.subject_kind.as_str(),
+        "subjectId": row.subject_id,
+        "state": row.desired_state.as_str(),
+        "controlRevision": row.control_revision,
+        "controllerGeneration": row.controller_generation,
+        "predecessorGeneration": row.predecessor_generation,
+        "restartBudget": row.restart_budget,
+        "restartUsed": row.restart_used,
+        "nextWakeAt": row.next_wake_at,
+        "lastProgressAt": row.last_progress_at,
+        "lastOutcome": row.last_outcome.map(|value| value.as_str()),
+        "lastError": row.last_error,
+        "exhaustedAt": row.exhausted_at,
+        "updatedAt": row.updated_at,
+    })
+}
+
+fn reservation_fact(row: &forged_ledger::AdmissionReservationRow) -> Value {
+    json!({
+        "reservationId": row.reservation_id,
+        "decisionId": row.decision_id,
+        "subjectKind": match row.subject_kind {
+            forged_types::AdmissionSubjectKind::Run => "run",
+            forged_types::AdmissionSubjectKind::Epic => "epic",
+            forged_types::AdmissionSubjectKind::Packet => "packet",
+        },
+        "subjectId": row.subject_id,
+        "controlRevision": row.control_revision,
+        "repository": row.repository,
+        "provider": row.provider,
+        "model": row.model,
+        "resourceClass": match row.resource_class {
+            forged_types::AdmissionResourceClass::Read => "read",
+            forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
+        },
+        "state": row.state.as_str(),
+        "ownerKind": row.owner_kind,
+        "ownerId": row.owner_id,
+        "recoveryDeadline": row.recovery_deadline,
+        "lastError": row.last_error,
+        "updatedAt": row.updated_at,
+    })
+}
+
+pub(super) fn enrich_operations_facts(
+    snapshot: &InventorySnapshot,
+    attention: &[Value],
+    entries: &mut [Value],
+) -> Result<(), Failure> {
+    for entry in entries {
+        let id = entry
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::internal("operator entry has no canonical id"))?
+            .to_owned();
+        let kind = if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+            WorkIdentitySubjectKind::Epic
+        } else {
+            WorkIdentitySubjectKind::Run
+        };
+        let is_plan = entry.get("source").and_then(Value::as_str) == Some("live-plan");
+        let desired = snapshot
+            .desired_work
+            .iter()
+            .find(|row| {
+                row.subject_id == id
+                    && row.subject_kind.as_str()
+                        == if kind == WorkIdentitySubjectKind::Epic {
+                            "epic"
+                        } else {
+                            "run"
+                        }
+            })
+            .map(desired_fact)
+            .unwrap_or(Value::Null);
+        let decisions = snapshot
+            .admission_decisions
+            .iter()
+            .filter(|decision| {
+                operations_subject_matches(kind, &id, decision.subject_kind, &decision.subject_id)
+            })
+            .map(|decision| {
+                serde_json::to_value(decision).map_err(|error| {
+                    Failure::internal(format!("serializing admission decision: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let reservations = snapshot
+            .admission_reservations
+            .iter()
+            .filter(|reservation| {
+                operations_subject_matches(
+                    kind,
+                    &id,
+                    reservation.subject_kind,
+                    &reservation.subject_id,
+                )
+            })
+            .map(reservation_fact)
+            .collect::<Vec<_>>();
+        let attention_items = attention
+            .iter()
+            .filter(|item| item.get("subjectId").and_then(Value::as_str) == Some(id.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let delivery = entry.get("delivery").cloned().unwrap_or(Value::Null);
+        let execution = json!({
+            "source": "ledger",
+            "liveSeats": entry.get("liveSeats").cloned().unwrap_or(json!(0)),
+            "currentStage": entry.get("currentStage").cloned().unwrap_or(Value::Null),
+            "currentSeat": entry.get("currentSeat").cloned().unwrap_or(Value::Null),
+            "currentAgent": entry.get("currentAgent").cloned().unwrap_or(Value::Null),
+        });
+        let object = entry
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("operator entry is not an object"))?;
+        object.insert(
+            "desired".to_owned(),
+            if is_plan {
+                json!({"source": "none", "value": Value::Null})
+            } else {
+                desired
+            },
+        );
+        object.insert(
+            "admission".to_owned(),
+            if is_plan {
+                json!({"source": "none", "decisions": [], "reservations": []})
+            } else {
+                json!({
+                    "source": "ledger",
+                    "decisions": decisions,
+                    "reservations": reservations,
+                })
+            },
+        );
+        object.insert(
+            "attentionItems".to_owned(),
+            json!({"source": "projection", "items": attention_items}),
+        );
+        object.insert(
+            "execution".to_owned(),
+            if is_plan {
+                json!({"source": "none", "state": "not-started"})
+            } else {
+                execution
+            },
+        );
+        object.insert(
+            "deliveryFact".to_owned(),
+            if is_plan {
+                json!({"source": "none", "value": Value::Null})
+            } else {
+                json!({"source": "ledger", "value": delivery})
+            },
+        );
+    }
+    Ok(())
+}
+
+pub(super) fn desired_only_entries(
+    snapshot: &InventorySnapshot,
+    entries: &[Value],
+) -> Result<Vec<Value>, Failure> {
+    let represented = entries
+        .iter()
+        .filter_map(|entry| {
+            let id = entry.get("id")?.as_str()?.to_owned();
+            let kind = if entry.get("kind").and_then(Value::as_str) == Some("epic") {
+                WorkIdentitySubjectKind::Epic
+            } else {
+                WorkIdentitySubjectKind::Run
+            };
+            Some((kind, id))
+        })
+        .collect::<BTreeSet<_>>();
+    snapshot
+        .desired_work
+        .iter()
+        .filter_map(|desired| {
+            let kind = match desired.subject_kind {
+                forged_ledger::DesiredSubjectKind::Run => WorkIdentitySubjectKind::Run,
+                forged_ledger::DesiredSubjectKind::Epic => WorkIdentitySubjectKind::Epic,
+            };
+            (!represented.contains(&(kind, desired.subject_id.clone()))).then_some((kind, desired))
+        })
+        .map(|(kind, desired)| {
+            let identity = snapshot
+                .work_identities
+                .get(&(kind, desired.subject_id.clone()))
+                .cloned()
+                .ok_or_else(|| {
+                    Failure::internal(format!(
+                        "desired {} {:?} has no durable work identity",
+                        kind.as_str(),
+                        desired.subject_id
+                    ))
+                })?;
+            let repository = identity.repository.as_ref().map(|value| value.path.clone());
+            Ok(json!({
+                "id": desired.subject_id,
+                "kind": if kind == WorkIdentitySubjectKind::Epic { "epic" } else { "slice" },
+                "identity": identity,
+                "beadId": identity.bead.id,
+                "repo": repository,
+                "baseRef": Value::Null,
+                "branch": Value::Null,
+                "state": "desired",
+                "stopReason": Value::Null,
+                "outcome": Value::Null,
+                "delivery": Value::Null,
+                "supersededBy": Value::Null,
+                "createdAt": desired.created_at,
+                "updatedAt": desired.updated_at,
+                "lastProgressAt": desired.last_progress_at.as_ref().unwrap_or(&desired.updated_at),
+                "liveSeats": 0,
+                "currentStage": Value::Null,
+                "currentSeat": Value::Null,
+                "currentAgent": Value::Null,
+                "costUsdKnown": 0.0,
+                "rowsMissingCost": 0,
+                "desiredOnly": true,
+            }))
+        })
+        .collect()
+}
+
+/// Attach the canonical durable navigation coordinates shared by Operations
+/// and Work Map. This is presentation identity only; all authority-bearing
+/// fields remain those already projected from the atomic ledger snapshot.
+pub(super) fn decorate_durable_entries(entries: &mut [Value]) -> Result<(), Failure> {
+    for entry in entries {
+        let object = entry
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("durable operator row is not an object"))?;
+        let (kind, kind_name) = if object.get("kind").and_then(Value::as_str) == Some("epic") {
+            (WorkRefKind::Epic, "epic")
+        } else {
+            (WorkRefKind::Run, "run")
+        };
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::internal("durable operator row has no id"))?
+            .to_owned();
+        object.insert("source".to_owned(), json!("durable"));
+        object.insert("workRef".to_owned(), work_ref(kind, &id)?);
+        object.insert(
+            "detailTarget".to_owned(),
+            json!({"subjectKind": kind_name, "subjectId": id}),
+        );
+    }
+    Ok(())
+}
+
+/// `operations overview` — the bounded, read-only operator surface.
+///
+/// One ledger snapshot supplies every durable fact. Beads contributes one
+/// exact claim/membership batch alongside one bounded N+1 plan discovery and
+/// one exact-id dependency hydrate. An outage retains unscoped durable rows
+/// and is reported as degraded instead of widening scope or inventing plan
+/// truth. This hot path never performs a controller-file or OS liveness probe
+/// per row.
+pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("operations_overview", req, || async {
+        let repository = repository_selector(req, "operations_overview")?;
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Failure::invalid("operations_overview limit must be an unsigned integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(OPERATIONS_DEFAULT_LIMIT);
+        if !(1..=OPERATIONS_MAX_LIMIT).contains(&limit) {
+            return Err(Failure::invalid(format!(
+                "operations_overview limit must be between 1 and {OPERATIONS_MAX_LIMIT}"
+            )));
+        }
+        let group_filter = operations_filter(req, "group")?;
+        if group_filter
+            .as_deref()
+            .is_some_and(|value| !QUEUE_GROUPS.iter().filter_map(|label| queue_code(label)).any(|code| code == value))
+        {
+            return Err(Failure::invalid(format!(
+                "unknown operations_overview group {:?}",
+                group_filter.as_deref().unwrap_or_default()
+            )));
+        }
+        let source_filter = operations_filter(req, "source")?;
+        if source_filter
+            .as_deref()
+            .is_some_and(|value| !matches!(value, "durable" | "live-plan"))
+        {
+            return Err(Failure::invalid(format!(
+                "unknown operations_overview source {:?}",
+                source_filter.as_deref().unwrap_or_default()
+            )));
+        }
+
+        let kinds: Vec<&str> = LIFECYCLE_KINDS
+            .iter()
+            .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
+            .copied()
+            .collect();
+        let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+        })
+        .await?;
+        let ledger_captured_at = now_iso();
+        let mut entries = project_entries(&snapshot, Spend::Include)?;
+        entries.extend(desired_only_entries(&snapshot, &entries)?);
+        decorate_durable_entries(&mut entries)?;
+
+        let bead_ids = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let plan_cfg = ctx.config.bd_config();
+        let claim_cfg = ctx.config.bd_config();
+        let plan_repository = repository.clone();
+        let claim_repository = repository.clone();
+        let (plan_read, claim_read) = tokio::join!(
+            forged_beads::plan_inventory(
+                &plan_cfg,
+                plan_repository.as_deref(),
+                LIVE_PLAN_LIMIT,
+            ),
+            async {
+                match claim_repository.as_deref() {
+                    Some(repository) => forged_beads::list_issues_for_repository(
+                        &claim_cfg,
+                        &bead_ids,
+                        repository,
+                    )
+                    .await,
+                    None => forged_beads::list_issues(&claim_cfg, &bead_ids).await,
+                }
+            }
+        );
+        let beads_captured_at = now_iso();
+        let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
+            Ok(inventory) => (
+                inventory.issues,
+                inventory.truncated,
+                inventory.discovered,
+                None,
+            ),
+            Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
+        };
+        let (claim_beads, claim_error) = match claim_read {
+            Ok(issues) => (issues, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        if repository.is_some() {
+            let matching_beads = claim_beads
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<BTreeSet<_>>();
+            entries.retain(|entry| {
+                entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| matching_beads.contains(id))
+            });
+        }
+        let represented: BTreeSet<String> = entries
+            .iter()
+            .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
+            .collect();
+        let mut plan_entries = Vec::new();
+        if plan_error.is_none() {
+            let mut conversion_error = None;
+            for plan in plans
+                .iter()
+                .filter(|plan| !represented.contains(&plan.issue.id))
+            {
+                match live_plan_entry(plan, &beads_captured_at) {
+                    Ok(entry) => plan_entries.push(entry),
+                    Err(error) => {
+                        conversion_error = Some(format!(
+                            "live plan identity for {:?} was unsafe: {}",
+                            plan.issue.id, error.message
+                        ));
+                        break;
+                    }
+                }
+            }
+            if let Some(error) = conversion_error {
+                plan_error = Some(error);
+                plan_entries.clear();
+                plans.clear();
+            }
+        }
+
+        if plan_error.is_none() {
+            let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
+                .iter()
+                .map(|plan| (plan.issue.id.as_str(), plan))
+                .collect();
+            for entry in &mut entries {
+                let bead_id = entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned);
+                if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+                    if let Some(object) = entry.as_object_mut() {
+                        object.insert("priority".to_owned(), json!(plan.issue.priority));
+                        object.insert(
+                            "plan".to_owned(),
+                            json!({
+                                "source": "beads",
+                                "status": plan.issue.status,
+                                "readiness": plan.readiness(),
+                                "priority": plan.issue.priority,
+                                "assignee": plan.issue.assignee,
+                                "issueType": plan.issue.issue_type,
+                                "revision": plan.issue.revision,
+                                "parent": plan.parent,
+                                "dependencies": plan.dependencies,
+                            }),
+                        );
+                    }
+                }
+            }
+            entries.extend(plan_entries);
+        }
+
+        let mut bead_summaries = claim_beads;
+        let mut known_beads = bead_summaries
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<BTreeSet<_>>();
+        bead_summaries.extend(
+            plans
+                .iter()
+                .map(|plan| plan.issue.clone())
+                .filter(|issue| known_beads.insert(issue.id.clone())),
+        );
+        let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
+            .into_iter()
+            .map(|item| {
+                serde_json::to_value(item).map_err(|error| {
+                    Failure::internal(format!("serializing attention item: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        enrich_operations_facts(&snapshot, &attention, &mut entries)?;
+
+        let bead_read = match claim_error.as_ref() {
+            Some(error) => Err(error.clone()),
+            None => Ok(bead_summaries),
+        };
+        let mut queue = operator_queue(&snapshot, &mut entries, &attention, bead_read);
+        let mut remaining = limit as usize;
+        let mut shown_total = 0usize;
+        let mut matching_total = 0usize;
+        let mut groups = Vec::new();
+        for group in queue
+            .get_mut("groups")
+            .and_then(Value::as_array_mut)
+            .into_iter()
+            .flatten()
+        {
+            let label = group.get("name").and_then(Value::as_str).unwrap_or_default();
+            let Some(code) = queue_code(label) else {
+                continue;
+            };
+            if group_filter.as_deref().is_some_and(|filter| filter != code) {
+                continue;
+            }
+            let mut rows = group
+                .get("entries")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(source) = source_filter.as_deref() {
+                rows.retain(|entry| entry.get("source").and_then(Value::as_str) == Some(source));
+            }
+            let total = rows.len();
+            matching_total += total;
+            let shown: Vec<Value> = rows.into_iter().take(remaining).collect();
+            remaining = remaining.saturating_sub(shown.len());
+            shown_total += shown.len();
+            groups.push(json!({
+                "code": code,
+                "label": label,
+                "total": total,
+                "shown": shown.len(),
+                "entries": shown,
+            }));
+        }
+        let total = entries.len();
+        let cost_usd_known: f64 = entries
+            .iter()
+            .filter_map(|entry| entry.get("costUsdKnown").and_then(Value::as_f64))
+            .sum();
+        let rows_missing_cost: u64 = entries
+            .iter()
+            .filter_map(|entry| entry.get("rowsMissingCost").and_then(Value::as_u64))
+            .sum();
+        let live = entries
+            .iter()
+            .filter(|entry| entry.get("liveSeats").and_then(Value::as_u64).unwrap_or(0) > 0)
+            .count();
+        let admitted = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .pointer("/admission/decisions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|decision| {
+                            decision.get("outcome").and_then(Value::as_str) == Some("admitted")
+                        })
+                    })
+                    || entry
+                        .pointer("/admission/reservations")
+                        .and_then(Value::as_array)
+                        .is_some_and(|reservations| !reservations.is_empty())
+            })
+            .count();
+        let queued = entries
+            .iter()
+            .filter(|entry| {
+                entry
+                    .pointer("/admission/decisions")
+                    .and_then(Value::as_array)
+                    .is_some_and(|decisions| {
+                        decisions.iter().any(|decision| {
+                            decision.get("outcome").and_then(Value::as_str) == Some("deferred")
+                        })
+                    })
+            })
+            .count();
+        let review_ready = entries
+            .iter()
+            .filter(|entry| entry.get("queueGroup").and_then(Value::as_str) == Some("Ready to merge"))
+            .count();
+        let recent = entries
+            .iter()
+            .filter(|entry| {
+                entry.get("source").and_then(Value::as_str) == Some("durable")
+                    && (entry.get("state").and_then(Value::as_str) == Some("stopped")
+                        || entry.get("outcome").is_some_and(|value| !value.is_null()))
+            })
+            .count();
+        Ok(json!({
+            "schema": "forged.operations-overview/1",
+            "scope": {"repository": repository},
+            "capturedAt": {
+                "ledger": ledger_captured_at,
+                "beads": beads_captured_at,
+            },
+            "sourceHealth": {
+                "ledger": {"state": "available"},
+                "beads": {
+                    "state": if claim_error.is_some() { "unavailable" } else { "available" },
+                    "error": claim_error,
+                },
+                "plan": {
+                    "state": if plan_error.is_some() { "unavailable" } else if plan_truncated { "partial" } else { "available" },
+                    "error": plan_error,
+                    "discovered": plan_discovered,
+                    "limit": LIVE_PLAN_LIMIT,
+                    "truncated": plan_truncated,
+                },
+            },
+            "coverage": {
+                "total": matching_total,
+                "available": total,
+                "matching": matching_total,
+                "shown": shown_total,
+                "limit": limit,
+                "filteredOut": total.saturating_sub(matching_total),
+                "truncated": shown_total < matching_total || plan_truncated,
+            },
+            "counts": {
+                "durable": entries
+                    .iter()
+                    .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                    .count(),
+                "live": live,
+                "admitted": admitted,
+                "queued": queued,
+                "reviewReady": review_ready,
+                "recent": recent,
+                "attention": attention.len(),
+                "planOnly": entries
+                    .iter()
+                    .filter(|entry| {
+                        entry.get("source").and_then(Value::as_str) == Some("live-plan")
+                    })
+                    .count(),
+            },
+            "queue": {"groups": groups, "total": matching_total},
+            "attention": attention,
+            "spend": {
+                "costUsdKnown": cost_usd_known,
+                "rowsMissingCost": rows_missing_cost,
+                "complete": rows_missing_cost == 0,
+            },
+        }))
+    })
+    .await
+}
+
+/// Return the new Operations projection to compatibility facades without
+/// reimplementing its ledger/Beads joins or queue policy.
+pub(super) async fn operations_projection(
+    ctx: &Ctx,
+    req: &OperationRequest,
+) -> Result<Value, Failure> {
+    let response = operations_overview(ctx, req).await;
+    if response.ok {
+        return Ok(response.result.unwrap_or(Value::Null));
+    }
+    let error = response.error.unwrap_or(forged_types::OpError {
+        code: ErrorCode::Internal,
+        message: "operations projection failed without an error".to_owned(),
+        recoverable: false,
+        detail: None,
+    });
+    Err(Failure {
+        code: error.code,
+        message: error.message,
+        recoverable: error.recoverable,
+    })
+}
+
+// ------------------------------------------------------- attention controls
+
+async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
+    let kinds: Vec<&str> = LIFECYCLE_KINDS
+        .iter()
+        .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
+        .copied()
+        .collect();
+    let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+    })
+    .await?;
+    let entries = project_entries(&snapshot, Spend::Include)?;
+    let bead_ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+        .collect();
+    // A Beads outage cannot authorize a control over a condition that only
+    // Beads can prove. Other ledger-backed items remain addressable.
+    let beads = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
+        .await
+        .unwrap_or_default();
+    super::attention::project_all(&snapshot, &entries, &beads)
+}
+
+#[derive(Clone, Copy)]
+enum AttentionControl {
+    Acknowledge,
+    Resolve,
+    Reopen,
+}
+
+impl AttentionControl {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Acknowledge => "attention_acknowledge",
+            Self::Resolve => "attention_resolve",
+            Self::Reopen => "attention_reopen",
+        }
+    }
+
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::Acknowledge => super::attention::ACKNOWLEDGED,
+            Self::Resolve => super::attention::RESOLVED,
+            Self::Reopen => super::attention::REOPENED,
+        }
+    }
+}
+
+async fn control_attention(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    control: AttentionControl,
+) -> OperationResponse {
+    let name = control.name();
+    let subject = match req.run_id.as_deref().filter(|value| !value.is_empty()) {
+        Some(value) => value.to_owned(),
+        None => {
+            return err_response(
+                &derive_key(name, None, None, None),
+                &Failure::invalid("attention control requires a subject id"),
+            )
+        }
+    };
+    let attention_id = match param_str(&req.params, "attentionId") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    let occurrence_id = match param_str(&req.params, "occurrenceId") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    let actor = match param_str(&req.params, "actor") {
+        Ok(value) if value.len() <= 200 => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key(name, Some(&subject), None, None),
+                &Failure::invalid("attention actor must be at most 200 bytes"),
+            )
+        }
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    default_key(
+        req,
+        format!("op:{name}:{subject}:{attention_id}:{occurrence_id}"),
+    );
+    let operation_key = req.idempotency_key.clone();
+    let items = match all_attention(ctx).await {
+        Ok(items) => items,
+        Err(error) => return err_response(&operation_key, &error),
+    };
+    let item = items.iter().find(|item| {
+        item.subject_id == subject
+            && item.attention_id == attention_id
+            && item.occurrence_id == occurrence_id
+    });
+    if item.is_none()
+        && items.iter().any(|candidate| {
+            candidate.subject_id == subject && candidate.attention_id == attention_id
+        })
+    {
+        return err_response(
+            &operation_key,
+            &Failure::invalid("attention occurrence is stale because newer causal evidence exists"),
+        );
+    }
+    let replay_request = req.clone();
+    match on_ledger(&ctx.ledger, move |ledger| {
+        ledger.replay_event_operation(name, &replay_request)
+    })
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&operation_key, &error),
+    }
+    let Some(item) = item else {
+        return err_response(
+            &operation_key,
+            &Failure::invalid(
+                "attention occurrence is stale, unknown, or no longer backed by durable truth",
+            ),
+        );
+    };
+
+    let mut payload = json!({
+        "schema": "forged.attention-transition/1",
+        "attentionId": attention_id,
+        "occurrenceId": occurrence_id,
+        "actor": actor,
+    });
+    let next_state = match control {
+        AttentionControl::Acknowledge => {
+            if item.state == AttentionState::Resolved {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid("resolved attention must be reopened before acknowledgement"),
+                );
+            }
+            AttentionState::Acknowledged
+        }
+        AttentionControl::Resolve => {
+            if !super::attention::resolution_allowed(item.condition) {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "this source-backed condition clears only through its domain transition",
+                    ),
+                );
+            }
+            let disposition_value = match req.params.get("disposition").cloned() {
+                Some(value) => value,
+                None => {
+                    return err_response(
+                        &operation_key,
+                        &Failure::invalid("missing required param \"disposition\""),
+                    )
+                }
+            };
+            let disposition: AttentionResolutionDisposition =
+                match serde_json::from_value(disposition_value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return err_response(
+                            &operation_key,
+                            &Failure::invalid(
+                                "attention disposition must be fixed, accepted-risk, accepted-unknown, superseded, or automatic",
+                            ),
+                        )
+                    }
+                };
+            if item.condition == forged_types::AttentionCondition::MissingCost
+                && disposition != AttentionResolutionDisposition::AcceptedUnknown
+            {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "missing-cost can only be resolved with accepted-unknown while pricing remains absent",
+                    ),
+                );
+            }
+            let note = req
+                .params
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if note.len() > 2_000 {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid("attention resolution note must be at most 2000 bytes"),
+                );
+            }
+            payload["disposition"] =
+                serde_json::to_value(disposition).expect("closed attention disposition serializes");
+            payload["note"] = json!(note);
+            AttentionState::Resolved
+        }
+        AttentionControl::Reopen => AttentionState::Open,
+    };
+    let result = json!({
+        "schema": "forged.attention-transition-result/1",
+        "subjectId": subject,
+        "attentionId": attention_id,
+        "occurrenceId": occurrence_id,
+        "state": next_state,
+    });
+    let request = req.clone();
+    match on_ledger(&ctx.ledger, move |ledger| {
+        ledger.apply_event_operation(name, &request, control.event_kind(), payload, result)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => err_response(&operation_key, &error),
+    }
+}
+
+pub async fn attention_acknowledge(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Acknowledge).await
+}
+
+pub async fn attention_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Resolve).await
+}
+
+pub async fn attention_reopen(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Reopen).await
 }
 
 // ---------------------------------------------------------------- events
