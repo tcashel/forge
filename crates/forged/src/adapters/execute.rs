@@ -1058,12 +1058,71 @@ async fn run_attempt(
         .await?;
     }
     failpoint::hit("provider.spawn.before");
-    let spawned = host.spawn(&packet.worktree, &shell_line, &env).await;
+    let prepared = match host.prepare(&packet.worktree, &shell_line, &env).await {
+        Ok(prepared) => prepared,
+        Err(error) => {
+            let note = format!("transport: provider prepare failed: {error}");
+            return fail_pre_spawn_transport(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                note,
+                "host-prepare",
+            )
+            .await;
+        }
+    };
+    let status_path = prepared.sentinel_path().to_string_lossy().into_owned();
+    let (ownership, controller_generation) = crate::core::herdr_ownership::attempt_identity(
+        &prepared,
+        &run_id,
+        &packet_id,
+        attempt_id,
+        &claim_token,
+    )?;
+    if let Some(identity) = ownership.as_ref() {
+        if let Err(failure) = crate::core::herdr_ownership::register(ctx, identity.clone()).await {
+            host.rollback_prepared(prepared).await;
+            let transport = format!("transport: provider ownership registration failed: {failure}");
+            let refusal = format!("unspawned: provider ownership registration refused: {failure}");
+            return settle_unspawned(
+                ctx,
+                &packet,
+                attempt_id,
+                &claim_token,
+                PreSpawnFailure {
+                    transport_note: transport,
+                    refusal_note: refusal,
+                    failure,
+                    phase: "ownership-registration",
+                },
+            )
+            .await;
+        }
+    }
+    failpoint::hit("provider.ownership.register.after");
+    let spawned = host.start(prepared).await;
     failpoint::hit("provider.spawn.after");
     let session = match spawned {
         Ok(session) => session,
+        Err(error) if ownership.is_some() => {
+            // `pane.send_input` is not idempotent. A transport error may be a
+            // lost success response, and HerdrHost's best-effort close is not
+            // death proof. Keep the exact attempt, claim, admission capacity,
+            // and ownership live so recovery can observe its durable sentinel
+            // or provider pid; settling here could admit a duplicate effect.
+            return Err(Failure {
+                code: error.wire_code(),
+                message: format!(
+                    "Herdr provider start outcome is ambiguous; retaining exact attempt for recovery: {error}"
+                ),
+                recoverable: true,
+            });
+        }
         Err(e) => {
-            // A spawn failure is transport: the provider never got to think.
+            // ProcessHost reports start failure only before it publishes a
+            // child, so no provider effect can exist on this branch.
             let note = format!("transport: provider spawn failed: {e}");
             crate::core::artifacts::materialize_and_join(
                 ctx,
@@ -1077,7 +1136,24 @@ async fn run_attempt(
             return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
         }
     };
-    crate::core::sessions::record_session_started(
+    if let Some(identity) = ownership.as_ref() {
+        if let Err(error) =
+            crate::core::herdr_ownership::mark_command_started(ctx, &identity.ownership_id).await
+        {
+            // The command may be live. Never retry send_input. Contain it by
+            // verified kill; if that cannot be proved, leave the running
+            // attempt and durable ownership for cross-process recovery.
+            if host.kill_confirmed(&session).await.is_ok() {
+                let note = format!(
+                    "transport: provider command-start evidence failed after start: {error}"
+                );
+                return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+            }
+            return Err(error);
+        }
+    }
+    failpoint::hit("provider.ownership.started.after");
+    if let Err(error) = crate::core::sessions::record_session_started(
         ctx,
         crate::core::sessions::SessionStarted {
             run_id: &run_id,
@@ -1086,10 +1162,19 @@ async fn run_attempt(
             host: host_kind,
             session_id: session.as_str(),
             socket_path: socket_path.as_deref(),
+            status_path: &status_path,
+            controller_generation,
             attach_hint: attach_hint.as_deref(),
         },
     )
-    .await?;
+    .await
+    {
+        if host.kill_confirmed(&session).await.is_ok() {
+            let note = format!("transport: provider session record failed after start: {error}");
+            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+        }
+        return Err(error);
+    }
     drop(submit_guard);
     crate::core::sessions::record_interventions_delivered(
         ctx,
@@ -1104,6 +1189,9 @@ async fn run_attempt(
         "host": host_kind,
         "sessionId": session.as_str(),
         "socketPath": socket_path,
+        "statusPath": status_path,
+        "controllerGeneration": controller_generation,
+        "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
         "attachHint": attach_hint,
     });
     ports
@@ -1298,12 +1386,12 @@ async fn run_attempt(
         }
     };
 
-    // Release the seat's terminal, after the section-(d) order rather than
-    // inside it. Bookkeeping, never fencing: the attempt is settled either
-    // way, so this can neither fail it nor delay it. The revoked path above
-    // does NOT come here — its `kill_confirmed` already closed the pane as
-    // part of verified death.
-    host.release(&session).await;
+    // A Herdr terminal is now durable supervisor work. Never make pane
+    // cleanup part of, or capable of changing, the settled attempt result.
+    // ProcessHost owns no migration-014 row and retains its no-op release.
+    if ownership.is_none() {
+        host.release(&session).await;
+    }
     settled
 }
 
@@ -1524,9 +1612,9 @@ mod tests {
 
 #[cfg(test)]
 mod settle_tests {
-    //! The settle path gives the seat's terminal back on the way out. That
-    //! release is bookkeeping — the ledger already holds the work — so a
-    //! herdr that refuses the close must not reach the settlement.
+    //! Settlement first durably records the provider result and requests pane
+    //! cleanup. The supervisor performs that cleanup independently, so a
+    //! Herdr refusal must never rewrite the result that already settled.
 
     use std::collections::BTreeMap;
     use std::os::unix::fs::PermissionsExt;
@@ -1546,9 +1634,15 @@ mod settle_tests {
     /// Every method the mock was asked for, in arrival order.
     type MethodLog = Arc<Mutex<Vec<String>>>;
 
-    /// A protocol-19 herdr that carries one seat's spawn through and REFUSES
-    /// every `pane.close`.
-    fn start_refusing_herdr(socket_path: &Path) -> MethodLog {
+    #[derive(Clone, Copy)]
+    enum MockBehavior {
+        RefuseClose,
+        LoseSendResponse,
+    }
+
+    /// A protocol-19 Herdr exercising either a refused cleanup or the
+    /// ambiguous start seam where send_input may have landed before EOF.
+    fn start_mock_herdr(socket_path: &Path, behavior: MockBehavior) -> MethodLog {
         let listener = UnixListener::bind(socket_path).expect("bind mock herdr socket");
         let seen: MethodLog = Arc::new(Mutex::new(Vec::new()));
         let recorded = Arc::clone(&seen);
@@ -1565,6 +1659,13 @@ mod settle_tests {
                         let id = frame["id"].as_str().unwrap_or_default().to_owned();
                         let method = frame["method"].as_str().unwrap_or_default().to_owned();
                         recorded.lock().expect("method log").push(method.clone());
+                        if method == "pane.send_input"
+                            && matches!(behavior, MockBehavior::LoseSendResponse)
+                        {
+                            // Drop the response after observing the request:
+                            // the client cannot know whether Herdr accepted it.
+                            return;
+                        }
                         let frame = match method.as_str() {
                             "ping" => json!({"id": id, "result": {"type": "pong",
                                 "version": "0.8.0", "protocol": 19, "capabilities": {}}}),
@@ -1584,10 +1685,11 @@ mod settle_tests {
                                 "pane_id": PANE_ID, "shell_pid": 4242,
                                 "foreground_process_group_id": 4242,
                                 "foreground_processes": [], "tty": "/dev/ttys001"}}}),
-                            // The defect under test: the seat's terminal
-                            // refuses to go.
-                            "pane.close" => json!({"id": id, "error": {
-                                "code": "INTERNAL", "message": "close refused"}}),
+                            "pane.close" if matches!(behavior, MockBehavior::RefuseClose) => {
+                                json!({"id": id, "error": {
+                                    "code": "INTERNAL", "message": "close refused"}})
+                            }
+                            "pane.close" => json!({"id": id, "result": {"type": "ok"}}),
                             other => panic!("unexpected herdr request {other:?}"),
                         };
                         let mut bytes = frame.to_string().into_bytes();
@@ -1731,37 +1833,43 @@ mod settle_tests {
         }
     }
 
-    #[tokio::test]
-    async fn a_refused_pane_close_does_not_change_what_settled() {
-        let root = tempfile::tempdir().expect("tempdir");
-        let socket = root.path().join("herdr.sock");
-        let seen = start_refusing_herdr(&socket);
-        write_bd_stub(&root.path().join("bd"), root.path());
-        std::fs::create_dir_all(root.path().join("beads")).expect("beads dir");
+    struct ClaimedFixture {
+        ctx: Ctx,
+        ledger: Ledger,
+        ports: ForgedPorts,
+        exec: ExecutionContext,
+        packet: WorkPacket,
+        resolved: crate::core::spec::ResolvedSpec,
+        packet_id: String,
+        attempt_id: i64,
+        claim_token: String,
+        packet_dir: PathBuf,
+    }
 
-        let ledger = Ledger::open(&root.path().join("state.db")).expect("open ledger");
+    async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
+        write_bd_stub(&root.join("bd"), root);
+        std::fs::create_dir_all(root.join("beads")).expect("beads dir");
+
+        let ledger = Ledger::open(&root.join("state.db")).expect("open ledger");
         ledger
             .create_run(forged_ledger::NewRun {
                 run_id: forged_types::RunId::new(RUN_ID).expect("run id"),
                 bead_id: RUN_ID.to_owned(),
-                repo: root.path().to_string_lossy().into_owned(),
+                repo: root.to_string_lossy().into_owned(),
                 base_ref: "main".to_owned(),
                 branch: format!("forged/{RUN_ID}"),
             })
             .expect("create run");
         let run = ledger.get_run(RUN_ID).expect("run row");
 
-        let spec_path = root.path().join("spec.md");
+        let spec_path = root.join("spec.md");
         std::fs::write(&spec_path, "# spec\n").expect("spec");
         let spec_sha = sha256_file(&spec_path).expect("spec sha");
-
         let ctx = Ctx {
-            config: config_for(root.path(), &socket),
+            config: config_for(root, socket),
             ledger: ledger.clone(),
         };
         let ports = ForgedPorts::new(ledger.clone(), ctx.config.clone());
-        // Required, not Preferred: a fallback to the process host would
-        // silently skip the very release this test is about.
         let exec = ExecutionContext {
             pr_number: None,
             findings: Vec::new(),
@@ -1770,7 +1878,7 @@ mod settle_tests {
             fix_round_budget: 1,
             push_url: String::new(),
             host_policy: HostPolicy::Required,
-            herdr_socket: Some(socket.clone()),
+            herdr_socket: Some(socket.to_path_buf()),
         };
         let intent = PacketIntent {
             stage: Stage::Implement,
@@ -1784,8 +1892,6 @@ mod settle_tests {
             execution: None,
             packet_id: None,
         };
-        // The deprecated file route: this test is about the seat's pane, not
-        // about where its spec came from, and a file-sourced spec needs no bd.
         let source = crate::core::spec::SpecSource::File(spec_path.to_string_lossy().into_owned());
         let resolved = crate::core::spec::ResolvedSpec {
             body: None,
@@ -1821,40 +1927,88 @@ mod settle_tests {
             .claim_packet_with_admission(
                 &packet_id,
                 &session_claimant(&packet_id, "claude"),
-                &forged_ledger::SpecFence::Sha256(spec_sha.clone()),
+                &forged_ledger::SpecFence::Sha256(spec_sha),
                 &reservation_id,
             )
             .expect("claim packet");
-
         let packet_dir = ctx.config.packet_dir_key(RUN_ID, "implement", 1);
         std::fs::create_dir_all(&packet_dir).expect("packet dir");
-        let attempt_dirs = PacketDirs::new(&packet_dir, claimed.attempt_id);
+
+        ClaimedFixture {
+            ctx,
+            ledger,
+            ports,
+            exec,
+            packet,
+            resolved,
+            packet_id,
+            attempt_id: claimed.attempt_id,
+            claim_token: claimed.claim_token,
+            packet_dir,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_refused_pane_close_does_not_change_what_settled() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::RefuseClose);
+        let fixture = claimed_fixture(root.path(), &socket).await;
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
         tokio::spawn(play_provider(
             attempt_dirs.attempt_path(),
             attempt_dirs.status(),
-            claude_capture(&packet_id),
+            claude_capture(&fixture.packet_id),
         ));
 
         let outcome = run_attempt(
-            &ctx,
-            &ports,
-            &exec,
-            &packet,
-            &resolved,
-            claimed.attempt_id,
-            &claimed.claim_token,
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
         )
         .await
         .expect("the attempt settles");
+
+        // Settlement requests cleanup but never performs the external effect
+        // inline: the result is durable before a supervisor tick can close.
+        let owned = fixture
+            .ledger
+            .find_owned_herdr_attempt(fixture.attempt_id, &fixture.claim_token)
+            .expect("ownership lookup")
+            .expect("owned provider pane");
+        assert_eq!(
+            owned.cleanup_state,
+            forged_ledger::OwnedHerdrCleanupState::Pending
+        );
+        assert!(
+            !seen
+                .lock()
+                .expect("method log")
+                .iter()
+                .any(|method| method == "pane.close"),
+            "settlement must not close inline"
+        );
+
+        let cleanup = crate::core::herdr_ownership::reconcile(&fixture.ctx)
+            .await
+            .expect("supervisor cleanup tick");
+        assert_eq!(cleanup["effects"][0]["outcome"], "retry-wait");
 
         // The close really was attempted, and really was refused...
         wait_for(&seen, "pane.close").await;
         // ...and the settlement is exactly the one the provider earned.
         match outcome {
-            PacketOutcome::Landed(result) => assert_eq!(result.packet_id, packet_id),
+            PacketOutcome::Landed(result) => assert_eq!(result.packet_id, fixture.packet_id),
             other => panic!("a refused close changed the outcome: {other:?}"),
         }
-        let attempt = ledger.get_attempt(claimed.attempt_id).expect("attempt row");
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt row");
         assert_eq!(attempt.state, forged_ledger::AttemptState::Completed);
         assert!(
             attempt
@@ -1865,17 +2019,20 @@ mod settle_tests {
         );
 
         // The durable record still carries the hint — it is an append-only
-        // event and nothing rewrites it — but the pane it names is released,
-        // so `session list` must stop advertising it. A hint that fails
-        // BECAUSE the release worked is worse than no hint at all.
+        // event and nothing rewrites it — but a terminal attempt is not an
+        // attachable session even while durable cleanup is retrying.
         assert!(
-            crate::core::sessions::stored_attach_hint_for_test(&ctx, RUN_ID, claimed.attempt_id)
-                .await
-                .is_some(),
+            crate::core::sessions::stored_attach_hint_for_test(
+                &fixture.ctx,
+                RUN_ID,
+                fixture.attempt_id,
+            )
+            .await
+            .is_some(),
             "the durable event still names an attach command"
         );
         let listed = crate::core::sessions::session_list(
-            &ctx,
+            &fixture.ctx,
             &forged_types::OperationRequest {
                 schema_version: 1,
                 idempotency_key: "session_list:test".to_owned(),
@@ -1892,11 +2049,75 @@ mod settle_tests {
             .as_array()
             .expect("sessions array")
             .iter()
-            .find(|s| s["attemptId"] == serde_json::json!(claimed.attempt_id))
+            .find(|s| s["attemptId"] == serde_json::json!(fixture.attempt_id))
             .expect("the settled attempt is listed");
         assert!(
             settled["attachHint"].is_null(),
-            "a released pane must advertise no attach command: {settled}"
+            "a settled attempt must advertise no attach command: {settled}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_lost_send_response_retains_attempt_and_capacity_for_recovery() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::LoseSendResponse);
+        let fixture = claimed_fixture(root.path(), &socket).await;
+
+        let error = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect_err("lost send response remains ambiguous");
+        assert!(error.recoverable);
+        assert!(error.message.contains("retaining exact attempt"));
+
+        wait_for(&seen, "pane.close").await;
+        let methods = seen.lock().expect("method log").clone();
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == "pane.send_input")
+                .count(),
+            1,
+            "an ambiguous non-idempotent send is never retried: {methods:?}"
+        );
+        assert_eq!(
+            methods
+                .iter()
+                .filter(|method| method.as_str() == "pane.close")
+                .count(),
+            1,
+            "the host attempts one bounded close: {methods:?}"
+        );
+
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt row");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Running);
+        fixture
+            .ledger
+            .assert_admitted_attempt_live(&fixture.claim_token)
+            .expect("ambiguous effect retains admission capacity");
+        let owned = fixture
+            .ledger
+            .find_owned_herdr_attempt(fixture.attempt_id, &fixture.claim_token)
+            .expect("ownership lookup")
+            .expect("durable exact pane");
+        assert_eq!(
+            owned.lifecycle_state,
+            forged_ledger::OwnedHerdrLifecycleState::Registered
+        );
+        assert_eq!(
+            owned.cleanup_state,
+            forged_ledger::OwnedHerdrCleanupState::NotRequested
         );
     }
 }

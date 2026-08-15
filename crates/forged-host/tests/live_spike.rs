@@ -14,7 +14,10 @@ use std::panic::{catch_unwind, resume_unwind, AssertUnwindSafe};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forged_host::{HerdrHost, HostSessionId, Liveness, SessionHost};
+use forged_host::{
+    HerdrCloseOutcome, HerdrControl, HerdrHost, HerdrSessionIdentity, HostSessionId, Liveness,
+    SessionHost,
+};
 
 const POLLS: u32 = 60; // 2 s apart ≈ 120 s overall
 
@@ -116,6 +119,78 @@ fn live_spike_claude_p_through_herdr() {
 
     if let Some(id) = session.lock().expect("session lock").take() {
         let _ = rt.block_on(host.kill_confirmed(&id));
+    }
+    if let Err(panic) = body {
+        resume_unwind(panic);
+    }
+}
+
+#[test]
+fn live_owned_provider_and_controller_cleanup_without_focus() {
+    if std::env::var("FORGED_LIVE_TESTS").as_deref() != Ok("1") {
+        eprintln!("live cleanup SKIPPED: FORGED_LIVE_TESTS=1 not set");
+        return;
+    }
+    let socket_path = HerdrHost::default_socket_path();
+    if !socket_path.exists() {
+        eprintln!(
+            "live cleanup SKIPPED: herdr socket absent at {}",
+            socket_path.display()
+        );
+        return;
+    }
+
+    let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let base = tempfile::tempdir().expect("tempdir");
+    let mut owned: Vec<HerdrSessionIdentity> = Vec::new();
+    let body = catch_unwind(AssertUnwindSafe(|| {
+        rt.block_on(async {
+            let host = HerdrHost::connect(&socket_path, base.path())
+                .await
+                .expect("connect live Herdr");
+            for role in ["provider", "controller"] {
+                let prepared = host
+                    .prepare(
+                        cwd.path(),
+                        &format!("printf '%s\\n' {role}"),
+                        &HashMap::new(),
+                    )
+                    .await
+                    .expect("prepare owned pane");
+                let exact_status = prepared.sentinel_path().to_path_buf();
+                let identity = prepared.herdr_identity().expect("Herdr identity").clone();
+                owned.push(identity.clone());
+                let id = host.start(prepared).await.expect("start once");
+                for _ in 0..50 {
+                    match host.alive(&id).await.expect("owned pane liveness") {
+                        Liveness::Exited(0) => break,
+                        Liveness::Exited(code) => panic!("{role} exited {code}"),
+                        Liveness::Vanished => panic!("{role} pane vanished before cleanup"),
+                        Liveness::Running => tokio::time::sleep(Duration::from_millis(100)).await,
+                    }
+                }
+                assert!(exact_status.is_file(), "{role} exact sentinel did not land");
+                let control = HerdrControl::connect_for(&identity)
+                    .await
+                    .expect("connect exact cleanup control");
+                assert!(matches!(
+                    control
+                        .close_owned(&identity)
+                        .await
+                        .expect("close owned pane"),
+                    HerdrCloseOutcome::Closed | HerdrCloseOutcome::AlreadyMissing
+                ));
+                owned.retain(|candidate| candidate != &identity);
+            }
+        });
+    }));
+
+    for identity in owned {
+        let _ = rt.block_on(async {
+            let control = HerdrControl::connect_for(&identity).await?;
+            control.close_owned(&identity).await
+        });
     }
     if let Err(panic) = body {
         resume_unwind(panic);

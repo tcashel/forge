@@ -11,7 +11,10 @@ use nix::unistd::Pid;
 use tokio::sync::Mutex;
 
 use crate::identity::ProcessIdentity;
-use crate::{sentinel, Confirmed, HostError, HostSessionId, Liveness, SessionHost};
+use crate::{
+    next_host_instance, sentinel, Confirmed, HostError, HostSessionId, Liveness, PreparedSession,
+    SessionHost,
+};
 
 /// Crate-static id counter shared by ALL ProcessHost instances, so ids never
 /// collide across hosts in one process. No randomness or clock needed.
@@ -33,6 +36,14 @@ struct ProcSession {
     status_path: PathBuf,
 }
 
+struct PreparedProcSession {
+    token: u64,
+    cwd: PathBuf,
+    shell_line: String,
+    env: HashMap<String, String>,
+    status_path: PathBuf,
+}
+
 /// A [`SessionHost`] backend running each session as a plain process:
 /// `/bin/sh -c "<line>; echo $? > <base>/<id>/status"`, `setsid()` in
 /// `pre_exec` so the shell leads a fresh session/process group.
@@ -41,6 +52,8 @@ struct ProcSession {
 /// overlaid on top; hermetic environments are out of scope for this slice.
 pub struct ProcessHost {
     base_status_dir: PathBuf,
+    instance: u64,
+    prepared: Mutex<HashMap<HostSessionId, PreparedProcSession>>,
     sessions: Mutex<HashMap<HostSessionId, ProcSession>>,
 }
 
@@ -52,7 +65,15 @@ impl ProcessHost {
     pub fn new(base_status_dir: impl Into<PathBuf>) -> Self {
         ProcessHost {
             base_status_dir: base_status_dir.into(),
+            instance: next_host_instance(),
+            prepared: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn remove_empty_status_dir(status_path: &Path) {
+        if let Some(session_dir) = status_path.parent() {
+            let _ = std::fs::remove_dir(session_dir);
         }
     }
 
@@ -87,12 +108,12 @@ impl ProcessHost {
 
 #[async_trait::async_trait]
 impl SessionHost for ProcessHost {
-    async fn spawn(
+    async fn prepare(
         &self,
         cwd: &Path,
         shell_line: &str,
         env: &HashMap<String, String>,
-    ) -> Result<HostSessionId, HostError> {
+    ) -> Result<PreparedSession, HostError> {
         sentinel::validate_shell_line(shell_line)?;
 
         // Mint an id and reserve <base>/<id>/ exclusively; on AlreadyExists
@@ -117,9 +138,47 @@ impl SessionHost for ProcessHost {
             }
         };
 
-        let full_line = sentinel::append_sentinel(shell_line, &status_path);
+        let prepared = PreparedSession::new(id.clone(), status_path.clone(), None, self.instance);
+        self.prepared.lock().await.insert(
+            id,
+            PreparedProcSession {
+                token: prepared.token(),
+                cwd: cwd.to_path_buf(),
+                shell_line: shell_line.to_string(),
+                env: env.clone(),
+                status_path,
+            },
+        );
+        Ok(prepared)
+    }
+
+    async fn start(&self, prepared: PreparedSession) -> Result<HostSessionId, HostError> {
+        if !prepared.issued_by(self.instance) {
+            return Err(HostError::session_not_found(prepared.id()));
+        }
+        let id = prepared.id().clone();
+        let pending = {
+            let mut sessions = self.prepared.lock().await;
+            let matches = sessions.get(&id).is_some_and(|pending| {
+                pending.token == prepared.token()
+                    && pending.status_path == prepared.sentinel_path()
+                    && prepared.herdr_identity().is_none()
+            });
+            if !matches {
+                return Err(HostError::session_not_found(&id));
+            }
+            sessions
+                .remove(&id)
+                .expect("matching prepared process disappeared under lock")
+        };
+
+        let full_line = sentinel::append_sentinel(&pending.shell_line, &pending.status_path);
         let mut command = tokio::process::Command::new("/bin/sh");
-        command.arg("-c").arg(&full_line).current_dir(cwd).envs(env);
+        command
+            .arg("-c")
+            .arg(&full_line)
+            .current_dir(&pending.cwd)
+            .envs(&pending.env);
         // SAFETY: setsid is async-signal-safe; the closure does nothing else.
         unsafe {
             command.pre_exec(|| {
@@ -128,12 +187,20 @@ impl SessionHost for ProcessHost {
                 Ok(())
             });
         }
-        let child = command
-            .spawn()
-            .map_err(|e| HostError::spawn_failed(format!("spawning /bin/sh: {e}")))?;
-        let pid = child
-            .id()
-            .ok_or_else(|| HostError::spawn_failed("spawned child has no pid"))?;
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                Self::remove_empty_status_dir(&pending.status_path);
+                return Err(HostError::spawn_failed(format!(
+                    "spawning /bin/sh: {error}"
+                )));
+            }
+        };
+        let Some(pid) = child.id() else {
+            let _ = child.kill().await;
+            Self::remove_empty_status_dir(&pending.status_path);
+            return Err(HostError::spawn_failed("spawned child has no pid"));
+        };
         let identity = ProcessIdentity::capture(pid).await;
 
         let mut sessions = self.sessions.lock().await;
@@ -143,10 +210,33 @@ impl SessionHost for ProcessHost {
                 child,
                 pid,
                 identity,
-                status_path,
+                status_path: pending.status_path,
             },
         );
         Ok(id)
+    }
+
+    async fn rollback_prepared(&self, prepared: PreparedSession) {
+        if !prepared.issued_by(self.instance) {
+            return;
+        }
+        let id = prepared.id().clone();
+        let removed = {
+            let mut sessions = self.prepared.lock().await;
+            let matches = sessions.get(&id).is_some_and(|pending| {
+                pending.token == prepared.token()
+                    && pending.status_path == prepared.sentinel_path()
+                    && prepared.herdr_identity().is_none()
+            });
+            if matches {
+                sessions.remove(&id)
+            } else {
+                None
+            }
+        };
+        if let Some(pending) = removed {
+            Self::remove_empty_status_dir(&pending.status_path);
+        }
     }
 
     async fn alive(&self, id: &HostSessionId) -> Result<Liveness, HostError> {

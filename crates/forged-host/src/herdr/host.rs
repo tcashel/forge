@@ -16,10 +16,20 @@ use tokio::time::Instant;
 use super::wire::{PaneInfoResult, PaneReadResponse, Pong, ProcessInfo, ProcessInfoResponse};
 use super::{CallError, Connection};
 use crate::identity::ProcessIdentity;
-use crate::{sentinel, Confirmed, HostError, HostSessionId, Liveness, SessionHost};
+use crate::{
+    next_host_instance, sentinel, Confirmed, HerdrSessionIdentity, HostError, HostSessionId,
+    Liveness, PreparedSession, SessionHost, HERDR_PROTOCOL_VERSION,
+};
 
-/// The protocol this crate is pinned to; anything else refuses to operate.
-const HERDR_PROTOCOL: u32 = 19;
+/// Result of an ownership-gated durable pane cleanup request.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrCloseOutcome {
+    /// Herdr accepted the close request.
+    Closed,
+    /// Herdr returned the exact protocol-19 `PANE_NOT_FOUND` code, proving
+    /// the opaque pane id is already absent.
+    AlreadyMissing,
+}
 
 // Phase budgets are WALL-CLOCK deadlines, not iteration counts: each poll
 // iteration may itself await a multi-second RPC or a subprocess, so counting
@@ -50,6 +60,14 @@ struct Seat {
     released: bool,
 }
 
+/// A pane and command reserved by prepare but not sent yet.
+struct PreparedSeat {
+    token: u64,
+    shell_line: String,
+    status_path: PathBuf,
+    identity: HerdrSessionIdentity,
+}
+
 /// Map Herdr's opaque pane id to a collision-free shell-safe directory name.
 /// Real ids contain `:`, and the sentinel path deliberately remains unquoted,
 /// so the transport id itself must never become a path component.
@@ -76,7 +94,10 @@ fn status_dir_key(pane_id: &str) -> String {
 /// subscription supplies closure observations as a best-effort accelerator.
 pub struct HerdrHost {
     conn: Arc<Connection>,
+    socket_path: PathBuf,
+    instance: u64,
     base_status_dir: PathBuf,
+    prepared: Mutex<HashMap<HostSessionId, PreparedSeat>>,
     sessions: Mutex<HashMap<HostSessionId, Seat>>,
     /// Label of the workspace seats are placed in, when the caller named one.
     /// `None` reproduces the pre-placement behaviour: an untargeted split,
@@ -92,6 +113,8 @@ pub struct HerdrHost {
 /// [`HerdrHost`], it does not own or spawn sessions.
 pub struct HerdrControl {
     conn: Arc<Connection>,
+    socket_path: PathBuf,
+    protocol: u32,
 }
 
 /// Plain-text pane output safe to expose through CLI/MCP.
@@ -114,9 +137,9 @@ async fn connect_pinned(socket_path: &Path) -> Result<Arc<Connection>, HostError
         .map_err(CallError::into_host_error)?;
     let pong: Pong = serde_json::from_value(pong_value)
         .map_err(|_| HostError::unavailable("malformed pong from herdr"))?;
-    if pong.protocol != HERDR_PROTOCOL {
+    if pong.protocol != HERDR_PROTOCOL_VERSION {
         return Err(HostError::ProtocolMismatch {
-            expected: HERDR_PROTOCOL,
+            expected: HERDR_PROTOCOL_VERSION,
             got: pong.protocol,
         });
     }
@@ -126,9 +149,62 @@ async fn connect_pinned(socket_path: &Path) -> Result<Arc<Connection>, HostError
 impl HerdrControl {
     /// Connect to protocol 19 without subscribing to session events.
     pub async fn connect(socket_path: impl AsRef<Path>) -> Result<Self, HostError> {
+        let socket_path = socket_path.as_ref().to_path_buf();
         Ok(Self {
-            conn: connect_pinned(socket_path.as_ref()).await?,
+            conn: connect_pinned(&socket_path).await?,
+            socket_path,
+            protocol: HERDR_PROTOCOL_VERSION,
         })
+    }
+
+    /// Connect using a durable identity, refusing unsupported or malformed
+    /// coordinates before opening a socket.
+    pub async fn connect_for(identity: &HerdrSessionIdentity) -> Result<Self, HostError> {
+        if identity.protocol() != HERDR_PROTOCOL_VERSION {
+            return Err(HostError::ProtocolMismatch {
+                expected: HERDR_PROTOCOL_VERSION,
+                got: identity.protocol(),
+            });
+        }
+        if identity.pane_id().is_empty() || identity.socket_path().as_os_str().is_empty() {
+            return Err(HostError::SessionNotFound {
+                id: identity.pane_id().to_string(),
+            });
+        }
+        Self::connect(identity.socket_path()).await
+    }
+
+    /// Close the exact durable Herdr identity this control was opened for.
+    ///
+    /// Socket/protocol mismatch is refused before `pane.close`. Only the
+    /// exact protocol-19 `PANE_NOT_FOUND` code is idempotent success; every
+    /// transport failure and other RPC refusal remains retryable failure.
+    pub async fn close_owned(
+        &self,
+        identity: &HerdrSessionIdentity,
+    ) -> Result<HerdrCloseOutcome, HostError> {
+        if identity.protocol() != self.protocol {
+            return Err(HostError::ProtocolMismatch {
+                expected: self.protocol,
+                got: identity.protocol(),
+            });
+        }
+        if identity.socket_path() != self.socket_path || identity.pane_id().is_empty() {
+            return Err(HostError::SessionNotFound {
+                id: identity.pane_id().to_string(),
+            });
+        }
+        match self
+            .conn
+            .call("pane.close", json!({"pane_id": identity.pane_id()}))
+            .await
+        {
+            Ok(_) => Ok(HerdrCloseOutcome::Closed),
+            Err(CallError::Rpc(error)) if error.is_pane_not_found() => {
+                Ok(HerdrCloseOutcome::AlreadyMissing)
+            }
+            Err(other) => Err(other.into_host_error()),
+        }
     }
 
     /// Read a bounded recent-unwrapped text snapshot.
@@ -187,7 +263,8 @@ impl HerdrHost {
         socket_path: impl AsRef<Path>,
         base_status_dir: impl Into<PathBuf>,
     ) -> Result<Self, HostError> {
-        let conn = connect_pinned(socket_path.as_ref()).await?;
+        let socket_path = socket_path.as_ref().to_path_buf();
+        let conn = connect_pinned(&socket_path).await?;
         conn.subscribe(json!({
             "subscriptions": [
                 {"type": "pane.created"},
@@ -199,7 +276,10 @@ impl HerdrHost {
         .map_err(CallError::into_host_error)?;
         Ok(HerdrHost {
             conn,
+            socket_path,
+            instance: next_host_instance(),
             base_status_dir: base_status_dir.into(),
+            prepared: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
             workspace_label: None,
             workspace: Mutex::new(None),
@@ -316,10 +396,10 @@ impl HerdrHost {
             .await;
     }
 
-    /// Everything after a successful `pane.split`: shell-readiness wait,
-    /// status-dir creation, and the single `pane.send_input`. Any failure
-    /// here makes the caller roll the pane back with a best-effort close.
-    async fn finish_spawn(&self, pane_id: &str, shell_line: &str) -> Result<PathBuf, HostError> {
+    /// Everything after a successful `pane.split` that is safe before
+    /// durable registration: shell-readiness wait and status-dir creation.
+    /// No command is sent here.
+    async fn finish_prepare(&self, pane_id: &str) -> Result<PathBuf, HostError> {
         // Wait for the pane's shell before typing into it, within a
         // wall-clock deadline; sleep only the remaining budget.
         let deadline = Instant::now() + READINESS_BUDGET;
@@ -354,21 +434,6 @@ impl HerdrHost {
         std::fs::create_dir(&session_dir)
             .map_err(|e| HostError::spawn_failed(format!("reserving session status dir: {e}")))?;
 
-        // Typed exactly once, never retried: send_input is not idempotent
-        // and a duplicate would run the line twice.
-        let full_line = sentinel::append_sentinel(shell_line, &status_path);
-        self.conn
-            .call(
-                "pane.send_input",
-                json!({"pane_id": pane_id, "text": full_line, "keys": ["Enter"]}),
-            )
-            .await
-            .map_err(|e| match e {
-                CallError::Rpc(e) => {
-                    HostError::spawn_failed(format!("pane.send_input refused: {}", e.message))
-                }
-                other => other.into_host_error(),
-            })?;
         Ok(status_path)
     }
 
@@ -404,12 +469,13 @@ impl HerdrHost {
 
 #[async_trait::async_trait]
 impl SessionHost for HerdrHost {
-    async fn spawn(
+    async fn prepare(
         &self,
         cwd: &Path,
         shell_line: &str,
         env: &HashMap<String, String>,
-    ) -> Result<HostSessionId, HostError> {
+    ) -> Result<PreparedSession, HostError> {
+        // Validate everything caller-controlled before reserving a pane.
         sentinel::validate_shell_line(shell_line)?;
         let cwd = cwd
             .to_str()
@@ -441,22 +507,113 @@ impl SessionHost for HerdrHost {
         // Feed the replay gate the pane_id we now own.
         self.conn.register_own_pane(&pane_id);
 
-        match self.finish_spawn(&pane_id, shell_line).await {
+        match self.finish_prepare(&pane_id).await {
             Ok(status_path) => {
-                let id = HostSessionId(pane_id);
-                self.sessions.lock().expect("sessions lock").insert(
+                let id = HostSessionId(pane_id.clone());
+                let identity = HerdrSessionIdentity::from_durable(
+                    pane_id,
+                    self.socket_path.clone(),
+                    HERDR_PROTOCOL_VERSION,
+                );
+                let prepared = PreparedSession::new(
                     id.clone(),
-                    Seat {
+                    status_path.clone(),
+                    Some(identity.clone()),
+                    self.instance,
+                );
+                self.prepared.lock().expect("prepared lock").insert(
+                    id,
+                    PreparedSeat {
+                        token: prepared.token(),
+                        shell_line: shell_line.to_string(),
                         status_path,
-                        released: false,
+                        identity,
                     },
                 );
-                Ok(id)
+                Ok(prepared)
             }
             Err(original) => {
                 self.best_effort_close(&pane_id).await;
                 Err(original)
             }
+        }
+    }
+
+    async fn start(&self, prepared: PreparedSession) -> Result<HostSessionId, HostError> {
+        if !prepared.issued_by(self.instance) {
+            return Err(HostError::session_not_found(prepared.id()));
+        }
+        let id = prepared.id().clone();
+        let pending = {
+            let mut seats = self.prepared.lock().expect("prepared lock");
+            let matches = seats.get(&id).is_some_and(|seat| {
+                seat.token == prepared.token()
+                    && seat.status_path == prepared.sentinel_path()
+                    && prepared.herdr_identity() == Some(&seat.identity)
+            });
+            if !matches {
+                return Err(HostError::session_not_found(&id));
+            }
+            seats
+                .remove(&id)
+                .expect("matching prepared pane disappeared under lock")
+        };
+
+        // Typed exactly once, never retried: send_input is not idempotent
+        // and a duplicate would run the line twice. The caller has already
+        // committed the durable identity before reaching this effect.
+        let full_line = sentinel::append_sentinel(&pending.shell_line, &pending.status_path);
+        let sent = self
+            .conn
+            .call(
+                "pane.send_input",
+                json!({"pane_id": id.as_str(), "text": full_line, "keys": ["Enter"]}),
+            )
+            .await
+            .map_err(|error| match error {
+                CallError::Rpc(error) => {
+                    HostError::spawn_failed(format!("pane.send_input refused: {}", error.message))
+                }
+                other => other.into_host_error(),
+            });
+        if let Err(original) = sent {
+            // A lost response is ambiguous, so never retry the command. A
+            // best-effort close limits the residual; durable cleanup remains
+            // authoritative when the caller registered this identity.
+            self.best_effort_close(id.as_str()).await;
+            return Err(original);
+        }
+
+        self.sessions.lock().expect("sessions lock").insert(
+            id.clone(),
+            Seat {
+                status_path: pending.status_path,
+                released: false,
+            },
+        );
+        Ok(id)
+    }
+
+    async fn rollback_prepared(&self, prepared: PreparedSession) {
+        if !prepared.issued_by(self.instance) {
+            return;
+        }
+        let id = prepared.id().clone();
+        let removed = {
+            let mut seats = self.prepared.lock().expect("prepared lock");
+            let matches = seats.get(&id).is_some_and(|seat| {
+                seat.token == prepared.token()
+                    && seat.status_path == prepared.sentinel_path()
+                    && prepared.herdr_identity() == Some(&seat.identity)
+            });
+            if matches {
+                seats.remove(&id)
+            } else {
+                None
+            }
+        };
+        if removed.is_some() {
+            self.best_effort_close(id.as_str()).await;
         }
     }
 

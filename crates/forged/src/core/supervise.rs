@@ -376,6 +376,33 @@ async fn reconcile_claimed(
             }
         };
     }
+    let owned_without_record = if record.is_none() {
+        handoff::owned_controller_for_generation(
+            ctx,
+            &row.subject_id,
+            subject_scope,
+            recovery_target,
+        )
+        .await?
+    } else {
+        None
+    };
+    if owned_without_record
+        .as_ref()
+        .is_some_and(|owned| owned.cleanup_state != forged_ledger::OwnedHerdrCleanupState::Released)
+    {
+        return finish_attention(
+            ctx,
+            &row,
+            &token,
+            format!(
+                "{} {} generation {recovery_target} owns a durable Herdr pane but has no verifiable controller identity; no replacement was spawned",
+                subject_scope.noun(),
+                row.subject_id
+            ),
+        )
+        .await;
+    }
     let status = match record.as_ref() {
         Some(record) => handoff::status_for(record).await,
         None => Value::Null,
@@ -437,7 +464,15 @@ async fn reconcile_claimed(
         .await;
     }
 
-    let observed_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
+    let observed_generation = record
+        .as_ref()
+        .map(handoff::generation)
+        .or_else(|| {
+            owned_without_record
+                .as_ref()
+                .and_then(|owned| owned.controller_generation)
+        })
+        .unwrap_or(0);
     if record.is_some() {
         let target = match handoff::controller_fence_target(ctx, &row.subject_id).await {
             Ok(target) => target,
@@ -613,8 +648,11 @@ async fn finish_spawn_failure(
     .await
 }
 
-async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
+pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     let started_at = now_iso();
+    // Pane cleanup is an independent durable work queue. Run it even when no
+    // desired subject is due; attempt settlement never waits on this effect.
+    let cleanup = super::herdr_ownership::reconcile(ctx).await?;
     let orphaned = {
         let now = started_at.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -757,10 +795,17 @@ async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         }
     }
     let wake_now = now_iso();
-    let next_wake_at = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.earliest_desired_wake(&wake_now)
+    let desired_now = wake_now.clone();
+    let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.earliest_desired_wake(&desired_now)
     })
     .await?;
+    let cleanup_wake_at = super::herdr_ownership::earliest_wake(ctx, &wake_now).await?;
+    let next_wake_at = match (desired_wake_at, cleanup_wake_at) {
+        (Some(desired), Some(cleanup)) => Some(desired.min(cleanup)),
+        (Some(wake), None) | (None, Some(wake)) => Some(wake),
+        (None, None) => None,
+    };
     Ok(json!({
         "schema": REPORT_SCHEMA,
         "tickId": tick_id,
@@ -770,6 +815,7 @@ async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "contended": contended,
         "orphanedReservations": orphaned.iter().map(|row| &row.reservation_id).collect::<Vec<_>>(),
         "subjects": subjects,
+        "cleanup": cleanup,
         "nextWakeAt": next_wake_at,
     }))
 }

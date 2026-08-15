@@ -36,6 +36,8 @@ struct SessionRecord {
     host: String,
     session_id: String,
     socket_path: Option<String>,
+    status_path: Option<String>,
+    controller_generation: Option<u32>,
     attach_hint: Option<String>,
 }
 
@@ -46,6 +48,8 @@ pub(crate) struct SessionStarted<'a> {
     pub host: &'a str,
     pub session_id: &'a str,
     pub socket_path: Option<&'a str>,
+    pub status_path: &'a str,
+    pub controller_generation: Option<u32>,
     pub attach_hint: Option<&'a str>,
 }
 
@@ -92,6 +96,14 @@ fn session_records(events: &[forged_ledger::EventRow]) -> Vec<SessionRecord> {
                     .get("socketPath")
                     .and_then(Value::as_str)
                     .map(str::to_owned),
+                status_path: payload
+                    .get("statusPath")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                controller_generation: payload
+                    .get("controllerGeneration")
+                    .and_then(Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok()),
                 attach_hint: payload
                     .get("attachHint")
                     .and_then(Value::as_str)
@@ -109,12 +121,14 @@ pub(crate) async fn record_session_started(
 ) -> Result<(), Failure> {
     let run_id = started.run_id.to_owned();
     let payload = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "attemptId": started.attempt_id,
         "packetId": started.packet_id,
         "host": started.host,
         "sessionId": started.session_id,
         "socketPath": started.socket_path,
+        "statusPath": started.status_path,
+        "controllerGeneration": started.controller_generation,
         "attachHint": started.attach_hint,
     });
     on_ledger(&ctx.ledger, move |ledger| {
@@ -245,13 +259,13 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "host": record.host,
                 "sessionId": record.session_id,
                 "socketPath": record.socket_path,
-                // The hint is durable; the PANE is not. A settled attempt has
-                // had its terminal released (`SessionHost::release`), so
-                // repeating the stored `forged session read --attempt N` here
-                // would advertise a command that fails BECAUSE the release
-                // worked. `Running` and `Revoking` are the states in which a
-                // pane can still be there to attach to; every other state
-                // reports no hint rather than a broken one.
+                "statusPath": record.status_path,
+                "controllerGeneration": record.controller_generation,
+                // The hint is durable, but terminal pane cleanup is an
+                // independent supervisor effect. `Running` and `Revoking`
+                // are the only states in which attachment remains useful;
+                // every terminal state suppresses the hint even while cleanup
+                // is pending or retrying.
                 "attachHint": match attempt.state {
                     forged_ledger::AttemptState::Running
                     | forged_ledger::AttemptState::Revoking => record.attach_hint.clone(),

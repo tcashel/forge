@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use forged_types::{
     AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionRateLimitV1,
     AdmissionResourceClass, AdmissionSpendV1, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
+    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
     ProviderHints, RunId, Stage,
 };
 
@@ -315,6 +316,278 @@ pub struct AdmissionBatchWrite {
     pub inputs: AdmissionInputsV1,
     pub decisions: Vec<AdmissionDecisionV1>,
     pub recovery_deadline: String,
+}
+
+/// Which closed owner shape an owned Herdr row carries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrOwnerKind {
+    Controller,
+    Attempt,
+}
+
+impl OwnedHerdrOwnerKind {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Controller => "controller",
+            Self::Attempt => "attempt",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrOwnerKind {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "controller" => Ok(Self::Controller),
+            "attempt" => Ok(Self::Attempt),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr owner kind: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Durable lifecycle evidence for the command in an owned pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrLifecycleState {
+    Registered,
+    CommandStarted,
+    OwnerTerminal,
+    OwnerDead,
+}
+
+impl OwnedHerdrLifecycleState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Registered => "registered",
+            Self::CommandStarted => "command-started",
+            Self::OwnerTerminal => "owner-terminal",
+            Self::OwnerDead => "owner-dead",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrLifecycleState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "registered" => Ok(Self::Registered),
+            "command-started" => Ok(Self::CommandStarted),
+            "owner-terminal" => Ok(Self::OwnerTerminal),
+            "owner-dead" => Ok(Self::OwnerDead),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr lifecycle state: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Durable cleanup state. Only the schedulable states participate in due and
+/// earliest-wake queries.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Released,
+}
+
+impl OwnedHerdrCleanupState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Released => "released",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "released" => Ok(Self::Released),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup state: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Why cleanup became eligible.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupReason {
+    CommandNotStarted,
+    AttemptSettled,
+    ControllerTerminal,
+    ControllerDead,
+}
+
+impl OwnedHerdrCleanupReason {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CommandNotStarted => "command-not-started",
+            Self::AttemptSettled => "attempt-settled",
+            Self::ControllerTerminal => "controller-terminal",
+            Self::ControllerDead => "controller-dead",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupReason {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "command-not-started" => Ok(Self::CommandNotStarted),
+            "attempt-settled" => Ok(Self::AttemptSettled),
+            "controller-terminal" => Ok(Self::ControllerTerminal),
+            "controller-dead" => Ok(Self::ControllerDead),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup reason: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// Verified close outcome. `PaneNotFound` is exact Herdr PANE_NOT_FOUND.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupRelease {
+    Closed,
+    PaneNotFound,
+}
+
+impl OwnedHerdrCleanupRelease {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Closed => "closed",
+            Self::PaneNotFound => "pane-not-found",
+        }
+    }
+}
+
+impl TryFrom<&str> for OwnedHerdrCleanupRelease {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "closed" => Ok(Self::Closed),
+            "pane-not-found" => Ok(Self::PaneNotFound),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown owned Herdr cleanup release: {other:?}"),
+            )),
+        }
+    }
+}
+
+/// One row of migration 014, in DDL order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnedHerdrSessionRow {
+    pub ownership_id: String,
+    pub schema: String,
+    pub owner_kind: OwnedHerdrOwnerKind,
+    pub subject_kind: OwnedHerdrSubjectKind,
+    pub subject_id: String,
+    pub run_id: Option<String>,
+    pub packet_id: Option<String>,
+    pub attempt_id: Option<i64>,
+    pub claim_token: Option<String>,
+    pub controller_generation: Option<u32>,
+    pub pane_id: String,
+    pub socket_path: String,
+    pub protocol: u32,
+    pub sentinel_path: String,
+    pub lifecycle_state: OwnedHerdrLifecycleState,
+    pub cleanup_state: OwnedHerdrCleanupState,
+    pub cleanup_reason: Option<OwnedHerdrCleanupReason>,
+    pub cleanup_release: Option<OwnedHerdrCleanupRelease>,
+    pub cleanup_token: Option<String>,
+    pub cleanup_lease_until: Option<String>,
+    pub cleanup_retry_budget: u32,
+    pub cleanup_retry_used: u32,
+    pub next_cleanup_at: Option<String>,
+    pub last_cleanup_error: Option<String>,
+    pub registered_at: String,
+    pub command_started_at: Option<String>,
+    pub cleanup_requested_at: Option<String>,
+    pub last_cleanup_attempt_at: Option<String>,
+    pub released_at: Option<String>,
+    pub updated_at: String,
+}
+
+impl OwnedHerdrSessionRow {
+    /// Reconstruct the exact immutable host identity without deriving any
+    /// path or interpreting the opaque pane id.
+    pub fn identity(&self) -> Result<OwnedHerdrSessionV1, LedgerError> {
+        let subject = OwnedHerdrSubjectV1 {
+            kind: self.subject_kind,
+            id: self.subject_id.clone(),
+        };
+        let owner = match self.owner_kind {
+            OwnedHerdrOwnerKind::Controller => OwnedHerdrOwnerV1::Controller {
+                subject,
+                generation: self.controller_generation.ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        "controller owner has no generation",
+                    )
+                })?,
+            },
+            OwnedHerdrOwnerKind::Attempt => OwnedHerdrOwnerV1::Attempt {
+                subject,
+                run_id: self.run_id.clone().ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no run")
+                })?,
+                packet_id: self.packet_id.clone().ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no packet")
+                })?,
+                attempt_id: self.attempt_id.ok_or_else(|| {
+                    refused(ErrorCode::InvalidRequest, "attempt owner has no attempt")
+                })?,
+                claim_token: self.claim_token.clone().ok_or_else(|| {
+                    refused(
+                        ErrorCode::InvalidRequest,
+                        "attempt owner has no claim token",
+                    )
+                })?,
+                controller_generation: self.controller_generation,
+            },
+        };
+        Ok(OwnedHerdrSessionV1 {
+            schema: self.schema.clone(),
+            ownership_id: self.ownership_id.clone(),
+            owner,
+            pane_id: self.pane_id.clone(),
+            socket_path: self.socket_path.clone(),
+            protocol: self.protocol,
+            sentinel_path: self.sentinel_path.clone(),
+        })
+    }
+}
+
+/// Result of persisting a transient cleanup failure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnedHerdrCleanupRetry {
+    Scheduled(OwnedHerdrSessionRow),
+    Exhausted(OwnedHerdrSessionRow),
 }
 
 /// A run's lifecycle state (`runs.state`).
@@ -1054,4 +1327,18 @@ pub struct Pragmas {
     pub busy_timeout_ms: i64,
     /// `PRAGMA user_version` — the last applied migration index.
     pub user_version: i64,
+}
+
+#[cfg(test)]
+mod owned_herdr_type_tests {
+    use super::*;
+
+    #[test]
+    fn owned_herdr_vocabulary_has_no_permissive_fallback() {
+        assert!(OwnedHerdrOwnerKind::try_from("legacy").is_err());
+        assert!(OwnedHerdrLifecycleState::try_from("unknown").is_err());
+        assert!(OwnedHerdrCleanupState::try_from("closing-ish").is_err());
+        assert!(OwnedHerdrCleanupReason::try_from("title-match").is_err());
+        assert!(OwnedHerdrCleanupRelease::try_from("not-found").is_err());
+    }
 }

@@ -9,7 +9,9 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use forged_host::{HerdrHost, ProcessHost, SessionHost};
-use forged_ledger::{DesiredSubjectKind, EffectClass, Ledger, OperationState, SlotOutcome};
+use forged_ledger::{
+    DesiredSubjectKind, EffectClass, Ledger, OperationState, OwnedHerdrCleanupState, SlotOutcome,
+};
 use forged_types::{AdmissionOutcome, ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
@@ -320,13 +322,72 @@ impl ControllerFenceTarget {
 
 /// The generation this detached run controller must join for machine effects.
 pub(super) fn controller_generation_for_run(run_id: &str) -> Option<u32> {
-    let scope = std::env::var(CONTROLLER_SCOPE_ENV).ok()?;
+    controller_generation_for_subject(Scope::Run, run_id)
+}
+
+fn controller_generation_for_subject(scope: Scope, subject_id: &str) -> Option<u32> {
+    let env_scope = std::env::var(CONTROLLER_SCOPE_ENV).ok()?;
     let id = std::env::var(CONTROLLER_ID_ENV).ok()?;
     let generation = std::env::var(CONTROLLER_GENERATION_ENV)
         .ok()?
         .parse::<u32>()
         .ok()?;
-    (scope == "run" && id == run_id && generation > 0).then_some(generation)
+    (env_scope == scope.noun() && id == subject_id && generation > 0).then_some(generation)
+}
+
+/// Exact detached-controller context inherited by a provider attempt.
+/// `None` means a direct foreground drive. A partial or malformed context is
+/// an ownership error, never permission to mint a generation-less identity.
+pub(super) fn controller_context_for_attempt(
+    run_id: &str,
+) -> Result<Option<(Scope, String, u32)>, Failure> {
+    parse_controller_context(
+        run_id,
+        std::env::var(CONTROLLER_SCOPE_ENV).ok(),
+        std::env::var(CONTROLLER_ID_ENV).ok(),
+        std::env::var(CONTROLLER_GENERATION_ENV).ok(),
+    )
+}
+
+fn parse_controller_context(
+    run_id: &str,
+    scope: Option<String>,
+    id: Option<String>,
+    generation: Option<String>,
+) -> Result<Option<(Scope, String, u32)>, Failure> {
+    match (scope, id, generation) {
+        (None, None, None) => Ok(None),
+        (Some(scope), Some(id), Some(generation)) => {
+            let scope = match scope.as_str() {
+                "run" if id == run_id => Scope::Run,
+                "epic" => Scope::Epic,
+                "run" => {
+                    return Err(Failure::internal(format!(
+                        "run controller {id} cannot own an attempt for run {run_id}"
+                    )))
+                }
+                other => {
+                    return Err(Failure::internal(format!(
+                        "unknown detached controller scope {other:?}"
+                    )))
+                }
+            };
+            let generation = generation
+                .parse::<u32>()
+                .ok()
+                .filter(|value| *value > 0)
+                .ok_or_else(|| {
+                    Failure::internal("detached controller generation must be a positive integer")
+                })?;
+            if id.is_empty() {
+                return Err(Failure::internal("detached controller id is empty"));
+            }
+            Ok(Some((scope, id, generation)))
+        }
+        _ => Err(Failure::internal(
+            "detached controller ownership environment is incomplete",
+        )),
+    }
 }
 
 /// Resolve the latest durable run-controller identity while the caller owns
@@ -339,7 +400,13 @@ pub(super) async fn controller_fence_target(
     let Some(record) = latest_record(ctx, run_id).await? else {
         return Ok(None);
     };
-    let generation = generation(&record);
+    controller_fence_target_from_record(&record)
+}
+
+fn controller_fence_target_from_record(
+    record: &Value,
+) -> Result<Option<ControllerFenceTarget>, Failure> {
+    let generation = generation(record);
     if generation == 0 {
         return Ok(None);
     }
@@ -368,8 +435,17 @@ pub(super) async fn controller_fence_target(
                 .filter(|value| !value.is_empty())
         })
         .ok_or_else(|| Failure::internal("controller record has no driver start identity"))?;
+    let scope = match record.get("scope").and_then(Value::as_str) {
+        Some("run") => Scope::Run,
+        Some("epic") => Scope::Epic,
+        _ => return Err(Failure::internal("controller record has unknown scope")),
+    };
+    let subject_id = record
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("controller record has no subject id"))?;
     let owned_by_current_process = pid == std::process::id() as i32
-        && controller_generation_for_run(run_id) == Some(generation);
+        && controller_generation_for_subject(scope, subject_id) == Some(generation);
     Ok(Some(ControllerFenceTarget {
         generation,
         pid,
@@ -486,6 +562,55 @@ pub(super) async fn latest_record(ctx: &Ctx, id: &str) -> Result<Option<Value>, 
     })
 }
 
+/// Resolve one exact controller generation. Cleanup must never substitute a
+/// newer controller's process identity for the pane owner it is adjudicating.
+pub(super) async fn record_for_generation(
+    ctx: &Ctx,
+    id: &str,
+    wanted_generation: u32,
+) -> Result<Option<Value>, Failure> {
+    let event_record = events(ctx, id)
+        .await?
+        .into_iter()
+        .rev()
+        .filter(|row| row.kind == CONTROLLER_STARTED)
+        .filter_map(|row| payload(&row))
+        .find(|record| generation(record) == wanted_generation);
+    if event_record.is_some() {
+        return Ok(event_record);
+    }
+    let file_record = std::fs::read_to_string(controller_dir(ctx, id).join(RECORD_FILE))
+        .ok()
+        .and_then(|text| serde_json::from_str::<Value>(&text).ok())
+        .filter(|record| generation(record) == wanted_generation);
+    Ok(file_record)
+}
+
+pub(super) async fn owned_controller_for_generation(
+    ctx: &Ctx,
+    id: &str,
+    scope: Scope,
+    generation: u32,
+) -> Result<Option<forged_ledger::OwnedHerdrSessionRow>, Failure> {
+    let id = id.to_owned();
+    let kind = scope.desired_kind();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_owned_herdr_controller(kind, &id, generation)
+    })
+    .await
+}
+
+pub(super) async fn controller_fence_target_for_generation(
+    ctx: &Ctx,
+    id: &str,
+    wanted_generation: u32,
+) -> Result<Option<ControllerFenceTarget>, Failure> {
+    let Some(record) = record_for_generation(ctx, id, wanted_generation).await? else {
+        return Ok(None);
+    };
+    controller_fence_target_from_record(&record)
+}
+
 /// Recover the minimum verifiable identity for a supervisor generation whose
 /// host spawn succeeded but whose process crashed before `controller.json`
 /// or its event was durable. PID publication follows lstart publication, so
@@ -539,14 +664,32 @@ pub(super) async fn recover_reserved_record(
             })
         }
     }
+    let subject_kind = scope.desired_kind();
+    let owned = {
+        let id = id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_owned_herdr_controller(subject_kind, &id, reserved_generation)
+        })
+        .await?
+    };
+    if let Some(owned) = owned.as_ref() {
+        // A verified published driver proves the prepared command started,
+        // even if the spawning process died before recording that transition.
+        super::herdr_ownership::mark_command_started(ctx, &owned.ownership_id).await?;
+    }
+    let status_path = owned.as_ref().map_or_else(
+        || dir.join(format!("controller-{reserved_generation}.drive-exit")),
+        |owned| PathBuf::from(&owned.sentinel_path),
+    );
     let record = json!({
-        "schemaVersion": 1,
+        "schemaVersion": if owned.is_some() { 2 } else { 1 },
         "scope": scope.noun(),
         "id": id,
         "generation": reserved_generation,
-        "host": "recovered",
-        "sessionId": Value::Null,
-        "attachHint": Value::Null,
+        "host": if owned.is_some() { "herdr" } else { "recovered" },
+        "sessionId": owned.as_ref().map(|row| row.pane_id.as_str()),
+        "socketPath": owned.as_ref().map(|row| row.socket_path.as_str()),
+        "attachHint": owned.as_ref().map(|_| format!("forged controller status --{} {id}", scope.noun())),
         "driver": {"pid": pid, "lstart": expected},
         // The spawned binary identity was not durably recorded before the
         // crash. Never attribute this live predecessor to the binary doing
@@ -554,7 +697,8 @@ pub(super) async fn recover_reserved_record(
         "binary": Value::Null,
         "pidPath": pid_path,
         "lstartPath": lstart_path,
-        "statusPath": dir.join(format!("controller-{reserved_generation}.drive-exit")),
+        "statusPath": status_path,
+        "ownershipId": owned.as_ref().map(|row| row.ownership_id.as_str()),
         "outputPath": dir.join(format!("controller-{reserved_generation}.log")),
         "submittedAt": now_iso(),
         "recoveredAfterSpawnCrash": true,
@@ -930,12 +1074,32 @@ pub(super) async fn spawn(
         }
     }
 
-    // The host effect is not idempotent and an error can be ambiguous (for
-    // example, a transport loss after Herdr created the pane). Preserve the
-    // admission before sending; only verified death may remove it afterwards.
+    let prepared = host.prepare(Path::new(repo), &shell_line, &env).await?;
+    let status_path = prepared.sentinel_path().to_path_buf();
+    let ownership = super::herdr_ownership::controller_identity(&prepared, scope, id, generation)?;
+    if let Some(identity) = ownership.as_ref() {
+        if let Err(error) = super::herdr_ownership::register(ctx, identity.clone()).await {
+            host.rollback_prepared(prepared).await;
+            return Err(error);
+        }
+    }
+    crate::failpoint::hit("controller.ownership.register.after");
+
+    // The start effect is not idempotent and an error can be ambiguous (for
+    // example, a transport loss after Herdr accepted send_input). Preserve
+    // the service-runtime admission before sending; only verified death may
+    // remove it afterwards.
     runtime_admission.preserve_spawn_attempt();
-    let session = host.spawn(Path::new(repo), &shell_line, &env).await?;
+    let session = host.start(prepared).await?;
     crate::failpoint::hit("controller.spawn.after");
+    let command_started_error = if let Some(identity) = ownership.as_ref() {
+        super::herdr_ownership::mark_command_started(ctx, &identity.ownership_id)
+            .await
+            .err()
+    } else {
+        None
+    };
+    crate::failpoint::hit("controller.ownership.started.after");
     let Some(pid) = await_pid(&pid_path).await else {
         if host.kill_confirmed(&session).await.is_ok() {
             runtime_admission.cancelled_after_confirmed_death()?;
@@ -965,9 +1129,8 @@ pub(super) async fn spawn(
             .clone()
             .expect("controller process-start identity checked above"),
     )?;
-    let status_path = status_base.join(session.as_str()).join("status");
     let record = json!({
-        "schemaVersion": 1,
+        "schemaVersion": 2,
         "scope": scope.noun(),
         "id": id,
         "generation": generation,
@@ -980,6 +1143,7 @@ pub(super) async fn spawn(
         "pidPath": pid_path,
         "lstartPath": lstart_path,
         "statusPath": status_path,
+        "ownershipId": ownership.as_ref().map(|identity| &identity.ownership_id),
         "outputPath": output_path,
         "submittedAt": now_iso(),
     });
@@ -988,6 +1152,12 @@ pub(super) async fn spawn(
     runtime_admission.complete()?;
     append_once(ctx, id, CONTROLLER_STARTED, record.clone()).await?;
     crate::failpoint::hit("controller.event.after");
+    if let Some(error) = command_started_error {
+        // The exact controller identity is already durable in its record and
+        // event. Returning the evidence-write failure makes the submit
+        // recoverable without ever retrying the start effect.
+        return Err(error);
+    }
     Ok(status_for(&record).await)
 }
 
@@ -1474,7 +1644,29 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                             },
                         )
                     }
-                    Ok(None) => {}
+                    Ok(None) => {
+                        match owned_controller_for_generation(ctx, &id, scope, owner_generation)
+                            .await
+                        {
+                            Ok(Some(owned))
+                                if owned.cleanup_state != OwnedHerdrCleanupState::Released =>
+                            {
+                                return err_response(
+                                    &req.idempotency_key,
+                                    &Failure {
+                                        code: ErrorCode::HostUnavailable,
+                                        message: format!(
+                                            "{} {id} generation {owner_generation} owns a durable Herdr pane but has no verifiable controller identity; refusing a duplicate spawn",
+                                            scope.noun()
+                                        ),
+                                        recoverable: true,
+                                    },
+                                );
+                            }
+                            Ok(_) => {}
+                            Err(error) => return err_response(&req.idempotency_key, &error),
+                        }
+                    }
                     Err(error) => return err_response(&req.idempotency_key, &error),
                 }
                 // The exact effect identity is confirmed absent. Release its
@@ -1586,7 +1778,10 @@ pub async fn epic_submit(ctx: &Ctx, req: &mut OperationRequest) -> OperationResp
 
 #[cfg(test)]
 mod tests {
-    use super::{controller_shell_line, controller_state, shell_quote, status_for};
+    use super::{
+        controller_shell_line, controller_state, parse_controller_context, shell_quote, status_for,
+        Scope,
+    };
     use serde_json::{json, Value};
     use std::path::Path;
 
@@ -1594,6 +1789,37 @@ mod tests {
     fn shell_quote_handles_spaces_and_apostrophes() {
         assert_eq!(shell_quote("plain"), "'plain'");
         assert_eq!(shell_quote("a b's"), "'a b'\"'\"'s'");
+    }
+
+    #[test]
+    fn attempt_controller_context_is_closed_and_direct_drive_is_explicit() {
+        assert!(parse_controller_context("run-1", None, None, None)
+            .expect("direct")
+            .is_none());
+        let (scope, id, generation) = parse_controller_context(
+            "child-1",
+            Some("epic".to_owned()),
+            Some("epic-1".to_owned()),
+            Some("4".to_owned()),
+        )
+        .expect("epic context")
+        .expect("detached");
+        assert!(matches!(scope, Scope::Epic));
+        assert_eq!((id.as_str(), generation), ("epic-1", 4));
+        assert!(parse_controller_context(
+            "run-1",
+            Some("run".to_owned()),
+            Some("other".to_owned()),
+            Some("1".to_owned()),
+        )
+        .is_err());
+        assert!(parse_controller_context(
+            "run-1",
+            Some("run".to_owned()),
+            None,
+            Some("1".to_owned()),
+        )
+        .is_err());
     }
 
     #[test]

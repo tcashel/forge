@@ -1749,8 +1749,14 @@ fn complete_recovered_controller_admission_at(
             "controller admission cannot complete before controller identity is durable",
         ));
     };
-    let record_matches = record.get("schemaVersion").and_then(Value::as_u64) == Some(1)
-        && record.get("id").and_then(Value::as_str) == Some(id)
+    // Controller record v2 adds the exact host-selected sentinel and durable
+    // Herdr ownership identity without changing the fenced driver identity
+    // this runtime admission validates. Keep v1 recovery for already-running
+    // controllers while accepting the closed current schema.
+    let record_matches = matches!(
+        record.get("schemaVersion").and_then(Value::as_u64),
+        Some(1 | 2)
+    ) && record.get("id").and_then(Value::as_str) == Some(id)
         && record.get("generation").and_then(Value::as_u64) == Some(u64::from(generation))
         && record.pointer("/driver/pid").and_then(Value::as_i64) == admission.pid.map(i64::from)
         && record.pointer("/driver/lstart").and_then(Value::as_str)

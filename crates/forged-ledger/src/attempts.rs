@@ -495,6 +495,7 @@ impl Ledger {
                  updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
                 rusqlite::params![result_json, now, attempt.attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt.attempt_id, &now)?;
             release_attempt_reservation_tx(&tx, attempt.attempt_id, &now)?;
             attempt_event(
                 &tx,
@@ -531,6 +532,7 @@ impl Ledger {
                  updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
                 rusqlite::params![note, now, attempt.attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt.attempt_id, &now)?;
             release_attempt_reservation_tx(&tx, attempt.attempt_id, &now)?;
             attempt_event(
                 &tx,
@@ -702,6 +704,7 @@ impl Ledger {
                  WHERE attempt_id = ?2",
                 rusqlite::params![now, attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt_id, &now)?;
             release_attempt_reservation_tx(&tx, attempt_id, &now)?;
             attempt_event(
                 &tx,
@@ -744,6 +747,7 @@ impl Ledger {
                  WHERE attempt_id = ?2",
                 rusqlite::params![now, attempt_id],
             )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt_id, &now)?;
             release_attempt_reservation_tx(&tx, attempt_id, &now)?;
             attempt_event(
                 &tx,

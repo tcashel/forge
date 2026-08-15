@@ -10,6 +10,7 @@ mod claimnext;
 mod drive;
 mod epic;
 pub(crate) mod handoff;
+pub(crate) mod herdr_ownership;
 mod observe;
 mod ops;
 pub(crate) mod sessions;

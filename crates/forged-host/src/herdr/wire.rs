@@ -17,26 +17,14 @@ pub(crate) struct WireError {
 }
 
 impl WireError {
-    /// Whether this error says THE PANE is not found. herdr pane ids are
-    /// never reused, so an id that no longer resolves can only mean that
-    /// pane is gone — pane-not-found IS proof of pane death. Any other
-    /// error proves nothing, so the match is deliberately tight: the
-    /// documented `PANE_NOT_FOUND` code compared exactly (normalized), plus
-    /// a few pane-specific message phrases. A bare "not found" (workspace
-    /// not found, method not found, ...) must NEVER read as pane death.
+    /// Whether this is the exact protocol-19 `PANE_NOT_FOUND` code.
+    ///
+    /// Herdr pane ids are never reused, so this one documented code proves
+    /// the pane is gone. Messages are diagnostics only: accepting a phrase
+    /// such as "pane not found" under another or absent code would turn an
+    /// ambiguous refusal into destructive cleanup authority.
     pub(crate) fn is_pane_not_found(&self) -> bool {
-        let normalize = |s: &str| s.to_ascii_lowercase().replace(['_', '-'], " ");
-        let code = match &self.code {
-            Value::String(s) => normalize(s),
-            other => normalize(&other.to_string()),
-        };
-        if code == "pane not found" {
-            return true;
-        }
-        let message = normalize(&self.message);
-        ["pane not found", "no such pane", "unknown pane"]
-            .iter()
-            .any(|phrase| message.contains(phrase))
+        matches!(&self.code, Value::String(code) if code == "PANE_NOT_FOUND")
     }
 }
 

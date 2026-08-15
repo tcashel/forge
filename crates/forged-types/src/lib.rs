@@ -7,6 +7,7 @@ pub mod canonical;
 pub mod contract;
 pub mod envelope;
 pub mod error;
+pub mod herdr_ownership;
 pub mod ids;
 pub mod packet;
 
@@ -26,6 +27,10 @@ pub use contract::{
 };
 pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
+pub use herdr_ownership::{
+    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
+    OWNED_HERDR_SESSION_SCHEMA_V1,
+};
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{
     AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,

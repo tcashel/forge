@@ -26,6 +26,7 @@ mod inventory;
 mod ledger;
 mod migrations;
 mod operations;
+mod owned_herdr;
 mod packets;
 mod runs;
 mod slots;
@@ -36,6 +37,7 @@ mod usage;
 pub use error::LedgerError;
 pub use inventory::InventorySnapshot;
 pub use ledger::{default_db_path, Ledger};
+pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;
 pub use types::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
     AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
@@ -43,6 +45,8 @@ pub use types::{
     DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
     DesiredWorkRow, EffectClass, EventRow, MergeSlotRow, NewAttemptArtifact, NewPacket, NewRun,
     NewRunDefinition, NewUsage, OperationOutcome, OperationRow, OperationState, OperationTicket,
+    OwnedHerdrCleanupReason, OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry,
+    OwnedHerdrCleanupState, OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow,
     PacketRow, Pragmas, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
     RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
 };

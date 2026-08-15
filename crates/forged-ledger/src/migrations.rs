@@ -393,6 +393,120 @@ CREATE INDEX admission_reservations_capacity
   ON admission_reservations(state, provider, repository, resource_class);
 ";
 
+/// Migration 014: durable ownership and convergent cleanup for new
+/// Forged-created Herdr panes. Identity columns are immutable after the
+/// prepare/register seam commits; lifecycle and cleanup columns remain the
+/// state machine's only update surface.
+const MIGRATION_014: &str = "
+CREATE TABLE owned_herdr_sessions (
+  ownership_id          TEXT PRIMARY KEY CHECK (length(ownership_id) > 0),
+  schema                TEXT NOT NULL CHECK (schema = 'forged.owned-herdr-session/1'),
+  owner_kind            TEXT NOT NULL CHECK (owner_kind IN ('controller','attempt')),
+  subject_kind          TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id            TEXT NOT NULL CHECK (length(subject_id) > 0),
+  run_id                TEXT,
+  packet_id             TEXT,
+  attempt_id            INTEGER,
+  claim_token           TEXT,
+  controller_generation INTEGER,
+  pane_id               TEXT NOT NULL CHECK (length(pane_id) > 0),
+  socket_path           TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol              INTEGER NOT NULL CHECK (protocol = 19),
+  sentinel_path         TEXT NOT NULL CHECK (length(sentinel_path) > 0),
+  lifecycle_state       TEXT NOT NULL CHECK (lifecycle_state IN
+                         ('registered','command-started','owner-terminal','owner-dead')),
+  cleanup_state         TEXT NOT NULL CHECK (cleanup_state IN
+                         ('not-requested','pending','leased','retry-wait','attention','released')),
+  cleanup_reason        TEXT CHECK (cleanup_reason IN
+                         ('command-not-started','attempt-settled','controller-terminal','controller-dead')),
+  cleanup_release       TEXT CHECK (cleanup_release IN ('closed','pane-not-found')),
+  cleanup_token         TEXT,
+  cleanup_lease_until   TEXT,
+  cleanup_retry_budget  INTEGER NOT NULL CHECK (cleanup_retry_budget > 0),
+  cleanup_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                        (cleanup_retry_used >= 0 AND cleanup_retry_used <= cleanup_retry_budget),
+  next_cleanup_at       TEXT,
+  last_cleanup_error    TEXT,
+  registered_at         TEXT NOT NULL,
+  command_started_at    TEXT,
+  cleanup_requested_at  TEXT,
+  last_cleanup_attempt_at TEXT,
+  released_at           TEXT,
+  updated_at            TEXT NOT NULL,
+  UNIQUE (socket_path, protocol, pane_id),
+  UNIQUE (sentinel_path),
+  CHECK (
+    (owner_kind = 'controller' AND run_id IS NULL AND packet_id IS NULL
+      AND attempt_id IS NULL AND claim_token IS NULL
+      AND controller_generation IS NOT NULL AND controller_generation > 0)
+    OR
+    (owner_kind = 'attempt' AND run_id IS NOT NULL AND packet_id IS NOT NULL
+      AND attempt_id IS NOT NULL AND attempt_id > 0 AND claim_token IS NOT NULL
+      AND (controller_generation IS NULL OR controller_generation > 0)
+      AND (controller_generation IS NOT NULL
+           OR (subject_kind = 'run' AND subject_id = run_id)))
+  ),
+  CHECK (
+    (lifecycle_state = 'registered' AND command_started_at IS NULL)
+    OR (lifecycle_state = 'command-started' AND command_started_at IS NOT NULL)
+    OR lifecycle_state IN ('owner-terminal','owner-dead')
+  ),
+  CHECK (
+    (cleanup_state = 'not-requested' AND cleanup_reason IS NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'pending' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NOT NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'leased' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NOT NULL
+      AND cleanup_lease_until IS NOT NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'retry-wait' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NOT NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NULL)
+    OR
+    (cleanup_state = 'attention' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND last_cleanup_error IS NOT NULL
+      AND cleanup_retry_used = cleanup_retry_budget AND released_at IS NULL)
+    OR
+    (cleanup_state = 'released' AND cleanup_reason IS NOT NULL
+      AND cleanup_release IS NOT NULL AND cleanup_token IS NULL
+      AND cleanup_lease_until IS NULL AND next_cleanup_at IS NULL
+      AND cleanup_requested_at IS NOT NULL AND released_at IS NOT NULL)
+  )
+);
+CREATE UNIQUE INDEX owned_herdr_cleanup_token
+  ON owned_herdr_sessions(cleanup_token) WHERE cleanup_token IS NOT NULL;
+CREATE INDEX owned_herdr_cleanup_wake
+  ON owned_herdr_sessions(cleanup_state, next_cleanup_at, cleanup_lease_until)
+  WHERE cleanup_state IN ('pending','leased','retry-wait');
+CREATE UNIQUE INDEX owned_herdr_attempt_owner
+  ON owned_herdr_sessions(attempt_id, claim_token)
+  WHERE owner_kind = 'attempt';
+CREATE UNIQUE INDEX owned_herdr_controller_owner
+  ON owned_herdr_sessions(subject_kind, subject_id, controller_generation)
+  WHERE owner_kind = 'controller';
+
+CREATE TRIGGER owned_herdr_identity_immutable
+BEFORE UPDATE OF ownership_id, schema, owner_kind, subject_kind, subject_id,
+                 run_id, packet_id, attempt_id, claim_token,
+                 controller_generation, pane_id, socket_path, protocol,
+                 sentinel_path, registered_at
+ON owned_herdr_sessions
+BEGIN
+  SELECT RAISE(ABORT, 'owned Herdr session identity is immutable');
+END;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -408,6 +522,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_011,
     MIGRATION_012,
     MIGRATION_013,
+    MIGRATION_014,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -527,7 +642,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 13);
+        assert_eq!(pragmas.user_version, 14);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -551,6 +666,7 @@ mod tests {
             "admission_batches",
             "admission_decisions",
             "admission_reservations",
+            "owned_herdr_sessions",
         ] {
             let found: String = conn
                 .query_row(
@@ -580,8 +696,46 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
         ledger.close().expect("close");
+    }
+
+    #[test]
+    fn migration_014_closes_protocol_and_freezes_only_identity() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        Ledger::open(&path)
+            .expect("migrate")
+            .close()
+            .expect("close");
+        let conn = rusqlite::Connection::open(&path).expect("raw");
+        let insert = |id: &str, protocol: i64| {
+            conn.execute(
+                "INSERT INTO owned_herdr_sessions (
+                   ownership_id, schema, owner_kind, subject_kind, subject_id,
+                   controller_generation, pane_id, socket_path, protocol, sentinel_path,
+                   lifecycle_state, cleanup_state, cleanup_retry_budget,
+                   cleanup_retry_used, registered_at, updated_at
+                 ) VALUES (?1, 'forged.owned-herdr-session/1', 'controller', 'run', 'run-1',
+                           1, ?2, '/tmp/herdr.sock', ?3, ?4,
+                           'registered', 'not-requested', 8, 0, 't', 't')",
+                rusqlite::params![id, format!("pane-{id}"), protocol, format!("/tmp/{id}")],
+            )
+        };
+        insert("bad-protocol", 18).expect_err("unknown protocol is closed");
+        insert("owned-1", 19).expect("valid identity");
+        conn.execute(
+            "UPDATE owned_herdr_sessions SET pane_id = 'foreign-pane' \
+             WHERE ownership_id = 'owned-1'",
+            [],
+        )
+        .expect_err("identity trigger rejects rewrites");
+        conn.execute(
+            "UPDATE owned_herdr_sessions SET lifecycle_state = 'owner-dead' \
+             WHERE ownership_id = 'owned-1'",
+            [],
+        )
+        .expect("lifecycle remains mutable without invented command-start evidence");
     }
 
     #[test]
@@ -603,7 +757,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -646,7 +800,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 13);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 14);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

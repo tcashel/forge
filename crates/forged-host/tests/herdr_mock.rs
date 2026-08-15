@@ -7,7 +7,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use forged_host::{Confirmed, HerdrControl, HerdrHost, HostError, Liveness, SessionHost};
+use forged_host::{
+    Confirmed, HerdrCloseOutcome, HerdrControl, HerdrHost, HerdrSessionIdentity, HostError,
+    Liveness, SessionHost, HERDR_PROTOCOL_VERSION,
+};
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -332,6 +335,233 @@ async fn connect_refuses_protocol_18_and_issues_no_further_requests() {
     // request ever issued.
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert_eq!(mock.methods(), vec!["ping".to_string()]);
+}
+
+#[tokio::test]
+async fn prepare_exposes_exact_identity_and_sends_only_after_registration_boundary() {
+    const UNSAFE_PANE_ID: &str = "workspace:pa ne;$'\"/7";
+    let registered = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let observed = Arc::clone(&registered);
+    let mock = Mock::start(move |method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        "events.subscribe" => vec![Action::Respond(json!({"type": "ok"}))],
+        "pane.split" => vec![Action::Respond(pane_info(UNSAFE_PANE_ID))],
+        "pane.process_info" => vec![Action::Respond(shell_ready(UNSAFE_PANE_ID))],
+        "pane.send_input" => {
+            assert!(
+                observed.load(Ordering::SeqCst),
+                "command reached Herdr before durable registration"
+            );
+            vec![Action::Respond(json!({"type": "ok"}))]
+        }
+        other => panic!("unexpected request {other}"),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect");
+
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("prepare");
+    assert_eq!(prepared.id().as_str(), UNSAFE_PANE_ID);
+    assert_eq!(prepared.sentinel_path(), only_status_path(base.path()));
+    let sentinel = prepared.sentinel_path().to_path_buf();
+    assert!(
+        sentinel
+            .to_string_lossy()
+            .chars()
+            .all(|character| character.is_ascii_alphanumeric()
+                || matches!(character, '/' | '.' | '_' | '-')),
+        "sentinel must remain shell-safe: {}",
+        sentinel.display()
+    );
+    let identity = prepared.herdr_identity().expect("herdr identity");
+    assert_eq!(identity.pane_id(), UNSAFE_PANE_ID);
+    assert_eq!(identity.socket_path(), mock.socket_path);
+    assert_eq!(identity.protocol(), HERDR_PROTOCOL_VERSION);
+    assert_eq!(
+        mock.methods(),
+        vec![
+            "ping",
+            "events.subscribe",
+            "pane.split",
+            "pane.process_info"
+        ],
+        "prepare must not send the command"
+    );
+
+    // Stand-in for the caller's committed durable ownership row.
+    registered.store(true, Ordering::SeqCst);
+    let id = host.start(prepared).await.expect("start");
+    assert_eq!(id.as_str(), UNSAFE_PANE_ID);
+    let send = mock.params_of("pane.send_input");
+    assert_eq!(send["pane_id"], UNSAFE_PANE_ID);
+    assert_eq!(
+        send["text"],
+        format!("sleep 5; echo $? > {}", sentinel.display())
+    );
+}
+
+#[tokio::test]
+async fn registration_failure_rolls_back_an_empty_pane_without_sending() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.split", 1) => vec![Action::Respond(pane_info(TEST_PANE_ID))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(TEST_PANE_ID))],
+        ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let host = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("connect");
+    let prepared = host
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("prepare");
+
+    host.rollback_prepared(prepared).await;
+
+    assert_eq!(mock.count_of("pane.send_input"), 0);
+    assert_eq!(mock.count_of("pane.close"), 1);
+    assert_eq!(
+        mock.params_of("pane.close"),
+        json!({"pane_id": TEST_PANE_ID})
+    );
+}
+
+#[tokio::test]
+async fn foreign_host_refuses_prepared_pane_without_any_pane_effect() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", _) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("events.subscribe", _) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.split", 1) => vec![Action::Respond(pane_info(TEST_PANE_ID))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready(TEST_PANE_ID))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let owner = HerdrHost::connect(&mock.socket_path, base.path())
+        .await
+        .expect("owner connect");
+    let prepared = owner
+        .prepare(cwd.path(), "sleep 5", &HashMap::new())
+        .await
+        .expect("prepare");
+    let stranger_base = tempfile::tempdir().expect("tempdir");
+    let stranger = HerdrHost::connect(&mock.socket_path, stranger_base.path())
+        .await
+        .expect("stranger connect");
+    let before = mock.methods();
+
+    let error = stranger
+        .start(prepared)
+        .await
+        .expect_err("foreign prepared pane");
+    assert!(matches!(error, HostError::SessionNotFound { .. }));
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    assert_eq!(mock.methods(), before);
+    assert_eq!(mock.count_of("pane.send_input"), 0);
+    assert_eq!(mock.count_of("pane.close"), 0);
+}
+
+#[tokio::test]
+async fn durable_close_distinguishes_closed_from_exact_missing() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("pane.close", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        ("pane.close", 2) => vec![PANE_NOT_FOUND],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let first = HerdrSessionIdentity::from_durable(
+        "w1:p1",
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&first)
+        .await
+        .expect("connect exact identity");
+    assert_eq!(
+        control.close_owned(&first).await.expect("close"),
+        HerdrCloseOutcome::Closed
+    );
+    let missing = HerdrSessionIdentity::from_durable(
+        "w1:p2",
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    assert_eq!(
+        control
+            .close_owned(&missing)
+            .await
+            .expect("already missing"),
+        HerdrCloseOutcome::AlreadyMissing
+    );
+}
+
+#[tokio::test]
+async fn durable_close_refuses_protocol_and_socket_mismatch_without_close_rpc() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        other => panic!("unexpected request {other}"),
+    });
+    let wrong_protocol = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION - 1,
+    );
+    let error = match HerdrControl::connect_for(&wrong_protocol).await {
+        Ok(_) => panic!("stored protocol mismatch must be refused"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, HostError::ProtocolMismatch { .. }));
+    assert!(
+        mock.methods().is_empty(),
+        "protocol mismatch opened a socket"
+    );
+
+    let control = HerdrControl::connect(&mock.socket_path)
+        .await
+        .expect("connect");
+    let wrong_socket = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.with_extension("foreign"),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let error = control
+        .close_owned(&wrong_socket)
+        .await
+        .expect_err("stored socket mismatch");
+    assert!(matches!(error, HostError::SessionNotFound { .. }));
+    assert_eq!(mock.methods(), vec!["ping"]);
+}
+
+#[tokio::test]
+async fn durable_close_does_not_trust_a_not_found_message_under_another_code() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("pane.close", 1) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "pane not found",
+        }],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let identity = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&identity).await.expect("connect");
+    let error = control
+        .close_owned(&identity)
+        .await
+        .expect_err("non-exact code must fail");
+    assert!(matches!(error, HostError::Unavailable { .. }));
 }
 
 // ---------------------------------------------------------------------------
