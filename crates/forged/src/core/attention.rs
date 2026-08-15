@@ -1212,6 +1212,7 @@ mod tests {
             inflight_operations: Vec::new(),
             admission_decisions: Vec::new(),
             admission_reservations: Vec::new(),
+            work_identities: BTreeMap::new(),
         }
     }
 
