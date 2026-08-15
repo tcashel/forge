@@ -3074,26 +3074,6 @@ fn work_ref(kind: WorkRefKind, id: &str) -> Result<Value, Failure> {
         .map_err(|error| Failure::internal(format!("serializing operator work reference: {error}")))
 }
 
-fn plan_readiness(plan: &forged_beads::PlanIssue) -> &'static str {
-    if plan.issue.status == "blocked"
-        || plan.dependencies.iter().any(|dependency| {
-            dependency
-                .status
-                .as_deref()
-                .is_some_and(|status| status != "closed")
-        })
-    {
-        "blocked"
-    } else {
-        match plan.issue.status.as_str() {
-            "open" => "ready",
-            "in_progress" => "claimed",
-            "deferred" => "deferred",
-            _ => "unknown",
-        }
-    }
-}
-
 fn live_plan_entry(plan: &forged_beads::PlanIssue, captured_at: &str) -> Result<Value, Failure> {
     let repository = plan
         .issue
@@ -3152,7 +3132,7 @@ fn live_plan_entry(plan: &forged_beads::PlanIssue, captured_at: &str) -> Result<
         "plan": {
             "source": "beads",
             "status": plan.issue.status,
-            "readiness": plan_readiness(plan),
+            "readiness": plan.readiness(),
             "priority": plan.issue.priority,
             "assignee": plan.issue.assignee,
             "issueType": plan.issue.issue_type,
@@ -3563,7 +3543,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                             json!({
                                 "source": "beads",
                                 "status": plan.issue.status,
-                                "readiness": plan_readiness(plan),
+                                "readiness": plan.readiness(),
                                 "priority": plan.issue.priority,
                                 "assignee": plan.issue.assignee,
                                 "issueType": plan.issue.issue_type,
