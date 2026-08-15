@@ -70,7 +70,7 @@ struct Projected {
     source_cursor: i64,
 }
 
-fn policy(
+pub(crate) fn policy(
     condition: AttentionCondition,
 ) -> (
     AttentionSeverity,
