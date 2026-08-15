@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Forty tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-one tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -30,10 +30,12 @@ use crate::core::{dispatch, Ctx};
 const OVERVIEW_URI: &str = "ui://forged/overview.html";
 const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
 const WORK_DETAIL_URI: &str = "ui://forged/work-detail.html";
+const WORK_MAP_URI: &str = "ui://forged/work-map.html";
 const APP_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_HTML: &str = include_str!("../assets/overview.html");
 const OPERATIONS_OVERVIEW_HTML: &str = include_str!("../assets/operations-overview.html");
 const WORK_DETAIL_HTML: &str = include_str!("../assets/work-detail.html");
+const WORK_MAP_HTML: &str = include_str!("../assets/work-map.html");
 
 fn app_tool_meta(uri: &str) -> MetaObject {
     let mut meta = MetaObject::new();
@@ -54,6 +56,10 @@ fn operations_overview_tool_meta() -> MetaObject {
 
 fn work_detail_tool_meta() -> MetaObject {
     app_tool_meta(WORK_DETAIL_URI)
+}
+
+fn work_map_tool_meta() -> MetaObject {
+    app_tool_meta(WORK_MAP_URI)
 }
 
 fn app_resource_meta() -> MetaObject {
@@ -401,6 +407,139 @@ pub struct OperationsOverviewParams {
 }
 
 impl OperationsOverviewArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Closed Work Map scope exposed in MCP discovery.
+#[derive(Debug, Default, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapScopeParam {
+    /// All operator-scoped work.
+    #[default]
+    Operator,
+    /// Work for one exact canonical repository path.
+    Repository,
+    /// Work for one exact epic id.
+    Epic,
+}
+
+/// Closed Operations group exposed by Work Map.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapGroupParam {
+    NeedsMe,
+    ReadyToMerge,
+    Running,
+    StalledOrRecoverable,
+    Planned,
+}
+
+/// Closed Work Map authority source.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum WorkMapSourceParam {
+    Durable,
+    LivePlan,
+}
+
+/// Closed canonical Work Map reference kind.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkMapRefKindParam {
+    Plan,
+    Run,
+    Epic,
+}
+
+/// Complete canonical focus coordinate for Work Map.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapFocusParam {
+    /// Contract discriminator; must be `forged.work-ref/1`.
+    #[serde(deserialize_with = "named_string")]
+    pub schema: String,
+    /// Exact node kind.
+    pub kind: WorkMapRefKindParam,
+    /// Exact canonical node id.
+    #[serde(deserialize_with = "named_string")]
+    pub id: String,
+}
+
+/// Typed MCP envelope for the bounded Work Map App.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Closed, bounded map query.
+    #[serde(default)]
+    pub params: WorkMapParams,
+}
+
+/// Closed parameters accepted by `work_map`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkMapParams {
+    /// Operator, repository, or epic scope.
+    #[serde(default)]
+    pub scope: WorkMapScopeParam,
+    /// Exact canonical repository path for repository scope.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repository: Option<String>,
+    /// Exact epic id for epic scope.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub epic_id: Option<String>,
+    /// Optional canonical Operations queue group.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<WorkMapGroupParam>,
+    /// Optional authority source.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<WorkMapSourceParam>,
+    /// Inclusive RFC3339 UTC history lower bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC history upper bound.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    /// Maximum graph nodes, 1..=500 (default 250).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_nodes: Option<u64>,
+    /// Optional complete canonical node focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub focus: Option<WorkMapFocusParam>,
+}
+
+impl WorkMapArgs {
     fn into_envelope(self) -> EnvelopeArgs {
         let params = match serde_json::to_value(&self.params) {
             Ok(Value::Object(map)) => map,
@@ -814,6 +953,17 @@ impl ForgedServer {
         self.call("work_history", args.0.into_envelope()).await
     }
 
+    /// Bounded authority-preserving work graph for navigation.
+    #[tool(
+        name = "work_map",
+        description = "Project a bounded graph of current Beads plans and distinct durable run/epic executions. Accepts operator, exact repository, or exact epic scope; canonical queue/source filters; an optional half-open history window; maxNodes up to 500; and a complete forged.work-ref/1 focus.",
+        meta = work_map_tool_meta()
+    )]
+    pub async fn work_map(&self, args: Parameters<WorkMapArgs>) -> CallToolResult {
+        self.call_structured("work_map", args.0.into_envelope())
+            .await
+    }
+
     /// Exact durable subject projection for the Work Detail App.
     #[tool(
         name = "work_detail",
@@ -896,6 +1046,10 @@ impl ServerHandler for ForgedServer {
                 .with_title("Forged Work Detail")
                 .with_description("Exact read-only projection of one Forged run or epic.")
                 .with_mime_type(APP_MIME),
+            Resource::new(WORK_MAP_URI, "forged-work-map")
+                .with_title("Forged Work Map")
+                .with_description("Bounded plan, queue, execution, dependency, and history graph.")
+                .with_mime_type(APP_MIME),
         ]))
     }
 
@@ -908,6 +1062,7 @@ impl ServerHandler for ForgedServer {
             OVERVIEW_URI => OVERVIEW_HTML,
             OPERATIONS_OVERVIEW_URI => OPERATIONS_OVERVIEW_HTML,
             WORK_DETAIL_URI => WORK_DETAIL_HTML,
+            WORK_MAP_URI => WORK_MAP_HTML,
             _ => {
                 return Err(ErrorData::resource_not_found(
                     format!("unknown forged resource {:?}", request.uri),

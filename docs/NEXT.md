@@ -253,6 +253,9 @@ guesses or widens by prefix:
 forged operations overview
 forged operations overview --repo /absolute/path/to/repository
 forged operations overview --group needs-me --limit 50
+forged work map
+forged work map --scope repository --repository /absolute/path/to/repository
+forged work map --scope epic --epic-id <epic-id> --max-nodes 250
 forged work detail --subject-kind run --subject-id <run-id>
 forged work detail --subject-kind epic --subject-id <epic-id>
 forged work list
@@ -287,6 +290,25 @@ per-row process or controller-file probe.
 drawer when the host supports server tool calls; otherwise the exact CLI/MCP
 command remains visible to the lead agent. Plan-only rows deliberately have
 no detail target until durable execution exists.
+
+`work map` returns `forged.work-map/1` and renders through
+`ui://forged/work-map.html`. It keeps current Beads plans and durable run or
+epic executions as distinct nodes, joined by explicit `execution-of` edges;
+multiple executions of one Bead never overwrite each other. Native dependency
+edges run from dependent to prerequisite, parent edges run child to parent,
+and filtered or cross-scope coordinates are bounded `contextOnly` nodes.
+Cycles, missing blocker status, and genuinely unavailable targets remain
+visible in graph health. Operator and repository scope use at most two Beads
+processes; epic scope uses at most three. Graphs over `maxNodes` refuse with
+`GRAPH_SCOPE_TOO_LARGE` rather than returning a misleading partial graph.
+
+Queue and attention fields use the same pure classifier as Operations, while
+desired/admission facts remain on their exact durable subjects. Work Map adds
+one bounded history projection and reports unattached subjects explicitly;
+plan-only nodes never inherit execution spend. Ledger, Beads, plan, and
+history captures and health remain separate because the sources are not one
+cross-system transaction. Selecting a durable App node calls Work Detail with
+its exact `{subjectKind, subjectId}`; plan nodes expose no execution control.
 
 The repository selector performs one native, id-bounded
 `metadata.repository` Beads query and reuses its rows for claim-health and

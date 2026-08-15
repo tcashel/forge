@@ -776,6 +776,7 @@ case "$cmd" in
     statuses=$(val --status "$@")
     limit=$(val --limit "$@")
     metadata_filter=$(val --metadata-field "$@")
+    parent_filter=$(val --parent "$@")
     if [ -z "$ids" ]; then
       ids=$(for field in "$state"/*.status; do
         [ -e "$field" ] || continue
@@ -799,6 +800,10 @@ case "$cmd" in
         esac
         repository=$(cat "$state/$id.repository" 2>/dev/null || true)
         [ "$repository" = "$expected_repository" ] || continue
+      fi
+      if [ -n "$parent_filter" ]; then
+        current_parent=$(cat "$state/$id.parent" 2>/dev/null || true)
+        [ "$current_parent" = "$parent_filter" ] || continue
       fi
       if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ "$shown" -ge "$limit" ]; then
         continue

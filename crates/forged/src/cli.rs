@@ -780,6 +780,120 @@ pub enum WorkCmd {
     History(WorkHistoryArgs),
     /// Project one exact run or epic for the Work Detail App.
     Detail(WorkDetailArgs),
+    /// Project the bounded plan, queue, execution, and history graph.
+    Map(WorkMapArgs),
+}
+
+/// Closed scope accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapScopeArg {
+    Operator,
+    Repository,
+    Epic,
+}
+
+impl WorkMapScopeArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Operator => "operator",
+            Self::Repository => "repository",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+/// Closed Operations queue group accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapGroupArg {
+    NeedsMe,
+    ReadyToMerge,
+    Running,
+    StalledOrRecoverable,
+    Planned,
+}
+
+impl WorkMapGroupArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::NeedsMe => "needs-me",
+            Self::ReadyToMerge => "ready-to-merge",
+            Self::Running => "running",
+            Self::StalledOrRecoverable => "stalled-or-recoverable",
+            Self::Planned => "planned",
+        }
+    }
+}
+
+/// Closed authority source accepted by `work map`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapSourceArg {
+    Durable,
+    LivePlan,
+}
+
+impl WorkMapSourceArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Durable => "durable",
+            Self::LivePlan => "live-plan",
+        }
+    }
+}
+
+/// Closed Work Map reference kind.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkMapRefKindArg {
+    Plan,
+    Run,
+    Epic,
+}
+
+impl WorkMapRefKindArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Run => "run",
+            Self::Epic => "epic",
+        }
+    }
+}
+
+/// `work map` flags.
+#[derive(Debug, Args)]
+pub struct WorkMapArgs {
+    /// Graph scope (default operator).
+    #[arg(long, value_enum, default_value = "operator")]
+    pub scope: WorkMapScopeArg,
+    /// Exact canonical repository path for repository scope.
+    #[arg(long)]
+    pub repository: Option<String>,
+    /// Exact epic id for epic scope.
+    #[arg(long)]
+    pub epic_id: Option<String>,
+    /// One canonical Operations queue group.
+    #[arg(long, value_enum)]
+    pub group: Option<WorkMapGroupArg>,
+    /// One authority source.
+    #[arg(long, value_enum)]
+    pub source: Option<WorkMapSourceArg>,
+    /// Inclusive RFC3339 UTC history lower bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC history upper bound.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Maximum graph nodes (default 250, maximum 500).
+    #[arg(long)]
+    pub max_nodes: Option<u64>,
+    /// Exact focus reference kind.
+    #[arg(long, value_enum, requires = "focus_id")]
+    pub focus_kind: Option<WorkMapRefKindArg>,
+    /// Exact focus reference id.
+    #[arg(long, requires = "focus_kind")]
+    pub focus_id: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// `work list` flags.
@@ -1093,6 +1207,7 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::List(_) => "work_list",
             WorkCmd::History(_) => "work_history",
             WorkCmd::Detail(_) => "work_detail",
+            WorkCmd::Map(_) => "work_map",
         },
         Command::Attention { command } => match command {
             AttentionCmd::Acknowledge(_) => "attention_acknowledge",
@@ -1564,6 +1679,43 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 (
                     "work_detail",
                     request(a.idempotency_key, run_id, Value::Object(params)),
+                )
+            }
+            WorkCmd::Map(a) => {
+                let mut params = Map::new();
+                params.insert("scope".to_owned(), json!(a.scope.as_str()));
+                for (name, value) in [
+                    ("repository", a.repository),
+                    ("epicId", a.epic_id),
+                    ("from", a.from),
+                    ("to", a.to),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(group) = a.group {
+                    params.insert("group".to_owned(), json!(group.as_str()));
+                }
+                if let Some(source) = a.source {
+                    params.insert("source".to_owned(), json!(source.as_str()));
+                }
+                if let Some(max_nodes) = a.max_nodes {
+                    params.insert("maxNodes".to_owned(), json!(max_nodes));
+                }
+                if let (Some(kind), Some(id)) = (a.focus_kind, a.focus_id) {
+                    params.insert(
+                        "focus".to_owned(),
+                        json!({
+                            "schema": "forged.work-ref/1",
+                            "kind": kind.as_str(),
+                            "id": id,
+                        }),
+                    );
+                }
+                (
+                    "work_map",
+                    request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
         },

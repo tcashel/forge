@@ -14,6 +14,7 @@ pub mod ids;
 pub mod packet;
 pub mod work_history;
 pub mod work_identity;
+pub mod work_map;
 pub mod work_ref;
 
 pub use admission::{
@@ -63,5 +64,10 @@ pub use work_identity::{
     normalize_repository_path, repository_label, work_display_title, WorkIdentityBeadV1,
     WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
     WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError, WORK_IDENTITY_SCHEMA_V1,
+};
+pub use work_map::{
+    WorkMapCapturedAtV1, WorkMapCountsV1, WorkMapEdgeKind, WorkMapEdgeV1, WorkMapGraphHealthV1,
+    WorkMapGroup, WorkMapNodeV1, WorkMapScopeKind, WorkMapScopeV1, WorkMapSource, WorkMapV1,
+    WORK_MAP_SCHEMA_V1,
 };
 pub use work_ref::{WorkRefKind, WorkRefV1, WorkRefValidationError, WORK_REF_SCHEMA_V1};

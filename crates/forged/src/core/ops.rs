@@ -1797,7 +1797,7 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 const RUN_SETTLED: &str = "run.settled";
 const PROTO_PR: &str = "proto.pr";
 const CONTROLLER_STARTED: &str = "forged.controller.started";
-const LIFECYCLE_KINDS: [&str; 7] = [
+pub(super) const LIFECYCLE_KINDS: [&str; 7] = [
     epic::STARTED,
     epic::PAUSED,
     epic::RESUMED,
@@ -1941,7 +1941,10 @@ pub async fn inventory(ctx: &Ctx, spend: Spend) -> Result<Vec<Value>, Failure> {
 /// The projection, separated from the read so the portfolio derives its
 /// entries and its attention rail from the SAME snapshot: two reads would
 /// let an attempt land between them and describe a run the entries do not.
-fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Value>, Failure> {
+pub(super) fn project_entries(
+    snapshot: &InventorySnapshot,
+    spend: Spend,
+) -> Result<Vec<Value>, Failure> {
     let lifecycles = epic_lifecycles(snapshot);
     // First start event per epic id; a payload that will not parse still
     // yields a discoverable id rather than hiding the epic.
@@ -2227,7 +2230,7 @@ const QUEUE_GROUPS: [&str; 5] = [
 /// Beads is queried once for exactly the ids in the ledger. Controller
 /// records and progress events come from the already-open inventory
 /// snapshot, avoiding a ledger projection per row.
-fn operator_queue(
+pub(super) fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
@@ -2963,7 +2966,7 @@ const OPERATIONS_DEFAULT_LIMIT: u64 = 200;
 const OPERATIONS_MAX_LIMIT: u64 = 500;
 const LIVE_PLAN_LIMIT: usize = 500;
 
-fn queue_code(label: &str) -> Option<&'static str> {
+pub(super) fn queue_code(label: &str) -> Option<&'static str> {
     match label {
         "Needs me" => Some("needs-me"),
         "Ready to merge" => Some("ready-to-merge"),
@@ -2998,7 +3001,10 @@ fn work_ref(kind: WorkRefKind, id: &str) -> Result<Value, Failure> {
         .map_err(|error| Failure::internal(format!("serializing operator work reference: {error}")))
 }
 
-fn live_plan_entry(plan: &forged_beads::PlanIssue, captured_at: &str) -> Result<Value, Failure> {
+pub(super) fn live_plan_entry(
+    plan: &forged_beads::PlanIssue,
+    captured_at: &str,
+) -> Result<Value, Failure> {
     let repository = plan
         .issue
         .metadata
@@ -3134,7 +3140,7 @@ fn reservation_fact(row: &forged_ledger::AdmissionReservationRow) -> Value {
     })
 }
 
-fn enrich_operations_facts(
+pub(super) fn enrich_operations_facts(
     snapshot: &InventorySnapshot,
     attention: &[Value],
     entries: &mut [Value],
@@ -3250,7 +3256,7 @@ fn enrich_operations_facts(
     Ok(())
 }
 
-fn desired_only_entries(
+pub(super) fn desired_only_entries(
     snapshot: &InventorySnapshot,
     entries: &[Value],
 ) -> Result<Vec<Value>, Failure> {
@@ -3317,6 +3323,34 @@ fn desired_only_entries(
         .collect()
 }
 
+/// Attach the canonical durable navigation coordinates shared by Operations
+/// and Work Map. This is presentation identity only; all authority-bearing
+/// fields remain those already projected from the atomic ledger snapshot.
+pub(super) fn decorate_durable_entries(entries: &mut [Value]) -> Result<(), Failure> {
+    for entry in entries {
+        let object = entry
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("durable operator row is not an object"))?;
+        let (kind, kind_name) = if object.get("kind").and_then(Value::as_str) == Some("epic") {
+            (WorkRefKind::Epic, "epic")
+        } else {
+            (WorkRefKind::Run, "run")
+        };
+        let id = object
+            .get("id")
+            .and_then(Value::as_str)
+            .ok_or_else(|| Failure::internal("durable operator row has no id"))?
+            .to_owned();
+        object.insert("source".to_owned(), json!("durable"));
+        object.insert("workRef".to_owned(), work_ref(kind, &id)?);
+        object.insert(
+            "detailTarget".to_owned(),
+            json!({"subjectKind": kind_name, "subjectId": id}),
+        );
+    }
+    Ok(())
+}
+
 /// `operations overview` — the bounded, read-only operator surface.
 ///
 /// One ledger snapshot supplies every durable fact. Beads contributes one
@@ -3376,26 +3410,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         let ledger_captured_at = now_iso();
         let mut entries = project_entries(&snapshot, Spend::Include)?;
         entries.extend(desired_only_entries(&snapshot, &entries)?);
-        for entry in &mut entries {
-            if let Some(object) = entry.as_object_mut() {
-                let (kind, kind_name) = if object.get("kind").and_then(Value::as_str) == Some("epic") {
-                    (WorkRefKind::Epic, "epic")
-                } else {
-                    (WorkRefKind::Run, "run")
-                };
-                let id = object
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .ok_or_else(|| Failure::internal("durable operator row has no id"))?
-                    .to_owned();
-                object.insert("source".to_owned(), json!("durable"));
-                object.insert("workRef".to_owned(), work_ref(kind, &id)?);
-                object.insert(
-                    "detailTarget".to_owned(),
-                    json!({"subjectKind": kind_name, "subjectId": id}),
-                );
-            }
-        }
+        decorate_durable_entries(&mut entries)?;
 
         let bead_ids = entries
             .iter()

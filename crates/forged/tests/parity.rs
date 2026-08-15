@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty public core functions, the CLI path and the MCP tool path produce
+//! the forty-one public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -27,6 +27,9 @@ fn normalized(mut envelope: Value) -> Value {
     }
     if envelope["result"]["capturedAt"]["beads"].is_string() {
         envelope["result"]["capturedAt"]["beads"] = json!("<sampled>");
+    }
+    if envelope["result"]["capturedAt"]["history"].is_string() {
+        envelope["result"]["capturedAt"]["history"] = json!("<sampled>");
     }
     if let Some(entries) = envelope["result"]["runs"].as_array_mut() {
         for entry in entries {
@@ -62,7 +65,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_tools_match_their_cli_counterparts() {
+fn all_forty_one_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -114,9 +117,10 @@ fn all_forty_tools_match_their_cli_counterparts() {
         "work_detail",
         "work_list",
         "work_history",
+        "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty tools, exactly");
+    assert_eq!(tools, expected, "the forty-one tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -223,10 +227,38 @@ fn all_forty_tools_match_their_cli_counterparts() {
             "work_detail advertises params.{param}: {detail_properties}"
         );
     }
+    let work_map = mcp.tool("work_map");
+    assert_eq!(
+        work_map.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/work-map.html"))
+    );
+    let map_schema = work_map
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "operator",
+        "repository",
+        "epic",
+        "needs-me",
+        "ready-to-merge",
+        "stalled-or-recoverable",
+        "durable",
+        "live-plan",
+        "maxNodes",
+        "focus",
+    ] {
+        assert!(
+            map_schema.contains(value),
+            "work_map advertises closed value or parameter {value}: {map_schema}"
+        );
+    }
     for (name, tool) in [
         ("work_list", &work_list),
         ("operations_overview", &operations),
         ("work_detail", &detail),
+        ("work_map", &work_map),
     ] {
         assert_eq!(
             tool.pointer("/inputSchema/additionalProperties"),
@@ -248,6 +280,7 @@ fn all_forty_tools_match_their_cli_counterparts() {
             "ui://forged/operations-overview.html",
         ),
         ("work_detail", &detail, "ui://forged/work-detail.html"),
+        ("work_map", &work_map, "ui://forged/work-map.html"),
     ] {
         assert_eq!(
             tool.pointer("/_meta/ui/resourceUri"),
@@ -272,12 +305,14 @@ fn all_forty_tools_match_their_cli_counterparts() {
             "ui://forged/overview.html".to_owned(),
             "ui://forged/operations-overview.html".to_owned(),
             "ui://forged/work-detail.html".to_owned(),
+            "ui://forged/work-map.html".to_owned(),
         ]
     );
     for uri in [
         "ui://forged/overview.html",
         "ui://forged/operations-overview.html",
         "ui://forged/work-detail.html",
+        "ui://forged/work-map.html",
     ] {
         let descriptor = mcp.resource(uri);
         assert!(
@@ -333,6 +368,26 @@ fn all_forty_tools_match_their_cli_counterparts() {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Work Detail") && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/work-map.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Work Map")
+            && html.contains("work_map")
+            && html.contains("work_detail")));
     assert_eq!(
         app.pointer("/contents/0/_meta/ui/csp"),
         Some(&json!({
@@ -425,6 +480,42 @@ fn all_forty_tools_match_their_cli_counterparts() {
     );
     assert!(structured["structuredContent"].is_object());
     assert_eq!(structured["structuredContent"]["ok"], json!(false));
+
+    let cli = env
+        .forged(&[
+            "work",
+            "map",
+            "--scope",
+            "repository",
+            "--repository",
+            &repository,
+            "--source",
+            "durable",
+            "--from",
+            "2020-01-01T00:00:00Z",
+            "--to",
+            "2020-01-02T00:00:00Z",
+            "--max-nodes",
+            "25",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_map",
+        envelope(json!({
+            "scope": "repository",
+            "repository": repository,
+            "source": "durable",
+            "from": "2020-01-01T00:00:00Z",
+            "to": "2020-01-02T00:00:00Z",
+            "maxNodes": 25
+        })),
+    );
+    assert_eq!(normalized(cli), normalized(tool), "work_map parity");
+    let structured = mcp.call_tool_result(
+        "work_map",
+        envelope(json!({"scope": "operator", "source": "durable"})),
+    );
+    assert!(structured["structuredContent"].is_object());
 
     let cli = env
         .forged(&[

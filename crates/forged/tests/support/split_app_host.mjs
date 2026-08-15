@@ -8,6 +8,7 @@ import { readFileSync } from "node:fs";
 const asset = process.argv[2];
 if (!asset) throw new Error("usage: split_app_host.mjs <split-app.html>");
 const operations = asset.endsWith("operations-overview.html");
+const workMap = asset.endsWith("work-map.html");
 const html = readFileSync(asset, "utf8");
 const match = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!match) throw new Error(`${asset} has no inline script`);
@@ -20,6 +21,8 @@ function element(tag) {
     className: "",
     textContent: undefined,
     title: "",
+    dataset: {},
+    attributes: {},
     hidden: false,
     disabled: false,
     kids: [],
@@ -29,6 +32,7 @@ function element(tag) {
     },
     append(...kids) { node.kids.push(...kids); },
     replaceChildren(...kids) { node.kids = [...kids]; },
+    setAttribute(name, value) { node.attributes[name] = String(value); },
     addEventListener(type, listener) {
       if (!listeners.has(type)) listeners.set(type, new Set());
       listeners.get(type).add(listener);
@@ -49,6 +53,7 @@ const document = {
   documentElement,
   body: element("body"),
   createElement: element,
+  createTextNode(text) { const node = element("#text"); node.textContent = String(text); return node; },
   getElementById(id) {
     if (!registry.has(id)) registry.set(id, element(id === "refresh" ? "button" : "div"));
     return registry.get(id);
@@ -143,7 +148,35 @@ const payload = operations
         }],
       },
     }
-  : {
+  : workMap
+    ? {
+      schema: "forged.work-map/1",
+      scope: { kind: "repository", repository: "/repo" },
+      sourceHealth: {
+        ledger: { state: "available" }, beads: { state: "available" },
+        plan: { state: "available" }, history: { state: "degraded" },
+      },
+      counts: { nodes: 2, edges: 1, runs: 1, epics: 0, attention: 0, historyUnattached: 1 },
+      nodes: [
+        {
+          workRef: { schema: "forged.work-ref/1", kind: "plan", id: "plan-one" },
+          source: "live-plan", contextOnly: false,
+          identity: { displayTitle: malicious }, plan: { status: "open" },
+          queue: { group: "planned" }, execution: { source: "none" }, history: null,
+          attention: [], detailTarget: null,
+        },
+        {
+          workRef: { schema: "forged.work-ref/1", kind: "run", id: "run-1" },
+          source: "durable", contextOnly: false,
+          identity: { displayTitle: "Durable work" }, plan: null,
+          queue: { group: "running" }, execution: { state: "active" }, history: null,
+          attention: [], detailTarget: { subjectKind: "run", subjectId: "run-1" },
+        },
+      ],
+      edges: [{ source: { kind: "run", id: "run-1" }, target: { kind: "plan", id: "plan-one" }, kind: "execution-of", contextOnly: false }],
+      graphHealth: { healthy: true }, capturedAt: { ledger: "2026-08-14T00:00:00Z" },
+    }
+    : {
       schema: "forged.work-detail/1",
       id: "run-1",
       kind: "run",
@@ -192,11 +225,14 @@ function flatten(root) {
 }
 const nodes = [...registry.values()].flatMap(flatten);
 const rows = nodes.filter((node) => node.class === "row");
+const mapNodes = nodes.filter((node) => node.class.startsWith("node"));
 const text = nodes.map((node) => node.text).filter((value) => value !== undefined).map(String);
 const sizeNotifications = posted.filter((message) => message.method === "ui/notifications/size-changed");
 process.stdout.write(JSON.stringify({
   operations,
+  workMap,
   rows,
+  mapNodes,
   text,
   malicious,
   innerHTMLWrites,

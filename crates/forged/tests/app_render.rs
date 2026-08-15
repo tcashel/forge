@@ -643,6 +643,7 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     let operations = root.join("operations-overview.html");
     let detail = root.join("work-detail.html");
+    let map = root.join("work-map.html");
 
     for (path, schema, tool) in [
         (
@@ -651,6 +652,7 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
             "operations_overview",
         ),
         (&detail, "forged.work-detail/1", "work_detail"),
+        (&map, "forged.work-map/1", "work_map"),
     ] {
         let html = std::fs::read_to_string(path).expect("read split App");
         for required in [
@@ -692,6 +694,10 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let html = std::fs::read_to_string(operations).expect("read Operations App");
     assert!(html.contains("entry.detailTarget"));
     assert!(html.contains("host.capabilities.serverTools"));
+    let html = std::fs::read_to_string(map).expect("read Work Map App");
+    assert!(html.contains("node.detailTarget"));
+    assert!(html.contains("subjectKind"));
+    assert!(html.contains("ArrowDown") && html.contains("ArrowUp"));
 }
 
 #[test]
@@ -699,12 +705,14 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
     let Some(node) = require_node() else { return };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
 
-    for (name, operations) in [
-        ("operations-overview.html", true),
-        ("work-detail.html", false),
+    for (name, operations, work_map) in [
+        ("operations-overview.html", true, false),
+        ("work-detail.html", false, false),
+        ("work-map.html", false, true),
     ] {
         let report = run_split_app_host(&node, &root.join(name));
         assert_eq!(report["operations"], json!(operations), "{name}: {report}");
+        assert_eq!(report["workMap"], json!(work_map), "{name}: {report}");
         assert_eq!(report["initialTheme"], json!("dark"), "{name}: {report}");
         assert_eq!(
             report["initialVariable"],
@@ -785,6 +793,16 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
                     .as_array()
                     .is_some_and(|texts| texts.contains(&json!("run:run-1"))),
                 "Operations visibly renders the canonical exact selector: {report}"
+            );
+        } else if work_map {
+            let rows = report["mapNodes"].as_array().expect("Work Map nodes");
+            assert_eq!(rows.len(), 2, "both Work Map nodes render: {report}");
+            assert!(
+                report["text"]
+                    .as_array()
+                    .is_some_and(|texts| texts.contains(&json!("run-1"))
+                        && texts.contains(&report["malicious"])),
+                "Work Map safely renders exact ids and hostile titles as text: {report}"
             );
         }
     }

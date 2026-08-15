@@ -263,6 +263,33 @@ pub struct PlanInventory {
     pub discovered: usize,
 }
 
+/// Scope for the Work Map's one bounded Beads graph read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WorkMapPlanScope {
+    /// All live operator-scoped plans.
+    Operator,
+    /// Live plans whose persisted repository metadata exactly matches.
+    Repository(String),
+    /// The named epic and its direct live children.
+    Epic(String),
+}
+
+/// Current plan rows plus exact Bead summaries needed by the shared
+/// Operations classifier. Both collections come from the same final hydrate;
+/// no separate claim/membership process is needed.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct WorkMapPlanInventory {
+    /// Hydrated live plan rows selected for display.
+    pub issues: Vec<PlanIssue>,
+    /// Exact durable-linked Bead summaries available to classification.
+    pub exact_issues: Vec<IssueSummary>,
+    /// More live plan rows matched than the caller's bound.
+    pub truncated: bool,
+    /// Number of live plan rows observed before the display bound.
+    pub discovered: usize,
+}
+
 /// A `revision` exactly as bd wrote it. A JSON number is rendered back to its
 /// own digits — never through an integer type, which would invite arithmetic
 /// on a value that has none.
@@ -485,6 +512,70 @@ fn plan_issue(value: &Value) -> Result<PlanIssue, String> {
     })
 }
 
+fn exact_issue(value: &Value) -> Result<IssueSummary, String> {
+    let object = value
+        .as_object()
+        .ok_or_else(|| "hydrated issue is not an object".to_owned())?;
+    let id = object
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| "hydrated issue has no non-empty string id".to_owned())?;
+    if !object.get("title").is_some_and(Value::is_string) {
+        return Err(format!("hydrated issue {id:?} has no string title"));
+    }
+    let status = object
+        .get("status")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("hydrated issue {id:?} has no non-empty string status"))?;
+    PlanDependencyStatus::try_from(status)
+        .map_err(|detail| format!("hydrated issue {id:?} has {detail}"))?;
+    object
+        .get("issue_type")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .ok_or_else(|| format!("hydrated issue {id:?} has no non-empty string issue_type"))?;
+    if object.get("revision").is_some_and(|value| {
+        !matches!(value, Value::Null | Value::Number(_))
+            && !matches!(value, Value::String(text) if !text.trim().is_empty())
+    }) {
+        return Err(format!("hydrated issue {id:?} has a malformed revision"));
+    }
+    if let Some(metadata) = object.get("metadata") {
+        let metadata = metadata
+            .as_object()
+            .ok_or_else(|| format!("hydrated issue {id:?} metadata is not an object"))?;
+        if metadata
+            .get("repository")
+            .is_some_and(|value| !value.is_string())
+        {
+            return Err(format!(
+                "hydrated issue {id:?} repository metadata is not a string"
+            ));
+        }
+    }
+    issue(value).ok_or_else(|| format!("hydrated issue {id:?} could not be projected"))
+}
+
+fn is_live_plan_status(status: &str) -> bool {
+    matches!(status, "open" | "in_progress" | "blocked" | "deferred")
+}
+
+fn push_unique_id(
+    ids: &mut Vec<String>,
+    seen: &mut BTreeSet<String>,
+    id: &str,
+) -> Result<(), String> {
+    if id.trim().is_empty() {
+        return Err("plan discovery produced an empty id".to_owned());
+    }
+    if seen.insert(id.to_owned()) {
+        ids.push(id.to_owned());
+    }
+    Ok(())
+}
+
 fn selected_discovery_ids(rows: &[Value], limit: usize) -> Result<Vec<String>, String> {
     let maximum = limit.saturating_add(1);
     if rows.len() > maximum {
@@ -687,6 +778,289 @@ pub async fn plan_inventory(
     })?;
     Ok(PlanInventory {
         issues,
+        truncated,
+        discovered,
+    })
+}
+
+/// Read every current Work Map plan node and the exact Beads rows needed for
+/// durable claim/attention classification with a constant process count.
+///
+/// Operator and repository scopes use one N+1 discovery plus one union
+/// hydrate. Epic scope uses native children, the epic's legacy dependency
+/// payload, then the same union hydrate. Exact durable ids missing from Beads
+/// are allowed to remain absent; selected current plan ids may not disappear
+/// between discovery and hydration.
+pub async fn work_map_plan_inventory(
+    cfg: &BdConfig,
+    scope: &WorkMapPlanScope,
+    exact_ids: &[String],
+    limit: usize,
+) -> Result<WorkMapPlanInventory, BdError> {
+    if limit == 0 {
+        return Err(BdError::Envelope {
+            context: "bd work map plan".to_owned(),
+            detail: "work map plan limit must be positive".to_owned(),
+        });
+    }
+    if exact_ids.iter().any(|id| id.trim().is_empty()) {
+        return Err(BdError::Envelope {
+            context: "bd work map plan".to_owned(),
+            detail: "work map exact ids must be non-empty".to_owned(),
+        });
+    }
+
+    let (mut selected, discovered, truncated, repository) = match scope {
+        WorkMapPlanScope::Operator | WorkMapPlanScope::Repository(_) => {
+            let discovery_limit = limit.saturating_add(1);
+            let limit_text = discovery_limit.to_string();
+            let repository = match scope {
+                WorkMapPlanScope::Repository(value) => Some(value.as_str()),
+                _ => None,
+            };
+            let metadata_field = repository.map(|value| format!("repository={value}"));
+            let mut args = vec![
+                "list",
+                "--status",
+                "open,in_progress,blocked,deferred",
+                "--limit",
+                &limit_text,
+                "--max-rows",
+                &limit_text,
+                "--sort",
+                "priority",
+                "--brief",
+                "--flat",
+            ];
+            if let Some(field) = metadata_field.as_deref() {
+                args.extend(["--metadata-field", field]);
+            }
+            args.extend(["--no-pager", "--json"]);
+            let raw = invoke::read(cfg, &args).await?;
+            let rows = envelope::as_list(&raw).unwrap_or_else(|| vec![raw.clone()]);
+            let discovered = rows.len();
+            let truncated = discovered > limit;
+            let selected =
+                selected_discovery_ids(&rows, limit).map_err(|detail| BdError::Envelope {
+                    context: "bd list work map plan".to_owned(),
+                    detail,
+                })?;
+            (
+                selected,
+                discovered,
+                truncated,
+                repository.map(str::to_owned),
+            )
+        }
+        WorkMapPlanScope::Epic(epic) => {
+            if epic.trim().is_empty() {
+                return Err(BdError::Envelope {
+                    context: "bd work map epic".to_owned(),
+                    detail: "epic id must be non-empty".to_owned(),
+                });
+            }
+            let discovery_limit = limit.saturating_add(1);
+            let limit_text = discovery_limit.to_string();
+            let native = invoke::read(
+                cfg,
+                &[
+                    "list",
+                    "--parent",
+                    epic,
+                    "--status",
+                    "open,in_progress,blocked,deferred",
+                    "--limit",
+                    &limit_text,
+                    "--max-rows",
+                    &limit_text,
+                    "--sort",
+                    "priority",
+                    "--brief",
+                    "--flat",
+                    "--no-pager",
+                    "--json",
+                ],
+            )
+            .await?;
+            let root = invoke::read(cfg, &["show", epic, "--json"]).await?;
+            let mut ids = Vec::new();
+            let mut seen = BTreeSet::new();
+            let value = envelope::first_obj(&root).ok_or_else(|| BdError::Envelope {
+                context: "bd show work map epic".to_owned(),
+                detail: format!("response omitted exact epic {epic:?}"),
+            })?;
+            let root_summary = exact_issue(value).map_err(|detail| BdError::Envelope {
+                context: "bd show work map epic".to_owned(),
+                detail,
+            })?;
+            if root_summary.id != *epic {
+                return Err(BdError::Envelope {
+                    context: "bd show work map epic".to_owned(),
+                    detail: format!(
+                        "requested epic {epic:?} but response named {:?}",
+                        root_summary.id
+                    ),
+                });
+            }
+            if is_live_plan_status(&root_summary.status) {
+                push_unique_id(&mut ids, &mut seen, epic).map_err(|detail| BdError::Envelope {
+                    context: "bd show work map epic".to_owned(),
+                    detail,
+                })?;
+            }
+            match value.get("dependencies") {
+                None | Some(Value::Null) => {}
+                Some(Value::Array(dependencies)) => {
+                    for dependency in dependencies {
+                        let object = dependency.as_object().ok_or_else(|| BdError::Envelope {
+                            context: "bd show work map epic".to_owned(),
+                            detail: "epic dependency is not an object".to_owned(),
+                        })?;
+                        let id = object
+                            .get("id")
+                            .or_else(|| object.get("depends_on_id"))
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| BdError::Envelope {
+                                context: "bd show work map epic".to_owned(),
+                                detail: "epic dependency has no canonical issue id".to_owned(),
+                            })?;
+                        let status = object
+                            .get("status")
+                            .and_then(Value::as_str)
+                            .filter(|value| !value.trim().is_empty())
+                            .ok_or_else(|| BdError::Envelope {
+                                context: "bd show work map epic".to_owned(),
+                                detail: format!("epic dependency {id:?} has no current status"),
+                            })?;
+                        PlanDependencyStatus::try_from(status).map_err(|detail| {
+                            BdError::Envelope {
+                                context: "bd show work map epic".to_owned(),
+                                detail: format!("epic dependency {id:?} has {detail}"),
+                            }
+                        })?;
+                        if id != epic && is_live_plan_status(status) {
+                            push_unique_id(&mut ids, &mut seen, id).map_err(|detail| {
+                                BdError::Envelope {
+                                    context: "bd show work map epic".to_owned(),
+                                    detail,
+                                }
+                            })?;
+                        }
+                        if ids.len() >= discovery_limit {
+                            break;
+                        }
+                    }
+                }
+                Some(_) => {
+                    return Err(BdError::Envelope {
+                        context: "bd show work map epic".to_owned(),
+                        detail: "epic dependencies is not an array".to_owned(),
+                    })
+                }
+            }
+            for value in envelope::as_list(&native).unwrap_or_else(|| vec![native.clone()]) {
+                let summary = exact_issue(&value).map_err(|detail| BdError::Envelope {
+                    context: "bd list work map epic children".to_owned(),
+                    detail,
+                })?;
+                if is_live_plan_status(&summary.status) {
+                    push_unique_id(&mut ids, &mut seen, &summary.id).map_err(|detail| {
+                        BdError::Envelope {
+                            context: "bd list work map epic children".to_owned(),
+                            detail,
+                        }
+                    })?;
+                }
+                if ids.len() >= discovery_limit {
+                    break;
+                }
+            }
+            let discovered = ids.len();
+            let truncated = discovered > limit;
+            ids.truncate(limit);
+            (ids, discovered, truncated, None)
+        }
+    };
+
+    let selected_plan_ids = selected.clone();
+    let mut requested = BTreeSet::new();
+    selected.retain(|id| requested.insert(id.clone()));
+    for id in exact_ids {
+        if requested.insert(id.clone()) {
+            selected.push(id.clone());
+        }
+    }
+    if selected.is_empty() {
+        return Ok(WorkMapPlanInventory {
+            issues: Vec::new(),
+            exact_issues: Vec::new(),
+            truncated,
+            discovered,
+        });
+    }
+
+    let mut show_args = Vec::with_capacity(selected.len() + 3);
+    show_args.push("show");
+    show_args.extend(selected.iter().map(String::as_str));
+    show_args.extend(["--brief-deps", "--json"]);
+    let raw = invoke::read(cfg, &show_args).await?;
+    let rows = envelope::as_list(&raw).unwrap_or_else(|| vec![raw.clone()]);
+    let requested_set: BTreeSet<&str> = selected.iter().map(String::as_str).collect();
+    let mut hydrated = BTreeMap::new();
+    for row in rows {
+        let summary = exact_issue(&row).map_err(|detail| BdError::Envelope {
+            context: "bd show work map plan".to_owned(),
+            detail,
+        })?;
+        if !requested_set.contains(summary.id.as_str()) {
+            return Err(BdError::Envelope {
+                context: "bd show work map plan".to_owned(),
+                detail: format!("hydrate returned unrequested issue id {:?}", summary.id),
+            });
+        }
+        if hydrated.insert(summary.id.clone(), row).is_some() {
+            return Err(BdError::Envelope {
+                context: "bd show work map plan".to_owned(),
+                detail: format!("hydrate returned duplicate issue id {:?}", summary.id),
+            });
+        }
+    }
+
+    let mut issues = Vec::with_capacity(selected_plan_ids.len());
+    for id in &selected_plan_ids {
+        let row = hydrated.get(id).ok_or_else(|| BdError::Envelope {
+            context: "bd show work map plan".to_owned(),
+            detail: format!("hydrate omitted selected plan issue {id:?}"),
+        })?;
+        let plan = plan_issue(row).map_err(|detail| BdError::Envelope {
+            context: "bd show work map plan".to_owned(),
+            detail,
+        })?;
+        if let Some(expected) = repository.as_deref() {
+            let actual = plan.issue.metadata.get("repository").map(String::as_str);
+            if actual != Some(expected) {
+                return Err(BdError::Envelope {
+                    context: "bd show work map plan".to_owned(),
+                    detail: format!("selected issue {id:?} repository changed during hydration"),
+                });
+            }
+        }
+        issues.push(plan);
+    }
+    let exact_issues = selected
+        .iter()
+        .filter_map(|id| hydrated.get(id))
+        .map(exact_issue)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|detail| BdError::Envelope {
+            context: "bd show work map plan".to_owned(),
+            detail,
+        })?;
+
+    Ok(WorkMapPlanInventory {
+        issues,
+        exact_issues,
         truncated,
         discovered,
     })
