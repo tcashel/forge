@@ -27,7 +27,7 @@ pub(crate) fn append_event_tx(
     Ok(())
 }
 
-fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
+pub(crate) fn event_row(row: &rusqlite::Row<'_>) -> Result<EventRow, rusqlite::Error> {
     Ok(EventRow {
         event_id: row.get(0)?,
         ts: row.get(1)?,

@@ -328,6 +328,39 @@ outcome each seat landed, artifacts, interventions, roster revisions, per-seat p
 and events. The MCP `overview` tool returns the identical structured
 projection and renders it through `ui://forged/overview.html`.
 
+## Bounded work history
+
+`work history` projects durable cross-run throughput, rework, settlement, and
+spend without consulting Beads, the filesystem, providers, GitHub, or live
+services. The CLI and MCP tool return the same `forged.work-history/1`
+contract:
+
+```sh
+forged work history
+forged work history --from 2030-01-01T00:00:00Z \
+  --to 2030-02-01T00:00:00Z --bucket day --group-by repository
+forged work history --repo /absolute/path/to/repository --epic <epic-id>
+forged work history --subject <run-or-epic-id> --limit 50 --cursor <cursor>
+```
+
+Windows are UTC and half-open (`from <= timestamp < to`). The default is the
+30 days ending at the response's `asOf`; explicit windows are capped at 366
+days and 400 closed hour/day/week buckets. Repository, epic, and subject
+filters are exact canonical identifiers, never display-title guesses. Subject
+pagination uses an opaque request-bound cursor. Grouping is closed to `none`,
+`repository`, `epic`, `stage`, and `provider`; at most 50 series are returned,
+with overflow combined into an explicit `other` series and missing dimensions
+retained as `unknown`.
+
+Each call reads one SQLite snapshot and returns canonical nested
+`WorkIdentityV1` values. Attempt ordinals include earlier durable attempts, so
+repeat attempts and rework stay correct when the first attempt predates the
+window. Rates carry their denominator and are null when that denominator is
+zero. Spend totals preserve every raw usage row: known cost is summed by its
+recorded `billed` or `imputed_api_rate` provenance, while unknown cost remains
+null and contributes to `rowsMissingCost`. Live plans are intentionally
+excluded until they have a durable identity.
+
 That MCP App draws one projection five ways, and never invents a state the
 ledger did not record:
 

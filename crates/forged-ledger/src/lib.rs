@@ -22,6 +22,7 @@ mod attempts;
 mod desired;
 mod error;
 mod events;
+mod history;
 mod inventory;
 mod ledger;
 mod migrations;
@@ -36,6 +37,7 @@ mod usage;
 mod work_identity;
 
 pub use error::LedgerError;
+pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
 pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
 pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;

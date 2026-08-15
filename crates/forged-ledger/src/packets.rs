@@ -16,7 +16,7 @@ use crate::types::{stage_as_str, stage_from_db, NewPacket, PacketRow};
 const PACKET_COLUMNS: &str = "packet_id, run_id, stage, seq, spec_path, spec_sha256, \
      spec_revision, body_json, created_at";
 
-fn packet_row(row: &rusqlite::Row<'_>) -> Result<PacketRow, rusqlite::Error> {
+pub(crate) fn packet_row(row: &rusqlite::Row<'_>) -> Result<PacketRow, rusqlite::Error> {
     Ok(PacketRow {
         packet_id: row.get(0)?,
         run_id: row.get(1)?,

@@ -241,6 +241,88 @@ impl WorkListArgs {
     }
 }
 
+/// Closed work-history bucket exposed in MCP discovery.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkHistoryBucketParam {
+    Hour,
+    Day,
+    Week,
+}
+
+/// Closed work-history grouping dimension exposed in MCP discovery.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "lowercase")]
+pub enum WorkHistoryGroupParam {
+    None,
+    Repository,
+    Epic,
+    Stage,
+    Provider,
+}
+
+/// Typed MCP envelope for the bounded history projection.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkHistoryArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// Optional read-only operation identity.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Retained for envelope compatibility; history is operator-wide.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Bounded history query.
+    #[serde(default)]
+    pub params: WorkHistoryParams,
+}
+
+/// Closed, bounded history parameters. Display titles are deliberately
+/// absent: every filter is a canonical id.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkHistoryParams {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub from: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub to: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bucket: Option<WorkHistoryBucketParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group_by: Option<WorkHistoryGroupParam>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub repo: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub epic: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cursor: Option<String>,
+}
+
+impl WorkHistoryArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params,
+        }
+    }
+}
+
 /// The forged MCP server: a thin adapter over the shared core.
 #[derive(Clone)]
 pub struct ForgedServer {
@@ -541,6 +623,17 @@ impl ForgedServer {
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
         self.call("work_list", args.0.into_envelope()).await
+    }
+
+    /// Bounded historical lifecycle, rework, and spend trend.
+    #[tool(
+        name = "work_history",
+        description = "Project bounded durable cross-run history and spend. Accepts an optional \
+                       half-open UTC window, hour/day/week bucket, one closed grouping dimension, \
+                       exact canonical repo/epic/subject filters, and bounded cursor pagination."
+    )]
+    pub async fn work_history(&self, args: Parameters<WorkHistoryArgs>) -> CallToolResult {
+        self.call("work_history", args.0.into_envelope()).await
     }
 
     /// Record custody of an exact active attention occurrence.

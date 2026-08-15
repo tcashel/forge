@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the thirty-seven public core functions, the CLI path and the MCP tool path produce
+//! the thirty-eight public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -18,6 +18,9 @@ fn normalized(mut envelope: Value) -> Value {
     }
     if envelope["result"]["queue"]["asOf"].is_string() {
         envelope["result"]["queue"]["asOf"] = json!("<sampled>");
+    }
+    if envelope["result"]["schema"] == json!("forged.work-history/1") {
+        envelope["result"]["asOf"] = json!("<sampled>");
     }
     if let Some(entries) = envelope["result"]["runs"].as_array_mut() {
         for entry in entries {
@@ -53,7 +56,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_thirty_seven_tools_match_their_cli_counterparts() {
+fn all_thirty_eight_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -102,9 +105,10 @@ fn all_thirty_seven_tools_match_their_cli_counterparts() {
         "usage_ingest",
         "usage_report",
         "work_list",
+        "work_history",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the thirty-seven tools, exactly");
+    assert_eq!(tools, expected, "the thirty-eight tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -160,6 +164,26 @@ fn all_thirty_seven_tools_match_their_cli_counterparts() {
         repository_schema.to_string().contains("string"),
         "work_list advertises params.repo as a string: {repository_schema}"
     );
+    let work_history = mcp.tool("work_history");
+    let history_schema = work_history
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "hour",
+        "day",
+        "week",
+        "repository",
+        "epic",
+        "stage",
+        "provider",
+    ] {
+        assert!(
+            history_schema.contains(value),
+            "work_history advertises closed value {value}: {history_schema}"
+        );
+    }
 
     assert_eq!(
         mcp.list_resources(),
@@ -627,6 +651,32 @@ fn all_thirty_seven_tools_match_their_cli_counterparts() {
         normalized(tool),
         "repository-scoped work_list parity"
     );
+
+    let cli = env
+        .forged(&[
+            "work",
+            "history",
+            "--from",
+            "2026-08-01T00:00:00Z",
+            "--to",
+            "2026-09-01T00:00:00Z",
+            "--bucket",
+            "day",
+            "--group-by",
+            "repository",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "work_history",
+        envelope(json!({
+            "from": "2026-08-01T00:00:00Z",
+            "to": "2026-09-01T00:00:00Z",
+            "bucket": "day",
+            "groupBy": "repository",
+        })),
+    );
+    assert_eq!(tool["operationId"], json!("op:work_history:read"));
+    assert_eq!(normalized(cli), normalized(tool), "work_history parity");
 
     // doctor: probe details are timing-dependent; the shape (names + ok
     // flags) must match.

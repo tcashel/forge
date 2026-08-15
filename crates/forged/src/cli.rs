@@ -743,6 +743,8 @@ pub struct OverviewArgs {
 pub enum WorkCmd {
     /// List slice runs and started epics, optionally scoped by repository.
     List(WorkListArgs),
+    /// Project bounded cross-run lifecycle, rework, and spend history.
+    History(WorkHistoryArgs),
 }
 
 /// `work list` flags.
@@ -751,6 +753,82 @@ pub struct WorkListArgs {
     /// Exact repository identity from Bead metadata.repository.
     #[arg(long)]
     pub repo: Option<String>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Closed time bucket accepted by `work history`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkHistoryBucketArg {
+    Hour,
+    Day,
+    Week,
+}
+
+impl WorkHistoryBucketArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Hour => "hour",
+            Self::Day => "day",
+            Self::Week => "week",
+        }
+    }
+}
+
+/// Closed grouping dimension accepted by `work history`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum WorkHistoryGroupArg {
+    None,
+    Repository,
+    Epic,
+    Stage,
+    Provider,
+}
+
+impl WorkHistoryGroupArg {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Repository => "repository",
+            Self::Epic => "epic",
+            Self::Stage => "stage",
+            Self::Provider => "provider",
+        }
+    }
+}
+
+/// `work history` flags. Omitted bounds default to the 30 days ending at
+/// the operation's single `asOf`.
+#[derive(Debug, Args)]
+pub struct WorkHistoryArgs {
+    /// Inclusive RFC3339 UTC lower bound.
+    #[arg(long)]
+    pub from: Option<String>,
+    /// Exclusive RFC3339 UTC upper bound.
+    #[arg(long)]
+    pub to: Option<String>,
+    /// Fixed trend bucket.
+    #[arg(long, value_enum)]
+    pub bucket: Option<WorkHistoryBucketArg>,
+    /// One grouping dimension.
+    #[arg(long, value_enum)]
+    pub group_by: Option<WorkHistoryGroupArg>,
+    /// Exact canonical repository path.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Exact canonical epic id.
+    #[arg(long)]
+    pub epic: Option<String>,
+    /// Exact canonical run or epic subject id.
+    #[arg(long)]
+    pub subject: Option<String>,
+    /// Subject page size (default 50, maximum 200).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Opaque continuation cursor from the preceding page.
+    #[arg(long)]
+    pub cursor: Option<String>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -937,6 +1015,7 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Service { command } => command.operation_name(),
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
+            WorkCmd::History(_) => "work_history",
         },
         Command::Attention { command } => match command {
             AttentionCmd::Acknowledge(_) => "attention_acknowledge",
@@ -1343,6 +1422,34 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 }
                 (
                     "work_list",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
+            WorkCmd::History(a) => {
+                let mut params = Map::new();
+                for (name, value) in [
+                    ("from", a.from),
+                    ("to", a.to),
+                    ("repo", a.repo),
+                    ("epic", a.epic),
+                    ("subject", a.subject),
+                    ("cursor", a.cursor),
+                ] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
+                if let Some(bucket) = a.bucket {
+                    params.insert("bucket".to_owned(), json!(bucket.as_str()));
+                }
+                if let Some(group_by) = a.group_by {
+                    params.insert("groupBy".to_owned(), json!(group_by.as_str()));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "work_history",
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }

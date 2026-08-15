@@ -11,6 +11,39 @@ use crate::ledger::Ledger;
 use crate::time::now_iso;
 use crate::types::{NewUsage, UsageRecord, UsageTotals};
 
+pub(crate) fn usage_record_row(row: &rusqlite::Row<'_>) -> Result<UsageRecord, rusqlite::Error> {
+    let input: i64 = row.get(5)?;
+    let output: i64 = row.get(6)?;
+    let cache_read: Option<i64> = row.get(7)?;
+    let cache_write: Option<i64> = row.get(8)?;
+    let web_searches: Option<i64> = row.get(13)?;
+    let convert = |index: usize, value: i64| {
+        u64::try_from(value).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                index,
+                rusqlite::types::Type::Integer,
+                Box::new(error),
+            )
+        })
+    };
+    Ok(UsageRecord {
+        run_id: row.get(0)?,
+        packet_id: row.get(1)?,
+        attempt_id: row.get(2)?,
+        provider: row.get(3)?,
+        model: row.get(4)?,
+        input_tokens: convert(5, input)?,
+        output_tokens: convert(6, output)?,
+        cache_read_tokens: cache_read.map(|value| convert(7, value)).transpose()?,
+        cache_write_tokens: cache_write.map(|value| convert(8, value)).transpose()?,
+        cost_usd: row.get(9)?,
+        pricing_basis: row.get(10)?,
+        rate_limit_used_percent: row.get(11)?,
+        ts: row.get(12)?,
+        web_search_requests: web_searches.map(|value| convert(13, value)).transpose()?,
+    })
+}
+
 fn as_i64(value: u64, what: &str) -> Result<i64, LedgerError> {
     i64::try_from(value).map_err(|_| {
         refused(
@@ -207,54 +240,10 @@ impl Ledger {
                  FROM usage WHERE run_id = ?1 ORDER BY usage_id",
             )?;
             let rows = stmt
-                .query_map([&run_id], |row| {
-                    Ok((
-                        row.get::<_, String>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<i64>>(2)?,
-                        row.get::<_, String>(3)?,
-                        row.get::<_, String>(4)?,
-                        row.get::<_, i64>(5)?,
-                        row.get::<_, i64>(6)?,
-                        row.get::<_, Option<i64>>(7)?,
-                        row.get::<_, Option<i64>>(8)?,
-                        row.get::<_, Option<f64>>(9)?,
-                        row.get::<_, Option<String>>(10)?,
-                        row.get::<_, Option<f64>>(11)?,
-                        row.get::<_, String>(12)?,
-                        row.get::<_, Option<i64>>(13)?,
-                    ))
-                })?
-                .collect::<Result<Vec<_>, _>>()?;
-            rows.into_iter()
-                .map(|r| {
-                    Ok(UsageRecord {
-                        run_id: r.0,
-                        packet_id: r.1,
-                        attempt_id: r.2,
-                        provider: r.3,
-                        model: r.4,
-                        input_tokens: as_u64(r.5, "input_tokens")?,
-                        output_tokens: as_u64(r.6, "output_tokens")?,
-                        cache_read_tokens: r
-                            .7
-                            .map(|v| as_u64(v, "cache_read_tokens"))
-                            .transpose()?,
-                        cache_write_tokens: r
-                            .8
-                            .map(|v| as_u64(v, "cache_write_tokens"))
-                            .transpose()?,
-                        cost_usd: r.9,
-                        pricing_basis: r.10,
-                        rate_limit_used_percent: r.11,
-                        ts: r.12,
-                        web_search_requests: r
-                            .13
-                            .map(|v| as_u64(v, "web_search_requests"))
-                            .transpose()?,
-                    })
-                })
-                .collect()
+                .query_map([&run_id], usage_record_row)?
+                .collect::<Result<Vec<_>, _>>()
+                .map_err(Into::into);
+            rows
         })
     }
 }

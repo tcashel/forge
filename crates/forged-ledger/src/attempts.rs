@@ -63,7 +63,7 @@ fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, ru
     }
 }
 
-fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
+pub(crate) fn attempt_row(row: &rusqlite::Row<'_>) -> Result<AttemptRow, rusqlite::Error> {
     Ok(AttemptRow {
         attempt_id: row.get(0)?,
         packet_id: row.get(1)?,

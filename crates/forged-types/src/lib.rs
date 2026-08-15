@@ -11,6 +11,7 @@ pub mod error;
 pub mod herdr_ownership;
 pub mod ids;
 pub mod packet;
+pub mod work_history;
 pub mod work_identity;
 
 pub use admission::{
@@ -45,6 +46,12 @@ pub use packet::{
     AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
     ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
     WorkPacket,
+};
+pub use work_history::{
+    WorkHistoryBucket, WorkHistoryBucketV1, WorkHistoryCoverageV1, WorkHistoryFiltersV1,
+    WorkHistoryGroupBy, WorkHistoryMetricsV1, WorkHistoryPricingV1, WorkHistorySeriesV1,
+    WorkHistorySettlementCountsV1, WorkHistorySubjectV1, WorkHistoryV1, WorkHistoryWindowV1,
+    WORK_HISTORY_SCHEMA_V1,
 };
 pub use work_identity::{
     normalize_repository_path, repository_label, work_display_title, WorkIdentityBeadV1,
