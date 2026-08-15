@@ -418,7 +418,7 @@ fn verified_missing_locator_has_one_replacement_and_never_moves_old_sessions() {
         .replace_herdr_layout(
             &original.layout_id,
             HerdrLayoutDegradationReason::VerificationMissing,
-            "exact root returned PANE_NOT_FOUND",
+            "exact root returned pane_not_found",
             "workspace:forge",
             "replacement",
             NOW,

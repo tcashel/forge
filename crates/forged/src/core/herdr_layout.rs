@@ -473,7 +473,7 @@ pub(crate) async fn configure(
             replacement_attempted = true;
             let detail = match reason {
                 HerdrLayoutDegradationReason::VerificationMissing => {
-                    "exact durable root returned PANE_NOT_FOUND"
+                    "exact durable root returned pane_not_found"
                 }
                 _ => "exact pane.layout did not match durable workspace/tab/root",
             };

@@ -312,7 +312,7 @@ async fn controller_reads_and_messages_a_durable_pane_id() {
 }
 
 const PANE_NOT_FOUND: Action = Action::RespondErr {
-    code: "PANE_NOT_FOUND",
+    code: "pane_not_found",
     message: "pane not found",
 };
 

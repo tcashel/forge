@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn pane_not_found_requires_the_exact_protocol_code() {
         let not_found = WireError {
-            code: Value::String("PANE_NOT_FOUND".to_string()),
+            code: Value::String("pane_not_found".to_string()),
             message: "pane not found".to_string(),
         };
         assert!(not_found.is_pane_not_found());
@@ -622,7 +622,7 @@ mod tests {
         };
         assert!(!by_message.is_pane_not_found());
         let wrong_case = WireError {
-            code: Value::String("pane_not_found".to_string()),
+            code: Value::String("PANE_NOT_FOUND".to_string()),
             message: "pane not found".to_string(),
         };
         assert!(!wrong_case.is_pane_not_found());

@@ -29,7 +29,7 @@ use crate::{
 pub enum HerdrCloseOutcome {
     /// Herdr accepted the close request.
     Closed,
-    /// Herdr returned the exact protocol-19 `PANE_NOT_FOUND` code, proving
+    /// Herdr returned the exact protocol-19 `pane_not_found` code, proving
     /// the opaque pane id is already absent.
     AlreadyMissing,
 }
@@ -58,7 +58,7 @@ pub struct HerdrLayoutSnapshot {
     pub panes: Vec<HerdrLayoutPane>,
 }
 
-/// `PANE_NOT_FOUND` is the only missing result; every other error remains
+/// `pane_not_found` is the only missing result; every other error remains
 /// unknown and must not authorize replacement or cleanup.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum HerdrLayoutInspection {
@@ -278,7 +278,7 @@ impl HerdrControl {
     /// Close the exact durable Herdr identity this control was opened for.
     ///
     /// Socket/protocol mismatch is refused before `pane.close`. Only the
-    /// exact protocol-19 `PANE_NOT_FOUND` code is idempotent success; every
+    /// exact protocol-19 `pane_not_found` code is idempotent success; every
     /// transport failure and other RPC refusal remains retryable failure.
     pub async fn close_owned(
         &self,

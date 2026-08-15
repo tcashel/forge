@@ -17,14 +17,14 @@ pub(crate) struct WireError {
 }
 
 impl WireError {
-    /// Whether this is the exact protocol-19 `PANE_NOT_FOUND` code.
+    /// Whether this is the exact protocol-19 `pane_not_found` code.
     ///
     /// Herdr pane ids are never reused, so this one documented code proves
     /// the pane is gone. Messages are diagnostics only: accepting a phrase
     /// such as "pane not found" under another or absent code would turn an
     /// ambiguous refusal into destructive cleanup authority.
     pub(crate) fn is_pane_not_found(&self) -> bool {
-        matches!(&self.code, Value::String(code) if code == "PANE_NOT_FOUND")
+        matches!(&self.code, Value::String(code) if code == "pane_not_found")
     }
 }
 

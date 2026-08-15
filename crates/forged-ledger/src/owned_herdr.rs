@@ -2,7 +2,7 @@
 //!
 //! Registration commits before command start. Cleanup is a separate,
 //! ownership-gated CAS saga: terminal work never depends on a pane-close
-//! response, and a lost response converges through exact PANE_NOT_FOUND.
+//! response, and a lost response converges through exact `pane_not_found`.
 
 use forged_types::{
     ErrorCode, OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind,
@@ -957,7 +957,7 @@ impl Ledger {
         })
     }
 
-    /// Acknowledged close and exact PANE_NOT_FOUND both converge to release.
+    /// Acknowledged close and exact `pane_not_found` both converge to release.
     pub fn ack_owned_herdr_cleanup(
         &self,
         ownership_id: &str,

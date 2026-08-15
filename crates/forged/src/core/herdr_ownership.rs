@@ -514,7 +514,7 @@ mod tests {
                         "pane.close" if close_number == 1 => return,
                         "pane.close" => json!({
                             "id": id,
-                            "error": {"code": "PANE_NOT_FOUND", "message": "gone"},
+                            "error": {"code": "pane_not_found", "message": "gone"},
                         }),
                         other => panic!("unexpected cleanup request {other}"),
                     };

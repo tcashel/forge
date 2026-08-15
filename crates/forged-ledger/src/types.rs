@@ -468,7 +468,7 @@ impl TryFrom<&str> for OwnedHerdrCleanupReason {
     }
 }
 
-/// Verified close outcome. `PaneNotFound` is exact Herdr PANE_NOT_FOUND.
+/// Verified close outcome. `PaneNotFound` is exact Herdr `pane_not_found`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OwnedHerdrCleanupRelease {
     Closed,
