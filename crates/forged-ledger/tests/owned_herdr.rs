@@ -1,13 +1,15 @@
 use std::sync::{Arc, Barrier};
 
 use forged_ledger::{
-    DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, Ledger, NewPacket, NewRun,
-    OwnedHerdrCleanupReason, OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry,
+    AdmissionBatchWrite, DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, Ledger,
+    NewPacket, NewRun, OwnedHerdrCleanupReason, OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry,
     OwnedHerdrCleanupState, OwnedHerdrLifecycleState, SpecFence,
 };
 use forged_types::{
-    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1, RunId,
-    Stage, OWNED_HERDR_SESSION_SCHEMA_V1,
+    AdmissionCandidateV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionOutcome,
+    AdmissionReason, AdmissionResourceClass, AdmissionSubjectKind, OwnedHerdrOwnerV1,
+    OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1, RunId, Stage,
+    ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1, OWNED_HERDR_SESSION_SCHEMA_V1,
 };
 
 fn seed_attempt(ledger: &Ledger, run: &str, generation: Option<u32>) -> (String, i64, String) {
@@ -93,6 +95,93 @@ fn controller_identity(id: &str, run: &str, generation: u32) -> OwnedHerdrSessio
         sentinel_path: format!("/tmp/exact controller/{generation}/status"),
         layout_id: None,
     }
+}
+
+#[test]
+fn exact_active_controller_reservation_authorizes_pre_spawn_registration() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+    let run = "controller-preauth";
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(run).expect("run id"),
+            bead_id: "bead-controller-preauth".to_owned(),
+            repo: "/repo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "work/controller-preauth".to_owned(),
+        })
+        .expect("run");
+    let snapshot = ledger
+        .admission_snapshot(Some((DesiredSubjectKind::Run, run.to_owned())))
+        .expect("snapshot");
+    let capacity = snapshot.capacity.clone();
+    let candidate = AdmissionCandidateV1 {
+        subject_kind: AdmissionSubjectKind::Run,
+        subject_id: run.to_owned(),
+        control_revision: 0,
+        bead_id: "bead-controller-preauth".to_owned(),
+        bead_revision: Some("rev-1".to_owned()),
+        bead_status: Some("open".to_owned()),
+        priority: Some(1),
+        repository: "/repo".to_owned(),
+        bead_repository: Some("/repo".to_owned()),
+        input_error: None,
+        desired_wake_at: None,
+        provider: Some("codex".to_owned()),
+        model: Some("gpt-test".to_owned()),
+        resource_class: AdmissionResourceClass::RepositoryWrite,
+        authorized_at: snapshot.as_of.clone(),
+    };
+    let decision = AdmissionDecisionV1 {
+        schema: ADMISSION_DECISION_SCHEMA_V1.to_owned(),
+        batch_id: "controller-preauth-batch".to_owned(),
+        subject_kind: AdmissionSubjectKind::Run,
+        subject_id: run.to_owned(),
+        control_revision: 0,
+        repository: "/repo".to_owned(),
+        priority: Some(1),
+        provider: Some("codex".to_owned()),
+        model: Some("gpt-test".to_owned()),
+        resource_class: AdmissionResourceClass::RepositoryWrite,
+        outcome: AdmissionOutcome::Admitted,
+        reason: AdmissionReason::CapacityAvailable,
+        policy_revision: "policy-v1".to_owned(),
+        evidence: capacity.clone(),
+        next_eligible_wake_at: None,
+    };
+    let reservation = ledger
+        .commit_admission_batch(AdmissionBatchWrite {
+            inputs: AdmissionInputsV1 {
+                schema: ADMISSION_INPUTS_SCHEMA_V1.to_owned(),
+                as_of: snapshot.as_of,
+                policy_revision: "policy-v1".to_owned(),
+                ledger_revision: snapshot.ledger_revision,
+                candidates: vec![candidate],
+                capacity,
+                spend: snapshot.spend,
+                latest_rate_limits: snapshot.latest_rate_limits,
+            },
+            decisions: vec![decision],
+            recovery_deadline: "2099-01-01T00:00:00.000000000Z".to_owned(),
+        })
+        .expect("commit admission")
+        .into_iter()
+        .next()
+        .expect("reservation");
+    ledger
+        .activate_admission_reservation(
+            &reservation.reservation_id,
+            "controller",
+            "run:controller-preauth:1",
+        )
+        .expect("activate exact controller reservation");
+
+    ledger
+        .register_owned_herdr_session(&controller_identity("own-preauth", run, 1))
+        .expect("exact active reservation authorizes registration");
+    assert!(ledger
+        .register_owned_herdr_session(&controller_identity("own-wrong-generation", run, 2))
+        .is_err());
 }
 
 #[test]

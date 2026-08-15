@@ -325,6 +325,104 @@ async fn subject_runtime(
     }
 }
 
+/// Adoption is observation, not a new capacity effect. Check an already-live
+/// exact controller before asking admission policy for a replacement slot;
+/// otherwise its own active provider attempt can fill repository capacity and
+/// make the supervisor defer forever instead of adopting it.
+async fn reconcile_live_before_admission(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+) -> Result<Option<Value>, Failure> {
+    let quick_record = handoff::latest_record(ctx, &row.subject_id).await?;
+    let quick_status = match quick_record.as_ref() {
+        Some(record) => handoff::status_for(record).await,
+        None => Value::Null,
+    };
+    if !handoff::is_active(&quick_status) {
+        return Ok(None);
+    }
+
+    if let Some(stop) = settle_landed_reality(ctx, row, token).await? {
+        return Ok(Some(stop));
+    }
+    crate::failpoint::hit("supervisor.stop-check.after");
+
+    let subject_scope = scope(row.subject_kind);
+    let _submit_guard = handoff::acquire_submit(ctx, &row.subject_id, subject_scope).await?;
+    let kind = row.subject_kind;
+    let id = row.subject_id.clone();
+    let lookup_id = id.clone();
+    let current = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.get_desired_work(kind, &lookup_id)
+    })
+    .await?;
+    let Some(row) = current else {
+        return Ok(Some(json!({
+            "action": "superseded",
+            "subject": {"kind": kind.as_str(), "id": id},
+            "detail": "desired authorization was removed while waiting for the submit fence",
+        })));
+    };
+    if row.reconcile_token.as_deref() != Some(token) {
+        return Ok(Some(json!({
+            "action": "superseded",
+            "desiredWork": row_json(&row),
+        })));
+    }
+
+    let record = handoff::latest_record(ctx, &row.subject_id).await?;
+    if let Some(value) = record.as_ref() {
+        crate::runtime::complete_recovered_controller_admission(
+            &ctx.config,
+            &row.subject_id,
+            handoff::generation(value),
+        )?;
+    }
+    let status = match record.as_ref() {
+        Some(record) => handoff::status_for(record).await,
+        None => Value::Null,
+    };
+    if !handoff::is_active(&status) {
+        return Ok(None);
+    }
+    crate::failpoint::hit("supervisor.observe.after");
+
+    let generation = handoff::generation(&status);
+    if generation != row.controller_generation {
+        return finish_attention(
+            ctx,
+            &row,
+            token,
+            format!(
+                "live controller generation {generation} does not match desired generation {}",
+                row.controller_generation
+            ),
+        )
+        .await
+        .map(Some);
+    }
+    let progress = last_progress(ctx, &row.subject_id).await?;
+    let report = finish_action(
+        ctx,
+        &row,
+        token,
+        "adopted",
+        DesiredReconcileUpdate {
+            desired_state: None,
+            outcome: DesiredReconcileOutcome::Adopted,
+            controller_generation: Some(generation),
+            predecessor_generation: row.predecessor_generation,
+            next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+            last_progress_at: progress,
+            last_error: None,
+            attention_condition: None,
+        },
+    )
+    .await?;
+    Ok(Some(report))
+}
+
 async fn reconcile_claimed(
     ctx: &Ctx,
     row: DesiredWorkRow,
@@ -475,14 +573,14 @@ async fn reconcile_claimed(
 
     if handoff::is_active(&status) {
         let generation = handoff::generation(&status);
-        if recovery_generation.is_some_and(|expected| expected != generation) {
+        if generation != row.controller_generation {
             return finish_attention(
                 ctx,
                 &row,
                 &token,
                 format!(
-                    "owned admission generation {} does not match live controller generation {generation}",
-                    recovery_generation.unwrap_or_default()
+                    "live controller generation {generation} does not match desired generation {}",
+                    row.controller_generation
                 ),
             )
             .await;
@@ -759,9 +857,31 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
             None => contended = contended.saturating_add(1),
         }
     }
+    let mut subjects = Vec::new();
+    let mut admission_rows = Vec::new();
+    for (candidate, token) in claimed_rows {
+        match reconcile_live_before_admission(ctx, &candidate, &token).await {
+            Ok(Some(report)) => subjects.push(report),
+            Ok(None) => admission_rows.push((candidate, token)),
+            Err(error) => {
+                // Mirror the ordinary per-subject failure path below. A
+                // crash still bypasses this code and retains the claim lease.
+                match finish_retryable(ctx, &candidate, &token, error.to_string()).await {
+                    Ok(report) => subjects.push(report),
+                    Err(finish_error) => subjects.push(json!({
+                        "action": "claim-retained",
+                        "subject": {"kind": candidate.subject_kind.as_str(), "id": candidate.subject_id},
+                        "error": error.to_string(),
+                        "finishError": finish_error.to_string(),
+                        "leaseUntil": candidate.reconcile_lease_until,
+                    })),
+                }
+            }
+        }
+    }
     let admissions = super::admission::admit(
         ctx,
-        claimed_rows
+        admission_rows
             .iter()
             .map(|(row, _)| (row.subject_kind, row.subject_id.clone()))
             .collect(),
@@ -780,8 +900,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
             )
         })
         .collect::<std::collections::BTreeMap<_, _>>();
-    let mut subjects = Vec::new();
-    for (candidate, token) in claimed_rows {
+    for (candidate, token) in admission_rows {
         let admission_kind = match candidate.subject_kind {
             DesiredSubjectKind::Run => forged_types::AdmissionSubjectKind::Run,
             DesiredSubjectKind::Epic => forged_types::AdmissionSubjectKind::Epic,

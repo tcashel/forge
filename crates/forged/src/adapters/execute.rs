@@ -403,6 +403,20 @@ async fn await_pid(attempt_dir: &Path) -> Option<u32> {
     None
 }
 
+/// A provider pid is not safely recoverable cross-process until its start
+/// stamp is durable. `ps` can briefly miss a just-spawned process under host
+/// load, so use the same bounded identity window as detached controllers.
+async fn await_provider_lstart(pid: u32) -> Option<String> {
+    let pid = i32::try_from(pid).ok()?;
+    for _ in 0..20 {
+        if let Some(lstart) = crate::adapters::ports::lstart_of(pid).await {
+            return Some(lstart);
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    None
+}
+
 /// Execute one open packet end to end: re-pin, claim, render, spawn, await,
 /// harvest, land or fail. Follows the section-(d) order exactly.
 ///
@@ -1347,7 +1361,6 @@ async fn run_attempt(
         }
         return Err(error);
     }
-    drop(submit_guard);
     crate::core::sessions::record_interventions_delivered(
         ctx,
         &run_id,
@@ -1380,7 +1393,15 @@ async fn run_attempt(
     // worktree. Stop the session, record a transport failure, and let the
     // transport-retry budget decide whether to try again.
     let Some(pid) = await_pid(dirs.path()).await else {
-        let _ = host.kill_confirmed(&session).await;
+        let stopped = host.kill_confirmed(&session).await;
+        drop(submit_guard);
+        stopped.map_err(|error| Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "provider pid was not durable and its process group could not be stopped: {error}"
+            ),
+            recoverable: true,
+        })?;
         let note = "transport: provider pid file never appeared".to_owned();
         crate::core::artifacts::materialize_and_join(
             ctx,
@@ -1394,11 +1415,50 @@ async fn run_attempt(
         return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
     };
     // The start-time stamp beside the pid is the pid-reuse guard for every
-    // process that did not spawn this attempt (see `adapters::ports`).
-    if let Some(lstart) = crate::adapters::ports::lstart_of(i32::try_from(pid).unwrap_or(-1)).await
-    {
-        let _ = std::fs::write(dirs.provider_lstart(), lstart);
+    // process that did not spawn this attempt (see `adapters::ports`). Do not
+    // let an effect-capable provider continue without that durable identity:
+    // a later revoker could not safely signal it.
+    let identity_failure = match await_provider_lstart(pid).await {
+        Some(lstart) => std::fs::write(dirs.provider_lstart(), lstart)
+            .err()
+            .map(|error| format!("cannot persist provider start time: {error}")),
+        None => Some("provider start time never appeared".to_owned()),
+    };
+    if let Some(detail) = identity_failure {
+        // A terminal sentinel is sufficient containment even when a very
+        // short-lived process vanished before `ps` could capture its start
+        // time. Otherwise the spawning host must prove the group stopped
+        // before the attempt may be settled and retried.
+        if !matches!(
+            host.alive(&session).await,
+            Ok(forged_host::Liveness::Exited(_))
+        ) {
+            let stopped = host.kill_confirmed(&session).await;
+            drop(submit_guard);
+            stopped.map_err(|error| Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                    "provider identity was not durable and its process group could not be stopped: {error}"
+                ),
+                recoverable: true,
+            })?;
+            let note = format!("transport: {detail}");
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "transport",
+                &json!({"note": &note}),
+                &session_evidence,
+            )
+            .await?;
+            return fail_and_grant_retry(ctx, &packet_id, &claim_token, note).await;
+        }
     }
+    // A concurrent stop/pause may proceed only after the provider has a
+    // cross-process identity that its revoker can verify. Before this point
+    // the spawning driver is the sole process able to contain the effect.
+    drop(submit_guard);
     failpoint::hit("guardian.start");
     let gcfg = forged_beads::GuardianConfig::new(
         ctx.config.bd_config(),

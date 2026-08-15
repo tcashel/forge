@@ -1332,20 +1332,206 @@ struct ControllerBlocker {
     reason: String,
 }
 
-fn pid_alive(pid: i32) -> Option<bool> {
-    match kill(Pid::from_raw(pid), None) {
-        Ok(()) | Err(Errno::EPERM) => Some(true),
-        Err(Errno::ESRCH) => Some(false),
-        Err(_) => None,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ControllerGroupState {
+    Absent,
+    Present,
+    Unknown,
+}
+
+fn classify_controller_group_probe(probe: Result<(), Errno>) -> ControllerGroupState {
+    match probe {
+        Err(Errno::ESRCH) => ControllerGroupState::Absent,
+        Ok(()) | Err(Errno::EPERM) => ControllerGroupState::Present,
+        Err(_) => ControllerGroupState::Unknown,
     }
+}
+
+#[async_trait]
+trait ControllerProcessProbe: Sync {
+    fn group_state(&self, pgid: i32) -> ControllerGroupState;
+
+    async fn leader_lstart(&self, pid: i32) -> Option<String>;
+}
+
+struct SystemControllerProcessProbe;
+
+#[async_trait]
+impl ControllerProcessProbe for SystemControllerProcessProbe {
+    fn group_state(&self, pgid: i32) -> ControllerGroupState {
+        let Some(group) = pgid.checked_neg() else {
+            return ControllerGroupState::Unknown;
+        };
+        classify_controller_group_probe(kill(Pid::from_raw(group), None))
+    }
+
+    async fn leader_lstart(&self, pid: i32) -> Option<String> {
+        crate::adapters::ports::lstart_of(pid).await
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ControllerProcessIdentity {
+    pgid: i32,
+    leader_lstart: String,
+}
+
+fn read_controller_inventory_bytes(
+    path: &Path,
+    max_bytes: u64,
+) -> Result<Option<Vec<u8>>, Failure> {
+    reject_symlink_chain(path)?;
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "inspecting {}: {error}",
+                path.display()
+            )))
+        }
+    };
+    if !metadata.is_file() {
+        return Err(Failure::internal(format!(
+            "{} is not a regular controller inventory file",
+            path.display()
+        )));
+    }
+    if metadata.len() > max_bytes {
+        return Err(Failure::internal(format!(
+            "{} is too large",
+            path.display()
+        )));
+    }
+    let file = OpenOptions::new()
+        .read(true)
+        .custom_flags(nix::libc::O_NOFOLLOW | nix::libc::O_NONBLOCK)
+        .open(path)
+        .map_err(|error| Failure::internal(format!("opening {}: {error}", path.display())))?;
+    if !file
+        .metadata()
+        .map_err(|error| Failure::internal(format!("stat {}: {error}", path.display())))?
+        .is_file()
+    {
+        return Err(Failure::internal(format!(
+            "{} changed away from a regular controller inventory file",
+            path.display()
+        )));
+    }
+    let mut bytes = Vec::new();
+    file.take(max_bytes + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|error| Failure::internal(format!("reading {}: {error}", path.display())))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(Failure::internal(format!(
+            "{} is too large",
+            path.display()
+        )));
+    }
+    Ok(Some(bytes))
+}
+
+fn read_controller_inventory_json<T: for<'de> Deserialize<'de>>(
+    path: &Path,
+) -> Result<Option<T>, Failure> {
+    const MAX_CONTROLLER_JSON_BYTES: u64 = 1024 * 1024;
+
+    let Some(bytes) = read_controller_inventory_bytes(path, MAX_CONTROLLER_JSON_BYTES)? else {
+        return Ok(None);
+    };
+    serde_json::from_slice(&bytes)
+        .map(Some)
+        .map_err(|error| Failure::internal(format!("parsing {}: {error}", path.display())))
+}
+
+fn fixed_controller_sidecar(path: &Path) -> Result<String, String> {
+    const MAX_SIDECAR_BYTES: u64 = 4 * 1024;
+
+    let bytes = read_controller_inventory_bytes(path, MAX_SIDECAR_BYTES)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| format!("{} does not exist", path.display()))?;
+    String::from_utf8(bytes)
+        .map_err(|error| format!("reading {} as UTF-8: {error}", path.display()))
+}
+
+fn controller_process_identity(
+    controller_dir: &Path,
+    record: &Value,
+) -> Result<ControllerProcessIdentity, String> {
+    let embedded_pid = record.pointer("/driver/pid");
+    let embedded_lstart = record.pointer("/driver/lstart");
+    if record.get("driver").is_some() {
+        let pgid = embedded_pid
+            .and_then(Value::as_i64)
+            .and_then(|value| i32::try_from(value).ok())
+            .filter(|value| *value > 1)
+            .ok_or_else(|| {
+                "embedded controller process-group id is missing or invalid".to_owned()
+            })?;
+        let leader_lstart = embedded_lstart
+            .and_then(Value::as_str)
+            .filter(|value| !value.trim().is_empty())
+            .map(str::to_owned)
+            .ok_or_else(|| {
+                "embedded controller process-start identity is missing or invalid".to_owned()
+            })?;
+        return Ok(ControllerProcessIdentity {
+            pgid,
+            leader_lstart,
+        });
+    }
+
+    let pid_path = controller_dir.join("controller.pid");
+    let lstart_path = controller_dir.join("controller.lstart");
+    let pid = fixed_controller_sidecar(&pid_path)
+        .map_err(|error| format!("legacy controller PID cannot be verified: {error}"))?;
+    let pgid = pid
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|value| *value > 1)
+        .ok_or_else(|| "legacy controller.pid is empty or malformed".to_owned())?;
+    let leader_lstart = fixed_controller_sidecar(&lstart_path)
+        .map_err(|error| format!("legacy controller start identity cannot be verified: {error}"))?
+        .trim()
+        .to_owned();
+    if leader_lstart.is_empty() {
+        return Err("legacy controller.lstart is empty or malformed".to_owned());
+    }
+    Ok(ControllerProcessIdentity {
+        pgid,
+        leader_lstart,
+    })
 }
 
 async fn controller_blockers(
     runs_root: &Path,
     candidate_abi: Option<&str>,
 ) -> Result<Vec<ControllerBlocker>, Failure> {
-    if !runs_root.exists() {
-        return Ok(Vec::new());
+    controller_blockers_with_probe(runs_root, candidate_abi, &SystemControllerProcessProbe).await
+}
+
+async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
+    runs_root: &Path,
+    candidate_abi: Option<&str>,
+    process_probe: &P,
+) -> Result<Vec<ControllerBlocker>, Failure> {
+    reject_symlink_chain(runs_root)?;
+    match fs::symlink_metadata(runs_root) {
+        Ok(metadata) if metadata.is_dir() => {}
+        Ok(_) => {
+            return Err(Failure::internal(format!(
+                "controller inventory root is not a real directory: {}",
+                runs_root.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "inspecting controller inventory root {}: {error}",
+                runs_root.display()
+            )))
+        }
     }
     let mut blockers = Vec::new();
     for entry in fs::read_dir(runs_root)
@@ -1354,9 +1540,37 @@ async fn controller_blockers(
         let entry =
             entry.map_err(|error| Failure::internal(format!("controller entry: {error}")))?;
         let fallback_id = entry.file_name().to_string_lossy().into_owned();
+        let entry_type = match entry.file_type() {
+            Ok(entry_type) => entry_type,
+            Err(error) => {
+                blockers.push(ControllerBlocker {
+                    id: fallback_id,
+                    state: "unknown".to_owned(),
+                    recorded_abi: None,
+                    reason: format!("controller inventory entry type cannot be verified: {error}"),
+                });
+                continue;
+            }
+        };
+        if entry_type.is_file() {
+            continue;
+        }
+        if !entry_type.is_dir() {
+            blockers.push(ControllerBlocker {
+                id: fallback_id,
+                state: "unknown".to_owned(),
+                recorded_abi: None,
+                reason: if entry_type.is_symlink() {
+                    "refusing symlinked controller inventory entry".to_owned()
+                } else {
+                    "refusing special controller inventory entry".to_owned()
+                },
+            });
+            continue;
+        }
         let controller_dir = entry.path().join("controller");
         let admission_path = controller_dir.join("runtime-admission.json");
-        match read_json::<ControllerAdmissionRecord>(&admission_path) {
+        match read_controller_inventory_json::<ControllerAdmissionRecord>(&admission_path) {
             Ok(Some(admission)) => {
                 let validation = admission.validate();
                 blockers.push(ControllerBlocker {
@@ -1385,8 +1599,18 @@ async fn controller_blockers(
             }
         }
         let path = controller_dir.join("controller.json");
-        let Some(record): Option<Value> = read_json(&path)? else {
-            continue;
+        let record: Value = match read_controller_inventory_json(&path) {
+            Ok(Some(record)) => record,
+            Ok(None) => continue,
+            Err(error) => {
+                blockers.push(ControllerBlocker {
+                    id: fallback_id.clone(),
+                    state: "unknown".to_owned(),
+                    recorded_abi: None,
+                    reason: format!("controller record cannot be verified: {error}"),
+                });
+                continue;
+            }
         };
         let id = record
             .get("id")
@@ -1428,10 +1652,13 @@ async fn controller_blockers(
                 expected.display()
             )),
             (Some(observed), Some(_)) => match fs::symlink_metadata(observed) {
-                Ok(_) => match reject_symlink_chain(observed) {
+                Ok(metadata) => match reject_symlink_chain(observed) {
                     Err(error) => Some(format!("unsafe controller sentinel: {error}")),
+                    Ok(()) if !metadata.is_file() => {
+                        Some("controller sentinel is not a regular file".to_owned())
+                    }
                     Ok(()) => match forged_host::read_exit_status(observed) {
-                        Ok(Some(_)) => continue,
+                        Ok(Some(_)) => None,
                         Ok(None) => {
                             Some("controller sentinel exists but is empty or malformed".to_owned())
                         }
@@ -1455,45 +1682,48 @@ async fn controller_blockers(
             });
             continue;
         }
-        let pid = record
-            .pointer("/driver/pid")
-            .and_then(Value::as_i64)
-            .and_then(|value| i32::try_from(value).ok());
-        let expected = record
-            .pointer("/driver/lstart")
-            .and_then(Value::as_str)
-            .map(str::to_owned);
-        let (state, reason) = match pid {
-            Some(pid) => match pid_alive(pid) {
-                Some(false) => continue,
-                Some(true) => {
-                    let current = crate::adapters::ports::lstart_of(pid).await;
-                    if expected.is_some() && current == expected {
-                        ("live", "verified live controller".to_owned())
-                    } else {
-                        (
-                            "unknown",
-                            "PID is present but process-start identity is missing or mismatched"
-                                .to_owned(),
-                        )
-                    }
-                }
-                None => (
-                    "unknown",
-                    "controller liveness could not be verified".to_owned(),
-                ),
-            },
-            None => ("unknown", "controller record has no PID".to_owned()),
+        let identity = match controller_process_identity(&controller_dir, &record) {
+            Ok(identity) => identity,
+            Err(reason) => {
+                blockers.push(ControllerBlocker {
+                    id,
+                    state: "unknown".to_owned(),
+                    recorded_abi,
+                    reason,
+                });
+                continue;
+            }
         };
-        if candidate_abi.is_some_and(|abi| recorded_abi.as_deref() == Some(abi)) {
-            continue;
+        match process_probe.group_state(identity.pgid) {
+            ControllerGroupState::Absent => continue,
+            ControllerGroupState::Unknown => blockers.push(ControllerBlocker {
+                id,
+                state: "unknown".to_owned(),
+                recorded_abi,
+                reason: "controller process-group liveness could not be verified".to_owned(),
+            }),
+            ControllerGroupState::Present => {
+                let current = process_probe.leader_lstart(identity.pgid).await;
+                if current.as_deref() != Some(identity.leader_lstart.as_str()) {
+                    blockers.push(ControllerBlocker {
+                        id,
+                        state: "unknown".to_owned(),
+                        recorded_abi,
+                        reason: "controller process group exists but its leader is missing, recycled, or has a mismatched start identity".to_owned(),
+                    });
+                    continue;
+                }
+                if candidate_abi.is_some_and(|abi| recorded_abi.as_deref() == Some(abi)) {
+                    continue;
+                }
+                blockers.push(ControllerBlocker {
+                    id,
+                    state: "live".to_owned(),
+                    recorded_abi,
+                    reason: "verified live controller process group".to_owned(),
+                });
+            }
         }
-        blockers.push(ControllerBlocker {
-            id,
-            state: state.to_owned(),
-            recorded_abi,
-            reason,
-        });
     }
     blockers.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(blockers)
@@ -1977,6 +2207,16 @@ async fn install<H: ServiceHost>(
     config: &ForgedConfig,
     faults: &LifecycleFaults,
 ) -> Result<Value, Failure> {
+    install_with_probe(host, paths, config, faults, &SystemControllerProcessProbe).await
+}
+
+async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
+    host: &H,
+    paths: &RuntimePaths,
+    config: &ForgedConfig,
+    faults: &LifecycleFaults,
+    process_probe: &P,
+) -> Result<Value, Failure> {
     let source_identity = current_binary_identity()?;
     let source = PathBuf::from(&source_identity.path);
     let target = copy_content_addressed(paths, &source, &source_identity)?;
@@ -2013,7 +2253,12 @@ async fn install<H: ServiceHost>(
         }));
     }
 
-    let blockers = controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI)).await?;
+    let blockers = controller_blockers_with_probe(
+        &config.runs_root,
+        Some(CONTROLLER_RUNTIME_ABI),
+        process_probe,
+    )
+    .await?;
     if !blockers.is_empty() {
         return Err(blockers_failure(&blockers));
     }
@@ -2053,7 +2298,12 @@ async fn install<H: ServiceHost>(
         return Err(rollback_transition(host, paths, transition, error).await);
     }
 
-    let blockers = match controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI)).await
+    let blockers = match controller_blockers_with_probe(
+        &config.runs_root,
+        Some(CONTROLLER_RUNTIME_ABI),
+        process_probe,
+    )
+    .await
     {
         Ok(blockers) => blockers,
         Err(error) => return Err(rollback_transition(host, paths, transition, error).await),
@@ -2781,6 +3031,36 @@ mod tests {
     #[derive(Clone, Default)]
     struct FakeHost(Arc<Mutex<FakeState>>);
 
+    #[derive(Default)]
+    struct FakeControllerProcessProbe {
+        groups: BTreeMap<i32, ControllerGroupState>,
+        leader_lstarts: BTreeMap<i32, String>,
+    }
+
+    impl FakeControllerProcessProbe {
+        fn set_group(&mut self, pgid: i32, state: ControllerGroupState) {
+            self.groups.insert(pgid, state);
+        }
+
+        fn set_leader_lstart(&mut self, pid: i32, lstart: &str) {
+            self.leader_lstarts.insert(pid, lstart.to_owned());
+        }
+    }
+
+    #[async_trait]
+    impl ControllerProcessProbe for FakeControllerProcessProbe {
+        fn group_state(&self, pgid: i32) -> ControllerGroupState {
+            self.groups
+                .get(&pgid)
+                .copied()
+                .unwrap_or(ControllerGroupState::Unknown)
+        }
+
+        async fn leader_lstart(&self, pid: i32) -> Option<String> {
+            self.leader_lstarts.get(&pid).cloned()
+        }
+    }
+
     impl FakeHost {
         fn set_loaded(&self, manifest: &RuntimeManifest) {
             self.0.lock().expect("fake lock").observation = LaunchdObservation {
@@ -3223,6 +3503,8 @@ mod tests {
         fs::create_dir_all(status.parent().expect("status parent")).expect("status dirs");
         let pid = i32::try_from(std::process::id()).expect("pid");
         let lstart = "test-process-start".to_owned();
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Absent);
         let record_path = controller.join("controller.json");
         let write_record = |status_path: &Path, abi: &str| {
             atomic_json(
@@ -3243,18 +3525,26 @@ mod tests {
         fs::write(&status, b"").expect("empty sentinel");
         write_record(&status, "forged.controller-runtime/0");
         assert_eq!(
-            controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
-                .await
-                .expect("blockers")
-                .len(),
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("blockers")
+            .len(),
             1
         );
         fs::write(&status, b"not-an-exit-code\n").expect("corrupt sentinel");
         assert_eq!(
-            controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
-                .await
-                .expect("blockers")
-                .len(),
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("blockers")
+            .len(),
             1
         );
 
@@ -3263,10 +3553,14 @@ mod tests {
         fs::write(&stale, b"0\n").expect("stale sentinel");
         write_record(&stale, "forged.controller-runtime/0");
         assert_eq!(
-            controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
-                .await
-                .expect("blockers")
-                .len(),
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("blockers")
+            .len(),
             1
         );
 
@@ -3274,20 +3568,305 @@ mod tests {
         fs::create_dir(&status).expect("sentinel directory");
         write_record(&status, "forged.controller-runtime/0");
         assert_eq!(
-            controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
-                .await
-                .expect("blockers")
-                .len(),
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("blockers")
+            .len(),
             1
         );
         fs::remove_dir(&status).expect("remove sentinel directory");
         fs::write(&status, b"0\n").expect("valid sentinel");
-        assert!(
-            controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
-                .await
-                .expect("blockers")
-                .is_empty()
+        assert!(controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("blockers")
+        .is_empty());
+    }
+
+    #[test]
+    fn negative_process_group_probe_is_strictly_tri_state() {
+        assert_eq!(
+            classify_controller_group_probe(Err(Errno::ESRCH)),
+            ControllerGroupState::Absent
         );
+        assert_eq!(
+            classify_controller_group_probe(Ok(())),
+            ControllerGroupState::Present
+        );
+        assert_eq!(
+            classify_controller_group_probe(Err(Errno::EPERM)),
+            ControllerGroupState::Present
+        );
+        assert_eq!(
+            classify_controller_group_probe(Err(Errno::EINVAL)),
+            ControllerGroupState::Unknown
+        );
+    }
+
+    #[tokio::test]
+    async fn controller_inventory_ignores_files_and_refuses_symlink_or_special_entries() {
+        let (_root, config, _paths) = setup();
+        fs::write(config.runs_root.join("beads-retro.md"), b"historical notes")
+            .expect("regular run-root artifact");
+
+        let outside = config
+            .anvil_home
+            .parent()
+            .expect("temp root")
+            .join("outside-run");
+        fs::create_dir_all(&outside).expect("outside directory");
+        symlink(&outside, config.runs_root.join("linked-run")).expect("run-root symlink");
+        let fifo_path = config.runs_root.join("run.fifo");
+        nix::unistd::mkfifo(
+            &fifo_path,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("run-root special entry");
+        let special_admission = config
+            .runs_root
+            .join("special-admission/controller/runtime-admission.json");
+        fs::create_dir_all(special_admission.parent().expect("controller parent"))
+            .expect("special admission parent");
+        nix::unistd::mkfifo(
+            &special_admission,
+            nix::sys::stat::Mode::S_IRUSR | nix::sys::stat::Mode::S_IWUSR,
+        )
+        .expect("special admission entry");
+
+        let blockers = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &FakeControllerProcessProbe::default(),
+        )
+        .await
+        .expect("controller blockers");
+        assert_eq!(blockers.len(), 3);
+        assert!(blockers
+            .iter()
+            .any(|blocker| { blocker.id == "linked-run" && blocker.reason.contains("symlinked") }));
+        assert!(blockers
+            .iter()
+            .any(|blocker| { blocker.id == "run.fifo" && blocker.reason.contains("special") }));
+        assert!(blockers.iter().any(|blocker| {
+            blocker.id == "special-admission"
+                && blocker
+                    .reason
+                    .contains("not a regular controller inventory file")
+        }));
+        assert!(blockers
+            .iter()
+            .all(|blocker| blocker.id != "beads-retro.md"));
+    }
+
+    #[tokio::test]
+    async fn legacy_identity_clears_only_for_absent_or_compatible_live_group() {
+        let (_root, config, _paths) = setup();
+        let controller = config.runs_root.join("run-legacy/controller");
+        fs::create_dir_all(&controller).expect("controller directory");
+        let status = controller.join("status/1/proc-legacy/status");
+        let pid = 42_001;
+        let lstart = "legacy-process-start";
+        let mut record = json!({
+            "schemaVersion": 1,
+            "id": "run-legacy",
+            "generation": 1,
+            "sessionId": "proc-legacy",
+            "binary": {"runtimeAbi": "forged.controller-runtime/0"},
+            "statusPath": status,
+        });
+        atomic_json(&controller.join("controller.json"), &record).expect("legacy record");
+        fs::write(controller.join("controller.pid"), format!("{pid}\n")).expect("legacy pid");
+        fs::write(controller.join("controller.lstart"), format!("{lstart}\n"))
+            .expect("legacy lstart");
+
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+        assert!(
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("dead legacy group")
+            .is_empty(),
+            "ESRCH-equivalent group absence is sufficient death proof"
+        );
+
+        process_probe.set_group(pid, ControllerGroupState::Present);
+        process_probe.set_leader_lstart(pid, lstart);
+        let live = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("live legacy group");
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].state, "live");
+
+        process_probe.set_group(pid, ControllerGroupState::Unknown);
+        let unknown = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("unknown legacy group");
+        assert_eq!(unknown.len(), 1);
+        assert_eq!(unknown[0].state, "unknown");
+
+        record["binary"]["runtimeAbi"] = json!(CONTROLLER_RUNTIME_ABI);
+        atomic_json(&controller.join("controller.json"), &record).expect("compatible record");
+        process_probe.set_group(pid, ControllerGroupState::Present);
+        assert!(controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("compatible live legacy group")
+        .is_empty());
+    }
+
+    #[tokio::test]
+    async fn terminal_sentinel_cannot_hide_orphan_group_or_pidless_record() {
+        let (_root, config, _paths) = setup();
+        let controller = config.runs_root.join("run-orphan/controller");
+        let status = controller.join("status/1/proc-orphan/status");
+        fs::create_dir_all(status.parent().expect("status parent")).expect("status directory");
+        fs::write(&status, b"0\n").expect("terminal sentinel");
+        let pid = 43_001;
+        let mut record = json!({
+            "schemaVersion": 1,
+            "id": "run-orphan",
+            "generation": 1,
+            "sessionId": "proc-orphan",
+            "driver": {"pid": pid, "lstart": "departed-leader"},
+            "binary": {"runtimeAbi": CONTROLLER_RUNTIME_ABI},
+            "statusPath": status,
+        });
+        atomic_json(&controller.join("controller.json"), &record).expect("orphan record");
+
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Present);
+        let orphan = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("orphan group blockers");
+        assert_eq!(orphan.len(), 1);
+        assert_eq!(orphan[0].state, "unknown");
+        assert!(orphan[0].reason.contains("leader is missing"));
+
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("driver");
+        atomic_json(&controller.join("controller.json"), &record).expect("pidless record");
+        let pidless = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("pidless blockers");
+        assert_eq!(pidless.len(), 1);
+        assert!(pidless[0].reason.contains("legacy controller PID"));
+    }
+
+    #[tokio::test]
+    async fn legacy_sidecars_are_fixed_regular_files_and_embedded_identity_wins() {
+        let (_root, config, _paths) = setup();
+        let controller = config.runs_root.join("run-sidecars/controller");
+        fs::create_dir_all(&controller).expect("controller directory");
+        let status = controller.join("status/1/proc-sidecars/status");
+        let record_path = controller.join("controller.json");
+        let pid_path = controller.join("controller.pid");
+        let lstart_path = controller.join("controller.lstart");
+        let outside_pid = config.anvil_home.join("outside.pid");
+        let outside_lstart = config.anvil_home.join("outside.lstart");
+        fs::write(&outside_pid, b"45001\n").expect("outside pid");
+        fs::write(&outside_lstart, b"outside-start\n").expect("outside lstart");
+        let mut record = json!({
+            "schemaVersion": 1,
+            "id": "run-sidecars",
+            "generation": 1,
+            "sessionId": "proc-sidecars",
+            "binary": {"runtimeAbi": CONTROLLER_RUNTIME_ABI},
+            "pidPath": outside_pid,
+            "lstartPath": outside_lstart,
+            "statusPath": status,
+        });
+        atomic_json(&record_path, &record).expect("legacy record");
+        fs::write(&pid_path, b"not-a-pid\n").expect("malformed pid");
+        fs::write(&lstart_path, b"legacy-start\n").expect("legacy lstart");
+
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(44_001, ControllerGroupState::Absent);
+        process_probe.set_group(45_001, ControllerGroupState::Absent);
+        let malformed = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("malformed sidecar blockers");
+        assert_eq!(malformed.len(), 1);
+        assert!(malformed[0].reason.contains("controller.pid"));
+
+        fs::write(&pid_path, b"44001\n").expect("valid legacy pid");
+        fs::remove_file(&lstart_path).expect("remove regular lstart");
+        symlink(&outside_lstart, &lstart_path).expect("unsafe lstart sidecar");
+        let unsafe_sidecar = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("unsafe sidecar blockers");
+        assert_eq!(unsafe_sidecar.len(), 1);
+        assert!(unsafe_sidecar[0].reason.contains("symlink"));
+
+        record["driver"] = json!({"pid": 44_001, "lstart": "embedded-start"});
+        atomic_json(&record_path, &record).expect("embedded record");
+        process_probe.set_group(44_001, ControllerGroupState::Present);
+        process_probe.set_leader_lstart(44_001, "embedded-start");
+        assert!(
+            controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("embedded identity")
+            .is_empty(),
+            "embedded identity must take precedence without reading unsafe legacy paths"
+        );
+
+        fs::remove_file(&lstart_path).expect("remove sidecar symlink");
+        fs::write(&lstart_path, b"legacy-start\n").expect("valid legacy lstart");
+        record["driver"] = json!({});
+        atomic_json(&record_path, &record).expect("malformed embedded record");
+        process_probe.set_group(44_001, ControllerGroupState::Absent);
+        let malformed_embedded = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("malformed embedded blockers");
+        assert_eq!(malformed_embedded.len(), 1);
+        assert!(malformed_embedded[0].reason.contains("embedded"));
     }
 
     #[tokio::test]
@@ -3299,25 +3878,36 @@ mod tests {
         let controller = config.runs_root.join("run-old/controller");
         fs::create_dir_all(&controller).expect("controller dir");
         let status = controller.join("status/1/proc-old/status");
-        let write_record = |abi: &str| {
-            atomic_json(
-                &controller.join("controller.json"),
-                &json!({
-                    "schemaVersion": 1,
-                    "id": "run-old",
-                    "generation": 1,
-                    "sessionId": "proc-old",
-                    "driver": {"pid": std::process::id(), "lstart": "unverifiable"},
-                    "binary": {"runtimeAbi": abi},
-                    "statusPath": status,
-                }),
-            )
-            .expect("controller record");
-        };
-        write_record("forged.controller-runtime/0");
-        let blocked = install(&host, &paths, &config, &LifecycleFaults::default())
-            .await
-            .expect_err("incompatible controller blocks ABI upgrade");
+        let pid = 41_001;
+        let lstart = "test-process-start";
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Present);
+        process_probe.set_leader_lstart(pid, lstart);
+        atomic_json(
+            &controller.join("controller.json"),
+            &json!({
+                "schemaVersion": 1,
+                "id": "run-old",
+                "generation": 1,
+                "sessionId": "proc-old",
+                "binary": {"runtimeAbi": "forged.controller-runtime/0"},
+                "statusPath": status,
+            }),
+        )
+        .expect("legacy controller record");
+        fs::write(controller.join("controller.pid"), format!("{pid}\n"))
+            .expect("legacy controller pid");
+        fs::write(controller.join("controller.lstart"), format!("{lstart}\n"))
+            .expect("legacy controller lstart");
+        let blocked = install_with_probe(
+            &host,
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &process_probe,
+        )
+        .await
+        .expect_err("incompatible controller blocks ABI upgrade");
         assert!(blocked.to_string().contains("drain required"));
         assert!(host
             .inspect(&paths)
@@ -3325,10 +3915,16 @@ mod tests {
             .expect("inspect")
             .authority_matches(&old));
 
-        write_record(CONTROLLER_RUNTIME_ABI);
-        let upgraded = install(&host, &paths, &config, &LifecycleFaults::default())
-            .await
-            .expect("compatible live controller permits upgrade");
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+        let upgraded = install_with_probe(
+            &host,
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &process_probe,
+        )
+        .await
+        .expect("dead legacy controller group permits upgrade");
         assert_eq!(upgraded["action"], json!("upgraded"));
         assert_eq!(
             read_manifest(&paths)

@@ -122,6 +122,11 @@ async fn run(args: cli::Cli) -> i32 {
         }
     };
     let ctx = Arc::new(Ctx { config, ledger });
+    if let Err(failure) = core::await_controller_authorization_from_env(&ctx).await {
+        let code = pre_dispatch_failure(name, failure.code, failure.message);
+        close(&ctx);
+        return code;
+    }
     if let Err(failure) = core::migrate_legacy_state(&ctx).await {
         let code = pre_dispatch_failure(name, failure.code, failure.message);
         close(&ctx);

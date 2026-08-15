@@ -835,6 +835,10 @@ fn convergence_crash_matrix_is_effect_exact() {
                     .iter()
                     .any(|line| line.starts_with(&run) && line.contains(" end "))
             });
+            let provider_group = provider_pid(&env, &run);
+            wait_until("post-spawn provider process group exit", || {
+                !process_group_alive(provider_group)
+            });
             assert_eq!(provider_starts(&env, "implementation").len(), 1);
             let (code, reconciled) = env.forged(&["reconcile", "--run", &run]);
             assert_eq!(code, 0, "reconcile {site}: {reconciled}");

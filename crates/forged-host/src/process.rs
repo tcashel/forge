@@ -81,21 +81,21 @@ impl ProcessHost {
     /// exited-but-unreaped direct child remains visible to `ps` as a zombie
     /// with an unchanged lstart, so the identity check alone would never
     /// observe the held child's death), then the identity comparator. Only
-    /// `Ok(Some(_))` is verified death; a `try_wait` `Err` proves nothing
-    /// and falls through to the identity probe rather than inventing a
-    /// verdict. The reaped exit status is discarded — the status file stays
-    /// the only exit-code truth. Never holds the session lock across an
-    /// await.
+    /// `Ok(Some(_))` is verified death and `Ok(None)` is verified liveness
+    /// for the child this host still owns. Only a `try_wait` error falls back
+    /// to the cross-process identity probe. The reaped exit status is
+    /// discarded — the status file stays the only exit-code truth. Never
+    /// holds the session lock across an await.
     async fn probe_dead(&self, id: &HostSessionId) -> Result<bool, HostError> {
         let identity = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(id)
                 .ok_or_else(|| HostError::session_not_found(id))?;
-            // Only Ok(Some(_)) is verified death; Ok(None) and a try_wait
-            // Err (which proves nothing) fall through to the identity probe.
-            if let Ok(Some(_)) = session.child.try_wait() {
-                return Ok(true);
+            match session.child.try_wait() {
+                Ok(Some(_)) => return Ok(true),
+                Ok(None) => return Ok(false),
+                Err(_) => {}
             }
             session.identity.clone()
         };
@@ -241,7 +241,7 @@ impl SessionHost for ProcessHost {
 
     async fn alive(&self, id: &HostSessionId) -> Result<Liveness, HostError> {
         // Status file first; reap the exited child while we're at it.
-        let (status_path, identity, dead_seen) = {
+        let (status_path, identity, child_state) = {
             let mut sessions = self.sessions.lock().await;
             let session = sessions
                 .get_mut(id)
@@ -250,23 +250,21 @@ impl SessionHost for ProcessHost {
                 let _ = session.child.try_wait();
                 return Ok(Liveness::Exited(code));
             }
-            // Only Ok(Some(_)) is a verified dead observation; an Err from
-            // try_wait proves nothing and defers to the identity probe.
-            let dead_seen = matches!(session.child.try_wait(), Ok(Some(_)));
+            let child_state = session.child.try_wait();
             (
                 session.status_path.clone(),
                 session.identity.clone(),
-                dead_seen,
+                child_state,
             )
         };
 
-        let dead = if dead_seen {
-            true
-        } else {
-            match identity {
+        let dead = match child_state {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(_) => match identity {
                 Some(identity) => !identity.is_same_process().await?,
                 None => false,
-            }
+            },
         };
         if !dead {
             return Ok(Liveness::Running);
