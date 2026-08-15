@@ -56,13 +56,15 @@ fn run_identity_survives_rename_and_outage_and_is_shared_without_extra_beads_rea
     let (identity, entry) = listed_identity(&env, "identity-run");
     let calls = &env.bd_calls()[calls_before..];
     assert_eq!(
-        calls
-            .iter()
-            .filter(|call| call.starts_with("list "))
-            .count(),
-        1,
-        "identity enrichment adds no Beads process: {calls:?}"
+        calls.len(),
+        3,
+        "identity enrichment adds nothing beyond Operations' exact claim batch and bounded plan discovery/hydration: {calls:?}"
     );
+    assert!(calls.iter().any(|call| call.starts_with("list --id ")));
+    assert!(calls
+        .iter()
+        .any(|call| call.starts_with("list --status open,in_progress,blocked,deferred")));
+    assert!(calls.iter().any(|call| call.starts_with("show ")));
     assert_eq!(identity["schema"], json!("forged.work-identity/1"));
     assert_eq!(
         identity["subject"],
