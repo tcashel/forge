@@ -16,7 +16,8 @@ use serde_json::{json, Value};
 use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
     render_dispatch_without_server_tools, render_resolution,
-    render_resolution_without_server_tools, require_node, run_split_app_host,
+    render_resolution_without_server_tools, require_node, run_agent_sessions_host,
+    run_split_app_host,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -644,6 +645,7 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let operations = root.join("operations-overview.html");
     let detail = root.join("work-detail.html");
     let map = root.join("work-map.html");
+    let sessions = root.join("agent-sessions.html");
 
     for (path, schema, tool) in [
         (
@@ -653,6 +655,11 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
         ),
         (&detail, "forged.work-detail/1", "work_detail"),
         (&map, "forged.work-map/1", "work_map"),
+        (
+            &sessions,
+            "forged.provider-session-inventory/1",
+            "session_inventory",
+        ),
     ] {
         let html = std::fs::read_to_string(path).expect("read split App");
         for required in [
@@ -698,6 +705,24 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     assert!(html.contains("node.detailTarget"));
     assert!(html.contains("subjectKind"));
     assert!(html.contains("ArrowDown") && html.contains("ArrowUp"));
+    let html = std::fs::read_to_string(sessions).expect("read Agent Sessions App");
+    assert!(html.contains("detailTarget(row)"));
+    assert!(html.contains("name:\"work_detail\""));
+    assert!(html.contains("name:\"session_inventory\""));
+    for forbidden in [
+        "session_read",
+        "session_message",
+        "session_stop",
+        "localStorage",
+        "sessionStorage",
+        "fetch(",
+        "idempotencyKey",
+    ] {
+        assert!(
+            !html.contains(forbidden),
+            "Agent Sessions contains forbidden capability {forbidden}"
+        );
+    }
 }
 
 #[test]
@@ -705,14 +730,20 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
     let Some(node) = require_node() else { return };
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
 
-    for (name, operations, work_map) in [
-        ("operations-overview.html", true, false),
-        ("work-detail.html", false, false),
-        ("work-map.html", false, true),
+    for (name, operations, work_map, agent_sessions) in [
+        ("operations-overview.html", true, false, false),
+        ("work-detail.html", false, false, false),
+        ("work-map.html", false, true, false),
+        ("agent-sessions.html", false, false, true),
     ] {
         let report = run_split_app_host(&node, &root.join(name));
         assert_eq!(report["operations"], json!(operations), "{name}: {report}");
         assert_eq!(report["workMap"], json!(work_map), "{name}: {report}");
+        assert_eq!(
+            report["agentSessions"],
+            json!(agent_sessions),
+            "{name}: {report}"
+        );
         assert_eq!(report["initialTheme"], json!("dark"), "{name}: {report}");
         assert_eq!(
             report["initialVariable"],
@@ -804,6 +835,92 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
                         && texts.contains(&report["malicious"])),
                 "Work Map safely renders exact ids and hostile titles as text: {report}"
             );
+        } else if agent_sessions {
+            assert_eq!(
+                report["sessionRows"].as_array().map(Vec::len),
+                Some(1),
+                "Agent Sessions renders one server-ordered row: {report}"
+            );
+            let text = report["text"].to_string();
+            for allowed in [
+                "run-1",
+                "pane-1",
+                "candidate-1",
+                "provider-1",
+                "inspect-work",
+            ] {
+                assert!(
+                    text.contains(allowed),
+                    "Agent Sessions shows {allowed}: {report}"
+                );
+            }
+            for secret in [
+                "secret-claimant",
+                "secret-revoke",
+                "secret-failure",
+                "secret-desired-error",
+                "secret-cleanup-error",
+                "secret-claim-token",
+                "secret-metadata-error",
+                "secret-lifecycle-error",
+                "secret-provider-error",
+                "/secret/socket",
+                "/secret/sentinel",
+                "/secret/projection-socket",
+            ] {
+                assert!(
+                    !text.contains(secret),
+                    "Agent Sessions must omit stored sensitive value {secret}: {report}"
+                );
+            }
         }
     }
+}
+
+#[test]
+fn agent_sessions_controls_are_bounded_exact_and_read_only() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("agent-sessions.html");
+    let report = run_agent_sessions_host(&node, &asset);
+
+    assert_eq!(report["automaticToolCalls"], json!(0), "{report}");
+    assert_eq!(report["toolCalls"], json!(4), "{report}");
+    assert_eq!(
+        report["interactiveCalls"],
+        json!([
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "limit": 25}}
+            },
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "includeHistorical": true, "limit": 25}}
+            },
+            {
+                "name": "session_inventory",
+                "arguments": {"schemaVersion": 1, "params": {"repository": "/repo", "provider": "codex", "cursor": "cursor-next", "includeHistorical": true, "limit": 25}}
+            },
+            {
+                "name": "work_detail",
+                "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-next"}}
+            }
+        ]),
+        "refresh is single-flight, history drops a prior cursor, next uses the exact request-bound cursor, and detail uses only the canonical run: {report}"
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("Next page work"),
+        "latest page renders: {report}"
+    );
+    assert!(
+        !text.contains(report["malicious"].as_str().unwrap_or_default()),
+        "page replacement does not accumulate the initial row: {report}"
+    );
+    assert_eq!(
+        report.pointer("/afterTeardown/timers"),
+        Some(&json!(0)),
+        "all explicit read and model-context requests tear down: {report}"
+    );
 }

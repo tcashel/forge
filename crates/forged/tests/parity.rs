@@ -202,6 +202,10 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         );
     }
     let session_inventory = mcp.tool("session_inventory");
+    assert_eq!(
+        session_inventory.pointer("/_meta/ui/resourceUri"),
+        Some(&json!("ui://forged/agent-sessions.html"))
+    );
     let inventory_schema = session_inventory
         .pointer("/inputSchema")
         .cloned()
@@ -283,6 +287,7 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         ("operations_overview", &operations),
         ("work_detail", &detail),
         ("work_map", &work_map),
+        ("session_inventory", &session_inventory),
     ] {
         assert_eq!(
             tool.pointer("/inputSchema/additionalProperties"),
@@ -305,6 +310,11 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         ),
         ("work_detail", &detail, "ui://forged/work-detail.html"),
         ("work_map", &work_map, "ui://forged/work-map.html"),
+        (
+            "session_inventory",
+            &session_inventory,
+            "ui://forged/agent-sessions.html",
+        ),
     ] {
         assert_eq!(
             tool.pointer("/_meta/ui/resourceUri"),
@@ -330,6 +340,7 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
             "ui://forged/operations-overview.html".to_owned(),
             "ui://forged/work-detail.html".to_owned(),
             "ui://forged/work-map.html".to_owned(),
+            "ui://forged/agent-sessions.html".to_owned(),
         ]
     );
     for uri in [
@@ -337,6 +348,7 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         "ui://forged/operations-overview.html",
         "ui://forged/work-detail.html",
         "ui://forged/work-map.html",
+        "ui://forged/agent-sessions.html",
     ] {
         let descriptor = mcp.resource(uri);
         assert!(
@@ -365,6 +377,27 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
             "Apps deny every {domain} capability"
         );
     }
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/permissions"),
+        Some(&json!({}))
+    );
+    let app = mcp.read_resource("ui://forged/agent-sessions.html");
+    assert!(app
+        .pointer("/contents/0/text")
+        .and_then(Value::as_str)
+        .is_some_and(|html| html.contains("Forged Agent Sessions")
+            && html.contains("forged.provider-session-inventory/1")
+            && html.contains("session_inventory")
+            && html.contains("work_detail")));
+    assert_eq!(
+        app.pointer("/contents/0/_meta/ui/csp"),
+        Some(&json!({
+            "baseUriDomains": [],
+            "connectDomains": [],
+            "frameDomains": [],
+            "resourceDomains": [],
+        }))
+    );
     assert_eq!(
         app.pointer("/contents/0/_meta/ui/permissions"),
         Some(&json!({}))
@@ -895,6 +928,25 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         normalized(cli),
         normalized(tool),
         "session_inventory parity"
+    );
+    let structured = mcp.call_tool_result(
+        "session_inventory",
+        envelope(json!({
+            "repository": repository,
+            "provider": "codex",
+            "activity": "running",
+            "limit": 25,
+        })),
+    );
+    assert!(structured["structuredContent"].is_object());
+    assert_eq!(
+        structured["structuredContent"],
+        serde_json::from_str::<Value>(
+            structured["content"][0]["text"]
+                .as_str()
+                .expect("session_inventory text fallback"),
+        )
+        .expect("session_inventory JSON text fallback")
     );
 
     let cli = env.forged(&["session", "read", "--attempt", "1"]).1;

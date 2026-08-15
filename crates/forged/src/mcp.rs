@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Forty-two tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-three tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -31,11 +31,13 @@ const OVERVIEW_URI: &str = "ui://forged/overview.html";
 const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
 const WORK_DETAIL_URI: &str = "ui://forged/work-detail.html";
 const WORK_MAP_URI: &str = "ui://forged/work-map.html";
+const AGENT_SESSIONS_URI: &str = "ui://forged/agent-sessions.html";
 const APP_MIME: &str = "text/html;profile=mcp-app";
 const OVERVIEW_HTML: &str = include_str!("../assets/overview.html");
 const OPERATIONS_OVERVIEW_HTML: &str = include_str!("../assets/operations-overview.html");
 const WORK_DETAIL_HTML: &str = include_str!("../assets/work-detail.html");
 const WORK_MAP_HTML: &str = include_str!("../assets/work-map.html");
+const AGENT_SESSIONS_HTML: &str = include_str!("../assets/agent-sessions.html");
 
 fn app_tool_meta(uri: &str) -> MetaObject {
     let mut meta = MetaObject::new();
@@ -60,6 +62,10 @@ fn work_detail_tool_meta() -> MetaObject {
 
 fn work_map_tool_meta() -> MetaObject {
     app_tool_meta(WORK_MAP_URI)
+}
+
+fn agent_sessions_tool_meta() -> MetaObject {
+    app_tool_meta(AGENT_SESSIONS_URI)
 }
 
 fn app_resource_meta() -> MetaObject {
@@ -952,13 +958,15 @@ impl ForgedServer {
     /// Transaction-consistent provider-session inventory across durable work.
     #[tool(
         name = "session_inventory",
-        description = "Inventory durable provider attempts across runs and repositories. Read-only; pane ids and confirmed provider-session ids remain distinct."
+        description = "Inventory durable provider attempts across runs and repositories. Read-only; pane ids and confirmed provider-session ids remain distinct.",
+        meta = agent_sessions_tool_meta()
     )]
     pub async fn session_inventory(
         &self,
         args: Parameters<SessionInventoryArgs>,
     ) -> CallToolResult {
-        self.call("session_inventory", args.0.into_envelope()).await
+        self.call_structured("session_inventory", args.0.into_envelope())
+            .await
     }
 
     /// Read recent output from a Herdr-backed session.
@@ -1143,6 +1151,12 @@ impl ServerHandler for ForgedServer {
                 .with_title("Forged Work Map")
                 .with_description("Bounded plan, queue, execution, dependency, and history graph.")
                 .with_mime_type(APP_MIME),
+            Resource::new(AGENT_SESSIONS_URI, "forged-agent-sessions")
+                .with_title("Forged Agent Sessions")
+                .with_description(
+                    "Bounded read-only diagnostics for provider attempts across durable work.",
+                )
+                .with_mime_type(APP_MIME),
         ]))
     }
 
@@ -1156,6 +1170,7 @@ impl ServerHandler for ForgedServer {
             OPERATIONS_OVERVIEW_URI => OPERATIONS_OVERVIEW_HTML,
             WORK_DETAIL_URI => WORK_DETAIL_HTML,
             WORK_MAP_URI => WORK_MAP_HTML,
+            AGENT_SESSIONS_URI => AGENT_SESSIONS_HTML,
             _ => {
                 return Err(ErrorData::resource_not_found(
                     format!("unknown forged resource {:?}", request.uri),

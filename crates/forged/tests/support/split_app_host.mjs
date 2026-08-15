@@ -7,8 +7,10 @@ import { readFileSync } from "node:fs";
 
 const asset = process.argv[2];
 if (!asset) throw new Error("usage: split_app_host.mjs <split-app.html>");
+const interactive = process.argv[3] === "--interactive";
 const operations = asset.endsWith("operations-overview.html");
 const workMap = asset.endsWith("work-map.html");
+const agentSessions = asset.endsWith("agent-sessions.html");
 const html = readFileSync(asset, "utf8");
 const match = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!match) throw new Error(`${asset} has no inline script`);
@@ -38,6 +40,10 @@ function element(tag) {
       listeners.get(type).add(listener);
     },
     removeEventListener(type, listener) { listeners.get(type)?.delete(listener); },
+    click() {
+      if (node.disabled) return;
+      for (const listener of [...(listeners.get("click") || [])]) listener({ type: "click", target: node });
+    },
   };
   Object.defineProperty(node, "innerHTML", {
     get() { return ""; },
@@ -113,9 +119,9 @@ dispatch({
   jsonrpc: "2.0",
   id: initialize.id,
   result: {
-    // Deliberately omit serverTools. Operations must still render exact
-    // selectors, but may not issue a tools/call request.
-    hostCapabilities: { updateModelContext: true },
+    // The default lifecycle pass deliberately omits serverTools. A separate
+    // interactive Agent Sessions pass opts in explicitly.
+    hostCapabilities: { updateModelContext: true, ...(interactive ? { serverTools: true } : {}) },
     hostContext: { theme: "dark", styles: { variables: { "--host-accent": "violet" } } },
   },
 });
@@ -176,6 +182,28 @@ const payload = operations
       edges: [{ source: { kind: "run", id: "run-1" }, target: { kind: "plan", id: "plan-one" }, kind: "execution-of", contextOnly: false }],
       graphHealth: { healthy: true }, capturedAt: { ledger: "2026-08-14T00:00:00Z" },
     }
+    : agentSessions
+      ? {
+        schema: "forged.provider-session-inventory/1",
+        asOf: "2026-08-15T00:00:00Z",
+        filters: { repository: "/repo", includeHistorical: false },
+        coverage: { missingWorkIdentity: 0, missingRepository: 0, missingDesiredWork: 0, missingOwnedProjection: 0, legacyHerdrRows: 0, processRows: 0, unknownHostRows: 0, degradationFacts: [] },
+        summary: { totalMatched: 1, returned: 1, active: 1, historical: 0, ownedHerdr: 1, process: 0, legacyHerdr: 0, unknownHost: 0 },
+        rows: [{
+          runId: "run-1", packetId: "run-1/implement/1", attemptId: 4, epicId: null,
+          identity: { subject: { kind: "run", id: "run-1" }, displayTitle: malicious },
+          repository: "/repo", stage: "implementation", provider: "codex", model: "gpt-5.6-sol",
+          attempt: { activity: "running", claimant: "secret-claimant", revokeReason: "secret-revoke", failNote: "secret-failure", startedAt: "2026-08-15T00:00:00Z", updatedAt: "2026-08-15T00:01:00Z", lastHeartbeatAt: null, endedAt: null },
+          recovery: "healthy",
+          desiredWork: { subjectKind: "run", subjectId: "run-1", desiredState: "running", controlRevision: 2, controllerGeneration: 1, predecessorGeneration: null, reconciliationOutcome: "healthy", restartBudget: 2, restartUsed: 0, nextWakeAt: null, lastProgressAt: "2026-08-15T00:01:00Z", lastError: "secret-desired-error", exhaustedAt: null, updatedAt: "2026-08-15T00:01:00Z" },
+          pendingInterventions: 0, hostMode: "owned-herdr",
+          ownedHerdr: { identity: { ownershipId: "owned-1", paneId: "pane-1", socketPath: "/secret/socket", sentinelPath: "/secret/sentinel", layoutId: "layout-1", protocol: 19 }, mutable: { lifecycleState: "active", cleanupState: "not-requested", cleanupRelease: null, cleanupRetryBudget: 3, cleanupRetryUsed: 0, nextCleanupAt: null, lastCleanupError: "secret-cleanup-error", registeredAt: "2026-08-15T00:00:00Z", commandStartedAt: "2026-08-15T00:00:01Z", cleanupRequestedAt: null, lastCleanupAttemptAt: null, releasedAt: null, updatedAt: "2026-08-15T00:01:00Z" } },
+          legacyHerdr: null,
+          projection: { identity: { projectionId: "projection-1", target: { kind: "attempt", runId: "run-1", packetId: "run-1/implement/1", attemptId: 4, claimToken: "secret-claim-token" }, paneId: "pane-1", socketPath: "/secret/projection-socket", protocol: 19, metadataSource: "forged:projection:metadata:test", lifecycleSource: "forged:projection:lifecycle:test", lifecycleAgent: "forged" }, mutable: { desiredRevision: 2, desiredLifecycle: "working", desiredRelease: false, metadata: { nextSequence: 3, appliedSequence: 2, appliedRevision: 2, state: "published", retryBudget: 3, retryUsed: 0, nextWakeAt: null, lastError: "secret-metadata-error", lastAttemptAt: "2026-08-15T00:01:00Z", appliedAt: "2026-08-15T00:01:00Z" }, lifecycle: { nextSequence: 3, appliedSequence: 2, appliedRevision: 2, state: "published", retryBudget: 3, retryUsed: 0, nextWakeAt: null, lastError: "secret-lifecycle-error", lastAttemptAt: "2026-08-15T00:01:00Z", appliedAt: "2026-08-15T00:01:00Z" }, providerSession: { candidate: "candidate-1", confirmed: "provider-1", source: "codex-thread-started", observedAt: "2026-08-15T00:00:02Z", error: "secret-provider-error" } } },
+          providerSessionId: "provider-1", recommendedAction: "inspect-work",
+        }],
+        nextCursor: "cursor-2",
+      }
     : {
       schema: "forged.work-detail/1",
       id: "run-1",
@@ -189,6 +217,13 @@ const payload = operations
       events: { events: [] },
       usage: { totals: { costUsdKnown: 0 } },
     };
+if (agentSessions) {
+  dispatch({
+    jsonrpc: "2.0",
+    method: "ui/notifications/tool-input",
+    params: { arguments: { schemaVersion: 1, params: { repository: "/repo", provider: "codex", limit: 25 } } },
+  });
+}
 dispatch({ jsonrpc: "2.0", method: "ui/notifications/tool-result", params: { structuredContent: { ok: true, result: payload } } });
 await Promise.resolve();
 documentElement.scrollHeight = 640;
@@ -201,6 +236,65 @@ dispatch({
 });
 const changedTheme = documentElement.style.colorScheme;
 const changedVariable = documentElement.style.values["--host-accent"];
+
+const interactiveCalls = [];
+const automaticToolCalls = posted.filter((message) => message.method === "tools/call").length;
+if (interactive) {
+  if (!agentSessions) throw new Error("interactive mode is only valid for Agent Sessions");
+  const settle = async () => { await Promise.resolve(); await Promise.resolve(); await Promise.resolve(); };
+  const calls = () => posted.filter((message) => message.method === "tools/call");
+  const respond = async (call, result) => {
+    dispatch({ jsonrpc: "2.0", id: call.id, result: { structuredContent: { ok: true, result } } });
+    await settle();
+  };
+  const page = (runId, title, includeHistorical, nextCursor) => {
+    const value = JSON.parse(JSON.stringify(payload));
+    value.filters.includeHistorical = includeHistorical;
+    value.rows[0].runId = runId;
+    value.rows[0].packetId = `${runId}/implement/1`;
+    value.rows[0].identity.subject.id = runId;
+    value.rows[0].identity.displayTitle = title;
+    value.rows[0].desiredWork.subjectId = runId;
+    value.nextCursor = nextCursor;
+    return value;
+  };
+
+  const beforeRefresh = calls().length;
+  registry.get("refresh").click();
+  registry.get("refresh").click();
+  await settle();
+  const refreshCalls = calls().slice(beforeRefresh);
+  if (refreshCalls.length !== 1) throw new Error(`refresh was not single-flight: ${refreshCalls.length}`);
+  interactiveCalls.push(refreshCalls[0]);
+  await respond(refreshCalls[0], page("run-refresh", "Refreshed page", false, "cursor-history"));
+
+  registry.get("history").click();
+  await settle();
+  const historyCall = calls().at(-1);
+  interactiveCalls.push(historyCall);
+  await respond(historyCall, page("run-history", "Historical page", true, "cursor-next"));
+
+  registry.get("next").click();
+  await settle();
+  const nextCall = calls().at(-1);
+  interactiveCalls.push(nextCall);
+  await respond(nextCall, page("run-next", "Next page work", true, null));
+
+  const live = [];
+  const walkLive = node => { live.push(node); for (const kid of node.kids) walkLive(kid); };
+  for (const root of registry.values()) walkLive(root);
+  const open = live.find(node => node.className === "open-detail" && !node.disabled);
+  if (!open) throw new Error("exact Work Detail control is unavailable");
+  open.click();
+  await settle();
+  const detailCall = calls().at(-1);
+  interactiveCalls.push(detailCall);
+  await respond(detailCall, {
+    schema: "forged.work-detail/1", id: "run-next", kind: "run", workRef: { kind: "run" },
+    identity: { displayTitle: "Next page work" }, status: { state: "active" },
+    workers: { sessions: [] }, reviews: { latestFindings: [] },
+  });
+}
 
 // Leave one frame and the update-model-context request pending so teardown
 // must cancel real scheduled work, not merely pass with empty collections.
@@ -226,18 +320,23 @@ function flatten(root) {
 const nodes = [...registry.values()].flatMap(flatten);
 const rows = nodes.filter((node) => node.class === "row");
 const mapNodes = nodes.filter((node) => node.class.startsWith("node"));
+const sessionRows = nodes.filter((node) => node.class === "session-row");
 const text = nodes.map((node) => node.text).filter((value) => value !== undefined).map(String);
 const sizeNotifications = posted.filter((message) => message.method === "ui/notifications/size-changed");
 process.stdout.write(JSON.stringify({
   operations,
   workMap,
+  agentSessions,
   rows,
   mapNodes,
+  sessionRows,
   text,
   malicious,
   innerHTMLWrites,
   injected: !!globalThis.injected,
   toolCalls: posted.filter((message) => message.method === "tools/call").length,
+  automaticToolCalls,
+  interactiveCalls: interactiveCalls.map(message => message.params),
   initialTheme,
   initialVariable,
   changedTheme,

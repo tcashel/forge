@@ -1778,6 +1778,27 @@ pub fn run_split_app_host(node: &str, asset: &Path) -> Value {
     serde_json::from_slice(&out.stdout).expect("the split App harness prints one JSON object")
 }
 
+/// Exercise the Agent Sessions App's explicit read-only controls through the
+/// same deterministic host, with `serverTools` deliberately enabled.
+pub fn run_agent_sessions_host(node: &str, asset: &Path) -> Value {
+    let harness = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/support/split_app_host.mjs"
+    );
+    let out = Command::new(node)
+        .args([harness, asset.to_string_lossy().as_ref(), "--interactive"])
+        .output()
+        .expect("spawn the interactive Agent Sessions host harness");
+    assert!(
+        out.status.success(),
+        "the interactive Agent Sessions harness failed for {}: {}",
+        asset.display(),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    serde_json::from_slice(&out.stdout)
+        .expect("the interactive Agent Sessions harness prints one JSON object")
+}
+
 fn render(node: &str, harness: &str, data: &Value) -> Rendered {
     let rendered = harness_output(node, harness, data);
     Rendered {
