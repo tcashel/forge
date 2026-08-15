@@ -323,8 +323,16 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
             .lines()
             .filter(|line| line.starts_with("list "))
             .count(),
+        2,
+        "one exact claim batch plus one bounded plan discovery enrich the whole queue: {calls}"
+    );
+    assert_eq!(
+        calls
+            .lines()
+            .filter(|line| line.starts_with("show "))
+            .count(),
         1,
-        "one bounded Beads read enriches the whole queue: {calls}"
+        "plan dependency hydration remains one batch: {calls}"
     );
 }
 
@@ -377,10 +385,13 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
             .iter()
             .filter(|call| call.starts_with("list "))
             .count(),
-        1,
-        "one Beads read serves membership and enrichment: {calls:?}"
+        2,
+        "one exact membership batch plus one bounded plan discovery: {calls:?}"
     );
-    let call = calls.last().expect("metadata list call");
+    let call = calls
+        .iter()
+        .find(|call| call.starts_with("list --id "))
+        .expect("exact metadata membership call");
     for fragment in [
         "--id ",
         "--metadata-field repository=/Users/operator/repositories/forge",

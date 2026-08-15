@@ -426,61 +426,50 @@ const PORTFOLIO_CAP: usize = 200;
 ///
 /// Carries no event page: `after`/`limit` address one subject's stream, and
 /// the portfolio is the level above any subject.
-async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
-    let portfolio = super::ops::portfolio(ctx).await?;
-    let admission = portfolio.admission.clone();
-    let total = portfolio.entries.len();
-    let attention_total = portfolio.attention.len();
-    let cost_usd_known: f64 = portfolio
-        .entries
+async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, Failure> {
+    let operations = super::ops::operations_projection(ctx, req).await?;
+    let queue_groups = super::ops::durable_compatibility_groups(&operations);
+    let entries = queue_groups
         .iter()
-        .filter_map(|entry| entry["costUsdKnown"].as_f64())
-        .sum();
-    let rows_missing_cost: u64 = portfolio
-        .entries
-        .iter()
-        .filter_map(|entry| entry["rowsMissingCost"].as_u64())
-        .sum();
-    let live_seats: u64 = portfolio
-        .entries
-        .iter()
-        .filter_map(|entry| entry["liveSeats"].as_u64())
-        .sum();
-    // `inventory` orders oldest first; the portfolio answers "what is
-    // running", so the newest entries are the ones that survive the cap.
-    let entries: Vec<Value> = portfolio
-        .entries
-        .into_iter()
-        .rev()
-        .take(PORTFOLIO_CAP)
-        .collect();
-    // The rail is severity-ordered, so its cap drops the least urgent.
-    let attention: Vec<Value> = portfolio
-        .attention
-        .into_iter()
-        .take(PORTFOLIO_CAP)
-        .collect();
-    let mut remaining = PORTFOLIO_CAP;
-    let queue_groups: Vec<Value> = portfolio.queue["groups"]
-        .as_array()
+        .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+        .cloned()
+        .collect::<Vec<_>>();
+    let total = operations
+        .pointer("/counts/durable")
+        .and_then(Value::as_u64)
+        .unwrap_or(entries.len() as u64);
+    let attention_total = operations
+        .get("attention")
+        .and_then(Value::as_array)
+        .map_or(0, Vec::len);
+    let attention = operations
+        .get("attention")
+        .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .map(|group| {
-            let all = group["entries"].as_array().cloned().unwrap_or_default();
-            let shown: Vec<Value> = all.iter().take(remaining).cloned().collect();
-            remaining = remaining.saturating_sub(shown.len());
-            json!({
-                "name": group["name"],
-                "count": all.len(),
-                "entries": shown,
-            })
+        .take(PORTFOLIO_CAP)
+        .cloned()
+        .collect::<Vec<_>>();
+    let admission = entries
+        .iter()
+        .flat_map(|entry| {
+            entry
+                .pointer("/admission/decisions")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
         })
-        .collect();
+        .cloned()
+        .collect::<Vec<_>>();
+    let live_seats = entries
+        .iter()
+        .filter_map(|entry| entry.get("liveSeats").and_then(Value::as_u64))
+        .sum::<u64>();
     let queue = json!({
         "groups": queue_groups,
         "total": total,
         "cap": PORTFOLIO_CAP,
-        "asOf": portfolio.queue["asOf"],
+        "asOf": operations.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
     });
     Ok(json!({
         "schema": "forged.overview/1",
@@ -494,9 +483,10 @@ async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
         "queue": queue,
         "admission": admission,
         "spend": {
-            "costUsdKnown": cost_usd_known,
-            "rowsMissingCost": rows_missing_cost,
+            "costUsdKnown": operations.pointer("/spend/costUsdKnown").cloned().unwrap_or(json!(0.0)),
+            "rowsMissingCost": operations.pointer("/spend/rowsMissingCost").cloned().unwrap_or(json!(0)),
         },
+        "sourceHealth": operations.get("sourceHealth").cloned().unwrap_or(Value::Null),
     }))
 }
 
@@ -626,7 +616,7 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             }
         }
         match (run, epic, id) {
-            (None, None, None) => portfolio_overview(ctx).await,
+            (None, None, None) => portfolio_overview(ctx, req).await,
             (Some(run), None, None) => run_overview(ctx, run, after, limit).await,
             (None, Some(epic), None) => epic_overview(ctx, epic, after, limit).await,
             // A resolved id projects through the SAME call the explicit

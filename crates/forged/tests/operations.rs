@@ -65,7 +65,8 @@ fn malformed_hydration_fails_the_plan_source_closed_without_hiding_durable_work(
     assert_eq!(code, 0, "durable projection remains available: {response}");
     assert_eq!(
         response["result"]["sourceHealth"]["beads"]["state"],
-        json!("unavailable")
+        json!("available"),
+        "the independent exact claim batch remains usable"
     );
     assert_eq!(
         response["result"]["sourceHealth"]["plan"]["state"],
@@ -76,8 +77,8 @@ fn malformed_hydration_fails_the_plan_source_closed_without_hiding_durable_work(
     assert!(!rows.contains_key("plan-bad"), "{response}");
     assert_eq!(
         env.bd_calls()[before..].len(),
-        2,
-        "malformed hydration is terminal, not retried per node"
+        3,
+        "one claim batch plus malformed plan discovery/hydration, never per-node retries"
     );
 }
 
@@ -159,10 +160,18 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
     );
 
     let calls = &env.bd_calls()[before..];
-    assert_eq!(calls.len(), 2, "one discovery plus one hydrate: {calls:?}");
-    assert!(calls[0].starts_with("list --status open,in_progress,blocked,deferred"));
-    assert!(calls[0].contains(&format!("--metadata-field repository={repository}")));
-    assert!(calls[1].starts_with("show "));
+    assert_eq!(
+        calls.len(),
+        3,
+        "one exact claim batch plus one discovery and one hydrate: {calls:?}"
+    );
+    let discovery = calls
+        .iter()
+        .find(|call| call.starts_with("list --status open,in_progress,blocked,deferred"))
+        .expect("plan discovery call");
+    assert!(discovery.contains(&format!("--metadata-field repository={repository}")));
+    assert!(calls.iter().any(|call| call.starts_with("list --id ")));
+    assert!(calls.iter().any(|call| call.starts_with("show ")));
     assert!(!calls
         .iter()
         .any(|call| call.starts_with("ready") || call.contains("graph")));

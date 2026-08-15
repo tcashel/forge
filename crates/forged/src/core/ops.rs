@@ -1994,11 +1994,12 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
                     run.run_id
                 ))
             })?;
+        let bead_id = identity.bead.id.clone();
         let mut entry = json!({
             "id": run.run_id.clone(),
             "kind": if epic { "epic" } else { "slice" },
             "identity": identity,
-            "beadId": run.bead_id.clone(),
+            "beadId": bead_id,
             "repo": run.repo.clone(),
             "baseRef": run.base_ref.clone(),
             "branch": run.branch.clone(),
@@ -2039,10 +2040,7 @@ fn project_entries(snapshot: &InventorySnapshot, spend: Spend) -> Result<Vec<Val
             Some(value @ Value::String(_)) => value.clone(),
             _ => Value::Null,
         };
-        let bead_id = match field("epicId") {
-            Value::Null => Value::from(epic_id.clone()),
-            value => value,
-        };
+        let bead_id = identity.bead.id.clone();
         let lifecycle = lifecycles.get(&epic_id);
         let updated_at = snapshot
             .latest_event
@@ -2216,122 +2214,6 @@ mod spend_projection_tests {
     }
 }
 
-/// The whole inventory and its typed active attention, from ONE snapshot.
-pub struct Portfolio {
-    /// Every inventory entry, oldest first — [`inventory`]'s own order.
-    pub entries: Vec<Value>,
-    /// One V1 item per active (subject, condition), most severe first.
-    pub attention: Vec<Value>,
-    /// The operator-facing grouping shared by `work list` and Overview.
-    pub queue: Value,
-    /// Latest admission decision per subject from the same ledger snapshot.
-    pub admission: Vec<forged_types::AdmissionDecisionV1>,
-}
-
-/// The portfolio: [`inventory`] with spend, plus the attention rail folded
-/// from the same snapshot.
-///
-/// Costs ONE ledger job, exactly as `inventory` does: every condition the
-/// rail reports has a durable source already inside the snapshot — the epic
-/// input events, `proto.quarantine`, `attempts.state = 'revoking'` via
-/// `live_attempts`, and the `usage_totals` map the entries are stamped from.
-/// Neither spend nor any condition adds a query, so the entries, the spend
-/// and the rail describe ONE ledger rather than a state that never held.
-pub async fn portfolio(ctx: &Ctx) -> Result<Portfolio, Failure> {
-    portfolio_for_repository(ctx, None).await
-}
-
-/// Build the shared operator projection, optionally restricted to Beads
-/// whose authoritative `metadata.repository` exactly matches `repository`.
-async fn portfolio_for_repository(
-    ctx: &Ctx,
-    repository: Option<&str>,
-) -> Result<Portfolio, Failure> {
-    let kinds: Vec<&str> = LIFECYCLE_KINDS
-        .iter()
-        .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
-        .copied()
-        .collect();
-    let snapshot = on_ledger(&ctx.ledger, move |l| {
-        l.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
-    })
-    .await?;
-    let mut entries = project_entries(&snapshot, Spend::Include)?;
-    let bead_ids: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-        .collect();
-    let bead_read: Result<Vec<forged_beads::IssueSummary>, String> = if let Some(repository) =
-        repository
-    {
-        // ONE native, id-bounded metadata query is both the membership
-        // decision and the queue's live Beads enrichment. An outage is not
-        // widened into an unfiltered result: scoped discovery fails closed.
-        let beads = forged_beads::list_issues_for_repository(
-            &ctx.config.bd_config(),
-            &bead_ids,
-            repository,
-        )
-        .await?;
-        let matching_ids: BTreeSet<&str> = beads.iter().map(|issue| issue.id.as_str()).collect();
-        entries.retain(|entry| {
-            entry["beadId"]
-                .as_str()
-                .is_some_and(|id| matching_ids.contains(id))
-        });
-        Ok(beads)
-    } else {
-        forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
-            .await
-            .map_err(|error| error.to_string())
-    };
-    finish_portfolio(ctx, snapshot, entries, bead_read, QueueLiveness::Probed).await
-}
-
-#[derive(Clone, Copy)]
-enum QueueLiveness {
-    /// Compatibility projection: verify controller files and OS identity.
-    Probed,
-    /// Operations hot path: report only durable evidence and explicit unknown.
-    Durable,
-}
-
-async fn finish_portfolio(
-    ctx: &Ctx,
-    snapshot: InventorySnapshot,
-    mut entries: Vec<Value>,
-    bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
-    liveness: QueueLiveness,
-) -> Result<Portfolio, Failure> {
-    let attention = super::attention::project_active(
-        &snapshot,
-        &entries,
-        bead_read.as_deref().unwrap_or_default(),
-    )?
-    .into_iter()
-    .map(|item| {
-        serde_json::to_value(item)
-            .map_err(|error| Failure::internal(format!("serializing attention item: {error}")))
-    })
-    .collect::<Result<Vec<_>, _>>()?;
-    let queue = operator_queue(
-        ctx,
-        &snapshot,
-        &mut entries,
-        &attention,
-        bead_read,
-        liveness,
-    )
-    .await;
-    let admission = snapshot.admission_decisions.clone();
-    Ok(Portfolio {
-        entries,
-        attention,
-        queue,
-        admission,
-    })
-}
-
 const QUEUE_GROUPS: [&str; 5] = [
     "Needs me",
     "Ready to merge",
@@ -2346,12 +2228,10 @@ const QUEUE_GROUPS: [&str; 5] = [
 /// records and progress events come from the already-open inventory
 /// snapshot, avoiding a ledger projection per row.
 async fn operator_queue(
-    ctx: &Ctx,
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
     bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
-    liveness: QueueLiveness,
 ) -> Value {
     let bead_error = bead_read.as_ref().err().cloned();
     let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
@@ -2409,18 +2289,7 @@ async fn operator_queue(
         let id = entry["id"].as_str().unwrap_or_default().to_owned();
         let bead_id = entry["beadId"].as_str().unwrap_or_default().to_owned();
         let record = controller_records.remove(&id).map(|(_, record)| record);
-        let controller = match liveness {
-            QueueLiveness::Probed => {
-                super::handoff::controller_status_from_snapshot(
-                    ctx,
-                    &id,
-                    record,
-                    snapshot.latest_event.get(&id),
-                )
-                .await
-            }
-            QueueLiveness::Durable => durable_controller_status(snapshot, &id, record),
-        };
+        let controller = durable_controller_status(snapshot, &id, record);
         let issue = beads.get(&bead_id);
         // Human-readable identity is frozen with the work. The bounded
         // Beads read below remains authoritative for claim health and
@@ -2451,8 +2320,7 @@ async fn operator_queue(
             || entry["state"] == json!("stopped");
         let dead_controller = !controller.is_null()
             && matches!(controller_state, Some("dead" | "vanished" | "exited"));
-        let unverified_controller_is_blocker =
-            matches!(liveness, QueueLiveness::Probed) && controller_state == Some("unknown");
+        let unverified_controller_is_blocker = false;
         let stale = claim_status == Some("in_progress")
             && (holder_mismatch
                 || (!awaiting_delivery
@@ -3023,16 +2891,72 @@ fn repository_selector(req: &OperationRequest, operation: &str) -> Result<Option
 /// can enumerate the inventory and then address any entry.
 pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
-        let repository = repository_selector(req, "work_list")?;
-        let portfolio = portfolio_for_repository(ctx, repository.as_deref()).await?;
+        let projection = operations_projection(ctx, req).await?;
+        if req.params.contains_key("repo")
+            && projection.pointer("/sourceHealth/beads/state").and_then(Value::as_str)
+                != Some("available")
+        {
+            return Err(Failure {
+                code: ErrorCode::BeadsError,
+                message: "work_list repository membership is unavailable".to_owned(),
+                recoverable: false,
+            });
+        }
+        let groups = durable_compatibility_groups(&projection);
+        let runs = groups
+            .iter()
+            .flat_map(|group| group["entries"].as_array().into_iter().flatten())
+            .cloned()
+            .collect::<Vec<_>>();
+        let total = runs.len();
+        let attention = projection
+            .get("attention")
+            .cloned()
+            .unwrap_or_else(|| json!([]));
+        let total = projection
+            .pointer("/counts/durable")
+            .and_then(Value::as_u64)
+            .unwrap_or(total as u64);
         Ok(json!({
-            "runs": portfolio.entries,
-            "queue": portfolio.queue,
-            "attentionTotal": portfolio.attention.len(),
-            "attention": portfolio.attention,
+            "runs": runs,
+            "queue": {
+                "groups": groups,
+                "total": total,
+                "cap": projection.pointer("/coverage/limit").cloned().unwrap_or(json!(OPERATIONS_DEFAULT_LIMIT)),
+                "asOf": projection.pointer("/capturedAt/ledger").cloned().unwrap_or(Value::Null),
+            },
+            "attentionTotal": attention.as_array().map_or(0, Vec::len),
+            "attention": attention,
+            "sourceHealth": projection.get("sourceHealth").cloned().unwrap_or(Value::Null),
         }))
     })
     .await
+}
+
+/// Legacy discovery never included plan-only Beads. Preserve that boundary
+/// while sourcing its ordering and grouping from Operations.
+pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
+    projection
+        .pointer("/queue/groups")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|group| {
+            let entries = group
+                .get("entries")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                .cloned()
+                .collect::<Vec<_>>();
+            json!({
+                "name": group.get("label").cloned().unwrap_or(Value::Null),
+                "count": entries.len(),
+                "entries": entries,
+            })
+        })
+        .collect()
 }
 
 const OPERATIONS_DEFAULT_LIMIT: u64 = 200;
@@ -3451,14 +3375,6 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         let ledger_captured_at = now_iso();
         let mut entries = project_entries(&snapshot, Spend::Include)?;
         entries.extend(desired_only_entries(&snapshot, &entries)?);
-        if let Some(repository) = repository.as_deref() {
-            entries.retain(|entry| {
-                entry
-                    .pointer("/identity/repository/path")
-                    .and_then(Value::as_str)
-                    == Some(repository)
-            });
-        }
         for entry in &mut entries {
             if let Some(object) = entry.as_object_mut() {
                 let (kind, kind_name) = if object.get("kind").and_then(Value::as_str) == Some("epic") {
@@ -3480,14 +3396,39 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             }
         }
 
-        let plan_read = forged_beads::plan_inventory(
-            &ctx.config.bd_config(),
-            repository.as_deref(),
-            LIVE_PLAN_LIMIT,
-        )
-        .await;
+        let bead_ids = entries
+            .iter()
+            .filter_map(|entry| {
+                entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
+        let plan_cfg = ctx.config.bd_config();
+        let claim_cfg = ctx.config.bd_config();
+        let plan_repository = repository.clone();
+        let claim_repository = repository.clone();
+        let (plan_read, claim_read) = tokio::join!(
+            forged_beads::plan_inventory(
+                &plan_cfg,
+                plan_repository.as_deref(),
+                LIVE_PLAN_LIMIT,
+            ),
+            async {
+                match claim_repository.as_deref() {
+                    Some(repository) => forged_beads::list_issues_for_repository(
+                        &claim_cfg,
+                        &bead_ids,
+                        repository,
+                    )
+                    .await,
+                    None => forged_beads::list_issues(&claim_cfg, &bead_ids).await,
+                }
+            }
+        );
         let beads_captured_at = now_iso();
-        let (mut plans, plan_truncated, plan_discovered, mut bead_error) = match plan_read {
+        let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
             Ok(inventory) => (
                 inventory.issues,
                 inventory.truncated,
@@ -3496,12 +3437,28 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             ),
             Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
         };
+        let (claim_beads, claim_error) = match claim_read {
+            Ok(issues) => (issues, None),
+            Err(error) => (Vec::new(), Some(error.to_string())),
+        };
+        if repository.is_some() {
+            let matching_beads = claim_beads
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<BTreeSet<_>>();
+            entries.retain(|entry| {
+                entry
+                    .get("beadId")
+                    .and_then(Value::as_str)
+                    .is_some_and(|id| matching_beads.contains(id))
+            });
+        }
         let represented: BTreeSet<String> = entries
             .iter()
             .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
             .collect();
         let mut plan_entries = Vec::new();
-        if bead_error.is_none() {
+        if plan_error.is_none() {
             let mut conversion_error = None;
             for plan in plans
                 .iter()
@@ -3519,13 +3476,13 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 }
             }
             if let Some(error) = conversion_error {
-                bead_error = Some(error);
+                plan_error = Some(error);
                 plan_entries.clear();
                 plans.clear();
             }
         }
 
-        if bead_error.is_none() {
+        if plan_error.is_none() {
             let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
                 .iter()
                 .map(|plan| (plan.issue.id.as_str(), plan))
@@ -3558,8 +3515,17 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             entries.extend(plan_entries);
         }
 
-        let bead_summaries: Vec<forged_beads::IssueSummary> =
-            plans.iter().map(|plan| plan.issue.clone()).collect();
+        let mut bead_summaries = claim_beads;
+        let mut known_beads = bead_summaries
+            .iter()
+            .map(|issue| issue.id.clone())
+            .collect::<BTreeSet<_>>();
+        bead_summaries.extend(
+            plans
+                .iter()
+                .map(|plan| plan.issue.clone())
+                .filter(|issue| known_beads.insert(issue.id.clone())),
+        );
         let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
             .into_iter()
             .map(|item| {
@@ -3570,19 +3536,11 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             .collect::<Result<Vec<_>, _>>()?;
         enrich_operations_facts(&snapshot, &attention, &mut entries)?;
 
-        let bead_read = match bead_error.as_ref() {
+        let bead_read = match claim_error.as_ref() {
             Some(error) => Err(error.clone()),
             None => Ok(bead_summaries),
         };
-        let mut queue = operator_queue(
-            ctx,
-            &snapshot,
-            &mut entries,
-            &attention,
-            bead_read,
-            QueueLiveness::Durable,
-        )
-        .await;
+        let mut queue = operator_queue(&snapshot, &mut entries, &attention, bead_read).await;
         let mut remaining = limit as usize;
         let mut shown_total = 0usize;
         let mut matching_total = 0usize;
@@ -3686,11 +3644,12 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             "sourceHealth": {
                 "ledger": {"state": "available"},
                 "beads": {
-                    "state": if bead_error.is_some() { "unavailable" } else { "available" },
-                    "error": bead_error,
+                    "state": if claim_error.is_some() { "unavailable" } else { "available" },
+                    "error": claim_error,
                 },
                 "plan": {
-                    "state": if bead_error.is_some() { "unavailable" } else if plan_truncated { "partial" } else { "available" },
+                    "state": if plan_error.is_some() { "unavailable" } else if plan_truncated { "partial" } else { "available" },
+                    "error": plan_error,
                     "discovered": plan_discovered,
                     "limit": LIVE_PLAN_LIMIT,
                     "truncated": plan_truncated,
@@ -3706,6 +3665,10 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 "truncated": shown_total < matching_total || plan_truncated,
             },
             "counts": {
+                "durable": entries
+                    .iter()
+                    .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                    .count(),
                 "live": live,
                 "admitted": admitted,
                 "queued": queued,
@@ -3729,6 +3692,29 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         }))
     })
     .await
+}
+
+/// Return the new Operations projection to compatibility facades without
+/// reimplementing its ledger/Beads joins or queue policy.
+pub(super) async fn operations_projection(
+    ctx: &Ctx,
+    req: &OperationRequest,
+) -> Result<Value, Failure> {
+    let response = operations_overview(ctx, req).await;
+    if response.ok {
+        return Ok(response.result.unwrap_or(Value::Null));
+    }
+    let error = response.error.unwrap_or(forged_types::OpError {
+        code: ErrorCode::Internal,
+        message: "operations projection failed without an error".to_owned(),
+        recoverable: false,
+        detail: None,
+    });
+    Err(Failure {
+        code: error.code,
+        message: error.message,
+        recoverable: error.recoverable,
+    })
 }
 
 // ------------------------------------------------------- attention controls
