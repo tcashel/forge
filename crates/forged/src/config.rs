@@ -64,6 +64,13 @@ pub struct AdmissionPolicy {
     pub total_active: u32,
     pub provider_active: u32,
     pub repository_write_active: u32,
+    /// Maximum number of non-terminal child runs one epic wave may hold.
+    ///
+    /// This is independently bounded from the global admission policy: the
+    /// epic selects a finite candidate window and admission remains the
+    /// authority for whether any selected child may execute.
+    #[serde(default = "default_epic_fanout")]
+    pub epic_fanout: u32,
     pub defer_seconds: u64,
     #[serde(default)]
     pub provider_overrides: BTreeMap<String, u32>,
@@ -85,6 +92,7 @@ impl Default for AdmissionPolicy {
             total_active: 8,
             provider_active: 4,
             repository_write_active: 1,
+            epic_fanout: default_epic_fanout(),
             defer_seconds: 60,
             provider_overrides: BTreeMap::new(),
             model_overrides: BTreeMap::new(),
@@ -101,6 +109,7 @@ impl AdmissionPolicy {
         if self.total_active == 0
             || self.provider_active == 0
             || self.repository_write_active == 0
+            || self.epic_fanout == 0
             || self.defer_seconds == 0
             || self.provider_overrides.values().any(|limit| *limit == 0)
             || self.model_overrides.values().any(|limit| *limit == 0)
@@ -125,6 +134,10 @@ impl AdmissionPolicy {
         }
         Ok(())
     }
+}
+
+const fn default_epic_fanout() -> u32 {
+    4
 }
 
 pub use forged_types::HostPolicyV1 as HostPolicy;
@@ -943,18 +956,37 @@ mod tests {
         assert_eq!(policy.total_active, 8);
         assert_eq!(policy.provider_active, 4);
         assert_eq!(policy.repository_write_active, 1);
+        assert_eq!(policy.epic_fanout, 4);
         assert_eq!(policy.defer_seconds, 60);
         assert!(policy.validate().is_ok());
 
         let parsed: ConfigFile = serde_yaml::from_str("defaultProfile: standard\n")
             .expect("legacy config without admission");
         assert!(parsed.admission.is_none());
+
+        let legacy_with_admission: ConfigFile = serde_yaml::from_str(
+            "admission:\n  totalActive: 8\n  providerActive: 4\n  repositoryWriteActive: 1\n  deferSeconds: 60\n",
+        )
+        .expect("legacy admission without epicFanout");
+        assert_eq!(
+            legacy_with_admission
+                .admission
+                .expect("admission")
+                .epic_fanout,
+            4
+        );
     }
 
     #[test]
     fn invalid_admission_policy_fails_closed() {
         let policy = AdmissionPolicy {
             total_active: 0,
+            ..AdmissionPolicy::default()
+        };
+        assert!(policy.validate().is_err());
+
+        let policy = AdmissionPolicy {
+            epic_fanout: 0,
             ..AdmissionPolicy::default()
         };
         assert!(policy.validate().is_err());

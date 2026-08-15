@@ -785,6 +785,11 @@ fn epic_terminal_and_input_stops_serialize_with_supervisor_spawn() {
             .authorize_desired_work(forged_ledger::DesiredSubjectKind::Epic, &epic, 0)
             .expect("authorize desired epic");
         ledger.close().expect("close");
+        if case == "input" {
+            let (code, wave) = env.forged(&["epic", "advance", "--epic", &epic]);
+            assert_eq!(code, 0, "commit complete input wave: {wave}");
+            assert!(wave["result"]["progress"]["wave"].is_number());
+        }
 
         // The stop transition wins the shared fence but pauses before its
         // atomic event+desired commit, so the supervisor can complete its
@@ -936,6 +941,9 @@ fn resolved_event_committed_then_crashed_replays_by_resolution_identity() {
         )
         .expect("authorize desired epic");
     ledger.close().expect("close");
+    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
+    assert_eq!(code, 0, "commit complete wave: {wave}");
+    assert!(wave["result"]["progress"]["wave"].is_number());
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-resolve-crash"]);
     assert_eq!(code, 0, "input stop: {held}");
     assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));

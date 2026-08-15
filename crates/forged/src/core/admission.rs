@@ -23,6 +23,8 @@ use crate::config::{now_iso, AdmissionPolicy};
 use crate::core::{on_ledger, Ctx, Failure};
 
 const RESERVATION_RECOVERY_SECONDS: u64 = 60;
+const SNAPSHOT_RETRY_LIMIT: usize = 16;
+const SNAPSHOT_CHANGED_MESSAGE: &str = "admission ledger facts changed before allocation";
 
 #[derive(Debug, Clone)]
 pub(crate) struct AdmissionResult {
@@ -138,7 +140,13 @@ fn epic_facts(
         repository,
         candidate.provider.clone(),
         candidate.model.clone(),
-        resource(candidate),
+        // The epic controller reconciles durable child state and serializes
+        // integration; it never runs a provider in the repository. Charging
+        // it as the package's first workspace-write seat makes the default
+        // repositoryWriteActive=1 deadlock fan-out recovery while a detached
+        // child attempt is live. Child controller/packet admission carries
+        // the actual provider resource class.
+        AdmissionResourceClass::Read,
     ))
 }
 
@@ -439,7 +447,28 @@ pub(crate) fn evaluate(
     Ok((inputs, decisions))
 }
 
+fn snapshot_changed(failure: &Failure) -> bool {
+    failure.code == forged_types::ErrorCode::OperationInProgress
+        && failure.message.ends_with(SNAPSHOT_CHANGED_MESSAGE)
+}
+
 pub(crate) async fn admit(
+    ctx: &Ctx,
+    targets: Vec<(DesiredSubjectKind, String)>,
+    explicit_submit: Option<(DesiredSubjectKind, String)>,
+) -> Result<Vec<AdmissionResult>, Failure> {
+    for attempt in 0..SNAPSHOT_RETRY_LIMIT {
+        match admit_once(ctx, targets.clone(), explicit_submit.clone()).await {
+            Err(failure) if snapshot_changed(&failure) && attempt + 1 < SNAPSHOT_RETRY_LIMIT => {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded admission retry loop always returns")
+}
+
+async fn admit_once(
     ctx: &Ctx,
     targets: Vec<(DesiredSubjectKind, String)>,
     explicit_submit: Option<(DesiredSubjectKind, String)>,
@@ -594,6 +623,21 @@ pub(crate) async fn admit_packet(
 }
 
 pub(crate) async fn admit_packet_facts(
+    ctx: &Ctx,
+    packet: &PacketAdmission,
+) -> Result<AdmissionResult, Failure> {
+    for attempt in 0..SNAPSHOT_RETRY_LIMIT {
+        match admit_packet_facts_once(ctx, packet).await {
+            Err(failure) if snapshot_changed(&failure) && attempt + 1 < SNAPSHOT_RETRY_LIMIT => {
+                tokio::task::yield_now().await;
+            }
+            result => return result,
+        }
+    }
+    unreachable!("bounded packet admission retry loop always returns")
+}
+
+async fn admit_packet_facts_once(
     ctx: &Ctx,
     packet: &PacketAdmission,
 ) -> Result<AdmissionResult, Failure> {

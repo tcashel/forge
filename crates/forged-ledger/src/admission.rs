@@ -585,6 +585,28 @@ fn durable_candidates(
                     conn.query_row("SELECT repo FROM runs WHERE run_id = ?1", [id], |row| {
                         row.get::<_, String>(0)
                     })?;
+                // A just-created epic child has no direct desired row until
+                // run_submit succeeds. Project it as a RUN decision, but
+                // borrow the parent epic's exact control epoch for this
+                // admission cycle. This preserves run-addressed capacity
+                // and decision evidence while making parent pause/stop the
+                // authorization fence. The successful submit atomically
+                // creates the child's own desired row before its controller
+                // can execute protocol work.
+                let authority = rows
+                    .iter()
+                    .find(|(row_kind, row_id, ..)| row_kind == "epic" && row_id == &parent)
+                    .cloned()
+                    .ok_or_else(|| internal("delegating epic desired row vanished"))?;
+                rows.push((
+                    key.0,
+                    key.1,
+                    authority.2,
+                    authority.3,
+                    authority.4,
+                    authority.5,
+                    authority.6,
+                ));
                 delegated = Some((parent, id.to_owned(), repository));
             } else {
                 rows.push((

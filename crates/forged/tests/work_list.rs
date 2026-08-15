@@ -309,8 +309,8 @@ fn repository_scope_uses_exact_bead_metadata_for_slices_epics_and_renamed_checko
     env.set_bead_repository("bead-repo-forge", forge);
     env.set_bead_repository("repo-drover", drover);
     env.set_bead_repository("bead-repo-smithy", smithy);
-    // The shim gives otherwise-unconfigured issues a default repository.
-    // Explicitly construct the metadata-less Bead this assertion exercises.
+    // Override the shim's convenience default so this fixture really models
+    // a Bead with no authoritative repository metadata.
     env.set_bead_field("bead-repo-unknown", "metadata", "{}");
     // The renamed checkout proves membership comes from current canonical
     // Bead metadata, not the launch-time repository column in the ledger.

@@ -477,6 +477,9 @@ fn unresolved_input_reparks_but_resolution_wakes_the_next_tick() {
         .authorize_desired_work(DesiredSubjectKind::Epic, "epic-input", 0)
         .expect("authorize desired epic");
     ledger.close().expect("close");
+    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
+    assert_eq!(code, 0, "commit complete wave: {wave}");
+    assert!(wave["result"]["progress"]["wave"].is_number());
     let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-input"]);
     assert_eq!(code, 0, "input stop: {held}");
     assert_eq!(held["result"]["stopped"]["code"], json!("non-code-child"));

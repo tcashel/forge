@@ -38,6 +38,40 @@ fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Val
     panic!("timed out waiting for forged {args:?}: {last}")
 }
 
+fn stop_run_when_kill_evidence_is_ready(env: &TestEnv, run: &str, reason: &str) -> Value {
+    // The provider process can become observable before its start-time
+    // fingerprint is durably recorded. `run stop` deliberately refuses to
+    // signal in that window, so retry the same SafeRetry operation until the
+    // guardian evidence catches up.
+    wait_for(
+        env,
+        &[
+            "run",
+            "stop",
+            "--run",
+            run,
+            "--outcome",
+            "cancelled",
+            "--reason",
+            reason,
+        ],
+        |_| true,
+    )
+}
+
+fn set_admission(env: &TestEnv, policy: Value) {
+    let path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&path).expect("read forged test config"))
+            .expect("forged test config JSON");
+    config["admission"] = policy;
+    std::fs::write(
+        path,
+        serde_json::to_string_pretty(&config).expect("serialize admission config"),
+    )
+    .expect("write admission config");
+}
+
 #[test]
 fn push_transport_retries_are_bounded_then_stop_as_input_required() {
     let env = TestEnv::new("forged-push-retry");
@@ -341,6 +375,297 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
         .filter(|args| args.iter().any(|arg| arg.contains("/pulls")))
         .count();
     assert_eq!(creates, 2, "one child PR plus one epic PR: {gh:?}");
+}
+
+#[test]
+fn epic_fanout_freezes_two_slots_and_a_failed_child_does_not_block_its_sibling() {
+    let env = TestEnv::new("forged-epic-fanout");
+    set_admission(
+        &env,
+        json!({
+            "totalActive": 8,
+            "providerActive": 4,
+            "repositoryWriteActive": 2,
+            "epicFanout": 2,
+            "deferSeconds": 60,
+            // No rate-limit observation exists in this hermetic fixture, so
+            // run submit durably queues every child without spawning a real
+            // detached process. That makes the fan-out window deterministic.
+            "rateLimitCeilingMillipercent": 90_000,
+            "rateLimitFreshSeconds": 60,
+        }),
+    );
+    env.seed_epic(
+        "epic-fanout",
+        &[
+            ("child-a", &env.spec, true),
+            ("child-b", &env.spec, true),
+            ("child-c", &env.spec, true),
+        ],
+    );
+    env.set_bead_field("child-a", "priority", "0");
+    env.set_bead_field("child-b", "priority", "1");
+    env.set_bead_field("child-c", "priority", "9");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-fanout",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "epic start: {started}");
+    assert_eq!(started["result"]["maxActiveChildren"], json!(2));
+    env.authorize_epic("epic-fanout");
+
+    let (code, integration) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "integration tick: {integration}");
+    let (code, wave) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "wave tick: {wave}");
+    assert_eq!(
+        wave["result"]["progress"]["children"],
+        json!(["child-a", "child-b", "child-c"])
+    );
+    // The whole launch order is part of the frozen wave. A later Beads edit
+    // can affect a future frontier, but cannot reshuffle already-recorded
+    // membership around a crash/restart boundary.
+    env.set_bead_field("child-c", "priority", "-1");
+    let (code, launched) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "launch tick: {launched}");
+    assert_eq!(
+        launched["result"]["progress"]["launched"]
+            .as_array()
+            .map(Vec::len),
+        Some(2)
+    );
+
+    let (code, status) = env.forged(&["epic", "status", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "fan-out status: {status}");
+    assert_eq!(status["result"]["maxActiveChildren"], json!(2));
+    assert_eq!(status["result"]["counts"]["queuedDeferred"], json!(2));
+    assert_eq!(status["result"]["counts"]["active"], json!(0));
+    let children = status["result"]["children"].as_array().expect("children");
+    let run_id = |id: &str| {
+        children
+            .iter()
+            .find(|child| child["id"] == json!(id))
+            .map(|child| child["runId"].clone())
+            .expect("frozen child")
+    };
+    assert_eq!(run_id("child-a"), json!("child-a"));
+    assert_eq!(run_id("child-b"), json!("child-b"));
+    assert!(run_id("child-c").is_null());
+
+    let events = env
+        .ledger()
+        .list_events(Some("epic-fanout"), 0, 65_536)
+        .expect("epic events");
+    let wave_position = events
+        .iter()
+        .position(|event| event.kind == "forged.epic.wave.started")
+        .expect("wave event");
+    let first_child_position = events
+        .iter()
+        .position(|event| event.kind == "forged.epic.child.started")
+        .expect("child event");
+    assert!(wave_position < first_child_position, "wave commits first");
+
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "child-a",
+            forged_ledger::RunOutcome::Blocked,
+            "fixture child failed independently".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle failed child");
+    ledger.close().expect("close ledger");
+
+    let (code, replacement) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "slot-opening tick: {replacement}");
+    assert_eq!(
+        replacement["result"]["progress"]["launched"]
+            .as_array()
+            .map(Vec::len),
+        Some(1),
+        "the independent third child fills the released slot: {replacement}"
+    );
+    let (_, status) = env.forged(&["epic", "status", "--epic", "epic-fanout"]);
+    assert_eq!(status["result"]["counts"]["queuedDeferred"], json!(2));
+    assert_eq!(status["result"]["counts"]["terminal"], json!(1));
+    assert_eq!(status["result"]["counts"]["held"], json!(1));
+    assert!(status["result"]["inputRequired"].is_null());
+    assert_eq!(
+        status["result"]["children"]
+            .as_array()
+            .and_then(|children| children.iter().find(|child| child["id"] == "child-c"))
+            .map(|child| child["runId"].clone()),
+        Some(json!("child-c"))
+    );
+
+    let ledger = env.ledger();
+    for child in ["child-b", "child-c"] {
+        ledger
+            .settle_run(
+                child,
+                forged_ledger::RunOutcome::Blocked,
+                "fixture child failed independently".to_owned(),
+                None,
+                None,
+                None,
+            )
+            .expect("settle remaining failed child");
+    }
+    ledger.close().expect("close ledger");
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-fanout"]);
+    assert_eq!(code, 0, "held-wave tick: {held}");
+    assert_eq!(
+        held["result"]["stopped"]["childId"],
+        json!("child-a"),
+        "failed children enter the resolution rail one-at-a-time by child id: {held}"
+    );
+}
+
+#[test]
+fn epic_fanout_obeys_repository_write_capacity_for_detached_child_attempts() {
+    for repository_limit in [1, 2] {
+        let env = TestEnv::new(&format!("forged-epic-write-limit-{repository_limit}"));
+        set_admission(
+            &env,
+            json!({
+                "totalActive": 8,
+                "providerActive": 4,
+                "repositoryWriteActive": repository_limit,
+                "epicFanout": 2,
+                "deferSeconds": 1,
+            }),
+        );
+        env.seed_epic(
+            "epic-write-limit",
+            &[
+                ("write-child-a", &env.spec, true),
+                ("write-child-b", &env.spec, true),
+            ],
+        );
+        assert_eq!(env.forged(&["init"]).0, 0);
+        let repo = env.repos.repo.to_string_lossy().into_owned();
+        let spec = env.spec.to_string_lossy().into_owned();
+        let (code, started) = env.forged(&[
+            "epic",
+            "start",
+            "--epic",
+            "epic-write-limit",
+            "--repo",
+            &repo,
+            "--spec",
+            &spec,
+            "--base-ref",
+            "main",
+        ]);
+        assert_eq!(code, 0, "epic start: {started}");
+        env.authorize_epic("epic-write-limit");
+        let ledger = env.ledger();
+        ledger
+            .record_desired_outcome(
+                forged_ledger::DesiredSubjectKind::Epic,
+                "epic-write-limit",
+                forged_ledger::DesiredState::Running,
+                forged_ledger::DesiredReconcileOutcome::Adopted,
+                None,
+                None,
+            )
+            .expect("park the directly-driven epic outside supervisor scope");
+        ledger.close().expect("close ledger");
+        // The two implementations are a barrier: neither exits until the
+        // test settles its run, so overlap (or its absence) is unambiguous.
+        env.set_scenario("implement", "hang", 2);
+        let driver = env
+            .forged_cmd(&["epic", "drive", "--epic", "epic-write-limit"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+            .expect("epic driver starts");
+
+        let implementation_starts = || {
+            env.provider_log()
+                .into_iter()
+                .filter(|line| line.contains("/implementation/0 start "))
+                .collect::<Vec<_>>()
+        };
+        let mut starts = Vec::new();
+        for _ in 0..200 {
+            starts = implementation_starts();
+            let expected = if repository_limit == 2 { 2 } else { 1 };
+            if starts.len() >= expected {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+        assert_eq!(
+            starts.len(),
+            if repository_limit == 2 { 2 } else { 1 },
+            "initial workspace-write overlap at limit {repository_limit}: {starts:?}"
+        );
+
+        if repository_limit == 1 {
+            std::thread::sleep(std::time::Duration::from_millis(500));
+            assert_eq!(
+                implementation_starts().len(),
+                1,
+                "the default repository slot serializes child attempts"
+            );
+            let first = if starts[0].starts_with("write-child-a/") {
+                "write-child-a"
+            } else {
+                "write-child-b"
+            };
+            let second = if first == "write-child-a" {
+                "write-child-b"
+            } else {
+                "write-child-a"
+            };
+            let _stopped =
+                stop_run_when_kill_evidence_is_ready(&env, first, "release barrier fixture");
+            std::thread::sleep(std::time::Duration::from_millis(1_100));
+            for _ in 0..100 {
+                let _ = env.forged(&["supervise", "--once"]);
+                starts = implementation_starts();
+                if starts.len() == 2 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            assert_eq!(
+                starts.len(),
+                2,
+                "the queued sibling starts only after the first slot is released: {starts:?}"
+            );
+            let _stopped =
+                stop_run_when_kill_evidence_is_ready(&env, second, "release barrier fixture");
+        } else {
+            for child in ["write-child-a", "write-child-b"] {
+                let _stopped =
+                    stop_run_when_kill_evidence_is_ready(&env, child, "release barrier fixture");
+            }
+        }
+
+        let output = driver.wait_with_output().expect("epic driver exits");
+        assert!(
+            output.status.success(),
+            "epic driver failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
 }
 
 #[test]
@@ -1857,6 +2182,10 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
         .as_object_mut()
         .expect("start object")
         .remove("executionPackage");
+    legacy_start
+        .as_object_mut()
+        .expect("start object")
+        .remove("maxActiveChildren");
     connection
         .execute(
             "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
@@ -1876,6 +2205,11 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
 
     let (code, migrated) = env.forged(&["epic", "status", "--epic", "legacy-package-epic"]);
     assert_eq!(code, 0, "legacy epic status migrates: {migrated}");
+    assert_eq!(
+        migrated["result"]["maxActiveChildren"],
+        json!(1),
+        "pre-fan-out epic events retain sequential replay"
+    );
 
     // Once frozen, later config changes do not affect either projection or
     // child creation from the epic package.
@@ -1889,7 +2223,7 @@ fn pre_snapshot_epic_start_gets_one_package_event_and_remains_driveable() {
         serde_json::to_string_pretty(&config).expect("serialize config"),
     )
     .expect("rewrite config");
-    for _ in 0..2 {
+    for _ in 0..3 {
         let (code, advanced) = env.forged(&["epic", "advance", "--epic", "legacy-package-epic"]);
         assert_eq!(code, 0, "legacy epic lifecycle advances: {advanced}");
     }
@@ -2030,7 +2364,8 @@ fn epic_roster_revision_updates_current_and_future_children() {
     env.authorize_epic("epic-roster");
     assert!(started["result"]["executionPackage"].is_object());
 
-    for _ in 0..2 {
+    // Resolution, durable wave commit, then the first bounded child launch.
+    for _ in 0..3 {
         let (code, advanced) = env.forged(&["epic", "advance", "--epic", "epic-roster"]);
         assert_eq!(code, 0, "advance to first child: {advanced}");
     }
