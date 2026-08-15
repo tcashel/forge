@@ -16,6 +16,7 @@ mod error;
 mod invocation;
 mod prompts;
 mod rollout;
+mod session;
 mod usage;
 
 pub use claude::ClaudeDriver;
@@ -24,4 +25,5 @@ pub use error::ProviderError;
 pub use invocation::{Invocation, PacketDirs, ProviderDriver};
 pub use prompts::{normalize_findings, PromptStage, PromptTemplates, RenderedFinding};
 pub use rollout::recover_usage_from_rollout;
+pub use session::{ProviderSessionScanner, SessionEvidenceUpdate, SESSION_DISCOVERY_MAX_BYTES};
 pub use usage::{PricingBasis, UsageCapture, UsageRow};

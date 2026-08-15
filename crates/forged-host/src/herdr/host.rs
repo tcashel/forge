@@ -1,8 +1,9 @@
 //! HerdrHost: sessions as herdr panes over the protocol-19 Unix socket,
-//! treating panes as dumb terminals (the `agent.*` surface is never
-//! consulted).
+//! treating panes as terminals. Durable projection calls are display-only
+//! metadata plus a projection-scoped custom lifecycle source; native Herdr
+//! session authority is deliberately absent from this API.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -10,6 +11,7 @@ use std::time::Duration;
 
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
+use serde::Deserialize;
 use serde_json::json;
 use tokio::time::Instant;
 
@@ -32,6 +34,86 @@ pub enum HerdrCloseOutcome {
     /// Herdr returned the exact protocol-19 `pane_not_found` code, proving
     /// the opaque pane id is already absent.
     AlreadyMissing,
+}
+
+/// Result of a projection-scoped report/release call.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProjectionOutcome {
+    Applied,
+    /// Exact lowercase protocol-19 `pane_not_found`; message text is never
+    /// interpreted as absence.
+    AlreadyMissing,
+}
+
+/// Display-only metadata. `tokens` is a complete fixed-whitelist update;
+/// `None` explicitly clears a value owned by this exact metadata source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrMetadataProjection {
+    pub source: String,
+    pub title: String,
+    pub agent: Option<String>,
+    pub applies_to_source: Option<String>,
+    pub state: Option<String>,
+    pub tokens: BTreeMap<String, Option<String>>,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrAgentProjection {
+    pub source: String,
+    pub agent: String,
+    pub state: forged_types::HerdrProjectionLifecycle,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrAgentRelease {
+    pub source: String,
+    pub agent: String,
+    pub sequence: u64,
+}
+
+#[derive(Debug, Deserialize)]
+struct OkResult {
+    #[serde(rename = "type")]
+    kind: String,
+}
+
+fn valid_source(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= forged_types::HERDR_PROJECTION_VALUE_MAX_BYTES
+        && !value.starts_with("herdr:")
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || b":._-".contains(&byte))
+}
+
+fn valid_agent(value: &str) -> bool {
+    matches!(value, "claude" | "codex")
+}
+
+fn valid_metadata(report: &HerdrMetadataProjection) -> bool {
+    valid_source(&report.source)
+        && !report.title.is_empty()
+        && report.title.len() <= forged_types::HERDR_PROJECTION_TITLE_MAX_BYTES
+        && !report.title.chars().any(char::is_control)
+        && report.sequence > 0
+        && report.agent.as_deref().is_none_or(valid_agent)
+        && report.applies_to_source.as_deref().is_none_or(valid_source)
+        && (report.agent.is_some() == report.applies_to_source.is_some())
+        && report.applies_to_source.as_deref() != Some(report.source.as_str())
+        && report.tokens.len() <= forged_types::HERDR_PROJECTION_TOKEN_MAX
+        && report.tokens.iter().all(|(key, value)| {
+            !key.is_empty()
+                && key.len() <= 32
+                && key
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || b"_-".contains(&byte))
+                && value.as_deref().is_none_or(|value| {
+                    value.len() <= forged_types::HERDR_PROJECTION_VALUE_MAX_BYTES
+                        && !value.chars().any(char::is_control)
+                })
+        })
 }
 
 /// Exact coordinates returned by one successful `tab.create` response.
@@ -306,6 +388,126 @@ impl HerdrControl {
             }
             Err(other) => Err(other.into_host_error()),
         }
+    }
+
+    fn validate_projection_identity(
+        &self,
+        identity: &HerdrSessionIdentity,
+    ) -> Result<(), HostError> {
+        if identity.protocol() != self.protocol {
+            return Err(HostError::ProtocolMismatch {
+                expected: self.protocol,
+                got: identity.protocol(),
+            });
+        }
+        if identity.socket_path() != self.socket_path || identity.pane_id().is_empty() {
+            return Err(HostError::SessionNotFound {
+                id: identity.pane_id().to_owned(),
+            });
+        }
+        Ok(())
+    }
+
+    async fn projection_call(
+        &self,
+        method: &str,
+        params: serde_json::Value,
+    ) -> Result<HerdrProjectionOutcome, HostError> {
+        match self.conn.call(method, params).await {
+            Ok(value) => {
+                let response: OkResult = serde_json::from_value(value)
+                    .map_err(|_| HostError::unavailable("malformed Herdr projection response"))?;
+                if response.kind != "ok" {
+                    return Err(HostError::unavailable(
+                        "unexpected Herdr projection response type",
+                    ));
+                }
+                Ok(HerdrProjectionOutcome::Applied)
+            }
+            Err(CallError::Rpc(error)) if error.is_pane_not_found() => {
+                Ok(HerdrProjectionOutcome::AlreadyMissing)
+            }
+            Err(other) => Err(other.into_host_error()),
+        }
+    }
+
+    /// Publish display metadata to one exact durable pane. There is no TTL:
+    /// durable monotonic sequences define freshness.
+    pub async fn report_metadata(
+        &self,
+        identity: &HerdrSessionIdentity,
+        report: &HerdrMetadataProjection,
+    ) -> Result<HerdrProjectionOutcome, HostError> {
+        self.validate_projection_identity(identity)?;
+        if !valid_metadata(report) {
+            return Err(HostError::unavailable(
+                "invalid bounded Herdr metadata projection",
+            ));
+        }
+        self.projection_call(
+            "pane.report_metadata",
+            json!({
+                "pane_id": identity.pane_id(),
+                "source": report.source,
+                "title": report.title,
+                "agent": report.agent,
+                "applies_to_source": report.applies_to_source,
+                "state": report.state,
+                "tokens": report.tokens,
+                "seq": report.sequence,
+            }),
+        )
+        .await
+    }
+
+    /// Report only custom-source provider lifecycle. This request type has no
+    /// provider-session id/path fields and rejects all reserved `herdr:*`
+    /// sources.
+    pub async fn report_agent(
+        &self,
+        identity: &HerdrSessionIdentity,
+        report: &HerdrAgentProjection,
+    ) -> Result<HerdrProjectionOutcome, HostError> {
+        self.validate_projection_identity(identity)?;
+        if !valid_source(&report.source) || !valid_agent(&report.agent) || report.sequence == 0 {
+            return Err(HostError::unavailable(
+                "invalid custom Herdr agent projection",
+            ));
+        }
+        self.projection_call(
+            "pane.report_agent",
+            json!({
+                "pane_id": identity.pane_id(),
+                "source": report.source,
+                "agent": report.agent,
+                "state": report.state.as_str(),
+                "seq": report.sequence,
+            }),
+        )
+        .await
+    }
+
+    /// Release only the exact custom source/agent previously used by this
+    /// projection. Reserved native sources cannot pass validation.
+    pub async fn release_agent(
+        &self,
+        identity: &HerdrSessionIdentity,
+        release: &HerdrAgentRelease,
+    ) -> Result<HerdrProjectionOutcome, HostError> {
+        self.validate_projection_identity(identity)?;
+        if !valid_source(&release.source) || !valid_agent(&release.agent) || release.sequence == 0 {
+            return Err(HostError::unavailable("invalid custom Herdr agent release"));
+        }
+        self.projection_call(
+            "pane.release_agent",
+            json!({
+                "pane_id": identity.pane_id(),
+                "source": release.source,
+                "agent": release.agent,
+                "seq": release.sequence,
+            }),
+        )
+        .await
     }
 
     /// Read a bounded recent-unwrapped text snapshot.

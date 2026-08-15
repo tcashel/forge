@@ -13,6 +13,7 @@ mod epic;
 pub(crate) mod handoff;
 pub(crate) mod herdr_layout;
 pub(crate) mod herdr_ownership;
+pub(crate) mod herdr_projection;
 mod history;
 mod observe;
 mod ops;

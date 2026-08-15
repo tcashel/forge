@@ -128,7 +128,10 @@ pub(crate) fn find_attempt_by_token_tx(
         .optional()?)
 }
 
-fn get_attempt_tx(conn: &Connection, attempt_id: i64) -> Result<AttemptRow, LedgerError> {
+pub(crate) fn get_attempt_tx(
+    conn: &Connection,
+    attempt_id: i64,
+) -> Result<AttemptRow, LedgerError> {
     let sql = format!("SELECT {ATTEMPT_COLUMNS} FROM attempts WHERE attempt_id = ?1");
     conn.query_row(&sql, [attempt_id], attempt_row)
         .optional()?

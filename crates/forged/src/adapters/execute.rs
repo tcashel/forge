@@ -934,6 +934,7 @@ async fn run_attempt(
             .await;
         }
     };
+    let provider_session_candidate = invocation.session_hint.clone();
 
     // 3. Prefix the pid capture (no exec — the host appends the sentinel to
     // the same shell, and `$$` is that shell's pid either way) and spawn
@@ -1156,6 +1157,15 @@ async fn run_attempt(
             )
             .await;
         }
+        // Projection persistence is best effort and contains no host effect.
+        // It may never change whether this prepared provider starts.
+        let _ = crate::core::herdr_projection::refresh(ctx).await;
+        crate::core::herdr_projection::record_candidate(
+            ctx,
+            &identity.ownership_id,
+            provider_session_candidate.as_deref(),
+        )
+        .await;
     }
     crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), Some(&prepared), None)
         .await;
@@ -1209,6 +1219,7 @@ async fn run_attempt(
             }
             return Err(error);
         }
+        let _ = crate::core::herdr_projection::refresh(ctx).await;
     }
     failpoint::hit("provider.ownership.started.after");
     if let Err(error) = crate::core::sessions::record_session_started(
@@ -1300,6 +1311,8 @@ async fn run_attempt(
     // Await completion by polling the host; the sentinel status file is the
     // only exit-code truth.
     let mut beats: u32 = 0;
+    let mut session_scanner =
+        forged_provider::ProviderSessionScanner::new(&packet.provider_hints.provider);
     let liveness = loop {
         match host.alive(&session).await {
             Ok(forged_host::Liveness::Running) => {
@@ -1340,6 +1353,18 @@ async fn run_attempt(
                         )
                         .await?;
                         return Ok(PacketOutcome::Revoked);
+                    }
+                }
+                if beats.is_multiple_of(5) {
+                    if let Some(identity) = ownership.as_ref() {
+                        crate::core::herdr_projection::discover_provider_session(
+                            ctx,
+                            &identity.ownership_id,
+                            &mut session_scanner,
+                            &dirs.stdout_working(),
+                            false,
+                        )
+                        .await;
                     }
                 }
                 tokio::time::sleep(Duration::from_millis(200)).await;
@@ -1448,6 +1473,20 @@ async fn run_attempt(
             .map(|()| PacketOutcome::Semantic(note))
         }
     };
+
+    // One final bounded evidence pass happens only after the attempt result
+    // has settled. Its success or failure cannot alter that result.
+    if let Some(identity) = ownership.as_ref() {
+        crate::core::herdr_projection::discover_provider_session(
+            ctx,
+            &identity.ownership_id,
+            &mut session_scanner,
+            &dirs.stdout(),
+            true,
+        )
+        .await;
+        let _ = crate::core::herdr_projection::refresh(ctx).await;
+    }
 
     // A Herdr terminal is now durable supervisor work. Never make pane
     // cleanup part of, or capable of changing, the settled attempt result.

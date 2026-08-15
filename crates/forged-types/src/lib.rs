@@ -10,6 +10,7 @@ pub mod envelope;
 pub mod error;
 pub mod herdr_layout;
 pub mod herdr_ownership;
+pub mod herdr_projection;
 pub mod ids;
 pub mod packet;
 pub mod work_history;
@@ -47,6 +48,12 @@ pub use herdr_layout::{
 pub use herdr_ownership::{
     OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
     OWNED_HERDR_SESSION_SCHEMA_V1,
+};
+pub use herdr_projection::{
+    herdr_projection_names, validate_provider_session_id, HerdrPaneProjectionV1,
+    HerdrProjectionLifecycle, HerdrProjectionTargetKind, HerdrProjectionTargetV1,
+    HerdrProjectionValidationError, HerdrSessionEvidenceSource, HERDR_PANE_PROJECTION_SCHEMA_V1,
+    HERDR_PROJECTION_TITLE_MAX_BYTES, HERDR_PROJECTION_TOKEN_MAX, HERDR_PROJECTION_VALUE_MAX_BYTES,
 };
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{

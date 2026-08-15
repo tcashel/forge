@@ -262,6 +262,17 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
             let attempt_id = record.attempt_id;
             let attempt =
                 on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+            let claim_token = attempt.claim_token.clone();
+            let owned = on_ledger(&ctx.ledger, move |ledger| {
+                ledger.find_owned_herdr_attempt(attempt_id, &claim_token)
+            })
+            .await?;
+            let projection = match owned {
+                Some(owned) => {
+                    super::herdr_projection::status_for_ownership(ctx, &owned.ownership_id).await
+                }
+                None => Value::Null,
+            };
             sessions.push(json!({
                 "attemptId": attempt.attempt_id,
                 "packetId": record.packet_id,
@@ -274,6 +285,7 @@ pub async fn session_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespons
                 "controllerGeneration": record.controller_generation,
                 "layoutId": record.layout_id,
                 "identity": identity.clone(),
+                "herdrProjection": projection,
                 // The hint is durable, but terminal pane cleanup is an
                 // independent supervisor effect. `Running` and `Revoking`
                 // are the only states in which attachment remains useful;

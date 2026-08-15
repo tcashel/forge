@@ -1,17 +1,19 @@
 //! HerdrHost tests against a mock protocol-19 Unix-socket server. No real
 //! herdr server and no `claude` binary required.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use forged_host::{
-    Confirmed, HerdrCloseOutcome, HerdrControl, HerdrHost, HerdrLayoutInspection,
-    HerdrLayoutTarget, HerdrSessionIdentity, HerdrTabCreateError, HostError, Liveness, SessionHost,
+    Confirmed, HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl, HerdrHost,
+    HerdrLayoutInspection, HerdrLayoutTarget, HerdrMetadataProjection, HerdrProjectionOutcome,
+    HerdrSessionIdentity, HerdrTabCreateError, HostError, Liveness, SessionHost,
     HERDR_PROTOCOL_VERSION,
 };
+use forged_types::HerdrProjectionLifecycle;
 use serde_json::{json, Value};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::UnixListener;
@@ -604,6 +606,167 @@ async fn durable_close_does_not_trust_a_not_found_message_under_another_code() {
         .await
         .expect_err("non-exact code must fail");
     assert!(matches!(error, HostError::Unavailable { .. }));
+}
+
+#[tokio::test]
+async fn projection_uses_display_and_custom_lifecycle_only() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        "pane.report_metadata" | "pane.report_agent" | "pane.release_agent" => {
+            vec![Action::Respond(json!({"type": "ok"}))]
+        }
+        // Any native-session request fails this test immediately.
+        other => panic!("unexpected or forbidden projection request {other:?}"),
+    });
+    let identity = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&identity).await.expect("connect");
+    let source = "forged:projection:lifecycle:0123456789abcdef";
+    let mut tokens = BTreeMap::new();
+    tokens.insert("provider_session".into(), Some("thread-7".into()));
+    tokens.insert("model".into(), Some("gpt-5".into()));
+    assert_eq!(
+        control
+            .report_metadata(
+                &identity,
+                &HerdrMetadataProjection {
+                    source: "forged:projection:metadata:0123456789abcdef".into(),
+                    title: "Work [attempt:7]".into(),
+                    agent: Some("codex".into()),
+                    applies_to_source: Some(source.into()),
+                    state: Some("working".into()),
+                    tokens,
+                    sequence: 4,
+                },
+            )
+            .await
+            .expect("metadata"),
+        HerdrProjectionOutcome::Applied
+    );
+    assert_eq!(
+        control
+            .report_agent(
+                &identity,
+                &HerdrAgentProjection {
+                    source: source.into(),
+                    agent: "codex".into(),
+                    state: HerdrProjectionLifecycle::Working,
+                    sequence: 2,
+                },
+            )
+            .await
+            .expect("agent"),
+        HerdrProjectionOutcome::Applied
+    );
+    assert_eq!(
+        control
+            .release_agent(
+                &identity,
+                &HerdrAgentRelease {
+                    source: source.into(),
+                    agent: "codex".into(),
+                    sequence: 3,
+                },
+            )
+            .await
+            .expect("release"),
+        HerdrProjectionOutcome::Applied
+    );
+    assert_eq!(mock.count_of("pane.report_agent_session"), 0);
+    for (_, params) in mock
+        .requests
+        .lock()
+        .expect("requests")
+        .iter()
+        .filter(|(method, _)| method.starts_with("pane.report") || method == "pane.release_agent")
+    {
+        let encoded = params.to_string();
+        assert!(!encoded.contains("herdr:claude"));
+        assert!(!encoded.contains("herdr:codex"));
+        assert!(!encoded.contains("session_path"));
+        assert!(!encoded.contains("ttl"));
+    }
+    assert_eq!(
+        mock.params_of("pane.report_metadata")["tokens"]["provider_session"],
+        "thread-7"
+    );
+    assert!(mock
+        .params_of("pane.report_metadata")
+        .get("token_updates")
+        .is_none());
+    assert_eq!(
+        mock.params_of("pane.report_metadata")["pane_id"],
+        TEST_PANE_ID
+    );
+    assert!(mock.params_of("pane.report_metadata")["source"].is_string());
+}
+
+#[tokio::test]
+async fn projection_rejects_official_sources_before_any_rpc() {
+    let mock = Mock::start(|method, _params, _n| match method {
+        "ping" => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        other => panic!("invalid projection emitted {other:?}"),
+    });
+    let identity = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&identity).await.expect("connect");
+    let error = control
+        .report_agent(
+            &identity,
+            &HerdrAgentProjection {
+                source: "herdr:codex".into(),
+                agent: "codex".into(),
+                state: HerdrProjectionLifecycle::Working,
+                sequence: 1,
+            },
+        )
+        .await
+        .expect_err("official source");
+    assert!(matches!(error, HostError::Unavailable { .. }));
+    assert_eq!(mock.methods(), vec!["ping"]);
+}
+
+#[tokio::test]
+async fn projection_only_accepts_exact_lowercase_pane_not_found() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("pane.release_agent", 1) => vec![PANE_NOT_FOUND],
+        ("pane.release_agent", 2) => vec![Action::RespondErr {
+            code: "PANE_NOT_FOUND",
+            message: "pane not found",
+        }],
+        ("pane.release_agent", 3) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "pane_not_found",
+        }],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let identity = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&identity).await.expect("connect");
+    let release = |sequence| HerdrAgentRelease {
+        source: "forged:projection:lifecycle:0123456789abcdef".into(),
+        agent: "claude".into(),
+        sequence,
+    };
+    assert_eq!(
+        control
+            .release_agent(&identity, &release(1))
+            .await
+            .expect("lowercase missing"),
+        HerdrProjectionOutcome::AlreadyMissing
+    );
+    assert!(control.release_agent(&identity, &release(2)).await.is_err());
+    assert!(control.release_agent(&identity, &release(3)).await.is_err());
 }
 
 // ---------------------------------------------------------------------------

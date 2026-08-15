@@ -722,6 +722,156 @@ BEGIN
 END;
 ";
 
+/// Migration 018: durable best-effort display and custom-lifecycle
+/// projections for exact post-migration Herdr ownership.  The table has no
+/// native session source/path column by design: confirmed provider ids are
+/// display metadata only.
+const MIGRATION_018: &str = "
+CREATE TABLE herdr_pane_projections (
+  projection_id          TEXT PRIMARY KEY CHECK (length(trim(projection_id)) > 0),
+  schema                 TEXT NOT NULL CHECK (schema = 'forged.herdr-pane-projection/1'),
+  target_kind            TEXT NOT NULL CHECK (target_kind IN ('anchor','controller','attempt')),
+  subject_kind           TEXT NOT NULL CHECK (subject_kind IN ('run','epic')),
+  subject_id             TEXT NOT NULL CHECK (length(trim(subject_id)) > 0),
+  ownership_id           TEXT REFERENCES owned_herdr_sessions(ownership_id),
+  layout_id              TEXT REFERENCES herdr_layouts(layout_id),
+  pane_id                TEXT NOT NULL CHECK (length(pane_id) > 0),
+  socket_path            TEXT NOT NULL CHECK (length(socket_path) > 0),
+  protocol               INTEGER NOT NULL CHECK (protocol = 19),
+  controller_generation  INTEGER,
+  run_id                 TEXT,
+  packet_id              TEXT,
+  attempt_id             INTEGER,
+  claim_token            TEXT,
+  stage                  TEXT CHECK (stage IN ('implement','reviewclaude','reviewcodex','fix')),
+  provider               TEXT CHECK (provider IN ('claude','codex')),
+  model                  TEXT,
+  layout_revision        INTEGER,
+  metadata_source        TEXT NOT NULL CHECK
+                         (length(metadata_source) <= 80 AND metadata_source NOT LIKE 'herdr:%'),
+  lifecycle_source       TEXT CHECK
+                         (lifecycle_source IS NULL OR
+                          (length(lifecycle_source) <= 80 AND lifecycle_source NOT LIKE 'herdr:%')),
+  lifecycle_agent        TEXT CHECK (lifecycle_agent IN ('claude','codex')),
+  session_candidate      TEXT CHECK
+                         (session_candidate IS NULL OR
+                          (length(CAST(session_candidate AS BLOB)) BETWEEN 1 AND 256
+                           AND session_candidate NOT GLOB '*' || char(10) || '*'
+                           AND session_candidate NOT GLOB '*' || char(13) || '*')),
+  session_confirmed      TEXT CHECK
+                         (session_confirmed IS NULL OR
+                          (length(CAST(session_confirmed AS BLOB)) BETWEEN 1 AND 80
+                           AND session_confirmed NOT GLOB '*' || char(10) || '*'
+                           AND session_confirmed NOT GLOB '*' || char(13) || '*')),
+  session_evidence_source TEXT CHECK
+                         (session_evidence_source IN ('claude-output','codex-thread-started')),
+  session_evidence_at    TEXT,
+  session_evidence_error TEXT,
+  desired_revision       INTEGER NOT NULL CHECK (desired_revision > 0),
+  desired_lifecycle      TEXT CHECK (desired_lifecycle IN ('working','unknown')),
+  desired_release        INTEGER NOT NULL DEFAULT 0 CHECK (desired_release IN (0,1)),
+
+  metadata_next_seq      INTEGER NOT NULL DEFAULT 0 CHECK (metadata_next_seq >= 0),
+  metadata_applied_seq   INTEGER CHECK (metadata_applied_seq > 0),
+  metadata_applied_revision INTEGER CHECK (metadata_applied_revision > 0),
+  metadata_state         TEXT NOT NULL CHECK (metadata_state IN
+                         ('pending','leased','retry-wait','attention','applied','missing')),
+  metadata_token         TEXT,
+  metadata_lease_until   TEXT,
+  metadata_retry_budget  INTEGER NOT NULL CHECK (metadata_retry_budget > 0),
+  metadata_retry_used    INTEGER NOT NULL DEFAULT 0 CHECK
+                         (metadata_retry_used BETWEEN 0 AND metadata_retry_budget),
+  metadata_next_wake_at  TEXT,
+  metadata_last_error    TEXT,
+  metadata_last_attempt_at TEXT,
+  metadata_applied_at    TEXT,
+
+  lifecycle_next_seq     INTEGER NOT NULL DEFAULT 0 CHECK (lifecycle_next_seq >= 0),
+  lifecycle_applied_seq  INTEGER CHECK (lifecycle_applied_seq > 0),
+  lifecycle_applied_revision INTEGER CHECK (lifecycle_applied_revision > 0),
+  lifecycle_state        TEXT CHECK (lifecycle_state IN
+                         ('not-requested','pending','leased','retry-wait','attention','applied','missing')),
+  lifecycle_token        TEXT,
+  lifecycle_lease_until  TEXT,
+  lifecycle_retry_budget INTEGER NOT NULL CHECK (lifecycle_retry_budget > 0),
+  lifecycle_retry_used   INTEGER NOT NULL DEFAULT 0 CHECK
+                         (lifecycle_retry_used BETWEEN 0 AND lifecycle_retry_budget),
+  lifecycle_next_wake_at TEXT,
+  lifecycle_last_error   TEXT,
+  lifecycle_last_attempt_at TEXT,
+  lifecycle_applied_at   TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL,
+
+  FOREIGN KEY (subject_kind, subject_id)
+    REFERENCES work_identities(subject_kind, subject_id),
+  UNIQUE (socket_path, protocol, pane_id, metadata_source),
+  CHECK (
+    (target_kind = 'anchor' AND layout_id IS NOT NULL AND ownership_id IS NULL
+      AND layout_revision IS NOT NULL AND layout_revision > 0
+      AND controller_generation IS NULL AND run_id IS NULL AND packet_id IS NULL
+      AND attempt_id IS NULL AND claim_token IS NULL AND stage IS NULL
+      AND provider IS NULL AND model IS NULL AND lifecycle_source IS NULL
+      AND lifecycle_agent IS NULL AND desired_lifecycle IS NULL
+      AND desired_release = 0 AND lifecycle_state = 'not-requested'
+      AND session_candidate IS NULL AND session_confirmed IS NULL
+      AND session_evidence_source IS NULL AND session_evidence_at IS NULL
+      AND session_evidence_error IS NULL)
+    OR
+    (target_kind = 'controller' AND ownership_id IS NOT NULL AND layout_id IS NULL
+      AND controller_generation IS NOT NULL AND controller_generation > 0
+      AND run_id IS NULL AND packet_id IS NULL AND attempt_id IS NULL
+      AND claim_token IS NULL AND stage IS NULL AND provider IS NULL AND model IS NULL
+      AND layout_revision IS NULL AND lifecycle_source IS NULL
+      AND lifecycle_agent IS NULL AND desired_lifecycle IS NULL
+      AND desired_release = 0 AND lifecycle_state = 'not-requested'
+      AND session_candidate IS NULL AND session_confirmed IS NULL
+      AND session_evidence_source IS NULL AND session_evidence_at IS NULL
+      AND session_evidence_error IS NULL)
+    OR
+    (target_kind = 'attempt' AND ownership_id IS NOT NULL AND layout_id IS NULL
+      AND run_id IS NOT NULL AND packet_id IS NOT NULL AND attempt_id IS NOT NULL
+      AND attempt_id > 0 AND claim_token IS NOT NULL AND stage IS NOT NULL
+      AND provider IS NOT NULL AND model IS NOT NULL AND layout_revision IS NULL
+      AND lifecycle_source IS NOT NULL AND lifecycle_agent = provider
+      AND lifecycle_state IS NOT NULL)
+  ),
+  CHECK ((session_confirmed IS NULL AND session_evidence_source IS NULL
+          AND session_evidence_at IS NULL)
+         OR (session_confirmed IS NOT NULL AND session_evidence_source IS NOT NULL
+             AND session_evidence_at IS NOT NULL)),
+  CHECK ((metadata_state = 'leased') =
+         (metadata_token IS NOT NULL AND metadata_lease_until IS NOT NULL)),
+  CHECK ((lifecycle_state = 'leased') =
+         (lifecycle_token IS NOT NULL AND lifecycle_lease_until IS NOT NULL))
+);
+CREATE UNIQUE INDEX herdr_projection_owned_target
+  ON herdr_pane_projections(ownership_id) WHERE ownership_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_layout_target
+  ON herdr_pane_projections(layout_id) WHERE layout_id IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_metadata_token
+  ON herdr_pane_projections(metadata_token) WHERE metadata_token IS NOT NULL;
+CREATE UNIQUE INDEX herdr_projection_lifecycle_token
+  ON herdr_pane_projections(lifecycle_token) WHERE lifecycle_token IS NOT NULL;
+CREATE INDEX herdr_projection_metadata_wake
+  ON herdr_pane_projections(metadata_state, metadata_next_wake_at, metadata_lease_until)
+  WHERE metadata_state IN ('pending','leased','retry-wait');
+CREATE INDEX herdr_projection_lifecycle_wake
+  ON herdr_pane_projections(lifecycle_state, lifecycle_next_wake_at, lifecycle_lease_until)
+  WHERE lifecycle_state IN ('pending','leased','retry-wait');
+
+CREATE TRIGGER herdr_projection_identity_immutable
+BEFORE UPDATE OF projection_id, schema, target_kind, subject_kind, subject_id,
+                 ownership_id, layout_id, pane_id, socket_path, protocol,
+                 controller_generation, run_id, packet_id, attempt_id,
+                 claim_token, stage, provider, model, layout_revision,
+                 metadata_source, lifecycle_source, lifecycle_agent, created_at
+ON herdr_pane_projections
+BEGIN
+  SELECT RAISE(ABORT, 'Herdr projection identity is immutable');
+END;
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -741,6 +891,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_015,
     MIGRATION_016,
     MIGRATION_017,
+    MIGRATION_018,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -863,7 +1014,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 17);
+        assert_eq!(pragmas.user_version, 18);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -890,6 +1041,7 @@ mod tests {
             "owned_herdr_sessions",
             "work_identities",
             "herdr_layouts",
+            "herdr_pane_projections",
         ] {
             let found: String = conn
                 .query_row(
@@ -939,8 +1091,8 @@ mod tests {
     }
 
     #[test]
-    fn representative_v10_v12_v15_and_exact_v16_upgrades_preserve_rows_and_reach_v17() {
-        for version in [10usize, 12, 15, 16] {
+    fn representative_v10_v12_v15_v16_and_exact_v17_upgrades_preserve_rows_and_reach_v18() {
+        for version in [10usize, 12, 15, 16, 17] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(format!("state-v{version}.db"));
             {
@@ -965,7 +1117,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1000,7 +1152,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
         ledger.close().expect("close");
     }
 
@@ -1061,7 +1213,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -1104,7 +1256,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 17);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 18);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

@@ -24,6 +24,59 @@ const LOOP_SCHEMA: &str = "forged.supervise.session/1";
 const POLL_SECONDS: u64 = 5;
 const CLAIM_LEASE_SECONDS: u64 = 60;
 const MAX_BACKOFF_SECONDS: u64 = 300;
+const PROJECTION_PASS_BUDGET: Duration = Duration::from_secs(5);
+
+struct ProjectionPassTask {
+    handle: Option<tokio::task::JoinHandle<Value>>,
+}
+
+impl ProjectionPassTask {
+    fn start(ctx: &Ctx) -> Self {
+        let projection_ctx = Ctx {
+            config: ctx.config.clone(),
+            ledger: ctx.ledger.clone(),
+        };
+        let handle = tokio::spawn(async move {
+            match tokio::time::timeout(
+                PROJECTION_PASS_BUDGET,
+                super::herdr_projection::reconcile(&projection_ctx),
+            )
+            .await
+            {
+                Ok(report) => report,
+                Err(_) => json!({
+                    "schema": "forged.herdr-projection.report/1",
+                    "effects": [],
+                    "timedOut": true,
+                    "budgetSeconds": PROJECTION_PASS_BUDGET.as_secs(),
+                }),
+            }
+        });
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn finish(mut self) -> Value {
+        let handle = self.handle.take().expect("projection task handle");
+        match handle.await {
+            Ok(report) => report,
+            Err(error) => json!({
+                "schema": "forged.herdr-projection.report/1",
+                "effects": [],
+                "error": format!("projection task failed: {error}"),
+            }),
+        }
+    }
+}
+
+impl Drop for ProjectionPassTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
 
 fn scope(kind: DesiredSubjectKind) -> Scope {
     match kind {
@@ -662,6 +715,11 @@ async fn finish_spawn_failure(
 
 pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     let started_at = now_iso();
+    // Give terminal custom-source release an opportunity to race independent
+    // close, but never put Herdr's network latency in front of cleanup or
+    // runnable work. The durable projection lease makes cancellation safe:
+    // an ambiguous request is retried later at a strictly newer sequence.
+    let projection_task = ProjectionPassTask::start(ctx);
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
     let cleanup = super::herdr_ownership::reconcile(ctx).await?;
@@ -811,6 +869,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
             }
         }
     }
+    let projection = projection_task.finish().await;
     let wake_now = now_iso();
     let desired_now = wake_now.clone();
     let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
@@ -819,10 +878,16 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     .await?;
     let cleanup_wake_at = super::herdr_ownership::earliest_wake(ctx, &wake_now).await?;
     let layout_wake_at = super::herdr_layout::earliest_wake(ctx, &wake_now).await;
-    let next_wake_at = [desired_wake_at, cleanup_wake_at, layout_wake_at]
-        .into_iter()
-        .flatten()
-        .min();
+    let projection_wake_at = super::herdr_projection::earliest_wake(ctx, &wake_now).await;
+    let next_wake_at = [
+        desired_wake_at,
+        cleanup_wake_at,
+        layout_wake_at,
+        projection_wake_at,
+    ]
+    .into_iter()
+    .flatten()
+    .min();
     Ok(json!({
         "schema": REPORT_SCHEMA,
         "tickId": tick_id,
@@ -834,6 +899,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "subjects": subjects,
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
+        "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))
 }

@@ -23,6 +23,7 @@ mod desired;
 mod error;
 mod events;
 mod herdr_layouts;
+mod herdr_projections;
 mod history;
 mod inventory;
 mod ledger;
@@ -40,6 +41,7 @@ mod work_identity;
 
 pub use error::LedgerError;
 pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
+pub use herdr_projections::{ClaimedHerdrProjectionEffect, HERDR_PROJECTION_RETRY_BUDGET};
 pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
 pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
@@ -55,7 +57,8 @@ pub use types::{
     DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
     DesiredWorkRow, EffectClass, EventRow, HerdrLayoutCleanupReason, HerdrLayoutCleanupRelease,
     HerdrLayoutCleanupRetry, HerdrLayoutCleanupState, HerdrLayoutCreation,
-    HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow, MergeSlotRow,
+    HerdrLayoutDegradationReason, HerdrLayoutLifecycleState, HerdrLayoutRow,
+    HerdrPaneProjectionRow, HerdrProjectionChannel, HerdrProjectionPublicationState, MergeSlotRow,
     NewAttemptArtifact, NewPacket, NewRun, NewRunDefinition, NewUsage, OperationOutcome,
     OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,

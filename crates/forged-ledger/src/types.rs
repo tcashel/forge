@@ -10,8 +10,10 @@ use std::collections::HashMap;
 use forged_types::{
     AdmissionCapacityV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionRateLimitV1,
     AdmissionResourceClass, AdmissionSpendV1, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, OwnedHerdrOwnerV1,
-    OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1, ProviderHints, RunId, Stage,
+    HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrPaneProjectionV1,
+    HerdrProjectionLifecycle, HerdrProjectionTargetKind, HerdrSessionEvidenceSource,
+    OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
+    ProviderHints, RunId, Stage,
 };
 
 use crate::error::{refused, LedgerError};
@@ -865,6 +867,114 @@ pub enum HerdrLayoutCreation {
 pub enum HerdrLayoutCleanupRetry {
     Scheduled(HerdrLayoutRow),
     Exhausted(HerdrLayoutRow),
+}
+
+/// Durable state of one independent projection publication channel.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProjectionPublicationState {
+    NotRequested,
+    Pending,
+    Leased,
+    RetryWait,
+    Attention,
+    Applied,
+    Missing,
+}
+
+impl HerdrProjectionPublicationState {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::NotRequested => "not-requested",
+            Self::Pending => "pending",
+            Self::Leased => "leased",
+            Self::RetryWait => "retry-wait",
+            Self::Attention => "attention",
+            Self::Applied => "applied",
+            Self::Missing => "missing",
+        }
+    }
+}
+
+impl TryFrom<&str> for HerdrProjectionPublicationState {
+    type Error = LedgerError;
+
+    fn try_from(value: &str) -> Result<Self, Self::Error> {
+        match value {
+            "not-requested" => Ok(Self::NotRequested),
+            "pending" => Ok(Self::Pending),
+            "leased" => Ok(Self::Leased),
+            "retry-wait" => Ok(Self::RetryWait),
+            "attention" => Ok(Self::Attention),
+            "applied" => Ok(Self::Applied),
+            "missing" => Ok(Self::Missing),
+            other => Err(refused(
+                ErrorCode::InvalidRequest,
+                format!("unknown Herdr projection publication state: {other:?}"),
+            )),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProjectionChannel {
+    Metadata,
+    Lifecycle,
+}
+
+impl HerdrProjectionChannel {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Metadata => "metadata",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
+/// Fully decoded migration-018 row.  Candidate and confirmation deliberately
+/// remain separate, and there is no provider-session path/native source.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HerdrPaneProjectionRow {
+    pub identity: HerdrPaneProjectionV1,
+    pub session_candidate: Option<String>,
+    pub session_confirmed: Option<String>,
+    pub session_evidence_source: Option<HerdrSessionEvidenceSource>,
+    pub session_evidence_at: Option<String>,
+    pub session_evidence_error: Option<String>,
+    pub desired_revision: u64,
+    pub desired_lifecycle: Option<HerdrProjectionLifecycle>,
+    pub desired_release: bool,
+    pub metadata_next_seq: u64,
+    pub metadata_applied_seq: Option<u64>,
+    pub metadata_applied_revision: Option<u64>,
+    pub metadata_state: HerdrProjectionPublicationState,
+    pub metadata_token: Option<String>,
+    pub metadata_lease_until: Option<String>,
+    pub metadata_retry_budget: u32,
+    pub metadata_retry_used: u32,
+    pub metadata_next_wake_at: Option<String>,
+    pub metadata_last_error: Option<String>,
+    pub metadata_last_attempt_at: Option<String>,
+    pub metadata_applied_at: Option<String>,
+    pub lifecycle_next_seq: u64,
+    pub lifecycle_applied_seq: Option<u64>,
+    pub lifecycle_applied_revision: Option<u64>,
+    pub lifecycle_state: HerdrProjectionPublicationState,
+    pub lifecycle_token: Option<String>,
+    pub lifecycle_lease_until: Option<String>,
+    pub lifecycle_retry_budget: u32,
+    pub lifecycle_retry_used: u32,
+    pub lifecycle_next_wake_at: Option<String>,
+    pub lifecycle_last_error: Option<String>,
+    pub lifecycle_last_attempt_at: Option<String>,
+    pub lifecycle_applied_at: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+impl HerdrPaneProjectionRow {
+    pub fn target_kind(&self) -> HerdrProjectionTargetKind {
+        self.identity.target.kind()
+    }
 }
 
 /// A run's lifecycle state (`runs.state`).

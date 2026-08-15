@@ -749,6 +749,12 @@ fn row_json(row: &HerdrLayoutRow) -> Value {
 }
 
 pub(crate) async fn status(ctx: &Ctx, subject: HerdrLayoutSubjectV1) -> Value {
+    let projection_kind = match subject.kind {
+        HerdrLayoutSubjectKind::Run => WorkIdentitySubjectKind::Run,
+        HerdrLayoutSubjectKind::Epic => WorkIdentitySubjectKind::Epic,
+    };
+    let projections =
+        super::herdr_projection::status_for_subject(ctx, projection_kind, &subject.id).await;
     match on_ledger(&ctx.ledger, move |ledger| {
         ledger.list_herdr_layouts_for_subject(subject)
     })
@@ -771,12 +777,14 @@ pub(crate) async fn status(ctx: &Ctx, subject: HerdrLayoutSubjectV1) -> Value {
                 "schema": "forged.herdr-layout.status/1",
                 "active": active,
                 "history": rows.iter().map(row_json).collect::<Vec<_>>(),
+                "projections": projections,
             })
         }
         Err(error) => json!({
             "schema": "forged.herdr-layout.status/1",
             "active": Value::Null,
             "history": [],
+            "projections": projections,
             "error": error.to_string(),
         }),
     }
