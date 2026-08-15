@@ -3,6 +3,7 @@
 //! newtypes, and the work-packet schema.
 
 pub mod admission;
+pub mod attention;
 pub mod canonical;
 pub mod contract;
 pub mod envelope;
@@ -16,6 +17,13 @@ pub use admission::{
     AdmissionOutcome, AdmissionRateLimitV1, AdmissionReason, AdmissionResourceClass,
     AdmissionSpendV1, AdmissionSubjectKind, ADMISSION_DECISION_SCHEMA_V1,
     ADMISSION_INPUTS_SCHEMA_V1,
+};
+pub use attention::{
+    attention_id, attention_occurrence_id, AttentionAcknowledgementV1, AttentionActionCode,
+    AttentionCondition, AttentionEvidenceKind, AttentionEvidenceRefV1, AttentionItemV1,
+    AttentionOwner, AttentionRecommendedActionV1, AttentionResolutionDisposition,
+    AttentionResolutionV1, AttentionSeverity, AttentionState, AttentionSubjectKind,
+    ATTENTION_ITEM_SCHEMA_V1,
 };
 pub use canonical::{canonical_json_bytes, parse_canonical, request_sha256, CanonicalError};
 pub use contract::{

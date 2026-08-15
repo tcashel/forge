@@ -192,8 +192,9 @@ pub struct DesiredReconcileUpdate {
     pub last_progress_at: Option<String>,
     /// Durable diagnostic for backoff or attention.
     pub last_error: Option<String>,
-    /// Whether this outcome is an explicit operator-attention condition.
-    pub attention: bool,
+    /// Closed supervisor attention reason to append, when this outcome needs
+    /// durable intervention evidence. `None` is an ordinary outcome.
+    pub attention_condition: Option<String>,
 }
 
 /// Closed lifecycle of one durable capacity reservation. Expiry moves a row

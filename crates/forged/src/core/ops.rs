@@ -7,12 +7,12 @@ use std::path::{Component, Path, PathBuf};
 
 use forged_gate::GateRequest;
 use forged_ledger::{
-    AttemptState, EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState,
-    RunState,
+    EffectClass, InventorySnapshot, NewRun, NewRunDefinition, OperationState, RunState,
 };
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
-    request_sha256, ErrorCode, OperationRequest, OperationResponse, RunId, WorkPacket,
+    request_sha256, AttentionItemV1, AttentionResolutionDisposition, AttentionState, ErrorCode,
+    OperationRequest, OperationResponse, RunId, WorkPacket,
 };
 use serde_json::{json, Value};
 
@@ -1942,6 +1942,11 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
         .and_then(|record| record.get("number"))
         .cloned()
         .unwrap_or(Value::Null);
+    let pr_base = pr
+        .as_ref()
+        .and_then(|record| record.get("baseRefName").or_else(|| record.get("base")))
+        .cloned()
+        .unwrap_or(Value::Null);
     let mut delivery = settled_delivery.unwrap_or_else(|| {
         if pr_number.is_null() {
             Value::Null
@@ -1955,6 +1960,9 @@ fn add_lifecycle(snapshot: &InventorySnapshot, id: &str, entry: &mut Value) {
     // erase a real delivery candidate.
     if delivery.get("pr").is_some_and(Value::is_null) && !pr_number.is_null() {
         delivery["pr"] = pr_number;
+    }
+    if let Some(object) = delivery.as_object_mut() {
+        object.insert("prBase".to_owned(), pr_base);
     }
     if let Some(object) = entry.as_object_mut() {
         object.insert("outcome".to_owned(), outcome);
@@ -1990,40 +1998,16 @@ fn add_spend(snapshot: &InventorySnapshot, spend: &Spend, id: &str, entry: &mut 
     }
 }
 
-/// The durable kinds the attention rail is folded from, on top of
-/// [`LIFECYCLE_KINDS`]. `proto.quarantine` is spelled here rather than
-/// imported because the ledger stores kind strings and the proto crate
-/// exposes the vocabulary only through its parsed variants.
-const ATTENTION_KINDS: [&str; 4] = [
-    epic::INPUT_REQUIRED,
-    epic::INPUT_RESOLVED,
-    "proto.quarantine",
-    "run.bead-settlement.pending",
-];
-
-/// One condition needing a human, in the order the rail reports them.
-///
-/// Severity, not alphabet: a subject holding for an answer or stuck
-/// mid-reclaim blocks work, custody of a refused result is evidence a human
-/// must adjudicate, and an unpriced usage row only makes a figure partial.
-const CONDITIONS: [&str; 7] = [
-    "input-required",
-    "blocked",
-    "beads-settlement-pending",
-    "revoking",
-    "quarantined",
-    "awaiting-delivery",
-    "missing-cost",
-];
-
-/// The whole inventory and what needs a human, from ONE snapshot.
+/// The whole inventory and its typed active attention, from ONE snapshot.
 pub struct Portfolio {
     /// Every inventory entry, oldest first — [`inventory`]'s own order.
     pub entries: Vec<Value>,
-    /// One entry per (subject, condition), most severe condition first.
+    /// One V1 item per active (subject, condition), most severe first.
     pub attention: Vec<Value>,
     /// The operator-facing grouping shared by `work list` and Overview.
     pub queue: Value,
+    /// Latest admission decision per subject from the same ledger snapshot.
+    pub admission: Vec<forged_types::AdmissionDecisionV1>,
 }
 
 /// The portfolio: [`inventory`] with spend, plus the attention rail folded
@@ -2047,16 +2031,18 @@ async fn portfolio_for_repository(
 ) -> Result<Portfolio, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS
         .iter()
-        .chain(ATTENTION_KINDS.iter())
+        .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
         .copied()
         .collect();
     let snapshot = on_ledger(&ctx.ledger, move |l| l.inventory_snapshot(&kinds)).await?;
     let mut entries = project_entries(&snapshot, Spend::Include)?;
-    let prefetched_beads = if let Some(repository) = repository {
-        let bead_ids: Vec<String> = entries
-            .iter()
-            .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-            .collect();
+    let bead_ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+        .collect();
+    let bead_read: Result<Vec<forged_beads::IssueSummary>, String> = if let Some(repository) =
+        repository
+    {
         // ONE native, id-bounded metadata query is both the membership
         // decision and the queue's live Beads enrichment. An outage is not
         // widened into an unfiltered result: scoped discovery fails closed.
@@ -2072,16 +2058,30 @@ async fn portfolio_for_repository(
                 .as_str()
                 .is_some_and(|id| matching_ids.contains(id))
         });
-        Some(beads)
+        Ok(beads)
     } else {
-        None
+        forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
+            .await
+            .map_err(|error| error.to_string())
     };
-    let attention = attention_rail(&snapshot, &entries);
-    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention, prefetched_beads).await;
+    let attention = super::attention::project_active(
+        &snapshot,
+        &entries,
+        bead_read.as_deref().unwrap_or_default(),
+    )?
+    .into_iter()
+    .map(|item| {
+        serde_json::to_value(item)
+            .map_err(|error| Failure::internal(format!("serializing attention item: {error}")))
+    })
+    .collect::<Result<Vec<_>, _>>()?;
+    let queue = operator_queue(ctx, &snapshot, &mut entries, &attention, bead_read).await;
+    let admission = snapshot.admission_decisions.clone();
     Ok(Portfolio {
         entries,
         attention,
         queue,
+        admission,
     })
 }
 
@@ -2103,19 +2103,9 @@ async fn operator_queue(
     snapshot: &InventorySnapshot,
     entries: &mut [Value],
     attention: &[Value],
-    prefetched_beads: Option<Vec<forged_beads::IssueSummary>>,
+    bead_read: Result<Vec<forged_beads::IssueSummary>, String>,
 ) -> Value {
-    let bead_read = match prefetched_beads {
-        Some(beads) => Ok(beads),
-        None => {
-            let bead_ids: Vec<String> = entries
-                .iter()
-                .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-                .collect();
-            forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids).await
-        }
-    };
-    let bead_error = bead_read.as_ref().err().map(ToString::to_string);
+    let bead_error = bead_read.as_ref().err().cloned();
     let beads: BTreeMap<String, forged_beads::IssueSummary> = bead_read
         .unwrap_or_default()
         .into_iter()
@@ -2243,6 +2233,7 @@ async fn operator_queue(
         });
         let attention_item = attention_by_id.get(id.as_str()).copied();
         let attention_condition = attention_item.and_then(|item| item["condition"].as_str());
+        let attention_owner = attention_item.and_then(|item| item["owner"].as_str());
         let blocker = attention_item
             .map(|item| item["detail"].clone())
             .or_else(|| {
@@ -2272,7 +2263,8 @@ async fn operator_queue(
                 Some(number @ Value::Number(_)) => json!({
                     "number": number,
                     "url": Value::Null,
-                    "baseBranch": entry["baseRef"],
+                    "baseBranch": entry.pointer("/delivery/prBase")
+                        .cloned().unwrap_or(Value::Null),
                     "isDraft": Value::Null,
                 }),
                 _ => Value::Null,
@@ -2281,26 +2273,26 @@ async fn operator_queue(
                 json!({
                     "number": record.get("number").cloned().unwrap_or(Value::Null),
                     "url": record.get("url").cloned().unwrap_or(Value::Null),
-                    "baseBranch": record.get("base").cloned()
-                        .unwrap_or_else(|| entry["baseRef"].clone()),
+                    "baseBranch": record.get("baseRefName")
+                        .or_else(|| record.get("base"))
+                        .cloned().unwrap_or(Value::Null),
                     "isDraft": record.get("isDraft").cloned().unwrap_or(Value::Null),
                 })
             },
         );
-        let has_pr = !pr.is_null();
-        let merge_actionable = awaiting_delivery && has_pr;
-        let needs_intervention =
-            attention_item.is_some() && attention_condition != Some("awaiting-delivery");
-        let group = if needs_intervention || claim_status == Some("blocked") {
+        let has_pr = pr.get("number").is_some_and(Value::is_number);
+        let exact_base = pr.get("baseBranch").and_then(Value::as_str)
+            == entry.get("baseRef").and_then(Value::as_str);
+        let merge_actionable = awaiting_delivery && has_pr && exact_base;
+        let merge_attention = attention_condition == Some("merge-approval") && has_pr && exact_base;
+        let group = if merge_attention || (merge_actionable && attention_item.is_none()) {
+            "Ready to merge"
+        } else if attention_owner == Some("human") || claim_status == Some("blocked") {
             "Needs me"
         } else if execution_live {
             "Running"
-        } else if merge_actionable {
-            "Ready to merge"
-        } else if attention_item.is_some() {
-            // A clean outcome without its promised PR is not mergeable.
-            "Needs me"
-        } else if !claim_known
+        } else if attention_owner == Some("lead-agent")
+            || !claim_known
             || stale
             || claim_status == Some("closed")
             || dead_controller
@@ -2311,8 +2303,14 @@ async fn operator_queue(
         } else {
             "Planned"
         };
+        let projected_action = attention_item
+            .and_then(|item| item.pointer("/recommendedAction/text"))
+            .and_then(Value::as_str)
+            .map(str::to_owned);
         let next_action = match group {
-            "Needs me" => "Resolve the recorded blocker, then resume execution".to_owned(),
+            "Needs me" => projected_action.unwrap_or_else(|| {
+                "Resolve the recorded blocker, then resume execution".to_owned()
+            }),
             "Ready to merge" => format!(
                 "Merge PR {} into {}",
                 pr.get("number")
@@ -2325,10 +2323,10 @@ async fn operator_queue(
                 || "Let the verified controller advance the workflow".to_owned(),
                 |stage| format!("Wait for {stage} to settle"),
             ),
-            "Stalled or recoverable" => {
+            "Stalled or recoverable" => projected_action.unwrap_or_else(|| {
                 "Inspect the blocker and resubmit only after controller death is verified"
                     .to_owned()
-            }
+            }),
             _ => "Submit a detached controller when this work should start".to_owned(),
         };
         if let Some(object) = entry.as_object_mut() {
@@ -2385,6 +2383,7 @@ async fn operator_queue(
 ///
 /// `entries` supplies each subject's `kind` and the spend the rail's last
 /// condition reads, so no id is looked up twice.
+#[cfg(any())]
 fn attention_rail(snapshot: &InventorySnapshot, entries: &[Value]) -> Vec<Value> {
     let kinds: BTreeMap<&str, &str> = entries
         .iter()
@@ -2686,9 +2685,241 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_list", req, || async {
         let repository = repository_selector(req)?;
         let portfolio = portfolio_for_repository(ctx, repository.as_deref()).await?;
-        Ok(json!({"runs": portfolio.entries, "queue": portfolio.queue}))
+        Ok(json!({
+            "runs": portfolio.entries,
+            "queue": portfolio.queue,
+            "attentionTotal": portfolio.attention.len(),
+            "attention": portfolio.attention,
+        }))
     })
     .await
+}
+
+// ------------------------------------------------------- attention controls
+
+async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
+    let kinds: Vec<&str> = LIFECYCLE_KINDS
+        .iter()
+        .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
+        .copied()
+        .collect();
+    let snapshot = on_ledger(&ctx.ledger, move |ledger| ledger.inventory_snapshot(&kinds)).await?;
+    let entries = project_entries(&snapshot, Spend::Include)?;
+    let bead_ids: Vec<String> = entries
+        .iter()
+        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
+        .collect();
+    // A Beads outage cannot authorize a control over a condition that only
+    // Beads can prove. Other ledger-backed items remain addressable.
+    let beads = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
+        .await
+        .unwrap_or_default();
+    super::attention::project_all(&snapshot, &entries, &beads)
+}
+
+#[derive(Clone, Copy)]
+enum AttentionControl {
+    Acknowledge,
+    Resolve,
+    Reopen,
+}
+
+impl AttentionControl {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Acknowledge => "attention_acknowledge",
+            Self::Resolve => "attention_resolve",
+            Self::Reopen => "attention_reopen",
+        }
+    }
+
+    fn event_kind(self) -> &'static str {
+        match self {
+            Self::Acknowledge => super::attention::ACKNOWLEDGED,
+            Self::Resolve => super::attention::RESOLVED,
+            Self::Reopen => super::attention::REOPENED,
+        }
+    }
+}
+
+async fn control_attention(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    control: AttentionControl,
+) -> OperationResponse {
+    let name = control.name();
+    let subject = match req.run_id.as_deref().filter(|value| !value.is_empty()) {
+        Some(value) => value.to_owned(),
+        None => {
+            return err_response(
+                &derive_key(name, None, None, None),
+                &Failure::invalid("attention control requires a subject id"),
+            )
+        }
+    };
+    let attention_id = match param_str(&req.params, "attentionId") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    let occurrence_id = match param_str(&req.params, "occurrenceId") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    let actor = match param_str(&req.params, "actor") {
+        Ok(value) if value.len() <= 200 => value.to_owned(),
+        Ok(_) => {
+            return err_response(
+                &derive_key(name, Some(&subject), None, None),
+                &Failure::invalid("attention actor must be at most 200 bytes"),
+            )
+        }
+        Err(error) => return err_response(&derive_key(name, Some(&subject), None, None), &error),
+    };
+    default_key(
+        req,
+        format!("op:{name}:{subject}:{attention_id}:{occurrence_id}"),
+    );
+    let operation_key = req.idempotency_key.clone();
+    let items = match all_attention(ctx).await {
+        Ok(items) => items,
+        Err(error) => return err_response(&operation_key, &error),
+    };
+    let item = items.iter().find(|item| {
+        item.subject_id == subject
+            && item.attention_id == attention_id
+            && item.occurrence_id == occurrence_id
+    });
+    if item.is_none()
+        && items.iter().any(|candidate| {
+            candidate.subject_id == subject && candidate.attention_id == attention_id
+        })
+    {
+        return err_response(
+            &operation_key,
+            &Failure::invalid("attention occurrence is stale because newer causal evidence exists"),
+        );
+    }
+    let replay_request = req.clone();
+    match on_ledger(&ctx.ledger, move |ledger| {
+        ledger.replay_event_operation(name, &replay_request)
+    })
+    .await
+    {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&operation_key, &error),
+    }
+    let Some(item) = item else {
+        return err_response(
+            &operation_key,
+            &Failure::invalid(
+                "attention occurrence is stale, unknown, or no longer backed by durable truth",
+            ),
+        );
+    };
+
+    let mut payload = json!({
+        "schema": "forged.attention-transition/1",
+        "attentionId": attention_id,
+        "occurrenceId": occurrence_id,
+        "actor": actor,
+    });
+    let next_state = match control {
+        AttentionControl::Acknowledge => {
+            if item.state == AttentionState::Resolved {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid("resolved attention must be reopened before acknowledgement"),
+                );
+            }
+            AttentionState::Acknowledged
+        }
+        AttentionControl::Resolve => {
+            if !super::attention::resolution_allowed(item.condition) {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "this source-backed condition clears only through its domain transition",
+                    ),
+                );
+            }
+            let disposition_value = match req.params.get("disposition").cloned() {
+                Some(value) => value,
+                None => {
+                    return err_response(
+                        &operation_key,
+                        &Failure::invalid("missing required param \"disposition\""),
+                    )
+                }
+            };
+            let disposition: AttentionResolutionDisposition =
+                match serde_json::from_value(disposition_value) {
+                    Ok(value) => value,
+                    Err(_) => {
+                        return err_response(
+                            &operation_key,
+                            &Failure::invalid(
+                                "attention disposition must be fixed, accepted-risk, accepted-unknown, superseded, or automatic",
+                            ),
+                        )
+                    }
+                };
+            if item.condition == forged_types::AttentionCondition::MissingCost
+                && disposition != AttentionResolutionDisposition::AcceptedUnknown
+            {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "missing-cost can only be resolved with accepted-unknown while pricing remains absent",
+                    ),
+                );
+            }
+            let note = req
+                .params
+                .get("note")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if note.len() > 2_000 {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid("attention resolution note must be at most 2000 bytes"),
+                );
+            }
+            payload["disposition"] =
+                serde_json::to_value(disposition).expect("closed attention disposition serializes");
+            payload["note"] = json!(note);
+            AttentionState::Resolved
+        }
+        AttentionControl::Reopen => AttentionState::Open,
+    };
+    let result = json!({
+        "schema": "forged.attention-transition-result/1",
+        "subjectId": subject,
+        "attentionId": attention_id,
+        "occurrenceId": occurrence_id,
+        "state": next_state,
+    });
+    let request = req.clone();
+    match on_ledger(&ctx.ledger, move |ledger| {
+        ledger.apply_event_operation(name, &request, control.event_kind(), payload, result)
+    })
+    .await
+    {
+        Ok(response) => response,
+        Err(error) => err_response(&operation_key, &error),
+    }
+}
+
+pub async fn attention_acknowledge(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Acknowledge).await
+}
+
+pub async fn attention_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Resolve).await
+}
+
+pub async fn attention_reopen(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    control_attention(ctx, req, AttentionControl::Reopen).await
 }
 
 // ---------------------------------------------------------------- events

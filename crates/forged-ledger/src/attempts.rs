@@ -102,6 +102,22 @@ pub(crate) fn list_live_attempts_tx(
     Ok(out)
 }
 
+/// Terminal attempts whose immutable artifact join is absent, inside the
+/// caller's observational transaction.
+pub(crate) fn list_attempts_missing_artifacts_tx(
+    conn: &Connection,
+) -> Result<Vec<AttemptRow>, LedgerError> {
+    let sql = "SELECT a.attempt_id, a.packet_id, a.claim_token, a.claimant, a.state, \
+         a.revoke_reason, a.revoke_scope, a.fail_note, a.result_json, a.started_at, \
+         a.updated_at, a.last_heartbeat_at, a.ended_at \
+         FROM attempts a WHERE a.state IN ('completed', 'failed') \
+         AND NOT EXISTS (SELECT 1 FROM attempt_artifacts aa WHERE aa.attempt_id = a.attempt_id) \
+         ORDER BY a.rowid";
+    let mut stmt = conn.prepare(sql)?;
+    let rows = stmt.query_map([], attempt_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 pub(crate) fn find_attempt_by_token_tx(
     conn: &Connection,
     claim_token: &str,

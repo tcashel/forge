@@ -92,6 +92,13 @@ fn desired_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<DesiredWorkRow> {
     })
 }
 
+pub(crate) fn list_desired_work_tx(conn: &Connection) -> Result<Vec<DesiredWorkRow>, LedgerError> {
+    let sql = format!("SELECT {COLUMNS} FROM desired_work ORDER BY subject_kind, subject_id");
+    let mut statement = conn.prepare(&sql)?;
+    let rows = statement.query_map([], desired_row)?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+}
+
 fn get_tx(
     conn: &Connection,
     kind: DesiredSubjectKind,
@@ -287,13 +294,7 @@ impl Ledger {
 
     /// All authorized subjects in canonical order.
     pub fn list_desired_work(&self) -> Result<Vec<DesiredWorkRow>, LedgerError> {
-        self.submit(move |conn| {
-            let sql =
-                format!("SELECT {COLUMNS} FROM desired_work ORDER BY subject_kind, subject_id");
-            let mut statement = conn.prepare(&sql)?;
-            let rows = statement.query_map([], desired_row)?;
-            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
-        })
+        self.submit(|conn| list_desired_work_tx(conn))
     }
 
     /// Running, non-exhausted rows whose persisted wake deadline is due.
@@ -661,7 +662,7 @@ impl Ledger {
             let exhausted_at =
                 (update.outcome == DesiredReconcileOutcome::Exhausted).then_some(now.clone());
             let attention_detail = update.last_error.clone();
-            let should_append_attention = update.attention
+            let should_append_attention = update.attention_condition.is_some()
                 && (before.last_outcome != Some(update.outcome)
                     || before.last_error != attention_detail);
             let should_append_restart = update.outcome == DesiredReconcileOutcome::Restarted
@@ -709,7 +710,7 @@ impl Ledger {
                         "schemaVersion": 1,
                         "subjectKind": kind.as_str(),
                         "subjectId": id,
-                        "condition": update.outcome.as_str(),
+                        "condition": update.attention_condition,
                         "detail": attention_detail,
                         "controllerGeneration": generation,
                         "restartBudget": before.restart_budget,
@@ -890,7 +891,7 @@ mod tests {
                     next_wake_at: Some("2030-01-01T00:00:05.000000000Z".to_owned()),
                     last_progress_at: None,
                     last_error: Some("spawn failed".to_owned()),
-                    attention: false,
+                    attention_condition: None,
                 },
             )
             .expect("finish");
@@ -1094,7 +1095,7 @@ mod tests {
                     next_wake_at: None,
                     last_progress_at: None,
                     last_error: Some("stale input observation".to_owned()),
-                    attention: true,
+                    attention_condition: Some("controller-dead".to_owned()),
                 },
             )
             .is_err());

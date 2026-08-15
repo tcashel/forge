@@ -426,10 +426,7 @@ const PORTFOLIO_CAP: usize = 200;
 /// the portfolio is the level above any subject.
 async fn portfolio_overview(ctx: &Ctx) -> Result<Value, Failure> {
     let portfolio = super::ops::portfolio(ctx).await?;
-    let admission = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.latest_admission_decisions(None, None)
-    })
-    .await?;
+    let admission = portfolio.admission.clone();
     let total = portfolio.entries.len();
     let attention_total = portfolio.attention.len();
     let cost_usd_known: f64 = portfolio

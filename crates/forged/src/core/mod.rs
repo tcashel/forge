@@ -6,6 +6,7 @@
 
 pub(crate) mod admission;
 pub(crate) mod artifacts;
+pub(crate) mod attention;
 mod claimnext;
 mod drive;
 mod epic;
@@ -790,6 +791,9 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "usage_ingest" => ops::usage_ingest(ctx, &mut req).await,
         "events_tail" => ops::events_tail(ctx, &req).await,
         "work_list" => ops::work_list(ctx, &req).await,
+        "attention_acknowledge" => ops::attention_acknowledge(ctx, &mut req).await,
+        "attention_resolve" => ops::attention_resolve(ctx, &mut req).await,
+        "attention_reopen" => ops::attention_reopen(ctx, &mut req).await,
         "worktree_retire" => ops::worktree_retire(ctx, &req).await,
         other => err_response(
             &read_key(other),

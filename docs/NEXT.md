@@ -257,6 +257,12 @@ forged overview --epic <epic-id>
 forged overview --id <id>          # kind-blind: resolves either, or lists candidates
 forged session list --run <run-id>
 forged events --run <id> --limit 200
+forged attention acknowledge --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity>
+forged attention resolve --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity> --disposition <disposition> --note '<note>'
+forged attention reopen --subject <id> --attention-id <id> \
+  --occurrence-id <id> --actor <identity>
 ```
 
 The repository selector performs one native, id-bounded
@@ -275,12 +281,23 @@ truncated), the portfolio-wide `spend`, and one queue grouped in this stable
 order: **Needs me**, **Ready to merge**, **Running**, **Stalled or
 recoverable**, **Planned**. The App renders that same queue; it does not
 derive a second classification. The `attention` rail names each
-subject that needs a human and the durable evidence for it — an epic holding
-on `input.required`, a blocked/input-required slice, a clean or accepted-risk
-candidate awaiting delivery, a pending Beads settlement, an attempt marked
-`revoking` and not yet reclaimed, a result taken into custody by
-`proto.quarantine`, or usage rows carrying no cost. An empty rail means
-nothing needs attention; it is never omitted.
+active condition with a closed severity, owner (`human` or `lead-agent`),
+stable `attentionId`, occurrence-fenced `occurrenceId`, bounded durable
+evidence references, and a typed recommended action. The shared projector
+covers input and terminal blockers, Beads settlement, revocation and
+quarantine custody, merge approval, partial cost, controller/restart
+failure, abandoned gates/retries, typed provider degradation, ambiguous
+effects, missing attempt evidence, and reviewer disagreement. Routine
+capacity waits and healthy automatic recovery are not attention. The same
+typed array and order appear in `overview`, `work list`, CLI, MCP, and the
+App; an empty rail means nothing needs attention and is never omitted.
+
+Acknowledgement records custody and stays visible. Resolve is accepted only
+for explicitly adjudicable custody conditions; source-backed operational
+conditions clear through their own domain transition. A later causal source
+keeps the stable attention id but receives a new occurrence id, so a stale
+control cannot dismiss a recurrence. These controls never resume work,
+release capacity, retry an effect, settle Beads, or merge a PR.
 
 Each queue/inventory entry carries a live Bead title (with a deterministic
 legacy fallback), durable launch repository and base branch, authoritative

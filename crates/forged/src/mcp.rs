@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Thirty-four tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Thirty-seven tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -541,6 +541,33 @@ impl ForgedServer {
     )]
     pub async fn work_list(&self, args: Parameters<WorkListArgs>) -> CallToolResult {
         self.call("work_list", args.0.into_envelope()).await
+    }
+
+    /// Record custody of an exact active attention occurrence.
+    #[tool(
+        name = "attention_acknowledge",
+        description = "Acknowledge an exact attention occurrence without hiding it or changing domain state."
+    )]
+    pub async fn attention_acknowledge(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_acknowledge", args.0).await
+    }
+
+    /// Resolve one explicitly adjudicable attention occurrence.
+    #[tool(
+        name = "attention_resolve",
+        description = "Resolve an exact adjudicable attention occurrence; source-backed domain conditions refuse."
+    )]
+    pub async fn attention_resolve(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_resolve", args.0).await
+    }
+
+    /// Reopen one exact resolved attention occurrence.
+    #[tool(
+        name = "attention_reopen",
+        description = "Reopen the exact current attention occurrence without changing domain state."
+    )]
+    pub async fn attention_reopen(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
+        self.call("attention_reopen", args.0).await
     }
 }
 

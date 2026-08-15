@@ -199,6 +199,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
                 "schemaVersion": 1,
                 "number": 42,
                 "isDraft": true,
+                "baseRefName": "main",
                 "url": "https://example.invalid/pr/42",
             }),
         )
@@ -211,6 +212,7 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
                 "schemaVersion": 1,
                 "number": 43,
                 "isDraft": true,
+                "baseRefName": "main",
                 "url": "https://example.invalid/pr/43",
             }),
         )

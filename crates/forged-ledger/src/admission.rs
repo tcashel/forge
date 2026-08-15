@@ -128,7 +128,9 @@ fn reservation_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdmissionReserva
     })
 }
 
-fn live_reservations(conn: &Connection) -> Result<Vec<AdmissionReservationRow>, LedgerError> {
+pub(crate) fn live_reservations(
+    conn: &Connection,
+) -> Result<Vec<AdmissionReservationRow>, LedgerError> {
     let sql = format!(
         "SELECT {RESERVATION_COLUMNS} FROM admission_reservations \
          WHERE state != 'released' ORDER BY reservation_id"
@@ -139,6 +141,24 @@ fn live_reservations(conn: &Connection) -> Result<Vec<AdmissionReservationRow>, 
         .collect::<Result<Vec<_>, _>>()
         .map_err(LedgerError::from)?;
     Ok(rows)
+}
+
+pub(crate) fn latest_admission_decisions_tx(
+    conn: &Connection,
+) -> Result<Vec<AdmissionDecisionV1>, LedgerError> {
+    let mut stmt = conn.prepare(
+        "SELECT d.decision_json FROM admission_decisions d \
+         WHERE d.rowid = (SELECT d2.rowid FROM admission_decisions d2 \
+           WHERE d2.subject_kind = d.subject_kind AND d2.subject_id = d.subject_id \
+           ORDER BY d2.rowid DESC LIMIT 1) \
+         ORDER BY d.subject_kind, d.subject_id, d.decision_id",
+    )?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let mut out = Vec::new();
+    for raw in rows {
+        out.push(serde_json::from_str(&raw?)?);
+    }
+    Ok(out)
 }
 
 fn packet_resource(body: &str) -> Result<(String, String, AdmissionResourceClass), LedgerError> {
@@ -1392,7 +1412,7 @@ impl Ledger {
                  WHERE (?1 IS NULL OR d.subject_kind = ?1) AND (?2 IS NULL OR d.subject_id = ?2) \
                    AND d.rowid = (SELECT d2.rowid FROM admission_decisions d2 \
                      WHERE d2.subject_kind = d.subject_kind AND d2.subject_id = d.subject_id \
-                     ORDER BY d2.created_at DESC, d2.rowid DESC LIMIT 1) \
+                     ORDER BY d2.rowid DESC LIMIT 1) \
                  ORDER BY d.subject_kind, d.subject_id, d.decision_id",
             )?;
             let rows =
@@ -2232,5 +2252,78 @@ mod tests {
                 .total_active,
             1
         );
+    }
+
+    #[test]
+    fn latest_admission_is_selected_by_append_order_not_caller_clock() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
+        let (subject_id, _) = seed_packet(&ledger, "clock-regression");
+        let decision = |batch: &str, reason: AdmissionReason| AdmissionDecisionV1 {
+            schema: ADMISSION_DECISION_SCHEMA_V1.to_owned(),
+            batch_id: batch.to_owned(),
+            subject_kind: AdmissionSubjectKind::Run,
+            subject_id: subject_id.clone(),
+            control_revision: 0,
+            repository: "/repo".to_owned(),
+            priority: None,
+            provider: Some("codex".to_owned()),
+            model: Some("gpt".to_owned()),
+            resource_class: AdmissionResourceClass::Read,
+            outcome: AdmissionOutcome::Deferred,
+            reason,
+            policy_revision: "policy".to_owned(),
+            evidence: AdmissionCapacityV1::default(),
+            next_eligible_wake_at: None,
+        };
+        let older = decision("batch-appended-first", AdmissionReason::StaleRateLimit);
+        let newer = decision("batch-appended-second", AdmissionReason::RateLimitCeiling);
+        ledger
+            .submit(move |conn| {
+                for (id, value, created_at) in [
+                    ("decision-first", older, "2099-01-01T00:00:00Z"),
+                    ("decision-second", newer, "2000-01-01T00:00:00Z"),
+                ] {
+                    let reason = serde_json::to_value(value.reason)?;
+                    conn.execute(
+                        "INSERT INTO admission_batches (batch_id, schema, policy_revision, \
+                         ledger_revision, inputs_sha256, inputs_json, as_of, created_at) \
+                         VALUES (?1, 'forged.admission-inputs/1', 'policy', 'revision', ?2, \
+                         '{}', ?3, ?3)",
+                        rusqlite::params![&value.batch_id, "0".repeat(64), created_at],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO admission_decisions (decision_id, batch_id, subject_kind, \
+                         subject_id, control_revision, outcome, reason, next_eligible_wake_at, \
+                         decision_json, created_at) VALUES (?1, ?2, 'run', ?3, 0, 'deferred', \
+                         ?4, NULL, ?5, ?6)",
+                        rusqlite::params![
+                            id,
+                            &value.batch_id,
+                            &value.subject_id,
+                            reason.as_str().expect("reason string"),
+                            serde_json::to_string(&value)?,
+                            created_at,
+                        ],
+                    )?;
+                }
+                Ok(())
+            })
+            .expect("seed clock-regressed decisions");
+
+        let latest = ledger
+            .latest_admission_decisions(None, None)
+            .expect("latest decisions");
+        assert_eq!(latest.len(), 1);
+        assert_eq!(latest[0].batch_id, "batch-appended-second");
+        assert_eq!(
+            ledger
+                .inventory_snapshot(&[])
+                .expect("same-snapshot admission")
+                .admission_decisions[0]
+                .batch_id,
+            "batch-appended-second"
+        );
+        ledger.close().expect("close");
     }
 }

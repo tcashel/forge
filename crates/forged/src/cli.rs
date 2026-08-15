@@ -87,6 +87,12 @@ pub enum Command {
         #[command(subcommand)]
         command: WorkCmd,
     },
+    /// Typed operator-attention custody controls.
+    Attention {
+        /// The attention subcommand.
+        #[command(subcommand)]
+        command: AttentionCmd,
+    },
     /// Worktree lifecycle.
     Worktree {
         /// The worktree subcommand.
@@ -750,6 +756,86 @@ pub struct WorkListArgs {
     pub idempotency_key: Option<String>,
 }
 
+/// `attention` subcommands. These alter custody only; domain state is never
+/// changed by an attention control.
+#[derive(Debug, Subcommand)]
+pub enum AttentionCmd {
+    /// Record who has custody while leaving the item active.
+    Acknowledge(AttentionTargetArgs),
+    /// Resolve an explicitly adjudicable occurrence.
+    Resolve(AttentionResolveArgs),
+    /// Reopen the exact current occurrence.
+    Reopen(AttentionTargetArgs),
+}
+
+/// Exact occurrence address shared by attention controls.
+#[derive(Debug, Args)]
+pub struct AttentionTargetArgs {
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject: String,
+    /// Stable subject-condition identity from the projection.
+    #[arg(long)]
+    pub attention_id: String,
+    /// Current causal occurrence identity from the projection.
+    #[arg(long)]
+    pub occurrence_id: String,
+    /// Human or lead-agent identity taking the action.
+    #[arg(long)]
+    pub actor: String,
+    /// Override the deterministic occurrence-scoped key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// Closed attention-resolution dispositions.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttentionDisposition {
+    Fixed,
+    AcceptedRisk,
+    AcceptedUnknown,
+    Superseded,
+    Automatic,
+}
+
+impl AttentionDisposition {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Fixed => "fixed",
+            Self::AcceptedRisk => "accepted-risk",
+            Self::AcceptedUnknown => "accepted-unknown",
+            Self::Superseded => "superseded",
+            Self::Automatic => "automatic",
+        }
+    }
+}
+
+/// `attention resolve` flags.
+#[derive(Debug, Args)]
+pub struct AttentionResolveArgs {
+    /// Canonical run or epic id.
+    #[arg(long)]
+    pub subject: String,
+    /// Stable subject-condition identity from the projection.
+    #[arg(long)]
+    pub attention_id: String,
+    /// Current causal occurrence identity from the projection.
+    #[arg(long)]
+    pub occurrence_id: String,
+    /// Human or lead-agent identity taking the action.
+    #[arg(long)]
+    pub actor: String,
+    /// Auditable disposition for this occurrence.
+    #[arg(long, value_enum)]
+    pub disposition: AttentionDisposition,
+    /// Bounded explanation of the disposition.
+    #[arg(long, default_value = "")]
+    pub note: String,
+    /// Override the deterministic occurrence-scoped key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
 /// `worktree` subcommands.
 #[derive(Debug, Subcommand)]
 pub enum WorktreeCmd {
@@ -851,6 +937,11 @@ pub fn command_name(command: &Command) -> &'static str {
         Command::Service { command } => command.operation_name(),
         Command::Work { command } => match command {
             WorkCmd::List(_) => "work_list",
+        },
+        Command::Attention { command } => match command {
+            AttentionCmd::Acknowledge(_) => "attention_acknowledge",
+            AttentionCmd::Resolve(_) => "attention_resolve",
+            AttentionCmd::Reopen(_) => "attention_reopen",
         },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(_) => "worktree_retire",
@@ -1255,6 +1346,46 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                     request(a.idempotency_key, None, Value::Object(params)),
                 )
             }
+        },
+        Command::Attention { command } => match command {
+            AttentionCmd::Acknowledge(a) => (
+                "attention_acknowledge",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                    }),
+                ),
+            ),
+            AttentionCmd::Resolve(a) => (
+                "attention_resolve",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                        "disposition": a.disposition.as_str(),
+                        "note": a.note,
+                    }),
+                ),
+            ),
+            AttentionCmd::Reopen(a) => (
+                "attention_reopen",
+                request(
+                    a.idempotency_key,
+                    Some(a.subject),
+                    json!({
+                        "attentionId": a.attention_id,
+                        "occurrenceId": a.occurrence_id,
+                        "actor": a.actor,
+                    }),
+                ),
+            ),
         },
         Command::Worktree { command } => match command {
             WorktreeCmd::Retire(a) => (

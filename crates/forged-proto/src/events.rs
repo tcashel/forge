@@ -78,6 +78,9 @@ pub enum ProtoEvent {
         /// Whether the PR is a draft — the engine's structural "draft only"
         /// record.
         is_draft: bool,
+        /// The base GitHub reported after creation. Older V1 rows omit it;
+        /// absence is unknown evidence, never permission to infer intent.
+        base_ref_name: Option<String>,
         /// The PR's url.
         url: String,
     },
@@ -211,11 +214,13 @@ impl ProtoEvent {
             ProtoEvent::Pr {
                 number,
                 is_draft,
+                base_ref_name,
                 url,
             } => json!({
                 "schemaVersion": 1,
                 "number": number,
                 "isDraft": is_draft,
+                "baseRefName": base_ref_name,
                 "url": url,
             }),
             ProtoEvent::Retry {
@@ -612,6 +617,16 @@ fn parse_pr(row: &EventRow, value: &Value) -> Result<ProtoEvent, ProtoError> {
     Ok(ProtoEvent::Pr {
         number: require_u64(row, value, "number")?,
         is_draft: require_bool(row, value, "isDraft")?,
+        base_ref_name: value
+            .get("baseRefName")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_str()
+                    .map(str::to_owned)
+                    .ok_or_else(|| malformed(row, "baseRefName is not a string or null"))
+            })
+            .transpose()?,
         url: require_str(row, value, "url")?,
     })
 }
@@ -745,7 +760,46 @@ mod tests {
             vec![ProtoEvent::Pr {
                 number: 7,
                 is_draft: true,
+                base_ref_name: None,
                 url: "u".to_owned()
+            }]
+        );
+    }
+
+    #[test]
+    fn pr_base_is_preserved_while_legacy_rows_remain_unknown() {
+        let current = row(
+            1,
+            "proto.pr",
+            json!({
+                "schemaVersion": 1,
+                "number": 7,
+                "isDraft": true,
+                "baseRefName": "integration",
+                "url": "u",
+            }),
+        );
+        assert_eq!(
+            parse_proto_events(&[current]).expect("current PR row"),
+            vec![ProtoEvent::Pr {
+                number: 7,
+                is_draft: true,
+                base_ref_name: Some("integration".to_owned()),
+                url: "u".to_owned(),
+            }]
+        );
+        let legacy = row(
+            2,
+            "proto.pr",
+            json!({"schemaVersion": 1, "number": 8, "isDraft": true, "url": "u8"}),
+        );
+        assert_eq!(
+            parse_proto_events(&[legacy]).expect("legacy PR row"),
+            vec![ProtoEvent::Pr {
+                number: 8,
+                is_draft: true,
+                base_ref_name: None,
+                url: "u8".to_owned(),
             }]
         );
     }
@@ -833,6 +887,7 @@ mod tests {
                 ProtoEvent::Pr {
                     number: 8,
                     is_draft: true,
+                    base_ref_name: None,
                     url: "u8".to_owned(),
                 },
             ],

@@ -98,6 +98,28 @@ pub(crate) fn usage_totals_per_run_tx(
     Ok(totals)
 }
 
+/// Newest unpriced usage identity and update time per run. This is causal
+/// identity for attention recurrence, not another totals query.
+pub(crate) fn latest_missing_usage_per_run_tx(
+    conn: &Connection,
+) -> Result<BTreeMap<String, (i64, String)>, LedgerError> {
+    let mut statement = conn.prepare(
+        "SELECT u.run_id, u.usage_id, u.ts FROM usage u \
+         WHERE u.cost_usd IS NULL AND u.usage_id = ( \
+           SELECT MAX(u2.usage_id) FROM usage u2 \
+           WHERE u2.run_id = u.run_id AND u2.cost_usd IS NULL) \
+         ORDER BY u.run_id",
+    )?;
+    let rows = statement.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            (row.get::<_, i64>(1)?, row.get::<_, String>(2)?),
+        ))
+    })?;
+    rows.collect::<Result<BTreeMap<_, _>, _>>()
+        .map_err(Into::into)
+}
+
 impl Ledger {
     /// Record one usage row, keyed by
     /// `(run_id, packet_id, attempt_id, provider, model)`.

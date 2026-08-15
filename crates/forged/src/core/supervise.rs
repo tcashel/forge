@@ -95,6 +95,16 @@ async fn finish_attention(
     token: &str,
     detail: String,
 ) -> Result<Value, Failure> {
+    finish_attention_condition(ctx, row, token, "controller-dead", detail).await
+}
+
+async fn finish_attention_condition(
+    ctx: &Ctx,
+    row: &DesiredWorkRow,
+    token: &str,
+    condition: &str,
+    detail: String,
+) -> Result<Value, Failure> {
     finish_action(
         ctx,
         row,
@@ -108,7 +118,7 @@ async fn finish_attention(
             next_wake_at: None,
             last_progress_at: None,
             last_error: Some(detail),
-            attention: true,
+            attention_condition: Some(condition.to_owned()),
         },
     )
     .await
@@ -134,7 +144,7 @@ async fn finish_retryable(
             next_wake_at: Some(deadline_after(&now, POLL_SECONDS)?),
             last_progress_at: None,
             last_error: Some(detail),
-            attention: false,
+            attention_condition: None,
         },
     )
     .await
@@ -174,7 +184,7 @@ async fn settle_landed_reality(
                         next_wake_at: None,
                         last_progress_at: Some(run.updated_at),
                         last_error: None,
-                        attention: false,
+                        attention_condition: None,
                     },
                 )
                 .await
@@ -197,7 +207,7 @@ async fn settle_landed_reality(
                             next_wake_at: None,
                             last_progress_at: last_progress(ctx, &row.subject_id).await?,
                             last_error: None,
-                            attention: false,
+                            attention_condition: None,
                         },
                     )
                     .await
@@ -217,17 +227,18 @@ async fn settle_landed_reality(
                             next_wake_at: None,
                             last_progress_at: last_progress(ctx, &row.subject_id).await?,
                             last_error: None,
-                            attention: false,
+                            attention_condition: None,
                         },
                     )
                     .await
                     .map(Some);
                 }
                 if stop.get("inputRequired").is_some() {
-                    return finish_attention(
+                    return finish_attention_condition(
                         ctx,
                         row,
                         token,
+                        "input-required",
                         format!(
                             "epic {} still requires explicit input resolution",
                             row.subject_id
@@ -437,7 +448,7 @@ async fn reconcile_claimed(
                 next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
                 last_progress_at: progress,
                 last_error: None,
-                attention: false,
+                attention_condition: None,
             },
         )
         .await?;
@@ -518,7 +529,7 @@ async fn reconcile_claimed(
                     "controller absence confirmed; current admission inputs must be re-evaluated"
                         .to_owned(),
                 ),
-                attention: false,
+                attention_condition: None,
             },
         )
         .await;
@@ -586,7 +597,7 @@ async fn reconcile_claimed(
                     next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
                     last_progress_at: last_progress(ctx, &reserved.subject_id).await?,
                     last_error: None,
-                    attention: false,
+                    attention_condition: None,
                 },
             )
             .await?;
@@ -642,7 +653,7 @@ async fn finish_spawn_failure(
             },
             last_progress_at: None,
             last_error: Some(detail),
-            attention: exhausted,
+            attention_condition: exhausted.then(|| "restart-budget-exhausted".to_owned()),
         },
     )
     .await
@@ -727,7 +738,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
                     next_wake_at: None,
                     last_progress_at: None,
                     last_error: Some("no admission candidate was projected".to_owned()),
-                    attention: true,
+                    attention_condition: Some("admission-ineligible".to_owned()),
                 },
             )
             .await?;
@@ -759,7 +770,9 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
                     next_wake_at,
                     last_progress_at: None,
                     last_error: Some(reason),
-                    attention: admission.decision.outcome == AdmissionOutcome::Ineligible,
+                    attention_condition: (admission.decision.outcome
+                        == AdmissionOutcome::Ineligible)
+                        .then(|| "admission-ineligible".to_owned()),
                 },
             )
             .await?;

@@ -1,6 +1,6 @@
 //! One transaction-consistent read of everything an inventory projection
-//! needs: run rows, live attempts, usage totals, the newest event per run,
-//! and the caller's chosen event kinds.
+//! needs: run/attempt/desired/operation/admission/artifact joins, usage
+//! totals, the newest event per run, and the caller's chosen event kinds.
 //!
 //! Why a snapshot and not a handful of calls: the projection cross-reads
 //! sources that a concurrent append moves independently. Fetched as separate
@@ -13,13 +13,20 @@
 
 use std::collections::BTreeMap;
 
-use crate::attempts::list_live_attempts_tx;
+use crate::admission::{latest_admission_decisions_tx, live_reservations};
+use crate::attempts::{list_attempts_missing_artifacts_tx, list_live_attempts_tx};
+use crate::desired::list_desired_work_tx;
 use crate::error::LedgerError;
 use crate::events::{latest_event_per_run_tx, list_events_by_kind_tx};
 use crate::ledger::Ledger;
+use crate::operations::list_inflight_operations_tx;
 use crate::runs::list_runs_tx;
-use crate::types::{AttemptRow, EventRow, RunRow, UsageTotals};
-use crate::usage::usage_totals_per_run_tx;
+use crate::types::{
+    AdmissionReservationRow, AttemptRow, DesiredWorkRow, EventRow, OperationRow, RunRow,
+    UsageTotals,
+};
+use crate::usage::{latest_missing_usage_per_run_tx, usage_totals_per_run_tx};
+use forged_types::AdmissionDecisionV1;
 
 /// Everything [`Ledger::inventory_snapshot`] read, all of it from the same
 /// point in the ledger's history.
@@ -29,9 +36,13 @@ pub struct InventorySnapshot {
     pub runs: Vec<RunRow>,
     /// Every `running`/`revoking` attempt, ordered by rowid ascending.
     pub live_attempts: Vec<AttemptRow>,
+    /// Terminal attempts missing their immutable artifact join.
+    pub attempts_missing_artifacts: Vec<AttemptRow>,
     /// Usage totals keyed by run id; a run with no usage rows is ABSENT,
     /// which callers read as zero spend.
     pub usage_totals: BTreeMap<String, UsageTotals>,
+    /// Newest unpriced usage row per run, for occurrence identity.
+    pub latest_missing_usage: BTreeMap<String, (i64, String)>,
     /// The newest event per run id, by `event_id` — the append position,
     /// never the `ts` string.
     pub latest_event: BTreeMap<String, EventRow>,
@@ -39,6 +50,14 @@ pub struct InventorySnapshot {
     /// position. A kind with no rows maps to an empty vec, so a caller
     /// never distinguishes "not asked for" from "none stored".
     pub events_by_kind: BTreeMap<String, Vec<EventRow>>,
+    /// Durable desired-work truth used by controller attention.
+    pub desired_work: Vec<DesiredWorkRow>,
+    /// Human-ambiguous effects which still retain external-effect custody.
+    pub inflight_operations: Vec<OperationRow>,
+    /// Latest scheduler decision per subject.
+    pub admission_decisions: Vec<AdmissionDecisionV1>,
+    /// Every capacity-bearing reservation.
+    pub admission_reservations: Vec<AdmissionReservationRow>,
 }
 
 impl InventorySnapshot {
@@ -73,9 +92,15 @@ impl Ledger {
             let snapshot = InventorySnapshot {
                 runs: list_runs_tx(&tx)?,
                 live_attempts: list_live_attempts_tx(&tx, None)?,
+                attempts_missing_artifacts: list_attempts_missing_artifacts_tx(&tx)?,
                 usage_totals: usage_totals_per_run_tx(&tx)?,
+                latest_missing_usage: latest_missing_usage_per_run_tx(&tx)?,
                 latest_event: latest_event_per_run_tx(&tx)?,
                 events_by_kind,
+                desired_work: list_desired_work_tx(&tx)?,
+                inflight_operations: list_inflight_operations_tx(&tx)?,
+                admission_decisions: latest_admission_decisions_tx(&tx)?,
+                admission_reservations: live_reservations(&tx)?,
             };
             tx.commit()?;
             Ok(snapshot)
