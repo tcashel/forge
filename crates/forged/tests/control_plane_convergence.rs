@@ -761,6 +761,7 @@ fn source_outage_keeps_durable_truth_without_cross_repository_leakage() {
     let fixture = ControlPlaneFixture::new("forged-control-plane-degraded");
     let repository = fixture.repository_a();
     fixture.env.set_bd_list_unreachable(true);
+    fixture.env.set_bd_show_unreachable(true);
     let before = fixture.fingerprint();
 
     let (code, operations) = fixture.env.forged(&["operations", "overview"]);

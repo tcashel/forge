@@ -524,13 +524,11 @@ fn exact_issue(value: &Value) -> Result<IssueSummary, String> {
     if !object.get("title").is_some_and(Value::is_string) {
         return Err(format!("hydrated issue {id:?} has no string title"));
     }
-    let status = object
+    object
         .get("status")
         .and_then(Value::as_str)
         .filter(|value| !value.trim().is_empty())
         .ok_or_else(|| format!("hydrated issue {id:?} has no non-empty string status"))?;
-    PlanDependencyStatus::try_from(status)
-        .map_err(|detail| format!("hydrated issue {id:?} has {detail}"))?;
     object
         .get("issue_type")
         .and_then(Value::as_str)
@@ -651,6 +649,34 @@ fn list(value: &Value) -> Vec<IssueSummary> {
         .collect()
 }
 
+fn exact_issue_rows(value: &Value, requested_ids: &[String]) -> Result<Vec<IssueSummary>, String> {
+    let requested: BTreeSet<&str> = requested_ids.iter().map(String::as_str).collect();
+    if requested.len() != requested_ids.len() {
+        return Err("requested issue ids are not unique".to_owned());
+    }
+
+    let rows = envelope::as_list(value).unwrap_or_else(|| vec![value.clone()]);
+    let mut by_id = BTreeMap::new();
+    for row in &rows {
+        let item = exact_issue(row)?;
+        let id = item.id.clone();
+        if !requested.contains(id.as_str()) {
+            return Err(format!("show returned unrequested issue id {id:?}"));
+        }
+        if by_id.insert(id.clone(), item).is_some() {
+            return Err(format!("show returned duplicate issue id {id:?}"));
+        }
+    }
+
+    // A requested issue can disappear between ledger discovery and this
+    // read. Preserve that as absence so admission classifies it unavailable;
+    // never manufacture a row from the request itself.
+    Ok(requested_ids
+        .iter()
+        .filter_map(|id| by_id.remove(id))
+        .collect())
+}
+
 /// Read one issue through `bd show`.
 pub async fn show_issue(cfg: &BdConfig, id: &str) -> Result<IssueSummary, BdError> {
     let data = invoke::read(cfg, &["show", id, "--json"]).await?;
@@ -663,12 +689,27 @@ pub async fn show_issue(cfg: &BdConfig, id: &str) -> Result<IssueSummary, BdErro
         })
 }
 
-/// Read an exact, bounded set of issues in one `bd list` invocation.
+/// Hydrate an exact, bounded set of issues in one
+/// `bd show <ids...> --brief-deps --json` invocation.
 ///
 /// Missing or deleted ids are absent from the result. Supplying exact ids
-/// avoids both an operator-wide scan and one `bd show` process per row.
+/// avoids both an operator-wide scan and one process per row. The complete
+/// `show` shape carries the opaque revision admission requires; brief `list`
+/// rows do not in pinned bd 1.2.1.
 pub async fn list_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<IssueSummary>, BdError> {
-    list_issues_matching_repository(cfg, ids, None).await
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = Vec::with_capacity(ids.len() + 3);
+    args.push("show");
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--brief-deps");
+    args.push("--json");
+    let data = invoke::read(cfg, &args).await?;
+    exact_issue_rows(&data, ids).map_err(|detail| BdError::Envelope {
+        context: "bd show exact issues".to_owned(),
+        detail,
+    })
 }
 
 /// Read an exact, bounded set of issues whose `metadata.repository` equals
@@ -683,23 +724,12 @@ pub async fn list_issues_for_repository(
     ids: &[String],
     repository: &str,
 ) -> Result<Vec<IssueSummary>, BdError> {
-    list_issues_matching_repository(cfg, ids, Some(repository)).await
-}
-
-async fn list_issues_matching_repository(
-    cfg: &BdConfig,
-    ids: &[String],
-    repository: Option<&str>,
-) -> Result<Vec<IssueSummary>, BdError> {
     if ids.is_empty() {
         return Ok(Vec::new());
     }
     let joined = ids.join(",");
-    let metadata_field = repository.map(|value| format!("repository={value}"));
-    let mut args = vec!["list", "--id", &joined];
-    if let Some(field) = metadata_field.as_deref() {
-        args.extend(["--metadata-field", field]);
-    }
+    let metadata_field = format!("repository={repository}");
+    let mut args = vec!["list", "--id", &joined, "--metadata-field", &metadata_field];
     args.extend(["--limit", "0", "--brief", "--flat", "--json"]);
     let data = invoke::read(cfg, &args).await?;
     Ok(list(&data))
@@ -1630,5 +1660,98 @@ mod tests {
                 "expected {expected:?} in {error:?}"
             );
         }
+    }
+
+    fn exact_row(id: &str, revision: Value) -> Value {
+        json!({
+            "id": id,
+            "title": format!("Issue {id}"),
+            "status": "open",
+            "priority": 1,
+            "issue_type": "task",
+            "metadata": {"repository": "/tmp/repository"},
+            "revision": revision,
+        })
+    }
+
+    #[test]
+    fn exact_issue_hydration_preserves_order_and_signed_revision_digits() {
+        let requested = vec!["issue-a".to_owned(), "issue-b".to_owned()];
+        let rows = json!([
+            exact_row("issue-b", json!(-6_192_208_415_116_251_521i64)),
+            exact_row("issue-a", json!(9_146_914_492_635_073_757i64)),
+        ]);
+        let issues = exact_issue_rows(&rows, &requested).expect("exact bounded hydration");
+        assert_eq!(
+            issues
+                .iter()
+                .map(|issue| issue.id.as_str())
+                .collect::<Vec<_>>(),
+            ["issue-a", "issue-b"]
+        );
+        assert_eq!(issues[0].revision.as_deref(), Some("9146914492635073757"));
+        assert_eq!(issues[1].revision.as_deref(), Some("-6192208415116251521"));
+        assert_eq!(
+            issues[0].metadata.get("repository").map(String::as_str),
+            Some("/tmp/repository")
+        );
+    }
+
+    #[test]
+    fn exact_issue_hydration_fails_closed_without_manufacturing_missing_rows() {
+        let requested = vec!["issue-a".to_owned(), "issue-b".to_owned()];
+        let missing = exact_issue_rows(&json!([exact_row("issue-a", json!(17))]), &requested)
+            .expect("a deleted issue remains absent");
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].id, "issue-a");
+
+        let revisionless = exact_issue_rows(
+            &json!([exact_row("issue-a", Value::Null)]),
+            &["issue-a".to_owned()],
+        )
+        .expect("a revision-less row remains visible as malformed admission input");
+        assert_eq!(revisionless[0].revision, None);
+
+        for (rows, expected) in [
+            (
+                json!([
+                    exact_row("issue-a", json!(17)),
+                    exact_row("issue-a", json!(18)),
+                ]),
+                "duplicate issue id",
+            ),
+            (
+                json!([
+                    exact_row("issue-a", json!(17)),
+                    exact_row("other", json!(18)),
+                ]),
+                "unrequested issue id",
+            ),
+            (
+                json!([{
+                    "id": "issue-a",
+                    "title": "Issue A",
+                    "status": "open",
+                    "issue_type": "task",
+                    "revision": {},
+                }]),
+                "malformed revision",
+            ),
+        ] {
+            let error = exact_issue_rows(&rows, &requested)
+                .expect_err("ambiguous or malformed rows must fail closed");
+            assert!(
+                error.contains(expected),
+                "expected {expected:?} in {error:?}"
+            );
+        }
+
+        let duplicate_request = vec!["issue-a".to_owned(), "issue-a".to_owned()];
+        assert!(exact_issue_rows(
+            &json!([exact_row("issue-a", json!(17))]),
+            &duplicate_request,
+        )
+        .expect_err("duplicate request is ambiguous")
+        .contains("requested issue ids are not unique"));
     }
 }

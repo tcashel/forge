@@ -1,6 +1,6 @@
 {
   "name": "forged",
-  "version": "0.3.0",
+  "version": "0.3.1",
   "description": "Forge-owned conversational planning and portfolio control over native Beads and typed Forged operations.",
   "author": {
     "name": "Tripp Cashel"

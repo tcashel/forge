@@ -242,6 +242,7 @@ fn operations_keeps_durable_truth_when_beads_is_unavailable() {
     env.forged(&["init"]);
     fabricate_run(&env, "durable-outage");
     env.set_bd_list_unreachable(true);
+    env.set_bd_show_unreachable(true);
 
     let (code, response) = env.forged(&["operations", "overview"]);
     assert_eq!(

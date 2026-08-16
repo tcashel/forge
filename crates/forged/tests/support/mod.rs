@@ -634,10 +634,15 @@ bump_revision() {
   n=$(cat "$state/$id.revseq" 2>/dev/null || echo 0)
   n=$((n + 1))
   printf '%s' "$n" > "$state/$id.revseq"
-  printf -- '-61922084151162515%02d' "$((n % 100))" > "$state/$id.revision"
+  if [ -f "$state/$id.force-null-revision" ]; then
+    printf 'null' > "$state/$id.revision"
+  else
+    printf -- '-61922084151162515%02d' "$((n % 100))" > "$state/$id.revision"
+  fi
 }
 issue_json() {
   id=$1
+  shape=${2:-show}
   title=$(cat "$state/$id.title" 2>/dev/null || echo "$id")
   description=$(cat "$state/$id.description" 2>/dev/null || true)
   status=$(cat "$state/$id.status" 2>/dev/null || echo open)
@@ -655,7 +660,8 @@ issue_json() {
   # bd emits `revision` on show/children only, as a signed 64-bit integer
   # that changes on every write.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
-  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s,"revision":%s,"updated_at":"2026-08-14T00:00:00Z","parent":%s,"dependencies":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision" "$parent_json" "$dependencies"
+  if [ "$shape" = brief ]; then revision_json=""; else revision_json=",\"revision\":$revision"; fi
+  printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s%s,"updated_at":"2026-08-14T00:00:00Z","parent":%s,"dependencies":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision_json" "$parent_json" "$dependencies"
 }
 case "$cmd" in
   version)
@@ -744,6 +750,15 @@ case "$cmd" in
       printf 'bd: connection refused\n' >&2
       exit 1
     fi
+    # Some tests isolate the packet's spec-fence read from admission's full
+    # multi-row hydrate. Pinned admission adds --brief-deps; show_issue does
+    # not, so the marker can fail only the latter contract.
+    if [ -f "$state/spec-show.unreachable" ]; then
+      case " $* " in
+        *" --brief-deps "*) ;;
+        *) printf 'bd: connection refused\n' >&2; exit 1 ;;
+      esac
+    fi
     # A direct run-start test has no reason to maintain the global frontier
     # fixture by hand. Remember every shown issue so `bd ready` can expose
     # open ones when no explicit frontier was seeded. Tests that exercise a
@@ -755,6 +770,11 @@ case "$cmd" in
       case "$id" in --*) continue ;; esac
       : > "$state/$id.seen"
       [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      if [ -f "$state/$id.revision-null-after-show" ]; then
+        printf 'null' > "$state/$id.revision"
+        : > "$state/$id.force-null-revision"
+        rm -f "$state/$id.revision-null-after-show"
+      fi
     done
     printf ']}\n' ;;
   comments)
@@ -808,7 +828,7 @@ case "$cmd" in
       if [ -n "$limit" ] && [ "$limit" -gt 0 ] 2>/dev/null && [ "$shown" -ge "$limit" ]; then
         continue
       fi
-      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id" brief
       shown=$((shown + 1))
     done
     IFS=$oldifs
@@ -1288,6 +1308,16 @@ impl TestEnv {
         .unwrap_or_else(|_| "-6192208415116251521".to_owned())
     }
 
+    /// Return the current full row once, then make every later `bd show` for
+    /// this Bead carry a null revision. This models a row becoming malformed
+    /// after controller admission but before packet admission.
+    pub fn null_revision_after_next_show(&self, bead: &str) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        std::fs::write(state.join(format!("{bead}.revision-null-after-show")), "1")
+            .expect("arm revision removal");
+    }
+
     /// Seed a bead whose OWN fields are the spec — the supported route.
     pub fn seed_bead_spec(&self, bead: &str, description: &str, acceptance: &str) {
         self.set_bead_field(bead, "title", &format!("Bead {bead}"));
@@ -1303,6 +1333,19 @@ impl TestEnv {
         let marker = state.join("show.unreachable");
         if unreachable {
             std::fs::write(marker, "1").expect("set bd outage");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+
+    /// Make only the plain `bd show <id> --json` spec-fence read fail while
+    /// admission's `show <ids...> --brief-deps --json` hydrate remains live.
+    pub fn set_bd_spec_show_unreachable(&self, unreachable: bool) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        let marker = state.join("spec-show.unreachable");
+        if unreachable {
+            std::fs::write(marker, "1").expect("set bd spec-read outage");
         } else {
             let _ = std::fs::remove_file(marker);
         }

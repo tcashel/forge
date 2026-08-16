@@ -15,7 +15,7 @@ use forged_ledger::{
     AttemptState, DesiredReconcileOutcome, DesiredReconcileUpdate, DesiredRestartReservation,
     DesiredState, DesiredSubjectKind,
 };
-use forged_types::{AdmissionOutcome, AdmissionSubjectKind};
+use forged_types::{AdmissionOutcome, AdmissionReason, AdmissionSubjectKind};
 #[cfg(feature = "failpoints")]
 use nix::errno::Errno;
 #[cfg(feature = "failpoints")]
@@ -400,6 +400,188 @@ fn exhaust_restart_budget(env: &TestEnv, run: &str) -> forged_ledger::DesiredWor
         .expect("desired row");
     ledger.close().expect("close ledger");
     exhausted
+}
+
+#[test]
+fn show_hydrated_revision_admits_controller_and_packet() {
+    let env = TestEnv::new("adm-show");
+    let run = "adm-show";
+    start_run(&env, run);
+    let calls_before = env.bd_calls().len();
+    env.set_scenario("implement", "hang", 1);
+
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "adm-show-submit",
+    ]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    assert!(
+        submitted["result"]["controller"].is_object(),
+        "a complete show row must not false-defer the controller: {submitted}"
+    );
+    wait_until("show-hydrated packet admission", || {
+        provider_starts(&env, "implementation").len() == 1
+    });
+
+    let ledger = env.ledger();
+    let decisions = ledger
+        .latest_admission_decisions(None, None)
+        .expect("admission decisions");
+    assert!(decisions.iter().any(|decision| {
+        decision.subject_kind == AdmissionSubjectKind::Run
+            && decision.subject_id == run
+            && decision.outcome == AdmissionOutcome::Admitted
+    }));
+    assert!(decisions.iter().any(|decision| {
+        decision.subject_kind == AdmissionSubjectKind::Packet
+            && decision.subject_id == format!("{run}/implementation/0")
+            && decision.outcome == AdmissionOutcome::Admitted
+    }));
+    ledger.close().expect("close ledger");
+
+    let calls = &env.bd_calls()[calls_before..];
+    assert!(
+        calls
+            .iter()
+            .filter(|call| call.starts_with(&format!("show {run} ")))
+            .all(|call| {
+                call == &format!("show {run} --json")
+                    || call == &format!("show {run} --brief-deps --json")
+            }),
+        "every exact read is a bounded one-id show: {calls:?}"
+    );
+    assert!(
+        !calls.iter().any(|call| call.starts_with("list --id ")),
+        "controller and packet admission must not use revision-less brief list: {calls:?}"
+    );
+
+    stop_run(&env, run);
+    no_live_reservations(&env);
+}
+
+#[test]
+fn custom_status_defers_only_that_row_in_a_mixed_admission_batch() {
+    let env = TestEnv::new("adm-custom-status");
+    let custom = "adm-awaiting-review";
+    let open = "adm-open";
+    start_run(&env, custom);
+    start_run(&env, open);
+    env.set_bead_field(custom, "status", "awaiting_review");
+    env.set_bead_field(custom, "priority", "0");
+    env.set_bead_field(open, "priority", "1");
+    env.authorize_run(custom);
+    env.authorize_run(open);
+    env.set_scenario("implement", "hang", 1);
+    let calls_before = env.bd_calls().len();
+
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "mixed admission tick: {tick}");
+    wait_until("open peer provider start", || {
+        provider_starts(&env, "implementation")
+            .iter()
+            .any(|start| start.starts_with(&format!("{open}/")))
+    });
+
+    let ledger = env.ledger();
+    let decisions = ledger
+        .latest_admission_decisions(Some(AdmissionSubjectKind::Run), None)
+        .expect("run admission decisions")
+        .into_iter()
+        .filter(|decision| decision.subject_id == custom || decision.subject_id == open)
+        .collect::<Vec<_>>();
+    let custom_decision = decisions
+        .iter()
+        .find(|decision| decision.subject_id == custom)
+        .expect("custom-status decision");
+    assert_eq!(custom_decision.outcome, AdmissionOutcome::Deferred);
+    assert_eq!(custom_decision.reason, AdmissionReason::BeadNotRunnable);
+    let open_decision = decisions
+        .iter()
+        .find(|decision| decision.subject_id == open)
+        .expect("open decision");
+    assert_eq!(open_decision.outcome, AdmissionOutcome::Admitted);
+    assert_eq!(open_decision.reason, AdmissionReason::CapacityAvailable);
+    assert_eq!(
+        custom_decision.batch_id, open_decision.batch_id,
+        "both rows must be evaluated from one exact hydration batch"
+    );
+    ledger.close().expect("close ledger");
+
+    let starts = provider_starts(&env, "implementation");
+    assert!(
+        starts
+            .iter()
+            .all(|start| start.starts_with(&format!("{open}/"))),
+        "the custom-status row is retained but never runnable: {starts:?}"
+    );
+    let calls = &env.bd_calls()[calls_before..];
+    assert!(
+        calls
+            .iter()
+            .any(|call| { call == &format!("show {custom} {open} --brief-deps --json") }),
+        "the mixed batch must use one native exact hydrate: {calls:?}"
+    );
+
+    stop_run(&env, open);
+    stop_run(&env, custom);
+    no_live_reservations(&env);
+}
+
+#[test]
+fn missing_packet_revision_defers_without_reservation_or_provider_effect() {
+    let env = TestEnv::new("adm-null");
+    let run = "adm-null";
+    start_run(&env, run);
+    // Controller admission consumes the armed full row. Every later show is
+    // revision-less, including the packet's exact admission read.
+    env.null_revision_after_next_show(run);
+
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "adm-null-submit",
+    ]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    assert!(
+        submitted["result"]["controller"].is_object(),
+        "the initial full row admits the controller: {submitted}"
+    );
+    wait_until("packet BeadMalformed decision", || {
+        let ledger = env.ledger();
+        let found = ledger
+            .latest_admission_decisions(Some(AdmissionSubjectKind::Packet), None)
+            .expect("packet admission decisions")
+            .iter()
+            .any(|decision| {
+                decision.subject_id == format!("{run}/implementation/0")
+                    && decision.outcome == AdmissionOutcome::Deferred
+                    && decision.reason == AdmissionReason::BeadMalformed
+            });
+        ledger.close().expect("close ledger");
+        found
+    });
+    assert!(
+        env.provider_log().is_empty(),
+        "revision-less packet admission must have zero provider effect"
+    );
+
+    let ledger = env.ledger();
+    let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+    assert!(snapshot.reservations.iter().all(|reservation| {
+        reservation.subject_kind != AdmissionSubjectKind::Packet
+            || reservation.subject_id != format!("{run}/implementation/0")
+    }));
+    ledger.close().expect("close ledger");
+
+    stop_run(&env, run);
+    no_live_reservations(&env);
 }
 
 #[test]

@@ -2060,6 +2060,7 @@ mod settle_tests {
                 "title": "settlement test",
                 "status": "open",
                 "priority": 2,
+                "issue_type": "task",
                 "revision": 1,
                 "metadata": {"repository": repository.to_string_lossy()},
             }],
