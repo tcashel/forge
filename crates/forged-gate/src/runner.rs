@@ -108,6 +108,13 @@ async fn run_one(req: &GateRequest, n: usize, command: &str) -> Result<GateRow, 
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    // A gate runs the repository's own commands. Inheriting the controller's
+    // ownership variables would let those commands read an attempt claim the
+    // controller holds and they do not, so a repository test that asserts
+    // ownership fencing fails against a claim it never made.
+    for name in forged_types::CONTROLLER_ENV {
+        cmd.env_remove(name);
+    }
     {
         // Own process group, so a timeout can kill every descendant.
         use std::os::unix::process::CommandExt;
@@ -363,5 +370,60 @@ mod tests {
     #[test]
     fn kill_group_without_a_recorded_pgid_is_success() {
         assert!(kill_group(None).is_ok());
+    }
+
+    /// A gate child must not inherit the controller's ownership variables.
+    ///
+    /// The controller sets them to fence its own attempt claim. A gate runs
+    /// the repository's commands, so a child that inherits them reads an
+    /// ownership claim it never made — which is how a repository's own
+    /// fencing tests fail against a live controller and pass everywhere else.
+    #[tokio::test]
+    async fn a_gate_child_does_not_inherit_the_controller_environment() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let cwd = root.path().join("cwd");
+        let artifacts = root.path().join("artifacts");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+
+        // The parent holds every controller variable, exactly as a detached
+        // controller does when it reaches its gate. The guard restores the
+        // process on every exit path: a leaked variable would silently change
+        // what a sibling test observes.
+        struct ControllerEnvGuard;
+        impl Drop for ControllerEnvGuard {
+            fn drop(&mut self) {
+                for name in forged_types::CONTROLLER_ENV {
+                    std::env::remove_var(name);
+                }
+            }
+        }
+        let _guard = ControllerEnvGuard;
+        for name in forged_types::CONTROLLER_ENV {
+            std::env::set_var(name, "set-by-the-controller");
+        }
+
+        let printed = forged_types::CONTROLLER_ENV
+            .iter()
+            .map(|name| format!("printf '%s=[%s]\\n' {name} \"${{{name}-}}\""))
+            .collect::<Vec<_>>()
+            .join("; ");
+        let request = GateRequest {
+            commands: vec![printed],
+            cwd,
+            artifacts_dir: artifacts.clone(),
+            timeout_per_command: Duration::from_secs(30),
+            preview_bytes: 4000,
+        };
+        let outcome = run_gates(&request).await.expect("gate runs");
+
+        assert_eq!(outcome.rows.len(), 1, "one command, one row");
+        let stdout = std::fs::read_to_string(artifacts.join("gate-1-stdout.log"))
+            .expect("gate stdout artifact");
+        for name in forged_types::CONTROLLER_ENV {
+            assert!(
+                stdout.contains(&format!("{name}=[]")),
+                "{name} leaked into the gate child; stdout was:\n{stdout}"
+            );
+        }
     }
 }
