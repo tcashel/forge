@@ -40,14 +40,6 @@ const TAIL_INTERVAL: Duration = Duration::from_millis(40);
 const RENDER_DRAIN_BUDGET: Duration = Duration::from_millis(250);
 const RUNNER_TRANSPORT_EXIT: i32 = 125;
 
-const CONTROLLER_ENV: [&str; 5] = [
-    "FORGED_CONTROLLER_PID_PATH",
-    "FORGED_CONTROLLER_LSTART_PATH",
-    "FORGED_CONTROLLER_SCOPE",
-    "FORGED_CONTROLLER_ID",
-    "FORGED_CONTROLLER_GENERATION",
-];
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 enum ProviderKindV1 {
@@ -552,7 +544,7 @@ fn run_request(
         .stdin(Stdio::from(prompt))
         .stdout(Stdio::from(raw_child))
         .stderr(Stdio::inherit());
-    for name in CONTROLLER_ENV {
+    for name in forged_types::CONTROLLER_ENV {
         command.env_remove(name);
     }
     let mut child = match command.spawn() {

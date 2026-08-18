@@ -6,6 +6,7 @@ pub mod admission;
 pub mod attention;
 pub mod canonical;
 pub mod contract;
+pub mod controller_env;
 pub mod envelope;
 pub mod error;
 pub mod herdr_layout;
@@ -41,6 +42,7 @@ pub use contract::{
     SeatExecutionV1, SeatId, SeatPurpose, EXECUTION_PACKAGE_SCHEMA_V1, PROFILE_SCHEMA_V1,
     RESOLVED_ROSTER_SCHEMA_V1, ROSTER_SCHEMA_V1,
 };
+pub use controller_env::CONTROLLER_ENV;
 pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
 pub use herdr_layout::{
