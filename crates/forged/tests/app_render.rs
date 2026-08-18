@@ -17,7 +17,7 @@ use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
     render_dispatch_without_server_tools, render_resolution,
     render_resolution_without_server_tools, require_node, run_agent_sessions_host,
-    run_split_app_host,
+    run_split_app_host, run_split_app_host_scenario,
 };
 
 /// One hoisted per-seat row, the shape `epic_overview` stamps.
@@ -875,6 +875,119 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
             }
         }
     }
+}
+
+/// A degraded plan source must reach the model as WORDS.
+///
+/// On 2026-08-17 one unsupported dependency kind made the whole plan source
+/// unavailable, and the Operations App told the model an unqualified
+/// "0 shown of 0" — the structured response carried the source-health error
+/// the whole time. The context now names the non-available source and its
+/// bounded error before any count, and an available source stays concise.
+#[test]
+fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let error = "hydrated issue \"beads-cvr\" dependency \"beads-vdv\" has unknown dependency type \"supersedes\"";
+    let overview = |plan: Value, entries: Value, coverage: Value| {
+        json!({
+            "structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1",
+                "scope": {"repository": "/repo"},
+                "sourceHealth": {
+                    "ledger": {"state": "available"},
+                    "beads": {"state": "available", "error": Value::Null},
+                    "plan": plan,
+                },
+                "coverage": coverage,
+                "counts": {"live": 0, "queued": 0, "attention": 0, "planOnly": 0, "reviewReady": 0},
+                "spend": {"costUsdKnown": 0},
+                "attention": [],
+                "queue": {"groups": [{"code": "planned", "label": "Planned", "total": 0, "shown": 0, "entries": entries}]},
+            }},
+        })
+    };
+    let scenario = |result: Value| {
+        json!({
+            "toolResult": result,
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+        })
+    };
+
+    let degraded = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &scenario(overview(
+            json!({"state": "unavailable", "error": error, "discovered": 0, "limit": 500, "truncated": false}),
+            json!([]),
+            json!({"total": 0, "shown": 0, "matching": 0, "truncated": false}),
+        )),
+    );
+    let context = degraded["modelContext"]
+        .as_array()
+        .and_then(|texts| texts.last())
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the App pushed no model context: {degraded}"));
+    let degradation = context
+        .find("plan unavailable")
+        .unwrap_or_else(|| panic!("the degraded plan source is not named: {context}"));
+    assert!(
+        context.contains(error),
+        "the bounded source-health error never reached the model: {context}"
+    );
+    let counts = context
+        .find("shown of")
+        .unwrap_or_else(|| panic!("the counts line is missing: {context}"));
+    assert!(
+        degradation < counts,
+        "zero counts must not be read before the reason they are zero: {context}"
+    );
+    assert!(
+        context.contains("NOT authoritative"),
+        "an empty queue must never read as authoritative coverage: {context}"
+    );
+    // The visual surface is unchanged: the pills still report every source.
+    let rendered = degraded["text"].to_string();
+    for pill in ["ledger available", "beads available", "plan unavailable"] {
+        assert!(
+            rendered.contains(pill),
+            "health pill {pill} is missing: {rendered}"
+        );
+    }
+
+    let healthy = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &scenario(overview(
+            json!({"state": "available", "error": Value::Null, "discovered": 1, "limit": 500, "truncated": false}),
+            json!([{"id": "plan-one", "state": "planned", "source": "live-plan", "identity": {"displayTitle": "Planned slice"}, "detailTarget": Value::Null}]),
+            json!({"total": 1, "shown": 1, "matching": 1, "truncated": false}),
+        )),
+    );
+    let context = healthy["modelContext"]
+        .as_array()
+        .and_then(|texts| texts.last())
+        .and_then(Value::as_str)
+        .unwrap_or_else(|| panic!("the App pushed no model context: {healthy}"));
+    assert!(
+        !context.contains("Source degradation"),
+        "an available source stays concise: {context}"
+    );
+    assert!(
+        context.starts_with("Forged Operations for /repo: 1 shown of 1 matching"),
+        "the ordinary context is unchanged: {context}"
+    );
+    assert!(
+        context.contains("- planned: plan-one Planned slice"),
+        "the ordinary context still names its rows: {context}"
+    );
+    assert!(
+        healthy["text"].to_string().contains("plan available"),
+        "health pills continue to render: {healthy}"
+    );
 }
 
 #[test]

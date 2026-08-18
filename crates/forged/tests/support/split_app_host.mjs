@@ -395,6 +395,9 @@ const mapNodes = nodes.filter((node) => node.class.startsWith("node"));
 const sessionRows = nodes.filter((node) => node.class === "session-row");
 const text = nodes.map((node) => node.text).filter((value) => value !== undefined).map(String);
 const sizeNotifications = posted.filter((message) => message.method === "ui/notifications/size-changed");
+const modelContext = posted
+  .filter((message) => message.method === "ui/update-model-context")
+  .map((message) => (message.params?.content || []).map((part) => part.text).join("\n"));
 process.stdout.write(JSON.stringify({
   operations,
   workMap,
@@ -415,6 +418,7 @@ process.stdout.write(JSON.stringify({
   changedTheme,
   changedVariable,
   sizeNotifications,
+  modelContext,
   beforeTeardown,
   afterTeardown: {
     timers: activeTimers.size,
