@@ -351,6 +351,7 @@ fn dependency_kind(kind: forged_beads::PlanDependencyType) -> WorkMapEdgeKind {
         forged_beads::PlanDependencyType::ParentChild => WorkMapEdgeKind::ParentChild,
         forged_beads::PlanDependencyType::Related => WorkMapEdgeKind::Related,
         forged_beads::PlanDependencyType::DiscoveredFrom => WorkMapEdgeKind::DiscoveredFrom,
+        forged_beads::PlanDependencyType::Supersedes => WorkMapEdgeKind::Supersedes,
     }
 }
 

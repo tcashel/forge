@@ -191,6 +191,71 @@ fn map_preserves_plan_twins_multiple_executions_and_native_edge_direction() {
     }));
 }
 
+/// `supersedes` survives the map as itself. Collapsing it into `related`
+/// would lose the one fact the edge carries — which plan replaced which —
+/// and promoting it into a blocker would invent a prerequisite out of
+/// history.
+#[test]
+fn a_supersedes_edge_keeps_its_native_kind_and_direction() {
+    let env = TestEnv::new("forged-work-map-supersedes");
+    env.forged(&["init"]);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+
+    env.set_bead_field("plan-replacement", "title", "Replacement slice");
+    env.set_bead_field("plan-replacement", "status", "open");
+    env.set_bead_field(
+        "plan-replacement",
+        "dependencies",
+        r#"[{"id":"plan-superseded","dependency_type":"supersedes","status":"open"}]"#,
+    );
+    env.set_bead_repository("plan-replacement", &repository);
+
+    let (code, response) = env.forged(&[
+        "work",
+        "map",
+        "--scope",
+        "repository",
+        "--repository",
+        &repository,
+    ]);
+    assert_eq!(code, 0, "work map: {response}");
+    assert_eq!(
+        response["result"]["sourceHealth"]["plan"]["state"], "available",
+        "a provenance edge cannot degrade the plan source: {response}"
+    );
+    let provenance = edge(
+        &response,
+        "plan:plan-replacement",
+        "supersedes",
+        "plan:plan-superseded",
+    );
+    assert_eq!(provenance["evidence"], json!(["plan.dependencies"]));
+    assert_eq!(
+        provenance["contextOnly"], true,
+        "the superseded bead is outside the hydrated scope, so it is boundary context: {response}"
+    );
+    let rows = nodes(&response);
+    assert_eq!(rows["plan:plan-superseded"]["contextOnly"], true);
+    assert_eq!(
+        rows["plan:plan-superseded"]["plan"]["status"], "open",
+        "boundary context carries the status the edge reported: {response}"
+    );
+    assert_eq!(
+        rows["plan:plan-replacement"]["plan"]["readiness"], "ready",
+        "provenance never changes graph readiness: {response}"
+    );
+    assert_eq!(
+        response["result"]["graphHealth"],
+        json!({
+            "healthy": true,
+            "cycleNodes": [],
+            "danglingTargets": [],
+            "missingBlockerStatus": [],
+        }),
+        "a supersedes edge is never missing-blocker health: {response}"
+    );
+}
+
 #[test]
 fn epic_scope_unions_native_and_legacy_children_in_three_reads() {
     let env = TestEnv::new("forged-work-map-epic");
