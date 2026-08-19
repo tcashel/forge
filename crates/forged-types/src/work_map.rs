@@ -104,6 +104,10 @@ pub enum WorkMapEdgeKind {
     ParentChild,
     Related,
     DiscoveredFrom,
+    /// Native `supersedes` provenance, kept as itself rather than collapsed
+    /// into `related`: additive to `forged.work-map/1`, which prints edge
+    /// kinds generically.
+    Supersedes,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

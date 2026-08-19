@@ -16,14 +16,35 @@ mod support;
 
 use std::path::Path;
 
-use forged_beads::show_issue;
-use serde_json::Value;
+use forged_beads::{
+    plan_inventory, show_issue, PlanDependencyStatus, PlanDependencyType, PlanReadiness,
+};
+use serde_json::{json, Value};
 
 const CONTEXT: &str = "the context body";
 const ACCEPTANCE: &str = "the acceptance body";
 const DESIGN: &str = "the design body";
 const NOTES: &str = "the notes body";
 const SPEC_ID: &str = "spec-42";
+
+/// Read one bead through the exact `show --brief-deps --json` shape the live
+/// plan hydrate uses, and return its first data object.
+fn brief_deps(bd: &Path, s: &support::Scratch, id: &str) -> Value {
+    let out = support::raw_bd(bd, s, &["show", id, "--brief-deps", "--json"])
+        .output()
+        .expect("spawning bd show --brief-deps");
+    assert!(
+        out.status.success(),
+        "bd show --brief-deps failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("show envelope");
+    match value.get("data").cloned().expect("show envelope data") {
+        Value::Array(items) => items.into_iter().next().expect("bd show returned no issue"),
+        other => other,
+    }
+}
 
 /// Create a bead carrying every spec field, returning its id.
 fn create_spec_bead(bd: &Path, s: &support::Scratch) -> String {
@@ -247,5 +268,119 @@ async fn a_lease_write_mints_a_new_revision_though_the_spec_is_untouched() {
         before_revision,
         "a lease claim mints a new revision: fencing a packet on the revision \
          would call forged's own resume drift"
+    );
+}
+
+/// The 2026-08-17 compatibility incident, against the pinned binary itself.
+///
+/// bd 1.2.1 accepts `supersedes` as a native dependency type, and one such
+/// edge on a live plan row used to make the ENTIRE repository-scoped plan
+/// source unavailable — Operations then reported an unqualified empty plan.
+/// This probe creates the real edge and reads it back through the same
+/// `show --brief-deps --json` shape plan inventory uses, so a bd upgrade
+/// that renames the relation or moves it out of `dependencies` fails here
+/// rather than silently emptying an operator's plan again.
+#[tokio::test]
+async fn a_native_supersedes_edge_hydrates_as_non_blocking_provenance() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("spec-contract-supersedes");
+    support::init_store(&bd, &s);
+    let superseded = support::create_bead(&bd, &s, "superseded original");
+    let replacement = support::create_bead(&bd, &s, "superseding replacement");
+
+    let out = support::raw_bd(
+        &bd,
+        &s,
+        &[
+            "dep",
+            "add",
+            &replacement,
+            &superseded,
+            "--type",
+            "supersedes",
+            "--json",
+        ],
+    )
+    .output()
+    .expect("spawning bd dep add --type supersedes");
+    assert!(
+        out.status.success(),
+        "pinned bd refused a native supersedes edge: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The raw shape first: these exact keys, on the SOURCE row, are what the
+    // plan hydrate reads. The superseded target carries no edge of its own.
+    let raw = brief_deps(&bd, &s, &replacement);
+    let dependencies = raw
+        .get("dependencies")
+        .and_then(Value::as_array)
+        .unwrap_or_else(|| panic!("bd dropped the supersedes edge from the source row: {raw}"));
+    assert_eq!(dependencies.len(), 1, "exactly one edge: {raw}");
+    assert_eq!(
+        dependencies[0].get("id").and_then(Value::as_str),
+        Some(superseded.as_str()),
+        "the edge points at the superseded bead: {raw}"
+    );
+    assert_eq!(
+        dependencies[0]
+            .get("dependency_type")
+            .and_then(Value::as_str),
+        Some("supersedes"),
+        "bd spells the native relation `supersedes`: {raw}"
+    );
+    let target = brief_deps(&bd, &s, &superseded);
+    assert!(
+        target
+            .get("dependencies")
+            .and_then(Value::as_array)
+            .is_none_or(Vec::is_empty),
+        "the native edge is directed source-to-target only: {target}"
+    );
+
+    // And the typed projection forged actually serves.
+    let cfg = support::cfg_for(&bd, &s);
+    let inventory = plan_inventory(&cfg, None, 10)
+        .await
+        .expect("a live plan carrying a supersedes edge must hydrate");
+    assert_eq!(inventory.discovered, 2, "both scratch beads are live");
+    assert!(!inventory.truncated);
+    let source = inventory
+        .issues
+        .iter()
+        .find(|issue| issue.issue.id == replacement)
+        .unwrap_or_else(|| {
+            panic!(
+                "the superseding plan row is missing: {:?}",
+                inventory.issues
+            )
+        });
+    assert_eq!(source.dependencies.len(), 1);
+    assert_eq!(source.dependencies[0].id, superseded);
+    assert_eq!(
+        source.dependencies[0].dependency_type,
+        PlanDependencyType::Supersedes
+    );
+    assert!(
+        !source.dependencies[0].dependency_type.blocks_readiness(),
+        "provenance is not a scheduling prerequisite"
+    );
+    assert_eq!(
+        source.dependencies[0].status,
+        Some(PlanDependencyStatus::Open),
+        "the superseded bead is still open — exactly the incident's shape"
+    );
+    assert_eq!(
+        source.readiness(),
+        PlanReadiness::Ready,
+        "an open superseded target must not block its replacement"
+    );
+    assert_eq!(
+        serde_json::to_value(&source.dependencies).expect("serialize dependencies"),
+        json!([{"id": superseded, "dependencyType": "supersedes", "status": "open"}]),
+        "the wire keeps the native kind rather than collapsing it"
     );
 }

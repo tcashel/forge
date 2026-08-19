@@ -73,9 +73,15 @@ pub struct PlanDependency {
 
 /// Closed subset of pinned bd dependency kinds supported by plan inventory.
 ///
-/// Only `blocks` affects scheduling readiness. The other three coordinates
+/// Only `blocks` affects scheduling readiness. The other four coordinates
 /// remain visible to consumers as hierarchy, context, or provenance without
 /// being promoted into blockers.
+///
+/// The subset stays closed on purpose: pinned bd 1.2.1 also advertises
+/// `tracks`, `until`, `caused-by`, `validates`, and `relates-to`, and each
+/// needs its own semantic review before a plan row may carry it. An
+/// unadjudicated kind must keep failing the hydrate closed rather than being
+/// skipped or coerced into `related`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "kebab-case")]
 pub enum PlanDependencyType {
@@ -87,6 +93,10 @@ pub enum PlanDependencyType {
     Related,
     /// A non-scheduling provenance link.
     DiscoveredFrom,
+    /// A non-scheduling provenance link from a replacement to the plan it
+    /// replaced. The superseded target's status — including a missing or
+    /// still-open one — is history, never a prerequisite.
+    Supersedes,
 }
 
 impl PlanDependencyType {
@@ -97,10 +107,14 @@ impl PlanDependencyType {
             Self::ParentChild => "parent-child",
             Self::Related => "related",
             Self::DiscoveredFrom => "discovered-from",
+            Self::Supersedes => "supersedes",
         }
     }
 
     /// Whether this edge can prevent the issue from being ready.
+    ///
+    /// Only `blocks` does. `supersedes` in particular points at work the
+    /// source replaced, which is routinely open or closed after the fact.
     pub const fn blocks_readiness(self) -> bool {
         matches!(self, Self::Blocks)
     }
@@ -115,6 +129,7 @@ impl TryFrom<&str> for PlanDependencyType {
             "parent-child" => Ok(Self::ParentChild),
             "related" => Ok(Self::Related),
             "discovered-from" => Ok(Self::DiscoveredFrom),
+            "supersedes" => Ok(Self::Supersedes),
             other => Err(format!("unknown dependency type {other:?}")),
         }
     }
@@ -1490,10 +1505,11 @@ mod tests {
                 {"id":"hard","dependency_type":"blocks","status":"closed"},
                 {"id":"parent","dependency_type":"parent-child","status":"open"},
                 {"id":"context","dependency_type":"related","status":"in_progress"},
-                {"id":"origin","dependency_type":"discovered-from"}
+                {"id":"origin","dependency_type":"discovered-from"},
+                {"id":"replaced","dependency_type":"supersedes","status":"open"}
             ]),
         ))
-        .expect("the four pinned dependency kinds");
+        .expect("the five pinned dependency kinds");
 
         assert_eq!(item.readiness(), PlanReadiness::Ready);
         assert_eq!(
@@ -1506,6 +1522,7 @@ mod tests {
                 PlanDependencyType::ParentChild,
                 PlanDependencyType::Related,
                 PlanDependencyType::DiscoveredFrom,
+                PlanDependencyType::Supersedes,
             ]
         );
         assert_eq!(
@@ -1514,9 +1531,64 @@ mod tests {
                 {"id":"hard","dependencyType":"blocks","status":"closed"},
                 {"id":"parent","dependencyType":"parent-child","status":"open"},
                 {"id":"context","dependencyType":"related","status":"in_progress"},
-                {"id":"origin","dependencyType":"discovered-from","status":null}
+                {"id":"origin","dependencyType":"discovered-from","status":null},
+                {"id":"replaced","dependencyType":"supersedes","status":"open"}
             ])
         );
+    }
+
+    /// The 2026-08-17 incident: one legitimate `supersedes` edge made the
+    /// whole repository-scoped plan source unavailable. It is provenance —
+    /// the superseded target's status is history in every shape bd emits it,
+    /// so it can never move the source off `ready`.
+    #[test]
+    fn a_supersedes_edge_is_provenance_and_never_moves_readiness() {
+        for status in [
+            json!({"id":"replaced","dependency_type":"supersedes","status":"open"}),
+            json!({"id":"replaced","dependency_type":"supersedes","status":"blocked"}),
+            json!({"id":"replaced","dependency_type":"supersedes","status":"closed"}),
+            json!({"id":"replaced","dependency_type":"supersedes"}),
+        ] {
+            let item = plan_issue(&hydrated("plan-a", "open", json!([status.clone()])))
+                .unwrap_or_else(|error| panic!("supersedes {status} was rejected: {error}"));
+            assert_eq!(
+                item.readiness(),
+                PlanReadiness::Ready,
+                "supersedes {status} changed readiness"
+            );
+            assert_eq!(item.dependencies.len(), 1, "the edge stays visible");
+            assert_eq!(
+                item.dependencies[0].dependency_type,
+                PlanDependencyType::Supersedes
+            );
+            assert!(!item.dependencies[0].dependency_type.blocks_readiness());
+            assert_eq!(item.dependencies[0].id, "replaced");
+        }
+    }
+
+    /// The neighbours bd 1.2.1 also advertises are NOT admitted with it: a
+    /// kind forged has not adjudicated must still fail the hydrate closed.
+    #[test]
+    fn unadjudicated_bd_dependency_kinds_remain_closed() {
+        for kind in [
+            "tracks",
+            "until",
+            "caused-by",
+            "validates",
+            "relates-to",
+            "supersedes ",
+            "Supersedes",
+        ] {
+            assert!(
+                plan_issue(&hydrated(
+                    "plan-a",
+                    "open",
+                    json!([{"id":"dep-a","dependency_type":kind,"status":"open"}]),
+                ))
+                .is_err(),
+                "dependency kind {kind:?} was accepted without adjudication"
+            );
+        }
     }
 
     #[test]

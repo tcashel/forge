@@ -207,12 +207,30 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     renderDetail(); pushModelContext(data); reportSize();
   }
   let lastContext = "";
+  // The counts below are only as complete as the sources behind them. A
+  // source the server already reported as degraded must reach the model as
+  // words, not as a silently smaller number, so this runs BEFORE the counts
+  // and reads the same bounded sourceHealth the pills render.
+  function degradedSources(data) {
+    const degraded = [];
+    for (const name of ["ledger", "beads", "plan"]) {
+      const source = data.sourceHealth?.[name];
+      const state = source?.state || "unknown";
+      if (state === "available") continue;
+      const error = typeof source?.error === "string" && source.error ? `: ${source.error.slice(0, 400)}` : "";
+      degraded.push(`${name} ${state}${error}`);
+    }
+    return degraded;
+  }
   function pushModelContext(data) {
     if (!host.capabilities.updateModelContext) return;
-    const lines = [
+    const degraded = degradedSources(data);
+    const lines = [];
+    if (degraded.length) lines.push(`Source degradation, counts below are NOT authoritative coverage — ${degraded.join("; ")}`);
+    lines.push(
       `Forged Operations for ${data.scope?.repository || "all repositories"}: ${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)} matching`,
       `${fmt(data.counts?.live)} live; ${fmt(data.counts?.queued)} queued; ${fmt(data.counts?.attention)} attention; ${fmt(data.counts?.reviewReady)} review-ready`,
-    ];
+    );
     for (const group of arr(data.queue?.groups)) {
       for (const entry of arr(group.entries).slice(0, 3)) lines.push(`- ${group.code}: ${entry.id} ${titleFor(entry)}`);
     }

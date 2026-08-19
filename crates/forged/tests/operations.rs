@@ -236,6 +236,105 @@ fn operations_joins_one_bounded_live_plan_without_duplicate_durable_work() {
         .any(|call| call.starts_with("ready") || call.contains("graph")));
 }
 
+/// The 2026-08-17 incident, at the surface that reported it: one live plan
+/// carrying a native `supersedes` edge failed the whole repository-scoped
+/// plan hydrate closed, so Operations served zero plan rows. The relation is
+/// provenance — it must keep the source available and the row visible while
+/// the deliberately unsupported kinds keep failing closed.
+#[test]
+fn a_supersedes_edge_keeps_the_repository_plan_source_available() {
+    let env = TestEnv::new("forged-operations-supersedes");
+    env.forged(&["init"]);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+
+    env.set_bead_field("plan-replacement", "title", "Replacement slice");
+    env.set_bead_field("plan-replacement", "status", "open");
+    env.set_bead_field(
+        "plan-replacement",
+        "dependencies",
+        r#"[{"id":"plan-superseded","dependency_type":"supersedes","status":"open"}]"#,
+    );
+    env.set_bead_repository("plan-replacement", &repository);
+    env.set_bead_field("plan-superseded", "title", "Superseded slice");
+    env.set_bead_field("plan-superseded", "status", "open");
+    env.set_bead_repository("plan-superseded", &repository);
+
+    let (code, response) = env.forged(&["operations", "overview", "--repo", &repository]);
+    assert_eq!(code, 0, "operations overview: {response}");
+    assert_eq!(
+        response["result"]["sourceHealth"]["plan"],
+        json!({
+            "state": "available",
+            "error": Value::Null,
+            "discovered": 2,
+            "limit": 500,
+            "truncated": false,
+        }),
+        "a provenance edge cannot degrade the plan source: {response}"
+    );
+    assert_eq!(response["result"]["coverage"]["matching"], json!(2));
+    assert_eq!(response["result"]["coverage"]["shown"], json!(2));
+    assert_eq!(response["result"]["counts"]["planOnly"], json!(2));
+
+    let rows = entries(&response);
+    assert_eq!(rows["plan-replacement"]["source"], json!("live-plan"));
+    assert_eq!(
+        rows["plan-replacement"]["plan"]["dependencies"],
+        json!([{"id": "plan-superseded", "dependencyType": "supersedes", "status": "open"}]),
+        "the exact native kind reaches the wire: {response}"
+    );
+    assert_eq!(
+        rows["plan-replacement"]["plan"]["readiness"],
+        json!("ready"),
+        "an open superseded target is history, not a blocker: {response}"
+    );
+    assert!(
+        rows.contains_key("plan-superseded"),
+        "the superseded plan stays visible on its own terms: {response}"
+    );
+
+    assert_eq!(
+        response["result"]["attention"],
+        json!([]),
+        "provenance never raises blocker attention: {response}"
+    );
+    assert_eq!(response["result"]["counts"]["attention"], json!(0));
+}
+
+/// The control for the test above: a kind forged has NOT adjudicated still
+/// fails the plan source closed, so the fix admitted one relation rather
+/// than every string bd advertises.
+#[test]
+fn an_unadjudicated_dependency_kind_still_fails_the_plan_source_closed() {
+    let env = TestEnv::new("forged-operations-unadjudicated-kind");
+    env.forged(&["init"]);
+    fabricate_run(&env, "durable-safe");
+    env.set_bead_field("plan-tracks", "status", "open");
+    env.set_bead_field("plan-tracks", "title", "Tracks another plan");
+    env.set_bead_field(
+        "plan-tracks",
+        "dependencies",
+        r#"[{"id":"plan-tracked","dependency_type":"tracks","status":"open"}]"#,
+    );
+
+    let (code, response) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "durable projection remains available: {response}");
+    assert_eq!(
+        response["result"]["sourceHealth"]["plan"]["state"],
+        json!("unavailable"),
+        "an unadjudicated relation is not silently coerced: {response}"
+    );
+    assert!(
+        response["result"]["sourceHealth"]["plan"]["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("tracks")),
+        "the bounded error names the kind that failed: {response}"
+    );
+    let rows = entries(&response);
+    assert!(rows.contains_key("durable-safe"), "{response}");
+    assert!(!rows.contains_key("plan-tracks"), "{response}");
+}
+
 #[test]
 fn operations_keeps_durable_truth_when_beads_is_unavailable() {
     let env = TestEnv::new("forged-operations-outage");
