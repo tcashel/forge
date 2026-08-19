@@ -516,8 +516,8 @@ fn work_detail_requires_an_exact_kind_and_projects_the_shared_subject_truth() {
     );
     assert_eq!(
         env.bd_calls().len(),
-        beads_before,
-        "native detail performs no Beads read"
+        beads_before + 2,
+        "native detail spends exactly one bounded read per projection"
     );
 
     let (code, response) = env.forged(&[
@@ -618,8 +618,8 @@ fn work_detail_captures_epic_children_from_the_atomic_ledger_subject() {
     );
     assert_eq!(
         env.bd_calls().len(),
-        before,
-        "epic child capture performs no recursive Beads reads"
+        before + 1,
+        "epic child capture reads the epic's own bead once and none per child"
     );
 }
 

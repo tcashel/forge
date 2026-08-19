@@ -2938,6 +2938,12 @@ pub async fn work_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
 
 /// Legacy discovery never included plan-only Beads. Preserve that boundary
 /// while sourcing its ordering and grouping from Operations.
+///
+/// `count` and `entries` keep their legacy durable-only meaning. `code`,
+/// `shown` and `total` are verbatim passthroughs of the source group, and
+/// `excluded.livePlan` is COUNTED from that group's rows rather than derived
+/// as `total - count`: under the page cap `total > shown`, so the
+/// subtraction would invent rows the caller never saw.
 pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
     projection
         .pointer("/queue/groups")
@@ -2945,18 +2951,29 @@ pub(super) fn durable_compatibility_groups(projection: &Value) -> Vec<Value> {
         .into_iter()
         .flatten()
         .map(|group| {
-            let entries = group
+            let rows = group
                 .get("entries")
                 .and_then(Value::as_array)
                 .into_iter()
                 .flatten()
-                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
-                .cloned()
                 .collect::<Vec<_>>();
+            let entries = rows
+                .iter()
+                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("durable"))
+                .map(|entry| (*entry).clone())
+                .collect::<Vec<_>>();
+            let live_plan = rows
+                .iter()
+                .filter(|entry| entry.get("source").and_then(Value::as_str) == Some("live-plan"))
+                .count();
             json!({
                 "name": group.get("label").cloned().unwrap_or(Value::Null),
                 "count": entries.len(),
                 "entries": entries,
+                "code": group.get("code").cloned().unwrap_or(Value::Null),
+                "shown": group.get("shown").cloned().unwrap_or(Value::Null),
+                "total": group.get("total").cloned().unwrap_or(Value::Null),
+                "excluded": {"livePlan": live_plan},
             })
         })
         .collect()
@@ -3323,6 +3340,60 @@ pub(super) fn desired_only_entries(
         .collect()
 }
 
+/// The exact, unique Bead ids one bounded live read covers.
+///
+/// Several runs legitimately share one Bead — a resubmission, a superseded
+/// attempt, an epic child re-driven — so the per-row ledger projection is not
+/// a set. The exact-hydrate contract requires one row per requested id;
+/// handing it a repeat fails the whole read closed.
+pub(super) fn entry_bead_ids(entries: &[Value]) -> Vec<String> {
+    entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("beadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+}
+
+/// Resolve one display title per operator row before any surface reads it.
+///
+/// `titleSource` is a SIBLING of the frozen `identity`: it never rewrites
+/// `identity.displayTitle` or `title`, which remain launch evidence. It
+/// carries a current Beads title only for a row whose identity froze without
+/// one, and always names the authority that answered.
+pub(super) fn decorate_titles(
+    entries: &mut [Value],
+    beads: &[forged_beads::IssueSummary],
+) -> Result<(), Failure> {
+    let titles: BTreeMap<&str, &str> = beads
+        .iter()
+        .map(|issue| (issue.id.as_str(), issue.title.as_str()))
+        .collect();
+    for entry in entries {
+        let identity: forged_types::WorkIdentityV1 =
+            serde_json::from_value(entry.get("identity").cloned().unwrap_or(Value::Null)).map_err(
+                |error| Failure::internal(format!("operator row has invalid identity: {error}")),
+            )?;
+        let resolved = forged_types::resolve_work_title(
+            &identity,
+            titles.get(identity.bead.id.as_str()).copied(),
+        );
+        let resolved = serde_json::to_value(resolved).map_err(|error| {
+            Failure::internal(format!("serializing operator row title: {error}"))
+        })?;
+        entry
+            .as_object_mut()
+            .ok_or_else(|| Failure::internal("operator row is not an object"))?
+            .insert("titleSource".to_owned(), resolved);
+    }
+    Ok(())
+}
+
 /// Attach the canonical durable navigation coordinates shared by Operations
 /// and Work Map. This is presentation identity only; all authority-bearing
 /// fields remain those already projected from the atomic ledger snapshot.
@@ -3412,15 +3483,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
         entries.extend(desired_only_entries(&snapshot, &entries)?);
         decorate_durable_entries(&mut entries)?;
 
-        let bead_ids = entries
-            .iter()
-            .filter_map(|entry| {
-                entry
-                    .get("beadId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned)
-            })
-            .collect::<Vec<_>>();
+        let bead_ids = entry_bead_ids(&entries);
         let plan_cfg = ctx.config.bd_config();
         let claim_cfg = ctx.config.bd_config();
         let plan_repository = repository.clone();
@@ -3542,6 +3605,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 .map(|plan| plan.issue.clone())
                 .filter(|issue| known_beads.insert(issue.id.clone())),
         );
+        decorate_titles(&mut entries, &bead_summaries)?;
         let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
             .into_iter()
             .map(|item| {
@@ -3745,16 +3809,14 @@ async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
         ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
     })
     .await?;
-    let entries = project_entries(&snapshot, Spend::Include)?;
-    let bead_ids: Vec<String> = entries
-        .iter()
-        .filter_map(|entry| entry["beadId"].as_str().map(str::to_owned))
-        .collect();
+    let mut entries = project_entries(&snapshot, Spend::Include)?;
+    let bead_ids = entry_bead_ids(&entries);
     // A Beads outage cannot authorize a control over a condition that only
     // Beads can prove. Other ledger-backed items remain addressable.
     let beads = forged_beads::list_issues(&ctx.config.bd_config(), &bead_ids)
         .await
         .unwrap_or_default();
+    decorate_titles(&mut entries, &beads)?;
     super::attention::project_all(&snapshot, &entries, &beads)
 }
 

@@ -589,13 +589,13 @@ fn modern_projections_and_all_five_apps_converge_on_real_envelopes() {
             "run-a",
         ])
         .1;
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 0, "Work Detail CLI");
+    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 1, "Work Detail CLI");
     let bd_start = fixture.env.bd_calls().len();
     let detail_raw = mcp.call_tool_result(
         "work_detail",
         envelope(json!({"subjectKind": "run", "subjectId": "run-a"})),
     );
-    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 0, "Work Detail MCP");
+    assert_read_slice(&fixture.env.bd_calls()[bd_start..], 1, "Work Detail MCP");
     let detail = assert_raw_parity(detail_cli, &detail_raw, "Work Detail");
 
     let bd_start = fixture.env.bd_calls().len();

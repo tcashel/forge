@@ -8,7 +8,7 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-use crate::{WorkIdentityV1, WorkRefV1};
+use crate::{WorkIdentityV1, WorkRefV1, WorkTitleV1};
 
 pub const WORK_MAP_SCHEMA_V1: &str = "forged.work-map/1";
 
@@ -133,6 +133,9 @@ pub struct WorkMapNodeV1 {
     pub source: String,
     pub context_only: bool,
     pub identity: Option<WorkIdentityV1>,
+    /// `None` where this surface resolved no title at all — a boundary node
+    /// has no identity to resolve one against, and that is a real state.
+    pub title_source: Option<WorkTitleV1>,
     pub repository: Option<String>,
     pub epic_id: Option<String>,
     pub plan: Value,
@@ -162,6 +165,11 @@ pub struct WorkMapGraphHealthV1 {
     pub missing_blocker_status: Vec<Value>,
 }
 
+/// Node tallies for one Work Map projection.
+///
+/// `epics` counts `identity.subject.kind`, not `work_ref.kind`: an epic is
+/// minted as a `plan` reference so its edges resolve, so `epics` deliberately
+/// overlaps `plan` and `plan + runs + epics == nodes` does not hold.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkMapCountsV1 {
