@@ -1267,6 +1267,48 @@ fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
             .is_some_and(|texts| texts.contains(&json!("run:run-1"))),
         "the Work Map keeps the exact selector: {map}"
     );
+
+    let sessions = run_split_app_host(&node, &root.join("agent-sessions.html"));
+    let session = sessions["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .find(|entry| entry["class"] == json!("session-head"))
+        .unwrap_or_else(|| panic!("the Agent Sessions row head: {sessions}"));
+    assert_eq!(
+        session["childClass"],
+        json!(["", "chips"]),
+        "the identity block leads the head: {session}"
+    );
+
+    // The portfolio card is drawn through `overview.html`'s own dispatch, so
+    // the ordering assertion is on document order under `#view`.
+    let dispatched = render_dispatch(
+        &node,
+        &json!({"ok": true, "result": {
+            "schema": "forged.overview/1",
+            "kind": "portfolio",
+            "entries": [{
+                "id": "pf-slice", "kind": "slice", "beadId": "bead-pf-slice", "state": "active",
+                "identity": {"displayTitle": "Make work legible [repositories/forge]"},
+            }],
+            "total": 1, "cap": 200, "liveSeats": 0,
+            "attention": [], "attentionTotal": 0,
+            "spend": {"costUsdKnown": 0.0, "rowsMissingCost": 0},
+        }}),
+    );
+    let position = |class: &str| {
+        dispatched
+            .view
+            .iter()
+            .position(|entry| entry["class"] == json!(class))
+            .unwrap_or_else(|| panic!("the portfolio card draws {class}: {}", dispatched.text))
+    };
+    assert!(
+        position("bead__title") < position("bead__id"),
+        "the portfolio card leads with its title: {}",
+        dispatched.text
+    );
 }
 
 /// No App prints a raw ISO timestamp.
