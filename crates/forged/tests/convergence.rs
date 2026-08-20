@@ -572,6 +572,17 @@ fn missing_packet_revision_defers_without_reservation_or_provider_effect() {
         "revision-less packet admission must have zero provider effect"
     );
 
+    // Only the capacity reason family parks. A BeadMalformed deferral never
+    // clears by waiting, so the controller keeps the exit contract instead
+    // of parking into a silent starve.
+    let controller = submitted["result"]["controller"]["pid"]
+        .as_i64()
+        .and_then(|pid| i32::try_from(pid).ok())
+        .expect("controller pid");
+    wait_until("controller exits on the non-capacity deferral", || {
+        !support::pid_alive(controller)
+    });
+
     let ledger = env.ledger();
     let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
     assert!(snapshot.reservations.iter().all(|reservation| {
@@ -806,6 +817,218 @@ fn capacity_deferral_parks_the_controller_instead_of_recycling() {
     // The released run drives itself to completion; nothing leaks capacity.
     wait_until("parked run completes after release", || {
         let (_, status) = env.forged(&["run", "status", "--run", parked]);
+        status["result"]["run"]["outcome"] == json!("clean")
+    });
+    no_live_reservations(&env);
+}
+
+/// The park contract under review fan-out (beads-ntc.15): an external seat
+/// claims the larger-id review sibling inside the smaller sibling's
+/// transport-retry window, so the re-claim defers on TotalCapacity while a
+/// seat of the SAME run is live. The parked controller must hold across the
+/// deferral and supervisor window without recycling, and the live sibling's
+/// attempt row must survive it untouched — still completable under its
+/// original claim token.
+#[cfg(feature = "failpoints")]
+#[test]
+fn capacity_deferral_parks_while_a_sibling_seat_runs() {
+    let env = TestEnv::new("adm-park-fan");
+    set_admission(&env, 1, 1, 3);
+    let run = "adm-park-fan";
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        run,
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "high",
+    ]);
+    assert_eq!(code, 0, "run start {run}: {started}");
+
+    // review-1's first claim fails on transport, granting the bounded retry
+    // window this fixture uses to seize the one admission slot out of claim
+    // order before the deterministic min-packet-id re-claim.
+    env.set_scenario("reviewclaude", "rate-limit", 1);
+    let (code, submitted) = env.forged(&[
+        "run",
+        "submit",
+        "--run",
+        run,
+        "--idempotency-key",
+        "adm-park-fan-submit",
+    ]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let controller = controller_pid(&submitted);
+    let deferred_packet = format!("{run}/review-1/0");
+    let live_packet = format!("{run}/review-2/0");
+    wait_until("review-1 transport-failed and re-claimable", || {
+        attempts_for(&env, run).iter().any(|attempt| {
+            attempt.packet_id == deferred_packet && attempt.state == AttemptState::Failed
+        })
+    });
+
+    // The external seat claims the larger-id sibling and stays inside it,
+    // holding the single totalActive slot open across the park.
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &live_packet]);
+    assert_eq!(code, 0, "external sibling claim: {claimed}");
+    let live_attempt = claimed["result"]["attempt_id"]
+        .as_i64()
+        .expect("external attempt id");
+    let live_token = claimed["result"]["claim_token"]
+        .as_str()
+        .expect("external claim token")
+        .to_owned();
+
+    // The retry deadline passes, the re-claim defers on the held slot, and
+    // the controller parks with its sibling seat live.
+    wait_until("first durable capacity deferral", || {
+        deferred_decisions(&env, &deferred_packet) >= 1
+    });
+    let ledger = env.ledger();
+    let decision = ledger
+        .latest_admission_decisions(
+            Some(AdmissionSubjectKind::Packet),
+            Some(deferred_packet.as_str()),
+        )
+        .expect("latest sibling decision")
+        .pop()
+        .expect("deferred sibling decision");
+    ledger.close().expect("close ledger");
+    assert_eq!(decision.outcome, AdmissionOutcome::Deferred);
+    assert_eq!(decision.reason, AdmissionReason::TotalCapacity);
+    let window_start: Vec<(i64, AttemptState)> = attempts_for(&env, run)
+        .into_iter()
+        .map(|attempt| (attempt.attempt_id, attempt.state))
+        .collect();
+    assert!(
+        window_start.contains(&(live_attempt, AttemptState::Running)),
+        "the parked run carries one LIVE seat into the deferral window: {window_start:?}"
+    );
+    wait_until("repeated deferral wakes without recycling", || {
+        deferred_decisions(&env, &deferred_packet) >= 4
+    });
+    assert!(
+        support::pid_alive(controller),
+        "the deferred controller must stay alive, not exit into a recycle"
+    );
+
+    // A due supervisor pass adopts the parked live controller and charges
+    // nothing: generation and restart budget stay untouched, no durable pane
+    // cleanup is enqueued, and the live sibling attempt does not move.
+    let ledger = env.ledger();
+    let before = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("parked desired row");
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Adopted,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make the parked row due");
+    ledger.close().expect("close ledger");
+    let (code, tick) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "supervisor tick over a parked controller: {tick}");
+    let ledger = env.ledger();
+    let after = ledger
+        .get_desired_work(DesiredSubjectKind::Run, run)
+        .expect("desired query")
+        .expect("parked desired row");
+    ledger.close().expect("close ledger");
+    assert_eq!(after.restart_used, 0, "parking must not charge restarts");
+    assert_eq!(
+        after.controller_generation, before.controller_generation,
+        "parking must not recycle the controller generation"
+    );
+    assert!(after.exhausted_at.is_none());
+    assert!(
+        support::pid_alive(controller),
+        "the adopted parked controller survives the supervisor pass"
+    );
+    let connection = rusqlite::Connection::open(env.anvil.join("state.db"))
+        .expect("open hermetic ownership ledger");
+    let cleanup_requested: i64 = connection
+        .query_row(
+            "SELECT COUNT(*) FROM owned_herdr_sessions WHERE cleanup_state != 'not-requested'",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count pane cleanup requests");
+    assert_eq!(cleanup_requested, 0, "no pane cleanup may be enqueued");
+    let window_end: Vec<(i64, AttemptState)> = attempts_for(&env, run)
+        .into_iter()
+        .map(|attempt| (attempt.attempt_id, attempt.state))
+        .collect();
+    assert_eq!(
+        window_start, window_end,
+        "the parked run's attempt rows must not transition during the window"
+    );
+    assert!(
+        window_end.contains(&(live_attempt, AttemptState::Running)),
+        "the live sibling seat survives the deferral and supervisor window: {window_end:?}"
+    );
+
+    // The surviving claim token still lands: the seat was never reclaimed or
+    // fenced out while its run was parked. Landing frees the slot, the
+    // deferred sibling admits, and the run drives itself to completion.
+    let result_path = env.root.join("review-2-result.json");
+    std::fs::write(
+        &result_path,
+        json!({
+            "schema": "forged.result.review/1",
+            "packetId": live_packet,
+            "outcome": {"review": {
+                "verdict": "approve",
+                "summary": "external sibling review",
+                "findings": [],
+                "available": true,
+            }},
+        })
+        .to_string(),
+    )
+    .expect("write external review result");
+    let (code, landed) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &live_packet,
+        "--attempt",
+        &live_attempt.to_string(),
+        "--claim-token",
+        &live_token,
+        "--result",
+        &result_path.to_string_lossy(),
+    ]);
+    assert_eq!(code, 0, "external completion after the window: {landed}");
+    assert_eq!(landed["result"]["outcome"], json!("Landed"), "{landed}");
+    wait_until("deferred sibling admitted after the release", || {
+        let ledger = env.ledger();
+        let admitted = ledger
+            .latest_admission_decisions(
+                Some(AdmissionSubjectKind::Packet),
+                Some(deferred_packet.as_str()),
+            )
+            .expect("latest sibling decision")
+            .into_iter()
+            .any(|decision| decision.outcome == AdmissionOutcome::Admitted);
+        ledger.close().expect("close ledger");
+        admitted
+    });
+    wait_until("parked run completes after release", || {
+        let (_, status) = env.forged(&["run", "status", "--run", run]);
         status["result"]["run"]["outcome"] == json!("clean")
     });
     no_live_reservations(&env);

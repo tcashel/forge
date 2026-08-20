@@ -14,7 +14,8 @@ use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
 use forged_types::{
-    ExecutionPolicyV1, OperationRequest, OperationResponse, Outcome, Stage, Verdict,
+    AdmissionOutcome, AdmissionReason, AdmissionSubjectKind, ExecutionPolicyV1, OperationRequest,
+    OperationResponse, Outcome, Stage, Verdict,
 };
 use serde_json::{json, Map, Value};
 
@@ -1192,12 +1193,16 @@ async fn advance_once(
 
 /// The loop: project → advance → honor → repeat until `Stop`.
 ///
-/// A recoverable `OperationInProgress` from the honor path — an admission
-/// deferral, or another process inside the same fenced step — is a wait, not
-/// a death: the controller parks (bounded sleep, re-project, retry) exactly
-/// like a `not_before` deadline instead of exiting. Exiting here made the
-/// supervisor read ordinary capacity queuing as a dead controller, charging
-/// `restart_used` and recycling the pane out from under live seats.
+/// A capacity deferral of the awaited packet — its latest durable admission
+/// decision is `Deferred` with a reason in the capacity family — is a wait,
+/// not a death: the controller parks (bounded sleep, re-project, retry)
+/// exactly like a `not_before` deadline instead of exiting. Exiting here
+/// made the supervisor read ordinary capacity queuing as a dead controller,
+/// charging `restart_used` and recycling the pane out from under live
+/// seats. Every other recoverable `OperationInProgress` keeps the exit:
+/// non-capacity deferral reasons (`BeadMalformed`, `Superseded`, ...) never
+/// clear by waiting, and only the deferred admission decision carries an
+/// attention projection, so parking on anything else would starve silently.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let echo = derive_key("run_drive", req.run_id.as_deref(), None, None);
     let run_id = match param_str(&req.params, "run") {
@@ -1239,6 +1244,11 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 if failure.code == forged_types::ErrorCode::OperationInProgress
                     && failure.recoverable =>
             {
+                match capacity_deferred(ctx, &action).await {
+                    Ok(true) => {}
+                    Ok(false) => return err_response(&echo, &failure),
+                    Err(f) => return err_response(&echo, &f),
+                }
                 deferral_wakes = deferral_wakes.saturating_add(1);
                 tracing::info!(
                     wakes = deferral_wakes,
@@ -1260,6 +1270,33 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             Err(f) => return err_response(&echo, &f),
         }
     }
+}
+
+/// Whether the awaited packet's LATEST durable admission decision is a
+/// capacity-family deferral — the only refusal that clears when someone
+/// else's seat finishes. The honor path raises the same recoverable
+/// `OperationInProgress` for every non-admitted reason and for fenced-step
+/// contention, so the failure alone cannot authorize a park: the durable
+/// decision is the evidence. Anything that is not awaiting a packet has no
+/// decision to join and never parks.
+async fn capacity_deferred(ctx: &Ctx, action: &NextAction) -> Result<bool, Failure> {
+    let NextAction::AwaitPacket { packet_id, .. } = action else {
+        return Ok(false);
+    };
+    let packet_id = packet_id.clone();
+    let decisions = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Packet), Some(&packet_id))
+    })
+    .await?;
+    Ok(decisions.iter().any(|decision| {
+        decision.outcome == AdmissionOutcome::Deferred
+            && matches!(
+                decision.reason,
+                AdmissionReason::TotalCapacity
+                    | AdmissionReason::ProviderCapacity
+                    | AdmissionReason::RepositoryWriteCapacity
+            )
+    }))
 }
 
 /// Append the parked run's deduplicated deferral marker.
