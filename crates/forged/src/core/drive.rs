@@ -1126,6 +1126,13 @@ async fn record_event(ctx: &Ctx, run_id: &str, event: ProtoEvent) -> Result<(), 
 /// driver's re-claims per packet.
 const SEMANTIC_RECLAIM_CAP: usize = 3;
 
+/// Consecutive deferral wakes before a parked run surfaces its durable
+/// attention marker. Parking itself is unbounded — a wait is a wait — but it
+/// must not become a silent starve, so the Nth wake appends one deduplicated
+/// `forged.admission.attention` marker that the attention projection joins
+/// against the packet's latest admission decision until the admit clears it.
+const PARKED_DEFERRAL_SURFACE_WAKES: u32 = 3;
+
 fn semantic_failures(view: &RunView, packet_id: &str) -> usize {
     view.terminal_attempts
         .get(packet_id)
@@ -1184,6 +1191,13 @@ async fn advance_once(
 }
 
 /// The loop: project → advance → honor → repeat until `Stop`.
+///
+/// A recoverable `OperationInProgress` from the honor path — an admission
+/// deferral, or another process inside the same fenced step — is a wait, not
+/// a death: the controller parks (bounded sleep, re-project, retry) exactly
+/// like a `not_before` deadline instead of exiting. Exiting here made the
+/// supervisor read ordinary capacity queuing as a dead controller, charging
+/// `restart_used` and recycling the pane out from under live seats.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let echo = derive_key("run_drive", req.run_id.as_deref(), None, None);
     let run_id = match param_str(&req.params, "run") {
@@ -1191,6 +1205,7 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         Err(f) => return err_response(&echo, &f),
     };
     let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+    let mut deferral_wakes: u32 = 0;
     loop {
         let view = match project(ctx, &run_id).await {
             Ok(view) => view,
@@ -1219,10 +1234,62 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     json!({"run_id": run_id, "terminal": terminal_json(&terminal)}),
                 );
             }
-            Ok(_) => continue,
+            Ok(_) => deferral_wakes = 0,
+            Err(failure)
+                if failure.code == forged_types::ErrorCode::OperationInProgress
+                    && failure.recoverable =>
+            {
+                deferral_wakes = deferral_wakes.saturating_add(1);
+                tracing::info!(
+                    wakes = deferral_wakes,
+                    detail = %failure.message,
+                    "deferred; parking until the next admission wake"
+                );
+                if deferral_wakes == PARKED_DEFERRAL_SURFACE_WAKES {
+                    if let Err(failure) =
+                        record_parked_deferral(ctx, &run_id, &action, &failure.message).await
+                    {
+                        return err_response(&echo, &failure);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(
+                    ctx.config.admission.defer_seconds.max(1),
+                ))
+                .await;
+            }
             Err(f) => return err_response(&echo, &f),
         }
     }
+}
+
+/// Append the parked run's deduplicated deferral marker.
+///
+/// `append_event_once` keys on the exact payload, so re-crossing the
+/// threshold in a later parked episode of the same packet re-arms nothing:
+/// one marker per distinct (packet, detail), however long the park lasts.
+async fn record_parked_deferral(
+    ctx: &Ctx,
+    run_id: &str,
+    action: &NextAction,
+    detail: &str,
+) -> Result<(), Failure> {
+    let packet_id = match action {
+        NextAction::AwaitPacket { packet_id, .. } => Some(packet_id.clone()),
+        _ => None,
+    };
+    let payload = json!({
+        "schema": "forged.admission.attention/1",
+        "condition": "admission-deferred",
+        "packetId": packet_id,
+        "wakes": PARKED_DEFERRAL_SURFACE_WAKES,
+        "detail": detail,
+    });
+    let run_id = run_id.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_once(&run_id, "forged.admission.attention", payload)?;
+        Ok(())
+    })
+    .await
 }
 
 /// Serialize open-packet intents for status payloads.

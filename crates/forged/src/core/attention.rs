@@ -155,6 +155,12 @@ pub(crate) fn policy(
             Action::WaitForProvider,
             "Wait for the recorded provider limit or revise policy",
         ),
+        Condition::AdmissionDeferred => (
+            Severity::Medium,
+            Owner::LeadAgent,
+            Action::WaitForCapacity,
+            "Wait for the deferred admission or free the contended capacity",
+        ),
         Condition::AmbiguousEffect => (
             Severity::Critical,
             Owner::Human,
@@ -812,7 +818,8 @@ fn collect_domain_sources(
     }
 
     // Only typed rate-limit decisions are provider degradation. Routine
-    // capacity deferrals remain queued work.
+    // capacity deferrals remain queued work until a parked controller
+    // crosses its wake threshold and appends the durable marker below.
     for decision in &snapshot.admission_decisions {
         if decision.outcome != AdmissionOutcome::Deferred
             || !matches!(
@@ -851,6 +858,66 @@ fn collect_domain_sources(
             serde_json::to_value(decision).unwrap_or(Value::Null),
             AttentionEvidenceKind::AdmissionDecision,
             &decision.batch_id,
+        );
+    }
+
+    // A parked controller appends one durable marker after its wake
+    // threshold. The item stands while that packet's LATEST admission
+    // decision is still deferred and clears through the admit itself — no
+    // attention control resolves it. Rate-limit deferrals keep their
+    // ProviderDegraded projection above.
+    let mut parked: BTreeMap<String, (&forged_ledger::EventRow, Value)> = BTreeMap::new();
+    for event in snapshot.events("forged.admission.attention") {
+        let Some(id) = event.run_id.as_ref() else {
+            continue;
+        };
+        let payload = event_value(&event.payload_json);
+        if payload.get("condition").and_then(Value::as_str) != Some("admission-deferred") {
+            continue;
+        }
+        if parked
+            .get(id)
+            .is_none_or(|(seen, _)| seen.event_id < event.event_id)
+        {
+            parked.insert(id.clone(), (event, payload));
+        }
+    }
+    for (id, (event, payload)) in parked {
+        let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) else {
+            continue;
+        };
+        let deferred = snapshot.admission_decisions.iter().find(|decision| {
+            decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
+                && decision.subject_id == packet_id
+                && decision.outcome == AdmissionOutcome::Deferred
+                && !matches!(
+                    decision.reason,
+                    AdmissionReason::RateLimitCeiling | AdmissionReason::StaleRateLimit
+                )
+        });
+        let Some(decision) = deferred else {
+            continue;
+        };
+        add_raw(
+            &mut raw,
+            &entries,
+            &id,
+            AttentionCondition::AdmissionDeferred,
+            &event.ts,
+            &event.ts,
+            event.event_id,
+            format!("event:{}", event.event_id),
+            format!(
+                "run is parked: packet {packet_id} admission deferred ({:?})",
+                decision.reason
+            ),
+            json!({
+                "packetId": packet_id,
+                "wakes": payload.get("wakes"),
+                "decision": decision,
+            }),
+            AttentionEvidenceKind::Event,
+            event.event_id.to_string(),
         );
     }
 
@@ -1132,6 +1199,7 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::ControllerDead
         | Condition::FailedGate
         | Condition::ProviderDegraded
+        | Condition::AdmissionDeferred
         | Condition::MissingEvidence => AttentionClass::Symptom,
     }
 }
@@ -1563,10 +1631,11 @@ mod tests {
             Condition::ControllerDead,
             Condition::FailedGate,
             Condition::ProviderDegraded,
+            Condition::AdmissionDeferred,
             Condition::MissingEvidence,
         ];
         assert_eq!(decisions.len(), 8);
-        assert_eq!(symptoms.len(), 7);
+        assert_eq!(symptoms.len(), 8);
         for condition in decisions {
             assert_eq!(
                 classification(condition),
@@ -1589,6 +1658,71 @@ mod tests {
             .chain(symptoms.iter())
             .map(|condition| serde_json::to_string(condition).expect("closed condition"))
             .collect();
-        assert_eq!(all.len(), 15, "one class per condition, no overlap");
+        assert_eq!(all.len(), 16, "one class per condition, no overlap");
+    }
+
+    #[test]
+    fn parked_deferral_marker_stands_only_while_the_decision_stays_deferred() {
+        let packet_decision = |outcome, reason| AdmissionDecisionV1 {
+            schema: ADMISSION_DECISION_SCHEMA_V1.to_owned(),
+            batch_id: "batch-park".to_owned(),
+            subject_kind: AdmissionSubjectKind::Packet,
+            subject_id: "run-park/remediation/0".to_owned(),
+            control_revision: 1,
+            repository: "/repo".to_owned(),
+            priority: None,
+            provider: Some("claude".to_owned()),
+            model: Some("opus".to_owned()),
+            resource_class: AdmissionResourceClass::RepositoryWrite,
+            outcome,
+            reason,
+            policy_revision: "policy".to_owned(),
+            evidence: AdmissionCapacityV1::default(),
+            next_eligible_wake_at: None,
+        };
+        let mut snapshot = snapshot();
+        snapshot.events_by_kind.insert(
+            "forged.admission.attention".to_owned(),
+            vec![event(
+                5,
+                "run-park",
+                "forged.admission.attention",
+                json!({
+                    "schema": "forged.admission.attention/1",
+                    "condition": "admission-deferred",
+                    "packetId": "run-park/remediation/0",
+                    "wakes": 3,
+                }),
+            )],
+        );
+
+        // No decision joined: the marker alone raises nothing.
+        assert!(project_active(&snapshot, &[entry("run-park")], &[])
+            .expect("project marker without decision")
+            .iter()
+            .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
+
+        snapshot.admission_decisions.push(packet_decision(
+            AdmissionOutcome::Deferred,
+            AdmissionReason::RepositoryWriteCapacity,
+        ));
+        let items =
+            project_active(&snapshot, &[entry("run-park")], &[]).expect("project parked deferral");
+        let item = items
+            .iter()
+            .find(|item| item.condition == AttentionCondition::AdmissionDeferred)
+            .expect("parked deferral item");
+        assert_eq!(item.subject_id, "run-park");
+        assert!(item.detail.contains("RepositoryWriteCapacity"), "{item:?}");
+
+        // The admit is the domain transition that clears the entry.
+        snapshot.admission_decisions[0] = packet_decision(
+            AdmissionOutcome::Admitted,
+            AdmissionReason::CapacityAvailable,
+        );
+        assert!(project_active(&snapshot, &[entry("run-park")], &[])
+            .expect("project admitted packet")
+            .iter()
+            .all(|item| item.condition != AttentionCondition::AdmissionDeferred));
     }
 }

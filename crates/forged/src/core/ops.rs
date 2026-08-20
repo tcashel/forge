@@ -584,24 +584,39 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
         let run_id = param_str(&req.params, "run")?;
         let view = super::drive::project(ctx, run_id).await?;
         let run_id_owned = run_id.to_owned();
-        let (definition, revision, protocol_terminal) = on_ledger(&ctx.ledger, move |ledger| {
-            let protocol_terminal = ledger
-                .list_events(Some(&run_id_owned), 0, 4096)?
-                .into_iter()
-                .find(|event| event.kind == "run.protocol-terminal")
-                .map(|event| {
-                    serde_json::from_str::<Value>(&event.payload_json)
-                        .map_err(forged_ledger::LedgerError::from)
-                })
-                .transpose()?
-                .and_then(|payload| payload.get("terminal").cloned());
-            Ok((
-                ledger.get_run_definition(&run_id_owned)?,
-                ledger.latest_roster_revision(&run_id_owned)?,
-                protocol_terminal,
-            ))
-        })
-        .await?;
+        let (definition, revision, protocol_terminal, admission_decisions) =
+            on_ledger(&ctx.ledger, move |ledger| {
+                let protocol_terminal = ledger
+                    .list_events(Some(&run_id_owned), 0, 4096)?
+                    .into_iter()
+                    .find(|event| event.kind == "run.protocol-terminal")
+                    .map(|event| {
+                        serde_json::from_str::<Value>(&event.payload_json)
+                            .map_err(forged_ledger::LedgerError::from)
+                    })
+                    .transpose()?
+                    .and_then(|payload| payload.get("terminal").cloned());
+                // Latest decision per packet: a parked run's deferral reason
+                // is durable status, not something only the controller knows.
+                let admission_decisions = ledger
+                    .latest_admission_decisions(
+                        Some(forged_types::AdmissionSubjectKind::Packet),
+                        None,
+                    )?
+                    .into_iter()
+                    .filter(|decision| {
+                        split_packet_key(&decision.subject_id)
+                            .is_ok_and(|(packet_run, _, _)| packet_run == run_id_owned)
+                    })
+                    .collect::<Vec<_>>();
+                Ok((
+                    ledger.get_run_definition(&run_id_owned)?,
+                    ledger.latest_roster_revision(&run_id_owned)?,
+                    protocol_terminal,
+                    admission_decisions,
+                ))
+            })
+            .await?;
         let action = forged_proto::advance(&view);
         let controller = super::handoff::controller_status(ctx, run_id).await?;
         let identity =
@@ -791,6 +806,12 @@ pub async fn run_status(ctx: &Ctx, req: &OperationRequest) -> OperationResponse 
                     "packetId": a.packet_id,
                     "state": a.state.as_str(),
                     "claimant": a.claimant,
+                })).collect::<Vec<_>>(),
+                "admission": admission_decisions.iter().map(|decision| json!({
+                    "packetId": decision.subject_id,
+                    "outcome": decision.outcome,
+                    "reason": decision.reason,
+                    "nextEligibleWakeAt": decision.next_eligible_wake_at,
                 })).collect::<Vec<_>>(),
                 "settledOperations": view.settled_operations.iter().map(|o| json!({
                     "name": o.name,
