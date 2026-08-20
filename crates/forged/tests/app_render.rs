@@ -1280,6 +1280,12 @@ fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
         json!(["", "chips"]),
         "the identity block leads the head: {session}"
     );
+    assert!(
+        sessions["nodes"].as_array().is_some_and(|nodes| nodes
+            .iter()
+            .any(|entry| entry["class"] == json!("chip chip--id"))),
+        "the canonical selector renders as a copyable chip: {sessions}"
+    );
 
     // The portfolio card is drawn through `overview.html`'s own dispatch, so
     // the ordering assertion is on document order under `#view`.
@@ -1305,8 +1311,8 @@ fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
             .unwrap_or_else(|| panic!("the portfolio card draws {class}: {}", dispatched.text))
     };
     assert!(
-        position("bead__title") < position("bead__id"),
-        "the portfolio card leads with its title: {}",
+        position("bead__title") < position("chip chip--id"),
+        "the portfolio card leads with its title and chips the selector: {}",
         dispatched.text
     );
 }
@@ -1577,6 +1583,46 @@ fn a_plan_source_row_opens_the_plan_facts_it_already_carries() {
         opened["toolCalls"],
         json!(0),
         "plan facts are already in hand, so opening them calls nothing: {opened}"
+    );
+}
+
+/// The Work Map drawer opens a plan node's own facts under a title-led
+/// heading with the selector demoted to a chip — the same contract the
+/// Operations plan drawer carries.
+#[test]
+fn the_work_map_drawer_opens_plan_facts_under_a_title_led_heading() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("work-map.html");
+    let opened = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "actions": [{"type": "click", "class": "node", "index": 0}],
+        }),
+    );
+    let text = opened["text"].to_string();
+    for expected in [
+        "plan facts",
+        "ready",
+        "task",
+        "operator",
+        "Submit a detached controller when this work should start",
+        "plan:plan-one",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the Work Map plan drawer shows {expected}: {text}"
+        );
+    }
+    assert!(
+        opened["nodes"].as_array().is_some_and(|nodes| nodes
+            .iter()
+            .any(|entry| entry["class"] == json!("chip chip--id"))),
+        "the drawer heading demotes the selector to a chip: {opened}"
     );
 }
 

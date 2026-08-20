@@ -228,7 +228,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       }
       rail.append(group);
     }
-    if (drawn < total) rail.append(el("div", "rail__note", `${fmt(drawn)} of ${fmt(total)} conditions shown`));
+    if (drawn < total) rail.append(el("div", "rail__note", `${fmt(drawn)} of ${fmt(total)} items shown`));
   }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
@@ -326,9 +326,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // title cell — a fifth child would push `source` out of its column.
         const title = el("span", "title", titleFor(entry)); const mark = titleMark(entry);
         if (mark) { title.append(document.createTextNode(" ")); title.append(el("span", "source", mark)); }
-        const progress = ago(entry.lastProgressAt || entry.updatedAt);
         // Staleness is presentation only: the row keeps its true ledger
-        // state and gains the age beside it.
+        // state and gains the age beside it. A plan row has no execution
+        // age — its lastProgressAt is the projection capture time — so it
+        // renders bare rather than claiming "0s ago".
+        const progress = target ? ago(entry.lastProgressAt || entry.updatedAt) : "";
         row.append(title); row.append(chip(selector || entry.id, "id"));
         row.append(el("span", "meta", `${entry.state || entry.outcome || "planned"}${progress ? ` · ${progress}` : ""}`));
         row.append(el("span", "source", entry.source || "unknown"));

@@ -180,7 +180,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   function renderRow(row) {
     const article = el("article", "session-row"); const head = el("div", "session-head"); const identity = el("div");
     identity.append(el("div", "session-title", row?.titleSource?.value || row?.identity?.displayTitle || row?.runId || "Untitled attempt"));
-    identity.append(el("div", "selector", `${shown(row?.identity?.subject?.kind)}:${shown(row?.identity?.subject?.id)} · run ${shown(row?.runId)} · packet ${shown(row?.packetId)} · attempt ${shown(row?.attemptId)}`));
+    const selectorLine = el("div", "selector");
+    selectorLine.append(chip(`${shown(row?.identity?.subject?.kind)}:${shown(row?.identity?.subject?.id)}`, "id"));
+    selectorLine.append(document.createTextNode(` run ${shown(row?.runId)} · packet ${shown(row?.packetId)} · attempt ${shown(row?.attemptId)}`));
+    identity.append(selectorLine);
     const chips = el("div", "chips");
     const activity = row?.attempt?.activity || "unknown"; const tone = activity === "running" ? "good" : activity === "revoking" || row?.recovery === "attention" ? "warn" : ["failed","stopped"].includes(activity) ? "bad" : "idle";
     chips.append(chip(activity, tone)); chips.append(chip(`recovery ${shown(row?.recovery)}`)); chips.append(chip(shown(row?.hostMode))); head.append(identity); head.append(chips); article.append(head);

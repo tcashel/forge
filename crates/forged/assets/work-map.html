@@ -147,7 +147,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   }
   function renderDrawer(node){
     const box=byId("drawer");box.replaceChildren();if(!node&&!state.detailError){box.hidden=true;return;}box.hidden=false;
-    const head=el("div","drawer__head");head.append(el("h2","",node?key(node.workRef):"Detail unavailable"));const close=el("button","","Close");close.type="button";close.addEventListener("click",()=>{state.selected=null;state.detail=null;state.detailError=null;render();});head.append(close);box.append(head);
+    const head=el("div","drawer__head");head.append(el("h2","",node?nodeTitle(node):"Detail unavailable"));if(node)head.append(chip(key(node.workRef),"id"));const close=el("button","","Close");close.type="button";close.addEventListener("click",()=>{state.selected=null;state.detail=null;state.detailError=null;render();});head.append(close);box.append(head);
     if(state.detailError){box.append(el("div","error",state.detailError.message));return;}
     const dl=el("dl","kv");const add=(label,value)=>{dl.append(el("dt","",label));dl.append(el("dd","",value==null||value===""?"—":value));};
     add("title",nodeTitle(node));add("source",node.source);add("repository",repositoryLabel(node.identity)||node.repository);add("epic",node.epicId);add("queue",node.queue?.group);add("execution",node.execution?.state||node.execution?.outcome);add("attention",arr(node.attention).length);add("history",node.history?"attached":"not attached");

@@ -1338,7 +1338,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
           if (!child) continue;
           const card = el("div", "bead");
           const top = el("div", "bead__top");
-          top.append(el("span", "bead__id", child.id));
+          top.append(chip(child.id, "id"));
           // Beads status outranks "has a run": a blocked bead with a live run
           // is still blocked, and the operator needs to see that first.
           const held = at(status, "inputRequired.childId") === child.id;
@@ -1708,7 +1708,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || entry.id || "";
       card.append(el("div", "bead__title", displayTitle));
       const top = el("div", "bead__top");
-      top.append(el("span", "bead__id", entry.id));
+      top.append(chip(entry.id, "id"));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
       card.append(top);
       // The title states its authority: an id form reads as an id, and a
