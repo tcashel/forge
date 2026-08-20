@@ -77,7 +77,7 @@ const host = {
   connected: true,
   capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
 };
-const source = ["el", "arr", "num", "int", "chip", "panel", "pickGrid", "choose", "viewResolution"]
+const source = ["el", "arr", "num", "int", "stamp", "ms", "ago", "chip", "panel", "pickGrid", "choose", "viewResolution"]
   .map(lift)
   .join("\n");
 const { viewResolution, choose } = new Function(

@@ -129,7 +129,7 @@ const document = {
 };
 
 const source = [
-  "el", "arr", "at", "num", "int", "chip", "panel", "pickGrid", "choose", "upToPortfolio",
+  "el", "arr", "at", "num", "int", "stamp", "ms", "ago", "chip", "panel", "pickGrid", "choose", "upToPortfolio",
   "viewResolution", "viewPortfolio", "drawRail", "portfolioRail", "render", "subjectParams",
   "capabilitiesSettled", "ingest",
 ]

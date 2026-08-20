@@ -163,15 +163,66 @@ const initialVariable = documentElement.style.values["--host-accent"];
 flushFrames();
 
 const malicious = '<img src=x onerror="globalThis.injected=true">';
+// Attention in its closed `forged.attention-item/1` shape. Every rail reads
+// `openedAt`, `recommendedAction` and `subjectTitle`, so a fixture carrying
+// only `{condition, detail}` proved nothing about any of them.
+const attentionItem = overrides => ({
+  schema: "forged.attention-item/1",
+  id: overrides.subjectId,
+  kind: "slice",
+  attentionId: `attention-${overrides.subjectId}-${overrides.condition}`,
+  occurrenceId: `occurrence-${overrides.subjectId}-${overrides.condition}`,
+  subjectKind: "run",
+  repository: "/home/op/forge",
+  severity: "high",
+  owner: "human",
+  state: "open",
+  subjectTitle: null,
+  updatedAt: "2026-08-15T00:06:00Z",
+  evidence: {},
+  evidenceRefs: [],
+  acknowledgement: null,
+  resolution: null,
+  ...overrides,
+});
+const attention = [
+  attentionItem({
+    subjectId: "run-1", condition: "input-required", severity: "critical",
+    openedAt: "2026-08-15T00:02:00Z", detail: "The implement packet asked a question",
+    subjectTitle: { known: true, value: malicious, source: "beads.title", beadId: "beads-one" },
+    recommendedAction: { code: "provide-input", text: "Answer the packet question, then resume" },
+  }),
+  attentionItem({
+    subjectId: "run-2", condition: "missing-cost", severity: "low",
+    openedAt: "2026-08-14T00:00:00Z", detail: "3 usage rows carry no cost",
+    subjectTitle: { known: false, value: "run-2", source: "unknown", beadId: "beads-two" },
+    recommendedAction: { code: "repair-pricing", text: "Repair the pricing basis for the unpriced rows" },
+  }),
+  attentionItem({
+    subjectId: "run-3", condition: "input-required", severity: "medium",
+    openedAt: "2026-08-13T00:00:00Z", detail: "The review packet asked a question",
+    subjectTitle: { known: true, value: "Older hold", source: "identity.displayTitle", beadId: "beads-three" },
+    recommendedAction: { code: "provide-input", text: "Answer the review question, then resume" },
+  }),
+];
+// Twenty-one findings, the live beads-016 total: the pre-change panel sliced
+// to twenty and said nothing at all about the one it dropped.
+const latestFindings = Array.from({ length: 21 }, (_, index) => ({
+  severity: ["blocker", "high", "medium", "low"][index % 4],
+  file: index === 5 ? null : index === 20 ? "crates/forged/assets/work-detail.html" : `crates/forged/src/finding_${index}.rs`,
+  line: index === 5 ? null : index === 20 ? 81 : index + 1,
+  message: index === 20 ? "The twenty-first finding must still be visible" : `Finding ${index} needs a decision`,
+}));
+const repositoryIdentity = { path: "/home/op/forge", label: "op/forge" };
 const payload = operations
   ? {
       schema: "forged.operations-overview/1",
       scope: {},
       sourceHealth: { ledger: { state: "available" }, beads: { state: "available" }, plan: { state: "available" } },
       coverage: { total: 2, shown: 2, truncated: false },
-      counts: { live: 1, queued: 0, attention: 0, planOnly: 1, reviewReady: 0 },
+      counts: { live: 1, queued: 0, attention: attention.length, planOnly: 1, reviewReady: 0 },
       spend: { costUsdKnown: 0 },
-      attention: [{ condition: malicious, detail: "text only" }],
+      attention,
       queue: {
         groups: [{
           code: "running",
@@ -179,8 +230,26 @@ const payload = operations
           total: 2,
           shown: 2,
           entries: [
-            { id: "plan-one", state: "planned", source: "live-plan", identity: { displayTitle: malicious }, detailTarget: null },
-            { id: "display-alias", state: "active", source: "durable", identity: { displayTitle: "Durable work" }, detailTarget: { subjectKind: "run", subjectId: "run-1" } },
+            {
+              id: "plan-one", state: "planned", source: "live-plan", beadId: "plan-one",
+              identity: { displayTitle: malicious, bead: { id: "plan-one" }, repository: repositoryIdentity },
+              titleSource: { known: true, value: malicious, source: "beads.title", beadId: "plan-one" },
+              lastProgressAt: "2026-08-15T00:00:00Z",
+              nextAction: "Submit a detached controller when this work should start",
+              plan: {
+                source: "beads", status: "open", readiness: "ready", priority: 1,
+                assignee: "operator", issueType: "task", revision: "rev-1",
+                parent: null, dependencies: [],
+              },
+              detailTarget: null,
+            },
+            {
+              id: "display-alias", state: "active", source: "durable", beadId: "beads-one",
+              identity: { displayTitle: "Durable work", bead: { id: "beads-one" }, repository: repositoryIdentity },
+              titleSource: { known: true, value: "Durable work", source: "identity.displayTitle", beadId: "beads-one" },
+              lastProgressAt: "2026-08-15T00:01:00Z",
+              detailTarget: { subjectKind: "run", subjectId: "run-1" },
+            },
           ],
         }],
       },
@@ -198,15 +267,26 @@ const payload = operations
         {
           workRef: { schema: "forged.work-ref/1", kind: "plan", id: "plan-one" },
           source: "live-plan", contextOnly: false,
-          identity: { displayTitle: malicious }, plan: { status: "open" },
-          queue: { group: "planned" }, execution: { source: "none" }, history: null,
+          identity: { displayTitle: malicious, repository: repositoryIdentity },
+          titleSource: { known: true, value: malicious, source: "beads.title", beadId: "plan-one" },
+          repository: "/home/op/forge",
+          plan: {
+            source: "beads", status: "open", readiness: "ready", priority: 1,
+            assignee: "operator", issueType: "task", revision: "rev-1",
+            parent: null, dependencies: [],
+          },
+          queue: { group: "planned", nextAction: "Submit a detached controller when this work should start" },
+          execution: { source: "none" }, history: null,
           attention: [], detailTarget: null,
         },
         {
           workRef: { schema: "forged.work-ref/1", kind: "run", id: "run-1" },
           source: "durable", contextOnly: false,
-          identity: { displayTitle: "Durable work" }, plan: null,
-          queue: { group: "running" }, execution: { state: "active" }, history: null,
+          identity: { displayTitle: "Durable work", repository: repositoryIdentity },
+          titleSource: { known: true, value: "Durable work", source: "identity.displayTitle", beadId: "beads-one" },
+          repository: "/home/op/forge", plan: null,
+          queue: { group: "running", desired: { lastProgressAt: "2026-08-15T00:01:00Z" } },
+          execution: { state: "active" }, history: null,
           attention: [], detailTarget: { subjectKind: "run", subjectId: "run-1" },
         },
       ],
@@ -222,7 +302,7 @@ const payload = operations
         summary: { totalMatched: 1, returned: 1, active: 1, historical: 0, ownedHerdr: 1, process: 0, legacyHerdr: 0, unknownHost: 0 },
         rows: [{
           runId: "run-1", packetId: "run-1/implement/1", attemptId: 4, epicId: null,
-          identity: { subject: { kind: "run", id: "run-1" }, displayTitle: malicious },
+          identity: { subject: { kind: "run", id: "run-1" }, displayTitle: malicious, repository: repositoryIdentity },
           repository: "/repo", stage: "implementation", provider: "codex", model: "gpt-5.6-sol",
           attempt: { activity: "running", claimant: "secret-claimant", revokeReason: "secret-revoke", failNote: "secret-failure", startedAt: "2026-08-15T00:00:00Z", updatedAt: "2026-08-15T00:01:00Z", lastHeartbeatAt: null, endedAt: null },
           recovery: "healthy",
@@ -240,12 +320,32 @@ const payload = operations
       id: "run-1",
       kind: "run",
       workRef: { kind: "run" },
-      identity: { displayTitle: malicious, bead: { id: "beads-one" }, repository: { path: "/repo" } },
+      identity: { displayTitle: malicious, bead: { id: "beads-one" }, repository: repositoryIdentity, baseRef: "main" },
+      titleSource: { known: true, value: malicious, source: "beads.title", beadId: "beads-one" },
       status: { state: "active" },
+      delivery: { source: "ledger", known: true, pr: 125, sha: "0f1e2d3c4b5a", base: "main" },
+      gates: [
+        { attemptId: 1, packetId: "run-1/implementation/0", implemented: true, commitsAhead: 2, summary: "Implemented the slice", gateState: "pass", passed: true, note: null },
+        { attemptId: 2, packetId: "run-1/review/0", implemented: false, commitsAhead: 0, summary: "The gate refused the change", gateState: "fail", passed: false, note: "clippy denied a warning" },
+      ],
       workers: { sessions: [] },
-      reviews: { latestFindings: [] },
+      reviews: {
+        latestFindings,
+        latestFindingTotal: latestFindings.length,
+        latestFindingLimit: 200,
+        latestFindingsTruncated: false,
+      },
+      attention,
+      attentionTotal: attention.length,
+      attentionLimit: 200,
+      attentionTruncated: false,
       artifacts: [],
-      events: { events: [] },
+      events: {
+        events: [
+          { eventId: 41, kind: "forged.run.started", ts: "2026-08-15T00:00:00Z" },
+          { eventId: 42, kind: "proto.gate", ts: "2026-08-15T00:04:00Z" },
+        ],
+      },
       usage: { totals: { costUsdKnown: 0 } },
     };
 if (scenario?.toolInput) {
@@ -286,6 +386,16 @@ for (const action of scenario?.actions || []) {
     dispatch({ jsonrpc: "2.0", method: "ui/notifications/tool-cancelled", params: action.params || {} });
   } else if (action.type === "host-context") {
     dispatch({ jsonrpc: "2.0", method: "ui/notifications/host-context-changed", params: action.params || {} });
+  } else if (action.type === "click") {
+    // A row that opens facts the payload already carries needs no tool call,
+    // so the scenario must be able to press it without `serverTools`.
+    const live = [];
+    const walkLive = node => { live.push(node); for (const kid of node.kids) walkLive(kid); };
+    for (const root of registry.values()) walkLive(root);
+    const targets = live.filter(node => node.className === action.class && !node.disabled);
+    const target = targets[action.index || 0];
+    if (!target) throw new Error(`no clickable ${action.class} at index ${action.index || 0}`);
+    target.click();
   } else {
     throw new Error(`unknown scenario action ${JSON.stringify(action)}`);
   }
@@ -384,8 +494,23 @@ function flatten(root) {
   const out = [];
   const walk = (node) => {
     // `cells` is the direct-child count: a CSS-grid row is only laid out
-    // correctly while it matches its own grid-template-columns.
-    out.push({ tag: node.tag, class: node.className, text: node.textContent, title: node.title, disabled: !!node.disabled, cells: node.kids.length });
+    // correctly while it matches its own grid-template-columns. `childClass`
+    // and `childText` are that row's cells IN ORDER, which is the only way an
+    // assertion can state which cell LEADS; a leaf carries neither, so a
+    // failure report stays readable.
+    const entry = {
+      tag: node.tag,
+      class: node.className,
+      text: node.textContent,
+      title: node.title,
+      disabled: !!node.disabled,
+      cells: node.kids.length,
+    };
+    if (node.kids.length) {
+      entry.childClass = node.kids.map((kid) => kid.className);
+      entry.childText = node.kids.map((kid) => (kid.textContent === undefined ? null : String(kid.textContent)));
+    }
+    out.push(entry);
     for (const kid of node.kids) walk(kid);
   };
   walk(root);
@@ -405,6 +530,7 @@ process.stdout.write(JSON.stringify({
   workMap,
   agentSessions,
   scenarioMode,
+  nodes,
   rows,
   mapNodes,
   sessionRows,

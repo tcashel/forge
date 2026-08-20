@@ -884,10 +884,12 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
         if operations {
             let rows = report["rows"].as_array().expect("Operations rows");
             assert_eq!(rows.len(), 2, "both Operations rows render: {report}");
-            assert_eq!(rows[0]["disabled"], json!(true));
+            // A plan row opens facts the payload already carried, so it is
+            // live even on a host that proxies no tool call at all.
+            assert_eq!(rows[0]["disabled"], json!(false));
             assert_eq!(
                 rows[0]["title"],
-                json!("Plan-only work has no durable detail yet")
+                json!("Open the plan facts this row already carries")
             );
             assert_eq!(rows[1]["disabled"], json!(true));
             assert_eq!(
@@ -906,9 +908,9 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
             assert!(
                 report["text"]
                     .as_array()
-                    .is_some_and(|texts| texts.contains(&json!("run-1"))
+                    .is_some_and(|texts| texts.contains(&json!("run:run-1"))
                         && texts.contains(&report["malicious"])),
-                "Work Map safely renders exact ids and hostile titles as text: {report}"
+                "Work Map safely renders exact selectors and hostile titles as text: {report}"
             );
         } else if agent_sessions {
             assert_eq!(
@@ -1208,4 +1210,398 @@ fn agent_sessions_controls_are_bounded_exact_and_read_only() {
         Some(&json!(0)),
         "all explicit read and model-context requests tear down: {report}"
     );
+}
+
+/// Every App surface leads with the display title and keeps the canonical
+/// selector beside it.
+///
+/// The id came first in every row, which made a queue of `run-0f3a…` strings
+/// that named nothing. Demoting the id is not hiding it: the selector is
+/// still rendered as its own cell, because it is what a follow-up call has
+/// to be addressed with.
+#[test]
+fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+
+    let operations = run_split_app_host(&node, &root.join("operations-overview.html"));
+    let rows = operations["rows"].as_array().expect("Operations rows");
+    assert_eq!(rows.len(), 2, "both Operations rows render: {operations}");
+    for row in rows {
+        assert_eq!(
+            row["childClass"][0], "title",
+            "the display title is the first cell: {row}"
+        );
+        assert!(
+            row["childClass"]
+                .as_array()
+                .is_some_and(|cells| cells.iter().any(|cell| cell == "chip chip--id")),
+            "the canonical selector stays visible as a chip: {row}"
+        );
+    }
+    assert_eq!(rows[0]["childText"][0], operations["malicious"]);
+    assert_eq!(rows[1]["childText"][0], json!("Durable work"));
+    assert_eq!(rows[1]["childText"][1], json!("run:run-1"));
+
+    let map = run_split_app_host(&node, &root.join("work-map.html"));
+    let map_rows = map["nodes"]
+        .as_array()
+        .expect("Work Map nodes")
+        .iter()
+        .filter(|entry| {
+            entry["class"] == json!("node") || entry["class"] == json!("node node--context")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(map_rows.len(), 2, "both Work Map nodes render: {map}");
+    for row in &map_rows {
+        assert_eq!(
+            row["childClass"][0], "title",
+            "the display title is the first cell: {row}"
+        );
+    }
+    assert_eq!(map_rows[0]["childText"][0], map["malicious"]);
+    assert_eq!(map_rows[1]["childText"][0], json!("Durable work"));
+    assert!(
+        map["text"]
+            .as_array()
+            .is_some_and(|texts| texts.contains(&json!("run:run-1"))),
+        "the Work Map keeps the exact selector: {map}"
+    );
+}
+
+/// No App prints a raw ISO timestamp.
+///
+/// `2026-08-15T00:01:00Z` answers "when" with a string an operator has to
+/// subtract from now in their head. Every one of them is an age or a clock
+/// time now, through the helpers lifted out of `overview.html`.
+#[test]
+fn no_split_app_prints_a_raw_iso_timestamp() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for name in [
+        "operations-overview.html",
+        "work-detail.html",
+        "work-map.html",
+        "agent-sessions.html",
+    ] {
+        let report = run_split_app_host(&node, &root.join(name));
+        for value in report["text"].as_array().expect("rendered text") {
+            let text = value.as_str().unwrap_or_default();
+            assert!(
+                !text.contains("T00:0") && !text.contains("2026-08-1"),
+                "{name} renders the raw timestamp {text:?}"
+            );
+        }
+    }
+}
+
+/// Work Detail renders the evidence its own payload already carried.
+///
+/// The projection has shipped `attention`, `delivery` and `gates` since the
+/// schema was written, and the panel drew none of them; the findings panel
+/// sliced to twenty of the live twenty-one and said nothing about the one it
+/// dropped. A finding without `file:line` is unactionable, so the address
+/// leads each row and the severities are tallied above them.
+#[test]
+fn work_detail_renders_the_attention_delivery_gates_and_addressed_findings() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("work-detail.html");
+    let report = run_split_app_host(&node, &asset);
+    let text = report["text"].to_string();
+
+    for expected in [
+        // Every one of the twenty-one findings, addressed.
+        "crates/forged/src/finding_0.rs:1",
+        "crates/forged/assets/work-detail.html:81",
+        "The twenty-first finding must still be visible",
+        // A finding the reviewer never addressed says so rather than vanishing.
+        "not addressed to a file",
+        // The severity tally.
+        "6 blocker",
+        "5 high",
+        // The attention conditions, with their recommended actions.
+        "input-required",
+        "Answer the packet question, then resume",
+        "Repair the pricing basis for the unpriced rows",
+        // Delivery and gates.
+        "125",
+        "pass",
+        "clippy denied a warning",
+        // The repository reads from its label, never its raw path.
+        "op/forge",
+    ] {
+        assert!(
+            text.contains(expected),
+            "Work Detail shows {expected}: {text}"
+        );
+    }
+    assert!(
+        !text.contains("/home/op/forge"),
+        "the repository renders from its label: {text}"
+    );
+}
+
+/// Truncation is stated, never silent.
+///
+/// A panel that quietly caps at twenty tells an operator who has twenty-one
+/// findings that they have twenty. The count the payload carries is the one
+/// that has to reach the screen.
+#[test]
+fn work_detail_states_a_finding_bound_rather_than_slicing_silently() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("work-detail.html");
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.work-detail/1",
+                "id": "run-1",
+                "kind": "run",
+                "workRef": {"kind": "run"},
+                "identity": {"displayTitle": "Bounded work", "bead": {"id": "beads-one"},
+                             "repository": {"path": "/home/op/forge", "label": "op/forge"}},
+                "status": {"state": "active"},
+                "workers": {"sessions": []},
+                "reviews": {
+                    "latestFindings": [
+                        {"severity": "blocker", "file": "src/lib.rs", "line": 7, "message": "One carried finding"},
+                    ],
+                    "latestFindingTotal": 21,
+                },
+                "attention": [],
+                "attentionTotal": 9,
+                "artifacts": [],
+                "events": {"events": []},
+                "usage": {"totals": {"costUsdKnown": 0}},
+            }}},
+        }),
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("1 of 21"),
+        "the findings panel states the bound it is showing: {text}"
+    );
+    assert!(
+        text.contains("0 of 9"),
+        "the attention panel states its bound too: {text}"
+    );
+}
+
+/// The rail answers "what needs a human", so it has to be readable as one.
+///
+/// Ungrouped, untitled, unordered `condition · id · detail` lines made a
+/// thirty-row wall. Conditions group, the oldest hold in each group leads,
+/// the subject's own title is what names it, and a rail that shows fewer
+/// items than the projection counted says so.
+#[test]
+fn the_operations_rail_groups_sorts_titles_and_states_its_bound() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+
+    let report = run_split_app_host(&node, &asset);
+    let groups = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| entry["class"] == json!("rail__group"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        groups.len(),
+        2,
+        "two conditions become two groups: {report}"
+    );
+    let rows = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| entry["class"] == json!("attention"))
+        .collect::<Vec<_>>();
+    assert_eq!(rows.len(), 3, "every condition still renders: {report}");
+    // Oldest first inside a condition: the hold that has waited longest is
+    // the one a human should look at first.
+    assert_eq!(rows[0]["childText"][0], json!("Older hold"));
+    assert_eq!(rows[1]["childText"][0], report["malicious"]);
+    let text = report["text"].to_string();
+    for expected in [
+        "Answer the review question, then resume",
+        "Repair the pricing basis for the unpriced rows",
+        "run:run-2",
+        // A subject nothing ever titled is rendered AS an id, exactly as a
+        // queue row renders it.
+        "untitled id",
+    ] {
+        assert!(text.contains(expected), "the rail shows {expected}: {text}");
+    }
+
+    // Beyond the rail's own bound the count it did not draw is stated.
+    let mut items = Vec::new();
+    for index in 0..14 {
+        items.push(json!({
+            "schema": "forged.attention-item/1",
+            "id": format!("run-{index}"),
+            "kind": "slice",
+            "subjectKind": "run",
+            "subjectId": format!("run-{index}"),
+            "subjectTitle": {"known": true, "value": format!("Held work {index}"),
+                             "source": "beads.title", "beadId": format!("beads-{index}")},
+            "condition": "blocked",
+            "severity": "high",
+            "owner": "human",
+            "state": "open",
+            "openedAt": format!("2026-08-{:02}T00:00:00Z", index + 1),
+            "updatedAt": "2026-08-15T00:00:00Z",
+            "detail": "held",
+            "recommendedAction": {"code": "resolve-blocker", "text": "Resolve the blocker"},
+        }));
+    }
+    let bounded = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1",
+                "scope": {"repository": "/repo"},
+                "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"},
+                                 "plan": {"state": "available"}},
+                "coverage": {"total": 0, "shown": 0, "matching": 0, "truncated": false},
+                "counts": {"live": 0, "queued": 0, "attention": 14, "planOnly": 0, "reviewReady": 0},
+                "spend": {"costUsdKnown": 0},
+                "attention": items,
+                "queue": {"groups": []},
+            }}},
+        }),
+    );
+    assert!(
+        bounded["text"].to_string().contains("of 14"),
+        "a bounded rail states what it did not draw: {}",
+        bounded["text"]
+    );
+}
+
+/// A plan row is not a dead row.
+///
+/// Every live-plan row rendered disabled with "no durable detail yet", which
+/// is true and useless: the projection hands the App the whole Beads plan
+/// record. The row opens what it already holds, and needs no server tool to
+/// do it.
+#[test]
+fn a_plan_source_row_opens_the_plan_facts_it_already_carries() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let report = run_split_app_host(&node, &asset);
+    let rows = report["rows"].as_array().expect("Operations rows");
+    assert_eq!(
+        rows[0]["disabled"],
+        json!(false),
+        "a plan row is never disabled for being plan-source: {report}"
+    );
+
+    let opened = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "actions": [{"type": "click", "class": "row", "index": 0}],
+        }),
+    );
+    let text = opened["text"].to_string();
+    for expected in [
+        "plan facts",
+        "ready",
+        "task",
+        "operator",
+        "Submit a detached controller when this work should start",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the plan drawer shows {expected}: {text}"
+        );
+    }
+    assert_eq!(
+        opened["toolCalls"],
+        json!(0),
+        "plan facts are already in hand, so opening them calls nothing: {opened}"
+    );
+}
+
+/// Agent Sessions leads with six facts and files the rest behind a
+/// disclosure.
+///
+/// Every attempt printed every recorded key at equal weight, so the diagnosis
+/// was buried in the evidence. The evidence is all still there — one control
+/// away.
+#[test]
+fn agent_sessions_collapses_its_recorded_facts_behind_a_disclosure() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("agent-sessions.html");
+    let report = run_split_app_host(&node, &asset);
+    let nodes = report["nodes"].as_array().expect("rendered nodes");
+    let headline = nodes
+        .iter()
+        .filter(|entry| entry["class"] == json!("kv kv--headline"))
+        .collect::<Vec<_>>();
+    assert_eq!(headline.len(), 1, "one headline per row: {report}");
+    assert_eq!(
+        headline[0]["cells"],
+        json!(12),
+        "six key/value pairs lead the row: {report}"
+    );
+    assert!(
+        nodes.iter().any(|entry| entry["tag"] == json!("details")),
+        "the remaining recorded facts sit behind a disclosure: {report}"
+    );
+    // The disclosure is a control, not a delete: the evidence still renders.
+    let text = report["text"].to_string();
+    for kept in ["pane-1", "candidate-1", "provider-1", "projection-1"] {
+        assert!(
+            text.contains(kept),
+            "the disclosure still carries {kept}: {text}"
+        );
+    }
+}
+
+/// Every App advertises `fullscreen`, so every App has to offer it.
+///
+/// Four of the five declared `availableDisplayModes: ["inline","fullscreen"]`
+/// in the handshake and then shipped no control that could ask for it.
+#[test]
+fn every_app_offers_the_display_mode_it_advertises() {
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for name in [
+        "overview.html",
+        "operations-overview.html",
+        "work-detail.html",
+        "work-map.html",
+        "agent-sessions.html",
+    ] {
+        let html = std::fs::read_to_string(root.join(name)).expect("read App");
+        assert!(
+            html.contains("availableDisplayModes"),
+            "{name} advertises its display modes"
+        );
+        assert!(
+            html.contains("ui/request-display-mode"),
+            "{name} offers a control that asks for the mode it advertises"
+        );
+        assert!(
+            html.contains("id=\"expand\""),
+            "{name} draws the Expand control"
+        );
+    }
 }
