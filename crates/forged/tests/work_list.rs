@@ -302,6 +302,17 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         json!("Prepare the operator queue"),
         "a live Beads rename cannot rewrite legacy durable identity"
     );
+    // The live title is carried BESIDE the frozen one, naming its authority,
+    // so a consumer can render it without the rename invariant dissolving.
+    assert_eq!(planned["titleSource"]["source"], json!("beads.title"));
+    assert_eq!(planned["titleSource"]["beadId"], json!("bead-q-planned"));
+    assert!(
+        planned["titleSource"]["value"]
+            .as_str()
+            .expect("resolved title")
+            .contains("Prepare the operator queue"),
+        "{planned}"
+    );
     assert_eq!(planned["ci"]["status"], json!("unknown"));
     for key in [
         "outcome",

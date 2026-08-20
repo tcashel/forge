@@ -421,6 +421,81 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
     );
 }
 
+/// The one operator-visible lie this slice produces the data to replace: the
+/// durable group counted 0 while conditions were open, and the App printed
+/// `nothing is waiting` over the top of them.
+#[test]
+fn the_portfolio_never_says_nothing_is_waiting_while_conditions_are_open() {
+    let Some(node) = require_node() else { return };
+    let entry = json!({
+        "id": "held-run",
+        "kind": "slice",
+        "beadId": "bead-held-run",
+        "identity": {"displayTitle": "bead-held-run [repositories/forge]"},
+        "titleSource": {
+            "known": true,
+            "value": "Repair the bead read [repositories/forge]",
+            "source": "beads.title",
+            "beadId": "bead-held-run",
+        },
+        "state": "active",
+    });
+    let mut payload = portfolio(
+        vec![entry.clone()],
+        vec![json!({
+            "id": "held-run",
+            "kind": "slice",
+            "condition": "blocked",
+            "severity": "high",
+            "detail": "an open condition",
+        })],
+    );
+    payload["queue"] = json!({
+        "total": 18,
+        "groups": [
+            {"name": "Needs me", "count": 1, "entries": [entry],
+             "code": "needs-me", "shown": 18, "total": 18,
+             "excluded": {"livePlan": 17}},
+        ],
+    });
+    let dispatched = render_dispatch(&node, &json!({"ok": true, "result": payload}));
+    assert!(
+        !dispatched.text.contains("nothing is waiting"),
+        "an open condition contradicts the sentence: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.text.contains("+17 planned"),
+        "excluded plan rows are secondary context: {}",
+        dispatched.text
+    );
+    // Secondary context, never summed into the headline.
+    assert!(
+        dispatched.text.contains("1\nneeds me"),
+        "the headline is the durable group's own count: {}",
+        dispatched.text
+    );
+    assert!(
+        !dispatched.text.contains("18\nneeds me"),
+        "the excluded rows are never summed into the headline: {}",
+        dispatched.text
+    );
+    // A live title is rendered, and marked as a current read rather than
+    // presented as launch evidence.
+    assert!(
+        dispatched
+            .text
+            .contains("Repair the bead read [repositories/forge]"),
+        "the resolved title reaches the card: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.text.contains("live title"),
+        "a current Beads read is marked live: {}",
+        dispatched.text
+    );
+}
+
 /// The rail is the answer to "what needs a human", so it has to be drawn
 /// from the payload's own conditions rather than re-derived by the App.
 #[test]

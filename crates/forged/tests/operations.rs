@@ -777,3 +777,285 @@ fn work_detail_bounds_history_uses_only_manifest_metadata_and_fails_closed_on_re
         "{response}"
     );
 }
+
+/// Two runs legitimately share one Bead — a resubmission, a superseded
+/// attempt, an epic child re-driven. The exact-hydrate contract requires one
+/// row per requested id, so an undeduplicated projection failed the WHOLE
+/// live read closed and reported every row as claim-unknown.
+///
+/// Unscoped on purpose: the `--repo` branch builds `bd list --id …`, which
+/// never reaches the uniqueness guard, so a scoped fixture would be a green
+/// test over an unfixed path.
+#[test]
+fn two_runs_sharing_one_bead_still_resolve_one_exact_claim_batch() {
+    let env = TestEnv::new("forged-operations-shared-bead");
+    env.forged(&["init"]);
+    let ledger = env.ledger();
+    for run_id in ["dup-first", "dup-second"] {
+        ledger
+            .create_run(forged_ledger::NewRun {
+                run_id: forged_types::RunId::new(run_id).expect("run id"),
+                bead_id: "bead-shared".to_owned(),
+                repo: env.repos.repo.to_string_lossy().into_owned(),
+                base_ref: env.repos.base.clone(),
+                branch: format!("forged/{run_id}"),
+            })
+            .expect("create run");
+    }
+    ledger.close().expect("close ledger");
+    env.set_bead_field("bead-shared", "title", "Shared by two runs");
+    env.set_bead_field("bead-shared", "status", "open");
+    env.set_bead_field("plan-only", "title", "Never executed");
+    env.set_bead_field("plan-only", "status", "open");
+
+    let before = env.bd_calls().len();
+    let (code, response) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "operations overview: {response}");
+    assert_eq!(
+        response["result"]["sourceHealth"]["beads"]["state"],
+        json!("available"),
+        "a repeated bead id cannot fail the whole live read closed: {response}"
+    );
+    let rows = entries(&response);
+    for id in ["dup-first", "dup-second"] {
+        assert_eq!(
+            rows[id]["claimHealth"]["known"],
+            json!(true),
+            "{id} joins the live claim read: {response}"
+        );
+    }
+    for (id, row) in &rows {
+        assert!(
+            !row["blocker"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("Beads unavailable"),
+            "{id} carries no outage blocker: {row}"
+        );
+    }
+
+    let calls = &env.bd_calls()[before..];
+    let shows = calls
+        .iter()
+        .filter(|call| call.starts_with("show ") && call.contains("--brief-deps --json"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        shows.len(),
+        2,
+        "one exact claim batch and one plan hydrate: {calls:?}"
+    );
+    // The claim batch is the read built from the LEDGER's per-run bead ids;
+    // the plan hydrate is built from discovery, which already deduplicates.
+    // Asserting over the hydrate would say nothing about the repaired path,
+    // and asserting non-crash alone would still pass if someone loosened
+    // `exact_issue_rows`.
+    let claim = shows
+        .iter()
+        .find(|call| !call.contains("plan-only"))
+        .unwrap_or_else(|| panic!("the exact claim batch is not the plan hydrate: {calls:?}"));
+    assert_eq!(
+        claim
+            .split_whitespace()
+            .filter(|token| *token == "bead-shared")
+            .count(),
+        1,
+        "the exact claim batch requests the shared bead exactly once: {claim}"
+    );
+}
+
+/// A durable identity that froze titleless gains a live title BESIDE it —
+/// never instead of it. `title` and `identity.displayTitle` remain launch
+/// evidence a later rename cannot rewrite.
+#[test]
+fn a_titleless_frozen_identity_gains_a_live_title_without_rewriting_launch_evidence() {
+    let env = TestEnv::new("forged-operations-title-source");
+    env.forged(&["init"]);
+    fabricate_run(&env, "titleless");
+    env.set_bead_field("bead-titleless", "title", "Repair the bead read");
+    env.set_bead_field("bead-titleless", "status", "closed");
+
+    let (code, response) = env.forged(&["operations", "overview"]);
+    assert_eq!(code, 0, "operations overview: {response}");
+    let rows = entries(&response);
+    let row = &rows["titleless"];
+    assert_eq!(row["identity"]["bead"]["title"], Value::Null, "{row}");
+    assert_eq!(row["titleSource"]["source"], json!("beads.title"), "{row}");
+    assert_eq!(row["titleSource"]["known"], json!(true), "{row}");
+    assert_eq!(
+        row["titleSource"]["beadId"],
+        json!("bead-titleless"),
+        "{row}"
+    );
+    assert!(
+        row["titleSource"]["value"]
+            .as_str()
+            .expect("resolved title")
+            .contains("Repair the bead read"),
+        "{row}"
+    );
+    // The frozen pair is untouched, and a closed bead is absent from plan
+    // discovery — it carries a title only because the exact read repaired.
+    assert_eq!(row["title"], row["identity"]["displayTitle"], "{row}");
+    assert_eq!(
+        row["identity"]["displayTitle"],
+        json!(forged_types::work_display_title(
+            "titleless",
+            None,
+            forged_types::repository_label(
+                &forged_types::normalize_repository_path(&env.repos.repo.to_string_lossy())
+                    .expect("canonical fixture repo")
+            )
+            .as_deref(),
+            None,
+            None,
+        )),
+        "{row}"
+    );
+}
+
+/// Work Detail spends exactly one bounded read on its OWN bead, and an epic
+/// never stamps its title or its bead id onto a child run's attention item.
+///
+/// `attention_subject` answers `(Run, <child run id>, ...)` for every run in
+/// the snapshot, so an unconditional fill would contradict `subjectId` on the
+/// same object.
+#[test]
+fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
+    let env = TestEnv::new("forged-work-detail-title-source");
+    env.forged(&["init"]);
+    fabricate_epic(&env, "title-epic");
+    fabricate_run(&env, "title-child");
+    let repository = forged_types::normalize_repository_path(&env.repos.repo.to_string_lossy())
+        .expect("canonical repository");
+    let label = forged_types::repository_label(&repository).expect("repository label");
+    // The child's identity froze titleless and names its epic, the exact
+    // shape that made an unconditional fill stamp the epic onto the child.
+    let display_title = forged_types::work_display_title(
+        "title-child",
+        None,
+        Some(&label),
+        None,
+        Some(&forged_types::WorkIdentityContextV1 {
+            id: "title-epic".to_owned(),
+            title: Some("Epic title-epic".to_owned()),
+        }),
+    );
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open fixture db");
+    connection
+        .execute(
+            "DELETE FROM work_identities WHERE subject_kind = 'run' AND subject_id = 'title-child'",
+            [],
+        )
+        .expect("remove legacy child identity");
+    connection
+        .execute(
+            "INSERT INTO work_identities (
+               schema, subject_kind, subject_id, bead_id, bead_title, bead_revision,
+               repository_path, repository_label, project_id, project_title,
+               epic_id, epic_title, display_title, captured_at, source
+             ) VALUES ('forged.work-identity/1', 'run', 'title-child',
+               'bead-title-child', NULL, NULL, ?1, ?2, NULL, NULL,
+               'title-epic', 'Epic title-epic', ?3,
+               '2026-08-14T12:00:00Z', 'durable')",
+            rusqlite::params![repository, label, display_title],
+        )
+        .expect("insert epic child identity");
+    drop(connection);
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some("title-epic"),
+            "forged.epic.child.started",
+            json!({"childId": "bead-title-child", "runId": "title-child"}),
+        )
+        .expect("child start");
+    ledger
+        .record_usage(forged_ledger::NewUsage {
+            run_id: "title-child".to_owned(),
+            packet_id: None,
+            attempt_id: None,
+            provider: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            input_tokens: 1,
+            output_tokens: 1,
+            cache_read_tokens: None,
+            cache_write_tokens: None,
+            cost_usd: None,
+            pricing_basis: None,
+            rate_limit_used_percent: None,
+            web_search_requests: None,
+        })
+        .expect("unpriced child usage");
+    ledger.close().expect("close ledger");
+    env.set_bead_field("title-epic", "title", "Epic bead title");
+    env.set_bead_field("bead-title-child", "title", "Child bead title");
+
+    let (code, response) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "epic",
+        "--subject-id",
+        "title-epic",
+    ]);
+    assert_eq!(code, 0, "work detail: {response}");
+    let detail = &response["result"];
+    assert_eq!(
+        detail["titleSource"]["beadId"],
+        json!("title-epic"),
+        "{detail}"
+    );
+    let items = detail["attention"].as_array().expect("attention items");
+    let children = items
+        .iter()
+        .filter(|item| item["subjectId"] != json!("title-epic"))
+        .collect::<Vec<_>>();
+    assert!(
+        !children.is_empty(),
+        "the fixture opens a child-run condition: {detail}"
+    );
+    for item in children {
+        assert_eq!(item["subjectId"], json!("title-child"), "{item}");
+        // A field named subjectTitle must not contradict subjectId on the
+        // same object: the child answers from its OWN frozen identity.
+        assert_eq!(
+            item["subjectTitle"]["beadId"],
+            json!("bead-title-child"),
+            "{item}"
+        );
+        assert_ne!(
+            item["subjectTitle"]["beadId"],
+            json!("title-epic"),
+            "{item}"
+        );
+        assert_ne!(
+            item["subjectTitle"]["value"], detail["titleSource"]["value"],
+            "{item}"
+        );
+    }
+
+    // Work Detail is what an operator opens when something is wrong, which
+    // is exactly when Beads may be unavailable: the read is fail-soft.
+    env.set_bd_show_unreachable(true);
+    let (code, outage) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "title-child",
+    ]);
+    assert_eq!(code, 0, "a Beads outage cannot fail Work Detail: {outage}");
+    assert_eq!(outage["ok"], json!(true), "{outage}");
+    assert_eq!(
+        outage["result"]["titleSource"]["source"],
+        json!("unknown"),
+        "{outage}"
+    );
+    assert_eq!(outage["result"]["titleSource"]["known"], json!(false));
+    assert_eq!(
+        outage["result"]["titleSource"]["value"],
+        outage["result"]["identity"]["displayTitle"]
+    );
+}
