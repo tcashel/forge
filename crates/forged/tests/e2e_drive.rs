@@ -171,7 +171,10 @@ fn epic_drive_runs_ready_children_merges_integration_and_stops_at_one_draft_pr()
     assert!(submitted["result"]["controller"]["sessionId"].is_string());
 
     let mut provider_started = false;
-    for _ in 0..100 {
+    // A loaded CI runner can take well over the old five-second window to
+    // schedule the detached controller and its child provider; the deadline
+    // bounds a hang, not the happy path.
+    for _ in 0..600 {
         if env
             .provider_log()
             .iter()
