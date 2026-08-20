@@ -1035,6 +1035,36 @@ fn work_detail_titles_its_subject_and_never_titles_a_child_with_the_epic() {
         );
     }
 
+    // The success path must prove the bounded read reached Beads with the
+    // live value: a wrong id or a never-matching join would leave every
+    // call-count assertion green while the spent 0->1 budget buys nothing.
+    let (code, live) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "title-child",
+    ]);
+    assert_eq!(code, 0, "work detail: {live}");
+    assert_eq!(
+        live["result"]["titleSource"]["source"],
+        json!("beads.title"),
+        "{live}"
+    );
+    assert_eq!(
+        live["result"]["titleSource"]["known"],
+        json!(true),
+        "{live}"
+    );
+    assert!(
+        live["result"]["titleSource"]["value"]
+            .as_str()
+            .expect("live title value")
+            .contains("Child bead title"),
+        "{live}"
+    );
+
     // Work Detail is what an operator opens when something is wrong, which
     // is exactly when Beads may be unavailable: the read is fail-soft.
     env.set_bd_show_unreachable(true);

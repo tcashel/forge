@@ -524,10 +524,18 @@ fn a_live_plan_epic_counts_as_an_epic_while_its_reference_stays_a_plan() {
     };
     assert_eq!(counts["plan"], json!(by_ref("plan")), "{response}");
     assert_eq!(counts["runs"], json!(by_ref("run")), "{response}");
-    assert!(
-        counts["plan"].as_u64().expect("plan count") + counts["runs"].as_u64().expect("run count")
-            < counts["nodes"].as_u64().expect("node count")
-                + counts["epics"].as_u64().expect("epic count"),
+    let plan_count = counts["plan"].as_u64().expect("plan count");
+    let run_count = counts["runs"].as_u64().expect("run count");
+    let node_count = counts["nodes"].as_u64().expect("node count");
+    let epic_count = counts["epics"].as_u64().expect("epic count");
+    assert_eq!(
+        plan_count + run_count,
+        node_count,
+        "reference kinds still partition the graph: {response}"
+    );
+    assert_ne!(
+        plan_count + run_count + epic_count,
+        node_count,
         "plan + runs + epics == nodes no longer holds: {response}"
     );
     let epic = &rows["plan:count-epic"];

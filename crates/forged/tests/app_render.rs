@@ -1131,7 +1131,7 @@ fn a_marked_operations_row_still_fills_exactly_its_declared_grid_columns() {
                     entry("run-untitled", json!({
                         "known": false,
                         "value": "run-untitled",
-                        "source": "subject.id",
+                        "source": "unknown",
                     })),
                     entry("run-plain", Value::Null),
                 ]}]},
