@@ -225,6 +225,19 @@ fn entry_ref(entry: &Value) -> Result<WorkRefV1, Failure> {
         .map_err(|error| Failure::internal(format!("operator entry has invalid workRef: {error}")))
 }
 
+/// Absent or null is "this surface resolved no title"; a present value that
+/// does not decode is a producer defect and fails closed like `identity`.
+fn title_source(entry: &Value) -> Result<Option<forged_types::WorkTitleV1>, Failure> {
+    match entry.get("titleSource") {
+        None | Some(Value::Null) => Ok(None),
+        Some(value) => serde_json::from_value(value.clone())
+            .map(Some)
+            .map_err(|error| {
+                Failure::internal(format!("operator entry has invalid titleSource: {error}"))
+            }),
+    }
+}
+
 fn queue_group(entry: &Value) -> Option<WorkMapGroup> {
     entry
         .get("queueGroup")
@@ -290,6 +303,7 @@ fn durable_node(entry: &Value, history: Value) -> Result<WorkMapNodeV1, Failure>
         source: "durable".to_owned(),
         context_only: false,
         identity: Some(identity.clone()),
+        title_source: title_source(entry)?,
         repository,
         epic_id: epic_context(&identity),
         plan: Value::Null,
@@ -310,6 +324,7 @@ fn plan_node(entry: &Value) -> Result<WorkMapNodeV1, Failure> {
         source: "live-plan".to_owned(),
         context_only: false,
         identity: Some(identity.clone()),
+        title_source: title_source(entry)?,
         repository,
         epic_id: epic_context(&identity),
         plan: entry.get("plan").cloned().unwrap_or(Value::Null),
@@ -334,6 +349,7 @@ fn boundary_node(id: &str, status: Value) -> Result<WorkMapNodeV1, Failure> {
         source: "beads-boundary".to_owned(),
         context_only: true,
         identity: None,
+        title_source: None,
         repository: None,
         epic_id: None,
         plan: json!({"source": "beads-boundary", "status": status}),
@@ -591,17 +607,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
             request.max_nodes
         )));
     }
-    let exact_ids = entries
-        .iter()
-        .filter_map(|entry| {
-            entry
-                .get("beadId")
-                .and_then(Value::as_str)
-                .map(str::to_owned)
-        })
-        .collect::<BTreeSet<_>>()
-        .into_iter()
-        .collect::<Vec<_>>();
+    let exact_ids = super::ops::entry_bead_ids(&entries);
     let plan_scope = match request.scope.kind {
         WorkMapScopeKind::Operator => forged_beads::WorkMapPlanScope::Operator,
         WorkMapScopeKind::Repository => forged_beads::WorkMapPlanScope::Repository(
@@ -652,6 +658,7 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
             entries.push(super::ops::live_plan_entry(plan, &beads_captured_at)?);
         }
     }
+    super::ops::decorate_titles(&mut entries, &bead_summaries)?;
     let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
         .into_iter()
         .map(|item| {
@@ -857,9 +864,12 @@ async fn project(ctx: &Ctx, request: MapRequest) -> Result<Value, Failure> {
         .iter()
         .filter(|node| node.work_ref.kind == WorkRefKind::Run)
         .count() as u64;
+    // Subject kind, not reference kind: an epic is minted as a `plan`
+    // reference so its edges resolve, so this count overlaps `plan_count`.
     let epic_count = nodes
         .iter()
-        .filter(|node| node.work_ref.kind == WorkRefKind::Epic)
+        .filter_map(|node| node.identity.as_ref())
+        .filter(|identity| identity.subject.kind == WorkIdentitySubjectKind::Epic)
         .count() as u64;
     let attention_count = nodes.iter().map(|node| node.attention.len() as u64).sum();
     if let Some(object) = history_coverage.as_object_mut() {

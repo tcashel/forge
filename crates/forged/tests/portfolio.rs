@@ -540,3 +540,52 @@ fn a_ledger_past_the_cap_reports_the_newest_entries_and_states_the_total() {
         "the oldest entry is the one truncated away"
     );
 }
+
+/// The two overview projections stopped contradicting each other. The
+/// portfolio's durable-only group states what it excluded rather than
+/// reporting 0 while Operations reports the same instant differently.
+#[test]
+fn a_compatibility_group_states_what_it_excluded_instead_of_reporting_zero() {
+    let env = TestEnv::new("forged-portfolio-excluded");
+    env.forged(&["init"]);
+    fabricate_run(&env, "pf-durable");
+    env.set_bead_field("bead-pf-durable", "status", "open");
+    for plan in ["pf-plan-one", "pf-plan-two"] {
+        env.set_bead_field(plan, "title", "Planned only");
+        env.set_bead_field(plan, "status", "open");
+    }
+
+    let value = portfolio(&env);
+    let groups = value["queue"]["groups"]
+        .as_array()
+        .unwrap_or_else(|| panic!("the portfolio carries queue groups: {value}"));
+    let planned = groups
+        .iter()
+        .find(|group| group["name"] == json!("Planned"))
+        .unwrap_or_else(|| panic!("the Planned group is present: {value}"));
+
+    let durable = planned["entries"].as_array().expect("group entries").len();
+    let excluded = planned["excluded"]["livePlan"]
+        .as_u64()
+        .expect("excluded live-plan count") as usize;
+    assert_eq!(durable, 1, "one durable row: {planned}");
+    assert_eq!(excluded, 2, "two live-plan rows: {planned}");
+    assert_eq!(planned["count"], json!(durable), "{planned}");
+    assert_eq!(planned["shown"], json!(durable + excluded), "{planned}");
+    assert_eq!(planned["code"], json!("planned"), "{planned}");
+    // `total` is the source group's own total, so it stays honest past the
+    // page cap where `total - count` would invent rows.
+    assert_eq!(planned["total"], json!(durable + excluded), "{planned}");
+
+    // The verbatim Operations counts ride the header; `entries` keeps its
+    // legacy durable-only boundary.
+    assert_eq!(value["counts"]["planOnly"], json!(2), "{value}");
+    assert_eq!(value["counts"]["durable"], json!(1), "{value}");
+    assert_eq!(value["coverage"], Value::Null, "{value}");
+    let rows = entries(&value);
+    assert_eq!(rows.len(), 1, "{value}");
+    assert!(
+        rows.iter().all(|entry| entry["source"] == json!("durable")),
+        "{value}"
+    );
+}

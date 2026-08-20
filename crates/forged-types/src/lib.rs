@@ -87,9 +87,10 @@ pub use work_history::{
     WORK_HISTORY_SCHEMA_V1,
 };
 pub use work_identity::{
-    normalize_repository_path, repository_label, work_display_title, WorkIdentityBeadV1,
-    WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError, WORK_IDENTITY_SCHEMA_V1,
+    normalize_repository_path, repository_label, resolve_work_title, work_display_title,
+    WorkIdentityBeadV1, WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource,
+    WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, WorkIdentityValidationError,
+    WorkTitleSource, WorkTitleV1, WORK_IDENTITY_SCHEMA_V1,
 };
 pub use work_map::{
     WorkMapCapturedAtV1, WorkMapCountsV1, WorkMapEdgeKind, WorkMapEdgeV1, WorkMapGraphHealthV1,

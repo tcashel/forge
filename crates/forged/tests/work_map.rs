@@ -482,3 +482,85 @@ fn plan_twins_cannot_inherit_durable_only_attention() {
     assert_eq!(plan[0]["condition"], "blocked");
     assert_eq!(plan[0]["evidenceRefs"][0]["kind"], "bead");
 }
+
+/// An epic bead is minted as a `plan` reference so every `execution-of`,
+/// `parent-child` and dependency target keeps resolving. `counts.epics`
+/// therefore reads subject kind, and deliberately overlaps `counts.plan`.
+#[test]
+fn a_live_plan_epic_counts_as_an_epic_while_its_reference_stays_a_plan() {
+    let env = TestEnv::new("forged-work-map-epic-count");
+    env.forged(&["init"]);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    fabricate_run(&env, "count-run");
+    env.set_bead_repository("bead-count-run", &repository);
+    env.set_bead_field("bead-count-run", "status", "in_progress");
+    env.set_bead_field("count-epic", "title", "Counted epic");
+    env.set_bead_field("count-epic", "type", "epic");
+    env.set_bead_field("count-epic", "status", "open");
+    env.set_bead_repository("count-epic", &repository);
+
+    let (code, response) = env.forged(&[
+        "work",
+        "map",
+        "--scope",
+        "repository",
+        "--repository",
+        &repository,
+    ]);
+    assert_eq!(code, 0, "work map: {response}");
+    let counts = &response["result"]["counts"];
+    assert!(
+        counts["epics"].as_u64().expect("epic count") >= 1,
+        "a live-plan epic bead counts as an epic: {response}"
+    );
+    let rows = nodes(&response);
+    // `plan` and `runs` still key off the REFERENCE kind, unchanged. Only
+    // `epics` moved to subject kind, so it overlaps `plan` by exactly the
+    // epic node rather than partitioning the graph.
+    let by_ref = |kind: &str| {
+        rows.values()
+            .filter(|node| node["workRef"]["kind"] == json!(kind))
+            .count() as u64
+    };
+    assert_eq!(counts["plan"], json!(by_ref("plan")), "{response}");
+    assert_eq!(counts["runs"], json!(by_ref("run")), "{response}");
+    let plan_count = counts["plan"].as_u64().expect("plan count");
+    let run_count = counts["runs"].as_u64().expect("run count");
+    let node_count = counts["nodes"].as_u64().expect("node count");
+    let epic_count = counts["epics"].as_u64().expect("epic count");
+    assert_eq!(
+        plan_count + run_count,
+        node_count,
+        "reference kinds still partition the graph: {response}"
+    );
+    assert_ne!(
+        plan_count + run_count + epic_count,
+        node_count,
+        "plan + runs + epics == nodes no longer holds: {response}"
+    );
+    let epic = &rows["plan:count-epic"];
+    assert_eq!(
+        epic["workRef"]["kind"],
+        json!("plan"),
+        "re-keying the reference would dangle every edge that targets it: {response}"
+    );
+    assert_eq!(epic["identity"]["subject"]["kind"], json!("epic"));
+    // `decorate_titles` runs after the live-plan entries are pushed, so a
+    // plan node carries the plan bead's real title rather than null.
+    assert_eq!(
+        epic["titleSource"]["source"],
+        json!("identity.displayTitle")
+    );
+    assert!(
+        epic["titleSource"]["value"]
+            .as_str()
+            .expect("plan node title")
+            .contains("Counted epic"),
+        "{epic}"
+    );
+    assert_eq!(
+        response["result"]["graphHealth"]["healthy"],
+        json!(true),
+        "{response}"
+    );
+}

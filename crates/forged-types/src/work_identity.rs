@@ -291,6 +291,84 @@ pub fn work_display_title(
     display
 }
 
+/// Which authority answered for one operator row's display title.
+///
+/// The wire strings are part of the contract and are pinned explicitly; the
+/// derived form would emit `beadsLive` and falsify the seam consumers read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum WorkTitleSource {
+    /// The frozen `identity.displayTitle` already carried a Bead title.
+    #[serde(rename = "identity.displayTitle")]
+    Identity,
+    /// A current bounded Beads read answered for an identity that froze
+    /// without a title.
+    #[serde(rename = "beads.title")]
+    BeadsLive,
+    /// No authority ever titled this work; `value` is the id form.
+    #[serde(rename = "unknown")]
+    Unknown,
+}
+
+/// One resolved display title, beside — never instead of — frozen identity.
+///
+/// `known == false` is the only way to distinguish "no authority ever titled
+/// this" from "we have a title", and is what lets a consumer render the id
+/// form as an id rather than present it as a title.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct WorkTitleV1 {
+    pub known: bool,
+    pub value: String,
+    pub source: WorkTitleSource,
+    pub bead_id: String,
+}
+
+/// Resolve one display title for an operator row without rewriting identity.
+///
+/// A frozen Bead title wins and yields `identity.display_title` verbatim, so
+/// the sibling can never contradict launch evidence. Only an identity that
+/// froze titleless consults `live`, and it is formatted through
+/// [`work_display_title`] so both title strings format identically.
+pub fn resolve_work_title(identity: &WorkIdentityV1, live: Option<&str>) -> WorkTitleV1 {
+    let frozen = identity
+        .bead
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|title| !title.is_empty());
+    if frozen.is_some() {
+        return WorkTitleV1 {
+            known: true,
+            value: identity.display_title.clone(),
+            source: WorkTitleSource::Identity,
+            bead_id: identity.bead.id.clone(),
+        };
+    }
+    match live.map(str::trim).filter(|title| !title.is_empty()) {
+        Some(title) => WorkTitleV1 {
+            known: true,
+            value: work_display_title(
+                &identity.subject.id,
+                Some(title),
+                identity
+                    .repository
+                    .as_ref()
+                    .map(|value| value.label.as_str()),
+                identity.project.as_ref(),
+                identity.epic.as_ref(),
+            ),
+            source: WorkTitleSource::BeadsLive,
+            bead_id: identity.bead.id.clone(),
+        },
+        None => WorkTitleV1 {
+            known: false,
+            value: identity.display_title.clone(),
+            source: WorkTitleSource::Unknown,
+            bead_id: identity.bead.id.clone(),
+        },
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -354,6 +432,94 @@ mod tests {
             "Identity"
         );
         assert_eq!(work_display_title("run-1", None, None, None, None), "run-1");
+    }
+
+    fn titleless_identity() -> WorkIdentityV1 {
+        let epic = WorkIdentityContextV1 {
+            id: "epic-1".to_owned(),
+            title: Some("Operations".to_owned()),
+        };
+        WorkIdentityV1 {
+            schema: WORK_IDENTITY_SCHEMA_V1.to_owned(),
+            subject: WorkIdentitySubjectV1 {
+                kind: WorkIdentitySubjectKind::Run,
+                id: "run-1".to_owned(),
+            },
+            bead: WorkIdentityBeadV1 {
+                id: "bead-1".to_owned(),
+                title: None,
+                revision: None,
+            },
+            repository: Some(WorkIdentityRepositoryV1 {
+                path: "/Users/tripp/repositories/forge".to_owned(),
+                label: "repositories/forge".to_owned(),
+            }),
+            project: None,
+            epic: Some(epic),
+            display_title: "Operations / run-1 [repositories/forge]".to_owned(),
+            captured_at: "2026-08-19T00:00:00.000000000Z".to_owned(),
+            source: WorkIdentitySource::LegacyFallback,
+        }
+    }
+
+    #[test]
+    fn a_frozen_title_wins_and_never_contradicts_identity() {
+        let mut identity = titleless_identity();
+        identity.bead.title = Some("Frozen".to_owned());
+        identity.display_title = work_display_title(
+            "run-1",
+            Some("Frozen"),
+            Some("repositories/forge"),
+            None,
+            identity.epic.as_ref(),
+        );
+        let resolved = resolve_work_title(&identity, Some("Renamed since launch"));
+        assert_eq!(resolved.source, WorkTitleSource::Identity);
+        assert_eq!(resolved.value, identity.display_title);
+        assert!(resolved.known);
+        assert_eq!(resolved.bead_id, "bead-1");
+    }
+
+    #[test]
+    fn a_live_title_is_formatted_exactly_as_identity_would_have_frozen_it() {
+        let identity = titleless_identity();
+        let resolved = resolve_work_title(&identity, Some("Repair the bead read"));
+        assert_eq!(resolved.source, WorkTitleSource::BeadsLive);
+        assert!(resolved.known);
+        assert_eq!(
+            resolved.value,
+            work_display_title(
+                &identity.subject.id,
+                Some("Repair the bead read"),
+                identity
+                    .repository
+                    .as_ref()
+                    .map(|value| value.label.as_str()),
+                identity.project.as_ref(),
+                identity.epic.as_ref(),
+            )
+        );
+        // No authority answers, so the id form is reported as unknown rather
+        // than presented as a title.
+        let blank = resolve_work_title(&identity, Some("   "));
+        assert_eq!(blank.source, WorkTitleSource::Unknown);
+        assert!(!blank.known);
+        assert_eq!(blank.value, identity.display_title);
+    }
+
+    #[test]
+    fn the_three_title_sources_serialize_to_their_pinned_wire_strings() {
+        for (source, wire) in [
+            (WorkTitleSource::Identity, "\"identity.displayTitle\""),
+            (WorkTitleSource::BeadsLive, "\"beads.title\""),
+            (WorkTitleSource::Unknown, "\"unknown\""),
+        ] {
+            assert_eq!(serde_json::to_string(&source).expect("closed source"), wire);
+            assert_eq!(
+                serde_json::from_str::<WorkTitleSource>(wire).expect("closed source"),
+                source
+            );
+        }
     }
 
     #[test]

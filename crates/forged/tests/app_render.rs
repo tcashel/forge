@@ -421,6 +421,81 @@ fn the_portfolio_renders_the_shared_operator_queue_groups_and_actions() {
     );
 }
 
+/// The one operator-visible lie this slice produces the data to replace: the
+/// durable group counted 0 while conditions were open, and the App printed
+/// `nothing is waiting` over the top of them.
+#[test]
+fn the_portfolio_never_says_nothing_is_waiting_while_conditions_are_open() {
+    let Some(node) = require_node() else { return };
+    let entry = json!({
+        "id": "held-run",
+        "kind": "slice",
+        "beadId": "bead-held-run",
+        "identity": {"displayTitle": "bead-held-run [repositories/forge]"},
+        "titleSource": {
+            "known": true,
+            "value": "Repair the bead read [repositories/forge]",
+            "source": "beads.title",
+            "beadId": "bead-held-run",
+        },
+        "state": "active",
+    });
+    let mut payload = portfolio(
+        vec![entry.clone()],
+        vec![json!({
+            "id": "held-run",
+            "kind": "slice",
+            "condition": "blocked",
+            "severity": "high",
+            "detail": "an open condition",
+        })],
+    );
+    payload["queue"] = json!({
+        "total": 18,
+        "groups": [
+            {"name": "Needs me", "count": 1, "entries": [entry],
+             "code": "needs-me", "shown": 18, "total": 18,
+             "excluded": {"livePlan": 17}},
+        ],
+    });
+    let dispatched = render_dispatch(&node, &json!({"ok": true, "result": payload}));
+    assert!(
+        !dispatched.text.contains("nothing is waiting"),
+        "an open condition contradicts the sentence: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.text.contains("+17 planned"),
+        "excluded plan rows are secondary context: {}",
+        dispatched.text
+    );
+    // Secondary context, never summed into the headline.
+    assert!(
+        dispatched.text.contains("1\nneeds me"),
+        "the headline is the durable group's own count: {}",
+        dispatched.text
+    );
+    assert!(
+        !dispatched.text.contains("18\nneeds me"),
+        "the excluded rows are never summed into the headline: {}",
+        dispatched.text
+    );
+    // A live title is rendered, and marked as a current read rather than
+    // presented as launch evidence.
+    assert!(
+        dispatched
+            .text
+            .contains("Repair the bead read [repositories/forge]"),
+        "the resolved title reaches the card: {}",
+        dispatched.text
+    );
+    assert!(
+        dispatched.text.contains("live title"),
+        "a current Beads read is marked live: {}",
+        dispatched.text
+    );
+}
+
 /// The rail is the answer to "what needs a human", so it has to be drawn
 /// from the payload's own conditions rather than re-derived by the App.
 #[test]
@@ -988,6 +1063,103 @@ fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
         healthy["text"].to_string().contains("plan available"),
         "health pills continue to render: {healthy}"
     );
+}
+
+/// A queue row is a fixed-width CSS grid, so the title mark has to ride
+/// inside the title cell. Appending it as its own child pushed `source` into
+/// the `meta` column and wrapped the row onto a second line — and every
+/// durable row marks `live title`, so that is the ordinary case, not an edge.
+#[test]
+fn a_marked_operations_row_still_fills_exactly_its_declared_grid_columns() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let html = std::fs::read_to_string(&asset).expect("read Operations App");
+    // The expected cell count is the asset's own column count, so the two
+    // cannot drift apart silently.
+    let declaration = html
+        .split_once(".row {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(rule, _)| rule.to_owned())
+        .expect("the .row rule");
+    let columns = declaration
+        .split_once("grid-template-columns:")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(tracks, _)| tracks.matches("minmax(").count())
+        .expect("the .row column tracks");
+    assert!(
+        columns > 1,
+        "the row rule declares its columns: {declaration}"
+    );
+
+    let entry = |id: &str, title_source: Value| {
+        json!({
+            "id": id,
+            "state": "active",
+            "source": "durable",
+            "identity": {"displayTitle": format!("{id} [/repo]")},
+            "titleSource": title_source,
+            "detailTarget": {"subjectKind": "run", "subjectId": id},
+        })
+    };
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1",
+                "scope": {"repository": "/repo"},
+                "sourceHealth": {
+                    "ledger": {"state": "available"},
+                    "beads": {"state": "available"},
+                    "plan": {"state": "available"},
+                },
+                "coverage": {"total": 3, "shown": 3, "matching": 3, "truncated": false},
+                "counts": {"live": 3, "queued": 0, "attention": 0, "planOnly": 0, "reviewReady": 0},
+                "spend": {"costUsdKnown": 0},
+                "attention": [],
+                "queue": {"groups": [{"code": "running", "label": "Running", "total": 3, "shown": 3, "entries": [
+                    entry("run-live", json!({
+                        "known": true,
+                        "value": "Repair the bead read",
+                        "source": "beads.title",
+                        "beadId": "beads-ntc.4",
+                    })),
+                    entry("run-untitled", json!({
+                        "known": false,
+                        "value": "run-untitled",
+                        "source": "unknown",
+                    })),
+                    entry("run-plain", Value::Null),
+                ]}]},
+            }}},
+        }),
+    );
+
+    let rows = report["rows"].as_array().expect("Operations rows");
+    assert_eq!(rows.len(), 3, "every row renders: {report}");
+    for row in rows {
+        assert_eq!(
+            row["cells"].as_u64(),
+            Some(columns as u64),
+            "a row must occupy exactly its {columns} grid columns: {report}"
+        );
+    }
+    let text = report["text"].to_string();
+    for expected in [
+        "Repair the bead read",
+        "live title",
+        "untitled id",
+        "durable",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the row still shows {expected}: {report}"
+        );
+    }
 }
 
 #[test]

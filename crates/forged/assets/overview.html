@@ -1706,8 +1706,15 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       top.append(el("span", "bead__id", entry.id));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
       card.append(top);
-      const displayTitle = (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || "";
+      const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || "";
       card.append(el("div", "bead__title", displayTitle));
+      // The title states its authority: an id form reads as an id, and a
+      // current Beads read is marked live rather than as launch evidence.
+      const titleMark = entry.titleSource
+        ? (entry.titleSource.known === false ? "untitled id"
+          : entry.titleSource.source === "beads.title" ? "live title" : "")
+        : "";
+      if (titleMark) card.append(el("div", "muted", titleMark));
       if (entry.beadId && displayTitle) card.append(el("div", "muted", entry.beadId));
       const foot = el("div", "bead__foot");
       foot.append(el("span", "", entry.state || "unknown"));
@@ -1742,6 +1749,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const missing = num(at(data, "spend.rowsMissingCost"));
     const needsMe = groups.find((group) => group.name === "Needs me");
     const held = needsMe ? num(needsMe.count) : num(data.attentionTotal);
+    // Plan rows are excluded from the durable group, never summed into its
+    // headline. And nothing is waiting is a claim about the whole
+    // inventory, so it cannot be printed while conditions are open.
+    const planned = needsMe ? num(at(needsMe, "excluded.livePlan")) : 0;
+    const waiting = num(data.attentionTotal);
 
     const head = panel("Portfolio", `cap ${int(data.cap)}`);
     const stats = el("div", "spend");
@@ -1756,7 +1768,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       entries.length < total ? `newest ${int(entries.length)} shown` : "all of them");
     stat(int(data.liveSeats), "live seats",
       num(data.liveSeats) ? "executing now" : "nothing is executing");
-    stat(int(held), "needs me", held ? (needsMe ? "see the queue" : "see the rail") : "nothing is waiting");
+    stat(int(held), "needs me", held
+      ? (planned ? `+${int(planned)} planned · see the queue` : (needsMe ? "see the queue" : "see the rail"))
+      : planned ? `+${int(planned)} planned`
+      : waiting ? `${int(waiting)} open · see the rail`
+      : "nothing is waiting");
     stat(`$${num(at(data, "spend.costUsdKnown")).toFixed(2)}`, "known spend",
       missing ? `${int(missing)} rows carry no cost` : "every row priced");
     head.body.append(stats);

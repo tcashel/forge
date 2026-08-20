@@ -50,6 +50,7 @@ pub(crate) const ATTENTION_EVENT_KINDS: [&str; 13] = [
 struct RawAttention {
     subject_kind: AttentionSubjectKind,
     subject_id: String,
+    subject_title: Option<forged_types::WorkTitleV1>,
     repository: Option<String>,
     condition: AttentionCondition,
     severity: AttentionSeverity,
@@ -191,6 +192,12 @@ fn subject_kind(entry: &Value) -> AttentionSubjectKind {
     }
 }
 
+/// The row's already-resolved title. Attention never re-derives the
+/// precedence rule and never reads Beads itself.
+fn subject_title(entry: &Value) -> Option<forged_types::WorkTitleV1> {
+    serde_json::from_value(entry.get("titleSource")?.clone()).ok()
+}
+
 fn repository(entry: &Value) -> Option<String> {
     entry
         .get("repo")
@@ -228,6 +235,7 @@ fn add_raw(
     raw.push(RawAttention {
         subject_kind: subject_kind(entry),
         subject_id: subject_id.to_owned(),
+        subject_title: subject_title(entry),
         repository: repository(entry),
         condition,
         severity,
@@ -1146,6 +1154,7 @@ pub(crate) fn project_all(
                 occurrence_id,
                 subject_kind,
                 subject_id,
+                subject_title: latest.subject_title.clone(),
                 repository: latest.repository.clone(),
                 condition,
                 severity: latest.severity,

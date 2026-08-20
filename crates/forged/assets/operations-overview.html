@@ -132,7 +132,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const cls = status === "available" ? "pill pill--ok" : status === "partial" ? "pill pill--warn" : "pill pill--bad";
     return el("span", cls, `${name} ${status}`);
   }
-  function titleFor(entry) { return entry?.identity?.displayTitle || entry?.beadId || "Untitled work"; }
+  function titleFor(entry) { return entry?.titleSource?.value || entry?.identity?.displayTitle || entry?.beadId || "Untitled work"; }
+  // A resolved title states its authority: an id form is rendered AS an id,
+  // and a current Beads read is marked live rather than read as launch
+  // evidence. A payload without `titleSource` marks nothing.
+  function titleMark(entry) { const t = entry?.titleSource; return !t ? "" : t.known === false ? "untitled id" : t.source === "beads.title" ? "live title" : ""; }
   function stateFor(detail) { return detail?.status?.state || detail?.status?.status || detail?.state || "unknown"; }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
@@ -194,7 +198,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
           : !canDetail
             ? `Exact detail target ${selector}; this host cannot call server tools`
             : `Open exact work detail for ${selector}`;
-        row.append(el("span", "id", selector || entry.id)); row.append(el("span", "title", titleFor(entry))); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
+        // The row IS the four-column grid, so the mark rides inside the
+        // title cell — a fifth child would push `source` out of its column.
+        const title = el("span", "title", titleFor(entry)); const mark = titleMark(entry);
+        if (mark) { title.append(document.createTextNode(" ")); title.append(el("span", "source", mark)); }
+        row.append(el("span", "id", selector || entry.id)); row.append(title); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
         if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
       }
       section.append(rows); groups.append(section);

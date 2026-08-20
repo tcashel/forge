@@ -267,6 +267,13 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
             "Planned",
         ]
     );
+    // The enriched groups reach this surface too; the top-level `counts`
+    // object does not, because `work_list` has no header to carry it.
+    for group in groups {
+        assert!(group["code"].is_string(), "{group}");
+        assert!(group["excluded"]["livePlan"].is_u64(), "{group}");
+    }
+    assert_eq!(response["result"]["counts"], Value::Null, "{response}");
     let in_group = |name: &str, id: &str| {
         groups
             .iter()
@@ -301,6 +308,17 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
         planned["title"],
         json!("Prepare the operator queue"),
         "a live Beads rename cannot rewrite legacy durable identity"
+    );
+    // The live title is carried BESIDE the frozen one, naming its authority,
+    // so a consumer can render it without the rename invariant dissolving.
+    assert_eq!(planned["titleSource"]["source"], json!("beads.title"));
+    assert_eq!(planned["titleSource"]["beadId"], json!("bead-q-planned"));
+    assert!(
+        planned["titleSource"]["value"]
+            .as_str()
+            .expect("resolved title")
+            .contains("Prepare the operator queue"),
+        "{planned}"
     );
     assert_eq!(planned["ci"]["status"], json!("unknown"));
     for key in [

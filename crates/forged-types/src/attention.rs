@@ -8,6 +8,8 @@
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::WorkTitleV1;
+
 pub const ATTENTION_ITEM_SCHEMA_V1: &str = "forged.attention-item/1";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
@@ -149,6 +151,9 @@ pub struct AttentionItemV1 {
     pub occurrence_id: String,
     pub subject_kind: AttentionSubjectKind,
     pub subject_id: String,
+    /// Resolved display title for `subject_id`, never for a different
+    /// subject. `None` where this surface could not resolve one.
+    pub subject_title: Option<WorkTitleV1>,
     pub repository: Option<String>,
     pub condition: AttentionCondition,
     pub severity: AttentionSeverity,

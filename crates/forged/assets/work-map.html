@@ -109,7 +109,11 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   }
   function healthPill(name,value){const status=value?.state||"unknown";return el("span",`pill ${status==="available"?"ok":status==="partial"||status==="degraded"?"warn":"bad"}`,`${name} ${status}`);}
   function nodeState(node){return node.plan?.status||node.queue?.group||node.execution?.state||node.execution?.outcome||"unknown";}
-  function nodeTitle(node){return node.identity?.displayTitle||node.plan?.title||node.workRef?.id||"Untitled";}
+  function nodeTitle(node){return node.titleSource?.value||node.identity?.displayTitle||node.plan?.title||node.workRef?.id||"Untitled";}
+  // A resolved title states its authority: an id form is rendered AS an id,
+  // and a current Beads read is marked live rather than read as launch
+  // evidence. A payload without `titleSource` marks nothing.
+  function titleMark(node){const t=node?.titleSource;return !t?"":t.known===false?"untitled id":t.source==="beads.title"?"live title":"";}
   async function openDetail(node){
     state.selected=key(node.workRef);state.detail=null;state.detailError=null;render();
     if(!node.detailTarget||Object.keys(node.detailTarget).length===0||!host.capabilities.serverTools)return;
@@ -132,7 +136,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
     for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name,data.sourceHealth?.[name]));
     for(const [value,label] of [[data.counts?.nodes,"nodes"],[data.counts?.edges,"edges"],[data.counts?.runs,"runs"],[data.counts?.epics,"epics"],[data.counts?.attention,"attention"],[data.counts?.historyUnattached,"history unknown"]]){const cell=el("div","stat");cell.append(el("b","",value??0));cell.append(el("span","",label));byId("stats").append(cell);}
     const nodeRows=byId("nodes");const canTools=!!host.capabilities.serverTools;
-    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));button.append(el("span","kind",node.workRef?.kind));const identity=el("span","");identity.append(el("span","id",node.workRef?.id));identity.append(document.createTextNode(" · "));identity.append(el("span","title",nodeTitle(node)));button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
+    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));button.append(el("span","kind",node.workRef?.kind));const identity=el("span","");identity.append(el("span","id",node.workRef?.id));identity.append(document.createTextNode(" · "));identity.append(el("span","title",nodeTitle(node)));const mark=titleMark(node);if(mark){identity.append(document.createTextNode(" "));identity.append(el("span","kind",mark));}button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
     if(!arr(data.nodes).length)nodeRows.append(el("div","empty","No work matches this bounded view."));
     for(const edge of arr(data.edges)){const row=el("div","edge");row.append(document.createTextNode(`${key(edge.source)} `));row.append(el("b","",edge.kind));row.append(document.createTextNode(` ${key(edge.target)}${edge.contextOnly?" · boundary":""}`));byId("edges").append(row);}
     if(!arr(data.edges).length)byId("edges").append(el("div","empty","No edges in scope."));

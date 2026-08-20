@@ -491,6 +491,10 @@ async fn portfolio_overview(ctx: &Ctx, req: &OperationRequest) -> Result<Value, 
         "attention": attention,
         "attentionTotal": attention_total,
         "queue": queue,
+        // Verbatim Operations counts. `coverage` is deliberately NOT passed
+        // through: this payload already carries `cap`, and two
+        // differently-defined caps in one envelope is a trap.
+        "counts": operations.get("counts").cloned().unwrap_or(Value::Null),
         "admission": admission,
         "spend": {
             "costUsdKnown": operations.pointer("/spend/costUsdKnown").cloned().unwrap_or(json!(0.0)),
@@ -1449,10 +1453,36 @@ fn apply_observed_attention_transitions(
     Ok(())
 }
 
+/// The title for one attention item's OWN subject.
+///
+/// `attention_subject` answers `(Run, <child run id>, ...)` for every child
+/// of an epic, so filling from `snapshot.identity` unconditionally would
+/// stamp the epic's title and bead id onto an item naming a child run.
+fn observed_subject_title(
+    snapshot: &WorkObservationSnapshot,
+    subject_kind: AttentionSubjectKind,
+    subject_id: &str,
+    subject: &forged_types::WorkTitleV1,
+) -> Option<forged_types::WorkTitleV1> {
+    let own_kind = match snapshot.subject.kind {
+        forged_types::WorkIdentitySubjectKind::Run => AttentionSubjectKind::Run,
+        forged_types::WorkIdentitySubjectKind::Epic => AttentionSubjectKind::Epic,
+    };
+    if subject_kind == own_kind && subject_id == snapshot.subject.id {
+        return Some(subject.clone());
+    }
+    snapshot
+        .child_identities
+        .iter()
+        .find(|identity| identity.subject.id == subject_id)
+        .map(|identity| forged_types::resolve_work_title(identity, None))
+}
+
 fn observation_attention(
     snapshot: &WorkObservationSnapshot,
     review: &ReviewProjection,
     results: &BTreeMap<i64, PacketResult>,
+    subject_title: &forged_types::WorkTitleV1,
 ) -> Result<Vec<Value>, Failure> {
     let mut sources = Vec::new();
     let artifacts = snapshot
@@ -2053,6 +2083,12 @@ fn observation_attention(
             attention_id: stable_id,
             occurrence_id,
             subject_kind,
+            subject_title: observed_subject_title(
+                snapshot,
+                subject_kind,
+                &subject_id,
+                subject_title,
+            ),
             subject_id,
             repository: latest.repository.clone(),
             condition,
@@ -2107,7 +2143,32 @@ fn observation_attention(
         .collect()
 }
 
-fn project_work_detail(snapshot: WorkObservationSnapshot) -> Result<Value, Failure> {
+/// Project exact Work Detail, spending ONE bounded Beads read on the
+/// subject's own bead so the drill-down destination every other App links to
+/// can state what the work is called.
+///
+/// The read is fail-soft on purpose: Work Detail is what an operator opens
+/// when something is wrong, which is exactly when Beads may be unavailable.
+/// A failed or empty read reports `source: "unknown"` and the projection
+/// returns normally; the error is never propagated and this schema carries
+/// no `sourceHealth`.
+async fn project_work_detail(
+    ctx: &Ctx,
+    snapshot: WorkObservationSnapshot,
+) -> Result<Value, Failure> {
+    let live_title = forged_beads::list_issues(
+        &ctx.config.bd_config(),
+        std::slice::from_ref(&snapshot.identity.bead.id),
+    )
+    .await
+    .ok()
+    .and_then(|issues| {
+        issues
+            .into_iter()
+            .find(|issue| issue.id == snapshot.identity.bead.id)
+    })
+    .map(|issue| issue.title);
+    let title_source = forged_types::resolve_work_title(&snapshot.identity, live_title.as_deref());
     let work_ref = WorkRefV1::new(
         match snapshot.subject.kind {
             forged_types::WorkIdentitySubjectKind::Run => WorkRefKind::Run,
@@ -2119,7 +2180,7 @@ fn project_work_detail(snapshot: WorkObservationSnapshot) -> Result<Value, Failu
     let decoded = decode_packets_and_results(&snapshot)?;
     let review = review_projection(&snapshot, &decoded.packets, &decoded.results);
     let gates = gate_rows(&decoded.results);
-    let attention = observation_attention(&snapshot, &review, &decoded.results)?;
+    let attention = observation_attention(&snapshot, &review, &decoded.results, &title_source)?;
 
     let (status, delivery) = match snapshot.subject.kind {
         forged_types::WorkIdentitySubjectKind::Run => {
@@ -2270,6 +2331,7 @@ fn project_work_detail(snapshot: WorkObservationSnapshot) -> Result<Value, Failu
         "id": snapshot.subject.id,
         "workRef": work_ref,
         "identity": snapshot.identity,
+        "titleSource": title_source,
         "cursor": cursor,
         "status": status,
         "delivery": delivery,
@@ -2392,7 +2454,7 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             ledger.work_observation_snapshot(kind, &id, after, event_limit)
         })
         .await?;
-        project_work_detail(snapshot)
+        project_work_detail(ctx, snapshot).await
     })
     .await
 }

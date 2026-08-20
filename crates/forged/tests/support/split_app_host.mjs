@@ -383,7 +383,9 @@ await Promise.resolve();
 function flatten(root) {
   const out = [];
   const walk = (node) => {
-    out.push({ tag: node.tag, class: node.className, text: node.textContent, title: node.title, disabled: !!node.disabled });
+    // `cells` is the direct-child count: a CSS-grid row is only laid out
+    // correctly while it matches its own grid-template-columns.
+    out.push({ tag: node.tag, class: node.className, text: node.textContent, title: node.title, disabled: !!node.disabled, cells: node.kids.length });
     for (const kid of node.kids) walk(kid);
   };
   walk(root);
