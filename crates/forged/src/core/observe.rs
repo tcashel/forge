@@ -1464,14 +1464,11 @@ fn observed_subject_title(
     subject_id: &str,
     subject: &forged_types::WorkTitleV1,
 ) -> Option<forged_types::WorkTitleV1> {
-    let matches_subject = subject_id == snapshot.subject.id
-        && match snapshot.subject.kind {
-            forged_types::WorkIdentitySubjectKind::Run => subject_kind == AttentionSubjectKind::Run,
-            forged_types::WorkIdentitySubjectKind::Epic => {
-                subject_kind == AttentionSubjectKind::Epic
-            }
-        };
-    if matches_subject {
+    let own_kind = match snapshot.subject.kind {
+        forged_types::WorkIdentitySubjectKind::Run => AttentionSubjectKind::Run,
+        forged_types::WorkIdentitySubjectKind::Epic => AttentionSubjectKind::Epic,
+    };
+    if subject_kind == own_kind && subject_id == snapshot.subject.id {
         return Some(subject.clone());
     }
     snapshot
@@ -2165,9 +2162,11 @@ async fn project_work_detail(
     )
     .await
     .ok()
-    .into_iter()
-    .flatten()
-    .find(|issue| issue.id == snapshot.identity.bead.id)
+    .and_then(|issues| {
+        issues
+            .into_iter()
+            .find(|issue| issue.id == snapshot.identity.bead.id)
+    })
     .map(|issue| issue.title);
     let title_source = forged_types::resolve_work_title(&snapshot.identity, live_title.as_deref());
     let work_ref = WorkRefV1::new(

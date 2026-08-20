@@ -267,6 +267,13 @@ fn the_operator_queue_is_human_named_grouped_and_honest_about_unknowns() {
             "Planned",
         ]
     );
+    // The enriched groups reach this surface too; the top-level `counts`
+    // object does not, because `work_list` has no header to carry it.
+    for group in groups {
+        assert!(group["code"].is_string(), "{group}");
+        assert!(group["excluded"]["livePlan"].is_u64(), "{group}");
+    }
+    assert_eq!(response["result"]["counts"], Value::Null, "{response}");
     let in_group = |name: &str, id: &str| {
         groups
             .iter()
