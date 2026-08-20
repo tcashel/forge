@@ -13,6 +13,8 @@
   --muted: var(--color-text-secondary, light-dark(#626773,#a3a8b2));
   --line: var(--color-border-primary, light-dark(#deddd7,#30333a));
   --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
+  --good: var(--color-text-success, light-dark(#287a43,#6bc27e));
+  --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
   --accent: light-dark(#167b72,#42c9b7);
   --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
@@ -35,7 +37,18 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
 .body { padding: 10px 11px; display: grid; gap: 7px; }
 .kv { display: grid; grid-template-columns: 105px 1fr; gap: 5px 9px; margin: 0; }.kv dt { color: var(--muted); }.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
 .item { padding-top: 7px; border-top: 1px solid var(--line); }.item:first-child { padding-top: 0; border-top: 0; }
-.item b { font-family: var(--mono); font-size: 11px; }.item p { margin: 3px 0 0; color: var(--muted); overflow-wrap: anywhere; }
+.item b { font-family: var(--mono); font-size: 11px; }.item p { margin: 3px 0 0; overflow-wrap: anywhere; }
+.item p.note { color: var(--muted); font-size: 11px; }
+.panel h2 .note { color: var(--muted); font-weight: 400; }
+/* Chips, ages and clock times are the same across all five Apps. */
+.chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
+.chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.chip--live,.chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+/* The canonical selector is demoted, never hidden: it addresses every
+   follow-up call, so it stays selectable even inside a row that is itself a
+   button. */
+.chip--id { font-family: var(--mono); -webkit-user-select: text; user-select: text; }
+.chip--id::before { display: none; }
 .empty,.error { border: 1px dashed var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }.error { color: var(--bad); border-color: currentColor; }
 .foot { color: var(--muted); font: 10px/1.4 var(--mono); display: flex; gap: 12px; flex-wrap: wrap; }
 @media(max-width:560px) { .summary { grid-template-columns: 1fr 1fr; }.summary div { border-top: 1px solid var(--line); border-left: 0; } }
@@ -43,7 +56,7 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
 </head>
 <body>
 <main id="app">
-  <header class="top"><div><h1 id="title">Work detail</h1><div class="sub" id="subtitle">Waiting for an exact subject.</div></div><div><span class="state" id="state">unknown</span> <button type="button" id="refresh">Refresh</button></div></header>
+  <header class="top"><div><h1 id="title">Work detail</h1><div class="sub" id="subtitle">Waiting for an exact subject.</div></div><div><span class="state" id="state">unknown</span> <button type="button" id="refresh">Refresh</button> <button type="button" id="expand" hidden>Expand</button></div></header>
   <section class="summary" id="summary"></section>
   <section class="grid" id="grid"><div class="empty">Waiting for detail.</div></section>
   <footer class="foot" id="foot"></footer>
@@ -57,38 +70,96 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
   const notify = (method, params = {}) => post({ jsonrpc: "2.0", method, params });
   let rpcId = 0; const pending = new Map(); const timers = new Set(); let observer = null; let sizeFrame = null; let tornDown = false;
   function request(method, params = {}) { if(tornDown)return Promise.reject(new Error("resource torn down"));const id = `forged-detail-${++rpcId}`; return new Promise((resolve,reject) => { const timer=setTimeout(() => { timers.delete(timer); if (pending.delete(id)) reject(new Error(`${method} timed out`)); },120000); timers.add(timer);pending.set(id,{resolve,reject,timer});post({jsonrpc:"2.0",id,method,params}); }); }
-  const host = { connected:false, capabilities:{} };
+  const host = { connected:false, capabilities:{}, context:{} };
   const state = { data:null, error:null, args:null, loading:false };
   const byId = id => document.getElementById(id);
   const el = (tag,cls,text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!=null)n.textContent=String(text); return n; };
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  // Time and chips, one format across all five Apps. An operator reads an
+  // AGE; a raw ISO stamp asks them to subtract it from now themselves.
+  const stamp = ts => (ts ? Date.parse(ts) : NaN);
+  function ms(value) { if(!Number.isFinite(value)||value<0)return "—"; const s=Math.round(value/1000); if(s<60)return `${s}s`; const m=Math.floor(s/60); if(m<60)return `${m}m${String(s%60).padStart(2,"0")}s`; return `${Math.floor(m/60)}h${String(m%60).padStart(2,"0")}m`; }
+  function clock(ts) { const t=stamp(ts); if(!Number.isFinite(t))return "—"; const d=new Date(t); const pad=n=>String(n).padStart(2,"0"); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+  function ago(ts) { const t=stamp(ts); if(!Number.isFinite(t))return ""; const delta=Date.now()-t; if(delta<0)return "just now"; return `${ms(delta)} ago`; }
+  // A value that is not a timestamp at all is shown verbatim rather than
+  // silently blanked; an absent one reads as absent.
+  function age(ts) { if(ts==null||ts==="")return "—"; return ago(ts)||String(ts); }
+  function chip(label,tone) { return el("span",`chip chip--${tone||"idle"}`,label); }
+  // A bound the operator cannot see is a lie about how much there is.
+  function bound(shown,total) { return total>shown?`${shown} of ${total} shown`:`${shown}`; }
+  // The label is the operator-facing repository name; the absolute path is
+  // addressing, and belongs in the tool call rather than on the screen.
+  function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
   function envelopeFrom(params) { let value=params?.structuredContent; if(!value){const text=arr(params?.content).find(block=>block.type==="text")?.text; try{value=JSON.parse(text);}catch{value=null;}} return value; }
   function ingest(params) { const envelope=envelopeFrom(params); if(envelope?.ok===false){state.error=envelope.error||{message:"Operation failed"};state.data=null;render();return;} const data=envelope?.result??envelope; if(!data||data.schema!=="forged.work-detail/1"){state.error={message:"The host returned an unsupported Work Detail payload."};state.data=null;render();return;} state.error=null;state.data=data;render(); }
-  function panel(title) { const box=el("section","panel"); box.append(el("h2","",title)); const body=el("div","body"); box.append(body); return {box,body}; }
-  function item(body,title,detail) { const row=el("div","item"); row.append(el("b","",title||"unknown")); if(detail)row.append(el("p","",detail)); body.append(row); }
+  function panel(title,note) { const box=el("section","panel"); const head=el("h2","",title); if(note){head.append(document.createTextNode(" "));head.append(el("span","note",note));} box.append(head); const body=el("div","body"); box.append(body); return {box,body}; }
+  function item(body,title,detail,note) { const row=el("div","item"); row.append(el("b","",title||"unknown")); if(detail)row.append(el("p","",detail)); if(note)row.append(el("p","note",note)); body.append(row); }
   function subjectState(data) { return data?.status?.state || data?.status?.status || data?.state || "unknown"; }
+  const SEVERITIES = ["blocker","high","medium","low"];
+  // A finding an operator cannot open is a finding they cannot fix, so the
+  // address leads its row and one that carries no address says so.
+  function findingAddress(finding) { if(!finding?.file)return "not addressed to a file"; return finding.line==null?String(finding.file):`${finding.file}:${finding.line}`; }
+  function findingTally(findings) {
+    const counts=new Map();
+    for(const finding of findings){const key=finding?.severity||"unrated";counts.set(key,(counts.get(key)||0)+1);}
+    const rank=key=>{const at=SEVERITIES.indexOf(key);return at<0?SEVERITIES.length:at;};
+    return [...counts.entries()].sort((a,b)=>rank(a[0])-rank(b[0])).map(([severity,count])=>`${count} ${severity}`).join(" · ");
+  }
   function render() {
     if(tornDown)return;
     const summary=byId("summary"),grid=byId("grid"),foot=byId("foot"); summary.replaceChildren();grid.replaceChildren();foot.replaceChildren();byId("refresh").disabled=state.loading||!host.capabilities.serverTools;
     if(state.error){byId("title").textContent="Work detail";byId("subtitle").textContent="Projection unavailable";byId("state").textContent="error";grid.append(el("div","error",state.error.message||String(state.error)));reportSize();return;}
     const data=state.data; if(!data){grid.append(el("div","empty","Waiting for detail."));reportSize();return;}
-    byId("title").textContent=data.titleSource?.value||data.identity?.displayTitle||data.id||"Work detail"; const titleMark=data.titleSource?(data.titleSource.known===false?" · untitled id":data.titleSource.source==="beads.title"?" · live title":""):"";byId("subtitle").textContent=`${data.workRef?.kind||data.kind} · ${data.id}${titleMark}`; byId("state").textContent=subjectState(data);
+    // The title leads; the canonical id rides beside it as a chip, because
+    // it is what every follow-up call has to be addressed with.
+    byId("title").textContent=data.titleSource?.value||data.identity?.displayTitle||data.id||"Work detail";
+    const titleMark=data.titleSource?(data.titleSource.known===false?"untitled id":data.titleSource.source==="beads.title"?"live title":""):"";
+    const subtitle=byId("subtitle");subtitle.replaceChildren();subtitle.append(el("span","",data.workRef?.kind||data.kind||"work"));subtitle.append(document.createTextNode(" "));subtitle.append(chip(data.id,"id"));if(titleMark){subtitle.append(document.createTextNode(" "));subtitle.append(el("span","",titleMark));}
+    byId("state").textContent=subjectState(data);
     const workers=arr(data.workers?.sessions),findings=arr(data.reviews?.latestFindings),events=arr(data.events?.events),artifacts=arr(data.artifacts);
-    for(const [value,label] of [[workers.length,"workers"],[findings.length,"findings"],[artifacts.length,"artifact groups"],[events.length,"events"],[`$${num(data.usage?.totals?.costUsdKnown).toFixed(2)}`,"known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
-    const identity=panel("Identity"),dl=el("dl","kv"); const add=(k,v)=>{dl.append(el("dt","",k));dl.append(el("dd","",v==null?"—":v));}; add("canonical id",data.id);add("bead",data.identity?.bead?.id);add("repository",data.identity?.repository?.path);add("base",data.identity?.baseRef);identity.body.append(dl);grid.append(identity.box);
+    // `gates` arrives bounded — {items,total,limit,truncated} — so reading it
+    // as a bare array renders every real gate result as none.
+    const holds=arr(data.attention),gates=arr(data.gates?.items??data.gates);
+    const findingTotal=num(data.reviews?.latestFindingTotal??findings.length),holdTotal=num(data.attentionTotal??holds.length),gateTotal=num(data.gates?.total??gates.length);
+    for(const [value,label] of [[workers.length,"workers"],[findingTotal,"findings"],[holdTotal,"attention"],[artifacts.length,"artifact groups"],[events.length,"events"],[`$${num(data.usage?.totals?.costUsdKnown).toFixed(2)}`,"known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
+    const identity=panel("Identity"),dl=el("dl","kv"); const add=(k,v)=>{dl.append(el("dt","",k));dl.append(el("dd","",v==null?"—":v));}; add("canonical id",data.id);add("bead",data.identity?.bead?.id);add("repository",repositoryLabel(data.identity));add("base",data.identity?.baseRef);identity.body.append(dl);grid.append(identity.box);
+    // What is holding this work, and what the projection says to do about
+    // it. The recommended action is the point of the row, not the condition.
+    const attention=panel("Attention",bound(holds.length,holdTotal));
+    if(!holds.length)attention.body.append(el("div","empty",holdTotal?`${holdTotal} conditions counted; none carried in this page.`:"Nothing is holding this work."));
+    for(const hold of holds)item(attention.body,`${hold.condition||"attention"}${hold.severity?` · ${hold.severity}`:""}`,hold.recommendedAction?.text||hold.detail,`${hold.detail||""}${hold.openedAt?` · opened ${age(hold.openedAt)}`:""}`);
+    grid.append(attention.box);
+    const delivery=data.delivery,ship=panel("Delivery");
+    if(!delivery||delivery.known===false)ship.body.append(el("div","empty","No pull request is recorded for this work."));
+    else{const dd=el("dl","kv");const shipped=(k,v)=>{dd.append(el("dt","",k));dd.append(el("dd","",v==null?"—":v));};shipped("pull request",delivery.pr);shipped("head sha",delivery.sha);shipped("base",delivery.base??data.identity?.baseRef);shipped("source",delivery.source);ship.body.append(dd);}
+    grid.append(ship.box);
+    const gate=panel("Gates",gates.length?`${gates.filter(row=>row.passed).length} of ${gates.length} passed${gateTotal>gates.length?` · ${bound(gates.length,gateTotal)}`:""}`:"none");
+    if(!gates.length)gate.body.append(el("div","empty",gateTotal?`${gateTotal} gate results counted; none carried in this page.`:"No gate result is recorded."));
+    for(const row of gates)item(gate.body,`${row.gateState||(row.passed?"pass":"unknown")} · ${row.packetId||`attempt ${row.attemptId}`}`,row.summary,row.note);
+    grid.append(gate.box);
     const work=panel("Workers"); if(!workers.length)work.body.append(el("div","empty","No provider session is live.")); for(const worker of workers)item(work.body,worker.seat||worker.provider||worker.sessionId,`${worker.state||"unknown"}${worker.model?` · ${worker.model}`:""}`);grid.append(work.box);
-    const review=panel("Review"); if(!findings.length)review.body.append(el("div","empty","No current findings.")); for(const finding of findings.slice(0,20))item(review.body,finding.severity||finding.verdict||"finding",finding.summary||finding.message||finding.detail);grid.append(review.box);
-    const evidence=panel("Evidence"); if(!artifacts.length)evidence.body.append(el("div","empty","No attempt artifact groups.")); for(const artifact of artifacts.slice(0,20))item(evidence.body,artifact.packetId||artifact.attemptId,`${arr(artifact.attempts).length} attempt records`);grid.append(evidence.box);
-    const ledger=panel("Recent events"); if(!events.length)ledger.body.append(el("div","empty","No events in this page.")); for(const event of events.slice(-30).reverse())item(ledger.body,`${event.eventId||"?"} · ${event.kind||"event"}`,event.ts||event.createdAt);grid.append(ledger.box);
+    // Every finding the payload carried, addressed and tallied. The panel
+    // used to cap at twenty and say nothing about the rest.
+    const review=panel("Review",findings.length?`${bound(findings.length,findingTotal)} · ${findingTally(findings)}`:bound(0,findingTotal));
+    if(!findings.length)review.body.append(el("div","empty",findingTotal?`${findingTotal} findings counted; none carried in this page.`:"No current findings."));
+    for(const finding of findings)item(review.body,`${finding.severity||finding.verdict||"finding"} · ${findingAddress(finding)}`,finding.message||finding.summary||finding.detail);
+    grid.append(review.box);
+    const evidence=panel("Evidence",bound(artifacts.length,num(data.artifactCoverage?.total??artifacts.length))); if(!artifacts.length)evidence.body.append(el("div","empty","No attempt artifact groups.")); for(const artifact of artifacts)item(evidence.body,artifact.packetId||artifact.attemptId,`${arr(artifact.attempts).length} attempt records`);grid.append(evidence.box);
+    const ledger=panel("Recent events",bound(Math.min(events.length,30),num(data.events?.total??events.length))); if(!events.length)ledger.body.append(el("div","empty","No events in this page.")); for(const event of events.slice(-30).reverse())item(ledger.body,`${event.eventId||"?"} · ${event.kind||"event"}`,`${clock(event.ts||event.createdAt)} · ${age(event.ts||event.createdAt)}`);grid.append(ledger.box);
     foot.append(el("span","",data.schema)); if(data.cursor!=null)foot.append(el("span","",`cursor ${data.cursor}`)); if(state.loading)foot.append(el("span","","refreshing")); pushModelContext(data);reportSize();
   }
-  let lastContext="";function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const text=[`Forged ${data.workRef?.kind||data.kind} ${data.id}: ${subjectState(data)}`,`bead ${data.identity?.bead?.id||"unknown"}; repository ${data.identity?.repository?.path||"unknown"}`,`${arr(data.workers?.sessions).length} workers; ${arr(data.reviews?.latestFindings).length} findings; ${arr(data.events?.events).length} events in page`].join("\n").slice(0,2000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
+  let lastContext="";function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const text=[`Forged ${data.workRef?.kind||data.kind} ${data.id}: ${subjectState(data)}`,`bead ${data.identity?.bead?.id||"unknown"}; repository ${repositoryLabel(data.identity)||"unknown"}`,`${arr(data.workers?.sessions).length} workers; ${num(data.reviews?.latestFindingTotal??arr(data.reviews?.latestFindings).length)} findings; ${num(data.attentionTotal??arr(data.attention).length)} attention; ${arr(data.events?.events).length} events in page`].join("\n").slice(0,2000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
   async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading||!state.args)return;state.loading=true;render();try{ingest(await request("tools/call",{name:"work_detail",arguments:state.args}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
   byId("refresh").addEventListener("click",refresh);
-  function applyContext(context={}){if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);}
+  // The handshake advertises fullscreen, so the surface has to offer the
+  // control that asks for it. A host that declines leaves the view as it is.
+  function applyDisplayMode(mode){host.context={...host.context,displayMode:mode};document.documentElement.setAttribute("data-display",mode);byId("expand").textContent=mode==="fullscreen"?"Collapse":"Expand";}
+  async function toggleDisplayMode(){const next=host.context.displayMode==="fullscreen"?"inline":"fullscreen";try{const result=await request("ui/request-display-mode",{mode:next});applyDisplayMode(result?.mode||next);}catch{/* the host may decline */}reportSize();}
+  byId("expand").addEventListener("click",toggleDisplayMode);
+  function applyContext(context={}){if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);if(context.displayMode)applyDisplayMode(context.displayMode);if(context.availableDisplayModes)byId("expand").hidden=!context.availableDisplayModes.includes("fullscreen");}
   let lastSize="";function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
-  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,request] of pending){clearTimeout(request.timer);timers.delete(request.timer);pending.delete(id);request.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();byId("refresh").removeEventListener("click",refresh);window.removeEventListener("message",onMessage);}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,request] of pending){clearTimeout(request.timer);timers.delete(request.timer);pending.delete(id);request.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();byId("refresh").removeEventListener("click",refresh);byId("expand").removeEventListener("click",toggleDisplayMode);window.removeEventListener("message",onMessage);}
   function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const p=pending.get(message.id);pending.delete(message.id);clearTimeout(p.timer);timers.delete(p.timer);message.error?p.reject(new Error(message.error.message||"request failed")):p.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=message.params?.arguments||state.args;else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error={message:message.params?.reason||"Cancelled"};render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
   window.addEventListener("message",onMessage);
   request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error={message:"The host did not complete the MCP Apps handshake."};render();}});

@@ -1338,7 +1338,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
           if (!child) continue;
           const card = el("div", "bead");
           const top = el("div", "bead__top");
-          top.append(el("span", "bead__id", child.id));
+          top.append(chip(child.id, "id"));
           // Beads status outranks "has a run": a blocked bead with a live run
           // is still blocked, and the operator needs to see that first.
           const held = at(status, "inputRequired.childId") === child.id;
@@ -1702,12 +1702,15 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       const card = el("button", canPick ? "bead bead--pick" : "bead");
       card.type = "button";
       card.disabled = !canPick;
+      // The display title leads the card. The canonical id keeps its place
+      // beside the kind, because it is what addresses the next call — but a
+      // queue of ids names nothing, and the title is what names the work.
+      const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || entry.id || "";
+      card.append(el("div", "bead__title", displayTitle));
       const top = el("div", "bead__top");
-      top.append(el("span", "bead__id", entry.id));
+      top.append(chip(entry.id, "id"));
       top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
       card.append(top);
-      const displayTitle = (entry.titleSource && entry.titleSource.value) || (entry.identity && entry.identity.displayTitle) || entry.title || entry.beadId || "";
-      card.append(el("div", "bead__title", displayTitle));
       // The title states its authority: an id form reads as an id, and a
       // current Beads read is marked live rather than as launch evidence.
       const titleMark = entry.titleSource
@@ -1717,7 +1720,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       if (titleMark) card.append(el("div", "muted", titleMark));
       if (entry.beadId && displayTitle) card.append(el("div", "muted", entry.beadId));
       const foot = el("div", "bead__foot");
+      // Staleness is presentation only: the row keeps its true ledger state
+      // and gains the age beside it, never a derived `stale` condition.
       foot.append(el("span", "", entry.state || "unknown"));
+      const progress = ago(entry.lastProgressAt || entry.updatedAt);
+      if (progress) foot.append(el("span", "", progress));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
       // Key PRESENCE, not truthiness: a measured $0.00 is a fact, and
       // hiding it exactly like an absent key would tell the operator the
@@ -1972,15 +1979,23 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const rows = data.kind === "epic" ? [] : packetRows(data);
     const head = headline(data);
 
-    nodes.identText.textContent = data.id;
+    // A subject view is headed by what the work IS. The epic path already
+    // carried its title down in `bits` while the slice path carried none at
+    // all, so both now lead with the resolved title and demote the canonical
+    // id to the chip that addresses the next call.
+    nodes.identText.textContent = at(data, "titleSource.value")
+      || at(data, "identity.displayTitle")
+      || at(data, "status.title")
+      || data.id;
     const existing = nodes.ident.querySelectorAll(".chip, .ident__copy");
     existing.forEach((node) => node.remove());
+    nodes.ident.append(chip(data.id, "idle"));
     nodes.ident.append(chip(head.label, head.tone));
 
     nodes.subident.textContent = "";
     nodes.subident.append(upToPortfolio());
     const bits = data.kind === "epic"
-      ? [["kind", "epic"], ["title", at(data, "status.title")], ["branch", at(data, "status.integrationBranch")], ["cursor", data.cursor]]
+      ? [["kind", "epic"], ["branch", at(data, "status.integrationBranch")], ["cursor", data.cursor]]
       : [["kind", "slice"], ["bead", at(data, "status.beadId")], ["branch", at(data, "status.branch")], ["cursor", data.cursor]];
     for (const [label, value] of bits) {
       if (value === undefined || value === null || value === "") continue;

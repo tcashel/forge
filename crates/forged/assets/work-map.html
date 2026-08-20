@@ -41,9 +41,21 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
 .panel { border:1px solid var(--line); border-radius:9px; overflow:hidden; }
 .panel h2 { margin:0; padding:9px 11px; background:var(--panel); font-size:12px; }
 .rows { display:grid; }
-.node { appearance:none; width:100%; border:0; border-top:1px solid var(--line); background:transparent; padding:10px 11px; text-align:left; display:grid; grid-template-columns:65px minmax(100px,1fr) 120px; gap:8px; align-items:baseline; }
+/* The display title leads. The canonical selector keeps its own column —
+   demoting an id is not hiding it. */
+.node { appearance:none; width:100%; border:0; border-top:1px solid var(--line); background:transparent; padding:10px 11px; text-align:left; display:grid; grid-template-columns:minmax(120px,1.4fr) minmax(120px,.9fr) 110px; gap:8px; align-items:baseline; }
 .node:first-child { border-top:0; }.node:hover,.node[aria-current="true"] { background:var(--panel); }
 .node--context { opacity:.72; }.kind { color:var(--accent); font-size:10px; text-transform:uppercase; }.id { font-size:11px; overflow-wrap:anywhere; }.state { color:var(--muted); font-size:11px; text-align:right; }
+.title { font-weight:500; }
+/* Chips, ages and clock times are the same across all five Apps. */
+.chip { display:inline-flex; align-items:center; gap:5px; border:1px solid currentColor; border-radius:999px; padding:2px 7px; font:500 10px/1.35 var(--sans); white-space:nowrap; color:var(--muted); vertical-align:middle; }
+.chip::before { content:""; width:5px; height:5px; border-radius:50%; background:currentColor; flex:none; }
+.chip--live,.chip--pass { color:var(--good); }.chip--warn { color:var(--warn); }.chip--block { color:var(--bad); }.chip--idle { color:var(--muted); }
+/* The canonical selector is demoted, never hidden: it addresses every
+   follow-up call, so it stays selectable even inside a row that is itself a
+   button. */
+.chip--id { font-family:var(--mono); -webkit-user-select:text; user-select:text; }
+.chip--id::before { display:none; }
 .edges { display:grid; max-height:420px; overflow:auto; }
 .edge { padding:8px 10px; border-top:1px solid var(--line); font:10px/1.4 var(--mono); overflow-wrap:anywhere; }
 .edge:first-child { border-top:0; }.edge b { color:var(--accent); }
@@ -53,7 +65,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
 .drawer[hidden] { display:none; }.drawer h2 { margin:0; font:600 14px/1.3 var(--mono); }.drawer__head { display:flex; justify-content:space-between; gap:8px; }.drawer button { border:1px solid var(--line); border-radius:6px; background:transparent; padding:5px 8px; }
 .kv { display:grid; grid-template-columns:105px 1fr; gap:5px 9px; margin:0; }.kv dt { color:var(--muted); }.kv dd { margin:0; font-family:var(--mono); overflow-wrap:anywhere; }
 .foot { display:flex; flex-wrap:wrap; gap:12px; font-size:10px; }
-@media(max-width:680px) { .layout { grid-template-columns:1fr; }.node { grid-template-columns:55px 1fr; }.state { grid-column:2; text-align:left; }.stat { border-top:1px solid var(--line); border-left:0; } }
+@media(max-width:680px) { .layout { grid-template-columns:1fr; }.node { grid-template-columns:1fr; }.state { grid-column:1; text-align:left; }.stat { border-top:1px solid var(--line); border-left:0; } }
 </style>
 </head>
 <body>
@@ -64,6 +76,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
       <label><span class="muted">group </span><select id="group"><option value="">all</option><option>needs-me</option><option>ready-to-merge</option><option>running</option><option>stalled-or-recoverable</option><option>planned</option></select></label>
       <label><span class="muted">source </span><select id="source"><option value="">all</option><option>durable</option><option>live-plan</option></select></label>
       <button type="button" id="refresh">Refresh</button>
+      <button type="button" id="expand" hidden>Expand</button>
     </div>
   </header>
   <section class="health" id="health" aria-label="Source health"></section>
@@ -90,6 +103,19 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   const arr = value => Array.isArray(value) ? value : [];
   const el = (tag, cls, text) => { const node=document.createElement(tag); if(cls)node.className=cls; if(text!=null)node.textContent=String(text); return node; };
   const key = ref => `${ref?.kind || "?"}:${ref?.id || "?"}`;
+  // Time and chips, one format across all five Apps. An operator reads an
+  // AGE; a raw ISO stamp asks them to subtract it from now themselves.
+  const stamp = ts => (ts ? Date.parse(ts) : NaN);
+  function ms(value) { if(!Number.isFinite(value)||value<0)return "—"; const s=Math.round(value/1000); if(s<60)return `${s}s`; const m=Math.floor(s/60); if(m<60)return `${m}m${String(s%60).padStart(2,"0")}s`; return `${Math.floor(m/60)}h${String(m%60).padStart(2,"0")}m`; }
+  function clock(ts) { const t=stamp(ts); if(!Number.isFinite(t))return "—"; const d=new Date(t); const pad=n=>String(n).padStart(2,"0"); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+  function ago(ts) { const t=stamp(ts); if(!Number.isFinite(t))return ""; const delta=Date.now()-t; if(delta<0)return "just now"; return `${ms(delta)} ago`; }
+  // A value that is not a timestamp at all is shown verbatim rather than
+  // silently blanked; an absent one reads as absent.
+  function age(ts) { if(ts==null||ts==="")return "—"; return ago(ts)||String(ts); }
+  function chip(label,tone) { return el("span",`chip chip--${tone||"idle"}`,label); }
+  // The label is the operator-facing repository name; the absolute path is
+  // addressing, and belongs in the tool call rather than on the screen.
+  function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
   function request(method, params={}) {
     if (tornDown) return Promise.reject(new Error("resource torn down"));
     const id=`forged-work-map-${++rpcId}`;
@@ -121,11 +147,15 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   }
   function renderDrawer(node){
     const box=byId("drawer");box.replaceChildren();if(!node&&!state.detailError){box.hidden=true;return;}box.hidden=false;
-    const head=el("div","drawer__head");head.append(el("h2","",node?key(node.workRef):"Detail unavailable"));const close=el("button","","Close");close.type="button";close.addEventListener("click",()=>{state.selected=null;state.detail=null;state.detailError=null;render();});head.append(close);box.append(head);
+    const head=el("div","drawer__head");head.append(el("h2","",node?nodeTitle(node):"Detail unavailable"));if(node)head.append(chip(key(node.workRef),"id"));const close=el("button","","Close");close.type="button";close.addEventListener("click",()=>{state.selected=null;state.detail=null;state.detailError=null;render();});head.append(close);box.append(head);
     if(state.detailError){box.append(el("div","error",state.detailError.message));return;}
     const dl=el("dl","kv");const add=(label,value)=>{dl.append(el("dt","",label));dl.append(el("dd","",value==null||value===""?"—":value));};
-    add("title",nodeTitle(node));add("source",node.source);add("repository",node.repository);add("epic",node.epicId);add("queue",node.queue?.group);add("execution",node.execution?.state||node.execution?.outcome);add("attention",arr(node.attention).length);add("history",node.history?"attached":"not attached");
-    if(node.workRef?.kind==="plan")add("detail","Plan facts only — no execution control");else add("detail",host.capabilities.serverTools?(state.detail?"Work Detail loaded":"Select to load Work Detail"):`${node.detailTarget?.subjectKind}:${node.detailTarget?.subjectId}`);
+    add("title",nodeTitle(node));add("source",node.source);add("repository",repositoryLabel(node.identity)||node.repository);add("epic",node.epicId);add("queue",node.queue?.group);add("execution",node.execution?.state||node.execution?.outcome);add("attention",arr(node.attention).length);add("history",node.history?"attached":"not attached");
+    const progress=node.queue?.desired?.lastProgressAt||node.execution?.updatedAt;if(progress)add("last progress",age(progress));
+    // A plan node is not a dead node: the whole Beads record already
+    // travelled inside the projection, so it opens what it already carries.
+    if(node.workRef?.kind==="plan"){add("plan facts","from the live Beads read; no execution record exists yet");add("status",node.plan?.status);add("readiness",node.plan?.readiness);add("issue type",node.plan?.issueType);add("priority",node.plan?.priority);add("assignee",node.plan?.assignee);add("parent",node.plan?.parent);add("dependencies",arr(node.plan?.dependencies).length);add("next action",node.queue?.nextAction);}
+    else add("detail",host.capabilities.serverTools?(state.detail?"Work Detail loaded":"Select to load Work Detail"):`${node.detailTarget?.subjectKind}:${node.detailTarget?.subjectId}`);
     box.append(dl);
   }
   function render(){
@@ -136,21 +166,28 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
     for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name,data.sourceHealth?.[name]));
     for(const [value,label] of [[data.counts?.nodes,"nodes"],[data.counts?.edges,"edges"],[data.counts?.runs,"runs"],[data.counts?.epics,"epics"],[data.counts?.attention,"attention"],[data.counts?.historyUnattached,"history unknown"]]){const cell=el("div","stat");cell.append(el("b","",value??0));cell.append(el("span","",label));byId("stats").append(cell);}
     const nodeRows=byId("nodes");const canTools=!!host.capabilities.serverTools;
-    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));button.append(el("span","kind",node.workRef?.kind));const identity=el("span","");identity.append(el("span","id",node.workRef?.id));identity.append(document.createTextNode(" · "));identity.append(el("span","title",nodeTitle(node)));const mark=titleMark(node);if(mark){identity.append(document.createTextNode(" "));identity.append(el("span","kind",mark));}button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
+    // The title leads the row; the kind and the canonical selector ride
+    // beside it, because the selector is what addresses a Work Detail call.
+    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));const title=el("span","title",nodeTitle(node));const mark=titleMark(node);if(mark){title.append(document.createTextNode(" "));title.append(el("span","kind",mark));}button.append(title);const identity=el("span","");identity.append(chip(node.workRef?.kind||"work","idle"));identity.append(document.createTextNode(" "));identity.append(chip(key(node.workRef),"id"));button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
     if(!arr(data.nodes).length)nodeRows.append(el("div","empty","No work matches this bounded view."));
     for(const edge of arr(data.edges)){const row=el("div","edge");row.append(document.createTextNode(`${key(edge.source)} `));row.append(el("b","",edge.kind));row.append(document.createTextNode(` ${key(edge.target)}${edge.contextOnly?" · boundary":""}`));byId("edges").append(row);}
     if(!arr(data.edges).length)byId("edges").append(el("div","empty","No edges in scope."));
     const selected=arr(data.nodes).find(node=>key(node.workRef)===state.selected);renderDrawer(selected||null);
-    byId("foot").append(el("span","",data.schema));byId("foot").append(el("span","",data.graphHealth?.healthy?"graph healthy":"graph issues visible"));byId("foot").append(el("span","",`${data.capturedAt?.ledger||"?"} ledger`));if(state.loading)byId("foot").append(el("span","","refreshing"));
+    byId("foot").append(el("span","",data.schema));byId("foot").append(el("span","",data.graphHealth?.healthy?"graph healthy":"graph issues visible"));if(data.capturedAt?.ledger)byId("foot").append(el("span","",`ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));if(state.loading)byId("foot").append(el("span","","refreshing"));
     pushModelContext(data);reportSize();
   }
   function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const lines=[`Forged Work Map ${data.scope?.kind}: ${data.counts?.nodes||0} nodes, ${data.counts?.edges||0} edges`,`${data.counts?.attention||0} attention; ${data.counts?.historyUnattached||0} durable nodes without attached history`];for(const node of arr(data.nodes).slice(0,12))lines.push(`- ${key(node.workRef)} ${nodeTitle(node)} [${nodeState(node)}]`);const text=lines.join("\n").slice(0,3000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
   async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading)return;state.loading=true;render();const base=state.args||{schemaVersion:1,params:{}};const params={...(base.params||{})};const group=byId("group").value,source=byId("source").value;if(group)params.group=group;else delete params.group;if(source)params.source=source;else delete params.source;try{ingest(await request("tools/call",{name:"work_map",arguments:{...base,params}}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
   byId("refresh").addEventListener("click",refresh);byId("group").addEventListener("change",refresh);byId("source").addEventListener("change",refresh);
   byId("nodes").addEventListener("keydown",event=>{if(!["ArrowDown","ArrowUp","Home","End"].includes(event.key))return;const rows=arr([...byId("nodes").querySelectorAll("button.node")]);if(!rows.length)return;event.preventDefault();const current=rows.indexOf(document.activeElement);const next=event.key==="Home"?0:event.key==="End"?rows.length-1:event.key==="ArrowDown"?Math.min(rows.length-1,current+1):Math.max(0,current-1);rows[next].focus();});
-  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [name,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(name,value);}
+  // The handshake advertises fullscreen, so the surface has to offer the
+  // control that asks for it. A host that declines leaves the view as it is.
+  function applyDisplayMode(mode){host.context={...host.context,displayMode:mode};document.documentElement.setAttribute("data-display",mode);byId("expand").textContent=mode==="fullscreen"?"Collapse":"Expand";}
+  async function toggleDisplayMode(){const next=host.context.displayMode==="fullscreen"?"inline":"fullscreen";try{const result=await request("ui/request-display-mode",{mode:next});applyDisplayMode(result?.mode||next);}catch{/* the host may decline */}reportSize();}
+  byId("expand").addEventListener("click",toggleDisplayMode);
+  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [name,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(name,value);if(context.displayMode)applyDisplayMode(context.displayMode);if(context.availableDisplayModes)byId("expand").hidden=!context.availableDisplayModes.includes("fullscreen");}
   function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
-  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();if(sizeFrame!==null)cancelAnimationFrame(sizeFrame);for(const [id,item] of pending){clearTimeout(item.timer);item.reject(new Error("resource torn down"));pending.delete(id);}for(const timer of timers)clearTimeout(timer);timers.clear();window.removeEventListener("message",onMessage);}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();if(sizeFrame!==null)cancelAnimationFrame(sizeFrame);for(const [id,item] of pending){clearTimeout(item.timer);item.reject(new Error("resource torn down"));pending.delete(id);}for(const timer of timers)clearTimeout(timer);timers.clear();byId("expand").removeEventListener("click",toggleDisplayMode);window.removeEventListener("message",onMessage);}
   function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const item=pending.get(message.id);pending.delete(message.id);clearTimeout(item.timer);timers.delete(item.timer);message.error?item.reject(new Error(message.error.message||"request failed")):item.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=message.params?.arguments||state.args;else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error={message:message.params?.reason||"Cancelled"};render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
   window.addEventListener("message",onMessage);
   request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error={message:"The host did not complete the MCP Apps handshake."};render();}});
