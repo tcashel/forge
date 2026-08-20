@@ -357,9 +357,9 @@ fn exact_replay_survives_authoritative_source_clearance() {
 // ---------------------------------------------------------- attention list
 
 /// The shared attention_list fixture: two quarantined runs (one decision
-/// group with two items, `att-a` older than `att-b`) and one blocked run
-/// (one symptom group). Run names keep alphabetical and append order
-/// aligned so item ordering is unambiguous.
+/// group with two items, `att-b` older than `att-a` — append order and
+/// alphabetical order deliberately DISAGREE so the oldest-first assertions
+/// cannot pass on an id sort) and one blocked run (one symptom group).
 fn seed_attention_list_fixture(env: &TestEnv) {
     env.forged(&["init"]);
     fabricate_run(env, "att-a");
@@ -367,15 +367,15 @@ fn seed_attention_list_fixture(env: &TestEnv) {
     fabricate_run(env, "att-blocked");
     append(
         env,
-        "att-a",
+        "att-b",
         "proto.quarantine",
-        json!({"packetId": "att-a/implement/0", "attemptId": 1, "reason": "stale token"}),
+        json!({"packetId": "att-b/implement/0", "attemptId": 1, "reason": "stale token"}),
     );
     append(
         env,
-        "att-b",
+        "att-a",
         "proto.quarantine",
-        json!({"packetId": "att-b/implement/0", "attemptId": 2, "reason": "stale token"}),
+        json!({"packetId": "att-a/implement/0", "attemptId": 2, "reason": "stale token"}),
     );
     let ledger = env.ledger();
     ledger
@@ -446,8 +446,8 @@ fn attention_list_groups_decisions_first_and_serves_complete_rail_items() {
     let quarantined = &groups[0];
     assert_eq!(quarantined["total"], json!(2));
     assert_eq!(quarantined["shown"], json!(2));
-    assert_eq!(quarantined["items"][0]["id"], json!("att-a"));
-    assert_eq!(quarantined["items"][1]["id"], json!("att-b"));
+    assert_eq!(quarantined["items"][0]["id"], json!("att-b"));
+    assert_eq!(quarantined["items"][1]["id"], json!("att-a"));
     assert_eq!(
         quarantined["oldestOpenedAt"], quarantined["items"][0]["openedAt"],
         "{listed}"
@@ -540,7 +540,7 @@ fn attention_list_truncation_is_a_stated_global_sequential_take() {
     let listed = attention_list(&env, &["--limit", "1"]);
     let quarantined = group(&listed, "quarantined");
     assert_eq!(quarantined["shown"], json!(1));
-    assert_eq!(quarantined["items"][0]["id"], json!("att-a"));
+    assert_eq!(quarantined["items"][0]["id"], json!("att-b"));
     assert_eq!(group(&listed, "blocked")["shown"], json!(0));
     assert_eq!(listed["totals"]["shown"], json!(1));
     assert_eq!(listed["totals"]["total"], json!(3));
@@ -707,4 +707,29 @@ fn attention_list_filters_and_bounds_fail_closed() {
             "{response}"
         );
     }
+}
+
+/// The repo scope is an exact match on the durable item repository: the
+/// fixture's own repository keeps its item, a foreign repository keeps
+/// none, and both answers state their totals. (Run-backed fixture items
+/// carry the fabricated run's repo, so the positively scoped item here is
+/// a plan-only blocked bead whose repository is set explicitly.)
+#[test]
+fn attention_list_repo_scope_matches_the_durable_item_repository() {
+    let env = TestEnv::new("forged-attention-list-repo-scope");
+    env.forged(&["init"]);
+    let repository = env.repos.repo.to_string_lossy().into_owned();
+    env.set_bead_field("plan-scope", "status", "blocked");
+    env.set_bead_field("plan-scope", "title", "Scoped blocked bead");
+    env.set_bead_repository("plan-scope", &repository);
+    let listed = attention_list(&env, &["--repo", &repository]);
+    assert_eq!(listed["totals"]["total"], json!(1), "{listed}");
+    assert_eq!(
+        group(&listed, "blocked")["items"][0]["id"],
+        json!("plan-scope"),
+        "{listed}"
+    );
+    let foreign = attention_list(&env, &["--repo", "/nowhere/else"]);
+    assert_eq!(foreign["totals"]["total"], json!(0), "{foreign}");
+    assert_eq!(foreign["groups"], json!([]), "{foreign}");
 }

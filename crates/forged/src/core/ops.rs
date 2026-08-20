@@ -3952,7 +3952,7 @@ pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationRespo
             )));
         }
 
-        let universe = collect_operations_universe(ctx, None).await?;
+        let universe = collect_operations_universe(ctx, repo.clone()).await?;
         let items = super::attention::project_all(
             &universe.snapshot,
             &universe.entries,
