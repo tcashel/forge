@@ -8,7 +8,7 @@ use std::collections::{BTreeMap, BTreeSet};
 use forged_beads::IssueSummary;
 use forged_ledger::{
     AdmissionReservationState, AttemptState, DesiredReconcileOutcome, DesiredState, EffectClass,
-    InventorySnapshot, InventoryUsage,
+    InventorySnapshot, InventoryUsage, RunOutcome,
 };
 use forged_types::{
     attention_id, attention_occurrence_id, AdmissionOutcome, AdmissionReason,
@@ -728,7 +728,11 @@ fn collect_domain_sources(
     }
 
     // Latest failed gate is attention only when no automatic execution path
-    // is live or scheduled.
+    // is live or scheduled and no closing terminal outcome settled the run.
+    // Closing covers landed, superseded, cancelled, and accepted-risk: a
+    // settled run repairs via a supersedes successor, never in place.
+    // Blocked/input-required stops and legacy-stopped rows without a
+    // terminal outcome keep flagging.
     let mut latest_gate: BTreeMap<String, &forged_ledger::EventRow> = BTreeMap::new();
     for event in snapshot.events("proto.gate") {
         if let Some(id) = event.run_id.as_ref() {
@@ -748,7 +752,19 @@ fn collect_domain_sources(
                 && desired.desired_state == DesiredState::Running
                 && desired.next_wake_at.is_some()
         });
-        if has_live || has_scheduled {
+        let has_closing_outcome = snapshot.runs.iter().any(|run| {
+            run.run_id == id
+                && matches!(
+                    run.terminal_outcome,
+                    Some(
+                        RunOutcome::Landed
+                            | RunOutcome::Superseded
+                            | RunOutcome::Cancelled
+                            | RunOutcome::AcceptedRisk
+                    )
+                )
+        });
+        if has_live || has_scheduled || has_closing_outcome {
             continue;
         }
         add_raw(
@@ -1210,6 +1226,7 @@ mod tests {
     use super::*;
     use forged_ledger::{
         AdmissionReservationRow, DesiredSubjectKind, DesiredWorkRow, EventRow, InventoryUsage,
+        RunRow, RunState,
     };
     use forged_types::{
         AdmissionCapacityV1, AdmissionDecisionV1, AdmissionResourceClass, AdmissionSubjectKind,
@@ -1253,6 +1270,40 @@ mod tests {
             kind: kind.to_owned(),
             payload_json: payload.to_string(),
         }
+    }
+
+    fn run_row(id: &str, state: RunState, terminal_outcome: Option<RunOutcome>) -> RunRow {
+        RunRow {
+            run_id: id.to_owned(),
+            bead_id: "bead-gate".to_owned(),
+            repo: "/repo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "forged/bead-gate".to_owned(),
+            protocol: "anvil/1".to_owned(),
+            state,
+            stop_reason: None,
+            created_at: "2026-08-14T11:00:00.000000000Z".to_owned(),
+            updated_at: "2026-08-14T12:00:00.000000000Z".to_owned(),
+            terminal_outcome,
+            delivery_pr: None,
+            delivery_sha: None,
+            superseded_by: None,
+        }
+    }
+
+    fn failed_gate_snapshot(run: RunRow) -> InventorySnapshot {
+        let mut snapshot = snapshot();
+        snapshot.events_by_kind.insert(
+            "proto.gate".to_owned(),
+            vec![event(
+                1,
+                &run.run_id,
+                "proto.gate",
+                json!({"passed": false}),
+            )],
+        );
+        snapshot.runs.push(run);
+        snapshot
     }
 
     fn desired(id: &str) -> DesiredWorkRow {
@@ -1401,6 +1452,53 @@ mod tests {
             .expect("project")
             .iter()
             .all(|item| item.condition != AttentionCondition::ReviewerDisagreement));
+    }
+
+    #[test]
+    fn failed_gate_is_suppressed_by_every_closing_terminal_outcome() {
+        for outcome in [
+            RunOutcome::Landed,
+            RunOutcome::Superseded,
+            RunOutcome::Cancelled,
+            RunOutcome::AcceptedRisk,
+        ] {
+            let snapshot =
+                failed_gate_snapshot(run_row("run-gate", RunState::Stopped, Some(outcome)));
+            assert!(
+                project_active(&snapshot, &[entry("run-gate")], &[])
+                    .expect("project")
+                    .iter()
+                    .all(|item| item.condition != AttentionCondition::FailedGate),
+                "{outcome:?} must close the failed-gate item"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_gate_still_flags_runs_the_outcome_leaves_open() {
+        for (state, outcome) in [
+            (RunState::Stopped, Some(RunOutcome::Blocked)),
+            (RunState::Stopped, Some(RunOutcome::InputRequired)),
+            (RunState::Active, None),
+        ] {
+            let snapshot = failed_gate_snapshot(run_row("run-gate", state, outcome));
+            assert!(
+                project_active(&snapshot, &[entry("run-gate")], &[])
+                    .expect("project")
+                    .iter()
+                    .any(|item| item.condition == AttentionCondition::FailedGate),
+                "{state:?}/{outcome:?} must keep the failed-gate item open"
+            );
+        }
+    }
+
+    #[test]
+    fn failed_gate_still_flags_a_legacy_stopped_run_without_an_outcome() {
+        let snapshot = failed_gate_snapshot(run_row("run-gate", RunState::Stopped, None));
+        assert!(project_active(&snapshot, &[entry("run-gate")], &[])
+            .expect("project")
+            .iter()
+            .any(|item| item.condition == AttentionCondition::FailedGate));
     }
 
     #[test]
