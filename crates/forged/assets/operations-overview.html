@@ -40,21 +40,38 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .stat:first-child { border-left: 0; }
 .stat b { display: block; font: 600 18px/1.2 var(--mono); }
 .stat span { color: var(--muted); font-size: 11px; }
-.rail { display: grid; gap: 6px; }
-.attention { border-left: 3px solid var(--bad); background: var(--panel); padding: 8px 10px; border-radius: 4px; }
-.attention b { font-family: var(--mono); font-size: 11px; }
-.attention span { margin-left: 8px; color: var(--muted); }
+.rail { display: grid; gap: 8px; }
+.rail__group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.rail__head { display: flex; justify-content: space-between; gap: 8px; padding: 7px 10px; background: var(--panel); font-size: 11px; }
+.rail__head b, .rail__head span { font-family: var(--mono); }
+.rail__head span { color: var(--muted); }
+.rail__note { color: var(--muted); font-size: 11px; }
+.attention { border-left: 3px solid var(--bad); background: var(--panel); padding: 8px 10px; }
+.attention b { font-weight: 600; margin-right: 6px; }
+.attention .act { margin-top: 3px; }
+.attention .meta { margin-top: 2px; }
 .groups { display: grid; gap: 12px; }
 .group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .group__head { padding: 9px 11px; background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
 .group__head b { font-size: 12px; }.group__head span { color: var(--muted); font-family: var(--mono); font-size: 11px; }
 .rows { display: grid; }
-.row { appearance: none; width: 100%; border: 0; border-radius: 0; border-top: 1px solid var(--line); padding: 10px 11px; text-align: left; display: grid; grid-template-columns: minmax(105px,.65fr) minmax(180px,1.5fr) minmax(90px,.6fr) minmax(100px,.7fr); gap: 10px; align-items: baseline; }
+/* The display title leads. The canonical selector keeps its own column —
+   demoting an id is not hiding it. */
+.row { appearance: none; width: 100%; border: 0; border-radius: 0; border-top: 1px solid var(--line); padding: 10px 11px; text-align: left; display: grid; grid-template-columns: minmax(180px,1.6fr) minmax(120px,.85fr) minmax(90px,.6fr) minmax(100px,.7fr); gap: 10px; align-items: baseline; }
 .row:first-child { border-top: 0; }
 .row:hover:not(:disabled) { background: var(--panel); }
 .id { font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
 .title { font-weight: 500; }.meta { color: var(--muted); font-size: 11px; }
 .source { font-family: var(--mono); font-size: 10px; color: var(--muted); }
+/* Chips, ages and clock times are the same across all five Apps. */
+.chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
+.chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.chip--live, .chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+/* The canonical selector is demoted, never hidden: it addresses every
+   follow-up call, so it stays selectable even inside a row that is itself a
+   button. */
+.chip--id { font-family: var(--mono); -webkit-user-select: text; user-select: text; }
+.chip--id::before { display: none; }
 .empty, .error { border: 1px dashed var(--line); border-radius: 8px; padding: 18px; color: var(--muted); }
 .error { color: var(--bad); border-color: currentColor; }
 .drawer { border: 1px solid var(--line); border-radius: 9px; padding: 12px; display: grid; gap: 10px; }
@@ -71,7 +88,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 <main id="app">
   <header class="top">
     <div><h1>Operations</h1><div class="sub" id="scope">Waiting for projection</div></div>
-    <div class="controls"><button type="button" id="refresh">Refresh</button></div>
+    <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="expand" hidden>Expand</button></div>
   </header>
   <div class="health" id="health"></div>
   <section class="stats" id="stats"></section>
@@ -103,12 +120,26 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     });
   }
   const host = { connected: false, capabilities: {}, context: {} };
-  const state = { data: null, error: null, args: null, loading: false, detail: null, detailError: null };
+  const state = { data: null, error: null, args: null, loading: false, detail: null, detailError: null, plan: null };
   const byId = id => document.getElementById(id);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; };
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const fmt = value => Math.round(num(value)).toLocaleString();
+
+  // Time and chips, one format across all five Apps. An operator reads an
+  // AGE; a raw ISO stamp asks them to subtract it from now themselves.
+  const stamp = ts => (ts ? Date.parse(ts) : NaN);
+  function ms(value) { if (!Number.isFinite(value) || value < 0) return "—"; const s = Math.round(value / 1000); if (s < 60) return `${s}s`; const m = Math.floor(s / 60); if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`; return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`; }
+  function clock(ts) { const t = stamp(ts); if (!Number.isFinite(t)) return "—"; const d = new Date(t); const pad = n => String(n).padStart(2, "0"); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+  function ago(ts) { const t = stamp(ts); if (!Number.isFinite(t)) return ""; const delta = Date.now() - t; if (delta < 0) return "just now"; return `${ms(delta)} ago`; }
+  // A value that is not a timestamp at all is shown verbatim rather than
+  // silently blanked; an absent one reads as absent.
+  function age(ts) { if (ts == null || ts === "") return "—"; return ago(ts) || String(ts); }
+  function chip(label, tone) { return el("span", `chip chip--${tone || "idle"}`, label); }
+  // The label is the operator-facing repository name; the absolute path is
+  // addressing, and belongs in the tool call rather than on the screen.
+  function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
 
   function envelopeFrom(params) {
     let value = params?.structuredContent;
@@ -138,26 +169,113 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // evidence. A payload without `titleSource` marks nothing.
   function titleMark(entry) { const t = entry?.titleSource; return !t ? "" : t.known === false ? "untitled id" : t.source === "beads.title" ? "live title" : ""; }
   function stateFor(detail) { return detail?.status?.state || detail?.status?.status || detail?.state || "unknown"; }
+  const SEVERITY_RANK = { critical: 0, high: 1, medium: 2, low: 3 };
+  // The rail is bounded so it stays a rail rather than a second queue. What
+  // it did not draw is stated, never dropped.
+  const RAIL_CAP = 12;
+  function severityTone(severity) { return severity === "critical" || severity === "high" ? "block" : severity === "medium" ? "warn" : "idle"; }
+  function attentionTitle(item) { return item?.subjectTitle?.value || item?.subjectId || item?.id || "unknown subject"; }
+  function attentionSelector(item) { const id = item?.subjectId || item?.id; return id ? `${item?.subjectKind || "run"}:${id}` : null; }
+  /**
+   * One rail an operator can actually read.
+   *
+   * Conditions group, because "what kind of thing is stuck" is the first
+   * question. Inside a group the OLDEST hold leads: the thing that has
+   * waited longest is the thing that has been ignored longest. The subject's
+   * own title names the row and the projection's recommended action is the
+   * point of it — neither is re-derived here, because this App has no ledger
+   * to re-derive them against.
+   */
+  function renderRail(data) {
+    const rail = byId("attention");
+    const items = arr(data.attention);
+    const total = Math.max(num(data.attentionTotal ?? data.counts?.attention ?? items.length), items.length);
+    const groups = new Map();
+    for (const item of items) {
+      const condition = String(item?.condition || "attention");
+      if (!groups.has(condition)) groups.set(condition, []);
+      groups.get(condition).push(item);
+    }
+    const opened = item => { const at = stamp(item?.openedAt); return Number.isFinite(at) ? at : Number.POSITIVE_INFINITY; };
+    const worst = rows => Math.min(...rows.map(row => SEVERITY_RANK[row?.severity] ?? 4));
+    const oldest = rows => Math.min(...rows.map(opened));
+    const ordered = [...groups.entries()].sort((a, b) => worst(a[1]) - worst(b[1]) || oldest(a[1]) - oldest(b[1]));
+    let remaining = RAIL_CAP;
+    let drawn = 0;
+    for (const [condition, rows] of ordered) {
+      if (remaining <= 0) break;
+      rows.sort((a, b) => opened(a) - opened(b));
+      const shown = rows.slice(0, remaining);
+      remaining -= shown.length; drawn += shown.length;
+      const group = el("section", "rail__group");
+      const head = el("div", "rail__head");
+      head.append(el("b", "", condition.replace(/-/g, " ")));
+      head.append(el("span", "", shown.length < rows.length ? `${fmt(shown.length)} of ${fmt(rows.length)}` : fmt(rows.length)));
+      group.append(head);
+      for (const item of shown) {
+        const row = el("div", "attention");
+        const title = el("b", "", attentionTitle(item));
+        // A resolved title states its authority here exactly as it does in a
+        // queue row: an id form is rendered AS an id.
+        if (item?.subjectTitle?.known === false) { title.append(document.createTextNode(" ")); title.append(el("span", "source", "untitled id")); }
+        row.append(title);
+        const selector = attentionSelector(item);
+        if (selector) row.append(chip(selector, "id"));
+        if (item?.severity) row.append(chip(item.severity, severityTone(item.severity)));
+        row.append(el("div", "act", item?.recommendedAction?.text || "The projection recommended no action."));
+        row.append(el("div", "meta", `${item?.detail || ""}${item?.openedAt ? ` · opened ${age(item.openedAt)}` : ""}`));
+        group.append(row);
+      }
+      rail.append(group);
+    }
+    if (drawn < total) rail.append(el("div", "rail__note", `${fmt(drawn)} of ${fmt(total)} conditions shown`));
+  }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
-    if (!state.detail && !state.detailError) { box.hidden = true; return; }
+    if (!state.detail && !state.detailError && !state.plan) { box.hidden = true; return; }
     box.hidden = false;
     const head = el("div", "drawer__head");
-    head.append(el("h2", "", state.detail ? `${state.detail.workRef?.kind || state.detail.kind} · ${state.detail.id}` : "Detail unavailable"));
-    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; renderDetail(); }); head.append(close); box.append(head);
+    const heading = el("div");
+    heading.append(el("h2", "", state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
+    if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
+    else if (state.detail) heading.append(chip(`${state.detail.workRef?.kind || state.detail.kind}:${state.detail.id}`, "id"));
+    head.append(heading);
+    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; renderDetail(); }); head.append(close); box.append(head);
     if (state.detailError) { box.append(el("div", "error", state.detailError.message || String(state.detailError))); return; }
     const dl = el("dl", "kv");
     const add = (key, value) => { dl.append(el("dt", "", key)); dl.append(el("dd", "", value == null ? "—" : value)); };
+    if (state.plan) {
+      const entry = state.plan;
+      add("plan facts", "from the live Beads read; no execution record exists yet");
+      add("bead", entry.beadId || entry.id);
+      add("status", entry.plan?.status);
+      add("readiness", entry.plan?.readiness);
+      add("issue type", entry.plan?.issueType);
+      add("priority", entry.plan?.priority ?? entry.priority);
+      add("assignee", entry.plan?.assignee);
+      add("parent", entry.plan?.parent);
+      add("dependencies", arr(entry.plan?.dependencies).length);
+      add("repository", repositoryLabel(entry.identity) || entry.repo);
+      add("updated", age(entry.lastProgressAt || entry.updatedAt));
+      add("next action", entry.nextAction);
+      box.append(dl);
+      return;
+    }
     add("state", stateFor(state.detail));
-    add("repository", state.detail.identity?.repository?.path);
+    add("repository", repositoryLabel(state.detail.identity));
     add("workers", arr(state.detail.workers?.sessions).length);
-    add("findings", arr(state.detail.reviews?.latestFindings).length);
+    add("findings", num(state.detail.reviews?.latestFindingTotal ?? arr(state.detail.reviews?.latestFindings).length));
     add("known spend", `$${num(state.detail.usage?.totals?.costUsdKnown).toFixed(2)}`);
     box.append(dl);
   }
+  /**
+   * A live-plan row is not a dead row: its whole Beads record already
+   * travelled inside the projection, so opening it needs no tool call.
+   */
+  function openPlan(entry) { state.detail = null; state.detailError = null; state.plan = entry; renderDetail(); reportSize(); }
   async function openDetail(entry) {
     if (!host.capabilities.serverTools || !entry?.detailTarget) return;
-    state.detail = null; state.detailError = null; renderDetail();
+    state.detail = null; state.detailError = null; state.plan = null; renderDetail();
     try {
       const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
       const envelope = envelopeFrom(result);
@@ -181,8 +299,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[`$${num(data.spend?.costUsdKnown).toFixed(2)}`,"known spend"]]) {
       const cell = el("div", "stat"); cell.append(el("b", "", typeof value === "string" ? value : fmt(value))); cell.append(el("span", "", label)); stats.append(cell);
     }
-    const rail = byId("attention");
-    for (const item of arr(data.attention).slice(0, 8)) { const row = el("div", "attention"); row.append(el("b", "", item.condition || "attention")); row.append(el("span", "", `${item.subjectId || item.id || ""} · ${item.detail || item.recommendedAction?.text || "Needs attention"}`)); rail.append(row); }
+    renderRail(data);
     const groups = byId("groups");
     const canDetail = !!host.capabilities.serverTools;
     for (const group of arr(data.queue?.groups)) {
@@ -192,24 +309,37 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       for (const entry of arr(group.entries)) {
         const target = entry.detailTarget;
         const selector = target ? `${target.subjectKind}:${target.subjectId}` : null;
-        const row = el("button", "row"); row.type = "button"; row.disabled = !canDetail || !target;
-        row.title = !target
-          ? "Plan-only work has no durable detail yet"
-          : !canDetail
-            ? `Exact detail target ${selector}; this host cannot call server tools`
-            : `Open exact work detail for ${selector}`;
+        // A row with no durable detail target is not therefore dead: a
+        // live-plan row already carries its whole Beads record, and opening
+        // that needs no server tool.
+        const planFacts = !target && !!entry.plan;
+        const row = el("button", "row"); row.type = "button";
+        row.disabled = target ? !canDetail : !planFacts;
+        row.title = target
+          ? (canDetail
+            ? `Open exact work detail for ${selector}`
+            : `Exact detail target ${selector}; this host cannot call server tools`)
+          : planFacts
+            ? "Open the plan facts this row already carries"
+            : "This row carries neither a durable detail target nor plan facts";
         // The row IS the four-column grid, so the mark rides inside the
         // title cell — a fifth child would push `source` out of its column.
         const title = el("span", "title", titleFor(entry)); const mark = titleMark(entry);
         if (mark) { title.append(document.createTextNode(" ")); title.append(el("span", "source", mark)); }
-        row.append(el("span", "id", selector || entry.id)); row.append(title); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
-        if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
+        const progress = ago(entry.lastProgressAt || entry.updatedAt);
+        // Staleness is presentation only: the row keeps its true ledger
+        // state and gains the age beside it.
+        row.append(title); row.append(chip(selector || entry.id, "id"));
+        row.append(el("span", "meta", `${entry.state || entry.outcome || "planned"}${progress ? ` · ${progress}` : ""}`));
+        row.append(el("span", "source", entry.source || "unknown"));
+        if (!row.disabled) row.addEventListener("click", () => (target ? openDetail(entry) : openPlan(entry))); rows.append(row);
       }
       section.append(rows); groups.append(section);
     }
     if (!arr(data.queue?.groups).length) groups.append(el("div", "empty", "No work matches this bounded view."));
     byId("foot").append(el("span", "", data.schema));
     byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
+    if (data.capturedAt?.ledger) byId("foot").append(el("span", "", `ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));
     if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
     if (state.loading) byId("foot").append(el("span", "", "refreshing"));
     renderDetail(); pushModelContext(data); reportSize();
@@ -256,10 +386,26 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     finally { state.loading = false; render(); }
   }
   byId("refresh").addEventListener("click", refresh);
+  // The handshake advertises fullscreen, so the surface has to offer the
+  // control that asks for it. A host that declines leaves the view as it is.
+  function applyDisplayMode(mode) {
+    host.context = { ...host.context, displayMode: mode };
+    document.documentElement.setAttribute("data-display", mode);
+    byId("expand").textContent = mode === "fullscreen" ? "Collapse" : "Expand";
+  }
+  async function toggleDisplayMode() {
+    const next = host.context.displayMode === "fullscreen" ? "inline" : "fullscreen";
+    try { const result = await request("ui/request-display-mode", { mode: next }); applyDisplayMode(result?.mode || next); }
+    catch { /* the host may decline; the button simply does nothing */ }
+    reportSize();
+  }
+  byId("expand").addEventListener("click", toggleDisplayMode);
   function applyContext(context = {}) {
     host.context = { ...host.context, ...context };
     if (context.theme) document.documentElement.style.colorScheme = context.theme;
     for (const [key, value] of Object.entries(context.styles?.variables || {})) document.documentElement.style.setProperty(key, value);
+    if (context.displayMode) applyDisplayMode(context.displayMode);
+    if (context.availableDisplayModes) byId("expand").hidden = !context.availableDisplayModes.includes("fullscreen");
   }
   let lastSize = "";
   function reportSize() {
@@ -285,6 +431,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     for (const timer of timers) clearTimeout(timer);
     timers.clear(); pending.clear();
     byId("refresh").removeEventListener("click", refresh);
+    byId("expand").removeEventListener("click", toggleDisplayMode);
     window.removeEventListener("message", onMessage);
   }
   function onMessage(event) {

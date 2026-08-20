@@ -40,10 +40,21 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .session-row { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .session-head { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; padding: 10px 11px; background: var(--panel); }
 .session-title { font-weight: 600; overflow-wrap: anywhere; }.selector { color: var(--muted); font: 10px/1.4 var(--mono); overflow-wrap: anywhere; }
-.chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }.chip { border: 1px solid var(--line); border-radius: 999px; padding: 2px 7px; font: 10px/1.3 var(--mono); }
-.chip--good { color: var(--good); }.chip--warn { color: var(--warn); }.chip--bad { color: var(--bad); }
+.chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
+/* Chips, ages and clock times are the same across all five Apps. */
+.chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
+.chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
+.chip--good,.chip--live,.chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--bad,.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+/* The canonical selector is demoted, never hidden: it addresses every
+   follow-up call, so it stays selectable. */
+.chip--id { font-family: var(--mono); -webkit-user-select: text; user-select: text; }
+.chip--id::before { display: none; }
 .facts { display: grid; grid-template-columns: repeat(auto-fit,minmax(235px,1fr)); gap: 0; }
 .panel { padding: 10px 11px; border-top: 1px solid var(--line); border-left: 1px solid var(--line); }.panel:nth-child(3n+1) { border-left: 0; }
+.panel--lead { border-left: 0; }
+.more { border-top: 1px solid var(--line); }
+.more > summary { padding: 8px 11px; cursor: pointer; color: var(--muted); font-size: 11px; }
+.more > summary:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .panel h2 { margin: 0 0 7px; font-size: 11px; }
 .kv { display: grid; grid-template-columns: 115px 1fr; gap: 4px 8px; margin: 0; }.kv dt { color: var(--muted); }.kv dd { margin: 0; font-family: var(--mono); overflow-wrap: anywhere; }
 .session-action { display: flex; justify-content: space-between; gap: 12px; align-items: center; padding: 9px 11px; border-top: 1px solid var(--line); }
@@ -59,7 +70,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 <main id="app">
   <header class="top">
     <div><h1>Agent Sessions</h1><div class="sub" id="scope">Waiting for provider-attempt inventory</div></div>
-    <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="history">Show history</button><button type="button" id="next">Next page</button></div>
+    <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="history">Show history</button><button type="button" id="next">Next page</button><button type="button" id="expand" hidden>Expand</button></div>
   </header>
   <div class="capability" id="capability">Connecting to the MCP Apps host.</div>
   <section class="stats" id="stats"></section>
@@ -94,6 +105,19 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   const finite = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const shown = value => value == null || value === "" ? "—" : typeof value === "boolean" ? (value ? "yes" : "no") : String(value);
   const fmt = value => Math.round(finite(value)).toLocaleString();
+  // Time and chips, one format across all five Apps. An operator reads an
+  // AGE; a raw ISO stamp asks them to subtract it from now themselves.
+  const stamp = ts => (ts ? Date.parse(ts) : NaN);
+  function ms(value) { if (!Number.isFinite(value) || value < 0) return "—"; const s = Math.round(value / 1000); if (s < 60) return `${s}s`; const m = Math.floor(s / 60); if (m < 60) return `${m}m${String(s % 60).padStart(2, "0")}s`; return `${Math.floor(m / 60)}h${String(m % 60).padStart(2, "0")}m`; }
+  function clock(ts) { const t = stamp(ts); if (!Number.isFinite(t)) return "—"; const d = new Date(t); const pad = n => String(n).padStart(2, "0"); return `${pad(d.getHours())}:${pad(d.getMinutes())}:${pad(d.getSeconds())}`; }
+  function ago(ts) { const t = stamp(ts); if (!Number.isFinite(t)) return ""; const delta = Date.now() - t; if (delta < 0) return "just now"; return `${ms(delta)} ago`; }
+  // A value that is not a timestamp at all is shown verbatim rather than
+  // silently blanked; an absent one reads as absent.
+  function age(ts) { if (ts == null || ts === "") return "—"; return ago(ts) || String(ts); }
+  function chip(label, tone) { return el("span", `chip chip--${tone || "idle"}`, label); }
+  // The label is the operator-facing repository name; the absolute path is
+  // addressing, and belongs in the tool call rather than on the screen.
+  function repositoryLabel(row) { return row?.identity?.repository?.label || row?.identity?.repository?.path || row?.repository; }
   function listen(node, type, callback) { node.addEventListener(type, callback); dynamicListeners.push([node, type, callback]); }
   function clearDynamicListeners() { for (const [node, type, callback] of dynamicListeners) node.removeEventListener(type, callback); dynamicListeners = []; }
   function envelopeFrom(params) {
@@ -128,7 +152,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   function add(dl, key, value) { dl.append(el("dt", "", key)); dl.append(el("dd", "", shown(value))); }
   function panel(title, pairs) { const box = el("section", "panel"); box.append(el("h2", "", title)); const dl = el("dl", "kv"); for (const [key, value] of pairs) add(dl, key, value); box.append(dl); return box; }
-  function channelPairs(prefix, channel) { if (!channel) return []; return [[`${prefix} state`,channel.state],[`${prefix} next seq`,channel.nextSequence],[`${prefix} applied seq`,channel.appliedSequence],[`${prefix} revision`,channel.appliedRevision],[`${prefix} retry`,`${shown(channel.retryUsed)} / ${shown(channel.retryBudget)}`],[`${prefix} next wake`,channel.nextWakeAt],[`${prefix} attempted`,channel.lastAttemptAt],[`${prefix} applied`,channel.appliedAt]]; }
+  function channelPairs(prefix, channel) { if (!channel) return []; return [[`${prefix} state`,channel.state],[`${prefix} next seq`,channel.nextSequence],[`${prefix} applied seq`,channel.appliedSequence],[`${prefix} revision`,channel.appliedRevision],[`${prefix} retry`,`${shown(channel.retryUsed)} / ${shown(channel.retryBudget)}`],[`${prefix} next wake`,age(channel.nextWakeAt)],[`${prefix} attempted`,age(channel.lastAttemptAt)],[`${prefix} applied`,age(channel.appliedAt)]]; }
   function guidance(code) {
     return ({
       "none":"No diagnostic follow-up is recommended.",
@@ -155,23 +179,43 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   function renderRow(row) {
     const article = el("article", "session-row"); const head = el("div", "session-head"); const identity = el("div");
-    identity.append(el("div", "session-title", row?.identity?.displayTitle || row?.runId || "Untitled attempt"));
+    identity.append(el("div", "session-title", row?.titleSource?.value || row?.identity?.displayTitle || row?.runId || "Untitled attempt"));
     identity.append(el("div", "selector", `${shown(row?.identity?.subject?.kind)}:${shown(row?.identity?.subject?.id)} · run ${shown(row?.runId)} · packet ${shown(row?.packetId)} · attempt ${shown(row?.attemptId)}`));
     const chips = el("div", "chips");
-    const activity = row?.attempt?.activity || "unknown"; const activityClass = activity === "running" ? "chip chip--good" : activity === "revoking" || row?.recovery === "attention" ? "chip chip--warn" : ["failed","stopped"].includes(activity) ? "chip chip--bad" : "chip";
-    chips.append(el("span",activityClass,activity)); chips.append(el("span","chip",`recovery ${shown(row?.recovery)}`)); chips.append(el("span","chip",shown(row?.hostMode))); head.append(identity); head.append(chips); article.append(head);
-    const facts = el("div", "facts");
-    facts.append(panel("Canonical work",[["repository",row?.repository],["epic",row?.epicId],["stage",row?.stage],["provider",row?.provider],["model",row?.model],["pending interventions",row?.pendingInterventions]]));
-    facts.append(panel("Attempt lifecycle",[["activity",row?.attempt?.activity],["started",row?.attempt?.startedAt],["updated",row?.attempt?.updatedAt],["heartbeat",row?.attempt?.lastHeartbeatAt],["ended",row?.attempt?.endedAt],["subject recovery",row?.recovery]]));
+    const activity = row?.attempt?.activity || "unknown"; const tone = activity === "running" ? "good" : activity === "revoking" || row?.recovery === "attention" ? "warn" : ["failed","stopped"].includes(activity) ? "bad" : "idle";
+    chips.append(chip(activity, tone)); chips.append(chip(`recovery ${shown(row?.recovery)}`)); chips.append(chip(shown(row?.hostMode))); head.append(identity); head.append(chips); article.append(head);
+    // Six facts lead: which work, where, who is on it, and how long since it
+    // last moved. Every other recorded key is evidence for that diagnosis,
+    // not a peer of it, so it sits one control away rather than at equal
+    // weight — a disclosure, never a deletion.
+    const lead = el("section", "panel panel--lead"); lead.append(el("h2", "", "Diagnosis"));
+    const headline = el("dl", "kv kv--headline");
+    for (const [key, value] of [
+      ["repository",repositoryLabel(row)],
+      ["stage",row?.stage],
+      ["provider",row?.model ? `${shown(row?.provider)} · ${row.model}` : row?.provider],
+      ["activity",`${shown(row?.attempt?.activity)} · ${age(row?.attempt?.updatedAt)}`],
+      ["recovery",row?.recovery],
+      ["last progress",age(row?.desiredWork?.lastProgressAt)],
+    ]) add(headline, key, value);
+    lead.append(headline); article.append(lead);
     const desired = row?.desiredWork;
-    facts.append(panel("Desired work",desired ? [["subject",`${shown(desired.subjectKind)}:${shown(desired.subjectId)}`],["desired state",desired.desiredState],["control revision",desired.controlRevision],["controller generation",desired.controllerGeneration],["predecessor",desired.predecessorGeneration],["reconciliation",desired.reconciliationOutcome],["restart",`${shown(desired.restartUsed)} / ${shown(desired.restartBudget)}`],["next wake",desired.nextWakeAt],["last progress",desired.lastProgressAt],["exhausted",desired.exhaustedAt],["updated",desired.updatedAt]] : [["state","not recorded"]]));
     const owned = row?.ownedHerdr;
-    facts.append(panel("Owned Herdr",owned ? [["ownership",owned.identity?.ownershipId],["pane locator",owned.identity?.paneId],["layout",owned.identity?.layoutId],["protocol",owned.identity?.protocol],["lifecycle",owned.mutable?.lifecycleState],["cleanup",owned.mutable?.cleanupState],["release",owned.mutable?.cleanupRelease],["cleanup retry",`${shown(owned.mutable?.cleanupRetryUsed)} / ${shown(owned.mutable?.cleanupRetryBudget)}`],["next cleanup",owned.mutable?.nextCleanupAt],["registered",owned.mutable?.registeredAt],["command started",owned.mutable?.commandStartedAt],["cleanup requested",owned.mutable?.cleanupRequestedAt],["cleanup attempted",owned.mutable?.lastCleanupAttemptAt],["released",owned.mutable?.releasedAt],["updated",owned.mutable?.updatedAt]] : [["mode",row?.hostMode === "process" ? "ProcessHost" : row?.hostMode === "legacy-herdr" ? "legacy Herdr" : "not owned"]]));
     const projection = row?.projection; const evidence = projection?.mutable?.providerSession;
-    facts.append(panel("Projection",projection ? [["projection",projection.identity?.projectionId],["target",`${shown(projection.identity?.target?.kind)}:${shown(projection.identity?.target?.id)}`],["pane locator",projection.identity?.paneId],["protocol",projection.identity?.protocol],["metadata source",projection.identity?.metadataSource],["lifecycle source",projection.identity?.lifecycleSource],["lifecycle agent",projection.identity?.lifecycleAgent],["desired revision",projection.mutable?.desiredRevision],["desired lifecycle",projection.mutable?.desiredLifecycle],["desired release",projection.mutable?.desiredRelease],...channelPairs("metadata",projection.mutable?.metadata),...channelPairs("lifecycle",projection.mutable?.lifecycle)] : [["publication","not recorded"]]));
     const pane = owned?.identity?.paneId || projection?.identity?.paneId || row?.legacyHerdr?.paneId;
-    facts.append(panel("Recorded identities",[["pane locator",pane],["provider candidate",evidence?.candidate],["confirmed provider id",row?.providerSessionId],["evidence source",evidence?.source],["observed",evidence?.observedAt],["legacy layout",row?.legacyHerdr?.layoutId],["legacy generation",row?.legacyHerdr?.controllerGeneration]]));
-    article.append(facts);
+    const recorded = [
+      ["Canonical work",[["repository",repositoryLabel(row)],["epic",row?.epicId],["stage",row?.stage],["provider",row?.provider],["model",row?.model],["pending interventions",row?.pendingInterventions]]],
+      ["Attempt lifecycle",[["activity",row?.attempt?.activity],["started",row?.attempt?.startedAt?`${clock(row.attempt.startedAt)} · ${age(row.attempt.startedAt)}`:"—"],["updated",age(row?.attempt?.updatedAt)],["heartbeat",age(row?.attempt?.lastHeartbeatAt)],["ended",age(row?.attempt?.endedAt)],["subject recovery",row?.recovery]]],
+      ["Desired work",desired ? [["subject",`${shown(desired.subjectKind)}:${shown(desired.subjectId)}`],["desired state",desired.desiredState],["control revision",desired.controlRevision],["controller generation",desired.controllerGeneration],["predecessor",desired.predecessorGeneration],["reconciliation",desired.reconciliationOutcome],["restart",`${shown(desired.restartUsed)} / ${shown(desired.restartBudget)}`],["next wake",age(desired.nextWakeAt)],["last progress",age(desired.lastProgressAt)],["exhausted",age(desired.exhaustedAt)],["updated",age(desired.updatedAt)]] : [["state","not recorded"]]],
+      ["Owned Herdr",owned ? [["ownership",owned.identity?.ownershipId],["pane locator",owned.identity?.paneId],["layout",owned.identity?.layoutId],["protocol",owned.identity?.protocol],["lifecycle",owned.mutable?.lifecycleState],["cleanup",owned.mutable?.cleanupState],["release",owned.mutable?.cleanupRelease],["cleanup retry",`${shown(owned.mutable?.cleanupRetryUsed)} / ${shown(owned.mutable?.cleanupRetryBudget)}`],["next cleanup",age(owned.mutable?.nextCleanupAt)],["registered",age(owned.mutable?.registeredAt)],["command started",age(owned.mutable?.commandStartedAt)],["cleanup requested",age(owned.mutable?.cleanupRequestedAt)],["cleanup attempted",age(owned.mutable?.lastCleanupAttemptAt)],["released",age(owned.mutable?.releasedAt)],["updated",age(owned.mutable?.updatedAt)]] : [["mode",row?.hostMode === "process" ? "ProcessHost" : row?.hostMode === "legacy-herdr" ? "legacy Herdr" : "not owned"]]],
+      ["Projection",projection ? [["projection",projection.identity?.projectionId],["target",`${shown(projection.identity?.target?.kind)}:${shown(projection.identity?.target?.id)}`],["pane locator",projection.identity?.paneId],["protocol",projection.identity?.protocol],["metadata source",projection.identity?.metadataSource],["lifecycle source",projection.identity?.lifecycleSource],["lifecycle agent",projection.identity?.lifecycleAgent],["desired revision",projection.mutable?.desiredRevision],["desired lifecycle",projection.mutable?.desiredLifecycle],["desired release",projection.mutable?.desiredRelease],...channelPairs("metadata",projection.mutable?.metadata),...channelPairs("lifecycle",projection.mutable?.lifecycle)] : [["publication","not recorded"]]],
+      ["Recorded identities",[["pane locator",pane],["provider candidate",evidence?.candidate],["confirmed provider id",row?.providerSessionId],["evidence source",evidence?.source],["observed",age(evidence?.observedAt)],["legacy layout",row?.legacyHerdr?.layoutId],["legacy generation",row?.legacyHerdr?.controllerGeneration]]],
+    ];
+    const more = el("details", "more");
+    more.append(el("summary", "", `All ${fmt(recorded.reduce((total, [, pairs]) => total + pairs.length, 0))} recorded facts`));
+    const facts = el("div", "facts");
+    for (const [title, pairs] of recorded) facts.append(panel(title, pairs));
+    more.append(facts); article.append(more);
     const action = el("div", "session-action"); const diagnostic = el("div", "guidance"); diagnostic.append(el("b", "", shown(row?.recommendedAction))); diagnostic.append(document.createTextNode(` · ${guidance(row?.recommendedAction)}`)); action.append(diagnostic);
     const target = detailTarget(row); const open = el("button", "open-detail", "Open Work Detail"); open.type = "button"; open.disabled = state.loading || !host.capabilities.serverTools || !target;
     open.title = !target ? "Identity is not an exact canonical run target" : !host.capabilities.serverTools ? `Exact detail target run:${target.subjectId}; this host cannot call server tools` : `Open exact Work Detail for run:${target.subjectId}`;
@@ -187,7 +231,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("sessions").append(el("div","error",state.error)); renderDetail(); reportSize(); return; }
     if (!data) { byId("sessions").append(el("div","empty","Waiting for sessions.")); renderDetail(); reportSize(); return; }
     const filters = data.filters || {}; const filterText = [filters.repository,filters.provider,filters.model,filters.activity].filter(Boolean).join(" · ");
-    byId("scope").textContent = `${filterText || "All durable work"} · as of ${shown(data.asOf)}`;
+    byId("scope").textContent = `${filterText || "All durable work"} · read ${clock(data.asOf)} · ${age(data.asOf)}`;
     for (const [value,label] of [[data.summary?.returned,"shown"],[data.summary?.totalMatched,"matched"],[data.summary?.active,"active"],[data.summary?.historical,"historical"],[data.summary?.ownedHerdr,"owned Herdr"],[data.summary?.process,"process"]]) { const cell=el("div","stat");cell.append(el("b","",fmt(value)));cell.append(el("span","",label));byId("stats").append(cell); }
     let coverageItems=0;
     for (const [value,label] of [[data.coverage?.missingWorkIdentity,"missing identity"],[data.coverage?.missingRepository,"missing repository"],[data.coverage?.missingDesiredWork,"missing desired work"],[data.coverage?.missingOwnedProjection,"missing projection"],[data.coverage?.legacyHerdrRows,"legacy Herdr"],[data.coverage?.processRows,"process host"],[data.coverage?.unknownHostRows,"unknown host"]]) if (finite(value)>0) { byId("coverage").append(el("span","pill",`${fmt(value)} ${label}`)); coverageItems+=1; }
@@ -223,9 +267,14 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   function toggleHistory(){const next=safeArguments(state.args);next.params.includeHistorical=!(state.data?.filters?.includeHistorical===true);delete next.params.cursor;inventoryCall(next);}
   function nextPage(){if(!state.data?.nextCursor)return;const next=safeArguments(state.args);next.params.cursor=state.data.nextCursor;inventoryCall(next);}
   byId("refresh").addEventListener("click",refresh);byId("history").addEventListener("click",toggleHistory);byId("next").addEventListener("click",nextPage);
-  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);}
+  // The handshake advertises fullscreen, so the surface has to offer the
+  // control that asks for it. A host that declines leaves the view as it is.
+  function applyDisplayMode(mode){host.context={...host.context,displayMode:mode};document.documentElement.setAttribute("data-display",mode);byId("expand").textContent=mode==="fullscreen"?"Collapse":"Expand";}
+  async function toggleDisplayMode(){const next=host.context.displayMode==="fullscreen"?"inline":"fullscreen";try{const result=await request("ui/request-display-mode",{mode:next});applyDisplayMode(result?.mode||next);}catch{/* the host may decline */}reportSize();}
+  byId("expand").addEventListener("click",toggleDisplayMode);
+  function applyContext(context={}){host.context={...host.context,...context};if(context.theme)document.documentElement.style.colorScheme=context.theme;for(const [key,value] of Object.entries(context.styles?.variables||{}))document.documentElement.style.setProperty(key,value);if(context.displayMode)applyDisplayMode(context.displayMode);if(context.availableDisplayModes)byId("expand").hidden=!context.availableDisplayModes.includes("fullscreen");}
   let lastSize="";function reportSize(){if(tornDown||sizeFrame!==null)return;sizeFrame=requestAnimationFrame(()=>{sizeFrame=null;if(tornDown)return;const size=`${window.innerWidth}:${document.documentElement.scrollHeight}`;if(size===lastSize)return;lastSize=size;notify("ui/notifications/size-changed",{width:Math.ceil(window.innerWidth),height:Math.ceil(document.documentElement.scrollHeight)});});}
-  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,item] of pending){clearTimeout(item.timer);timers.delete(item.timer);pending.delete(id);item.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();clearDynamicListeners();byId("refresh").removeEventListener("click",refresh);byId("history").removeEventListener("click",toggleHistory);byId("next").removeEventListener("click",nextPage);window.removeEventListener("message",onMessage);}
+  function teardown(){if(tornDown)return;tornDown=true;observer?.disconnect();observer=null;if(sizeFrame!==null){cancelAnimationFrame(sizeFrame);sizeFrame=null;}for(const [id,item] of pending){clearTimeout(item.timer);timers.delete(item.timer);pending.delete(id);item.reject(new Error("resource torn down"));}for(const timer of timers)clearTimeout(timer);timers.clear();pending.clear();clearDynamicListeners();byId("refresh").removeEventListener("click",refresh);byId("history").removeEventListener("click",toggleHistory);byId("next").removeEventListener("click",nextPage);byId("expand").removeEventListener("click",toggleDisplayMode);window.removeEventListener("message",onMessage);}
   function onMessage(event){const message=event.data;if(!message||message.jsonrpc!=="2.0")return;if(message.id!==undefined&&pending.has(message.id)){const item=pending.get(message.id);pending.delete(message.id);clearTimeout(item.timer);timers.delete(item.timer);message.error?item.reject(new Error("request failed")):item.resolve(message.result);return;}if(message.method==="ui/notifications/tool-input")state.args=safeArguments(message.params?.arguments);else if(message.method==="ui/notifications/tool-result")ingest(message.params);else if(message.method==="ui/notifications/tool-cancelled"){state.loading=false;state.error="The host cancelled the read-only request.";render();}else if(message.method==="ui/notifications/host-context-changed")applyContext(message.params);else if(message.method==="ui/resource-teardown"){teardown();if(message.id!==undefined)post({jsonrpc:"2.0",id:message.id,result:{}});}}
   window.addEventListener("message",onMessage);
   request("ui/initialize",{protocolVersion:PROTOCOL_VERSION,appInfo:APP_INFO,appCapabilities:{availableDisplayModes:["inline","fullscreen"]}}).then(result=>{if(tornDown)return;host.connected=true;host.capabilities=result?.hostCapabilities||{};applyContext(result?.hostContext);notify("ui/notifications/initialized",{});render();observer=new ResizeObserver(reportSize);observer.observe(document.body);}).catch(()=>{if(!tornDown){state.error="The host did not complete the MCP Apps handshake.";render();}});
