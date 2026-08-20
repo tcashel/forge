@@ -12,9 +12,9 @@ use forged_ledger::{
 };
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
-    request_sha256, AttentionItemV1, AttentionResolutionDisposition, AttentionState, ErrorCode,
-    ExecutionPackageV1, OperationRequest, OperationResponse, RunId, WorkIdentityContextV1,
-    WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
+    request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
+    AttentionState, ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
+    WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
@@ -3422,6 +3422,196 @@ pub(super) fn decorate_durable_entries(entries: &mut [Value]) -> Result<(), Fail
     Ok(())
 }
 
+/// The one operator collection universe: the atomic ledger snapshot, durable
+/// and desired-only entries joined with one bounded live-plan discovery and
+/// one exact claim batch, titles resolved. Operations and the attention
+/// listing project this same universe so no surface serves a narrower one.
+struct OperationsUniverse {
+    snapshot: InventorySnapshot,
+    ledger_captured_at: String,
+    beads_captured_at: String,
+    entries: Vec<Value>,
+    bead_summaries: Vec<forged_beads::IssueSummary>,
+    claim_error: Option<String>,
+    plan_error: Option<String>,
+    plan_discovered: usize,
+    plan_truncated: bool,
+}
+
+impl OperationsUniverse {
+    /// The shared degradation posture: a Beads outage keeps ledger-backed
+    /// rows and is reported per source instead of failing the read closed.
+    fn source_health(&self) -> Value {
+        json!({
+            "ledger": {"state": "available"},
+            "beads": {
+                "state": if self.claim_error.is_some() { "unavailable" } else { "available" },
+                "error": &self.claim_error,
+            },
+            "plan": {
+                "state": if self.plan_error.is_some() { "unavailable" } else if self.plan_truncated { "partial" } else { "available" },
+                "error": &self.plan_error,
+                "discovered": self.plan_discovered,
+                "limit": LIVE_PLAN_LIMIT,
+                "truncated": self.plan_truncated,
+            },
+        })
+    }
+}
+
+async fn collect_operations_universe(
+    ctx: &Ctx,
+    repository: Option<String>,
+) -> Result<OperationsUniverse, Failure> {
+    let kinds: Vec<&str> = LIFECYCLE_KINDS
+        .iter()
+        .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
+        .copied()
+        .collect();
+    let snapshot = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
+    })
+    .await?;
+    let ledger_captured_at = now_iso();
+    let mut entries = project_entries(&snapshot, Spend::Include)?;
+    entries.extend(desired_only_entries(&snapshot, &entries)?);
+    decorate_durable_entries(&mut entries)?;
+
+    let bead_ids = entry_bead_ids(&entries);
+    let plan_cfg = ctx.config.bd_config();
+    let claim_cfg = ctx.config.bd_config();
+    let plan_repository = repository.clone();
+    let claim_repository = repository.clone();
+    let (plan_read, claim_read) = tokio::join!(
+        forged_beads::plan_inventory(&plan_cfg, plan_repository.as_deref(), LIVE_PLAN_LIMIT,),
+        async {
+            match claim_repository.as_deref() {
+                Some(repository) => {
+                    forged_beads::list_issues_for_repository(&claim_cfg, &bead_ids, repository)
+                        .await
+                }
+                None => forged_beads::list_issues(&claim_cfg, &bead_ids).await,
+            }
+        }
+    );
+    let beads_captured_at = now_iso();
+    let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
+        Ok(inventory) => (
+            inventory.issues,
+            inventory.truncated,
+            inventory.discovered,
+            None,
+        ),
+        Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
+    };
+    let (claim_beads, claim_error) = match claim_read {
+        Ok(issues) => (issues, None),
+        Err(error) => (Vec::new(), Some(error.to_string())),
+    };
+    if repository.is_some() {
+        let matching_beads = claim_beads
+            .iter()
+            .map(|issue| issue.id.as_str())
+            .collect::<BTreeSet<_>>();
+        entries.retain(|entry| {
+            entry
+                .get("beadId")
+                .and_then(Value::as_str)
+                .is_some_and(|id| matching_beads.contains(id))
+        });
+    }
+    let represented: BTreeSet<String> = entries
+        .iter()
+        .filter_map(|entry| {
+            entry
+                .get("beadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
+        })
+        .collect();
+    let mut plan_entries = Vec::new();
+    if plan_error.is_none() {
+        let mut conversion_error = None;
+        for plan in plans
+            .iter()
+            .filter(|plan| !represented.contains(&plan.issue.id))
+        {
+            match live_plan_entry(plan, &beads_captured_at) {
+                Ok(entry) => plan_entries.push(entry),
+                Err(error) => {
+                    conversion_error = Some(format!(
+                        "live plan identity for {:?} was unsafe: {}",
+                        plan.issue.id, error.message
+                    ));
+                    break;
+                }
+            }
+        }
+        if let Some(error) = conversion_error {
+            plan_error = Some(error);
+            plan_entries.clear();
+            plans.clear();
+        }
+    }
+
+    if plan_error.is_none() {
+        let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
+            .iter()
+            .map(|plan| (plan.issue.id.as_str(), plan))
+            .collect();
+        for entry in &mut entries {
+            let bead_id = entry
+                .get("beadId")
+                .and_then(Value::as_str)
+                .map(str::to_owned);
+            if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
+                if let Some(object) = entry.as_object_mut() {
+                    object.insert("priority".to_owned(), json!(plan.issue.priority));
+                    object.insert(
+                        "plan".to_owned(),
+                        json!({
+                            "source": "beads",
+                            "status": plan.issue.status,
+                            "readiness": plan.readiness(),
+                            "priority": plan.issue.priority,
+                            "assignee": plan.issue.assignee,
+                            "issueType": plan.issue.issue_type,
+                            "revision": plan.issue.revision,
+                            "parent": plan.parent,
+                            "dependencies": plan.dependencies,
+                        }),
+                    );
+                }
+            }
+        }
+        entries.extend(plan_entries);
+    }
+
+    let mut bead_summaries = claim_beads;
+    let mut known_beads = bead_summaries
+        .iter()
+        .map(|issue| issue.id.clone())
+        .collect::<BTreeSet<_>>();
+    bead_summaries.extend(
+        plans
+            .iter()
+            .map(|plan| plan.issue.clone())
+            .filter(|issue| known_beads.insert(issue.id.clone())),
+    );
+    decorate_titles(&mut entries, &bead_summaries)?;
+    Ok(OperationsUniverse {
+        snapshot,
+        ledger_captured_at,
+        beads_captured_at,
+        entries,
+        bead_summaries,
+        claim_error,
+        plan_error,
+        plan_discovered,
+        plan_truncated,
+    })
+}
+
 /// `operations overview` — the bounded, read-only operator surface.
 ///
 /// One ledger snapshot supplies every durable fact. Beads contributes one
@@ -3449,10 +3639,12 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             )));
         }
         let group_filter = operations_filter(req, "group")?;
-        if group_filter
-            .as_deref()
-            .is_some_and(|value| !QUEUE_GROUPS.iter().filter_map(|label| queue_code(label)).any(|code| code == value))
-        {
+        if group_filter.as_deref().is_some_and(|value| {
+            !QUEUE_GROUPS
+                .iter()
+                .filter_map(|label| queue_code(label))
+                .any(|code| code == value)
+        }) {
             return Err(Failure::invalid(format!(
                 "unknown operations_overview group {:?}",
                 group_filter.as_deref().unwrap_or_default()
@@ -3469,143 +3661,18 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             )));
         }
 
-        let kinds: Vec<&str> = LIFECYCLE_KINDS
-            .iter()
-            .chain(super::attention::ATTENTION_EVENT_KINDS.iter())
-            .copied()
-            .collect();
-        let snapshot = on_ledger(&ctx.ledger, move |ledger| {
-            ledger.inventory_snapshot(&kinds, InventoryUsageSelection::Include)
-        })
-        .await?;
-        let ledger_captured_at = now_iso();
-        let mut entries = project_entries(&snapshot, Spend::Include)?;
-        entries.extend(desired_only_entries(&snapshot, &entries)?);
-        decorate_durable_entries(&mut entries)?;
-
-        let bead_ids = entry_bead_ids(&entries);
-        let plan_cfg = ctx.config.bd_config();
-        let claim_cfg = ctx.config.bd_config();
-        let plan_repository = repository.clone();
-        let claim_repository = repository.clone();
-        let (plan_read, claim_read) = tokio::join!(
-            forged_beads::plan_inventory(
-                &plan_cfg,
-                plan_repository.as_deref(),
-                LIVE_PLAN_LIMIT,
-            ),
-            async {
-                match claim_repository.as_deref() {
-                    Some(repository) => forged_beads::list_issues_for_repository(
-                        &claim_cfg,
-                        &bead_ids,
-                        repository,
-                    )
-                    .await,
-                    None => forged_beads::list_issues(&claim_cfg, &bead_ids).await,
-                }
-            }
-        );
-        let beads_captured_at = now_iso();
-        let (mut plans, plan_truncated, plan_discovered, mut plan_error) = match plan_read {
-            Ok(inventory) => (
-                inventory.issues,
-                inventory.truncated,
-                inventory.discovered,
-                None,
-            ),
-            Err(error) => (Vec::new(), false, 0, Some(error.to_string())),
-        };
-        let (claim_beads, claim_error) = match claim_read {
-            Ok(issues) => (issues, None),
-            Err(error) => (Vec::new(), Some(error.to_string())),
-        };
-        if repository.is_some() {
-            let matching_beads = claim_beads
-                .iter()
-                .map(|issue| issue.id.as_str())
-                .collect::<BTreeSet<_>>();
-            entries.retain(|entry| {
-                entry
-                    .get("beadId")
-                    .and_then(Value::as_str)
-                    .is_some_and(|id| matching_beads.contains(id))
-            });
-        }
-        let represented: BTreeSet<String> = entries
-            .iter()
-            .filter_map(|entry| entry.get("beadId").and_then(Value::as_str).map(str::to_owned))
-            .collect();
-        let mut plan_entries = Vec::new();
-        if plan_error.is_none() {
-            let mut conversion_error = None;
-            for plan in plans
-                .iter()
-                .filter(|plan| !represented.contains(&plan.issue.id))
-            {
-                match live_plan_entry(plan, &beads_captured_at) {
-                    Ok(entry) => plan_entries.push(entry),
-                    Err(error) => {
-                        conversion_error = Some(format!(
-                            "live plan identity for {:?} was unsafe: {}",
-                            plan.issue.id, error.message
-                        ));
-                        break;
-                    }
-                }
-            }
-            if let Some(error) = conversion_error {
-                plan_error = Some(error);
-                plan_entries.clear();
-                plans.clear();
-            }
-        }
-
-        if plan_error.is_none() {
-            let plans_by_id: BTreeMap<&str, &forged_beads::PlanIssue> = plans
-                .iter()
-                .map(|plan| (plan.issue.id.as_str(), plan))
-                .collect();
-            for entry in &mut entries {
-                let bead_id = entry
-                    .get("beadId")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned);
-                if let Some(plan) = bead_id.as_deref().and_then(|id| plans_by_id.get(id)) {
-                    if let Some(object) = entry.as_object_mut() {
-                        object.insert("priority".to_owned(), json!(plan.issue.priority));
-                        object.insert(
-                            "plan".to_owned(),
-                            json!({
-                                "source": "beads",
-                                "status": plan.issue.status,
-                                "readiness": plan.readiness(),
-                                "priority": plan.issue.priority,
-                                "assignee": plan.issue.assignee,
-                                "issueType": plan.issue.issue_type,
-                                "revision": plan.issue.revision,
-                                "parent": plan.parent,
-                                "dependencies": plan.dependencies,
-                            }),
-                        );
-                    }
-                }
-            }
-            entries.extend(plan_entries);
-        }
-
-        let mut bead_summaries = claim_beads;
-        let mut known_beads = bead_summaries
-            .iter()
-            .map(|issue| issue.id.clone())
-            .collect::<BTreeSet<_>>();
-        bead_summaries.extend(
-            plans
-                .iter()
-                .map(|plan| plan.issue.clone())
-                .filter(|issue| known_beads.insert(issue.id.clone())),
-        );
-        decorate_titles(&mut entries, &bead_summaries)?;
+        let universe = collect_operations_universe(ctx, repository.clone()).await?;
+        let source_health = universe.source_health();
+        let OperationsUniverse {
+            snapshot,
+            ledger_captured_at,
+            beads_captured_at,
+            mut entries,
+            bead_summaries,
+            claim_error,
+            plan_truncated,
+            ..
+        } = universe;
         let attention = super::attention::project_active(&snapshot, &entries, &bead_summaries)?
             .into_iter()
             .map(|item| {
@@ -3631,7 +3698,10 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             .into_iter()
             .flatten()
         {
-            let label = group.get("name").and_then(Value::as_str).unwrap_or_default();
+            let label = group
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             let Some(code) = queue_code(label) else {
                 continue;
             };
@@ -3704,7 +3774,9 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
             .count();
         let review_ready = entries
             .iter()
-            .filter(|entry| entry.get("queueGroup").and_then(Value::as_str) == Some("Ready to merge"))
+            .filter(|entry| {
+                entry.get("queueGroup").and_then(Value::as_str) == Some("Ready to merge")
+            })
             .count();
         let recent = entries
             .iter()
@@ -3721,20 +3793,7 @@ pub async fn operations_overview(ctx: &Ctx, req: &OperationRequest) -> Operation
                 "ledger": ledger_captured_at,
                 "beads": beads_captured_at,
             },
-            "sourceHealth": {
-                "ledger": {"state": "available"},
-                "beads": {
-                    "state": if claim_error.is_some() { "unavailable" } else { "available" },
-                    "error": claim_error,
-                },
-                "plan": {
-                    "state": if plan_error.is_some() { "unavailable" } else if plan_truncated { "partial" } else { "available" },
-                    "error": plan_error,
-                    "discovered": plan_discovered,
-                    "limit": LIVE_PLAN_LIMIT,
-                    "truncated": plan_truncated,
-                },
-            },
+            "sourceHealth": source_health,
             "coverage": {
                 "total": matching_total,
                 "available": total,
@@ -3798,6 +3857,228 @@ pub(super) async fn operations_projection(
 }
 
 // ------------------------------------------------------- attention controls
+
+const ATTENTION_LIST_DEFAULT_LIMIT: u64 = 100;
+const ATTENTION_LIST_MAX_LIMIT: u64 = 500;
+
+/// The custody-state scope `attention list` serves. `Active` reproduces
+/// `project_active`'s semantics exactly: open plus acknowledged.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum AttentionListState {
+    Active,
+    Open,
+    All,
+}
+
+impl AttentionListState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Open => "open",
+            Self::All => "all",
+        }
+    }
+}
+
+fn attention_list_filter<'p>(
+    req: &'p OperationRequest,
+    key: &str,
+) -> Result<Option<&'p str>, Failure> {
+    let Some(value) = req.params.get(key) else {
+        return Ok(None);
+    };
+    let value = value
+        .as_str()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| {
+            Failure::invalid(format!("attention_list {key} must be a non-empty string"))
+        })?;
+    Ok(Some(value))
+}
+
+/// `attention list` — the authoritative read-only attention projection.
+///
+/// The collection universe is the Operations universe — ledger entries plus
+/// live plan entries plus claim/plan bead summaries — projected through
+/// `project_all` and state-filtered afterwards, so `state=all` can serve the
+/// resolved occurrences `project_active` strips. Items are complete
+/// unmodified `forged.attention-item/1` objects, grouped by condition with
+/// decisions before symptoms and oldest first, truncation always stated.
+pub async fn attention_list(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
+    read_only("attention_list", req, || async {
+        use super::attention::{classification, AttentionClass};
+        let repo = repository_selector(req, "attention_list")?;
+        let state = match attention_list_filter(req, "state")? {
+            None | Some("active") => AttentionListState::Active,
+            Some("open") => AttentionListState::Open,
+            Some("all") => AttentionListState::All,
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "unknown attention_list state {other:?}"
+                )))
+            }
+        };
+        let condition = attention_list_filter(req, "condition")?
+            .map(|value| {
+                serde_json::from_value::<AttentionCondition>(json!(value)).map_err(|_| {
+                    Failure::invalid(format!("unknown attention_list condition {value:?}"))
+                })
+            })
+            .transpose()?;
+        let class = match attention_list_filter(req, "classification")? {
+            None => None,
+            Some("decision") => Some(AttentionClass::Decision),
+            Some("symptom") => Some(AttentionClass::Symptom),
+            Some(other) => {
+                return Err(Failure::invalid(format!(
+                    "unknown attention_list classification {other:?}"
+                )))
+            }
+        };
+        let limit = req
+            .params
+            .get("limit")
+            .map(|value| {
+                value.as_u64().ok_or_else(|| {
+                    Failure::invalid("attention_list limit must be an unsigned integer")
+                })
+            })
+            .transpose()?
+            .unwrap_or(ATTENTION_LIST_DEFAULT_LIMIT);
+        if !(1..=ATTENTION_LIST_MAX_LIMIT).contains(&limit) {
+            return Err(Failure::invalid(format!(
+                "attention_list limit must be between 1 and {ATTENTION_LIST_MAX_LIMIT}"
+            )));
+        }
+
+        let universe = collect_operations_universe(ctx, repo.clone()).await?;
+        let items = super::attention::project_all(
+            &universe.snapshot,
+            &universe.entries,
+            &universe.bead_summaries,
+        )?;
+        let items: Vec<AttentionItemV1> = items
+            .into_iter()
+            .filter(|item| match state {
+                AttentionListState::Active => item.state != AttentionState::Resolved,
+                AttentionListState::Open => item.state == AttentionState::Open,
+                AttentionListState::All => true,
+            })
+            .filter(|item| {
+                repo.as_deref()
+                    .is_none_or(|repo| item.repository.as_deref() == Some(repo))
+            })
+            .filter(|item| condition.is_none_or(|condition| item.condition == condition))
+            .filter(|item| class.is_none_or(|class| classification(item.condition) == class))
+            .collect();
+
+        // Totals are post-filter, pre-limit, so they reconcile:
+        // open + acknowledged + resolved == total == decisions + symptoms.
+        let total = items.len();
+        let open = items
+            .iter()
+            .filter(|item| item.state == AttentionState::Open)
+            .count();
+        let acknowledged = items
+            .iter()
+            .filter(|item| item.state == AttentionState::Acknowledged)
+            .count();
+        let resolved = items
+            .iter()
+            .filter(|item| item.state == AttentionState::Resolved)
+            .count();
+        let decisions = items
+            .iter()
+            .filter(|item| classification(item.condition) == AttentionClass::Decision)
+            .count();
+        let symptoms = total - decisions;
+
+        let mut by_condition: BTreeMap<AttentionCondition, Vec<AttentionItemV1>> = BTreeMap::new();
+        for item in items {
+            by_condition.entry(item.condition).or_default().push(item);
+        }
+        let mut ordered: Vec<(
+            AttentionCondition,
+            AttentionClass,
+            String,
+            Vec<AttentionItemV1>,
+        )> = Vec::new();
+        for (condition, mut group) in by_condition {
+            group.sort_by(|left, right| {
+                (left.opened_at.as_str(), left.subject_id.as_str())
+                    .cmp(&(right.opened_at.as_str(), right.subject_id.as_str()))
+            });
+            let oldest = group
+                .first()
+                .map(|item| item.opened_at.clone())
+                .unwrap_or_default();
+            ordered.push((condition, classification(condition), oldest, group));
+        }
+        ordered.sort_by(|left, right| {
+            (left.1 != AttentionClass::Decision, left.2.as_str(), left.0).cmp(&(
+                right.1 != AttentionClass::Decision,
+                right.2.as_str(),
+                right.0,
+            ))
+        });
+
+        // Global sequential take in rendered order, the sibling policy: a
+        // truncated group still states its own total, nothing goes silent.
+        let mut remaining = limit as usize;
+        let mut shown_total = 0usize;
+        let mut groups = Vec::new();
+        for (condition, class, oldest, group) in ordered {
+            let group_total = group.len();
+            let shown = group
+                .into_iter()
+                .take(remaining)
+                .map(|item| {
+                    serde_json::to_value(item).map_err(|error| {
+                        Failure::internal(format!("serializing attention item: {error}"))
+                    })
+                })
+                .collect::<Result<Vec<_>, _>>()?;
+            remaining = remaining.saturating_sub(shown.len());
+            shown_total += shown.len();
+            groups.push(json!({
+                "condition": condition,
+                "classification": class,
+                "total": group_total,
+                "shown": shown.len(),
+                "oldestOpenedAt": oldest,
+                "items": shown,
+            }));
+        }
+
+        Ok(json!({
+            "schema": "forged.attention-list/1",
+            "capturedAt": {
+                "ledger": &universe.ledger_captured_at,
+                "beads": &universe.beads_captured_at,
+            },
+            "filters": {
+                "repo": repo,
+                "state": state.as_str(),
+                "condition": condition,
+                "classification": class,
+                "limit": limit,
+            },
+            "sourceHealth": universe.source_health(),
+            "totals": {
+                "open": open,
+                "acknowledged": acknowledged,
+                "resolved": resolved,
+                "decisions": decisions,
+                "symptoms": symptoms,
+                "shown": shown_total,
+                "total": total,
+            },
+            "groups": groups,
+        }))
+    })
+    .await
+}
 
 async fn all_attention(ctx: &Ctx) -> Result<Vec<AttentionItemV1>, Failure> {
     let kinds: Vec<&str> = LIFECYCLE_KINDS

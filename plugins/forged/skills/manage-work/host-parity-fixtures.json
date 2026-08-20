@@ -117,6 +117,7 @@
     "artifact_compact",
     "artifact_verify",
     "attention_acknowledge",
+    "attention_list",
     "attention_reopen",
     "attention_resolve",
     "claim_next",

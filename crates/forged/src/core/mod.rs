@@ -810,6 +810,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "events_tail" => ops::events_tail(ctx, &req).await,
         "work_list" => ops::work_list(ctx, &req).await,
         "work_history" => history::work_history(ctx, &req).await,
+        "attention_list" => ops::attention_list(ctx, &req).await,
         "attention_acknowledge" => ops::attention_acknowledge(ctx, &mut req).await,
         "attention_resolve" => ops::attention_resolve(ctx, &mut req).await,
         "attention_reopen" => ops::attention_reopen(ctx, &mut req).await,

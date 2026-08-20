@@ -1,4 +1,4 @@
-//! `forged mcp` — the rmcp stdio server. Forty-three tools, each taking the same
+//! `forged mcp` — the rmcp stdio server. Forty-four tools, each taking the same
 //! operation envelope in and returning the same envelope out; every
 //! tool routes through the identical core dispatch the CLI uses, so the two
 //! surfaces are two adapters over one core.
@@ -485,6 +485,90 @@ pub struct OperationsOverviewParams {
 }
 
 impl OperationsOverviewArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        let params = match serde_json::to_value(&self.params) {
+            Ok(Value::Object(map)) => map,
+            _ => serde_json::Map::new(),
+        };
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: None,
+            params,
+        }
+    }
+}
+
+/// Closed custody-state scope exposed by `attention_list`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum AttentionListStateParam {
+    /// Open plus acknowledged (the default).
+    Active,
+    /// Open only, excluding acknowledged.
+    Open,
+    /// Every occurrence, including resolved.
+    All,
+}
+
+/// Closed attention classification exposed by `attention_list`.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "kebab-case")]
+pub enum AttentionListClassParam {
+    Decision,
+    Symptom,
+}
+
+/// Typed envelope for the authoritative attention listing.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttentionListArgs {
+    /// Envelope schema version; always 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    /// The idempotency key; defaulted to `op:attention_list:read`.
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    /// Attention listing parameters.
+    #[serde(default)]
+    pub params: AttentionListParams,
+}
+
+/// Filters accepted by `attention_list`.
+#[derive(Debug, Default, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct AttentionListParams {
+    /// Exact durable repository identity.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub repo: Option<String>,
+    /// Custody-state scope: active (open plus acknowledged, the default),
+    /// open, or all.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub state: Option<AttentionListStateParam>,
+    /// Exact attention condition.
+    #[serde(
+        default,
+        deserialize_with = "present_means_named",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub condition: Option<String>,
+    /// Class filter: decision or symptom.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub classification: Option<AttentionListClassParam>,
+    /// Maximum items across all groups, 1..=500 (default 100).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<u64>,
+}
+
+impl AttentionListArgs {
     fn into_envelope(self) -> EnvelopeArgs {
         let params = match serde_json::to_value(&self.params) {
             Ok(Value::Object(map)) => map,
@@ -1074,6 +1158,19 @@ impl ForgedServer {
     pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {
         self.call_structured("work_detail", args.0.into_envelope())
             .await
+    }
+
+    /// The authoritative bounded attention listing.
+    #[tool(
+        name = "attention_list",
+        description = "List attention items grouped by condition, decision groups before symptom \
+                       groups, items oldest first, truncation always stated. Optional exact \
+                       params.repo and params.condition filters, closed params.state \
+                       (active, open, all) and params.classification (decision, symptom), \
+                       and params.limit up to 500."
+    )]
+    pub async fn attention_list(&self, args: Parameters<AttentionListArgs>) -> CallToolResult {
+        self.call("attention_list", args.0.into_envelope()).await
     }
 
     /// Record custody of an exact active attention occurrence.
