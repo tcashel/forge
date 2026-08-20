@@ -324,10 +324,17 @@ const payload = operations
       titleSource: { known: true, value: malicious, source: "beads.title", beadId: "beads-one" },
       status: { state: "active" },
       delivery: { source: "ledger", known: true, pr: 125, sha: "0f1e2d3c4b5a", base: "main" },
-      gates: [
-        { attemptId: 1, packetId: "run-1/implementation/0", implemented: true, commitsAhead: 2, summary: "Implemented the slice", gateState: "pass", passed: true, note: null },
-        { attemptId: 2, packetId: "run-1/review/0", implemented: false, commitsAhead: 0, summary: "The gate refused the change", gateState: "fail", passed: false, note: "clippy denied a warning" },
-      ],
+      // Bounded exactly as `bounded()` emits it in observe.rs; a bare array
+      // here would let the App read gates as none and still pass.
+      gates: {
+        items: [
+          { attemptId: 1, packetId: "run-1/implementation/0", implemented: true, commitsAhead: 2, summary: "Implemented the slice", gateState: "pass", passed: true, note: null },
+          { attemptId: 2, packetId: "run-1/review/0", implemented: false, commitsAhead: 0, summary: "The gate refused the change", gateState: "fail", passed: false, note: "clippy denied a warning" },
+        ],
+        total: 2,
+        limit: 200,
+        truncated: false,
+      },
       workers: { sessions: [] },
       reviews: {
         latestFindings,

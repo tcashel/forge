@@ -118,8 +118,10 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
     const subtitle=byId("subtitle");subtitle.replaceChildren();subtitle.append(el("span","",data.workRef?.kind||data.kind||"work"));subtitle.append(document.createTextNode(" "));subtitle.append(chip(data.id,"id"));if(titleMark){subtitle.append(document.createTextNode(" "));subtitle.append(el("span","",titleMark));}
     byId("state").textContent=subjectState(data);
     const workers=arr(data.workers?.sessions),findings=arr(data.reviews?.latestFindings),events=arr(data.events?.events),artifacts=arr(data.artifacts);
-    const holds=arr(data.attention),gates=arr(data.gates);
-    const findingTotal=num(data.reviews?.latestFindingTotal??findings.length),holdTotal=num(data.attentionTotal??holds.length);
+    // `gates` arrives bounded — {items,total,limit,truncated} — so reading it
+    // as a bare array renders every real gate result as none.
+    const holds=arr(data.attention),gates=arr(data.gates?.items??data.gates);
+    const findingTotal=num(data.reviews?.latestFindingTotal??findings.length),holdTotal=num(data.attentionTotal??holds.length),gateTotal=num(data.gates?.total??gates.length);
     for(const [value,label] of [[workers.length,"workers"],[findingTotal,"findings"],[holdTotal,"attention"],[artifacts.length,"artifact groups"],[events.length,"events"],[`$${num(data.usage?.totals?.costUsdKnown).toFixed(2)}`,"known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
     const identity=panel("Identity"),dl=el("dl","kv"); const add=(k,v)=>{dl.append(el("dt","",k));dl.append(el("dd","",v==null?"—":v));}; add("canonical id",data.id);add("bead",data.identity?.bead?.id);add("repository",repositoryLabel(data.identity));add("base",data.identity?.baseRef);identity.body.append(dl);grid.append(identity.box);
     // What is holding this work, and what the projection says to do about
@@ -132,8 +134,8 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
     if(!delivery||delivery.known===false)ship.body.append(el("div","empty","No pull request is recorded for this work."));
     else{const dd=el("dl","kv");const shipped=(k,v)=>{dd.append(el("dt","",k));dd.append(el("dd","",v==null?"—":v));};shipped("pull request",delivery.pr);shipped("head sha",delivery.sha);shipped("base",delivery.base??data.identity?.baseRef);shipped("source",delivery.source);ship.body.append(dd);}
     grid.append(ship.box);
-    const gate=panel("Gates",gates.length?`${gates.filter(row=>row.passed).length} of ${gates.length} passed`:"none");
-    if(!gates.length)gate.body.append(el("div","empty","No gate result is recorded."));
+    const gate=panel("Gates",gates.length?`${gates.filter(row=>row.passed).length} of ${gates.length} passed${gateTotal>gates.length?` · ${bound(gates.length,gateTotal)}`:""}`:"none");
+    if(!gates.length)gate.body.append(el("div","empty",gateTotal?`${gateTotal} gate results counted; none carried in this page.`:"No gate result is recorded."));
     for(const row of gates)item(gate.body,`${row.gateState||(row.passed?"pass":"unknown")} · ${row.packetId||`attempt ${row.attemptId}`}`,row.summary,row.note);
     grid.append(gate.box);
     const work=panel("Workers"); if(!workers.length)work.body.append(el("div","empty","No provider session is live.")); for(const worker of workers)item(work.body,worker.seat||worker.provider||worker.sessionId,`${worker.state||"unknown"}${worker.model?` · ${worker.model}`:""}`);grid.append(work.box);
