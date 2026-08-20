@@ -1065,6 +1065,103 @@ fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
     );
 }
 
+/// A queue row is a fixed-width CSS grid, so the title mark has to ride
+/// inside the title cell. Appending it as its own child pushed `source` into
+/// the `meta` column and wrapped the row onto a second line — and every
+/// durable row marks `live title`, so that is the ordinary case, not an edge.
+#[test]
+fn a_marked_operations_row_still_fills_exactly_its_declared_grid_columns() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let html = std::fs::read_to_string(&asset).expect("read Operations App");
+    // The expected cell count is the asset's own column count, so the two
+    // cannot drift apart silently.
+    let declaration = html
+        .split_once(".row {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(rule, _)| rule.to_owned())
+        .expect("the .row rule");
+    let columns = declaration
+        .split_once("grid-template-columns:")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(tracks, _)| tracks.matches("minmax(").count())
+        .expect("the .row column tracks");
+    assert!(
+        columns > 1,
+        "the row rule declares its columns: {declaration}"
+    );
+
+    let entry = |id: &str, title_source: Value| {
+        json!({
+            "id": id,
+            "state": "active",
+            "source": "durable",
+            "identity": {"displayTitle": format!("{id} [/repo]")},
+            "titleSource": title_source,
+            "detailTarget": {"subjectKind": "run", "subjectId": id},
+        })
+    };
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1",
+                "scope": {"repository": "/repo"},
+                "sourceHealth": {
+                    "ledger": {"state": "available"},
+                    "beads": {"state": "available"},
+                    "plan": {"state": "available"},
+                },
+                "coverage": {"total": 3, "shown": 3, "matching": 3, "truncated": false},
+                "counts": {"live": 3, "queued": 0, "attention": 0, "planOnly": 0, "reviewReady": 0},
+                "spend": {"costUsdKnown": 0},
+                "attention": [],
+                "queue": {"groups": [{"code": "running", "label": "Running", "total": 3, "shown": 3, "entries": [
+                    entry("run-live", json!({
+                        "known": true,
+                        "value": "Repair the bead read",
+                        "source": "beads.title",
+                        "beadId": "beads-ntc.4",
+                    })),
+                    entry("run-untitled", json!({
+                        "known": false,
+                        "value": "run-untitled",
+                        "source": "subject.id",
+                    })),
+                    entry("run-plain", Value::Null),
+                ]}]},
+            }}},
+        }),
+    );
+
+    let rows = report["rows"].as_array().expect("Operations rows");
+    assert_eq!(rows.len(), 3, "every row renders: {report}");
+    for row in rows {
+        assert_eq!(
+            row["cells"].as_u64(),
+            Some(columns as u64),
+            "a row must occupy exactly its {columns} grid columns: {report}"
+        );
+    }
+    let text = report["text"].to_string();
+    for expected in [
+        "Repair the bead read",
+        "live title",
+        "untitled id",
+        "durable",
+    ] {
+        assert!(
+            text.contains(expected),
+            "the row still shows {expected}: {report}"
+        );
+    }
+}
+
 #[test]
 fn agent_sessions_controls_are_bounded_exact_and_read_only() {
     let Some(node) = require_node() else { return };

@@ -198,7 +198,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
           : !canDetail
             ? `Exact detail target ${selector}; this host cannot call server tools`
             : `Open exact work detail for ${selector}`;
-        row.append(el("span", "id", selector || entry.id)); row.append(el("span", "title", titleFor(entry))); const mark = titleMark(entry); if (mark) row.append(el("span", "source", mark)); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
+        // The row IS the four-column grid, so the mark rides inside the
+        // title cell — a fifth child would push `source` out of its column.
+        const title = el("span", "title", titleFor(entry)); const mark = titleMark(entry);
+        if (mark) { title.append(document.createTextNode(" ")); title.append(el("span", "source", mark)); }
+        row.append(el("span", "id", selector || entry.id)); row.append(title); row.append(el("span", "meta", entry.state || entry.outcome || "planned")); row.append(el("span", "source", entry.source || "unknown"));
         if (!row.disabled) row.addEventListener("click", () => openDetail(entry)); rows.append(row);
       }
       section.append(rows); groups.append(section);
