@@ -1095,16 +1095,78 @@ pub struct WorkDetailArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `attention` subcommands. These alter custody only; domain state is never
-/// changed by an attention control.
+/// `attention` subcommands. `list` is the one read; the controls alter
+/// custody only, and domain state is never changed by any of them.
 #[derive(Debug, Subcommand)]
 pub enum AttentionCmd {
+    /// List attention items grouped by condition, decisions first.
+    List(AttentionListArgs),
     /// Record who has custody while leaving the item active.
     Acknowledge(AttentionTargetArgs),
     /// Resolve an explicitly adjudicable occurrence.
     Resolve(AttentionResolveArgs),
     /// Reopen the exact current occurrence.
     Reopen(AttentionTargetArgs),
+}
+
+/// Closed custody-state scope for `attention list`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttentionListState {
+    /// Open plus acknowledged (the default).
+    Active,
+    /// Open only, excluding acknowledged.
+    Open,
+    /// Every occurrence, including resolved.
+    All,
+}
+
+impl AttentionListState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Active => "active",
+            Self::Open => "open",
+            Self::All => "all",
+        }
+    }
+}
+
+/// Closed attention classification for `attention list`.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum AttentionListClassification {
+    Decision,
+    Symptom,
+}
+
+impl AttentionListClassification {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Decision => "decision",
+            Self::Symptom => "symptom",
+        }
+    }
+}
+
+/// `attention list` flags.
+#[derive(Debug, Args)]
+pub struct AttentionListArgs {
+    /// Exact durable repository identity.
+    #[arg(long)]
+    pub repo: Option<String>,
+    /// Custody-state scope (default active: open plus acknowledged).
+    #[arg(long, value_enum)]
+    pub state: Option<AttentionListState>,
+    /// Exact condition filter.
+    #[arg(long)]
+    pub condition: Option<String>,
+    /// Class filter: decision or symptom.
+    #[arg(long, value_enum)]
+    pub classification: Option<AttentionListClassification>,
+    /// Maximum items across all groups, 1..=500 (default 100).
+    #[arg(long)]
+    pub limit: Option<u64>,
+    /// Override the read-only idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
 }
 
 /// Exact occurrence address shared by attention controls.
@@ -1288,6 +1350,7 @@ pub fn command_name(command: &Command) -> &'static str {
             WorkCmd::Map(_) => "work_map",
         },
         Command::Attention { command } => match command {
+            AttentionCmd::List(_) => "attention_list",
             AttentionCmd::Acknowledge(_) => "attention_acknowledge",
             AttentionCmd::Resolve(_) => "attention_resolve",
             AttentionCmd::Reopen(_) => "attention_reopen",
@@ -1836,6 +1899,27 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             }
         },
         Command::Attention { command } => match command {
+            AttentionCmd::List(a) => {
+                let mut params = Map::new();
+                for (key, value) in [("repo", a.repo), ("condition", a.condition)] {
+                    if let Some(value) = value {
+                        params.insert(key.to_owned(), json!(value));
+                    }
+                }
+                if let Some(state) = a.state {
+                    params.insert("state".to_owned(), json!(state.as_str()));
+                }
+                if let Some(classification) = a.classification {
+                    params.insert("classification".to_owned(), json!(classification.as_str()));
+                }
+                if let Some(limit) = a.limit {
+                    params.insert("limit".to_owned(), json!(limit));
+                }
+                (
+                    "attention_list",
+                    request(a.idempotency_key, None, Value::Object(params)),
+                )
+            }
             AttentionCmd::Acknowledge(a) => (
                 "attention_acknowledge",
                 request(

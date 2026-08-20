@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-three public core functions, the CLI path and the MCP tool path produce
+//! the forty-four public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -68,7 +68,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_three_tools_match_their_cli_counterparts() {
+fn all_forty_four_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -84,6 +84,7 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         "artifact_verify",
         "artifact_compact",
         "attention_acknowledge",
+        "attention_list",
         "attention_reopen",
         "attention_resolve",
         "doctor",
@@ -125,7 +126,7 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-three tools, exactly");
+    assert_eq!(tools, expected, "the forty-four tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -240,6 +241,32 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
             "operations_overview advertises params.{param}: {operation_properties}"
         );
     }
+    let attention_list = mcp.tool("attention_list");
+    let attention_schema = attention_list
+        .pointer("/inputSchema")
+        .cloned()
+        .unwrap_or(Value::Null)
+        .to_string();
+    for value in [
+        "repo",
+        "condition",
+        "classification",
+        "limit",
+        "active",
+        "open",
+        "all",
+        "decision",
+        "symptom",
+    ] {
+        assert!(
+            attention_schema.contains(value),
+            "attention_list advertises closed value or parameter {value}: {attention_schema}"
+        );
+    }
+    assert!(
+        attention_list.pointer("/_meta/ui/resourceUri").is_none(),
+        "attention_list attaches no UI resource in this slice: {attention_list}"
+    );
     let detail = mcp.tool("work_detail");
     assert_eq!(
         detail.pointer("/_meta/ui/resourceUri"),
@@ -611,6 +638,21 @@ fn all_forty_three_tools_match_their_cli_counterparts() {
         envelope(json!({"repo": repository, "limit": 25})),
     );
     assert!(structured["structuredContent"].is_object());
+
+    let cli = env
+        .forged(&["attention", "list", "--state", "all", "--limit", "25"])
+        .1;
+    let tool = mcp.call_tool(
+        "attention_list",
+        envelope(json!({"state": "all", "limit": 25})),
+    );
+    assert_eq!(tool["operationId"], json!("op:attention_list:read"));
+    assert_eq!(
+        tool["result"]["schema"],
+        json!("forged.attention-list/1"),
+        "{tool}"
+    );
+    assert_eq!(normalized(cli), normalized(tool), "attention_list parity");
 
     let cli = env
         .forged(&[
@@ -1209,6 +1251,14 @@ fn split_inventory_tools_refuse_unknown_fields_at_both_schema_boundaries() {
             json!({"schemaVersion": 1, "params": {"unexpected": true}}),
         ),
         (
+            "attention_list",
+            json!({"schemaVersion": 1, "unexpected": true, "params": {}}),
+        ),
+        (
+            "attention_list",
+            json!({"schemaVersion": 1, "params": {"unexpected": true}}),
+        ),
+        (
             "work_detail",
             json!({"schemaVersion": 1, "unexpected": true, "params": {"subjectKind": "run", "subjectId": "absent"}}),
         ),
@@ -1273,6 +1323,29 @@ fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
         assert!(
             text.contains("failed to deserialize parameters"),
             "malformed Work Detail target is refused before dispatch: {arguments}: {refusal}"
+        );
+    }
+
+    // The closed attention_list state and classification enums refuse any
+    // value outside their contract before dispatch, as does a present
+    // null/wrong-typed scope.
+    for params in [
+        json!({"repo": null}),
+        json!({"state": "resolved"}),
+        json!({"classification": "root-cause"}),
+        json!({"limit": "25"}),
+    ] {
+        let refusal = mcp.call_tool_error_result(
+            "attention_list",
+            json!({"schemaVersion": 1, "params": params.clone()}),
+        );
+        let text = refusal
+            .pointer("/content/0/text")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(
+            text.contains("failed to deserialize parameters"),
+            "malformed attention_list params are a transport refusal: {params}: {refusal}"
         );
     }
 }

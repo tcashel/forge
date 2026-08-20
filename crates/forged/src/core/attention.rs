@@ -1103,6 +1103,39 @@ pub(crate) fn resolution_allowed(condition: AttentionCondition) -> bool {
     )
 }
 
+/// The two triage classes: a `decision` waits on operator judgment or
+/// authorization; a `symptom` clears only through a domain transition an
+/// agent or the supervisor owns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, serde::Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub(crate) enum AttentionClass {
+    Decision,
+    Symptom,
+}
+
+/// The fixed condition-to-class mapping every surface consumes. Exhaustive
+/// on purpose: a new condition fails the build until it is classified.
+pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
+    use AttentionCondition as Condition;
+    match condition {
+        Condition::InputRequired
+        | Condition::MergeApproval
+        | Condition::Quarantined
+        | Condition::MissingCost
+        | Condition::RetryExhausted
+        | Condition::ReviewerDisagreement
+        | Condition::AmbiguousEffect
+        | Condition::RestartBudgetExhausted => AttentionClass::Decision,
+        Condition::Blocked
+        | Condition::BeadsSettlementPending
+        | Condition::Revoking
+        | Condition::ControllerDead
+        | Condition::FailedGate
+        | Condition::ProviderDegraded
+        | Condition::MissingEvidence => AttentionClass::Symptom,
+    }
+}
+
 /// Project active and resolved occurrences. Controls use the resolved rows;
 /// operator surfaces filter them through [`project_active`].
 pub(crate) fn project_all(
@@ -1508,5 +1541,54 @@ mod tests {
         let error = project_active(&snapshot, &[entry("run-usage")], &[])
             .expect_err("attention cannot interpret omitted usage as no missing cost");
         assert!(error.message.contains("requires included inventory usage"));
+    }
+
+    #[test]
+    fn classification_pins_the_exact_decision_and_symptom_sets() {
+        use AttentionCondition as Condition;
+        let decisions = [
+            Condition::InputRequired,
+            Condition::MergeApproval,
+            Condition::Quarantined,
+            Condition::MissingCost,
+            Condition::RetryExhausted,
+            Condition::ReviewerDisagreement,
+            Condition::AmbiguousEffect,
+            Condition::RestartBudgetExhausted,
+        ];
+        let symptoms = [
+            Condition::Blocked,
+            Condition::BeadsSettlementPending,
+            Condition::Revoking,
+            Condition::ControllerDead,
+            Condition::FailedGate,
+            Condition::ProviderDegraded,
+            Condition::MissingEvidence,
+        ];
+        assert_eq!(decisions.len(), 8);
+        assert_eq!(symptoms.len(), 7);
+        for condition in decisions {
+            assert_eq!(
+                classification(condition),
+                AttentionClass::Decision,
+                "{condition:?} is an operator decision"
+            );
+        }
+        for condition in symptoms {
+            assert_eq!(
+                classification(condition),
+                AttentionClass::Symptom,
+                "{condition:?} clears through a domain transition"
+            );
+        }
+        // The two pinned sets cover the whole closed condition contract; the
+        // exhaustive match in `classification` breaks the build first when a
+        // new condition appears, and this count breaks when a set drifts.
+        let all: BTreeSet<String> = decisions
+            .iter()
+            .chain(symptoms.iter())
+            .map(|condition| serde_json::to_string(condition).expect("closed condition"))
+            .collect();
+        assert_eq!(all.len(), 15, "one class per condition, no overlap");
     }
 }
