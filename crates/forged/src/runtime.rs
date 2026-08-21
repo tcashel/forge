@@ -1332,6 +1332,15 @@ struct ControllerBlocker {
     reason: String,
 }
 
+/// One drain-check pass over the controller inventory. `blockers` refuse the
+/// runtime change; `repairable` records are mismatched but probe-confirmed
+/// dead, so they ride the Ok payload of install/stop — never the refusal.
+#[derive(Debug, Default)]
+struct ControllerDrainScan {
+    blockers: Vec<ControllerBlocker>,
+    repairable: Vec<ControllerBlocker>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ControllerGroupState {
     Absent,
@@ -1504,10 +1513,46 @@ fn controller_process_identity(
     })
 }
 
+/// The status path the generation authority expects for a controller record.
+///
+/// The derivation is host-kind-aware: a herdr host stores its sentinel under
+/// the shell-safe hex [`forged_host::herdr_status_dir_key`] of the pane id
+/// (raw pane ids carry `:`, which the unquoted sentinel line must never see),
+/// while every other host — the process host and pre-host-field records —
+/// joins the raw session id. A spawn-crash recovery record with no session
+/// settles at the drive-exit sidecar.
+fn expected_controller_status(controller_dir: &Path, record: &Value) -> Option<PathBuf> {
+    let generation = record.get("generation").and_then(Value::as_u64)?;
+    match record.get("sessionId").and_then(Value::as_str) {
+        Some(session) => {
+            let session_dir = if record.get("host").and_then(Value::as_str) == Some("herdr") {
+                forged_host::herdr_status_dir_key(session)
+            } else {
+                session.to_owned()
+            };
+            Some(
+                controller_dir
+                    .join("status")
+                    .join(generation.to_string())
+                    .join(session_dir)
+                    .join("status"),
+            )
+        }
+        None if record
+            .get("recoveredAfterSpawnCrash")
+            .and_then(Value::as_bool)
+            == Some(true) =>
+        {
+            Some(controller_dir.join(format!("controller-{generation}.drive-exit")))
+        }
+        None => None,
+    }
+}
+
 async fn controller_blockers(
     runs_root: &Path,
     candidate_abi: Option<&str>,
-) -> Result<Vec<ControllerBlocker>, Failure> {
+) -> Result<ControllerDrainScan, Failure> {
     controller_blockers_with_probe(runs_root, candidate_abi, &SystemControllerProcessProbe).await
 }
 
@@ -1515,7 +1560,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
     runs_root: &Path,
     candidate_abi: Option<&str>,
     process_probe: &P,
-) -> Result<Vec<ControllerBlocker>, Failure> {
+) -> Result<ControllerDrainScan, Failure> {
     reject_symlink_chain(runs_root)?;
     match fs::symlink_metadata(runs_root) {
         Ok(metadata) if metadata.is_dir() => {}
@@ -1525,7 +1570,9 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
                 runs_root.display()
             )))
         }
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ControllerDrainScan::default())
+        }
         Err(error) => {
             return Err(Failure::internal(format!(
                 "inspecting controller inventory root {}: {error}",
@@ -1533,7 +1580,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             )))
         }
     }
-    let mut blockers = Vec::new();
+    let mut scan = ControllerDrainScan::default();
     for entry in fs::read_dir(runs_root)
         .map_err(|error| Failure::internal(format!("reading controller inventory: {error}")))?
     {
@@ -1543,7 +1590,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
         let entry_type = match entry.file_type() {
             Ok(entry_type) => entry_type,
             Err(error) => {
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id: fallback_id,
                     state: "unknown".to_owned(),
                     recorded_abi: None,
@@ -1556,7 +1603,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             continue;
         }
         if !entry_type.is_dir() {
-            blockers.push(ControllerBlocker {
+            scan.blockers.push(ControllerBlocker {
                 id: fallback_id,
                 state: "unknown".to_owned(),
                 recorded_abi: None,
@@ -1573,7 +1620,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
         match read_controller_inventory_json::<ControllerAdmissionRecord>(&admission_path) {
             Ok(Some(admission)) => {
                 let validation = admission.validate();
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id: admission.id,
                     state: "admitting".to_owned(),
                     recorded_abi: Some(admission.runtime_abi),
@@ -1589,7 +1636,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             }
             Ok(None) => {}
             Err(error) => {
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id: fallback_id.clone(),
                     state: "unknown".to_owned(),
                     recorded_abi: None,
@@ -1603,7 +1650,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             Ok(Some(record)) => record,
             Ok(None) => continue,
             Err(error) => {
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id: fallback_id.clone(),
                     state: "unknown".to_owned(),
                     recorded_abi: None,
@@ -1625,32 +1672,35 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             .get("statusPath")
             .and_then(Value::as_str)
             .map(PathBuf::from);
-        let generation = record.get("generation").and_then(Value::as_u64);
-        let session = record.get("sessionId").and_then(Value::as_str);
-        let expected_status = match (generation, session) {
-            (Some(generation), Some(session)) => Some(
-                controller_dir
-                    .join("status")
-                    .join(generation.to_string())
-                    .join(session)
-                    .join("status"),
-            ),
-            (Some(generation), None)
-                if record
-                    .get("recoveredAfterSpawnCrash")
-                    .and_then(Value::as_bool)
-                    == Some(true) =>
-            {
-                Some(controller_dir.join(format!("controller-{generation}.drive-exit")))
-            }
-            _ => None,
-        };
+        let expected_status = expected_controller_status(&controller_dir, &record);
         let sentinel_problem = match (status_path.as_ref(), expected_status.as_ref()) {
-            (Some(observed), Some(expected)) if observed != expected => Some(format!(
-                "controller status path {} does not match generation authority {}",
-                observed.display(),
-                expected.display()
-            )),
+            (Some(observed), Some(expected)) if observed != expected => {
+                let reason = format!(
+                    "controller status path {} does not match generation authority {}",
+                    observed.display(),
+                    expected.display()
+                );
+                // A mismatched record whose recorded process group is
+                // probe-confirmed dead cannot shelter a live controller: it
+                // downgrades to a repairable entry on the Ok payload, never
+                // the refusal. Live and unverifiable identities keep the
+                // blocker-before-probe ordering.
+                if controller_process_identity(&controller_dir, &record)
+                    .ok()
+                    .is_some_and(|identity| {
+                        process_probe.group_state(identity.pgid) == ControllerGroupState::Absent
+                    })
+                {
+                    scan.repairable.push(ControllerBlocker {
+                        id,
+                        state: "dead".to_owned(),
+                        recorded_abi,
+                        reason,
+                    });
+                    continue;
+                }
+                Some(reason)
+            }
             (Some(observed), Some(_)) => match fs::symlink_metadata(observed) {
                 Ok(metadata) => match reject_symlink_chain(observed) {
                     Err(error) => Some(format!("unsafe controller sentinel: {error}")),
@@ -1674,7 +1724,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             (_, None) => Some("controller record has no valid generation/session".to_owned()),
         };
         if let Some(reason) = sentinel_problem {
-            blockers.push(ControllerBlocker {
+            scan.blockers.push(ControllerBlocker {
                 id,
                 state: "unknown".to_owned(),
                 recorded_abi,
@@ -1685,7 +1735,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
         let identity = match controller_process_identity(&controller_dir, &record) {
             Ok(identity) => identity,
             Err(reason) => {
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id,
                     state: "unknown".to_owned(),
                     recorded_abi,
@@ -1696,7 +1746,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
         };
         match process_probe.group_state(identity.pgid) {
             ControllerGroupState::Absent => continue,
-            ControllerGroupState::Unknown => blockers.push(ControllerBlocker {
+            ControllerGroupState::Unknown => scan.blockers.push(ControllerBlocker {
                 id,
                 state: "unknown".to_owned(),
                 recorded_abi,
@@ -1705,7 +1755,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             ControllerGroupState::Present => {
                 let current = process_probe.leader_lstart(identity.pgid).await;
                 if current.as_deref() != Some(identity.leader_lstart.as_str()) {
-                    blockers.push(ControllerBlocker {
+                    scan.blockers.push(ControllerBlocker {
                         id,
                         state: "unknown".to_owned(),
                         recorded_abi,
@@ -1716,7 +1766,7 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
                 if candidate_abi.is_some_and(|abi| recorded_abi.as_deref() == Some(abi)) {
                     continue;
                 }
-                blockers.push(ControllerBlocker {
+                scan.blockers.push(ControllerBlocker {
                     id,
                     state: "live".to_owned(),
                     recorded_abi,
@@ -1725,8 +1775,10 @@ async fn controller_blockers_with_probe<P: ControllerProcessProbe + ?Sized>(
             }
         }
     }
-    blockers.sort_by(|left, right| left.id.cmp(&right.id));
-    Ok(blockers)
+    scan.blockers.sort_by(|left, right| left.id.cmp(&right.id));
+    scan.repairable
+        .sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(scan)
 }
 
 fn blockers_failure(blockers: &[ControllerBlocker]) -> Failure {
@@ -2253,14 +2305,14 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         }));
     }
 
-    let blockers = controller_blockers_with_probe(
+    let scan = controller_blockers_with_probe(
         &config.runs_root,
         Some(CONTROLLER_RUNTIME_ABI),
         process_probe,
     )
     .await?;
-    if !blockers.is_empty() {
-        return Err(blockers_failure(&blockers));
+    if !scan.blockers.is_empty() {
+        return Err(blockers_failure(&scan.blockers));
     }
 
     let previous_observation = host.inspect(paths).await?;
@@ -2298,19 +2350,19 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         return Err(rollback_transition(host, paths, transition, error).await);
     }
 
-    let blockers = match controller_blockers_with_probe(
+    let scan = match controller_blockers_with_probe(
         &config.runs_root,
         Some(CONTROLLER_RUNTIME_ABI),
         process_probe,
     )
     .await
     {
-        Ok(blockers) => blockers,
+        Ok(scan) => scan,
         Err(error) => return Err(rollback_transition(host, paths, transition, error).await),
     };
-    if !blockers.is_empty() {
+    if !scan.blockers.is_empty() {
         return Err(
-            rollback_transition(host, paths, transition, blockers_failure(&blockers)).await,
+            rollback_transition(host, paths, transition, blockers_failure(&scan.blockers)).await,
         );
     }
 
@@ -2362,6 +2414,7 @@ async fn install_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
         "schema": RUNTIME_OPERATION_SCHEMA,
         "action": if previous.is_some() { "upgraded" } else { "installed" },
         "manifest": candidate,
+        "repairable": scan.repairable,
     }))
 }
 
@@ -2377,10 +2430,9 @@ async fn start<H: ServiceHost>(
             "installed supervisor configuration differs from this process; run `forged service install` to publish a new generation",
         ));
     }
-    let blockers =
-        controller_blockers(&config.runs_root, Some(&manifest.binary.runtime_abi)).await?;
-    if !blockers.is_empty() {
-        return Err(blockers_failure(&blockers));
+    let scan = controller_blockers(&config.runs_root, Some(&manifest.binary.runtime_abi)).await?;
+    if !scan.blockers.is_empty() {
+        return Err(blockers_failure(&scan.blockers));
     }
     let observation = host.inspect(paths).await?;
     if !observation.loaded {
@@ -2402,26 +2454,48 @@ async fn stop<H: ServiceHost>(
     drain: bool,
     timeout_seconds: u64,
 ) -> Result<Value, Failure> {
+    stop_with_probe(
+        host,
+        paths,
+        config,
+        drain,
+        timeout_seconds,
+        &SystemControllerProcessProbe,
+    )
+    .await
+}
+
+async fn stop_with_probe<H: ServiceHost, P: ControllerProcessProbe + ?Sized>(
+    host: &H,
+    paths: &RuntimePaths,
+    config: &ForgedConfig,
+    drain: bool,
+    timeout_seconds: u64,
+    process_probe: &P,
+) -> Result<Value, Failure> {
     let observation = fence_service(host, paths).await?;
-    let blockers = if drain {
+    let scan = if drain {
         let started = Instant::now();
         loop {
-            let blockers = controller_blockers(&config.runs_root, None).await?;
-            if blockers.is_empty() || started.elapsed() >= Duration::from_secs(timeout_seconds) {
-                break blockers;
+            let scan =
+                controller_blockers_with_probe(&config.runs_root, None, process_probe).await?;
+            if scan.blockers.is_empty() || started.elapsed() >= Duration::from_secs(timeout_seconds)
+            {
+                break scan;
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
         }
     } else {
-        Vec::new()
+        ControllerDrainScan::default()
     };
-    if !blockers.is_empty() {
-        return Err(blockers_failure(&blockers));
+    if !scan.blockers.is_empty() {
+        return Err(blockers_failure(&scan.blockers));
     }
     Ok(json!({
         "schema": RUNTIME_OPERATION_SCHEMA,
         "action": if observation.loaded { "stopped" } else { "already-stopped" },
         "drained": drain,
+        "repairable": scan.repairable,
     }))
 }
 
@@ -2468,13 +2542,13 @@ async fn uninstall<H: ServiceHost>(
     if let Err(error) = write_transition(paths, &transition) {
         return Err(rollback_transition(host, paths, transition, error).await);
     }
-    let blockers = match controller_blockers(&config.runs_root, None).await {
-        Ok(blockers) => blockers,
+    let scan = match controller_blockers(&config.runs_root, None).await {
+        Ok(scan) => scan,
         Err(error) => return Err(rollback_transition(host, paths, transition, error).await),
     };
-    if !blockers.is_empty() {
+    if !scan.blockers.is_empty() {
         return Err(
-            rollback_transition(host, paths, transition, blockers_failure(&blockers)).await,
+            rollback_transition(host, paths, transition, blockers_failure(&scan.blockers)).await,
         );
     }
     let remove_result = (|| {
@@ -3496,7 +3570,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn malformed_empty_stale_and_unsafe_controller_sentinels_block() {
+    async fn malformed_empty_and_unsafe_controller_sentinels_block_dead_stale_downgrades() {
         let (_root, config, _paths) = setup();
         let controller = config.runs_root.join("run-1/controller");
         let status = controller.join("status/1/proc-1/status");
@@ -3532,6 +3606,7 @@ mod tests {
             )
             .await
             .expect("blockers")
+            .blockers
             .len(),
             1
         );
@@ -3544,6 +3619,7 @@ mod tests {
             )
             .await
             .expect("blockers")
+            .blockers
             .len(),
             1
         );
@@ -3552,17 +3628,19 @@ mod tests {
         fs::create_dir_all(stale.parent().expect("stale parent")).expect("stale dirs");
         fs::write(&stale, b"0\n").expect("stale sentinel");
         write_record(&stale, "forged.controller-runtime/0");
-        assert_eq!(
-            controller_blockers_with_probe(
-                &config.runs_root,
-                Some(CONTROLLER_RUNTIME_ABI),
-                &process_probe,
-            )
-            .await
-            .expect("blockers")
-            .len(),
-            1
+        let stale_scan = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("stale scan");
+        assert!(
+            stale_scan.blockers.is_empty(),
+            "a stale path over a probe-confirmed-dead group no longer blocks"
         );
+        assert_eq!(stale_scan.repairable.len(), 1);
+        assert_eq!(stale_scan.repairable[0].state, "dead");
 
         fs::remove_file(&status).expect("remove corrupt sentinel");
         fs::create_dir(&status).expect("sentinel directory");
@@ -3575,19 +3653,254 @@ mod tests {
             )
             .await
             .expect("blockers")
+            .blockers
             .len(),
             1
         );
         fs::remove_dir(&status).expect("remove sentinel directory");
         fs::write(&status, b"0\n").expect("valid sentinel");
-        assert!(controller_blockers_with_probe(
+        let clean = controller_blockers_with_probe(
             &config.runs_root,
             Some(CONTROLLER_RUNTIME_ABI),
             &process_probe,
         )
         .await
-        .expect("blockers")
-        .is_empty());
+        .expect("blockers");
+        assert!(clean.blockers.is_empty());
+        assert!(clean.repairable.is_empty());
+    }
+
+    #[test]
+    fn expected_status_derivation_follows_the_recorded_host_kind() {
+        let controller = Path::new("/anvil/runs/beads-95t/controller");
+
+        // A herdr record expects the shell-safe hex key, never the raw pane
+        // id (which carries `:`).
+        let key = forged_host::herdr_status_dir_key("wA:p1D");
+        assert_eq!(key, "pane-77413a703144");
+        let herdr = json!({"generation": 7, "host": "herdr", "sessionId": "wA:p1D"});
+        assert_eq!(
+            expected_controller_status(controller, &herdr),
+            Some(controller.join("status/7").join(&key).join("status"))
+        );
+
+        // Process-hosted and pre-host-field legacy records keep the raw join.
+        let process = json!({"generation": 1, "host": "process", "sessionId": "proc-9-4"});
+        assert_eq!(
+            expected_controller_status(controller, &process),
+            Some(controller.join("status/1/proc-9-4/status"))
+        );
+        let legacy = json!({"generation": 1, "sessionId": "proc-1"});
+        assert_eq!(
+            expected_controller_status(controller, &legacy),
+            Some(controller.join("status/1/proc-1/status"))
+        );
+
+        // Spawn-crash recovery with durable herdr ownership records the
+        // ownership row's sentinel path, which carries the same hex key.
+        let recovered_owned = json!({
+            "generation": 3,
+            "host": "herdr",
+            "sessionId": "wA:p1D",
+            "recoveredAfterSpawnCrash": true,
+        });
+        assert_eq!(
+            expected_controller_status(controller, &recovered_owned),
+            Some(controller.join("status/3").join(&key).join("status"))
+        );
+
+        // The no-ownership recovery branch has no session and settles at the
+        // drive-exit sidecar.
+        let recovered = json!({
+            "generation": 3,
+            "host": "recovered",
+            "sessionId": null,
+            "recoveredAfterSpawnCrash": true,
+        });
+        assert_eq!(
+            expected_controller_status(controller, &recovered),
+            Some(controller.join("controller-3.drive-exit"))
+        );
+
+        // No generation, or no session without the recovery marker, derives
+        // nothing.
+        assert_eq!(
+            expected_controller_status(controller, &json!({"sessionId": "proc-1"})),
+            None
+        );
+        assert_eq!(
+            expected_controller_status(controller, &json!({"generation": 2})),
+            None
+        );
+    }
+
+    #[tokio::test]
+    async fn herdr_record_with_hex_status_dir_satisfies_the_drain_check() {
+        let (_root, config, _paths) = setup();
+        let controller = config.runs_root.join("beads-95t/controller");
+        let status = controller
+            .join("status/7")
+            .join(forged_host::herdr_status_dir_key("wA:p1D"))
+            .join("status");
+        fs::create_dir_all(status.parent().expect("status parent")).expect("status dirs");
+        let pid = 46_001;
+        atomic_json(
+            &controller.join("controller.json"),
+            &json!({
+                "schemaVersion": 2,
+                "id": "beads-95t",
+                "generation": 7,
+                "host": "herdr",
+                "sessionId": "wA:p1D",
+                "driver": {"pid": pid, "lstart": "herdr-start"},
+                "binary": {"runtimeAbi": CONTROLLER_RUNTIME_ABI},
+                "statusPath": status,
+            }),
+        )
+        .expect("herdr record");
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+        let scan = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("herdr drain scan");
+        assert!(
+            scan.blockers.is_empty(),
+            "hex status dir must satisfy the derivation: {:?}",
+            scan.blockers
+        );
+        assert!(scan.repairable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn mismatched_record_downgrades_to_repairable_only_over_a_dead_group() {
+        let (_root, config, _paths) = setup();
+        let controller = config.runs_root.join("run-mismatch/controller");
+        fs::create_dir_all(&controller).expect("controller dir");
+        let pid = 47_001;
+        let mut record = json!({
+            "schemaVersion": 2,
+            "id": "run-mismatch",
+            "generation": 2,
+            "host": "process",
+            "sessionId": "proc-2-1",
+            "driver": {"pid": pid, "lstart": "mismatch-start"},
+            "binary": {"runtimeAbi": CONTROLLER_RUNTIME_ABI},
+            "statusPath": controller.join("status/1/proc-1-0/status"),
+        });
+        atomic_json(&controller.join("controller.json"), &record).expect("mismatched record");
+
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+        let dead = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("dead scan");
+        assert!(
+            dead.blockers.is_empty(),
+            "confirmed-dead mismatch must not block: {:?}",
+            dead.blockers
+        );
+        assert_eq!(dead.repairable.len(), 1);
+        assert_eq!(dead.repairable[0].state, "dead");
+        assert!(dead.repairable[0]
+            .reason
+            .contains("does not match generation authority"));
+
+        for state in [ControllerGroupState::Present, ControllerGroupState::Unknown] {
+            process_probe.set_group(pid, state);
+            let scan = controller_blockers_with_probe(
+                &config.runs_root,
+                Some(CONTROLLER_RUNTIME_ABI),
+                &process_probe,
+            )
+            .await
+            .expect("unconfirmed scan");
+            assert_eq!(
+                scan.blockers.len(),
+                1,
+                "unconfirmed death must keep blocking"
+            );
+            assert!(scan.repairable.is_empty());
+            assert!(scan.blockers[0]
+                .reason
+                .contains("does not match generation authority"));
+        }
+
+        // Without a verifiable process identity death cannot be confirmed:
+        // the mismatch still blocks.
+        record
+            .as_object_mut()
+            .expect("record object")
+            .remove("driver");
+        atomic_json(&controller.join("controller.json"), &record).expect("identityless record");
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+        let identityless = controller_blockers_with_probe(
+            &config.runs_root,
+            Some(CONTROLLER_RUNTIME_ABI),
+            &process_probe,
+        )
+        .await
+        .expect("identityless scan");
+        assert_eq!(identityless.blockers.len(), 1);
+        assert!(identityless.repairable.is_empty());
+    }
+
+    #[tokio::test]
+    async fn dead_mismatched_record_rides_the_ok_payload_of_install_and_stop() {
+        let (_root, config, paths) = setup();
+        paths.ensure_layout().expect("layout");
+        let host = FakeHost::default();
+        let controller = config.runs_root.join("run-repair/controller");
+        fs::create_dir_all(&controller).expect("controller dir");
+        let pid = 48_001;
+        atomic_json(
+            &controller.join("controller.json"),
+            &json!({
+                "schemaVersion": 2,
+                "id": "run-repair",
+                "generation": 2,
+                "host": "process",
+                "sessionId": "proc-2-1",
+                "driver": {"pid": pid, "lstart": "repair-start"},
+                "binary": {"runtimeAbi": CONTROLLER_RUNTIME_ABI},
+                "statusPath": controller.join("status/1/proc-1-0/status"),
+            }),
+        )
+        .expect("repairable record");
+        let mut process_probe = FakeControllerProcessProbe::default();
+        process_probe.set_group(pid, ControllerGroupState::Absent);
+
+        let installed = install_with_probe(
+            &host,
+            &paths,
+            &config,
+            &LifecycleFaults::default(),
+            &process_probe,
+        )
+        .await
+        .expect("dead mismatched record permits install");
+        assert_eq!(installed["action"], json!("installed"));
+        assert_eq!(installed["repairable"][0]["id"], json!("run-repair"));
+        assert_eq!(installed["repairable"][0]["state"], json!("dead"));
+
+        let stopped = stop_with_probe(&host, &paths, &config, true, 0, &process_probe)
+            .await
+            .expect("dead mismatched record permits drain stop");
+        assert_eq!(stopped["drained"], json!(true));
+        assert_eq!(stopped["repairable"][0]["id"], json!("run-repair"));
+
+        process_probe.set_group(pid, ControllerGroupState::Present);
+        let refused = stop_with_probe(&host, &paths, &config, true, 0, &process_probe)
+            .await
+            .expect_err("live mismatched record still blocks the drain");
+        assert!(refused.to_string().contains("drain required"));
     }
 
     #[test]
@@ -3646,7 +3959,8 @@ mod tests {
             &FakeControllerProcessProbe::default(),
         )
         .await
-        .expect("controller blockers");
+        .expect("controller blockers")
+        .blockers;
         assert_eq!(blockers.len(), 3);
         assert!(blockers
             .iter()
@@ -3696,6 +4010,7 @@ mod tests {
             )
             .await
             .expect("dead legacy group")
+            .blockers
             .is_empty(),
             "ESRCH-equivalent group absence is sufficient death proof"
         );
@@ -3708,7 +4023,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("live legacy group");
+        .expect("live legacy group")
+        .blockers;
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].state, "live");
 
@@ -3719,7 +4035,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("unknown legacy group");
+        .expect("unknown legacy group")
+        .blockers;
         assert_eq!(unknown.len(), 1);
         assert_eq!(unknown[0].state, "unknown");
 
@@ -3733,6 +4050,7 @@ mod tests {
         )
         .await
         .expect("compatible live legacy group")
+        .blockers
         .is_empty());
     }
 
@@ -3763,7 +4081,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("orphan group blockers");
+        .expect("orphan group blockers")
+        .blockers;
         assert_eq!(orphan.len(), 1);
         assert_eq!(orphan[0].state, "unknown");
         assert!(orphan[0].reason.contains("leader is missing"));
@@ -3779,7 +4098,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("pidless blockers");
+        .expect("pidless blockers")
+        .blockers;
         assert_eq!(pidless.len(), 1);
         assert!(pidless[0].reason.contains("legacy controller PID"));
     }
@@ -3820,7 +4140,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("malformed sidecar blockers");
+        .expect("malformed sidecar blockers")
+        .blockers;
         assert_eq!(malformed.len(), 1);
         assert!(malformed[0].reason.contains("controller.pid"));
 
@@ -3833,7 +4154,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("unsafe sidecar blockers");
+        .expect("unsafe sidecar blockers")
+        .blockers;
         assert_eq!(unsafe_sidecar.len(), 1);
         assert!(unsafe_sidecar[0].reason.contains("symlink"));
 
@@ -3849,6 +4171,7 @@ mod tests {
             )
             .await
             .expect("embedded identity")
+            .blockers
             .is_empty(),
             "embedded identity must take precedence without reading unsafe legacy paths"
         );
@@ -3864,7 +4187,8 @@ mod tests {
             &process_probe,
         )
         .await
-        .expect("malformed embedded blockers");
+        .expect("malformed embedded blockers")
+        .blockers;
         assert_eq!(malformed_embedded.len(), 1);
         assert!(malformed_embedded[0].reason.contains("embedded"));
     }
@@ -4000,7 +4324,8 @@ mod tests {
         let _lifecycle = RuntimeLock::acquire(&paths).expect("lifecycle lock after spawn exits");
         let blockers = controller_blockers(&config.runs_root, Some(CONTROLLER_RUNTIME_ABI))
             .await
-            .expect("admission blocker");
+            .expect("admission blocker")
+            .blockers;
         assert_eq!(blockers.len(), 1);
         assert_eq!(blockers[0].state, "admitting");
         drop(_lifecycle);

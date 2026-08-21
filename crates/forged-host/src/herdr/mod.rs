@@ -6,9 +6,10 @@ mod host;
 pub(crate) mod wire;
 
 pub use host::{
-    HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl, HerdrCreatedTab,
-    HerdrHost, HerdrLayoutInspection, HerdrLayoutPane, HerdrLayoutSnapshot, HerdrLayoutTarget,
-    HerdrMetadataProjection, HerdrProjectionOutcome, HerdrTabCreateError, PaneSnapshot,
+    herdr_status_dir_key, HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl,
+    HerdrCreatedTab, HerdrHost, HerdrLayoutInspection, HerdrLayoutPane, HerdrLayoutSnapshot,
+    HerdrLayoutTarget, HerdrMetadataProjection, HerdrProjectionOutcome, HerdrTabCreateError,
+    PaneSnapshot,
 };
 
 use std::collections::HashSet;

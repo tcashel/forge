@@ -14,9 +14,10 @@ mod process;
 mod sentinel;
 
 pub use herdr::{
-    HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl, HerdrCreatedTab,
-    HerdrHost, HerdrLayoutInspection, HerdrLayoutPane, HerdrLayoutSnapshot, HerdrLayoutTarget,
-    HerdrMetadataProjection, HerdrProjectionOutcome, HerdrTabCreateError, PaneSnapshot,
+    herdr_status_dir_key, HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl,
+    HerdrCreatedTab, HerdrHost, HerdrLayoutInspection, HerdrLayoutPane, HerdrLayoutSnapshot,
+    HerdrLayoutTarget, HerdrMetadataProjection, HerdrProjectionOutcome, HerdrTabCreateError,
+    PaneSnapshot,
 };
 pub use process::ProcessHost;
 
