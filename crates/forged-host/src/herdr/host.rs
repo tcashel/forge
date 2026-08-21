@@ -251,7 +251,11 @@ struct PreparedSeat {
 /// Map Herdr's opaque pane id to a collision-free shell-safe directory name.
 /// Real ids contain `:`, and the sentinel path deliberately remains unquoted,
 /// so the transport id itself must never become a path component.
-fn status_dir_key(pane_id: &str) -> String {
+///
+/// Exported at the crate root because the encoding is part of the durable
+/// record contract: a caller that re-derives a recorded herdr sentinel path
+/// from its pane id must apply this exact mapping, never the raw id.
+pub fn herdr_status_dir_key(pane_id: &str) -> String {
     let mut key = String::with_capacity(5 + pane_id.len() * 2);
     key.push_str("pane-");
     for byte in pane_id.bytes() {
@@ -843,7 +847,7 @@ impl HerdrHost {
         // transport identifiers (and contain shell-unsafe `:`), so encode
         // their bytes rather than weakening sentinel-path validation. Herdr
         // never reuses pane ids, so an existing dir is always an error.
-        let session_dir = self.base_status_dir.join(status_dir_key(pane_id));
+        let session_dir = self.base_status_dir.join(herdr_status_dir_key(pane_id));
         let status_path = session_dir.join("status");
         sentinel::validate_status_path(&status_path)?;
         std::fs::create_dir_all(&self.base_status_dir)
