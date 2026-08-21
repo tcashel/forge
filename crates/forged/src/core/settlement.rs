@@ -766,7 +766,7 @@ pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) ->
         EffectClass::HumanAmbiguous,
         req,
         None,
-        { move |_operation| async move { adjudicate(ctx, &run_id, adjudication).await } },
+        move |_operation| async move { adjudicate(ctx, &run_id, adjudication).await },
     )
     .await
 }
