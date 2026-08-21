@@ -1244,11 +1244,15 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 if failure.code == forged_types::ErrorCode::OperationInProgress
                     && failure.recoverable =>
             {
-                match capacity_deferred(ctx, &action).await {
-                    Ok(true) => {}
-                    Ok(false) => return err_response(&echo, &failure),
+                let packet_id = match classify_deferral(ctx, &action).await {
+                    Ok(DeferralClass::Parked { packet_id }) => packet_id,
+                    // A concurrent admission can land between the refusal
+                    // and this read; the packet is ours to drive now, so
+                    // re-project immediately instead of exiting.
+                    Ok(DeferralClass::AdmittedMeanwhile) => continue,
+                    Ok(DeferralClass::NotCapacity) => return err_response(&echo, &failure),
                     Err(f) => return err_response(&echo, &f),
-                }
+                };
                 deferral_wakes = deferral_wakes.saturating_add(1);
                 tracing::info!(
                     wakes = deferral_wakes,
@@ -1257,7 +1261,7 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 );
                 if deferral_wakes == PARKED_DEFERRAL_SURFACE_WAKES {
                     if let Err(failure) =
-                        record_parked_deferral(ctx, &run_id, &action, &failure.message).await
+                        record_parked_deferral(ctx, &run_id, &packet_id, &failure.message).await
                     {
                         return err_response(&echo, &failure);
                     }
@@ -1272,31 +1276,56 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     }
 }
 
-/// Whether the awaited packet's LATEST durable admission decision is a
-/// capacity-family deferral — the only refusal that clears when someone
-/// else's seat finishes. The honor path raises the same recoverable
-/// `OperationInProgress` for every non-admitted reason and for fenced-step
-/// contention, so the failure alone cannot authorize a park: the durable
-/// decision is the evidence. Anything that is not awaiting a packet has no
-/// decision to join and never parks.
-async fn capacity_deferred(ctx: &Ctx, action: &NextAction) -> Result<bool, Failure> {
+/// How to treat a recoverable admission refusal for the awaited packet.
+enum DeferralClass {
+    /// The LATEST durable decision defers on a wait-clearing reason
+    /// (capacity or rate limit): park and retry on the wake.
+    Parked { packet_id: String },
+    /// The latest decision is an admit — a concurrent admission landed
+    /// between the refusal and this read. Re-project, never exit.
+    AdmittedMeanwhile,
+    /// Anything else (no decision, non-capacity refusal, fenced-step
+    /// contention): the failure stands.
+    NotCapacity,
+}
+
+/// Classify by the awaited packet's LATEST durable admission decision —
+/// the only evidence that a refusal clears by waiting. The honor path
+/// raises the same recoverable `OperationInProgress` for every
+/// non-admitted reason and for fenced-step contention, so the failure
+/// alone cannot authorize a park. Rate-limit deferrals are pure waits too
+/// (their visibility stays ProviderDegraded); anything that is not
+/// awaiting a packet has no decision to join and never parks.
+async fn classify_deferral(ctx: &Ctx, action: &NextAction) -> Result<DeferralClass, Failure> {
     let NextAction::AwaitPacket { packet_id, .. } = action else {
-        return Ok(false);
+        return Ok(DeferralClass::NotCapacity);
     };
     let packet_id = packet_id.clone();
+    let query_id = packet_id.clone();
     let decisions = on_ledger(&ctx.ledger, move |ledger| {
-        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Packet), Some(&packet_id))
+        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Packet), Some(&query_id))
     })
     .await?;
-    Ok(decisions.iter().any(|decision| {
+    if decisions
+        .iter()
+        .any(|decision| decision.outcome == AdmissionOutcome::Admitted)
+    {
+        return Ok(DeferralClass::AdmittedMeanwhile);
+    }
+    if decisions.iter().any(|decision| {
         decision.outcome == AdmissionOutcome::Deferred
             && matches!(
                 decision.reason,
                 AdmissionReason::TotalCapacity
                     | AdmissionReason::ProviderCapacity
                     | AdmissionReason::RepositoryWriteCapacity
+                    | AdmissionReason::RateLimitCeiling
+                    | AdmissionReason::StaleRateLimit
             )
-    }))
+    }) {
+        return Ok(DeferralClass::Parked { packet_id });
+    }
+    Ok(DeferralClass::NotCapacity)
 }
 
 /// Append the parked run's deduplicated deferral marker.
@@ -1307,13 +1336,9 @@ async fn capacity_deferred(ctx: &Ctx, action: &NextAction) -> Result<bool, Failu
 async fn record_parked_deferral(
     ctx: &Ctx,
     run_id: &str,
-    action: &NextAction,
+    packet_id: &str,
     detail: &str,
 ) -> Result<(), Failure> {
-    let packet_id = match action {
-        NextAction::AwaitPacket { packet_id, .. } => Some(packet_id.clone()),
-        _ => None,
-    };
     let payload = json!({
         "schema": "forged.admission.attention/1",
         "condition": "admission-deferred",

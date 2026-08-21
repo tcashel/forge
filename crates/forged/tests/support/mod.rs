@@ -458,7 +458,10 @@ case "$mode" in
   hang) sleep 3600; finish ;;
   slow) sleep 4 ;;
   wait-release)
-    until [ -f "$FORGED_SHIM_DIR/release.$scenario_stage" ]; do sleep 0.1; done ;;
+    for _ in $(seq 1 600); do
+      [ -f "$FORGED_SHIM_DIR/release.$scenario_stage" ] && break
+      sleep 0.1
+    done ;;
   no-block) emit_result "done without any result block"; finish ;;
   malformed) emit_result "done
 ${fence}forged-result
@@ -561,7 +564,10 @@ case "$mode" in
   hang) sleep 3600; finish ;;
   slow) sleep 4 ;;
   wait-release)
-    until [ -f "$FORGED_SHIM_DIR/release.$scenario_stage" ]; do sleep 0.1; done ;;
+    for _ in $(seq 1 600); do
+      [ -f "$FORGED_SHIM_DIR/release.$scenario_stage" ] && break
+      sleep 0.1
+    done ;;
   rate-limit)
     printf '{"type":"turn.failed","error":{"message":"rate limit"}}\n'
     finish ;;
