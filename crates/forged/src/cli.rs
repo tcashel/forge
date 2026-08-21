@@ -852,7 +852,7 @@ pub enum WorkCmd {
     List(WorkListArgs),
     /// Project bounded cross-run lifecycle, rework, and spend history.
     History(WorkHistoryArgs),
-    /// Project one exact run or epic for the Work Detail App.
+    /// Project one run or epic for the Work Detail App.
     Detail(WorkDetailArgs),
     /// Project the bounded plan, queue, execution, and history graph.
     Map(WorkMapArgs),
@@ -1075,15 +1075,21 @@ pub struct WorkHistoryArgs {
     pub idempotency_key: Option<String>,
 }
 
-/// `work detail` flags.
+/// `work detail` flags. Exactly one addressing form: the exact
+/// `--subject-kind`/`--subject-id` pair, or a bare `--id`. The core owns
+/// that refusal — a clap conflict rule here would emit a usage error and
+/// diverge from the MCP envelope.
 #[derive(Debug, Args)]
 pub struct WorkDetailArgs {
-    /// Exact durable subject kind.
+    /// Exact durable subject kind; travels only with --subject-id.
     #[arg(long, value_enum)]
-    pub subject_kind: WorkDetailKind,
-    /// Canonical run or epic id.
+    pub subject_kind: Option<WorkDetailKind>,
+    /// Canonical run or epic id; travels only with --subject-kind.
     #[arg(long)]
-    pub subject_id: String,
+    pub subject_id: Option<String>,
+    /// Bare run or epic id, resolved against the durable inventory.
+    #[arg(long)]
+    pub id: Option<String>,
     /// Return event rows after this event id.
     #[arg(long)]
     pub after: Option<i64>,
@@ -1843,16 +1849,24 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             }
             WorkCmd::Detail(a) => {
                 let mut params = Map::new();
-                params.insert("subjectKind".to_owned(), json!(a.subject_kind.as_str()));
-                params.insert("subjectId".to_owned(), json!(a.subject_id));
+                if let Some(kind) = a.subject_kind {
+                    params.insert("subjectKind".to_owned(), json!(kind.as_str()));
+                }
+                for (name, value) in [("subjectId", a.subject_id), ("id", a.id)] {
+                    if let Some(value) = value {
+                        params.insert(name.to_owned(), json!(value));
+                    }
+                }
                 if let Some(after) = a.after {
                     params.insert("after".to_owned(), json!(after));
                 }
                 if let Some(limit) = a.limit {
                     params.insert("limit".to_owned(), json!(limit));
                 }
+                // The subject id or the bare id, whichever form is present.
                 let run_id = params
                     .get("subjectId")
+                    .or_else(|| params.get("id"))
                     .and_then(Value::as_str)
                     .map(str::to_owned);
                 (

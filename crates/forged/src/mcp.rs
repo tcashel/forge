@@ -727,7 +727,7 @@ pub enum WorkDetailKind {
     Epic,
 }
 
-/// Typed envelope for the exact Work Detail App.
+/// Typed envelope for the Work Detail App.
 #[derive(Debug, Deserialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars")]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
@@ -738,20 +738,36 @@ pub struct WorkDetailArgs {
     /// The idempotency key; defaulted to `op:work_detail:read`.
     #[serde(default)]
     pub idempotency_key: Option<String>,
-    /// Exact detail target and event page.
+    /// Addressed detail target and event page.
     pub params: WorkDetailParams,
 }
 
-/// Required exact target for `work_detail`.
+/// Addressed target for `work_detail`: EXACTLY one form — the exact
+/// `subjectKind`/`subjectId` pair, or a bare `id` resolved against the
+/// durable inventory. Sending both forms, or half the pair, is refused.
 #[derive(Debug, Deserialize, Serialize, JsonSchema)]
 #[schemars(crate = "rmcp::schemars", inline)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct WorkDetailParams {
-    /// Durable subject kind.
-    pub subject_kind: WorkDetailKind,
-    /// Canonical run or epic id.
-    #[serde(deserialize_with = "named_string")]
-    pub subject_id: String,
+    /// Exact durable subject kind; travels only with `subjectId`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub subject_kind: Option<WorkDetailKind>,
+    /// Canonical run or epic id; travels only with `subjectKind`.
+    #[serde(
+        default,
+        deserialize_with = "named_string_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub subject_id: Option<String>,
+    /// Bare run or epic id, resolved kind-blind: an exact id beats any
+    /// prefix, a unique prefix resolves, anything else answers with
+    /// `resolution` candidates instead of the detail body.
+    #[serde(
+        default,
+        deserialize_with = "named_string_opt",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub id: Option<String>,
     /// Return event rows after this event id (default 0).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub after: Option<i64>,
@@ -772,9 +788,25 @@ where
     Ok(value)
 }
 
+/// [`named_string`] over an OPTIONAL field: serde only calls this when the
+/// key is present, so an absent key still defaults to `None` while a
+/// present-but-unnamed value stays a deserialize-time refusal.
+fn named_string_opt<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+    D: rmcp::serde::Deserializer<'de>,
+{
+    named_string(deserializer).map(Some)
+}
+
 impl WorkDetailArgs {
     fn into_envelope(self) -> EnvelopeArgs {
-        let run_id = Some(self.params.subject_id.clone());
+        // The subject id or the bare id, whichever addressing form is
+        // present; the core refuses a call carrying neither or both.
+        let run_id = self
+            .params
+            .subject_id
+            .clone()
+            .or_else(|| self.params.id.clone());
         let params = match serde_json::to_value(&self.params) {
             Ok(Value::Object(map)) => map,
             _ => serde_json::Map::new(),
@@ -1149,10 +1181,10 @@ impl ForgedServer {
             .await
     }
 
-    /// Exact durable subject projection for the Work Detail App.
+    /// Durable subject projection for the Work Detail App.
     #[tool(
         name = "work_detail",
-        description = "Project one exact durable run or epic. params.subjectKind and params.subjectId are required; params.after and params.limit page its event tail.",
+        description = "Project one durable run or epic. Address it with EXACTLY one form: the exact params.subjectKind + params.subjectId pair, or a bare params.id resolved against the durable inventory (an exact id beats any prefix, a unique prefix resolves, anything else answers with resolution candidates). params.after and params.limit page its event tail.",
         meta = work_detail_tool_meta()
     )]
     pub async fn work_detail(&self, args: Parameters<WorkDetailArgs>) -> CallToolResult {

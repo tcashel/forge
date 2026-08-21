@@ -90,6 +90,19 @@ fn an_unknown_id_answers_with_an_empty_candidate_list() {
     );
     assert_eq!(resolution(&response)["reason"], json!("unknown"));
     assert_eq!(candidates(&response), Vec::<Value>::new());
+    // The complete envelope, pinned whole: resolution is shared with
+    // work_detail now, and overview's wrapper must not drift by a key.
+    assert_eq!(
+        response["result"],
+        json!({
+            "schema": "forged.overview/1",
+            "resolution": {
+                "query": "nothing-by-that-name",
+                "reason": "unknown",
+                "candidates": [],
+            },
+        })
+    );
     // No single subject, so none of the projection keys.
     for key in ["status", "workers", "kind", "id", "usage", "events"] {
         assert_eq!(
