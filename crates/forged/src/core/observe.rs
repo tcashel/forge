@@ -15,7 +15,7 @@ use forged_types::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::core::{on_ledger, param_opt_str, param_str, read_only, Ctx, Failure};
+use crate::core::{on_ledger, param_opt_str, read_only, Ctx, Failure};
 
 fn request(run_id: &str, params: Value) -> OperationRequest {
     OperationRequest {
@@ -510,9 +510,12 @@ enum Resolved {
     Slice(String),
     /// The id names one epic.
     Epic(String),
-    /// The id named no single subject; the caller gets a chooser instead of
-    /// a refusal, already shaped as a `forged.overview/1` payload.
-    Candidates(Value),
+    /// The id named no single subject; the raw
+    /// `{query, reason, candidates}` resolution object, which each caller
+    /// wraps under its OWN schema key — a chooser that invented another
+    /// tool's schema would be a payload the caller's consumer refuses to
+    /// draw.
+    Unresolved(Value),
 }
 
 /// Resolve a bare `id` to a kind through ONE inventory scan.
@@ -550,13 +553,10 @@ async fn resolve(ctx: &Ctx, id: &str) -> Result<Resolved, Failure> {
     if candidates.len() == 1 {
         return Ok(resolved(&candidates[0]));
     }
-    Ok(Resolved::Candidates(json!({
-        "schema": "forged.overview/1",
-        "resolution": {
-            "query": id,
-            "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
-            "candidates": candidates,
-        },
+    Ok(Resolved::Unresolved(json!({
+        "query": id,
+        "reason": if candidates.is_empty() { "unknown" } else { "ambiguous" },
+        "candidates": candidates,
     })))
 }
 
@@ -638,7 +638,10 @@ pub async fn overview(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
             (None, None, Some(id)) => match resolve(ctx, id).await? {
                 Resolved::Slice(run) => run_overview(ctx, &run, after, limit).await,
                 Resolved::Epic(epic) => epic_overview(ctx, &epic, after, limit).await,
-                Resolved::Candidates(payload) => Ok(payload),
+                Resolved::Unresolved(resolution) => Ok(json!({
+                    "schema": "forged.overview/1",
+                    "resolution": resolution,
+                })),
             },
             _ => unreachable!(),
         }
@@ -2486,23 +2489,68 @@ async fn project_work_detail(
     }))
 }
 
-/// Exact work projection used by the Work Detail App.
+/// Work projection used by the Work Detail App.
 ///
-/// Unlike [`overview`], this surface never resolves a bare id or widens to a
-/// portfolio. The caller must supply the canonical kind and id it learned
-/// from Operations, so a stale or malformed drawer target fails closed.
+/// Addressed by EXACTLY one form: the canonical `subjectKind`/`subjectId`
+/// pair, or a bare `id` resolved with [`overview`]'s semantics. The pair is
+/// an assertion and stays exact — a stale or malformed drawer target fails
+/// closed and never prefix-resolves. The bare id is a question: an id that
+/// resolves to no single subject answers with the same `resolution` object
+/// overview emits, under this tool's own schema key. Sending both forms is
+/// refused rather than silently preferring one, which would hide a caller's
+/// bug; so is half a pair. Enforcement lives here so the CLI and MCP refuse
+/// with identical envelopes.
 pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_detail", req, || async {
-        let kind = match param_str(&req.params, "subjectKind")? {
-            "run" => forged_types::WorkIdentitySubjectKind::Run,
-            "epic" => forged_types::WorkIdentitySubjectKind::Epic,
-            other => {
+        // A present addressing key must name a subject: `param_opt_str`
+        // reads `""`, `null` and a non-string alike as absent, and treating
+        // those as omitted would answer a caller's failed interpolation with
+        // a refusal about the wrong mistake — or, worse, resolve the other
+        // form it did not mean.
+        for key in ["subjectKind", "subjectId", "id"] {
+            if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
                 return Err(Failure::invalid(format!(
-                    "work detail kind must be \"run\" or \"epic\", got {other:?}"
-                )))
+                    "work detail param {key:?} must name a subject"
+                )));
             }
+        }
+        let bare = param_opt_str(&req.params, "id").map(str::to_owned);
+        let subject_kind = param_opt_str(&req.params, "subjectKind");
+        let subject_id = param_opt_str(&req.params, "subjectId").map(str::to_owned);
+        if bare.is_some() && (subject_kind.is_some() || subject_id.is_some()) {
+            return Err(Failure::invalid(
+                "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" \
+                 pair, never both",
+            ));
+        }
+        if subject_kind.is_some() != subject_id.is_some() {
+            return Err(Failure::invalid(
+                "work detail params \"subjectKind\" and \"subjectId\" travel as a pair; \
+                 send both or address by bare \"id\"",
+            ));
+        }
+        let exact = match (subject_kind, subject_id) {
+            (Some(kind), Some(id)) => {
+                let kind = match kind {
+                    "run" => forged_types::WorkIdentitySubjectKind::Run,
+                    "epic" => forged_types::WorkIdentitySubjectKind::Epic,
+                    other => {
+                        return Err(Failure::invalid(format!(
+                            "work detail kind must be \"run\" or \"epic\", got {other:?}"
+                        )))
+                    }
+                };
+                Some((kind, id))
+            }
+            (None, None) if bare.is_none() => {
+                return Err(Failure::invalid(
+                    "work detail requires param \"id\" or the exact \
+                     \"subjectKind\"/\"subjectId\" pair",
+                ))
+            }
+            (None, None) => None,
+            _ => unreachable!("a half pair is refused above"),
         };
-        let id = param_str(&req.params, "subjectId")?.to_owned();
         let after = req.params.get("after").and_then(Value::as_i64).unwrap_or(0);
         if after < 0 {
             return Err(Failure::invalid("work detail after must be non-negative"));
@@ -2519,6 +2567,23 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
         }
         let event_limit = u32::try_from(limit)
             .map_err(|_| Failure::invalid("work detail limit does not fit u32"))?;
+        let (kind, id) = match (exact, bare) {
+            (Some(pair), None) => pair,
+            // A resolved id projects through the SAME snapshot the exact
+            // pair reads, so the two answers cannot drift; the resolved kind
+            // is the inventory's, never a guess.
+            (None, Some(bare)) => match resolve(ctx, &bare).await? {
+                Resolved::Slice(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
+                Resolved::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
+                Resolved::Unresolved(resolution) => {
+                    return Ok(json!({
+                        "schema": "forged.work-detail/1",
+                        "resolution": resolution,
+                    }))
+                }
+            },
+            _ => unreachable!("exactly one addressing form survives the checks above"),
+        };
         let snapshot = on_ledger(&ctx.ledger, move |ledger| {
             ledger.work_observation_snapshot(kind, &id, after, event_limit)
         })

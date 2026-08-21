@@ -276,7 +276,7 @@ fn all_forty_four_tools_match_their_cli_counterparts() {
         .pointer("/inputSchema/properties/params/properties")
         .cloned()
         .unwrap_or(Value::Null);
-    for param in ["subjectKind", "subjectId", "after", "limit"] {
+    for param in ["subjectKind", "subjectId", "id", "after", "limit"] {
         assert!(
             detail_properties.get(param).is_some(),
             "work_detail advertises params.{param}: {detail_properties}"
@@ -677,6 +677,33 @@ fn all_forty_four_tools_match_their_cli_counterparts() {
     );
     assert!(structured["structuredContent"].is_object());
     assert_eq!(structured["structuredContent"]["ok"], json!(false));
+
+    // The bare-id form: a resolved id and an unresolvable one both answer
+    // identically on both surfaces.
+    let cli = env.forged(&["work", "detail", "--id", "par-repository"]).1;
+    let tool = mcp.call_tool("work_detail", envelope(json!({"id": "par-repository"})));
+    assert_eq!(
+        tool["result"]["schema"],
+        json!("forged.work-detail/1"),
+        "{tool}"
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "work_detail bare-id parity"
+    );
+    let cli = env.forged(&["work", "detail", "--id", "absent"]).1;
+    let tool = mcp.call_tool("work_detail", envelope(json!({"id": "absent"})));
+    assert_eq!(
+        tool["ok"],
+        json!(true),
+        "an unknown id is not an error: {tool}"
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "work_detail resolution parity"
+    );
 
     // run_revise_roster: a nonexistent run refuses identically.
     let cli = env
@@ -1314,6 +1341,8 @@ fn split_app_tools_refuse_malformed_typed_targets_before_dispatch() {
         json!({"schemaVersion": 1, "params": {"subjectKind": "plan", "subjectId": "x"}}),
         json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": " "}}),
         json!({"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "x", "after": "0"}}),
+        json!({"schemaVersion": 1, "params": {"id": " "}}),
+        json!({"schemaVersion": 1, "params": {"id": null}}),
     ] {
         let refusal = mcp.call_tool_error_result("work_detail", arguments.clone());
         let text = refusal
