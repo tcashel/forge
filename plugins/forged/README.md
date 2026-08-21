@@ -57,11 +57,16 @@ codex plugin add forged@forge
 
 The Claude manifest registers the `forged mcp` server over stdio, resolving
 the operator-installed `forged` binary from PATH (the host silently skips a
-missing binary; the plugin never installs software). Migration: operators with
-a prior user-scope entry run `claude mcp remove forged` once; until then two
-registrations spawn the same binary and tool-name precedence is host-defined.
-The Codex manifest carries no server registration; skills there use the CLI
-read path.
+missing binary; the plugin never installs software). Migration: operators
+with a prior user-scope entry first confirm in a fresh session that the
+plugin-mounted forged tools appear — a bare name the host cannot resolve is
+skipped silently, leaving no forged tools and no diagnostic — and only then
+run `claude mcp remove forged` once. Until then two registrations spawn the
+same binary and tool-name precedence is host-defined. If the plugin mount
+does not appear, keep or re-add the user-scope entry
+(`claude mcp add forged -- <absolute path to forged> mcp`) and run
+`/forged:setup` to diagnose PATH. The Codex manifest carries no server
+registration; skills there use the CLI read path.
 
 After installation, run `/forged:setup`. Then talk normally: ask the lead agent
 to explore an idea, plan or revise work, critique or adjudicate a Bead, ask
