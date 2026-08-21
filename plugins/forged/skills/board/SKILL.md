@@ -41,6 +41,10 @@ to hide. Degrade explicitly to the CLI, which remains the primary read path:
 forged operations overview
 ```
 
+Preserve any scope the operator named: a repository carries through as
+`--repo <canonical path>` and a group as `--group <code>` — the fallback
+answers the same question, never a wider one.
+
 Report the same one-line summary from its JSON output, and say that the
 session has no forged server tools. If the CLI is also missing, state that
 and point the operator at `/forged:setup` — never fail silently, and never

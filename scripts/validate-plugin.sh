@@ -515,6 +515,7 @@ const expectedAllowedDifferences = [
   'manifest-filename',
   'codex-manifest-discovery-metadata',
   'host-marketplace-envelope-and-source-metadata',
+  'claude-only-mcp-server-registration',
 ];
 const expectedForbiddenDifferences = [
   'plugin-identity',
@@ -832,6 +833,18 @@ skill_files=("$plugin"/skills/*/SKILL.md)
 [[ ${#skill_files[@]} -eq 8 ]] && pass "exactly eight skills" || fail "exactly eight skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
+
+check_board_skill() {
+  local skill="$plugin/skills/board/SKILL.md"
+  grep -q '^name: board$' "$skill" || return 1
+  grep -qE '^description: .+' "$skill" || return 1
+  grep -q 'operations_overview' "$skill" || return 1
+  grep -q 'forged operations overview' "$skill" || return 1
+  grep -q -- '--repo' "$skill" || return 1
+  grep -q '/forged:setup' "$skill" || return 1
+  grep -q 'never fail silently' "$skill" || return 1
+}
+check "board skill contract" check_board_skill
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
 grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"
