@@ -78,7 +78,8 @@
   "allowedHostDifferences": [
     "manifest-filename",
     "codex-manifest-discovery-metadata",
-    "host-marketplace-envelope-and-source-metadata"
+    "host-marketplace-envelope-and-source-metadata",
+    "claude-only-mcp-server-registration"
   ],
   "forbiddenHostDifferences": [
     "plugin-identity",

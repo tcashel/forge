@@ -66,6 +66,17 @@ If initial Forged configuration is absent, inspect `forged init --help` and tell
 the operator exactly what it will create under `ANVIL_HOME` before requesting
 consent. Never infer permission from invoking this skill.
 
+Migration: the Claude plugin manifest now registers the `forged mcp` server
+itself. Operators with an existing user-scope entry migrate in this order:
+first open a fresh session and confirm the plugin-mounted forged tools are
+listed — the host skips the plugin registration silently, with no error, when
+the bare `forged` command does not resolve on the host's own PATH — and only
+after that proof run `claude mcp remove forged` once. Until then the two
+registrations spawn the same binary and tool-name precedence is host-defined.
+If the plugin mount never appears, keep the user-scope entry (restore it with
+`claude mcp add forged -- <absolute path to forged> mcp`) and diagnose PATH
+with the probes above.
+
 Validate configured provider adapters and optional durable supervision with the
 commands reported by `forged doctor`. Distinguish source/config evidence from a
 live runtime proof. Do not install a provider, alter credentials, or launch a

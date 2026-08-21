@@ -377,6 +377,7 @@ function inventorySkills(skillsRoot) {
     .filter((relative) => /^[^/]+\/SKILL\.md$/.test(relative));
   const expectedEntrypoints = [
     'adjudicate/SKILL.md',
+    'board/SKILL.md',
     'critique/SKILL.md',
     'dispatch/SKILL.md',
     'manage-work/SKILL.md',
@@ -449,10 +450,20 @@ function loadHost(host) {
   const manifestPath = resolveInside(pluginRoot, manifestRelative, 'file', `${host} manifest`);
   const manifest = readJson(manifestPath, `${host} manifest`);
   const expectedManifestKeys = isClaude
-    ? commonManifestKeys
+    ? [...commonManifestKeys, 'mcpServers']
     : [...commonManifestKeys, 'interface', 'keywords'];
   exactKeys(manifest, expectedManifestKeys, `${host} manifest`);
   validateCommonManifest(manifest, `${host} manifest`);
+
+  if (isClaude) {
+    exactKeys(manifest.mcpServers, ['forged'], 'Claude manifest mcpServers');
+    exactKeys(manifest.mcpServers.forged, ['args', 'command'], 'Claude manifest forged MCP server');
+    invariant(manifest.mcpServers.forged.command === 'forged', 'Claude manifest forged MCP server command moved');
+    invariant(
+      stableJson(manifest.mcpServers.forged.args) === stableJson(['mcp']),
+      'Claude manifest forged MCP server args moved',
+    );
+  }
 
   if (!isClaude) {
     invariant(
@@ -504,6 +515,7 @@ const expectedAllowedDifferences = [
   'manifest-filename',
   'codex-manifest-discovery-metadata',
   'host-marketplace-envelope-and-source-metadata',
+  'claude-only-mcp-server-registration',
 ];
 const expectedForbiddenDifferences = [
   'plugin-identity',
@@ -698,7 +710,7 @@ try {
 
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
-      `version=${claude.manifest.version} skills=7 inventorySha256=${claude.inventory.digest} ` +
+      `version=${claude.manifest.version} skills=8 inventorySha256=${claude.inventory.digest} ` +
       `cases=14+31 tools=44 surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
@@ -818,9 +830,21 @@ check "manage-work dual-host registration and contract parity" check_manage_work
   "$plugin/skills/manage-work/host-parity-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
-[[ ${#skill_files[@]} -eq 7 ]] && pass "exactly seven skills" || fail "exactly seven skills"
+[[ ${#skill_files[@]} -eq 8 ]] && pass "exactly eight skills" || fail "exactly eight skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
+
+check_board_skill() {
+  local skill="$plugin/skills/board/SKILL.md"
+  grep -q '^name: board$' "$skill" || return 1
+  grep -qE '^description: .+' "$skill" || return 1
+  grep -q 'operations_overview' "$skill" || return 1
+  grep -q 'forged operations overview' "$skill" || return 1
+  grep -q -- '--repo' "$skill" || return 1
+  grep -q '/forged:setup' "$skill" || return 1
+  grep -q 'never fail silently' "$skill" || return 1
+}
+check "board skill contract" check_board_skill
 check "bootstrap shell syntax" bash -n "$plugin/bootstrap/install-beads.sh"
 grep -Fq '../../agents/critic.md' "$plugin/skills/critique/SKILL.md" \
   && pass "critique resolves the shared critic" || fail "critique resolves the shared critic"

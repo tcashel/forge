@@ -22,7 +22,7 @@ execution, or an existing-work control become a new submission.
 
 | Intent | Route | Authority |
 | --- | --- | --- |
-| Observe or explain the portfolio, queue, repository, or what needs attention | `forged operations overview` | Read only |
+| Observe or explain the portfolio, queue, repository, or what needs attention | `forged operations overview` (deliberately opening the board view routes via `../board/SKILL.md`) | Read only |
 | Explain one durable run or epic | Resolve one exact WorkIdentity, then `forged work detail` | Read only |
 | Explore | Discuss or research supplied context | Persist nothing |
 | Plan or revise | Read and follow `../plan/SKILL.md` | Native Bead writes only |

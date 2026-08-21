@@ -8,5 +8,11 @@
   "homepage": "https://github.com/tcashel/forge",
   "repository": "https://github.com/tcashel/forge",
   "license": "LicenseRef-MIT-OpenAI-Anthropic-Rider",
-  "skills": "./skills/"
+  "skills": "./skills/",
+  "mcpServers": {
+    "forged": {
+      "command": "forged",
+      "args": ["mcp"]
+    }
+  }
 }
