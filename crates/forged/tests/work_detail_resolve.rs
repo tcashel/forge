@@ -63,6 +63,35 @@ fn an_exact_run_id_answers_identically_to_the_exact_pair() {
     assert_eq!(by_id["result"].get("resolution"), None);
 }
 
+/// A unique RUN prefix is as transparent as the exact id: the full detail
+/// body, byte-equal to the pair call, with no resolution key.
+#[test]
+fn a_unique_run_prefix_projects_the_exact_pair_body() {
+    let env = TestEnv::new("forged-detail-resolve-run-prefix");
+    env.forged(&["init"]);
+    fabricate_run(&env, "dr-slice");
+    fabricate_epic(&env, "other-epic");
+
+    let (code, by_pair) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "dr-slice",
+    ]);
+    assert_eq!(code, 0, "work detail pair: {by_pair}");
+    let (code, by_prefix) = env.forged(&["work", "detail", "--id", "dr-sl"]);
+    assert_eq!(code, 0, "work detail --id dr-sl: {by_prefix}");
+    assert_eq!(
+        result(&by_prefix),
+        result(&by_pair),
+        "run prefix projection differs from the exact pair"
+    );
+    assert_eq!(by_prefix["result"]["workRef"]["kind"], json!("run"));
+    assert_eq!(by_prefix["result"].get("resolution"), None);
+}
+
 /// The resolution derives the epic subject kind from the inventory — an
 /// exact epic id and a unique epic-id prefix both project what
 /// `--subject-kind epic` asserts, never a hardcoded run.

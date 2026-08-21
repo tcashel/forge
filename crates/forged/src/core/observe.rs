@@ -2570,9 +2570,11 @@ pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse
             .map_err(|_| Failure::invalid("work detail limit does not fit u32"))?;
         let (kind, id) = match (exact, bare) {
             (Some(pair), None) => pair,
-            // A resolved id projects through the SAME snapshot the exact
-            // pair reads, so the two answers cannot drift; the resolved kind
-            // is the inventory's, never a guess.
+            // Resolution reads its own inventory snapshot and the detail
+            // then projects a fresh one; on the append-only ledger a subject
+            // resolved by the first cannot vanish from the second, so the
+            // two answers agree — the resolved kind is the inventory's,
+            // never a guess.
             (None, Some(bare)) => match resolve(ctx, &bare).await? {
                 Resolved::Slice(run) => (forged_types::WorkIdentitySubjectKind::Run, run),
                 Resolved::Epic(epic) => (forged_types::WorkIdentitySubjectKind::Epic, epic),
