@@ -238,17 +238,33 @@ fn mixed_half_or_absent_addressing_is_refused_identically_everywhere() {
         "the refusal must name the conflict: {message}"
     );
 
-    // A present-but-empty id from the CLI is refused up front, never read
-    // as "no form named". (The MCP transport refuses it before dispatch;
-    // `parity.rs` pins that boundary.)
-    let (code, cli) = env.forged(&["work", "detail", "--id", ""]);
-    assert_ne!(code, 0, "{cli}");
-    assert_eq!(cli["error"]["code"], json!("INVALID_REQUEST"));
-    assert!(
-        cli["error"]["message"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("must name a subject"),
-        "{cli}"
-    );
+    // A present-but-unnamed id from the CLI — empty or whitespace-only, a
+    // failed interpolation either way — is refused up front, never read as
+    // "no form named" and never answered as a successful "unknown". (The
+    // MCP transport refuses the same values before dispatch; `parity.rs`
+    // pins that boundary.)
+    for cli_args in [
+        vec!["work", "detail", "--id", ""],
+        vec!["work", "detail", "--id", " "],
+        vec!["work", "detail", "--id", "\t\n"],
+        vec![
+            "work",
+            "detail",
+            "--subject-kind",
+            "run",
+            "--subject-id",
+            " ",
+        ],
+    ] {
+        let (code, cli) = env.forged(&cli_args);
+        assert_ne!(code, 0, "{cli_args:?} must refuse: {cli}");
+        assert_eq!(cli["error"]["code"], json!("INVALID_REQUEST"), "{cli}");
+        assert!(
+            cli["error"]["message"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("must name a subject"),
+            "{cli_args:?}: {cli}"
+        );
+    }
 }

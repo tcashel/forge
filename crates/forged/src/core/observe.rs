@@ -15,7 +15,7 @@ use forged_types::{
 };
 use serde_json::{json, Map, Value};
 
-use crate::core::{on_ledger, param_opt_str, read_only, Ctx, Failure};
+use crate::core::{on_ledger, param_named_str, param_opt_str, read_only, Ctx, Failure};
 
 fn request(run_id: &str, params: Value) -> OperationRequest {
     OperationRequest {
@@ -2502,21 +2502,22 @@ async fn project_work_detail(
 /// with identical envelopes.
 pub async fn work_detail(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     read_only("work_detail", req, || async {
-        // A present addressing key must name a subject: `param_opt_str`
-        // reads `""`, `null` and a non-string alike as absent, and treating
-        // those as omitted would answer a caller's failed interpolation with
-        // a refusal about the wrong mistake — or, worse, resolve the other
-        // form it did not mean.
+        // A present addressing key must name a subject: `param_named_str`
+        // reads `""`, whitespace, `null` and a non-string alike as absent,
+        // and treating those as omitted would answer a caller's failed
+        // interpolation with a refusal about the wrong mistake — or, worse,
+        // resolve the other form it did not mean. The MCP transport refuses
+        // the same values at deserialize; this keeps the CLI as strict.
         for key in ["subjectKind", "subjectId", "id"] {
-            if req.params.contains_key(key) && param_opt_str(&req.params, key).is_none() {
+            if req.params.contains_key(key) && param_named_str(&req.params, key).is_none() {
                 return Err(Failure::invalid(format!(
                     "work detail param {key:?} must name a subject"
                 )));
             }
         }
-        let bare = param_opt_str(&req.params, "id").map(str::to_owned);
-        let subject_kind = param_opt_str(&req.params, "subjectKind");
-        let subject_id = param_opt_str(&req.params, "subjectId").map(str::to_owned);
+        let bare = param_named_str(&req.params, "id").map(str::to_owned);
+        let subject_kind = param_named_str(&req.params, "subjectKind");
+        let subject_id = param_named_str(&req.params, "subjectId").map(str::to_owned);
         if bare.is_some() && (subject_kind.is_some() || subject_id.is_some()) {
             return Err(Failure::invalid(
                 "work detail takes param \"id\" or the exact \"subjectKind\"/\"subjectId\" \

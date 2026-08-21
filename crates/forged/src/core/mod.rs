@@ -241,6 +241,16 @@ pub fn param_opt_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'
         .filter(|s| !s.is_empty())
 }
 
+/// Read an optional string param that must NAME something: a
+/// whitespace-only value reads as absent, matching the MCP boundary's
+/// `named_string` refusal so both surfaces agree on what counts as a name.
+pub fn param_named_str<'p>(params: &'p Map<String, Value>, key: &str) -> Option<&'p str> {
+    params
+        .get(key)
+        .and_then(Value::as_str)
+        .filter(|s| !s.trim().is_empty())
+}
+
 /// Split a deterministic packet id (`<run_id>/<stage>/<seq>`) into its
 /// parts.
 pub fn split_packet_id(packet_id: &str) -> Result<(String, forged_types::Stage, i64), Failure> {
