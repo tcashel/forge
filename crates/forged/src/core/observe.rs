@@ -1683,6 +1683,75 @@ fn observation_attention(
         );
     }
 
+    // A parked run's admission-deferred marker mirrors the global
+    // projection with the identical event-backed occurrence: the marker
+    // event joined to the packet's CURRENT capacity deferral. Rate-limit
+    // deferrals keep their ProviderDegraded mirror above. Only a complete
+    // event page can prove the latest marker; an incomplete page mirrors
+    // nothing rather than a stale occurrence.
+    if snapshot.events.after_event_id == 0 && !snapshot.events.has_more {
+        let mut parked: Option<(&EventRow, Value)> = None;
+        for event in &snapshot.events.rows {
+            if event.kind != "forged.admission.attention" {
+                continue;
+            }
+            let payload: Value = serde_json::from_str(&event.payload_json).unwrap_or(Value::Null);
+            if payload.get("condition").and_then(Value::as_str) != Some("admission-deferred") {
+                continue;
+            }
+            if parked
+                .as_ref()
+                .is_none_or(|(seen, _)| seen.event_id < event.event_id)
+            {
+                parked = Some((event, payload));
+            }
+        }
+        if let Some((event, payload)) = parked {
+            if let Some(packet_id) = payload.get("packetId").and_then(Value::as_str) {
+                let deferred = snapshot.admission_decisions.iter().find(|decision| {
+                    decision.subject_kind == forged_types::AdmissionSubjectKind::Packet
+                        && decision.subject_id == packet_id
+                        && decision.outcome == AdmissionOutcome::Deferred
+                        && !matches!(
+                            decision.reason,
+                            AdmissionReason::RateLimitCeiling | AdmissionReason::StaleRateLimit
+                        )
+                });
+                if let Some(decision) = deferred {
+                    let run_id = snapshot
+                        .packets
+                        .iter()
+                        .find(|packet| packet.packet_id == packet_id)
+                        .map(|packet| packet.run_id.as_str())
+                        .unwrap_or(snapshot.subject.id.as_str());
+                    let (kind, subject, repository) = attention_subject(snapshot, run_id);
+                    attention_source(
+                        &mut sources,
+                        kind,
+                        subject,
+                        repository,
+                        AttentionCondition::AdmissionDeferred,
+                        event.ts.clone(),
+                        event.ts.clone(),
+                        event.event_id,
+                        format!("event:{}", event.event_id),
+                        format!(
+                            "run is parked: packet {packet_id} admission deferred ({:?})",
+                            decision.reason
+                        ),
+                        json!({
+                            "packetId": packet_id,
+                            "wakes": payload.get("wakes"),
+                            "decision": decision,
+                        }),
+                        AttentionEvidenceKind::Event,
+                        event.event_id.to_string(),
+                    );
+                }
+            }
+        }
+    }
+
     for operation in &snapshot.inflight_operations {
         if operation.effect_class != EffectClass::HumanAmbiguous {
             continue;

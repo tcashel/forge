@@ -14,7 +14,8 @@ use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
 use forged_types::{
-    ExecutionPolicyV1, OperationRequest, OperationResponse, Outcome, Stage, Verdict,
+    AdmissionOutcome, AdmissionReason, AdmissionSubjectKind, ExecutionPolicyV1, OperationRequest,
+    OperationResponse, Outcome, Stage, Verdict,
 };
 use serde_json::{json, Map, Value};
 
@@ -1126,6 +1127,13 @@ async fn record_event(ctx: &Ctx, run_id: &str, event: ProtoEvent) -> Result<(), 
 /// driver's re-claims per packet.
 const SEMANTIC_RECLAIM_CAP: usize = 3;
 
+/// Consecutive deferral wakes before a parked run surfaces its durable
+/// attention marker. Parking itself is unbounded — a wait is a wait — but it
+/// must not become a silent starve, so the Nth wake appends one deduplicated
+/// `forged.admission.attention` marker that the attention projection joins
+/// against the packet's latest admission decision until the admit clears it.
+const PARKED_DEFERRAL_SURFACE_WAKES: u32 = 3;
+
 fn semantic_failures(view: &RunView, packet_id: &str) -> usize {
     view.terminal_attempts
         .get(packet_id)
@@ -1184,6 +1192,17 @@ async fn advance_once(
 }
 
 /// The loop: project → advance → honor → repeat until `Stop`.
+///
+/// A capacity deferral of the awaited packet — its latest durable admission
+/// decision is `Deferred` with a reason in the capacity family — is a wait,
+/// not a death: the controller parks (bounded sleep, re-project, retry)
+/// exactly like a `not_before` deadline instead of exiting. Exiting here
+/// made the supervisor read ordinary capacity queuing as a dead controller,
+/// charging `restart_used` and recycling the pane out from under live
+/// seats. Every other recoverable `OperationInProgress` keeps the exit:
+/// non-capacity deferral reasons (`BeadMalformed`, `Superseded`, ...) never
+/// clear by waiting, and only the deferred admission decision carries an
+/// attention projection, so parking on anything else would starve silently.
 pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let echo = derive_key("run_drive", req.run_id.as_deref(), None, None);
     let run_id = match param_str(&req.params, "run") {
@@ -1191,6 +1210,7 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         Err(f) => return err_response(&echo, &f),
     };
     let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+    let mut deferral_wakes: u32 = 0;
     loop {
         let view = match project(ctx, &run_id).await {
             Ok(view) => view,
@@ -1219,10 +1239,119 @@ pub async fn run_drive(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                     json!({"run_id": run_id, "terminal": terminal_json(&terminal)}),
                 );
             }
-            Ok(_) => continue,
+            Ok(_) => deferral_wakes = 0,
+            Err(failure)
+                if failure.code == forged_types::ErrorCode::OperationInProgress
+                    && failure.recoverable =>
+            {
+                let packet_id = match classify_deferral(ctx, &action).await {
+                    Ok(DeferralClass::Parked { packet_id }) => packet_id,
+                    // A concurrent admission can land between the refusal
+                    // and this read; the packet is ours to drive now, so
+                    // re-project immediately instead of exiting.
+                    Ok(DeferralClass::AdmittedMeanwhile) => continue,
+                    Ok(DeferralClass::NotCapacity) => return err_response(&echo, &failure),
+                    Err(f) => return err_response(&echo, &f),
+                };
+                deferral_wakes = deferral_wakes.saturating_add(1);
+                tracing::info!(
+                    wakes = deferral_wakes,
+                    detail = %failure.message,
+                    "deferred; parking until the next admission wake"
+                );
+                if deferral_wakes == PARKED_DEFERRAL_SURFACE_WAKES {
+                    if let Err(failure) =
+                        record_parked_deferral(ctx, &run_id, &packet_id, &failure.message).await
+                    {
+                        return err_response(&echo, &failure);
+                    }
+                }
+                tokio::time::sleep(Duration::from_secs(
+                    ctx.config.admission.defer_seconds.max(1),
+                ))
+                .await;
+            }
             Err(f) => return err_response(&echo, &f),
         }
     }
+}
+
+/// How to treat a recoverable admission refusal for the awaited packet.
+enum DeferralClass {
+    /// The LATEST durable decision defers on a wait-clearing reason
+    /// (capacity or rate limit): park and retry on the wake.
+    Parked { packet_id: String },
+    /// The latest decision is an admit — a concurrent admission landed
+    /// between the refusal and this read. Re-project, never exit.
+    AdmittedMeanwhile,
+    /// Anything else (no decision, non-capacity refusal, fenced-step
+    /// contention): the failure stands.
+    NotCapacity,
+}
+
+/// Classify by the awaited packet's LATEST durable admission decision —
+/// the only evidence that a refusal clears by waiting. The honor path
+/// raises the same recoverable `OperationInProgress` for every
+/// non-admitted reason and for fenced-step contention, so the failure
+/// alone cannot authorize a park. Rate-limit deferrals are pure waits too
+/// (their visibility stays ProviderDegraded); anything that is not
+/// awaiting a packet has no decision to join and never parks.
+async fn classify_deferral(ctx: &Ctx, action: &NextAction) -> Result<DeferralClass, Failure> {
+    let NextAction::AwaitPacket { packet_id, .. } = action else {
+        return Ok(DeferralClass::NotCapacity);
+    };
+    let packet_id = packet_id.clone();
+    let query_id = packet_id.clone();
+    let decisions = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.latest_admission_decisions(Some(AdmissionSubjectKind::Packet), Some(&query_id))
+    })
+    .await?;
+    if decisions
+        .iter()
+        .any(|decision| decision.outcome == AdmissionOutcome::Admitted)
+    {
+        return Ok(DeferralClass::AdmittedMeanwhile);
+    }
+    if decisions.iter().any(|decision| {
+        decision.outcome == AdmissionOutcome::Deferred
+            && matches!(
+                decision.reason,
+                AdmissionReason::TotalCapacity
+                    | AdmissionReason::ProviderCapacity
+                    | AdmissionReason::RepositoryWriteCapacity
+                    | AdmissionReason::RateLimitCeiling
+                    | AdmissionReason::StaleRateLimit
+            )
+    }) {
+        return Ok(DeferralClass::Parked { packet_id });
+    }
+    Ok(DeferralClass::NotCapacity)
+}
+
+/// Append the parked run's deduplicated deferral marker.
+///
+/// `append_event_once` keys on the exact payload, so re-crossing the
+/// threshold in a later parked episode of the same packet re-arms nothing:
+/// one marker per distinct (packet, detail), however long the park lasts.
+async fn record_parked_deferral(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    detail: &str,
+) -> Result<(), Failure> {
+    let payload = json!({
+        "schema": "forged.admission.attention/1",
+        "condition": "admission-deferred",
+        "packetId": packet_id,
+        "wakes": PARKED_DEFERRAL_SURFACE_WAKES,
+        "detail": detail,
+    });
+    let run_id = run_id.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event_once(&run_id, "forged.admission.attention", payload)?;
+        Ok(())
+    })
+    .await
 }
 
 /// Serialize open-packet intents for status payloads.
