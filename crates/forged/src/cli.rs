@@ -208,6 +208,8 @@ pub enum RunCmd {
     Status(RunScoped),
     /// Stop and settle the complete run.
     Stop(RunStopArgs),
+    /// Explicitly settle a run whose controller record cannot be fenced.
+    AdjudicateSettlement(RunAdjudicateSettlementArgs),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
     /// Accept the final deduplicated findings after review-budget exhaustion.
@@ -268,6 +270,61 @@ pub struct RunStopArgs {
     /// Successor run id; required only for `superseded`.
     #[arg(long)]
     pub superseded_by: Option<String>,
+    /// Override the derived idempotency key.
+    #[arg(long)]
+    pub idempotency_key: Option<String>,
+}
+
+/// `run adjudicate-settlement` outcomes: the abandoned-run terminal set.
+/// Clean, blocked, and input-required describe live protocol states, which
+/// an evidence-gap adjudication has no business asserting.
+#[derive(Debug, Clone, Copy, ValueEnum)]
+pub enum RunAdjudicateOutcome {
+    /// Landed, with PR and exact merge SHA evidence.
+    Landed,
+    /// Replaced by a named successor run.
+    Superseded,
+    /// Cancelled without declaring the Bead complete.
+    Cancelled,
+}
+
+impl RunAdjudicateOutcome {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Landed => "landed",
+            Self::Superseded => "superseded",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// `run adjudicate-settlement` flags.
+#[derive(Debug, Args)]
+pub struct RunAdjudicateSettlementArgs {
+    /// Run whose latest controller record lacks durable driver identity.
+    #[arg(long)]
+    pub run: String,
+    /// Adjudicated terminal outcome.
+    #[arg(long, value_enum)]
+    pub outcome: RunAdjudicateOutcome,
+    /// Pull request number; required only for `landed`.
+    #[arg(long)]
+    pub pr: Option<u64>,
+    /// Exact merge commit SHA; required only for `landed`.
+    #[arg(long)]
+    pub sha: Option<String>,
+    /// Successor run id; required only for `superseded`.
+    #[arg(long)]
+    pub superseded_by: Option<String>,
+    /// Human identity asserting this explicitly destructive settlement.
+    #[arg(long)]
+    pub actor: String,
+    /// Why this run may settle without verified controller death.
+    #[arg(long)]
+    pub rationale: String,
+    /// Exactly which durable evidence is missing — the gap being adjudicated.
+    #[arg(long)]
+    pub evidence_gap: String,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1292,6 +1349,7 @@ pub fn command_name(command: &Command) -> &'static str {
             RunCmd::Submit(_) => "run_submit",
             RunCmd::Status(_) => "run_status",
             RunCmd::Stop(_) => "run_stop",
+            RunCmd::AdjudicateSettlement(_) => "run_adjudicate_settlement",
             RunCmd::ReviseRoster(_) => "run_revise_roster",
             RunCmd::AcceptRisk(_) => "run_accept_risk",
         },
@@ -1438,6 +1496,23 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "pr": a.pr,
                         "sha": a.sha,
                         "supersededBy": a.superseded_by,
+                    }),
+                ),
+            ),
+            RunCmd::AdjudicateSettlement(a) => (
+                "run_adjudicate_settlement",
+                request(
+                    a.idempotency_key,
+                    Some(a.run.clone()),
+                    json!({
+                        "run": a.run,
+                        "outcome": a.outcome.as_str(),
+                        "pr": a.pr,
+                        "sha": a.sha,
+                        "supersededBy": a.superseded_by,
+                        "actor": a.actor,
+                        "rationale": a.rationale,
+                        "evidenceGap": a.evidence_gap,
                     }),
                 ),
             ),

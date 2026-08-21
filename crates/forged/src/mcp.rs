@@ -875,6 +875,18 @@ impl ForgedServer {
         self.call("run_stop", args.0).await
     }
 
+    /// Explicitly destructive settlement of an unfenceable legacy run.
+    #[tool(
+        name = "run_adjudicate_settlement",
+        description = "Explicitly destructive: settle a run whose latest controller record lacks durable driver identity (no pid and lstart to fence), recording actor, rationale, and the evidence gap as a durable adjudication event. Refuses runs the normal fence can settle and runs with uncontained machine effects."
+    )]
+    pub async fn run_adjudicate_settlement(
+        &self,
+        args: Parameters<EnvelopeArgs>,
+    ) -> CallToolResult {
+        self.call("run_adjudicate_settlement", args.0).await
+    }
+
     /// Append an explicit roster revision.
     #[tool(
         name = "run_revise_roster",

@@ -696,6 +696,140 @@ fn settlement_kills_draft_pr_generation_before_gh_can_fire() {
     assert_eq!(creates_after, 0, "gh.call.before never crossed into POST");
 }
 
+// ------------------------------------------- settlement adjudication saga
+
+/// Crash between the durable adjudication event and the fencing terminal
+/// write. Recovery is the SAME human decision re-asserted verbatim: it
+/// adopts the standing event instead of duplicating it, completes the
+/// terminal projection with the generation revocation, and seals the
+/// interrupted human-ambiguous row with the real outcome.
+#[test]
+fn adjudication_crash_between_event_and_terminal_write_recovers() {
+    let env = TestEnv::new("km-adjudicate-crash");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    support::fabricate_run(&env, "adj-crash");
+    env.set_bead_field("bead-adj-crash", "status", "in_progress");
+    env.set_assignee("bead-adj-crash", "forged:bead-adj-crash:0");
+    {
+        let ledger = env.ledger();
+        ledger
+            .append_event(
+                Some("adj-crash"),
+                "forged.controller.started",
+                json!({"scope": "run", "id": "adj-crash", "generation": 1}),
+            )
+            .expect("legacy controller record");
+        ledger.close().expect("close");
+    }
+    let args = [
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        "adj-crash",
+        "--outcome",
+        "cancelled",
+        "--actor",
+        "operator",
+        "--rationale",
+        "legacy run predates durable driver identity",
+        "--evidence-gap",
+        "controller.started carries no /driver/pid and no lstart",
+    ];
+    let fp = env.root.join("fp-adjudicate");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let status = env
+        .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("adjudicator spawns");
+    assert!(!status.success(), "adjudication crash failpoint fired");
+    {
+        let ledger = env.ledger();
+        let run = ledger.get_run("adj-crash").expect("run");
+        assert_eq!(
+            run.state,
+            forged_ledger::RunState::Active,
+            "the terminal write never happened"
+        );
+        let events = ledger
+            .list_events(Some("adj-crash"), 0, 65_536)
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.settlement-adjudication")
+                .count(),
+            1,
+            "the adjudication event is durable before the crash seam"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.controller.revoked")
+                .count(),
+            0
+        );
+        let inflight = ledger.list_inflight_operations(None).expect("inflight");
+        assert!(
+            inflight
+                .iter()
+                .any(|op| op.name == "run_adjudicate_settlement"),
+            "the interrupted human-ambiguous row stays in progress: {inflight:?}"
+        );
+        ledger.close().expect("close");
+    }
+
+    let (code, recovered) = env.forged(&args);
+    assert_eq!(code, 0, "recovered adjudication: {recovered}");
+    assert_eq!(recovered["ok"], json!(true), "{recovered}");
+    assert_eq!(recovered["result"]["outcome"], json!("cancelled"));
+    {
+        let ledger = env.ledger();
+        let run = ledger.get_run("adj-crash").expect("run");
+        assert_eq!(run.state, forged_ledger::RunState::Stopped);
+        assert_eq!(
+            run.terminal_outcome,
+            Some(forged_ledger::RunOutcome::Cancelled)
+        );
+        let events = ledger
+            .list_events(Some("adj-crash"), 0, 65_536)
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.settlement-adjudication")
+                .count(),
+            1,
+            "recovery adopts the standing event instead of duplicating it"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.controller.revoked")
+                .count(),
+            1,
+            "the recorded generation is revoked exactly once"
+        );
+        let stuck = ledger.list_inflight_operations(None).expect("inflight");
+        assert!(
+            stuck
+                .iter()
+                .all(|op| op.name != "run_adjudicate_settlement"),
+            "the interrupted row was sealed, not stranded: {stuck:?}"
+        );
+        ledger.close().expect("close");
+    }
+
+    let (code, replay) = env.forged(&args);
+    assert_eq!(code, 0, "replay: {replay}");
+    assert_eq!(replay["reused"], json!(true), "{replay}");
+}
+
 // ------------------------------------------------------- epic merge recovery
 
 #[test]

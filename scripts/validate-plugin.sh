@@ -556,8 +556,8 @@ const expectedTools = [
   'epic_drive', 'epic_pause', 'epic_resolve', 'epic_resume', 'epic_revise_roster',
   'epic_start', 'epic_status', 'epic_submit', 'events_tail', 'operations_overview',
   'overview', 'packet_claim', 'packet_complete', 'packet_fail', 'reconcile',
-  'review_publish', 'run_accept_risk', 'run_advance', 'run_revise_roster', 'run_start',
-  'run_status', 'run_stop', 'run_submit', 'session_inventory', 'session_list',
+  'review_publish', 'run_accept_risk', 'run_adjudicate_settlement', 'run_advance', 'run_revise_roster',
+  'run_start', 'run_status', 'run_stop', 'run_submit', 'session_inventory', 'session_list',
   'session_message', 'session_read', 'session_stop', 'usage_ingest', 'usage_report',
   'work_detail', 'work_history', 'work_list', 'work_map',
 ];
@@ -656,8 +656,8 @@ function validateParityFixture(registration) {
   invariant(stableJson(fixture.allowedHostDifferences) === stableJson(expectedAllowedDifferences), 'allowed host differences moved');
   invariant(stableJson(fixture.forbiddenHostDifferences) === stableJson(expectedForbiddenDifferences), 'forbidden host differences moved');
   invariant(stableJson(fixture.forbiddenEffects) === stableJson(expectedForbiddenEffects), 'forbidden validation effects moved');
-  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 44-tool declaration moved');
-  invariant(fixture.tools.length === 44 && new Set(fixture.tools).size === 44, 'tool declaration must contain 44 unique tools');
+  invariant(stableJson(fixture.tools) === stableJson(expectedTools), 'exact 45-tool declaration moved');
+  invariant(fixture.tools.length === 45 && new Set(fixture.tools).size === 45, 'tool declaration must contain 45 unique tools');
   invariant(stableJson(fixture.surfaces) === stableJson(expectedSurfaces), 'exact five-surface declaration moved');
   invariant(fixture.surfaces.length === 5, 'surface declaration must contain five resources');
   exactKeys(fixture.contracts, ['intent', 'portfolioControl'], 'host parity contracts');
@@ -711,7 +711,7 @@ try {
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
       `version=${claude.manifest.version} skills=8 inventorySha256=${claude.inventory.digest} ` +
-      `cases=14+31 tools=44 surfaces=5 evidence=declarative-contract-only`,
+      `cases=14+31 tools=45 surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
   console.error(`host parity validation failed: ${error.message}`);

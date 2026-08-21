@@ -1,5 +1,5 @@
 //! CLI/MCP parity (the two-adapters-over-one-core criterion): for each of
-//! the forty-four public core functions, the CLI path and the MCP tool path produce
+//! the forty-five public core functions, the CLI path and the MCP tool path produce
 //! identical `OperationResponse` values — modulo the minted `operationId` —
 //! from the same core call.
 
@@ -68,7 +68,7 @@ fn doctor_shape(envelope: &Value) -> Value {
 }
 
 #[test]
-fn all_forty_four_tools_match_their_cli_counterparts() {
+fn all_forty_five_tools_match_their_cli_counterparts() {
     let env = TestEnv::new("forged-parity");
     env.forged(&["init"]);
     fabricate_run(&env, "par-repository");
@@ -108,6 +108,7 @@ fn all_forty_four_tools_match_their_cli_counterparts() {
         "review_publish",
         "run_advance",
         "run_accept_risk",
+        "run_adjudicate_settlement",
         "run_revise_roster",
         "run_start",
         "run_status",
@@ -126,7 +127,7 @@ fn all_forty_four_tools_match_their_cli_counterparts() {
         "work_map",
     ];
     expected.sort_unstable();
-    assert_eq!(tools, expected, "the forty-four tools, exactly");
+    assert_eq!(tools, expected, "the forty-five tools, exactly");
 
     let overview_tool = mcp.tool("overview");
     assert_eq!(
@@ -564,6 +565,45 @@ fn all_forty_four_tools_match_their_cli_counterparts() {
         }),
     );
     assert_eq!(normalized(cli), normalized(tool), "run_stop parity");
+
+    let cli = env
+        .forged(&[
+            "run",
+            "adjudicate-settlement",
+            "--run",
+            "absent",
+            "--outcome",
+            "cancelled",
+            "--actor",
+            "operator",
+            "--rationale",
+            "legacy run predates durable driver identity",
+            "--evidence-gap",
+            "controller record has no /driver/pid and no lstart",
+        ])
+        .1;
+    let tool = mcp.call_tool(
+        "run_adjudicate_settlement",
+        json!({
+            "schemaVersion": 1,
+            "runId": "absent",
+            "params": {
+                "run": "absent",
+                "outcome": "cancelled",
+                "pr": null,
+                "sha": null,
+                "supersededBy": null,
+                "actor": "operator",
+                "rationale": "legacy run predates durable driver identity",
+                "evidenceGap": "controller record has no /driver/pid and no lstart"
+            }
+        }),
+    );
+    assert_eq!(
+        normalized(cli),
+        normalized(tool),
+        "run_adjudicate_settlement parity"
+    );
 
     let cli = env.forged(&["overview", "--run", "absent"]).1;
     let tool = mcp.call_tool(
