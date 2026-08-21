@@ -3,11 +3,11 @@
 **Talk to one agent. Keep the specification in Beads. Manage durable work.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
-It gives Claude and Codex the same seven capabilities through one shared skill
+It gives Claude and Codex the same eight capabilities through one shared skill
 tree: automatic conversational routing, planning, proportional critique,
-adjudication, operator setup, slice dispatch, and epic handoff. The shared
-router also projects the bounded operator portfolio and invokes landed,
-target-scoped controls without adding another state store.
+adjudication, operator setup, slice dispatch, epic handoff, and a deliberate
+board launcher. The shared router also projects the bounded operator portfolio
+and invokes landed, target-scoped controls without adding another state store.
 
 ## Ownership
 
@@ -55,6 +55,14 @@ codex plugin marketplace add /absolute/path/to/forge
 codex plugin add forged@forge
 ```
 
+The Claude manifest registers the `forged mcp` server over stdio, resolving
+the operator-installed `forged` binary from PATH (the host silently skips a
+missing binary; the plugin never installs software). Migration: operators with
+a prior user-scope entry run `claude mcp remove forged` once; until then two
+registrations spawn the same binary and tool-name precedence is host-defined.
+The Codex manifest carries no server registration; skills there use the CLI
+read path.
+
 After installation, run `/forged:setup`. Then talk normally: ask the lead agent
 to explore an idea, plan or revise work, critique or adjudicate a Bead, ask
 what needs attention, explain one run's blocker or spend, reprioritize a Bead,
@@ -71,6 +79,7 @@ mutation selectors.
 Named skills remain available as explicit power-user and debugging surfaces:
 
 - `/forged:manage-work`
+- `/forged:board`
 - `/forged:plan`
 - `/forged:critique`
 - `/forged:adjudicate`
