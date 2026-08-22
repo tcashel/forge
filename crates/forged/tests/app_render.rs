@@ -16,7 +16,7 @@ use serde_json::{json, Value};
 use support::{
     render_cost, render_dispatch, render_dispatch_before_server_tools,
     render_dispatch_without_server_tools, render_resolution,
-    render_resolution_without_server_tools, require_node, run_agent_sessions_host,
+    render_resolution_without_server_tools, render_waves, require_node, run_agent_sessions_host,
     run_split_app_host, run_split_app_host_scenario,
 };
 
@@ -450,6 +450,51 @@ fn semantic_operations_scenario() -> Value {
     })
 }
 
+fn semantic_agent_sessions_scenario() -> Value {
+    let row = |id: &str, title: &str, activity: &str, revoke_reason: Value| {
+        json!({
+            "runId": id,
+            "packetId": format!("{id}/implement/1"),
+            "attemptId": 1,
+            "identity": {
+                "subject": {"kind": "run", "id": id},
+                "displayTitle": title,
+                "repository": {"path": "/repo", "label": "repo"}
+            },
+            "titleSource": {"known": true, "value": title, "source": "identity.displayTitle"},
+            "repository": "/repo",
+            "stage": "implementation",
+            "provider": "codex",
+            "model": "gpt-5.6-sol",
+            "attempt": {
+                "activity": activity,
+                "revokeReason": revoke_reason,
+                "updatedAt": "2026-08-22T11:30:00Z"
+            },
+            "recovery": "attention",
+            "hostMode": "owned-herdr",
+            "recommendedAction": "inspect-session"
+        })
+    };
+    json!({
+        "now": "2026-08-22T12:00:00Z",
+        "hostCapabilities": {"updateModelContext": true},
+        "allowedTools": [],
+        "toolResult": {"structuredContent": {"ok": true, "result": {
+            "schema": "forged.provider-session-inventory/1",
+            "asOf": "2026-08-22T12:00:00Z",
+            "filters": {"repository": "/repo", "includeHistorical": true},
+            "coverage": {"degradationFacts": []},
+            "summary": {"totalMatched": 3, "returned": 3, "active": 1, "historical": 2},
+            "rows": [
+                row("revoking-run", "Recover fenced session", "revoking", json!("controller heartbeat expired")),
+                row("failed-run", "Failed session", "failed", Value::Null),
+                row("reclaimed-run", "Reclaimed session", "reclaimed", Value::Null)
+            ]
+        }}}
+    })
+}
+
 #[test]
 fn five_state_mapping_is_total_precedence_ordered_and_keeps_internal_detail_state() {
     let Some(node) = require_node() else { return };
@@ -497,6 +542,75 @@ fn five_state_mapping_is_total_precedence_ordered_and_keeps_internal_detail_stat
     assert!(
         detail_text.contains("active"),
         "the precise internal state remains visible: {detail}"
+    );
+
+    let sessions = run_split_app_host_scenario(
+        &node,
+        &root.join("agent-sessions.html"),
+        &semantic_agent_sessions_scenario(),
+    );
+    let session_rows = sessions["sessionRows"]
+        .as_array()
+        .expect("semantic Agent Sessions rows");
+    assert!(
+        session_rows[0]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--running")),
+        "revoking is live recovery work: {sessions}"
+    );
+    assert!(
+        session_rows[1]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--stalled")),
+        "failed attempts are stalled: {sessions}"
+    );
+    assert!(
+        session_rows[2]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--stalled")),
+        "reclaimed attempts are stalled: {sessions}"
+    );
+    let session_text = sessions["text"].to_string();
+    assert!(
+        session_text.contains("recovering")
+            && session_text.contains("controller heartbeat expired"),
+        "revoking renders the attempt's recovery reason: {sessions}"
+    );
+
+    let waves = render_waves(
+        &node,
+        &json!({
+            "status": {
+                "children": [
+                    {"id": "active-child", "title": "Active child", "runId": "run-active", "runState": "active", "beadsStatus": "in_progress"},
+                    {"id": "blocked-child", "title": "Blocked child", "runId": "run-blocked", "runState": "stopped", "terminalOutcome": "blocked", "beadsStatus": "blocked"},
+                    {"id": "merged-child", "title": "Merged child", "runId": "run-merged", "runState": "stopped", "beadsStatus": "closed", "merged": {"pr": 153}}
+                ],
+                "waves": [{"wave": 1, "children": ["active-child", "blocked-child", "merged-child"]}]
+            },
+            "attention": []
+        }),
+    );
+    let wave_cards = waves["cards"]
+        .as_array()
+        .expect("semantic epic child cards");
+    assert!(
+        wave_cards[0]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--running")),
+        "an active epic child is running: {waves}"
+    );
+    assert!(
+        wave_cards[1]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--stalled")),
+        "a blocked epic child is stalled: {waves}"
+    );
+    assert!(
+        wave_cards[2]["class"]
+            .as_str()
+            .is_some_and(|class| class.contains("semantic--landed")),
+        "object-valued merge evidence lands an epic child: {waves}"
     );
 }
 

@@ -1834,6 +1834,18 @@ pub fn render_resolution(node: &str, resolution: &Value) -> Rendered {
     )
 }
 
+/// Render the epic Waves tab through `assets/overview.html` itself.
+pub fn render_waves(node: &str, data: &Value) -> Value {
+    harness_output(
+        node,
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/tests/support/render_waves.mjs"
+        ),
+        data,
+    )
+}
+
 /// Execute a split App through a deterministic MCP Apps host lifecycle.
 pub fn run_split_app_host(node: &str, asset: &Path) -> Value {
     let harness = concat!(
