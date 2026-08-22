@@ -9,6 +9,9 @@
 //!   bead and, when reality already matches the promised outcome, record
 //!   `run.bead-settlement.succeeded` without mutating the bead. Foreign
 //!   custody converges and hands off — a successor's claim is never touched.
+//!   The terminal marker comment is deliberately forfeited on
+//!   success-without-mutation: the settlement's job is custody and status,
+//!   and writing a comment would make convergence a mutation.
 //! - MUTATING retries under a persisted bounded budget with per-run
 //!   claim/lease fencing, charge-before-mutate, and 30s-doubling backoff
 //!   capped at 8 minutes. Exhaustion stops mutation only; the probe outlives
