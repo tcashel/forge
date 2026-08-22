@@ -407,6 +407,7 @@ function resultParams(result, transport) {
   return result;
 }
 const answeredToolCalls = new Set();
+const toolResponseCounts = new Map();
 async function settleToolResponses() {
   for (let pass = 0; pass < 20; pass += 1) {
     await Promise.resolve();
@@ -416,7 +417,12 @@ async function settleToolResponses() {
       const name = call?.params?.name;
       if (!Object.hasOwn(scenario?.toolResponses || {}, name)) continue;
       answeredToolCalls.add(call.id);
-      const configured = scenario.toolResponses[name];
+      const configuredResponses = scenario.toolResponses[name];
+      const responseIndex = toolResponseCounts.get(name) || 0;
+      toolResponseCounts.set(name, responseIndex + 1);
+      const configured = Array.isArray(configuredResponses)
+        ? configuredResponses[responseIndex % configuredResponses.length]
+        : configuredResponses;
       if (configured?.rpcError) {
         dispatch({ jsonrpc: "2.0", id: call.id, error: configured.rpcError });
       } else {

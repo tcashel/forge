@@ -435,9 +435,10 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
         .pointer("/contents/0/text")
         .and_then(Value::as_str)
         .is_some_and(|html| html.contains("Forged Operations")
+            && html.contains("operations_overview")
             && html.contains("attention_list")
             && html.contains("work_map")
-            && !html.contains("name: \"work_detail\"")));
+            && html.contains("work_detail")));
     assert_eq!(
         app.pointer("/contents/0/_meta/ui/csp"),
         Some(&json!({

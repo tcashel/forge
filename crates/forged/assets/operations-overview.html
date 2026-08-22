@@ -141,7 +141,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   const host = { connected: false, capabilities: {}, context: {} };
   const state = {
-    data: null, error: null, args: null,
+    data: null, error: null, args: null, loading: false,
     triage: null, triageMap: null, triageError: null, triageLoading: false, triageStarted: false,
     detail: null, detailError: null, plan: null, entry: null, attentionSelection: null,
     lastOpenedAt: null, openedAt: new Date(Date.now()).toISOString(),
@@ -176,14 +176,15 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
   function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
-  function conditionClass(name) { return arr(state.triage?.groups).find(group=>group?.condition===name)?.classification||null; }
-  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>conditionClass(name)==="decision"))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&conditionClass(name)==="symptom"))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
   function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
   function semanticReason(conditions) { const item=conditions.find(row=>row?.condition==="revoking");return item?.evidence?.reason||item?.detail||""; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${fmt(missing)} unpriced`:""}`; }
   function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
-  function fullHeadline(data) { const list=state.triage;const hasEmbedded=Array.isArray(data?.attention),items=arr(data?.attention),embeddedTotal=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisionGroups=arr(list?.groups).filter(group=>group?.classification==="decision"),symptomGroups=arr(list?.groups).filter(group=>group?.classification==="symptom");const decisions=num(list?.totals?.decisions),oldest=decisionGroups.flatMap(group=>arr(group?.items).map(item=>item?.openedAt)).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(list)parts.push(`${fmt(decisions)} decision${decisions===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);else if(hasEmbedded)parts.push(`${fmt(embeddedTotal)} embedded attention item${embeddedTotal===1?"":"s"}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=symptomGroups.map(group=>`${String(group?.condition||"symptom").replace(/-/g," ")} ${fmt(group?.total)}`).join(", ");if(list)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(!list&&hasEmbedded&&embeddedTotal>items.length)parts.push(`${fmt(items.length)} of ${fmt(embeddedTotal)} embedded attention items shown (capped)`);return `${parts.join("; ")}.`; }
+  function fullHeadline(data) { const list=state.triage;const hasEmbedded=Array.isArray(data?.attention),items=arr(data?.attention),embeddedTotal=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisionGroups=list?arr(list.groups).filter(group=>group?.classification==="decision"):[];const symptomGroups=list?arr(list.groups).filter(group=>group?.classification==="symptom"):[];const embeddedDecisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const decisions=list?num(list?.totals?.decisions):embeddedDecisions.length;const oldest=(list?decisionGroups.flatMap(group=>arr(group?.items)):embeddedDecisions).map(item=>item?.openedAt).filter(Boolean).sort()[0];const embeddedSymptoms=new Map();if(!list)for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))embeddedSymptoms.set(item.condition,(embeddedSymptoms.get(item.condition)||0)+1);const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(list||hasEmbedded)parts.push(`${fmt(decisions)} decision${decisions===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=list?symptomGroups.map(group=>`${String(group?.condition||"symptom").replace(/-/g," ")} ${fmt(group?.total)}`).join(", "):[...embeddedSymptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(list||hasEmbedded)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(!list&&hasEmbedded&&embeddedTotal>items.length)parts.push(`${fmt(items.length)} of ${fmt(embeddedTotal)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   function envelopeFrom(params) {
     let value = params?.structuredContent;
@@ -200,8 +201,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (!data || data.schema !== "forged.operations-overview/1") {
       state.error = { message: "The host returned an unsupported Operations payload." }; state.data = null; render(); return;
     }
-    state.error = null; state.data = data; render();
-    if (host.connected && !state.triageStarted) refreshTriage();
+    state.error = null; state.data = data;
+    state.triage = null; state.triageMap = null; state.triageError = null; state.triageStarted = false;
+    render();
+    if (host.connected) refreshTriage();
   }
   function healthPill(name, source) {
     const status = source?.state || "unknown";
@@ -218,6 +221,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // The rail is bounded so it stays a rail rather than a second queue. What
   // it did not draw is stated, never dropped.
   const RAIL_CAP = 12;
+  const BLOCKER_ROOT_CAP = 5;
   function severityTone(severity) { return severity === "critical" || severity === "high" ? "block" : severity === "medium" ? "warn" : "idle"; }
   function attentionTitle(item) { return item?.subjectTitle?.value || item?.subjectId || item?.id || "unknown subject"; }
   function attentionSelector(item) { const id = item?.subjectId || item?.id; return id ? `${item?.subjectKind || "run"}:${id}` : null; }
@@ -305,19 +309,28 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     for (const edge of arr(map?.edges)) {
       if (edge?.kind !== "blocks" || edge?.source?.kind !== "plan") continue;
       const key = `plan:${edge.source.id}`;
-      if (!direct.has(key)) direct.set(key, edge.target);
+      if (!direct.has(key)) direct.set(key, []);
+      if (!direct.get(key).some(target=>target?.kind===edge?.target?.kind&&target?.id===edge?.target?.id)) direct.get(key).push(edge.target);
     }
     const roots = new Map();
+    let unresolved = 0;
     for (const item of arr(group?.items)) {
       const bead = itemBeadId(item);
-      const target = bead ? direct.get(`plan:${bead}`) : null;
-      const key = target ? `${target.kind}:${target.id}` : `unresolved:${bead || item?.subjectId || item?.id}`;
-      const node = target ? nodes.get(key) : null;
-      const title = node?.titleSource?.value || node?.identity?.displayTitle || target?.id || "Root cause unavailable";
-      if (!roots.has(key)) roots.set(key, { title, count: 0 });
-      roots.get(key).count += 1;
+      const targets = bead ? arr(direct.get(`plan:${bead}`)) : [];
+      if (!targets.length) { unresolved += 1; continue; }
+      let missing = false;
+      for (const target of targets) {
+        const key = `${target?.kind}:${target?.id}`;
+        const node = nodes.get(key);
+        if (!node) { missing = true; continue; }
+        const title = node?.titleSource?.value || node?.identity?.displayTitle || target?.id;
+        if (!title) { missing = true; continue; }
+        if (!roots.has(key)) roots.set(key, { title, count: 0 });
+        roots.get(key).count += 1;
+      }
+      if (missing) unresolved += 1;
     }
-    return [...roots.values()];
+    return { roots: [...roots.values()], unresolved };
   }
   function renderSymptom(group, map) {
     const condition = String(group?.condition || "symptom");
@@ -327,12 +340,16 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const total = Math.max(num(group?.total ?? shown), shown);
     const line = el("div", "symptom-line");
     if (condition === "blocked") {
-      const roots = blockedRoots(group, map);
-      const summary = shown < total
-        ? `${fmt(shown)} of ${fmt(total)} blocked · ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"} shown`
-        : `${fmt(total)} blocked on ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"}`;
+      const result = blockedRoots(group, map);
+      const roots = result.roots;
+      const blockedSummary = shown < total ? `${fmt(shown)} of ${fmt(total)} blocked` : `${fmt(total)} blocked`;
+      const summary = roots.length
+        ? `${blockedSummary} on ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"}`
+        : `${blockedSummary} · root cause mapping unavailable`;
       line.append(el("span", "symptom-summary", summary));
-      for (const root of roots) line.append(el("span", "symptom-root", `${root.title} · ${fmt(root.count)} blocked`));
+      for (const root of roots.slice(0, BLOCKER_ROOT_CAP)) line.append(el("span", "symptom-root", `${root.title} · ${fmt(root.count)} blocked`));
+      if (roots.length > BLOCKER_ROOT_CAP) line.append(el("span", "rail__note", `${fmt(BLOCKER_ROOT_CAP)} of ${fmt(roots.length)} root causes shown`));
+      if (result.unresolved) line.append(el("span", "symptom-unresolved", `Root cause unavailable · ${fmt(result.unresolved)} blocked`));
     } else {
       line.append(el("span", "symptom-summary", shown < total ? `${fmt(shown)} of ${fmt(total)} ${label}` : `${fmt(total)} ${label}`));
       for (const item of items) line.append(el("span", "symptom-item", attentionTitle(item)));
@@ -444,10 +461,23 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    */
   function openPlan(entry) { state.detail = null; state.detailError = null; state.entry = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
   function openEntry(entry) { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; state.entry = entry; renderDetail(); reportSize(); }
+  async function openDetail(entry) {
+    if (!host.capabilities.serverTools || !entry?.detailTarget) { openEntry(entry); return; }
+    state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = null; renderDetail();
+    try {
+      const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
+      const envelope = envelopeFrom(result);
+      if (envelope?.ok === false) throw new Error(envelope.error?.message || "Detail failed");
+      const detail = envelope?.result ?? envelope;
+      if (!detail || detail.schema !== "forged.work-detail/1") throw new Error("Unsupported Work Detail payload");
+      state.detail = detail;
+    } catch (error) { state.detailError = { message: String(error.message || error) }; }
+    renderDetail(); reportSize();
+  }
   function render() {
     if (tornDown) return;
     byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
-    byId("refresh").disabled = state.triageLoading || !host.capabilities.serverTools;
+    byId("refresh").disabled = state.loading || state.triageLoading || !host.capabilities.serverTools;
     if (state.error) { byId("headline").textContent="";byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
     const data = state.data;
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
@@ -474,7 +504,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         const conditions=conditionRows(entry,data.attention);const semantic=semanticState(entry,group.code||group.label,conditions);const row = el("button", `row semantic--${semantic}`); row.type = "button";
         row.disabled = !target && !planFacts;
         row.title = target
-          ? `Open projected work facts for ${selector}`
+          ? (host.capabilities.serverTools ? `Open exact work detail for ${selector}` : `Open projected work facts for ${selector}`)
           : planFacts
             ? "Open the plan facts this row already carries"
             : "This row carries neither a durable detail target nor plan facts";
@@ -492,7 +522,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         const meta=el("span","meta");meta.append(document.createTextNode(entry.state||entry.outcome||"planned"));if(progressAt){meta.append(document.createTextNode(" · "));meta.append(ageNode(progressAt));}const reason=semanticReason(conditions);if(reason)meta.append(document.createTextNode(` · ${reason}`));row.append(meta);
         row.append(el("span","cost",spendText(entry)??"—"));
         row.append(el("span", "source", entry.source || "unknown"));
-        if (!row.disabled) row.addEventListener("click", () => (target ? openEntry(entry) : openPlan(entry))); rows.append(row);
+        if (!row.disabled) row.addEventListener("click", () => (target ? openDetail(entry) : openPlan(entry))); rows.append(row);
       }
       section.append(rows); groups.append(section);
     }
@@ -501,6 +531,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
     if (data.capturedAt?.ledger) byId("foot").append(el("span", "", `ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));
     if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
+    if (state.loading) byId("foot").append(el("span", "", "refreshing portfolio"));
     if (state.triageLoading) byId("foot").append(el("span", "", "refreshing triage"));
     renderDetail(); pushModelContext(data); reportSize();
   }
@@ -547,28 +578,83 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (!value || value.schema !== schema) throw new Error(`${label} returned an unsupported payload`);
     return value;
   }
+  function mergeTriage(active, settlements) {
+    const activeGroups = arr(active?.groups);
+    const allGroups = arr(settlements?.groups);
+    const activeByCondition = new Map(activeGroups.map(group=>[group?.condition,group]));
+    const allByCondition = new Map(allGroups.map(group=>[group?.condition,group]));
+    const conditions = [...activeGroups.map(group=>group?.condition), ...allGroups.map(group=>group?.condition).filter(condition=>!activeByCondition.has(condition))];
+    const merged = conditions.map((condition,index) => {
+      const activeGroup = activeByCondition.get(condition);
+      const allGroup = allByCondition.get(condition);
+      const activeItems = arr(activeGroup?.items).filter(item=>item?.state!=="resolved");
+      const resolvedItems = arr(allGroup?.items).filter(item=>item?.state==="resolved").sort((left,right)=>String(right?.updatedAt||right?.openedAt||"").localeCompare(String(left?.updatedAt||left?.openedAt||"")));
+      const activeTotal = num(activeGroup?.total);
+      const resolvedTotal = Math.max(resolvedItems.length, num(allGroup?.total)-activeTotal);
+      return {
+        condition,
+        classification: activeGroup?.classification || allGroup?.classification,
+        total: activeTotal + resolvedTotal,
+        shown: activeItems.length + resolvedItems.length,
+        oldestOpenedAt: activeGroup?.oldestOpenedAt || allGroup?.oldestOpenedAt,
+        items: [...activeItems, ...resolvedItems],
+        active: !!activeGroup,
+        index,
+        resolvedTotal,
+      };
+    });
+    merged.sort((left,right)=>(left.classification!=="decision")-(right.classification!=="decision")||(right.active-left.active)||left.index-right.index);
+    const groups = merged.map(({active: _active, index: _index, resolvedTotal: _resolvedTotal, ...group})=>group);
+    const resolvedDecisions = merged.filter(group=>group.classification==="decision").reduce((total,group)=>total+group.resolvedTotal,0);
+    const resolvedSymptoms = merged.filter(group=>group.classification==="symptom").reduce((total,group)=>total+group.resolvedTotal,0);
+    const totals = {
+      open: num(active?.totals?.open),
+      acknowledged: num(active?.totals?.acknowledged),
+      resolved: num(settlements?.totals?.resolved),
+      decisions: num(active?.totals?.decisions) + resolvedDecisions,
+      symptoms: num(active?.totals?.symptoms) + resolvedSymptoms,
+      shown: groups.reduce((total,group)=>total+group.shown,0),
+      total: num(active?.totals?.total) + num(settlements?.totals?.resolved),
+    };
+    return { ...active, filters: { ...active?.filters, settlements: "all" }, totals, groups };
+  }
   async function refreshTriage() {
     if (!host.connected || !host.capabilities.serverTools || state.triageLoading) return;
     state.triageStarted = true; state.triageLoading = true; state.triageError = null; render();
     const repo = state.args?.params?.repo || state.data?.scope?.repository;
-    const attentionParams = { state: "all", limit: 100 };
+    const activeParams = { state: "active", limit: 100 };
+    const settlementParams = { state: "all", limit: 500 };
     const mapParams = {};
     if (typeof repo === "string" && repo) {
-      attentionParams.repo = repo;
+      activeParams.repo = repo;
+      settlementParams.repo = repo;
       mapParams.scope = "repository"; mapParams.repository = repo;
     }
     try {
-      const [attentionResult, mapResult] = await Promise.all([
-        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: attentionParams } }),
+      const [activeResult, settlementResult, mapResult] = await Promise.all([
+        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: activeParams } }),
+        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: settlementParams } }),
         request("tools/call", { name: "work_map", arguments: { schemaVersion: 1, params: mapParams } }),
       ]);
-      state.triage = triageResult(attentionResult, "forged.attention-list/1", "attention_list");
+      const active = triageResult(activeResult, "forged.attention-list/1", "attention_list active");
+      const settlements = triageResult(settlementResult, "forged.attention-list/1", "attention_list settlements");
+      state.triage = mergeTriage(active, settlements);
       state.triageMap = triageResult(mapResult, "forged.work-map/1", "work_map");
     } catch (error) {
       state.triage = null; state.triageMap = null; state.triageError = String(error.message || error);
-    } finally { state.triageLoading = false; render(); }
+    } finally {
+      state.triageLoading = false; render();
+      if (!state.triageStarted && host.connected) refreshTriage();
+    }
   }
-  byId("refresh").addEventListener("click", refreshTriage);
+  async function refresh() {
+    if (!host.connected || !host.capabilities.serverTools || state.loading || state.triageLoading) return;
+    state.loading = true; render();
+    try { ingest(await request("tools/call", { name: "operations_overview", arguments: state.args || { schemaVersion: 1, params: {} } })); }
+    catch (error) { state.error = { message: String(error.message || error) }; }
+    finally { state.loading = false; render(); }
+  }
+  byId("refresh").addEventListener("click", refresh);
   // The handshake advertises fullscreen, so the surface has to offer the
   // control that asks for it. A host that declines leaves the view as it is.
   function applyDisplayMode(mode) {
@@ -613,7 +699,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     for (const timer of timers) clearTimeout(timer);
     timers.clear(); pending.clear();
-    byId("refresh").removeEventListener("click", refreshTriage);
+    byId("refresh").removeEventListener("click", refresh);
     byId("expand").removeEventListener("click", toggleDisplayMode);
     window.removeEventListener("message", onMessage);
   }

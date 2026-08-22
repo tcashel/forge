@@ -347,6 +347,7 @@ fn every_classifying_asset_pins_the_exact_attention_condition_partition() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     for name in [
         "overview.html",
+        "operations-overview.html",
         "work-map.html",
         "work-detail.html",
         "agent-sessions.html",
@@ -363,12 +364,6 @@ fn every_classifying_asset_pins_the_exact_attention_condition_partition() {
             "{name}"
         );
     }
-    let operations = std::fs::read_to_string(root.join("operations-overview.html"))
-        .expect("read Operations App");
-    assert!(
-        !operations.contains("DECISION_CONDITIONS") && !operations.contains("SYMPTOM_CONDITIONS"),
-        "Operations consumes attention_list classification without a condition roster"
-    );
 }
 
 fn semantic_operations_scenario() -> Value {
@@ -430,21 +425,10 @@ fn semantic_operations_scenario() -> Value {
     );
     let revoking = json!({"subjectId": "recovering-run", "subjectKind": "run", "condition": "revoking", "severity": "medium", "openedAt": "2026-08-22T10:00:00Z", "updatedAt": "2026-08-22T10:00:00Z", "detail": "attempt is fenced", "evidence": {"reason": "controller heartbeat expired"}});
     let admission = json!({"subjectId": "deferred-plan", "subjectKind": "run", "condition": "admission-deferred", "severity": "medium", "openedAt": "2026-08-22T11:00:00Z", "updatedAt": "2026-08-22T11:00:00Z", "detail": "repository capacity is occupied"});
-    let listed = attention_list_fixture(
-        vec![
-            json!({"condition": "admission-deferred", "classification": "symptom", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-22T11:00:00Z", "items": [admission.clone()]}),
-            json!({"condition": "revoking", "classification": "symptom", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-22T10:00:00Z", "items": [revoking.clone()]}),
-        ],
-        json!({"open": 2, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 2, "shown": 2, "total": 2}),
-    );
     json!({
         "now": "2026-08-22T12:00:00Z",
-        "hostCapabilities": {"updateModelContext": true, "serverTools": true},
-        "allowedTools": ["attention_list", "work_map"],
-        "toolResponses": {
-            "attention_list": {"structuredContent": {"ok": true, "result": listed}},
-            "work_map": {"structuredContent": {"ok": true, "result": empty_work_map(vec![], vec![])}}
-        },
+        "hostCapabilities": {"updateModelContext": true},
+        "allowedTools": [],
         "toolResult": {"structuredContent": {"ok": true, "result": {
             "schema": "forged.operations-overview/1",
             "scope": {"repository": "/repo"},
@@ -553,6 +537,12 @@ fn five_state_mapping_is_total_precedence_ordered_and_keeps_internal_detail_stat
     assert!(
         text.contains("recovering") && text.contains("controller heartbeat expired"),
         "revocation renders its evidence reason without inventing a saga stage: {report}"
+    );
+    assert!(
+        report["headline"]
+            .as_str()
+            .is_some_and(|headline| headline.contains("symptoms: admission deferred 1, revoking 1")),
+        "the embedded partition still feeds the headline without server tools: {report}"
     );
 
     let detail = run_split_app_host(&node, &root.join("work-detail.html"));
@@ -740,7 +730,7 @@ fn headline_components_are_omitted_for_absent_fields_and_operations_states_its_c
     );
     let headline = report["headline"].as_str().expect("Operations headline");
     assert!(
-        headline.contains("2 of 7 embedded attention items shown (capped)"),
+        headline.contains("2 of 7 attention conditions classified (capped)"),
         "the Operations cap is stated: {headline}"
     );
     for fabricated in ["known spend", "running", "ready to merge"] {
@@ -1317,7 +1307,12 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
         (
             &operations,
             "forged.operations-overview/1",
-            &["attention_list", "work_map"][..],
+            &[
+                "operations_overview",
+                "attention_list",
+                "work_map",
+                "work_detail",
+            ][..],
         ),
         (&detail, "forged.work-detail/1", &["work_detail"][..]),
         (&map, "forged.work-map/1", &["work_map"][..]),
@@ -1369,8 +1364,8 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let html = std::fs::read_to_string(operations).expect("read Operations App");
     assert!(html.contains("entry.detailTarget"));
     assert!(html.contains("host.capabilities.serverTools"));
-    assert!(!html.contains("name: \"operations_overview\""));
-    assert!(!html.contains("name: \"work_detail\""));
+    assert!(html.contains("name: \"operations_overview\""));
+    assert!(html.contains("name: \"work_detail\""));
     let html = std::fs::read_to_string(map).expect("read Work Map App");
     assert!(html.contains("node.detailTarget"));
     assert!(html.contains("subjectKind"));
@@ -2141,15 +2136,21 @@ fn triage_scenario(attention_list: Value, work_map: Value, storage: Value) -> Va
         ("2026-08-20T10:00:00.000Z", "2026-08-20T10:00:00.000Z"),
         "Use the embedded action",
     );
+    let overview = embedded_operations(vec![embedded]);
+    let active = active_attention_list(&attention_list);
     json!({
         "now": "2026-08-22T12:00:00.000Z",
         "hostCapabilities": {"updateModelContext": true, "serverTools": true},
-        "allowedTools": ["attention_list", "work_map"],
+        "allowedTools": ["operations_overview", "attention_list", "work_map", "work_detail"],
         "storage": storage,
         "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
-        "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![embedded])}},
+        "toolResult": {"structuredContent": {"ok": true, "result": overview.clone()}},
         "toolResponses": {
-            "attention_list": {"structuredContent": {"ok": true, "result": attention_list}},
+            "operations_overview": {"structuredContent": {"ok": true, "result": overview}},
+            "attention_list": [
+                {"structuredContent": {"ok": true, "result": active}},
+                {"structuredContent": {"ok": true, "result": attention_list}}
+            ],
             "work_map": {"structuredContent": {"ok": true, "result": work_map}}
         }
     })
@@ -2162,6 +2163,65 @@ fn attention_list_fixture(groups: Vec<Value>, totals: Value) -> Value {
         "filters": {"repo": "/repo", "state": "all", "condition": Value::Null, "classification": Value::Null, "limit": 100},
         "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"}},
         "totals": totals,
+        "groups": groups,
+    })
+}
+
+fn active_attention_list(listed: &Value) -> Value {
+    let mut groups = Vec::new();
+    let mut decisions = 0_u64;
+    let mut symptoms = 0_u64;
+    for source in listed["groups"].as_array().into_iter().flatten() {
+        let items = source["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["state"] != json!("resolved"))
+            .cloned()
+            .collect::<Vec<_>>();
+        let resolved_shown = source["items"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter(|item| item["state"] == json!("resolved"))
+            .count() as u64;
+        let total = source["total"].as_u64().unwrap_or(items.len() as u64);
+        let active_total = total.saturating_sub(resolved_shown);
+        if active_total == 0 {
+            continue;
+        }
+        if source["classification"] == json!("decision") {
+            decisions += active_total;
+        } else {
+            symptoms += active_total;
+        }
+        groups.push(json!({
+            "condition": source["condition"],
+            "classification": source["classification"],
+            "total": active_total,
+            "shown": items.len(),
+            "oldestOpenedAt": source["oldestOpenedAt"],
+            "items": items,
+        }));
+    }
+    let open = listed["totals"]["open"].as_u64().unwrap_or_default();
+    let acknowledged = listed["totals"]["acknowledged"]
+        .as_u64()
+        .unwrap_or_default();
+    json!({
+        "schema": "forged.attention-list/1",
+        "capturedAt": listed["capturedAt"],
+        "filters": {"repo": "/repo", "state": "active", "condition": Value::Null, "classification": Value::Null, "limit": 100},
+        "sourceHealth": listed["sourceHealth"],
+        "totals": {
+            "open": open,
+            "acknowledged": acknowledged,
+            "resolved": 0,
+            "decisions": decisions,
+            "symptoms": symptoms,
+            "shown": groups.iter().filter_map(|group| group["shown"].as_u64()).sum::<u64>(),
+            "total": open + acknowledged,
+        },
         "groups": groups,
     })
 }
@@ -2222,10 +2282,11 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
     assert_eq!(
         report["serverToolCalls"],
         json!([
-            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "all", "limit": 100}}},
+            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "active", "limit": 100}}},
+            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "all", "limit": 500}}},
             {"name": "work_map", "arguments": {"schemaVersion": 1, "params": {"scope": "repository", "repository": "/repo"}}}
         ]),
-        "load fires the pinned two-tool set with the initiating repository scope: {report}"
+        "load separates active attention from bounded settlements and reads the scoped map: {report}"
     );
     let nodes = report["nodes"].as_array().expect("rendered nodes");
     let headings = nodes
@@ -2278,7 +2339,7 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
 }
 
 #[test]
-fn operations_triage_manual_refresh_repeats_only_the_pinned_two_tool_read() {
+fn operations_manual_refresh_updates_the_projection_and_then_rereads_triage() {
     let Some(node) = require_node() else { return };
     let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -2298,8 +2359,112 @@ fn operations_triage_manual_refresh_repeats_only_the_pinned_two_tool_read() {
         .collect::<Vec<_>>();
     assert_eq!(
         names,
-        vec!["attention_list", "work_map", "attention_list", "work_map"],
-        "load and manual refresh use only the pinned pair: {report}"
+        vec![
+            "attention_list",
+            "attention_list",
+            "work_map",
+            "operations_overview",
+            "attention_list",
+            "attention_list",
+            "work_map"
+        ],
+        "manual refresh updates the portfolio before rereading the triage rail: {report}"
+    );
+}
+
+#[test]
+fn operations_host_projection_push_rereads_the_triage_rail() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let listed = attention_list_fixture(
+        vec![],
+        json!({"open": 0, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 0, "shown": 0, "total": 0}),
+    );
+    let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
+    scenario["actions"] = json!([{
+        "type": "tool-result",
+        "toolResult": scenario["toolResult"].clone()
+    }]);
+    let report = run_split_app_host_scenario(&node, &asset, &scenario);
+    let names = report["serverToolCalls"]
+        .as_array()
+        .expect("tool calls")
+        .iter()
+        .filter_map(|call| call["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec![
+            "attention_list",
+            "attention_list",
+            "work_map",
+            "attention_list",
+            "attention_list",
+            "work_map"
+        ],
+        "a host-pushed projection invalidates and rereads the rail: {report}"
+    );
+}
+
+#[test]
+fn operations_durable_row_fetches_exact_work_detail_with_projected_fallback_reserved_for_toolless_hosts(
+) {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let listed = attention_list_fixture(
+        vec![],
+        json!({"open": 0, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 0, "shown": 0, "total": 0}),
+    );
+    let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
+    let entry = json!({
+        "id": "display-alias",
+        "state": "active",
+        "source": "durable",
+        "identity": {"displayTitle": "Durable work", "repository": {"path": "/repo", "label": "repo"}},
+        "titleSource": {"known": true, "value": "Durable work", "source": "identity.displayTitle"},
+        "lastProgressAt": "2026-08-22T11:00:00.000Z",
+        "detailTarget": {"subjectKind": "run", "subjectId": "run-1"},
+    });
+    scenario["toolResult"]["structuredContent"]["result"]["coverage"] =
+        json!({"total": 1, "shown": 1, "matching": 1, "truncated": false});
+    scenario["toolResult"]["structuredContent"]["result"]["queue"] = json!({
+        "groups": [{"code": "running", "label": "Running", "total": 1, "shown": 1, "entries": [entry]}]
+    });
+    scenario["toolResponses"]["work_detail"] = json!({"structuredContent": {"ok": true, "result": {
+        "schema": "forged.work-detail/1",
+        "id": "run-1",
+        "kind": "run",
+        "workRef": {"kind": "run", "id": "run-1"},
+        "identity": {"displayTitle": "Exact durable detail", "repository": {"path": "/repo", "label": "repo"}},
+        "titleSource": {"known": true, "value": "Exact durable detail", "source": "identity.displayTitle"},
+        "status": {"state": "active"},
+        "workers": {"sessions": [{"attemptId": 7}]},
+        "reviews": {"latestFindingTotal": 2},
+        "usage": {"totals": {"costUsdKnown": 1.25, "rowsMissingCost": 0}}
+    }}});
+    scenario["actions"] = json!([{"type": "click", "class": "row", "index": 0}]);
+
+    let report = run_split_app_host_scenario(&node, &asset, &scenario);
+    assert_eq!(
+        report["serverToolCalls"]
+            .as_array()
+            .and_then(|calls| calls.last()),
+        Some(&json!({
+            "name": "work_detail",
+            "arguments": {"schemaVersion": 1, "params": {"subjectKind": "run", "subjectId": "run-1"}}
+        })),
+        "durable drill-down uses the exact projection target: {report}"
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("Exact durable detail")
+            && text.contains("workers")
+            && text.contains("findings"),
+        "the drawer renders facts from Work Detail rather than only the bounded row: {report}"
     );
 }
 
@@ -2389,6 +2554,169 @@ fn operations_triage_groups_blocked_items_by_their_direct_named_blocker() {
 }
 
 #[test]
+fn operations_blocked_roots_keep_all_edges_and_collapse_unresolved_evidence() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let multi = triage_item(
+        "blocked-multi",
+        "plan-multi",
+        "blocked",
+        "Blocked on two gates",
+        "open",
+        ("2026-08-22T08:00:00.000Z", "2026-08-22T08:30:00.000Z"),
+        "Resolve both blockers",
+    );
+    let mut event_only = triage_item(
+        "blocked-event",
+        "unused-bead",
+        "blocked",
+        "Event-only evidence",
+        "open",
+        ("2026-08-22T08:00:00.000Z", "2026-08-22T08:30:00.000Z"),
+        "Inspect settlement evidence",
+    );
+    event_only["evidenceRefs"] = json!([{"kind": "event", "id": "event-1"}]);
+    let missing_node = triage_item(
+        "blocked-missing",
+        "plan-missing",
+        "blocked",
+        "Blocker outside bounded map",
+        "open",
+        ("2026-08-22T08:00:00.000Z", "2026-08-22T08:30:00.000Z"),
+        "Open a wider map",
+    );
+    let listed = attention_list_fixture(
+        vec![json!({
+            "condition": "blocked",
+            "classification": "symptom",
+            "total": 3,
+            "shown": 3,
+            "oldestOpenedAt": "2026-08-22T08:00:00.000Z",
+            "items": [multi, event_only, missing_node]
+        })],
+        json!({"open": 3, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 3, "shown": 3, "total": 3}),
+    );
+    let node_for = |id: &str, title: &str| {
+        json!({
+            "workRef": {"schema": "forged.work-ref/1", "kind": "plan", "id": id},
+            "source": "live-plan",
+            "titleSource": {"known": true, "value": title, "source": "beads.title", "beadId": id}
+        })
+    };
+    let edge = |source: &str, target: &str| {
+        json!({
+            "source": {"schema": "forged.work-ref/1", "kind": "plan", "id": source},
+            "target": {"schema": "forged.work-ref/1", "kind": "plan", "id": target},
+            "kind": "blocks",
+            "contextOnly": false
+        })
+    };
+    let map = empty_work_map(
+        vec![
+            node_for("root-a", "Release gate A"),
+            node_for("root-b", "Release gate B"),
+        ],
+        vec![
+            edge("plan-multi", "root-a"),
+            edge("plan-multi", "root-b"),
+            edge("plan-missing", "outside-map"),
+        ],
+    );
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, map, json!("absent")),
+    );
+    let text = report["text"].to_string();
+    assert!(text.contains("3 blocked on 2 root causes"), "{report}");
+    let roots = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| entry["class"] == json!("symptom-root"))
+        .map(|entry| entry["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots,
+        vec!["Release gate A · 1 blocked", "Release gate B · 1 blocked"],
+        "one blocked item retains both direct blockers: {report}"
+    );
+    assert_eq!(
+        report["nodes"]
+            .as_array()
+            .expect("rendered nodes")
+            .iter()
+            .filter(|entry| entry["class"] == json!("symptom-unresolved"))
+            .map(|entry| entry["text"].as_str().unwrap_or_default())
+            .collect::<Vec<_>>(),
+        vec!["Root cause unavailable · 2 blocked"],
+        "event-only and out-of-map evidence collapse outside the root count: {report}"
+    );
+}
+
+#[test]
+fn operations_blocked_root_lines_are_capped_and_reconciled() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let blocked = (0..7)
+        .map(|index| {
+            triage_item(
+                &format!("blocked-{index}"),
+                &format!("plan-{index}"),
+                "blocked",
+                &format!("Blocked {index}"),
+                "open",
+                ("2026-08-22T08:00:00.000Z", "2026-08-22T08:30:00.000Z"),
+                "Resolve blocker",
+            )
+        })
+        .collect::<Vec<_>>();
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "blocked", "classification": "symptom", "total": 7, "shown": 7, "oldestOpenedAt": "2026-08-22T08:00:00.000Z", "items": blocked}),
+        ],
+        json!({"open": 7, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 7, "shown": 7, "total": 7}),
+    );
+    let nodes = (0..7)
+        .map(|index| json!({
+            "workRef": {"schema": "forged.work-ref/1", "kind": "plan", "id": format!("root-{index}")},
+            "source": "live-plan",
+            "titleSource": {"known": true, "value": format!("Root {index}"), "source": "beads.title"}
+        }))
+        .collect::<Vec<_>>();
+    let edges = (0..7)
+        .map(|index| json!({
+            "source": {"schema": "forged.work-ref/1", "kind": "plan", "id": format!("plan-{index}")},
+            "target": {"schema": "forged.work-ref/1", "kind": "plan", "id": format!("root-{index}")},
+            "kind": "blocks",
+            "contextOnly": false
+        }))
+        .collect::<Vec<_>>();
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, empty_work_map(nodes, edges), json!("absent")),
+    );
+    let root_lines = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| entry["class"] == json!("symptom-root"))
+        .count();
+    assert_eq!(root_lines, 5, "root lines stay bounded: {report}");
+    assert!(
+        report["text"]
+            .to_string()
+            .contains("5 of 7 root causes shown"),
+        "the bound is explicit: {report}"
+    );
+}
+
+#[test]
 fn operations_triage_reconciles_client_and_server_truncation() {
     let Some(node) = require_node() else { return };
     let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -2440,6 +2768,77 @@ fn operations_triage_reconciles_client_and_server_truncation() {
     assert!(
         text.contains("2 of 4 blocked"),
         "server group truncation is stated: {report}"
+    );
+}
+
+#[test]
+fn operations_active_decisions_lead_the_bounded_recent_settlement_feed() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let active = triage_item(
+        "active-decision",
+        "active-bead",
+        "input-required",
+        "Active decision must remain visible",
+        "open",
+        ("2026-08-22T10:00:00.000Z", "2026-08-22T10:30:00.000Z"),
+        "Answer active decision",
+    );
+    let settled = (0..20)
+        .map(|index| {
+            triage_item(
+                &format!("settled-{index}"),
+                &format!("settled-bead-{index}"),
+                "merge-approval",
+                &format!("Settled decision {index}"),
+                "resolved",
+                (
+                    "2026-08-01T08:00:00.000Z",
+                    &format!("2026-08-22T09:{index:02}:00.000Z"),
+                ),
+                "Review settlement",
+            )
+        })
+        .collect::<Vec<_>>();
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "merge-approval", "classification": "decision", "total": 20, "shown": 20, "oldestOpenedAt": "2026-08-01T08:00:00.000Z", "items": settled}),
+            json!({"condition": "input-required", "classification": "decision", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-22T10:00:00.000Z", "items": [active]}),
+        ],
+        json!({"open": 1, "acknowledged": 0, "resolved": 20, "decisions": 21, "symptoms": 0, "shown": 21, "total": 21}),
+    );
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent")),
+    );
+    let decisions = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| {
+            entry["class"]
+                .as_str()
+                .is_some_and(|class| class.contains("decision-row"))
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        decisions.len(),
+        12,
+        "the client decision cap still applies: {report}"
+    );
+    assert_eq!(
+        decisions[0]["childText"][1],
+        json!("Active decision must remain visible"),
+        "resolved history cannot displace active work: {report}"
+    );
+    assert!(
+        report["text"]
+            .to_string()
+            .contains("12 of 21 decisions shown"),
+        "the combined active plus settlement bound reconciles: {report}"
     );
 }
 
