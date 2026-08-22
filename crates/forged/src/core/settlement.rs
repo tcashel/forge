@@ -114,6 +114,16 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
 /// The supervisor retry pass instead passes the custody epoch RECORDED in
 /// the pending payload, so a later claim-next's live frontier claim is
 /// never adopted by an old settlement's retry.
+///
+/// Residual window, accepted: holder strings cannot name epochs, so a
+/// custody change to the SAME string between the identity read and the
+/// CAS write — a released-then-re-claimed frontier claim, or a repeated
+/// `run stop` for the same run whose earlier settlement is still pending —
+/// is indistinguishable here. The ledger bounds it from both sides: the
+/// retry pass's charge and succeeded appends are fenced on the pending
+/// event still heading the stream, and every bd write is CAS-guarded on
+/// the exact holder, so the window needs a byte-identical claim taken
+/// while a terminal run's settlement is still pending.
 pub(super) async fn settle_bead(
     ctx: &Ctx,
     run_id: &str,
@@ -268,8 +278,10 @@ pub(crate) async fn settle(
     // (`observedHolder`), because the retry pass discriminates custody
     // epochs by that recorded data, never by the live holder string. When
     // the resolution itself fails — the same bd outage that pends — the
-    // field is omitted and the retry pass falls back to the conservative
-    // frontier-is-foreign rule.
+    // payload marks `observedHolderUnresolved` instead: a failed resolution
+    // is not a legacy non-record, and the retry pass re-resolves it on a
+    // later successful read rather than parking conservative-foreign
+    // forever.
     let (settled, observed_holder) =
         match lease_identity(&ctx.config.bd_config(), &run.bead_id, run_id).await {
             Ok(actor) => (
@@ -290,8 +302,9 @@ pub(crate) async fn settle(
                 "pending": true,
                 "error": error.to_string(),
             });
-            if let Some(holder) = observed_holder {
-                pending["observedHolder"] = json!(holder);
+            match observed_holder {
+                Some(holder) => pending["observedHolder"] = json!(holder),
+                None => pending["observedHolderUnresolved"] = json!(true),
             }
             let event_run = run_id.to_owned();
             let event = pending.clone();

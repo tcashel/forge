@@ -372,6 +372,7 @@ fn every_failure_after_a_successful_claim_releases_the_claim_token() {
 
     let sites = [
         "bead-settlement.wake-deadline",
+        "bead-settlement.mutation-lease-deadline",
         "bead-settlement.charge",
         "bead-settlement.get-run",
         "bead-settlement.mutation",

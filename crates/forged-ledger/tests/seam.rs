@@ -7,7 +7,8 @@ use std::sync::Arc;
 
 use forged_ledger::{
     default_db_path, AttemptState, ClaimedAttempt, EffectClass, Ledger, LedgerError, NewPacket,
-    NewRun, NewUsage, OperationOutcome, OperationState, RunState, SlotOutcome, SpecFence,
+    NewRun, NewUsage, OperationOutcome, OperationState, RetryErrorUpdate, RunState, SlotOutcome,
+    SpecFence,
 };
 use forged_types::{
     ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, RunId, Stage,
@@ -448,9 +449,34 @@ fn bead_settlement_seam_members_are_consumable() {
                    "settled": false, "pending": true, "error": "still held", "attempt": 1}),
         )
         .expect("append_bead_settlement_pending_if_pending"));
+    // A charge for a superseded pending event refuses at the stream head.
+    ledger
+        .charge_bead_settlement_retry(
+            "run-settle",
+            "seam-token",
+            "2030-01-01T00:00:30.000000000Z",
+            "2030-01-01T00:08:00.000000000Z",
+            pending.event_id,
+        )
+        .expect_err("charge refuses once its pending event is superseded");
     assert!(ledger
-        .finish_bead_settlement_retry("run-settle", "seam-token", Some("still held".to_owned()))
+        .finish_bead_settlement_retry(
+            "run-settle",
+            "seam-token",
+            RetryErrorUpdate::Set("still held".to_owned())
+        )
         .expect("finish_bead_settlement_retry"));
+    // A failed probe read defers the wake without touching observations.
+    ledger
+        .defer_bead_settlement_probe("run-settle", "2030-01-01T00:02:00.000000000Z", 120)
+        .expect("defer_bead_settlement_probe");
+    // The other two RetryErrorUpdate arms are addressable at the seam.
+    assert!(!ledger
+        .finish_bead_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Keep)
+        .expect("finish keep (already released)"));
+    assert!(!ledger
+        .finish_bead_settlement_retry("run-settle", "seam-token", RetryErrorUpdate::Clear)
+        .expect("finish clear (already released)"));
 
     // Every BeadSettlementRetryRow field.
     let row = ledger

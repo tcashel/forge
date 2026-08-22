@@ -572,13 +572,30 @@ fn unrecorded_frontier_custody_is_foreign_and_never_mutated() {
 fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
     let env = TestEnv::new("bsr-stop-frontier");
     env.forged(&["init"]);
+    let bead = "bead-bsr-stop-frontier";
+    // The REAL claim-next flow, not a fabricated assignee: the fresh
+    // frontier bead is claimed under forged:frontier:0 and that identity is
+    // the run's whole-run lease end to end.
+    env.seed_frontier(bead);
+    let (code, claimed) = env.forged(&[
+        "claim-next",
+        "--holder",
+        "worker-frontier",
+        "--idempotency-key",
+        "op:claim_next:bsr-stop-frontier",
+    ]);
+    assert_eq!(code, 0, "claim-next: {claimed}");
+    assert_eq!(claimed["result"]["claimed"]["bead_id"], json!(bead));
+    assert_eq!(
+        env.assignee(bead).as_deref(),
+        Some(FRONTIER),
+        "the real claim-next claim holds the frontier identity"
+    );
+    // A fresh frontier claim mints custody, not a run row — that arrives at
+    // run start. Only the run row is fabricated; the custody under test came
+    // through the real claim path.
     let run = "bsr-stop-frontier";
-    let bead = format!("bead-{run}");
     fabricate_run(&env, run);
-    // The whole-run lease identity is the frontier claim adopted from
-    // claim-next: run stop must settle under it, not the derived holder.
-    env.set_bead_field(&bead, "status", "in_progress");
-    env.set_assignee(&bead, FRONTIER);
 
     let sha = "e".repeat(40);
     let (code, stopped) = env.forged(&[
@@ -604,7 +621,7 @@ fn run_stop_settles_a_frontier_claimed_run_under_the_frontier_identity() {
     assert_eq!(stopped["result"]["bead"]["closed"], json!(true));
     assert_eq!(stopped["result"]["bead"]["released"], json!(true));
 
-    let closes: Vec<String> = mutation_calls(&env, &bead)
+    let closes: Vec<String> = mutation_calls(&env, bead)
         .into_iter()
         .filter(|call| call.contains("--status closed"))
         .collect();
@@ -629,19 +646,75 @@ fn a_landed_promise_over_an_open_unassigned_bead_takes_guarded_custody_then_clos
     let env = TestEnv::new("bsr-unassigned");
     env.forged(&["init"]);
 
-    // The blocked→accept-risk→landed live repro: the blocked settlement
-    // released the claim, then the landed stop pended over an open,
-    // unassigned bead.
+    // The blocked→accept-risk→landed live repro, driven through the REAL
+    // stop operations: the blocked settlement releases the claim, then the
+    // landed stop pends over the open, unassigned bead it left behind.
     let run = "bsr-unassigned";
-    let bead = seed_pending_derived(
-        &env,
-        run,
-        RunOutcome::Landed,
-        "delivery verified",
-        "bead is open and unassigned",
-    );
-    env.set_bead_field(&bead, "status", "open");
+    let bead = format!("bead-{run}");
     let expected = format!("forged:{bead}:0");
+    fabricate_run(&env, run);
+    env.set_bead_field(&bead, "status", "in_progress");
+    env.set_assignee(&bead, &expected);
+    let (code, blocked) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "blocked",
+        "--reason",
+        "review budget exhausted after 2 rounds with verdict requestChanges",
+    ]);
+    assert_eq!(code, 0, "blocked stop: {blocked}");
+    assert_eq!(
+        env.assignee(&bead),
+        None,
+        "the blocked settlement released the claim: {blocked}"
+    );
+    // The review-exhaustion evidence accept-risk requires is protocol
+    // state, not settlement state — the one fabricated precondition.
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(run),
+            "run.protocol-terminal",
+            json!({"terminal": {"reviewBudgetExhausted": {
+                "reviewRounds": 2, "finalVerdict": "requestChanges"}}}),
+        )
+        .expect("protocol terminal");
+    ledger.close().expect("close");
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        run,
+        "--accepted-by",
+        "operator",
+        "--rationale",
+        "operator remediated the findings on the branch",
+    ]);
+    assert_eq!(code, 0, "accept-risk: {accepted}");
+    let sha = "a".repeat(40);
+    let (code, landed) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "landed",
+        "--reason",
+        "operator merged after accept-risk",
+        "--pr",
+        "121",
+        "--sha",
+        &sha,
+    ]);
+    assert_eq!(code, 0, "landed stop: {landed}");
+    assert_eq!(
+        landed["result"]["bead"]["pending"],
+        json!(true),
+        "the held close refuses the unassigned bead and pends: {landed}"
+    );
 
     // A second landed pending whose bead a stranger holds still refuses.
     let thief_run = "bsr-unassigned-thief";
@@ -655,6 +728,12 @@ fn a_landed_promise_over_an_open_unassigned_bead_takes_guarded_custody_then_clos
     env.set_bead_field(&thief_bead, "status", "in_progress");
     env.set_assignee(&thief_bead, "forged:thief:0");
 
+    // The real stops above logged their own refused closes; the assertions
+    // below count only what the retry pass adds.
+    let closes_before = mutation_calls(&env, &bead)
+        .into_iter()
+        .filter(|call| call.contains("--status closed"))
+        .count();
     let report = supervise_once(&env);
     let action = settlement_action(&report, run);
     assert_eq!(action["action"], json!("retried"), "{report}");
@@ -674,16 +753,30 @@ fn a_landed_promise_over_an_open_unassigned_bead_takes_guarded_custody_then_clos
         .into_iter()
         .filter(|call| call.contains("--status closed"))
         .collect();
-    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert_eq!(closes.len(), closes_before + 1, "{closes:?}");
     assert!(
-        closes[0].contains(&format!("--if-assignee {expected}")),
+        closes
+            .last()
+            .expect("retry close")
+            .contains(&format!("--if-assignee {expected}")),
         "the close stays the guarded held close: {closes:?}"
     );
     assert_eq!(env.assignee(&bead), None);
+    // The blocked and accepted-risk settlements each recorded their own
+    // succeeded; the retry's convergence is the third and the stream head,
+    // so the run no longer discovers as pending.
     assert_eq!(
         settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
-        1
+        3
     );
+    let ledger = env.ledger();
+    let still_pending = ledger
+        .list_pending_bead_settlements()
+        .expect("discovery")
+        .into_iter()
+        .any(|row| row.run_id == run);
+    ledger.close().expect("close");
+    assert!(!still_pending, "the landed promise no longer pends");
     assert_eq!(retry_row(&env, run).expect("row").used, 1);
 
     // The stranger-held bead refused: no claim was even attempted.
@@ -1001,6 +1094,152 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
 /// `now` in the ledger's own timestamp shape, for lexicographic comparison.
 fn support_now() -> String {
     jiff::Timestamp::now().to_string()
+}
+
+#[test]
+fn a_failed_probe_read_defers_the_wake_on_the_decaying_schedule() {
+    let env = TestEnv::new("bsr-probe-outage");
+    env.forged(&["init"]);
+    let run = "bsr-probe-outage";
+    let bead = seed_pending_derived(
+        &env,
+        run,
+        RunOutcome::Landed,
+        "delivery verified",
+        "bd unreachable",
+    );
+    env.set_bd_show_unreachable(true);
+
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("probe-failed"), "{action}");
+    assert!(action["nextProbeAt"].is_string(), "{action}");
+    let row = retry_row(&env, run).expect("the deferral upserts the row");
+    assert_eq!(
+        row.probe_interval_s,
+        Some(60),
+        "first deferral is the floor"
+    );
+    assert!(
+        row.probe_wake_at.expect("deferred wake").as_str() > support_now().as_str(),
+        "the failed read still parks the row"
+    );
+    assert_eq!(row.used, 0, "an outage charges nothing");
+
+    // Still down but not yet due: the pass skips the row entirely, so a
+    // batch of unreadable rows can no longer starve later settlements.
+    let report = supervise_once(&env);
+    assert!(maybe_settlement_action(&report, run).is_none(), "{report}");
+
+    // Due again and still down: the deferral doubles.
+    rewind_probe(&env, run);
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("probe-failed"), "{action}");
+    assert_eq!(
+        retry_row(&env, run).expect("row").probe_interval_s,
+        Some(120)
+    );
+
+    // bd returns and the bead is already settled: normal convergence.
+    env.set_bd_show_unreachable(false);
+    env.set_bead_field(&bead, "status", "closed");
+    rewind_probe(&env, run);
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("converged"), "{action}");
+}
+
+#[test]
+fn a_settled_retry_clears_the_stored_error() {
+    let env = TestEnv::new("bsr-clear-error");
+    env.forged(&["init"]);
+    let run = "bsr-clear-error";
+    let bead = seed_pending_derived(
+        &env,
+        run,
+        RunOutcome::Landed,
+        "delivery verified",
+        "bd refused the close",
+    );
+    env.set_bead_field(&bead, "status", "in_progress");
+    env.set_assignee(&bead, "forged:thief:0");
+
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("retry-failed"), "{action}");
+    assert!(
+        retry_row(&env, run).expect("row").last_error.is_some(),
+        "a failed attempt records its error"
+    );
+
+    // Custody returns to the expected assignee; the settled retry clears
+    // the stale error with the claim instead of preserving it forever.
+    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    rewind_wake(&env, run);
+    rewind_probe(&env, run);
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("retried"), "{action}");
+    assert_eq!(
+        retry_row(&env, run).expect("row").last_error,
+        None,
+        "a settled retry clears the stored error"
+    );
+}
+
+#[test]
+fn an_unresolved_pend_time_epoch_is_re_resolved_and_stamped() {
+    let env = TestEnv::new("bsr-unresolved");
+    env.forged(&["init"]);
+    let run = "bsr-unresolved";
+    let bead = format!("bead-{run}");
+    fabricate_run(&env, run);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            run,
+            RunOutcome::Landed,
+            "delivery verified".to_owned(),
+            Some(129),
+            Some("d".repeat(40)),
+            None,
+        )
+        .expect("settle run");
+    // The pend-time resolution failed (the same bd outage that pended), so
+    // the payload carries the unresolved marker instead of a holder.
+    let mut payload = pending_payload(&bead, "landed", "bd unreachable at stop", None);
+    payload["observedHolderUnresolved"] = json!(true);
+    ledger
+        .append_event(Some(run), "run.bead-settlement.pending", payload)
+        .expect("pending event");
+    ledger.close().expect("close");
+    env.set_bead_field(&bead, "status", "in_progress");
+    env.set_assignee(&bead, FRONTIER);
+
+    // First pass: the epoch is re-resolved from the live lease and stamped
+    // durably; nothing is probed, charged, or mutated.
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("epoch-recorded"), "{action}");
+    assert_eq!(action["observedHolder"], json!(FRONTIER));
+    let pendings = settlement_events(&env, run, "run.bead-settlement.pending");
+    let stamped = pendings.last().expect("stamped pending");
+    assert_eq!(stamped["observedHolder"], json!(FRONTIER), "{stamped}");
+    assert!(
+        stamped.get("observedHolderUnresolved").is_none(),
+        "{stamped}"
+    );
+    assert!(mutation_calls(&env, &bead).is_empty());
+    assert!(retry_row(&env, run).is_none_or(|row| row.used == 0));
+
+    // Second pass: the recorded frontier epoch retries and closes under the
+    // frontier identity — the machine repair path re-resolution restores.
+    let action = settlement_action(&supervise_once(&env), run);
+    assert_eq!(action["action"], json!("retried"), "{action}");
+    let closes: Vec<String> = mutation_calls(&env, &bead)
+        .into_iter()
+        .filter(|call| call.contains("--status closed"))
+        .collect();
+    assert_eq!(closes.len(), 1, "{closes:?}");
+    assert!(
+        closes[0].contains(&format!("--actor {FRONTIER}")),
+        "the recorded epoch settles under the frontier identity: {closes:?}"
+    );
 }
 
 #[test]

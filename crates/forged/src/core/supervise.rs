@@ -87,7 +87,9 @@ impl Drop for ProjectionPassTask {
 /// pass's handle has finished (a non-blocking poll) and NEVER awaits a
 /// running one; the tick report carries the last COMPLETED pass's report.
 /// `supervise --once` joins the pass fully, so single-tick runs stay
-/// deterministic and a pass failure still fails the tick that observes it.
+/// deterministic; a pass failure is folded into the report it carries,
+/// never propagated — supervision and admission outlive any settlement
+/// wedge.
 /// An abort on drop is equivalent to a crash: the persisted charge and
 /// claim lease are the recovery evidence.
 pub(super) struct BeadSettlementPass {
@@ -106,13 +108,13 @@ impl BeadSettlementPass {
     /// Harvest a FINISHED pass without blocking, then spawn a new one when
     /// idle. A pass still running is left alone: no second pass spawns
     /// while one runs, and the tick never waits.
-    async fn poll(&mut self, ctx: &Ctx) -> Result<(), Failure> {
+    async fn poll(&mut self, ctx: &Ctx) {
         if self
             .handle
             .as_ref()
             .is_some_and(tokio::task::JoinHandle::is_finished)
         {
-            self.harvest().await?;
+            self.harvest().await;
         }
         if self.handle.is_none() {
             let pass_ctx = Ctx {
@@ -123,28 +125,33 @@ impl BeadSettlementPass {
                 super::bead_settlement::reconcile(&pass_ctx).await
             }));
         }
-        Ok(())
     }
 
     /// Join the current pass to completion — the `--once` determinism seam.
-    async fn join(&mut self) -> Result<(), Failure> {
-        self.harvest().await
+    async fn join(&mut self) {
+        self.harvest().await;
     }
 
-    async fn harvest(&mut self) -> Result<(), Failure> {
+    /// Fold the finished pass into the report — NEVER a propagated error.
+    /// A pass failure or panic is a per-pass fact the next tick's report
+    /// carries; propagating it would let a settlement wedge skip due-work
+    /// claiming or terminate long-running supervision, the exact coupling
+    /// the decoupled pass exists to prevent.
+    async fn harvest(&mut self) {
         let Some(handle) = self.handle.take() else {
-            return Ok(());
+            return;
         };
         self.last_report = match handle.await {
             Ok(Ok(report)) => report,
-            Ok(Err(failure)) => return Err(failure),
-            Err(error) => {
-                return Err(Failure::internal(format!(
-                    "bead settlement task failed: {error}"
-                )))
-            }
+            Ok(Err(failure)) => json!({
+                "schema": "forged.bead-settlement.report/1",
+                "error": failure.to_string(),
+            }),
+            Err(error) => json!({
+                "schema": "forged.bead-settlement.report/1",
+                "error": format!("bead settlement task failed: {error}"),
+            }),
         };
-        Ok(())
     }
 
     fn report(&self) -> Value {
@@ -909,7 +916,7 @@ pub(super) async fn tick(
     // retries live inside the pass. It runs beside the tick, decoupled from
     // the tick join, never in front of due-work claiming — see
     // [`BeadSettlementPass`].
-    settlement.poll(ctx).await?;
+    settlement.poll(ctx).await;
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
     let cleanup = super::herdr_ownership::reconcile(ctx).await?;
@@ -1082,7 +1089,7 @@ pub(super) async fn tick(
     }
     let projection = projection_task.finish().await;
     if join_settlement {
-        settlement.join().await?;
+        settlement.join().await;
     }
     let bead_settlement = settlement.report();
     let wake_now = now_iso();

@@ -47,14 +47,14 @@
 //! tick, decoupled from it — see `BeadSettlementPass` in `supervise`.
 
 use forged_beads::IssueSummary;
-use forged_ledger::{PendingBeadSettlementRow, RunOutcome};
+use forged_ledger::{PendingBeadSettlementRow, RetryErrorUpdate, RunOutcome};
 use serde_json::{json, Value};
 
 use crate::config::now_iso;
 
 use super::settlement::{self, Settlement};
 use super::supervise::deadline_after;
-use super::{on_ledger, run_holder, Ctx, Failure, FRONTIER_HOLDER};
+use super::{lease_identity, on_ledger, run_holder, Ctx, Failure, FRONTIER_HOLDER};
 
 const REPORT_SCHEMA: &str = "forged.bead-settlement.report/1";
 const CLAIM_LEASE_SECONDS: u64 = 60;
@@ -254,7 +254,6 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         .get("observedHolder")
         .and_then(Value::as_str)
         .map(str::to_owned);
-    let frontier_recorded = observed_holder.as_deref() == Some(FRONTIER_HOLDER);
 
     // Episode watermark: a pending event newer than the row's stamp can
     // only be a fresh run-stop settlement episode — every charge and every
@@ -268,16 +267,57 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         })
         .await?
     };
+    // Every report entry from here on states whether this discovery reset
+    // the episode, so absence is information (a pre-reset malformed entry).
+    let entry = |action: &str| {
+        let mut map = entry(&run_id, action);
+        map.insert("episodeReset".to_owned(), json!(episode_reset));
+        map
+    };
 
     let bd = ctx.config.bd_config();
+    // A pend-time custody resolution that FAILED is not a legacy
+    // non-record: re-resolve on a later pass and stamp the result durably
+    // via a re-pend, so a frontier wedge whose stop raced a bd outage still
+    // gains its machine repair path instead of parking as
+    // conservative-foreign forever. The stamped re-pend advances the
+    // stream head, so this pass stops here and the NEXT discovery carries
+    // the recorded epoch.
+    if observed_holder.is_none()
+        && payload.get("observedHolderUnresolved") == Some(&Value::Bool(true))
+    {
+        if let Ok(actor) = lease_identity(&bd, &bead_id, &run_id).await {
+            let mut stamped = payload.clone();
+            stamped["observedHolder"] = json!(actor);
+            if let Some(map) = stamped.as_object_mut() {
+                map.remove("observedHolderUnresolved");
+            }
+            let appended = {
+                let run = run_id.clone();
+                let pending_event = pending.event_id;
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, stamped)
+                })
+                .await?
+            };
+            let mut report = entry("epoch-recorded");
+            report.insert("observedHolder".to_owned(), json!(actor));
+            report.insert("appended".to_owned(), json!(appended));
+            return Ok(Value::Object(report));
+        }
+    }
+    let frontier_recorded = observed_holder.as_deref() == Some(FRONTIER_HOLDER);
     let issue = match forged_beads::show_issue(&bd, &bead_id).await {
         Ok(issue) => issue,
         Err(error) => {
-            // A failed read is not a mutating attempt: no charge, no event,
-            // and no probe-schedule advance — the schedule decays on
-            // observations, not outages.
-            let mut report = entry(&run_id, "probe-failed");
+            // A failed read is not a mutating attempt: no charge, no event —
+            // but the wake still advances on the decaying schedule, or
+            // earliest-wake selection would keep an unreadable row in front
+            // of every pass forever and starve the rest.
+            let next_probe_at = defer_failed_probe(ctx, &run_id).await?;
+            let mut report = entry("probe-failed");
             report.insert("error".to_owned(), json!(error.to_string()));
+            report.insert("nextProbeAt".to_owned(), json!(next_probe_at));
             return Ok(Value::Object(report));
         }
     };
@@ -288,8 +328,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 Ok(true) => Probe::Converged,
                 Ok(false) => Probe::Retry,
                 Err(error) => {
-                    let mut report = entry(&run_id, "probe-failed");
+                    let next_probe_at = defer_failed_probe(ctx, &run_id).await?;
+                    let mut report = entry("probe-failed");
                     report.insert("error".to_owned(), json!(error.to_string()));
+                    report.insert("nextProbeAt".to_owned(), json!(next_probe_at));
                     return Ok(Value::Object(report));
                 }
             }
@@ -354,7 +396,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             })
             .await?
         };
-        let mut report = entry(&run_id, "converged");
+        let mut report = entry("converged");
         report.insert("appended".to_owned(), json!(appended));
         return Ok(Value::Object(report));
     }
@@ -362,9 +404,8 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         // Frontier custody this settlement never recorded: not ours to
         // mutate, not delivered enough to converge. No charge, no event —
         // the standing beads-settlement-pending attention keeps carrying it.
-        let mut report = entry(&run_id, "frontier-held");
+        let mut report = entry("frontier-held");
         report.insert("holder".to_owned(), json!(FRONTIER_HOLDER));
-        report.insert("episodeReset".to_owned(), json!(episode_reset));
         return Ok(Value::Object(report));
     }
     if let Some(row) = &standing {
@@ -387,7 +428,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 })
                 .await?
             };
-            let mut report = entry(&run_id, "exhausted");
+            let mut report = entry("exhausted");
             report.insert("attempts".to_owned(), json!(row.used));
             report.insert("stamped".to_owned(), json!(stamped));
             return Ok(Value::Object(report));
@@ -397,7 +438,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             .as_deref()
             .is_some_and(|wake| wake > now.as_str())
         {
-            let mut report = entry(&run_id, "waiting");
+            let mut report = entry("waiting");
             report.insert("nextWakeAt".to_owned(), json!(row.next_wake_at));
             return Ok(Value::Object(report));
         }
@@ -415,7 +456,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         .await?
     };
     let Some(claimed) = claimed else {
-        return Ok(Value::Object(entry(&run_id, "contended")));
+        return Ok(Value::Object(entry("contended")));
     };
 
     // The mutation runs under the RECORDED custody epoch: the holder this
@@ -434,7 +475,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
     // exist, so no exit path may return past the claim release. A ledger
     // failure after the charge may cost the charged attempt, but no exit
     // leaves a standing claim token.
-    let post_claim: Result<(serde_json::Map<String, Value>, Option<String>), Failure> = async {
+    let post_claim: Result<(serde_json::Map<String, Value>, RetryErrorUpdate), Failure> = async {
         // Re-check under the fence: another executor may have charged
         // between the standing read and this claim.
         if claimed.used >= claimed.budget
@@ -443,7 +484,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 .as_deref()
                 .is_some_and(|wake| wake > now.as_str())
         {
-            return Ok((entry(&run_id, "superseded"), None));
+            return Ok((entry("superseded"), RetryErrorUpdate::Keep));
         }
 
         let attempt = claimed.used + 1;
@@ -451,6 +492,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             return Err(Failure::internal(detail));
         }
         let wake = deadline_after(&now, backoff_seconds(claimed.used))?;
+        if let Some(detail) = crate::failpoint::injected("bead-settlement.mutation-lease-deadline")
+        {
+            return Err(Failure::internal(detail));
+        }
         let mutation_lease = deadline_after(&now, MUTATION_LEASE_SECONDS)?;
         if let Some(detail) = crate::failpoint::injected("bead-settlement.charge") {
             return Err(Failure::internal(detail));
@@ -547,11 +592,11 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     })
                     .await?
                 };
-                let mut report = entry(&run_id, "retried");
+                let mut report = entry("retried");
                 report.insert("attempt".to_owned(), json!(attempt));
                 report.insert("settled".to_owned(), json!(true));
                 report.insert("appended".to_owned(), json!(appended));
-                Ok((report, None))
+                Ok((report, RetryErrorUpdate::Clear))
             }
             Err(error) => {
                 let mut repended = json!({
@@ -588,10 +633,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     })
                     .await?;
                 }
-                let mut report = entry(&run_id, "retry-failed");
+                let mut report = entry("retry-failed");
                 report.insert("attempt".to_owned(), json!(attempt));
                 report.insert("error".to_owned(), json!(error.to_string()));
-                Ok((report, Some(error.to_string())))
+                Ok((report, RetryErrorUpdate::Set(error.to_string())))
             }
         }
     }
@@ -602,7 +647,13 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             Ok(Value::Object(report))
         }
         Err(error) => {
-            finish(ctx, &run_id, &token, Some(error.to_string())).await;
+            finish(
+                ctx,
+                &run_id,
+                &token,
+                RetryErrorUpdate::Set(error.to_string()),
+            )
+            .await;
             Err(error)
         }
     }
@@ -632,9 +683,40 @@ async fn release_held_closed(ctx: &Ctx, bead_id: &str, actor: &str) -> Result<()
     Ok(())
 }
 
+/// Advance a run's probe wake after a FAILED bd read, on the same decaying
+/// schedule an unchanged observation uses. Without this, earliest-wake
+/// selection keeps an unreadable row at the front of every pass and
+/// [`PROBE_BATCH`] of them starve every later pending settlement forever.
+/// Observations and budget are untouched; returns the recorded wake.
+async fn defer_failed_probe(ctx: &Ctx, run_id: &str) -> Result<String, Failure> {
+    let standing = {
+        let run = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.get_bead_settlement_retry(&run)
+        })
+        .await?
+    };
+    let interval = standing
+        .as_ref()
+        .and_then(|row| row.probe_interval_s)
+        .map_or(PROBE_FLOOR_SECONDS, |previous| {
+            previous.saturating_mul(2).min(PROBE_CAP_SECONDS)
+        });
+    let wake = deadline_after(&now_iso(), u64::from(interval))?;
+    {
+        let run = run_id.to_owned();
+        let wake_at = wake.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.defer_bead_settlement_probe(&run, &wake_at, interval)
+        })
+        .await?;
+    }
+    Ok(wake)
+}
+
 /// Release the per-run claim. A lost token is not an error — the lease is
 /// the crash-recovery evidence — so failures are logged, never propagated.
-async fn finish(ctx: &Ctx, run_id: &str, token: &str, last_error: Option<String>) {
+async fn finish(ctx: &Ctx, run_id: &str, token: &str, last_error: RetryErrorUpdate) {
     let run = run_id.to_owned();
     let claim_token = token.to_owned();
     if let Err(error) = on_ledger(&ctx.ledger, move |ledger| {

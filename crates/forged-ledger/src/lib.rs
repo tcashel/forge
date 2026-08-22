@@ -42,7 +42,7 @@ mod types;
 mod usage;
 mod work_identity;
 
-pub use bead_settlement::BEAD_SETTLEMENT_RETRY_BUDGET;
+pub use bead_settlement::{RetryErrorUpdate, BEAD_SETTLEMENT_RETRY_BUDGET};
 pub use error::LedgerError;
 pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
 pub use herdr_projections::{ClaimedHerdrProjectionEffect, HERDR_PROJECTION_RETRY_BUDGET};

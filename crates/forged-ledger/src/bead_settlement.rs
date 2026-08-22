@@ -27,6 +27,20 @@ const SUCCEEDED: &str = "run.bead-settlement.succeeded";
 /// that motivates the retry in the first place.
 pub const BEAD_SETTLEMENT_RETRY_BUDGET: u32 = 8;
 
+/// What a finished executor does to the retry row's stored `last_error` —
+/// explicit three-state so a converged exit cannot accidentally preserve a
+/// stale failure string and a no-op exit cannot accidentally erase one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RetryErrorUpdate {
+    /// A no-op exit (superseded, contended re-check): the row's error still
+    /// describes the last real attempt.
+    Keep,
+    /// A converged or settled exit: no failure stands any more.
+    Clear,
+    /// A failed attempt: record its error.
+    Set(String),
+}
+
 const COLUMNS: &str = "run_id, budget, used, next_wake_at, last_error, \
     claim_token, claim_lease_until, event_id, probe_wake_at, probe_interval_s, \
     last_observed_status, last_observed_assignee, last_observed_revision, \
@@ -248,10 +262,15 @@ impl Ledger {
     /// the whole post-charge bd mutation chain, not just the claim-to-charge
     /// window, or a slow chain hands a live executor's run to a rival.
     /// `pending_event_id` — the discovered pending event this attempt
-    /// settles — stamps the episode watermark in the same transaction, so a
-    /// crash after the charge can never read the already-charged episode as
-    /// a new one and reset the budget. Refuses when the token is stale or
-    /// the budget is spent.
+    /// settles — must still be the stream head INSIDE this transaction:
+    /// an executor whose episode was superseded by a fresh run-stop pending
+    /// between its discovery read and this charge refuses here, BEFORE any
+    /// bd mutation, instead of firing the stale outcome against the new
+    /// episode (the succeeded append carries the same fence for the window
+    /// after the mutation). The id also stamps the episode watermark in the
+    /// same transaction, so a crash after the charge can never read the
+    /// already-charged episode as a new one and reset the budget. Refuses
+    /// when the token is stale or the budget is spent.
     pub fn charge_bead_settlement_retry(
         &self,
         run_id: &str,
@@ -266,6 +285,19 @@ impl Ledger {
         let lease_until = lease_until.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            match latest_settlement_tx(&tx, &run_id)? {
+                Some((event_id, ref kind, _))
+                    if kind == PENDING && event_id == pending_event_id => {}
+                _ => {
+                    return Err(refused(
+                        ErrorCode::OperationInProgress,
+                        format!(
+                            "bead settlement retry for {run_id:?} was superseded by a newer \
+                             settlement episode; refusing to charge a stale outcome"
+                        ),
+                    ));
+                }
+            }
             let affected = tx.execute(
                 "UPDATE bead_settlement_retry \
                  SET used = used + 1, next_wake_at = ?1, claim_lease_until = ?2, \
@@ -300,26 +332,72 @@ impl Ledger {
     /// Release the claim taken by [`Ledger::claim_bead_settlement_retry`].
     /// A stale token is not an error — a crashed executor's lease simply
     /// expires — so the return reports whether this token still held it.
+    /// `last_error` is explicit three-state: a converged or settled exit
+    /// must CLEAR the stored error, or the row keeps reporting a failure
+    /// that no longer stands.
     pub fn finish_bead_settlement_retry(
         &self,
         run_id: &str,
         token: &str,
-        last_error: Option<String>,
+        last_error: RetryErrorUpdate,
     ) -> Result<bool, LedgerError> {
         let run_id = run_id.to_owned();
         let token = token.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let (keep, value) = match last_error {
+                RetryErrorUpdate::Keep => (true, None),
+                RetryErrorUpdate::Clear => (false, None),
+                RetryErrorUpdate::Set(error) => (false, Some(error)),
+            };
             let affected = tx.execute(
                 "UPDATE bead_settlement_retry \
                  SET claim_token = NULL, claim_lease_until = NULL, \
-                     last_error = CASE WHEN ?1 IS NULL THEN last_error ELSE ?1 END, \
-                     updated_at = ?2 \
-                 WHERE run_id = ?3 AND claim_token = ?4",
-                rusqlite::params![last_error, now_iso(), run_id, token],
+                     last_error = CASE WHEN ?1 THEN last_error ELSE ?2 END, \
+                     updated_at = ?3 \
+                 WHERE run_id = ?4 AND claim_token = ?5",
+                rusqlite::params![keep, value, now_iso(), run_id, token],
             )?;
             tx.commit()?;
             Ok(affected == 1)
+        })
+    }
+
+    /// Advance one run's probe wake without touching its observation or
+    /// budget columns — the deferral for a FAILED probe read. Earliest-wake
+    /// selection would otherwise keep an unreadable row at the front of
+    /// every pass forever, starving later pending settlements; a failed
+    /// read defers on the same decaying schedule an unchanged observation
+    /// does. Upserts so a row that has never been probed still defers.
+    pub fn defer_bead_settlement_probe(
+        &self,
+        run_id: &str,
+        probe_wake_at: &str,
+        probe_interval_s: u32,
+    ) -> Result<(), LedgerError> {
+        let run_id = run_id.to_owned();
+        let probe_wake_at = probe_wake_at.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO bead_settlement_retry \
+                   (run_id, budget, used, probe_wake_at, probe_interval_s, \
+                    created_at, updated_at) \
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5, ?5) \
+                 ON CONFLICT(run_id) DO UPDATE SET \
+                   probe_wake_at = excluded.probe_wake_at, \
+                   probe_interval_s = excluded.probe_interval_s, \
+                   updated_at = excluded.updated_at",
+                rusqlite::params![
+                    run_id,
+                    i64::from(BEAD_SETTLEMENT_RETRY_BUDGET),
+                    probe_wake_at,
+                    i64::from(probe_interval_s),
+                    now_iso(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -614,6 +692,14 @@ mod tests {
         let second = Ledger::open(&path).expect("second handle");
         let now = "2030-01-01T00:00:00.000000000Z";
         let lease = "2030-01-01T00:01:00.000000000Z";
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("lease held"))
+            .expect("pending");
+        let pending_event = ledger
+            .list_pending_bead_settlements()
+            .expect("discovery")
+            .remove(0)
+            .event_id;
 
         let won = ledger
             .claim_bead_settlement_retry("run-retry", "tick-a", now, lease)
@@ -626,8 +712,13 @@ mod tests {
             .expect("loser")
             .is_none());
         second
-            .charge_bead_settlement_retry("run-retry", "tick-b", lease, lease, 1)
+            .charge_bead_settlement_retry("run-retry", "tick-b", lease, lease, pending_event)
             .expect_err("a stale token must not charge");
+        // The stream-head fence: an executor whose discovered pending is no
+        // longer current refuses BEFORE any bd mutation could fire.
+        ledger
+            .charge_bead_settlement_retry("run-retry", "tick-a", lease, lease, pending_event - 1)
+            .expect_err("a superseded episode must not charge");
 
         let mutation_lease = "2030-01-01T00:08:00.000000000Z";
         let charged = ledger
@@ -636,7 +727,7 @@ mod tests {
                 "tick-a",
                 "2030-01-01T00:00:30.000000000Z",
                 mutation_lease,
-                1,
+                pending_event,
             )
             .expect("charge");
         assert_eq!(charged.used, 1);
@@ -655,7 +746,11 @@ mod tests {
             "the charge stamps the episode watermark transactionally"
         );
         assert!(ledger
-            .finish_bead_settlement_retry("run-retry", "tick-a", Some("still held".to_owned()))
+            .finish_bead_settlement_retry(
+                "run-retry",
+                "tick-a",
+                RetryErrorUpdate::Set("still held".to_owned())
+            )
             .expect("finish"));
         let released = ledger
             .get_bead_settlement_retry("run-retry")
@@ -676,11 +771,11 @@ mod tests {
             .expect("free row reclaims");
         for _ in reclaimed.used..reclaimed.budget {
             second
-                .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, 1)
+                .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, pending_event)
                 .expect("charge within budget");
         }
         second
-            .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, 1)
+            .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, pending_event)
             .expect_err("the budget bounds mutating charges");
     }
 
