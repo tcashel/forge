@@ -245,7 +245,10 @@ fn approve_review_stops_done_with_the_standing_verdict() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
+            review_rounds: 1,
+            final_verdict: Some(Verdict::Approve),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }
@@ -323,7 +326,10 @@ fn rereview_join_stops_done_with_its_merged_verdict() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
+            review_rounds: 2,
+            final_verdict: Some(Verdict::Approve),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }
@@ -359,7 +365,10 @@ fn failing_gate_still_advances_to_push_then_draftpr_then_done() {
     assert_eq!(
         advance(&done),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
+            review_rounds: 1,
+            final_verdict: Some(Verdict::Approve),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }

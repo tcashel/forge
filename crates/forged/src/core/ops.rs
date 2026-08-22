@@ -1053,14 +1053,15 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
     };
-    // Exhaustion normally settles the run before an operator can accept its
-    // risk. Read the preserved protocol terminal (or an existing acceptance)
-    // so the evidence gate survives the stopped state projection.
+    // A terminal review failure normally settles the run before an operator
+    // can accept its risk. Read the preserved protocol terminal (or an
+    // existing acceptance) so the evidence gate survives the stopped state
+    // projection.
     let persisted_review_rounds = {
         let event_run = run_id.clone();
         match on_ledger(&ctx.ledger, move |ledger| {
             let mut accepted = None;
-            let mut exhausted = None;
+            let mut terminal_rounds = None;
             for event in ledger.list_events(Some(&event_run), 0, 4096)? {
                 let payload: Value = serde_json::from_str(&event.payload_json)?;
                 match event.kind.as_str() {
@@ -1068,15 +1069,13 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                         accepted = payload.get("reviewRounds").and_then(Value::as_u64);
                     }
                     "run.protocol-terminal" => {
-                        exhausted = payload
-                            .pointer("/terminal/reviewBudgetExhausted/reviewRounds")
-                            .and_then(Value::as_u64);
+                        terminal_rounds = risk_terminal_review_rounds(&payload).map(u64::from);
                     }
                     _ => {}
                 }
             }
             Ok(accepted
-                .or(exhausted)
+                .or(terminal_rounds)
                 .and_then(|rounds| u8::try_from(rounds).ok()))
         })
         .await
@@ -1127,10 +1126,19 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     forged_proto::NextAction::Stop(
                         forged_proto::Terminal::ReviewBudgetExhausted { review_rounds, .. },
                     ) => review_rounds,
+                    forged_proto::NextAction::Stop(forged_proto::Terminal::RemediationFailed {
+                        round,
+                        ..
+                    }) => round,
+                    forged_proto::NextAction::Stop(forged_proto::Terminal::Done {
+                        review_rounds,
+                        final_verdict,
+                        ..
+                    }) if final_verdict != Some(forged_types::Verdict::Approve) => review_rounds,
                     _ => return err_response(
                         &derive_key("run_accept_risk", Some(&run_id), Some(&accepted_by), None),
                         &Failure::invalid(
-                            "risk can be accepted only after the review round budget is exhausted",
+                            "risk can be accepted only after a terminal non-approve review outcome",
                         ),
                     ),
                 },
@@ -1188,6 +1196,42 @@ pub async fn run_accept_risk(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         },
     )
     .await
+}
+
+fn risk_terminal_review_rounds(payload: &Value) -> Option<u8> {
+    let terminal = payload.get("terminal")?;
+    if let Some(value) = terminal.get("reviewBudgetExhausted") {
+        if !is_non_approve_terminal_verdict(value) {
+            return None;
+        }
+        return value
+            .get("reviewRounds")
+            .and_then(Value::as_u64)
+            .and_then(|rounds| u8::try_from(rounds).ok());
+    }
+    if let Some(value) = terminal.get("remediationFailed") {
+        if !is_non_approve_terminal_verdict(value) {
+            return None;
+        }
+        return value
+            .get("round")
+            .and_then(Value::as_u64)
+            .and_then(|round| u8::try_from(round).ok());
+    }
+    let done = terminal.get("done")?;
+    if !is_non_approve_terminal_verdict(done) {
+        return None;
+    }
+    done.get("reviewRounds")
+        .and_then(Value::as_u64)
+        .and_then(|rounds| u8::try_from(rounds).ok())
+}
+
+fn is_non_approve_terminal_verdict(value: &Value) -> bool {
+    matches!(
+        value.get("finalVerdict"),
+        Some(Value::String(verdict)) if matches!(verdict.as_str(), "requestChanges" | "block")
+    ) || value.get("finalVerdict") == Some(&Value::Null)
 }
 
 // ----------------------------------------------------------- packet show

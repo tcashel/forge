@@ -1045,6 +1045,184 @@ fn accepted_risk_settlement_replays_exactly_and_compares_singleton_payload() {
 }
 
 #[test]
+fn remediation_failed_and_non_approve_done_are_accepted_risk_exits() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let cases = [
+        (
+            "run-risk-remediation",
+            json!({
+                "remediationFailed": {
+                    "round": 2,
+                    "finalVerdict": "requestChanges",
+                }
+            }),
+            "remediation failed in round 2 with verdict requestChanges",
+            2,
+        ),
+        (
+            "run-risk-done",
+            json!({
+                "done": {
+                    "reviewRounds": 3,
+                    "finalVerdict": "block",
+                }
+            }),
+            "protocol exhausted its review rounds with verdict block",
+            3,
+        ),
+    ];
+
+    for (id, terminal, reason, rounds) in cases {
+        let run = make_run(&ledger, id);
+        ledger
+            .append_event_kind_once(
+                &run,
+                "run.protocol-terminal",
+                json!({"schemaVersion": 1, "terminal": terminal}),
+            )
+            .expect("review terminal");
+        ledger
+            .settle_run(
+                &run,
+                RunOutcome::Blocked,
+                reason.to_owned(),
+                None,
+                None,
+                None,
+            )
+            .expect("blocked settlement");
+        let settled = ledger
+            .accept_review_risk(&run, rounds, acceptance("lead", "bounded residual risk"))
+            .expect("accept risk");
+        assert_eq!(settled.terminal_outcome, Some(RunOutcome::AcceptedRisk));
+        let accepted = ledger
+            .list_events(Some(&run), 0, 100)
+            .expect("events")
+            .into_iter()
+            .find(|event| event.kind == "forged.review.risk_accepted")
+            .expect("accepted-risk event");
+        let payload: serde_json::Value =
+            serde_json::from_str(&accepted.payload_json).expect("accepted-risk payload");
+        assert_eq!(payload["reviewRounds"], json!(rounds));
+    }
+    ledger.close().expect("close");
+}
+
+#[test]
+fn every_terminal_outcome_has_an_explicit_typed_exit() {
+    #[derive(Debug, Clone, Copy)]
+    enum TypedExit {
+        AcceptRisk,
+        Supersession,
+        LandedSettlement,
+    }
+
+    // This table is the state-machine contract. Supersession is a standing
+    // typed exit for the terminal outcomes listed here, not a transition the
+    // test discovers by probing the lattice.
+    let cases = [
+        (RunOutcome::Clean, TypedExit::LandedSettlement),
+        (RunOutcome::Blocked, TypedExit::AcceptRisk),
+        (RunOutcome::InputRequired, TypedExit::Supersession),
+        (RunOutcome::Cancelled, TypedExit::Supersession),
+        (RunOutcome::AcceptedRisk, TypedExit::LandedSettlement),
+        (RunOutcome::Superseded, TypedExit::Supersession),
+        (RunOutcome::Landed, TypedExit::LandedSettlement),
+    ];
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    for (index, (outcome, typed_exit)) in cases.into_iter().enumerate() {
+        let run = make_run(&ledger, &format!("run-typed-exit-{index}"));
+        let delivery_reason = "delivery landed";
+        let delivery_pr = u64::try_from(index).expect("small index") + 10;
+        let delivery_sha = format!("{index:040x}");
+        let superseded_reason = "replaced by a corrected run";
+        let successor = format!("successor-{index}");
+
+        match outcome {
+            RunOutcome::Blocked => block_after_review_exhaustion(&ledger, &run, 2),
+            RunOutcome::AcceptedRisk => {
+                block_after_review_exhaustion(&ledger, &run, 2);
+                ledger
+                    .accept_review_risk(&run, 2, acceptance("lead", "known containment"))
+                    .expect("prepare accepted-risk outcome");
+            }
+            RunOutcome::Landed => {
+                ledger
+                    .settle_run(
+                        &run,
+                        outcome,
+                        delivery_reason.to_owned(),
+                        Some(delivery_pr),
+                        Some(delivery_sha.clone()),
+                        None,
+                    )
+                    .expect("prepare landed outcome");
+            }
+            RunOutcome::Superseded => {
+                ledger
+                    .settle_run(
+                        &run,
+                        outcome,
+                        superseded_reason.to_owned(),
+                        None,
+                        None,
+                        Some(successor.clone()),
+                    )
+                    .expect("prepare superseded outcome");
+            }
+            RunOutcome::Clean | RunOutcome::InputRequired | RunOutcome::Cancelled => {
+                ledger
+                    .settle_run(
+                        &run,
+                        outcome,
+                        format!("prepared {}", outcome.as_str()),
+                        None,
+                        None,
+                        None,
+                    )
+                    .expect("prepare terminal outcome");
+            }
+        }
+
+        let exited = match typed_exit {
+            TypedExit::AcceptRisk => ledger
+                .accept_review_risk(&run, 2, acceptance("lead", "known containment"))
+                .expect("accept-risk exit"),
+            TypedExit::Supersession => ledger
+                .settle_run(
+                    &run,
+                    RunOutcome::Superseded,
+                    superseded_reason.to_owned(),
+                    None,
+                    None,
+                    Some(successor),
+                )
+                .expect("supersession exit"),
+            TypedExit::LandedSettlement => ledger
+                .settle_run(
+                    &run,
+                    RunOutcome::Landed,
+                    delivery_reason.to_owned(),
+                    Some(delivery_pr),
+                    Some(delivery_sha),
+                    None,
+                )
+                .expect("landed settlement exit"),
+        };
+        let expected = match typed_exit {
+            TypedExit::AcceptRisk => RunOutcome::AcceptedRisk,
+            TypedExit::Supersession => RunOutcome::Superseded,
+            TypedExit::LandedSettlement => RunOutcome::Landed,
+        };
+        assert_eq!(exited.terminal_outcome, Some(expected), "{outcome:?}");
+    }
+    ledger.close().expect("close");
+}
+
+#[test]
 fn accepted_risk_repairs_only_an_exact_legacy_torn_event() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");

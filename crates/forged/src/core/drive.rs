@@ -324,26 +324,44 @@ fn action_json(action: &NextAction) -> Value {
 /// Serialize a `Terminal` for the wire.
 pub fn terminal_json(terminal: &Terminal) -> Value {
     match terminal {
-        Terminal::Done { final_verdict } => json!({
-            "done": {"finalVerdict": final_verdict.map(verdict_str)}
+        Terminal::Done {
+            review_rounds,
+            final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
+        } => json!({
+            "done": review_terminal_json(
+                *review_rounds,
+                *final_verdict,
+                *final_verdict_is_durable,
+                *failed_review_seats,
+            )
         }),
         Terminal::ReviewBudgetExhausted {
             review_rounds,
             final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
         } => json!({
-            "reviewBudgetExhausted": {
-                "reviewRounds": review_rounds,
-                "finalVerdict": final_verdict.map(verdict_str),
-            }
+            "reviewBudgetExhausted": review_terminal_json(
+                *review_rounds,
+                *final_verdict,
+                *final_verdict_is_durable,
+                *failed_review_seats,
+            )
         }),
         Terminal::RemediationFailed {
             round,
             final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
         } => json!({
-            "remediationFailed": {
-                "round": round,
-                "finalVerdict": final_verdict.map(verdict_str),
-            }
+            "remediationFailed": remediation_terminal_json(
+                *round,
+                *final_verdict,
+                *final_verdict_is_durable,
+                *failed_review_seats,
+            )
         }),
         Terminal::SpecAmendmentProposed {
             stage_id,
@@ -375,6 +393,53 @@ pub fn terminal_json(terminal: &Terminal) -> Value {
     }
 }
 
+fn review_terminal_json(
+    review_rounds: u8,
+    final_verdict: Option<Verdict>,
+    final_verdict_is_durable: bool,
+    failed_review_seats: u32,
+) -> Value {
+    let mut value = json!({
+        "reviewRounds": review_rounds,
+        "finalVerdict": final_verdict.map(verdict_str),
+    });
+    add_verdict_provenance(&mut value, final_verdict_is_durable, failed_review_seats);
+    value
+}
+
+fn remediation_terminal_json(
+    round: u8,
+    final_verdict: Option<Verdict>,
+    final_verdict_is_durable: bool,
+    failed_review_seats: u32,
+) -> Value {
+    let mut value = json!({
+        "round": round,
+        "finalVerdict": final_verdict.map(verdict_str),
+    });
+    add_verdict_provenance(&mut value, final_verdict_is_durable, failed_review_seats);
+    value
+}
+
+fn add_verdict_provenance(
+    value: &mut Value,
+    final_verdict_is_durable: bool,
+    failed_review_seats: u32,
+) {
+    if failed_review_seats == 0 {
+        return;
+    }
+    let object = value.as_object_mut().expect("review terminal is an object");
+    object.insert(
+        "finalVerdictDurable".to_owned(),
+        Value::Bool(final_verdict_is_durable),
+    );
+    object.insert(
+        "failedReviewSeats".to_owned(),
+        Value::from(failed_review_seats),
+    );
+}
+
 fn verdict_str(v: Verdict) -> &'static str {
     match v {
         Verdict::Approve => "approve",
@@ -387,36 +452,56 @@ fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settle
     let (outcome, reason) = match terminal {
         Terminal::Done {
             final_verdict: Some(Verdict::Approve),
+            final_verdict_is_durable: true,
+            ..
         } => (
             forged_ledger::RunOutcome::Clean,
             "protocol completed with an approve verdict".to_owned(),
         ),
-        Terminal::Done { final_verdict } => (
+        Terminal::Done {
+            final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
+            ..
+        } => (
             forged_ledger::RunOutcome::Blocked,
-            format!(
-                "protocol exhausted its review rounds with verdict {}",
-                final_verdict.map(verdict_str).unwrap_or("unavailable")
-            ),
+            synthetic_verdict_reason(*final_verdict_is_durable, *failed_review_seats)
+                .unwrap_or_else(|| {
+                    format!(
+                        "protocol exhausted its review rounds with verdict {}",
+                        final_verdict.map(verdict_str).unwrap_or("unavailable")
+                    )
+                }),
         ),
         Terminal::ReviewBudgetExhausted {
             review_rounds,
             final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
         } => (
             forged_ledger::RunOutcome::Blocked,
-            format!(
-                "review budget exhausted after {review_rounds} rounds with verdict {}",
-                final_verdict.map(verdict_str).unwrap_or("unavailable")
-            ),
+            synthetic_verdict_reason(*final_verdict_is_durable, *failed_review_seats)
+                .unwrap_or_else(|| {
+                    format!(
+                        "review budget exhausted after {review_rounds} rounds with verdict {}",
+                        final_verdict.map(verdict_str).unwrap_or("unavailable")
+                    )
+                }),
         ),
         Terminal::RemediationFailed {
             round,
             final_verdict,
+            final_verdict_is_durable,
+            failed_review_seats,
         } => (
             forged_ledger::RunOutcome::Blocked,
-            format!(
-                "remediation failed in round {round} with verdict {}",
-                final_verdict.map(verdict_str).unwrap_or("unavailable")
-            ),
+            synthetic_verdict_reason(*final_verdict_is_durable, *failed_review_seats)
+                .unwrap_or_else(|| {
+                    format!(
+                        "remediation failed in round {round} with verdict {}",
+                        final_verdict.map(verdict_str).unwrap_or("unavailable")
+                    )
+                }),
         ),
         Terminal::SpecAmendmentProposed { stage_id, .. } => (
             forged_ledger::RunOutcome::InputRequired,
@@ -447,6 +532,15 @@ fn automatic_settlement(terminal: &Terminal) -> Option<super::settlement::Settle
         delivery_pr: None,
         delivery_sha: None,
         superseded_by: None,
+    })
+}
+
+fn synthetic_verdict_reason(
+    final_verdict_is_durable: bool,
+    failed_review_seats: u32,
+) -> Option<String> {
+    (!final_verdict_is_durable && failed_review_seats > 0).then(|| {
+        format!("verdict unavailable: {failed_review_seats} review seat(s) failed without a result")
     })
 }
 

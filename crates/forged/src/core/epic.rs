@@ -1484,7 +1484,9 @@ fn clean_slice(view: &forged_proto::RunView) -> (bool, Value) {
         || matches!(
             terminal,
             NextAction::Stop(Terminal::Done {
-                final_verdict: Some(Verdict::Approve)
+                final_verdict: Some(Verdict::Approve),
+                final_verdict_is_durable: true,
+                ..
             })
         );
     let gate_passed = view
