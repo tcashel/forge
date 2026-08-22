@@ -1630,17 +1630,40 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     };
     if let Some(owned) = unreleased {
         let generation = owned.controller_generation.unwrap_or(0);
-        return err_response(
-            &derive_key(scope.operation(), Some(&id), None, None),
-            &Failure {
-                code: ErrorCode::HostUnavailable,
-                message: format!(
-                    "{} {id} generation {generation} owns an unreleased durable Herdr pane; refusing a duplicate spawn",
-                    scope.noun()
-                ),
-                recoverable: true,
-            },
-        );
+        if owned.cleanup_state == forged_ledger::OwnedHerdrCleanupState::Attention {
+            // Attention is a TERMINAL park (the cleanup budget exhausted
+            // while the host was unreachable), so refusing here would lock
+            // submission forever. A fresh submit is operator intent that
+            // the host is back — and this submit's own spawn proves it —
+            // so the parked cleanup requeues with a fresh budget and the
+            // spawn proceeds; the pass releases the stale pane behind it.
+            let requeue = {
+                let kind = scope.desired_kind();
+                let subject_id = id.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.requeue_owned_herdr_cleanup_attention(kind, &subject_id)
+                })
+                .await
+            };
+            if let Err(error) = requeue {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                );
+            }
+        } else {
+            return err_response(
+                &derive_key(scope.operation(), Some(&id), None, None),
+                &Failure {
+                    code: ErrorCode::HostUnavailable,
+                    message: format!(
+                        "{} {id} generation {generation} owns an unreleased durable Herdr pane; refusing a duplicate spawn",
+                        scope.noun()
+                    ),
+                    recoverable: true,
+                },
+            );
+        }
     }
     let owned_generation = {
         let kind = scope.desired_kind();

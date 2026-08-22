@@ -1417,8 +1417,23 @@ mod tests {
         let path = dir.path().join("state-v20-owned.db");
         {
             let conn = rusqlite::Connection::open(&path).expect("raw database");
-            for migration in MIGRATIONS.iter().take(20) {
-                conn.execute_batch(migration).expect("seed migration");
+            // A REAL v20 operator database carries the narrow four-value
+            // cleanup_reason CHECK; the in-place edit to MIGRATION_014 only
+            // shapes fresh databases. Recover the legacy DDL from the edited
+            // text so this fixture proves the 021 REBUILD widens it.
+            let legacy_014 =
+                MIGRATIONS[13].replace("'controller-dead','orphaned-submit'", "'controller-dead'");
+            assert_ne!(
+                legacy_014, MIGRATIONS[13],
+                "the in-place migration 014 edit under test is present"
+            );
+            for (index, migration) in MIGRATIONS.iter().take(20).enumerate() {
+                if index == 13 {
+                    conn.execute_batch(&legacy_014)
+                        .expect("seed legacy migration 014");
+                } else {
+                    conn.execute_batch(migration).expect("seed migration");
+                }
             }
             conn.execute_batch(
                 "INSERT INTO work_identities (
@@ -1459,6 +1474,14 @@ mod tests {
                  PRAGMA user_version=20;",
             )
             .expect("seed v20 owned projection");
+            conn.execute(
+                "UPDATE owned_herdr_sessions SET lifecycle_state = 'owner-dead',
+                   cleanup_state = 'pending', cleanup_reason = 'orphaned-submit',
+                   next_cleanup_at = 't', cleanup_requested_at = 't'
+                 WHERE ownership_id = 'migration-owned'",
+                [],
+            )
+            .expect_err("the narrow legacy CHECK rejects the new reason before migration");
         }
 
         let ledger = Ledger::open(&path).expect("upgrade owned v20 database");

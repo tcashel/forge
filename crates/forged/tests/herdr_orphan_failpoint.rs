@@ -99,12 +99,30 @@ impl PaneNotFoundServer {
 
 impl Drop for PaneNotFoundServer {
     fn drop(&mut self) {
+        // Best-effort on every step: this Drop also runs while a test
+        // assertion unwinds, and a fixture-side panic here would abort the
+        // process and mask the real failure.
         self.stop.store(true, Ordering::SeqCst);
         if let Some(thread) = self.thread.take() {
-            thread.join().expect("join Herdr fixture");
+            let _ = thread.join();
         }
-        std::fs::remove_file(&self.socket_path).expect("remove Herdr fixture socket");
+        let _ = std::fs::remove_file(&self.socket_path);
     }
+}
+
+/// A short /tmp path, deliberately NOT under CARGO_TARGET_TMPDIR: sun_path
+/// caps a Unix socket address at 104 bytes on macOS and target tmpdir paths
+/// routinely exceed it. The pid+nonce name is collision-free and the
+/// fixture's Drop removes it best-effort.
+fn fixture_socket_path(tag: &str) -> std::path::PathBuf {
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock after epoch")
+        .as_nanos();
+    std::path::PathBuf::from(format!(
+        "/tmp/forged-{tag}-{}-{nonce}.sock",
+        std::process::id()
+    ))
 }
 
 fn start_run(env: &TestEnv, run: &str) {
@@ -249,19 +267,59 @@ fn stop_run(env: &TestEnv, run: &str) {
 }
 
 #[test]
+fn ordinary_orphan_recovery_without_a_reservation_releases_and_resubmits() {
+    let env = TestEnv::new("herdr-orphan-plain");
+    let run = "herdr-orphan-plain-run";
+    start_run(&env, run);
+    let socket = fixture_socket_path("herdr-orphan-plain");
+    let server = PaneNotFoundServer::start(&socket);
+    seed_owned_pane(&env, run, &socket);
+
+    // No orphaned reservation: the ordinary recovery branch alone must
+    // observe the pane gone, record the release evidence, and reopen
+    // submission at the next generation.
+    let (code, recovered) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "recovery tick: {recovered}");
+    let ledger = env.ledger();
+    let released = ledger
+        .get_owned_herdr_session("orphaned-submit-owner")
+        .expect("get ownership")
+        .expect("ownership row");
+    assert_eq!(
+        released.cleanup_reason,
+        Some(OwnedHerdrCleanupReason::OrphanedSubmit)
+    );
+    assert_eq!(
+        released.cleanup_release,
+        Some(OwnedHerdrCleanupRelease::PaneNotFound)
+    );
+    assert_eq!(released.cleanup_state, OwnedHerdrCleanupState::Released);
+    ledger.close().expect("close ledger");
+
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", run]);
+    assert_eq!(code, 0, "resubmit: {submitted}");
+    assert_eq!(submitted["result"]["controller"]["generation"], json!(2));
+    assert!(submitted["result"]["controller"]["pid"].is_number());
+    let methods = server.methods();
+    assert_eq!(
+        methods
+            .iter()
+            .filter(|method| method.as_str() == "pane.close")
+            .count(),
+        1,
+        "the recovery closes the orphaned pane exactly once: {methods:?}"
+    );
+    stop_run(&env, run);
+}
+
+#[test]
 fn crash_after_probe_recovers_then_expired_reservation_resubmits_at_next_generation() {
     let env = TestEnv::new("herdr-orphan-failpoint");
     let run = "herdr-orphan-run";
     start_run(&env, run);
     seed_orphaned_reservation(&env, run);
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .expect("clock after epoch")
-        .as_nanos();
-    let socket = std::path::PathBuf::from(format!(
-        "/tmp/forged-herdr-orphan-{}-{nonce}.sock",
-        std::process::id()
-    ));
+    let socket = fixture_socket_path("herdr-orphan");
     let server = PaneNotFoundServer::start(&socket);
     seed_owned_pane(&env, run, &socket);
 

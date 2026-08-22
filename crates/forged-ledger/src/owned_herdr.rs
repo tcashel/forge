@@ -614,6 +614,13 @@ fn exact_controller_settled_tx(
             current.is_some_and(|(value, _)| value >= i64::from(generation))
         }
         (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::OrphanedSubmit)) => {
+            // Exact-generation absence, deliberately admitting LATER desired
+            // epochs: the pane is generation-scoped, so a successor proves
+            // this generation was abandoned and releasing its pane cannot
+            // touch the successor's. A desired row at exactly this
+            // generation means the generation is live, not orphaned. The
+            // strict at-or-above form would strand a requested cleanup the
+            // moment recovery resubmits, wedging the submit fence forever.
             current.is_none_or(|(value, _)| value != i64::from(generation))
         }
         _ => false,
@@ -974,9 +981,12 @@ impl Ledger {
                 OwnedHerdrCleanupReason::ControllerDead => current
                     .as_ref()
                     .is_some_and(|(value, _)| *value >= i64::from(generation)),
+                // Mirrors the settle-time predicate exactly — see
+                // exact_controller_settled_tx for why later epochs are
+                // deliberately admitted.
                 OwnedHerdrCleanupReason::OrphanedSubmit => current
                     .as_ref()
-                    .is_none_or(|(value, _)| *value < i64::from(generation)),
+                    .is_none_or(|(value, _)| *value != i64::from(generation)),
                 _ => false,
             };
             if !durable {
@@ -1181,6 +1191,32 @@ impl Ledger {
             } else {
                 OwnedHerdrCleanupRetry::Scheduled(row)
             })
+        })
+    }
+
+    /// Requeue every attention-parked controller cleanup for one subject.
+    /// A fresh submit is operator intent that the host is expected back, so
+    /// the exhausted budget resets and the pass retries — the submit fence
+    /// must never refuse forever on a terminal parked row. Returns how many
+    /// rows requeued.
+    pub fn requeue_owned_herdr_cleanup_attention(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<u32, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = now_iso();
+            let affected = tx.execute(
+                "UPDATE owned_herdr_sessions SET cleanup_state = 'pending', \
+                   cleanup_retry_used = 0, next_cleanup_at = ?1, updated_at = ?1 \
+                 WHERE owner_kind = 'controller' AND subject_kind = ?2 \
+                   AND subject_id = ?3 AND cleanup_state = 'attention'",
+                rusqlite::params![now, kind.as_str(), subject_id],
+            )?;
+            tx.commit()?;
+            Ok(u32::try_from(affected).unwrap_or(u32::MAX))
         })
     }
 
