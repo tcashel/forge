@@ -222,7 +222,8 @@ fn delivery_requires_the_durably_observed_exact_pr_base() {
     ledger.close().expect("close ledger");
 
     let wrong = overview(&env);
-    assert!(attention(&wrong, "attention-pr-base", "missing-evidence").is_some());
+    let gap = attention(&wrong, "attention-pr-base", "missing-evidence")
+        .expect("wrong-base missing-evidence");
     assert!(wrong["queue"]["groups"]
         .as_array()
         .expect("groups")
@@ -230,6 +231,34 @@ fn delivery_requires_the_durably_observed_exact_pr_base() {
         .find(|group| group["name"] == json!("Ready to merge"))
         .and_then(|group| group["entries"].as_array())
         .is_some_and(Vec::is_empty));
+
+    // A wrong-base delivery PR is a repairable gap, never adjudicable
+    // absence: evidence-absent refuses on this flavour of the condition.
+    let (_, refused) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-pr-base",
+        "--attention-id",
+        gap["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        gap["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "must not silence a live delivery alarm",
+    ]);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("repairable delivery"),
+        "{refused}"
+    );
 
     append(
         &env,
@@ -453,6 +482,34 @@ fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() 
         "{refused}"
     );
 
+    // The absence record demands its auditable rationale: a blank note
+    // refuses.
+    let (_, unnoted) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-evidence",
+        "--attention-id",
+        attention_id,
+        "--occurrence-id",
+        occurrence_id,
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "   ",
+    ]);
+    assert_eq!(unnoted["ok"], json!(false), "{unnoted}");
+    assert_eq!(unnoted["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        unnoted["error"]["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("nonblank note"),
+        "{unnoted}"
+    );
+
     let (code, resolved) = env.forged(&[
         "attention",
         "resolve",
@@ -604,6 +661,126 @@ fn evidence_absent_binds_to_missing_evidence_in_both_directions() {
         json!("this source-backed condition clears only through its domain transition"),
         "{refused}"
     );
+}
+
+#[test]
+fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
+    let env = TestEnv::new("forged-attention-evidence-merged");
+    env.forged(&["init"]);
+    fabricate_run(&env, "attention-merged");
+    let (packet_id, sha) = open_implement_packet(&env, "attention-merged", 0);
+    let attempt = fail_manifest_less_attempt(&env, &packet_id, &sha);
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "attention-merged",
+            forged_ledger::RunOutcome::Clean,
+            "review approved".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle clean");
+    ledger.close().expect("close ledger");
+
+    // The clean run without a delivery PR and the manifest-less attempt
+    // share one condition, so they merge into one occurrence. Adjudicating
+    // it as absent would silence the live, repairable delivery alarm.
+    let merged = attention(&overview(&env), "attention-merged", "missing-evidence")
+        .expect("merged missing-evidence");
+    assert!(
+        merged["evidenceRefs"]
+            .as_array()
+            .expect("evidence refs")
+            .iter()
+            .any(|reference| reference["kind"] == json!("event")),
+        "{merged}"
+    );
+    let (_, refused) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-merged",
+        "--attention-id",
+        merged["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        merged["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "the delivery gap is still live",
+    ]);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("repairable delivery"),
+        "{refused}"
+    );
+
+    // Recording the exact-base PR repairs the delivery gap; the surviving
+    // occurrence covers only the manifest-less attempt and is adjudicable.
+    append(
+        &env,
+        "attention-merged",
+        "proto.pr",
+        json!({
+            "schemaVersion": 1,
+            "number": 21,
+            "isDraft": true,
+            "baseRefName": env.repos.base,
+            "url": "https://example.invalid/pr/21",
+        }),
+    );
+    let repaired = overview(&env);
+    assert!(attention(&repaired, "attention-merged", "merge-approval").is_some());
+    let remaining = attention(&repaired, "attention-merged", "missing-evidence")
+        .expect("attempt-scoped missing-evidence");
+    assert_ne!(remaining["occurrenceId"], merged["occurrenceId"]);
+    assert!(
+        remaining["evidenceRefs"]
+            .as_array()
+            .expect("evidence refs")
+            .iter()
+            .all(|reference| reference["kind"] == json!("attempt")),
+        "{remaining}"
+    );
+    let (code, resolved) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-merged",
+        "--attention-id",
+        remaining["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        remaining["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "attempt predates the artifact manifest",
+    ]);
+    assert_eq!(code, 0, "{resolved}");
+    assert_eq!(resolved["ok"], json!(true), "{resolved}");
+    let ledger = env.ledger();
+    let transitions = ledger
+        .list_events_by_kind("forged.attention.resolved")
+        .expect("resolved transitions");
+    ledger.close().expect("close ledger");
+    assert_eq!(transitions.len(), 1, "one durable resolution");
+    let payload: Value =
+        serde_json::from_str(&transitions[0].payload_json).expect("transition payload");
+    assert_eq!(
+        payload["attemptIds"],
+        json!([attempt.to_string()]),
+        "{payload}"
+    );
+    assert!(attention(&overview(&env), "attention-merged", "missing-evidence").is_none());
 }
 
 #[test]

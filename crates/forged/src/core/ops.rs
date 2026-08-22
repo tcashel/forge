@@ -4240,13 +4240,14 @@ async fn control_attention(
             AttentionState::Acknowledged
         }
         AttentionControl::Resolve => {
-            if !super::attention::resolution_allowed(item.condition) {
-                return err_response(
-                    &operation_key,
-                    &Failure::invalid(
-                        "this source-backed condition clears only through its domain transition",
-                    ),
-                );
+            if !super::attention::resolution_allowed(item) {
+                let message = if item.condition == forged_types::AttentionCondition::MissingEvidence
+                {
+                    "this missing-evidence occurrence includes repairable delivery evidence and clears only through the recorded exact-base delivery PR"
+                } else {
+                    "this source-backed condition clears only through its domain transition"
+                };
+                return err_response(&operation_key, &Failure::invalid(message));
             }
             let disposition_value = match req.params.get("disposition").cloned() {
                 Some(value) => value,
@@ -4308,6 +4309,19 @@ async fn control_attention(
                 return err_response(
                     &operation_key,
                     &Failure::invalid("attention resolution note must be at most 2000 bytes"),
+                );
+            }
+            // The absence record is only auditable with its rationale; an
+            // empty note would durably claim absence while explaining
+            // nothing.
+            if disposition == AttentionResolutionDisposition::EvidenceAbsent
+                && note.trim().is_empty()
+            {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "evidence-absent requires a nonblank note stating the auditable rationale",
+                    ),
                 );
             }
             payload["disposition"] =

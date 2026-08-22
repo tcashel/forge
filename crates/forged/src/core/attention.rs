@@ -1160,15 +1160,24 @@ fn transition_state(
 
 /// Conditions for which attention itself owns explicit custody. Other
 /// conditions clear only through their authoritative domain transition.
-pub(crate) fn resolution_allowed(condition: AttentionCondition) -> bool {
-    matches!(
-        condition,
+/// Missing evidence is source-qualified, not condition-wide: only an
+/// occurrence composed entirely of manifest-less attempts is adjudicable.
+/// A clean/accepted-risk run whose delivery PR is missing or wrong-based
+/// raises the same condition from settlement evidence, but that gap is
+/// repairable — recording the exact-base PR clears it — so any occurrence
+/// carrying non-attempt evidence refuses explicit resolution.
+pub(crate) fn resolution_allowed(item: &AttentionItemV1) -> bool {
+    match item.condition {
         AttentionCondition::Quarantined
-            | AttentionCondition::MissingCost
-            | AttentionCondition::RetryExhausted
-            | AttentionCondition::ReviewerDisagreement
-            | AttentionCondition::MissingEvidence
-    )
+        | AttentionCondition::MissingCost
+        | AttentionCondition::RetryExhausted
+        | AttentionCondition::ReviewerDisagreement => true,
+        AttentionCondition::MissingEvidence => item
+            .evidence_refs
+            .iter()
+            .all(|evidence| evidence.kind == AttentionEvidenceKind::Attempt),
+        _ => false,
+    }
 }
 
 /// The two triage classes: a `decision` waits on operator judgment or

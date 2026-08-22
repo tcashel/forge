@@ -312,10 +312,13 @@ forged attention acknowledge --subject "$SUBJECT_ID" \
 Resolve only explicitly adjudicable custody conditions: `quarantined`,
 `missing-cost`, `retry-exhausted`, `reviewer-disagreement`, and
 `missing-evidence`. Missing cost accepts only `accepted-unknown` while
-pricing remains absent. Missing evidence accepts only `evidence-absent`, the
-explicit record that the evidence was never captured and cannot be
-reconstructed. Every other condition clears only through the named domain
-transition:
+pricing remains absent. Missing evidence accepts only `evidence-absent` —
+the explicit record, with a mandatory nonblank note, that the evidence was
+never captured and cannot be reconstructed — and only when every source in
+the occurrence is a manifest-less attempt. A clean or accepted-risk run
+whose delivery PR is missing or wrong-based raises the same condition but is
+repairable: record the exact-base PR instead of adjudicating absence. Every
+other condition clears only through the named domain transition:
 
 ```bash
 forged attention resolve --subject "$SUBJECT_ID" \
