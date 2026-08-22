@@ -16,6 +16,11 @@
   --warn: var(--color-text-warning, light-dark(#8b6313, #ddb04d));
   --bad: var(--color-text-danger, light-dark(#b43c31, #e87b70));
   --accent: light-dark(#167b72, #42c9b7);
+  --state-attend: light-dark(#a62f48, #ff879a);
+  --state-running: light-dark(#176f9f, #66c7f2);
+  --state-stalled: light-dark(#93610b, #e8b34f);
+  --state-landed: light-dark(#287a43, #76cf8b);
+  --state-dormant: light-dark(#6d6875, #aaa4b2);
   --sans: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
   --mono: ui-monospace, SFMono-Regular, Menlo, monospace;
 }
@@ -31,6 +36,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .sub, .muted { color: var(--muted); }
 .sub { margin-top: 4px; font-family: var(--mono); font-size: 11px; }
+.headline { margin: 0; overflow: hidden; color: var(--ink); font-size: 13px; font-weight: 500; text-overflow: ellipsis; white-space: nowrap; }
 .controls { display: flex; gap: 6px; align-items: center; }
 .health { display: flex; gap: 6px; flex-wrap: wrap; }
 .pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font-size: 11px; }
@@ -57,7 +63,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .rows { display: grid; }
 /* The display title leads. The canonical selector keeps its own column —
    demoting an id is not hiding it. */
-.row { appearance: none; width: 100%; border: 0; border-radius: 0; border-top: 1px solid var(--line); padding: 10px 11px; text-align: left; display: grid; grid-template-columns: minmax(180px,1.6fr) minmax(120px,.85fr) minmax(90px,.6fr) minmax(100px,.7fr); gap: 10px; align-items: baseline; }
+.row { appearance: none; width: 100%; border: 0; border-radius: 0; border-top: 1px solid var(--line); border-left: 4px solid transparent; padding: 10px 11px; text-align: left; display: grid; grid-template-columns: minmax(180px,1.6fr) minmax(120px,.85fr) minmax(76px,.5fr) minmax(150px,.9fr) minmax(90px,.55fr) minmax(80px,.5fr); gap: 10px; align-items: baseline; }
 .row:first-child { border-top: 0; }
 .row:hover:not(:disabled) { background: var(--panel); }
 .id { font-family: var(--mono); font-size: 11px; overflow-wrap: anywhere; }
@@ -67,6 +73,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
 .chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
 .chip--live, .chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+.chip--attend { color: var(--state-attend); }.chip--running { color: var(--state-running); }.chip--stalled { color: var(--state-stalled); }.chip--landed { color: var(--state-landed); }.chip--dormant { color: var(--state-dormant); }
+.semantic--attend { border-left-color: var(--state-attend); }.semantic--running { border-left-color: var(--state-running); }.semantic--stalled { border-left-color: var(--state-stalled); }.semantic--landed { border-left-color: var(--state-landed); }.semantic--dormant { border-left-color: var(--state-dormant); }
+.age { font-family: var(--mono); }.age--quiet { color: var(--muted); }.age--amber { color: var(--state-stalled); }.age--loud { color: var(--state-attend); font-weight: 600; }
+.cost { font-family: var(--mono); font-size: 11px; white-space: nowrap; }
 /* The canonical selector is demoted, never hidden: it addresses every
    follow-up call, so it stays selectable even inside a row that is itself a
    button. */
@@ -90,6 +100,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     <div><h1>Operations</h1><div class="sub" id="scope">Waiting for projection</div></div>
     <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="expand" hidden>Expand</button></div>
   </header>
+  <p class="headline" id="headline"></p>
   <div class="health" id="health"></div>
   <section class="stats" id="stats"></section>
   <section class="rail" id="attention"></section>
@@ -126,6 +137,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const fmt = value => Math.round(num(value)).toLocaleString();
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
 
   // Time and chips, one format across all five Apps. An operator reads an
   // AGE; a raw ISO stamp asks them to subtract it from now themselves.
@@ -136,10 +149,19 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // A value that is not a timestamp at all is shown verbatim rather than
   // silently blanked; an absent one reads as absent.
   function age(ts) { if (ts == null || ts === "") return "—"; return ago(ts) || String(ts); }
+  function ageTone(ts) { const elapsed=Date.now()-stamp(ts); return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud"; }
+  function ageNode(ts) { return el("span",`age age--${ageTone(ts)}`,age(ts)); }
   function chip(label, tone) { return el("span", `chip chip--${tone || "idle"}`, label); }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
+  function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
+  function semanticReason(conditions) { const item=conditions.find(row=>row?.condition==="revoking");return item?.evidence?.reason||item?.detail||""; }
+  function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${fmt(missing)} unpriced`:""}`; }
+  function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
+  function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${fmt(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${fmt(items.length)} of ${fmt(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   function envelopeFrom(params) {
     let value = params?.structuredContent;
@@ -265,7 +287,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     add("repository", repositoryLabel(state.detail.identity));
     add("workers", arr(state.detail.workers?.sessions).length);
     add("findings", num(state.detail.reviews?.latestFindingTotal ?? arr(state.detail.reviews?.latestFindings).length));
-    add("known spend", `$${num(state.detail.usage?.totals?.costUsdKnown).toFixed(2)}`);
+    add("known spend", spendText(state.detail.usage?.totals) || "—");
     box.append(dl);
   }
   /**
@@ -290,13 +312,14 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (tornDown) return;
     byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
     byId("refresh").disabled = state.loading || !host.capabilities.serverTools;
-    if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
+    if (state.error) { byId("headline").textContent="";byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
     const data = state.data;
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
     byId("scope").textContent = data.scope?.repository || "All repositories";
+    const headline=fullHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;state.lastHeadline=headline;
     const health = byId("health"); health.append(healthPill("ledger", data.sourceHealth?.ledger)); health.append(healthPill("beads", data.sourceHealth?.beads)); health.append(healthPill("plan", data.sourceHealth?.plan));
     const stats = byId("stats");
-    for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[`$${num(data.spend?.costUsdKnown).toFixed(2)}`,"known spend"]]) {
+    for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[spendText(data.spend)??"—","known spend"]]) {
       const cell = el("div", "stat"); cell.append(el("b", "", typeof value === "string" ? value : fmt(value))); cell.append(el("span", "", label)); stats.append(cell);
     }
     renderRail(data);
@@ -313,7 +336,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // live-plan row already carries its whole Beads record, and opening
         // that needs no server tool.
         const planFacts = !target && !!entry.plan;
-        const row = el("button", "row"); row.type = "button";
+        const conditions=conditionRows(entry,data.attention);const semantic=semanticState(entry,group.code||group.label,conditions);const row = el("button", `row semantic--${semantic}`); row.type = "button";
         row.disabled = target ? !canDetail : !planFacts;
         row.title = target
           ? (canDetail
@@ -330,9 +353,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // state and gains the age beside it. A plan row has no execution
         // age — its lastProgressAt is the projection capture time — so it
         // renders bare rather than claiming "0s ago".
-        const progress = target ? ago(entry.lastProgressAt || entry.updatedAt) : "";
+        const progressAt = target ? entry.lastProgressAt || entry.updatedAt : null;
         row.append(title); row.append(chip(selector || entry.id, "id"));
-        row.append(el("span", "meta", `${entry.state || entry.outcome || "planned"}${progress ? ` · ${progress}` : ""}`));
+        row.append(chip(semanticLabel(entry,conditions,semantic),semantic));
+        const meta=el("span","meta");meta.append(document.createTextNode(entry.state||entry.outcome||"planned"));if(progressAt){meta.append(document.createTextNode(" · "));meta.append(ageNode(progressAt));}const reason=semanticReason(conditions);if(reason)meta.append(document.createTextNode(` · ${reason}`));row.append(meta);
+        row.append(el("span","cost",spendText(entry)??"—"));
         row.append(el("span", "source", entry.source || "unknown"));
         if (!row.disabled) row.addEventListener("click", () => (target ? openDetail(entry) : openPlan(entry))); rows.append(row);
       }
@@ -365,7 +390,9 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   function pushModelContext(data) {
     if (!host.capabilities.updateModelContext) return;
     const degraded = degradedSources(data);
-    const lines = [];
+    // The rendered headline string verbatim: recomputing it here would let
+    // the human and the model disagree at a time-formatting boundary.
+    const lines = [state.lastHeadline ?? fullHeadline(data)];
     if (degraded.length) lines.push(`Source degradation, counts below are NOT authoritative coverage — ${degraded.join("; ")}`);
     lines.push(
       `Forged Operations for ${data.scope?.repository || "all repositories"}: ${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)} matching`,

@@ -38,10 +38,10 @@ const lines = readFileSync(asset, "utf8").split("\n");
  * breaks this loudly instead of silently rendering stale code.
  */
 function lift(name) {
-  const heads = [`  function ${name}(`, `  const ${name} = `];
+  const heads = [`  function ${name}(`, `  const ${name} = `, `  let ${name} = `];
   const start = lines.findIndex((line) => heads.some((head) => line.startsWith(head)));
   if (start < 0) throw new Error(`overview.html no longer declares ${name}`);
-  if (lines[start].endsWith(";")) return lines[start];
+  if (lines[start].endsWith(";") || (lines[start].startsWith("  function") && lines[start].endsWith(" }"))) return lines[start];
   const closer = lines[start].startsWith("  function") ? "  }" : "  };";
   const end = lines.findIndex((line, i) => i > start && line === closer);
   if (end < 0) throw new Error(`overview.html: no closer for ${name}`);
@@ -135,11 +135,24 @@ const source = [
 ]
   .map(lift)
   .join("\n");
+const semanticSource = [
+  "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "conditionRows", "semanticState", "semanticLabel",
+  "degradedSources", "queueCount", "spendText", "fullHeadline", "pushPortfolioModelContext",
+]
+  .map(lift)
+  .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
 // writes through, and substituting our own would test the substitute.
 const host = {
   connected: true,
-  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
+  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0", updateModelContext: true },
+};
+const modelContext = [];
+const request = (method, params) => {
+  if (method === "ui/update-model-context") {
+    modelContext.push((params?.content || []).map((part) => part.text).join("\n"));
+  }
+  return Promise.resolve({});
 };
 const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "document",
@@ -149,8 +162,9 @@ const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "packetRows",
   "headline",
   "host",
-  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
-)(document, () => {}, () => {}, () => {}, () => [], () => ({}), host);
+  "request",
+  `${lift("state")}\n${lift("nodes")}\n${lift("lastModelContext")}\n${semanticSource}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
+)(document, () => {}, () => {}, () => {}, () => [], () => ({}), host, request);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");
@@ -212,5 +226,7 @@ process.stdout.write(
     controlsHidden: nodes.controls.hidden,
     args: state.args,
     error: state.error,
+    headline: registry.get("headline")?.textContent || "",
+    modelContext,
   }),
 );

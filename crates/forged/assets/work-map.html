@@ -16,6 +16,11 @@
   --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
   --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
   --accent: light-dark(#167b72,#42c9b7);
+  --state-attend: light-dark(#a62f48,#ff879a);
+  --state-running: light-dark(#176f9f,#66c7f2);
+  --state-stalled: light-dark(#93610b,#e8b34f);
+  --state-landed: light-dark(#287a43,#76cf8b);
+  --state-dormant: light-dark(#6d6875,#aaa4b2);
   --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
 }
@@ -30,6 +35,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
 .sub,.muted,.foot { color:var(--muted); }
 .sub,.foot,.id,.kind { font-family:var(--mono); }
 .sub { margin-top:4px; font-size:11px; }
+.headline { margin:0; overflow:hidden; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
 .controls,.health { display:flex; flex-wrap:wrap; gap:6px; }
 .controls button,.controls select { border:1px solid var(--line); border-radius:6px; background:transparent; padding:6px 9px; }
 .pill { border:1px solid var(--line); border-radius:999px; padding:3px 8px; font-size:11px; }
@@ -43,7 +49,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
 .rows { display:grid; }
 /* The display title leads. The canonical selector keeps its own column —
    demoting an id is not hiding it. */
-.node { appearance:none; width:100%; border:0; border-top:1px solid var(--line); background:transparent; padding:10px 11px; text-align:left; display:grid; grid-template-columns:minmax(120px,1.4fr) minmax(120px,.9fr) 110px; gap:8px; align-items:baseline; }
+.node { appearance:none; width:100%; border:0; border-top:1px solid var(--line); border-left:4px solid transparent; background:transparent; padding:10px 11px; text-align:left; display:grid; grid-template-columns:minmax(150px,1.4fr) minmax(120px,.9fr) minmax(76px,.55fr) minmax(145px,.85fr) minmax(90px,.55fr); gap:8px; align-items:baseline; }
 .node:first-child { border-top:0; }.node:hover,.node[aria-current="true"] { background:var(--panel); }
 .node--context { opacity:.72; }.kind { color:var(--accent); font-size:10px; text-transform:uppercase; }.id { font-size:11px; overflow-wrap:anywhere; }.state { color:var(--muted); font-size:11px; text-align:right; }
 .title { font-weight:500; }
@@ -51,6 +57,10 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
 .chip { display:inline-flex; align-items:center; gap:5px; border:1px solid currentColor; border-radius:999px; padding:2px 7px; font:500 10px/1.35 var(--sans); white-space:nowrap; color:var(--muted); vertical-align:middle; }
 .chip::before { content:""; width:5px; height:5px; border-radius:50%; background:currentColor; flex:none; }
 .chip--live,.chip--pass { color:var(--good); }.chip--warn { color:var(--warn); }.chip--block { color:var(--bad); }.chip--idle { color:var(--muted); }
+.chip--attend { color:var(--state-attend); }.chip--running { color:var(--state-running); }.chip--stalled { color:var(--state-stalled); }.chip--landed { color:var(--state-landed); }.chip--dormant { color:var(--state-dormant); }
+.semantic--attend { border-left-color:var(--state-attend); }.semantic--running { border-left-color:var(--state-running); }.semantic--stalled { border-left-color:var(--state-stalled); }.semantic--landed { border-left-color:var(--state-landed); }.semantic--dormant { border-left-color:var(--state-dormant); }
+.age { font-family:var(--mono); }.age--quiet { color:var(--muted); }.age--amber { color:var(--state-stalled); }.age--loud { color:var(--state-attend); font-weight:600; }
+.cost { font-family:var(--mono); font-size:11px; white-space:nowrap; }
 /* The canonical selector is demoted, never hidden: it addresses every
    follow-up call, so it stays selectable even inside a row that is itself a
    button. */
@@ -79,6 +89,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
       <button type="button" id="expand" hidden>Expand</button>
     </div>
   </header>
+  <p class="headline" id="headline"></p>
   <section class="health" id="health" aria-label="Source health"></section>
   <section class="stats" id="stats"></section>
   <div class="layout">
@@ -101,6 +112,8 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   const state = { data:null, error:null, args:null, loading:false, selected:null, detail:null, detailError:null };
   const byId = id => document.getElementById(id);
   const arr = value => Array.isArray(value) ? value : [];
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
   const el = (tag, cls, text) => { const node=document.createElement(tag); if(cls)node.className=cls; if(text!=null)node.textContent=String(text); return node; };
   const key = ref => `${ref?.kind || "?"}:${ref?.id || "?"}`;
   // Time and chips, one format across all five Apps. An operator reads an
@@ -112,10 +125,18 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   // A value that is not a timestamp at all is shown verbatim rather than
   // silently blanked; an absent one reads as absent.
   function age(ts) { if(ts==null||ts==="")return "—"; return ago(ts)||String(ts); }
+  function ageTone(ts){const elapsed=Date.now()-stamp(ts);return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud";}
+  function ageNode(ts){return el("span",`age age--${ageTone(ts)}`,age(ts));}
   function chip(label,tone) { return el("span",`chip chip--${tone||"idle"}`,label); }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
+  function conditionRows(value,all=[]){const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[];}
+  function semanticState(value,group,conditions=conditionRows(value)){const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant";}
+  function semanticLabel(value,conditions,semantic=semanticState(value,null,conditions)){return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic;}
+  function spendText(spend){if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=typeof spend.costUsdKnown==="number"&&Number.isFinite(spend.costUsdKnown)?spend.costUsdKnown:0,missing=typeof spend.rowsMissingCost==="number"&&Number.isFinite(spend.rowsMissingCost)?spend.rowsMissingCost:0;if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${Math.round(missing).toLocaleString()} unpriced`:""}`;}
+  function degradedSources(data){const degraded=[];for(const name of ["ledger","beads","plan","history"]){const source=data?.sourceHealth?.[name];if(!source)continue;const status=source.state||"unknown";if(status!=="available")degraded.push(`${name} ${status}`);}return degraded;}
+  function reducedHeadline(data){const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);for(const [key,label] of [["nodes","nodes"],["edges","edges"],["runs","runs"],["epics","epics"],["attention","attention"]])if(typeof data?.counts?.[key]==="number")parts.push(`${Math.round(data.counts[key]).toLocaleString()} ${label}`);return `${parts.join("; ")}.`;}
   function request(method, params={}) {
     if (tornDown) return Promise.reject(new Error("resource torn down"));
     const id=`forged-work-map-${++rpcId}`;
@@ -160,15 +181,15 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
   }
   function render(){
     if(tornDown)return;for(const id of ["health","stats","nodes","edges","foot"])byId(id).replaceChildren();byId("refresh").disabled=state.loading||!host.capabilities.serverTools;
-    if(state.error){byId("scope").textContent="Projection unavailable";byId("nodes").append(el("div","error",state.error.message||String(state.error)));renderDrawer(null);reportSize();return;}
+    if(state.error){byId("headline").textContent="";byId("scope").textContent="Projection unavailable";byId("nodes").append(el("div","error",state.error.message||String(state.error)));renderDrawer(null);reportSize();return;}
     const data=state.data;if(!data){byId("nodes").append(el("div","empty","Waiting for work."));renderDrawer(null);reportSize();return;}
-    const scope=data.scope?.kind==="repository"?data.scope.repository:data.scope?.kind==="epic"?data.scope.epicId:"All operator work";byId("scope").textContent=scope;
+    const scope=data.scope?.kind==="repository"?data.scope.repository:data.scope?.kind==="epic"?data.scope.epicId:"All operator work";byId("scope").textContent=scope;const headline=reducedHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;
     for(const name of ["ledger","beads","plan","history"])byId("health").append(healthPill(name,data.sourceHealth?.[name]));
     for(const [value,label] of [[data.counts?.nodes,"nodes"],[data.counts?.edges,"edges"],[data.counts?.runs,"runs"],[data.counts?.epics,"epics"],[data.counts?.attention,"attention"],[data.counts?.historyUnattached,"history unknown"]]){const cell=el("div","stat");cell.append(el("b","",value??0));cell.append(el("span","",label));byId("stats").append(cell);}
     const nodeRows=byId("nodes");const canTools=!!host.capabilities.serverTools;
     // The title leads the row; the kind and the canonical selector ride
     // beside it, because the selector is what addresses a Work Detail call.
-    for(const node of arr(data.nodes)){const button=el("button",`node${node.contextOnly?" node--context":""}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));const title=el("span","title",nodeTitle(node));const mark=titleMark(node);if(mark){title.append(document.createTextNode(" "));title.append(el("span","kind",mark));}button.append(title);const identity=el("span","");identity.append(chip(node.workRef?.kind||"work","idle"));identity.append(document.createTextNode(" "));identity.append(chip(key(node.workRef),"id"));button.append(identity);button.append(el("span","state",nodeState(node)));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
+    for(const node of arr(data.nodes)){const conditions=conditionRows(node);const semantic=semanticState(node,node.queue?.group,conditions);const button=el("button",`node${node.contextOnly?" node--context":""} semantic--${semantic}`);button.type="button";button.dataset.ref=key(node.workRef);button.setAttribute("aria-current",String(state.selected===key(node.workRef)));const title=el("span","title",nodeTitle(node));const mark=titleMark(node);if(mark){title.append(document.createTextNode(" "));title.append(el("span","kind",mark));}button.append(title);const identity=el("span","");identity.append(chip(node.workRef?.kind||"work","idle"));identity.append(document.createTextNode(" "));identity.append(chip(key(node.workRef),"id"));button.append(identity);button.append(chip(semanticLabel(node,conditions,semantic),semantic));const meta=el("span","state",nodeState(node));const progress=node.queue?.desired?.lastProgressAt||node.execution?.updatedAt;if(progress){meta.append(document.createTextNode(" · "));meta.append(ageNode(progress));}const recovery=conditions.find(item=>item?.condition==="revoking"),reason=recovery?.evidence?.reason||recovery?.detail;if(reason)meta.append(document.createTextNode(` · ${reason}`));button.append(meta);button.append(el("span","cost",spendText(node.execution?.usage)??"—"));button.addEventListener("click",()=>openDetail(node));nodeRows.append(button);}
     if(!arr(data.nodes).length)nodeRows.append(el("div","empty","No work matches this bounded view."));
     for(const edge of arr(data.edges)){const row=el("div","edge");row.append(document.createTextNode(`${key(edge.source)} `));row.append(el("b","",edge.kind));row.append(document.createTextNode(` ${key(edge.target)}${edge.contextOnly?" · boundary":""}`));byId("edges").append(row);}
     if(!arr(data.edges).length)byId("edges").append(el("div","empty","No edges in scope."));
@@ -176,7 +197,7 @@ h1 { margin:0; font-size:20px; line-height:1.2; }
     byId("foot").append(el("span","",data.schema));byId("foot").append(el("span","",data.graphHealth?.healthy?"graph healthy":"graph issues visible"));if(data.capturedAt?.ledger)byId("foot").append(el("span","",`ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));if(state.loading)byId("foot").append(el("span","","refreshing"));
     pushModelContext(data);reportSize();
   }
-  function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const lines=[`Forged Work Map ${data.scope?.kind}: ${data.counts?.nodes||0} nodes, ${data.counts?.edges||0} edges`,`${data.counts?.attention||0} attention; ${data.counts?.historyUnattached||0} durable nodes without attached history`];for(const node of arr(data.nodes).slice(0,12))lines.push(`- ${key(node.workRef)} ${nodeTitle(node)} [${nodeState(node)}]`);const text=lines.join("\n").slice(0,3000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
+  function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const lines=[reducedHeadline(data),`Forged Work Map ${data.scope?.kind}: ${data.counts?.nodes||0} nodes, ${data.counts?.edges||0} edges`,`${data.counts?.attention||0} attention; ${data.counts?.historyUnattached||0} durable nodes without attached history`];for(const node of arr(data.nodes).slice(0,12))lines.push(`- ${key(node.workRef)} ${nodeTitle(node)} [${nodeState(node)}]`);const text=lines.join("\n").slice(0,3000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
   async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading)return;state.loading=true;render();const base=state.args||{schemaVersion:1,params:{}};const params={...(base.params||{})};const group=byId("group").value,source=byId("source").value;if(group)params.group=group;else delete params.group;if(source)params.source=source;else delete params.source;try{ingest(await request("tools/call",{name:"work_map",arguments:{...base,params}}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
   byId("refresh").addEventListener("click",refresh);byId("group").addEventListener("change",refresh);byId("source").addEventListener("change",refresh);
   byId("nodes").addEventListener("keydown",event=>{if(!["ArrowDown","ArrowUp","Home","End"].includes(event.key))return;const rows=arr([...byId("nodes").querySelectorAll("button.node")]);if(!rows.length)return;event.preventDefault();const current=rows.indexOf(document.activeElement);const next=event.key==="Home"?0:event.key==="End"?rows.length-1:event.key==="ArrowDown"?Math.min(rows.length-1,current+1):Math.max(0,current-1);rows[next].focus();});

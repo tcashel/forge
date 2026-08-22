@@ -16,6 +16,11 @@
   --good: var(--color-text-success, light-dark(#287a43,#6bc27e));
   --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
   --accent: light-dark(#167b72,#42c9b7);
+  --state-attend: light-dark(#a62f48,#ff879a);
+  --state-running: light-dark(#176f9f,#66c7f2);
+  --state-stalled: light-dark(#93610b,#e8b34f);
+  --state-landed: light-dark(#287a43,#76cf8b);
+  --state-dormant: light-dark(#6d6875,#aaa4b2);
   --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
 }
@@ -27,6 +32,7 @@ button:disabled { opacity: .55; cursor: default; } button:hover:not(:disabled) {
 .top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
 h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
 .sub { margin-top: 4px; color: var(--muted); font-size: 11px; }
+.headline { margin:0; overflow:hidden; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
 .state { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font: 11px/1.3 var(--mono); }
 .summary { display: grid; grid-template-columns: repeat(auto-fit,minmax(130px,1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .summary div { padding: 10px 12px; border-left: 1px solid var(--line); }.summary div:first-child { border-left: 0; }
@@ -44,6 +50,9 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
 .chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
 .chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
 .chip--live,.chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+.chip--attend { color:var(--state-attend); }.chip--running { color:var(--state-running); }.chip--stalled { color:var(--state-stalled); }.chip--landed { color:var(--state-landed); }.chip--dormant { color:var(--state-dormant); }
+.semantic-chip { margin-right:5px; }
+.age--quiet { color:var(--muted); }.age--amber { color:var(--state-stalled); }.age--loud { color:var(--state-attend); font-weight:600; }
 /* The canonical selector is demoted, never hidden: it addresses every
    follow-up call, so it stays selectable even inside a row that is itself a
    button. */
@@ -56,7 +65,8 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
 </head>
 <body>
 <main id="app">
-  <header class="top"><div><h1 id="title">Work detail</h1><div class="sub" id="subtitle">Waiting for an exact subject.</div></div><div><span class="state" id="state">unknown</span> <button type="button" id="refresh">Refresh</button> <button type="button" id="expand" hidden>Expand</button></div></header>
+  <header class="top"><div><h1 id="title">Work detail</h1><div class="sub" id="subtitle">Waiting for an exact subject.</div></div><div><span class="chip semantic-chip chip--dormant" id="semantic">dormant</span><span class="state" id="state">unknown</span> <button type="button" id="refresh">Refresh</button> <button type="button" id="expand" hidden>Expand</button></div></header>
+  <p class="headline" id="headline"></p>
   <section class="summary" id="summary"></section>
   <section class="grid" id="grid"><div class="empty">Waiting for detail.</div></section>
   <footer class="foot" id="foot"></footer>
@@ -76,6 +86,8 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
   const el = (tag,cls,text) => { const n=document.createElement(tag); if(cls)n.className=cls; if(text!=null)n.textContent=String(text); return n; };
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
   // Time and chips, one format across all five Apps. An operator reads an
   // AGE; a raw ISO stamp asks them to subtract it from now themselves.
   const stamp = ts => (ts ? Date.parse(ts) : NaN);
@@ -85,16 +97,23 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
   // A value that is not a timestamp at all is shown verbatim rather than
   // silently blanked; an absent one reads as absent.
   function age(ts) { if(ts==null||ts==="")return "—"; return ago(ts)||String(ts); }
+  function ageTone(ts){const elapsed=Date.now()-stamp(ts);return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud";}
   function chip(label,tone) { return el("span",`chip chip--${tone||"idle"}`,label); }
   // A bound the operator cannot see is a lie about how much there is.
   function bound(shown,total) { return total>shown?`${shown} of ${total} shown`:`${shown}`; }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
+  function conditionRows(value,all=[]){const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[];}
+  function semanticState(value,group,conditions=conditionRows(value)){const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempts=arr(value?.attempts?.items||value?.attempts);const attempt=value?.attempt?.activity||value?.attempt?.state||(value?.status?.state==="active"?"running":null)||(attempts.some(row=>row?.state==="running")?"running":null);const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant";}
+  function semanticLabel(value,conditions,semantic=semanticState(value,null,conditions)){return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic;}
+  function spendText(spend){if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return `? (${Math.round(missing).toLocaleString()} unpriced)`;return `$${known.toFixed(2)}${missing>0?` + ${Math.round(missing).toLocaleString()} unpriced`:""}`;}
+  function degradedSources(data){if(!data?.sourceHealth)return [];const degraded=[];for(const [name,source] of Object.entries(data.sourceHealth)){const status=source?.state||"unknown";if(status!=="available")degraded.push(`${name} ${status}`);}return degraded;}
+  function reducedHeadline(data){const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);const state=subjectState(data);if(state)parts.push(`${data?.workRef?.kind||data?.kind||"work"} ${data?.id||"unknown"} is ${state}`);const findings=data?.reviews?.latestFindingTotal??(Array.isArray(data?.reviews?.latestFindings)?data.reviews.latestFindings.length:null);if(typeof findings==="number")parts.push(`${Math.round(findings).toLocaleString()} findings`);const attention=typeof data?.attentionTotal==="number"?data.attentionTotal:Array.isArray(data?.attention)?data.attention.length:null;if(typeof attention==="number")parts.push(`${Math.round(attention).toLocaleString()} attention`);const spend=spendText(data?.usage?.totals);if(spend!=null)parts.push(`${spend} known spend`);return `${parts.join("; ")}.`;}
   function envelopeFrom(params) { let value=params?.structuredContent; if(!value){const text=arr(params?.content).find(block=>block.type==="text")?.text; try{value=JSON.parse(text);}catch{value=null;}} return value; }
   function ingest(params) { const envelope=envelopeFrom(params); if(envelope?.ok===false){state.error=envelope.error||{message:"Operation failed"};state.data=null;render();return;} const data=envelope?.result??envelope; if(!data||data.schema!=="forged.work-detail/1"){state.error={message:"The host returned an unsupported Work Detail payload."};state.data=null;render();return;} state.error=null;state.data=data;render(); }
   function panel(title,note) { const box=el("section","panel"); const head=el("h2","",title); if(note){head.append(document.createTextNode(" "));head.append(el("span","note",note));} box.append(head); const body=el("div","body"); box.append(body); return {box,body}; }
-  function item(body,title,detail,note) { const row=el("div","item"); row.append(el("b","",title||"unknown")); if(detail)row.append(el("p","",detail)); if(note)row.append(el("p","note",note)); body.append(row); }
+  function item(body,title,detail,note,openedAt) { const row=el("div","item"); row.append(el("b","",title||"unknown")); if(detail)row.append(el("p","",detail)); if(note||openedAt){const aside=el("p",openedAt?`note age age--${ageTone(openedAt)}`:"note",note);if(openedAt){if(note)aside.append(document.createTextNode(" · "));aside.append(document.createTextNode(`opened ${age(openedAt)}`));}row.append(aside);} body.append(row); }
   function subjectState(data) { return data?.status?.state || data?.status?.status || data?.state || "unknown"; }
   const SEVERITIES = ["blocker","high","medium","low"];
   // A finding an operator cannot open is a finding they cannot fix, so the
@@ -109,7 +128,7 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
   function render() {
     if(tornDown)return;
     const summary=byId("summary"),grid=byId("grid"),foot=byId("foot"); summary.replaceChildren();grid.replaceChildren();foot.replaceChildren();byId("refresh").disabled=state.loading||!host.capabilities.serverTools;
-    if(state.error){byId("title").textContent="Work detail";byId("subtitle").textContent="Projection unavailable";byId("state").textContent="error";grid.append(el("div","error",state.error.message||String(state.error)));reportSize();return;}
+    if(state.error){byId("headline").textContent="";byId("title").textContent="Work detail";byId("subtitle").textContent="Projection unavailable";byId("state").textContent="error";const semanticNode=byId("semantic");semanticNode.className="chip semantic-chip";semanticNode.textContent="";grid.append(el("div","error",state.error.message||String(state.error)));reportSize();return;}
     const data=state.data; if(!data){grid.append(el("div","empty","Waiting for detail."));reportSize();return;}
     // The title leads; the canonical id rides beside it as a chip, because
     // it is what every follow-up call has to be addressed with.
@@ -122,13 +141,14 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
     // as a bare array renders every real gate result as none.
     const holds=arr(data.attention),gates=arr(data.gates?.items??data.gates);
     const findingTotal=num(data.reviews?.latestFindingTotal??findings.length),holdTotal=num(data.attentionTotal??holds.length),gateTotal=num(data.gates?.total??gates.length);
-    for(const [value,label] of [[workers.length,"workers"],[findingTotal,"findings"],[holdTotal,"attention"],[artifacts.length,"artifact groups"],[events.length,"events"],[`$${num(data.usage?.totals?.costUsdKnown).toFixed(2)}`,"known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
+    const conditions=conditionRows(data),semantic=semanticState(data,null,conditions),semanticNode=byId("semantic");semanticNode.className=`chip semantic-chip chip--${semantic}`;semanticNode.textContent=semanticLabel(data,conditions,semantic);const headline=reducedHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;
+    for(const [value,label] of [[workers.length,"workers"],[findingTotal,"findings"],[holdTotal,"attention"],[artifacts.length,"artifact groups"],[events.length,"events"],[spendText(data.usage?.totals)??"—","known spend"]]){const cell=el("div");cell.append(el("b","",value));cell.append(el("span","",label));summary.append(cell);}
     const identity=panel("Identity"),dl=el("dl","kv"); const add=(k,v)=>{dl.append(el("dt","",k));dl.append(el("dd","",v==null?"—":v));}; add("canonical id",data.id);add("bead",data.identity?.bead?.id);add("repository",repositoryLabel(data.identity));add("base",data.identity?.baseRef);identity.body.append(dl);grid.append(identity.box);
     // What is holding this work, and what the projection says to do about
     // it. The recommended action is the point of the row, not the condition.
     const attention=panel("Attention",bound(holds.length,holdTotal));
     if(!holds.length)attention.body.append(el("div","empty",holdTotal?`${holdTotal} conditions counted; none carried in this page.`:"Nothing is holding this work."));
-    for(const hold of holds)item(attention.body,`${hold.condition||"attention"}${hold.severity?` · ${hold.severity}`:""}`,hold.recommendedAction?.text||hold.detail,`${hold.detail||""}${hold.openedAt?` · opened ${age(hold.openedAt)}`:""}`);
+    for(const hold of holds)item(attention.body,`${hold.condition||"attention"}${hold.severity?` · ${hold.severity}`:""}`,hold.recommendedAction?.text||hold.detail,hold.evidence?.reason||hold.detail,hold.openedAt);
     grid.append(attention.box);
     const delivery=data.delivery,ship=panel("Delivery");
     if(!delivery||delivery.known===false)ship.body.append(el("div","empty","No pull request is recorded for this work."));
@@ -149,7 +169,7 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
     const ledger=panel("Recent events",bound(Math.min(events.length,30),num(data.events?.total??events.length))); if(!events.length)ledger.body.append(el("div","empty","No events in this page.")); for(const event of events.slice(-30).reverse())item(ledger.body,`${event.eventId||"?"} · ${event.kind||"event"}`,`${clock(event.ts||event.createdAt)} · ${age(event.ts||event.createdAt)}`);grid.append(ledger.box);
     foot.append(el("span","",data.schema)); if(data.cursor!=null)foot.append(el("span","",`cursor ${data.cursor}`)); if(state.loading)foot.append(el("span","","refreshing")); pushModelContext(data);reportSize();
   }
-  let lastContext="";function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const text=[`Forged ${data.workRef?.kind||data.kind} ${data.id}: ${subjectState(data)}`,`bead ${data.identity?.bead?.id||"unknown"}; repository ${repositoryLabel(data.identity)||"unknown"}`,`${arr(data.workers?.sessions).length} workers; ${num(data.reviews?.latestFindingTotal??arr(data.reviews?.latestFindings).length)} findings; ${num(data.attentionTotal??arr(data.attention).length)} attention; ${arr(data.events?.events).length} events in page`].join("\n").slice(0,2000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
+  let lastContext="";function pushModelContext(data){if(!host.capabilities.updateModelContext)return;const text=[reducedHeadline(data),`Forged ${data.workRef?.kind||data.kind} ${data.id}: ${subjectState(data)}`,`bead ${data.identity?.bead?.id||"unknown"}; repository ${repositoryLabel(data.identity)||"unknown"}`,`${arr(data.workers?.sessions).length} workers; ${num(data.reviews?.latestFindingTotal??arr(data.reviews?.latestFindings).length)} findings; ${num(data.attentionTotal??arr(data.attention).length)} attention; ${arr(data.events?.events).length} events in page`].join("\n").slice(0,2000);if(text===lastContext)return;lastContext=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});}
   async function refresh(){if(!host.connected||!host.capabilities.serverTools||state.loading||!state.args)return;state.loading=true;render();try{ingest(await request("tools/call",{name:"work_detail",arguments:state.args}));}catch(error){state.error={message:String(error.message||error)};}finally{state.loading=false;render();}}
   byId("refresh").addEventListener("click",refresh);
   // The handshake advertises fullscreen, so the surface has to offer the

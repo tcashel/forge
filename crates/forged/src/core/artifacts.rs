@@ -380,8 +380,13 @@ fn remove_run_file(run_root: &Path, relative: &str) -> Result<bool, Failure> {
             display.display()
         )));
     }
-    unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir)
-        .map_err(|error| nix_failure("removing artifact", &display, error))?;
+    match unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir) {
+        Ok(()) => {}
+        // A racing reconciler removed it between our open and this unlink:
+        // the artifact is gone, which is the goal — convergence, not error.
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(nix_failure("removing artifact", &display, error)),
+    }
     fsync(&parent).map_err(|error| nix_failure("syncing artifact directory", &display, error))?;
     Ok(true)
 }
@@ -406,8 +411,11 @@ fn remove_manifest_file(run_root: &Path, file: &ManifestFileV1) -> Result<bool, 
             file.path
         )));
     }
-    unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir)
-        .map_err(|error| nix_failure("removing compacted artifact", &display, error))?;
+    match unlinkat(&parent, Path::new(&leaf), UnlinkatFlags::NoRemoveDir) {
+        Ok(()) => {}
+        Err(Errno::ENOENT) => return Ok(false),
+        Err(error) => return Err(nix_failure("removing compacted artifact", &display, error)),
+    }
     fsync(&parent).map_err(|error| nix_failure("syncing artifact directory", &display, error))?;
     Ok(true)
 }

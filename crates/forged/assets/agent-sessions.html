@@ -16,6 +16,11 @@
   --warn: var(--color-text-warning, light-dark(#8b6313,#ddb04d));
   --bad: var(--color-text-danger, light-dark(#b43c31,#e87b70));
   --accent: light-dark(#167b72,#42c9b7);
+  --state-attend: light-dark(#a62f48,#ff879a);
+  --state-running: light-dark(#176f9f,#66c7f2);
+  --state-stalled: light-dark(#93610b,#e8b34f);
+  --state-landed: light-dark(#287a43,#76cf8b);
+  --state-dormant: light-dark(#6d6875,#aaa4b2);
   --sans: ui-sans-serif,system-ui,-apple-system,"Segoe UI",sans-serif;
   --mono: ui-monospace,SFMono-Regular,Menlo,monospace;
 }
@@ -29,6 +34,7 @@ button:focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; }
 .top { display: flex; justify-content: space-between; gap: 12px; align-items: flex-start; flex-wrap: wrap; }
 h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .sub,.muted { color: var(--muted); }.sub { margin-top: 4px; font: 11px/1.4 var(--mono); }
+.headline { margin:0; overflow:hidden; font-weight:500; text-overflow:ellipsis; white-space:nowrap; }
 .controls { display: flex; gap: 6px; flex-wrap: wrap; }
 .capability { border: 1px solid var(--line); border-radius: 7px; padding: 8px 10px; color: var(--muted); }
 .stats { display: grid; grid-template-columns: repeat(auto-fit,minmax(110px,1fr)); border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
@@ -37,7 +43,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .coverage { display: flex; gap: 6px; flex-wrap: wrap; }
 .pill { border: 1px solid var(--line); border-radius: 999px; padding: 3px 8px; font: 10px/1.3 var(--mono); }
 .sessions { display: grid; gap: 10px; }
-.session-row { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
+.session-row { border: 1px solid var(--line); border-left:4px solid transparent; border-radius: 9px; overflow: hidden; }
 .session-head { display: flex; gap: 12px; justify-content: space-between; align-items: flex-start; padding: 10px 11px; background: var(--panel); }
 .session-title { font-weight: 600; overflow-wrap: anywhere; }.selector { color: var(--muted); font: 10px/1.4 var(--mono); overflow-wrap: anywhere; }
 .chips { display: flex; gap: 5px; flex-wrap: wrap; justify-content: flex-end; }
@@ -45,6 +51,9 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .chip { display: inline-flex; align-items: center; gap: 5px; border: 1px solid currentColor; border-radius: 999px; padding: 2px 7px; font: 500 10px/1.35 var(--sans); white-space: nowrap; color: var(--muted); vertical-align: middle; }
 .chip::before { content: ""; width: 5px; height: 5px; border-radius: 50%; background: currentColor; flex: none; }
 .chip--good,.chip--live,.chip--pass { color: var(--good); }.chip--warn { color: var(--warn); }.chip--bad,.chip--block { color: var(--bad); }.chip--idle { color: var(--muted); }
+.chip--attend { color:var(--state-attend); }.chip--running { color:var(--state-running); }.chip--stalled { color:var(--state-stalled); }.chip--landed { color:var(--state-landed); }.chip--dormant { color:var(--state-dormant); }
+.semantic--attend { border-left-color:var(--state-attend); }.semantic--running { border-left-color:var(--state-running); }.semantic--stalled { border-left-color:var(--state-stalled); }.semantic--landed { border-left-color:var(--state-landed); }.semantic--dormant { border-left-color:var(--state-dormant); }
+.age--quiet { color:var(--muted); }.age--amber { color:var(--state-stalled); }.age--loud { color:var(--state-attend); }
 /* The canonical selector is demoted, never hidden: it addresses every
    follow-up call, so it stays selectable. */
 .chip--id { font-family: var(--mono); -webkit-user-select: text; user-select: text; }
@@ -72,6 +81,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     <div><h1>Agent Sessions</h1><div class="sub" id="scope">Waiting for provider-attempt inventory</div></div>
     <div class="controls"><button type="button" id="refresh">Refresh</button><button type="button" id="history">Show history</button><button type="button" id="next">Next page</button><button type="button" id="expand" hidden>Expand</button></div>
   </header>
+  <p class="headline" id="headline"></p>
   <div class="capability" id="capability">Connecting to the MCP Apps host.</div>
   <section class="stats" id="stats"></section>
   <section class="coverage" id="coverage"></section>
@@ -102,6 +112,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   const byId = id => document.getElementById(id);
   const el = (tag, cls, text) => { const node = document.createElement(tag); if (cls) node.className = cls; if (text != null) node.textContent = String(text); return node; };
   const arr = value => Array.isArray(value) ? value : [];
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
   const finite = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const shown = value => value == null || value === "" ? "—" : typeof value === "boolean" ? (value ? "yes" : "no") : String(value);
   const fmt = value => Math.round(finite(value)).toLocaleString();
@@ -114,10 +126,16 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // A value that is not a timestamp at all is shown verbatim rather than
   // silently blanked; an absent one reads as absent.
   function age(ts) { if (ts == null || ts === "") return "—"; return ago(ts) || String(ts); }
+  function ageTone(ts){const elapsed=Date.now()-stamp(ts);return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud";}
+  function ageNode(ts){return el("span",`age age--${ageTone(ts)}`,age(ts));}
   function chip(label, tone) { return el("span", `chip chip--${tone || "idle"}`, label); }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(row) { return row?.identity?.repository?.label || row?.identity?.repository?.path || row?.repository; }
+  function conditionRows(value,all=[]){const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[];}
+  function semanticState(value,group,conditions=conditionRows(value)){const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||["running","revoking"].includes(attempt)||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||attempt==="failed"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||attempt==="reclaimed"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant";}
+  function semanticLabel(value,conditions,semantic=semanticState(value,null,conditions)){return semantic==="running"&&(value?.attempt?.activity==="revoking"||conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking"))?"recovering":semantic;}
+  function reducedHeadline(data){const returned=typeof data?.summary?.returned==="number"?fmt(data.summary.returned):null,total=typeof data?.summary?.totalMatched==="number"?fmt(data.summary.totalMatched):null;const parts=[];const facts=arr(data?.coverage?.degradationFacts);if(facts.length)parts.push(`Degraded coverage: ${facts.join(", ")}`);if(returned!=null&&total!=null)parts.push(`${returned} rows shown of ${total}`);else if(returned!=null)parts.push(`${returned} rows shown`);return `${parts.join("; ")}.`;}
   function listen(node, type, callback) { node.addEventListener(type, callback); dynamicListeners.push([node, type, callback]); }
   function clearDynamicListeners() { for (const [node, type, callback] of dynamicListeners) node.removeEventListener(type, callback); dynamicListeners = []; }
   function envelopeFrom(params) {
@@ -178,7 +196,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const dl = el("dl", "kv"); add(dl,"state",state.detail?.status?.state || state.detail?.status?.status || state.detail?.state); add(dl,"canonical id",state.detail?.id); add(dl,"title",state.detail?.identity?.displayTitle); add(dl,"workers",arr(state.detail?.workers?.sessions).length); add(dl,"findings",arr(state.detail?.reviews?.latestFindings).length); box.append(dl);
   }
   function renderRow(row) {
-    const article = el("article", "session-row"); const head = el("div", "session-head"); const identity = el("div");
+    const conditions=conditionRows(row),semantic=semanticState(row,null,conditions),progressAt=row?.desiredWork?.lastProgressAt||row?.attempt?.updatedAt;const article = el("article", `session-row semantic--${semantic}`); const head = el("div", "session-head"); const identity = el("div");
     identity.append(el("div", "session-title", row?.titleSource?.value || row?.identity?.displayTitle || row?.runId || "Untitled attempt"));
     const selectorLine = el("div", "selector");
     selectorLine.append(chip(`${shown(row?.identity?.subject?.kind)}:${shown(row?.identity?.subject?.id)}`, "id"));
@@ -186,7 +204,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     identity.append(selectorLine);
     const chips = el("div", "chips");
     const activity = row?.attempt?.activity || "unknown"; const tone = activity === "running" ? "good" : activity === "revoking" || row?.recovery === "attention" ? "warn" : ["failed","stopped"].includes(activity) ? "bad" : "idle";
-    chips.append(chip(activity, tone)); chips.append(chip(`recovery ${shown(row?.recovery)}`)); chips.append(chip(shown(row?.hostMode))); head.append(identity); head.append(chips); article.append(head);
+    chips.append(chip(semanticLabel(row,conditions,semantic),semantic));chips.append(chip(activity, tone)); chips.append(chip(`recovery ${shown(row?.recovery)}`)); chips.append(chip(shown(row?.hostMode)));if(progressAt)chips.append(ageNode(progressAt));const recovery=conditions.find(item=>item?.condition==="revoking"),reason=recovery?.evidence?.reason||recovery?.detail||(activity==="revoking"?row?.attempt?.revokeReason:null);if(reason)chips.append(el("span","recovery-reason",reason)); head.append(identity); head.append(chips); article.append(head);
     // Six facts lead: which work, where, who is on it, and how long since it
     // last moved. Every other recorded key is evidence for that diagnosis,
     // not a peer of it, so it sits one control away rather than at equal
@@ -231,10 +249,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     byId("refresh").disabled = state.loading || !canCall; byId("history").disabled = state.loading || !canCall; byId("next").disabled = state.loading || !canCall || !data?.nextCursor;
     byId("history").textContent = data?.filters?.includeHistorical ? "Hide history" : "Show history";
     byId("capability").textContent = canCall ? "Read-only controls use exact session_inventory and Work Detail selectors." : "This host cannot call server tools; exact selectors and the current bounded result remain diagnostic only.";
-    if (state.error) { byId("scope").textContent = "Projection unavailable"; byId("sessions").append(el("div","error",state.error)); renderDetail(); reportSize(); return; }
+    if (state.error) { byId("headline").textContent="";byId("scope").textContent = "Projection unavailable"; byId("sessions").append(el("div","error",state.error)); renderDetail(); reportSize(); return; }
     if (!data) { byId("sessions").append(el("div","empty","Waiting for sessions.")); renderDetail(); reportSize(); return; }
     const filters = data.filters || {}; const filterText = [filters.repository,filters.provider,filters.model,filters.activity].filter(Boolean).join(" · ");
     byId("scope").textContent = `${filterText || "All durable work"} · read ${clock(data.asOf)} · ${age(data.asOf)}`;
+    const headline=reducedHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;
     for (const [value,label] of [[data.summary?.returned,"shown"],[data.summary?.totalMatched,"matched"],[data.summary?.active,"active"],[data.summary?.historical,"historical"],[data.summary?.ownedHerdr,"owned Herdr"],[data.summary?.process,"process"]]) { const cell=el("div","stat");cell.append(el("b","",fmt(value)));cell.append(el("span","",label));byId("stats").append(cell); }
     let coverageItems=0;
     for (const [value,label] of [[data.coverage?.missingWorkIdentity,"missing identity"],[data.coverage?.missingRepository,"missing repository"],[data.coverage?.missingDesiredWork,"missing desired work"],[data.coverage?.missingOwnedProjection,"missing projection"],[data.coverage?.legacyHerdrRows,"legacy Herdr"],[data.coverage?.processRows,"process host"],[data.coverage?.unknownHostRows,"unknown host"]]) if (finite(value)>0) { byId("coverage").append(el("span","pill",`${fmt(value)} ${label}`)); coverageItems+=1; }
@@ -247,7 +266,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   function pushModelContext(data) {
     if (!host.capabilities.updateModelContext) return;
-    const lines=[`Forged Agent Sessions: ${fmt(data.summary?.returned)} shown of ${fmt(data.summary?.totalMatched)} matching; ${fmt(data.summary?.active)} active`,`filters: repository ${data.filters?.repository||"all"}; provider ${data.filters?.provider||"all"}; model ${data.filters?.model||"all"}; activity ${data.filters?.activity||"all"}; history ${data.filters?.includeHistorical===true}`];
+    const lines=[reducedHeadline(data),`Forged Agent Sessions: ${fmt(data.summary?.returned)} shown of ${fmt(data.summary?.totalMatched)} matching; ${fmt(data.summary?.active)} active`,`filters: repository ${data.filters?.repository||"all"}; provider ${data.filters?.provider||"all"}; model ${data.filters?.model||"all"}; activity ${data.filters?.activity||"all"}; history ${data.filters?.includeHistorical===true}`];
     for(const row of arr(data.rows).slice(0,5))lines.push(`- run ${row.runId}: ${row.attempt?.activity||"unknown"}; recovery ${row.recovery||"unknown"}`);
     const text=lines.join("\n").slice(0,3000);if(text===pushModelContext.last)return;pushModelContext.last=text;request("ui/update-model-context",{content:[{type:"text",text}]}).catch(()=>{});
   }
