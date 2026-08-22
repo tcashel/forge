@@ -1410,7 +1410,7 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
     };
-    let mut result: forged_types::PacketResult = match serde_json::from_value(result_value) {
+    let result: forged_types::PacketResult = match serde_json::from_value(result_value) {
         Ok(result) => result,
         Err(error) => {
             return err_response(
@@ -1419,8 +1419,28 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
             )
         }
     };
-    if let Err(message) = crate::adapters::extract::normalize_implement_gate_state(&mut result) {
-        return err_response(&req.idempotency_key, &Failure::invalid(message));
+    // Replay and in-progress recovery come BEFORE the closed-set gate: a
+    // request stored before this vocabulary existed (legacy prose
+    // gateState) must keep replaying its stored response verbatim on a
+    // byte-identical retry, and an in-flight row keeps answering through
+    // the fence. Only a FRESH request faces validation; a fresh writer
+    // racing itself stores the identical already-valid payload, so the
+    // probe-then-validate window cannot strand anything.
+    let existing = {
+        let key = req.idempotency_key.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation("packet_complete", &key)
+        })
+        .await
+    };
+    let existing = match existing {
+        Ok(row) => row,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    if existing.is_none() {
+        if let Err(message) = crate::adapters::extract::validate_implement_gate_state(&result) {
+            return err_response(&req.idempotency_key, &Failure::invalid(message));
+        }
     }
     let params = req.params.clone();
     fenced(

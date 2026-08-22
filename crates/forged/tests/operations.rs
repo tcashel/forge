@@ -913,7 +913,7 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
     assert_eq!(
         response["error"]["message"],
         json!(format!(
-            "implement result gateState must be \"pass\" or \"fail\", got {prose:?}"
+            "implement result gateState must be exactly \"pass\" or \"fail\", got {prose:?}"
         ))
     );
     let (retry_code, retry_response) = env.forged(&[
@@ -960,7 +960,7 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
                 implemented: true,
                 commits_ahead: 1,
                 summary: "corrected fixture".to_owned(),
-                gate_state: Some(" Pass \t".to_owned()),
+                gate_state: Some("pass".to_owned()),
                 note: None,
             },
         })

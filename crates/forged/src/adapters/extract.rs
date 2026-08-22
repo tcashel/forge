@@ -31,19 +31,22 @@ pub fn is_transport_message(message: &str) -> bool {
 }
 
 /// Normalize the closed implement-gate vocabulary at either ingestion path.
-pub(crate) fn normalize_implement_gate_state(result: &mut PacketResult) -> Result<(), String> {
+/// Fence the closed gateState vocabulary on a FRESH implement result: the
+/// wire contract is EXACTLY "pass" or "fail" (or null for unknown), and the
+/// seat template promises that vocabulary verbatim — so case or whitespace
+/// variants refuse instead of being silently rewritten, and the stored
+/// request payload and the recorded result stay byte-identical.
+pub(crate) fn validate_implement_gate_state(result: &PacketResult) -> Result<(), String> {
     if let forged_types::Outcome::Implement {
         gate_state: Some(gate_state),
         ..
-    } = &mut result.outcome
+    } = &result.outcome
     {
-        let normalized = gate_state.trim().to_ascii_lowercase();
-        if !matches!(normalized.as_str(), "pass" | "fail") {
+        if !matches!(gate_state.as_str(), "pass" | "fail") {
             return Err(format!(
-                "implement result gateState must be \"pass\" or \"fail\", got {gate_state:?}"
+                "implement result gateState must be exactly \"pass\" or \"fail\", got {gate_state:?}"
             ));
         }
-        *gate_state = normalized;
     }
     Ok(())
 }
@@ -89,7 +92,7 @@ pub fn extract_forged_result(
         .iter()
         .rev()
         .find_map(|c| serde_json::from_str::<PacketResult>(c).ok());
-    let Some(mut result) = selected else {
+    let Some(result) = selected else {
         return Err("malformed forged-result block".to_owned());
     };
     if result.schema != expected_schema {
@@ -98,7 +101,7 @@ pub fn extract_forged_result(
     if result.packet_id != packet_id {
         return Err("forged-result packetId mismatch".to_owned());
     }
-    normalize_implement_gate_state(&mut result)?;
+    validate_implement_gate_state(&result)?;
     Ok(result)
 }
 
@@ -429,7 +432,7 @@ mod tests {
     }
 
     #[test]
-    fn implement_gate_state_is_normalized_and_closed_at_both_harvesters() {
+    fn implement_gate_state_is_exact_and_closed_at_both_harvesters() {
         let stream = "{\"type\":\"turn.completed\",\"usage\":{}}";
         let prose = block(&implement_json_with_gate_state(
             PKT,
@@ -443,7 +446,7 @@ mod tests {
             "result": prose,
         })
         .to_string();
-        let note = "implement result gateState must be \"pass\" or \"fail\", got \
+        let note = "implement result gateState must be exactly \"pass\" or \"fail\", got \
                     \"all five gates pass: build, test, clippy, fmt, docs\"";
         assert!(matches!(
             harvest_claude(&claude_prose, SCHEMA, PKT),
@@ -454,10 +457,29 @@ mod tests {
             Harvest::Semantic(actual) if actual == note
         ));
 
+        for variant in [json!(" Pass "), json!("FAIL\t"), json!("Pass")] {
+            let result = block(&implement_json_with_gate_state(PKT, SCHEMA, 1, variant));
+            let claude = json!({
+                "type": "result",
+                "is_error": false,
+                "result": result,
+            })
+            .to_string();
+            for harvested in [
+                harvest_claude(&claude, SCHEMA, PKT),
+                harvest_codex(stream, Some(&result), SCHEMA, PKT),
+            ] {
+                assert!(
+                    matches!(harvested, Harvest::Semantic(ref note)
+                        if note.contains("must be exactly")),
+                    "a case or whitespace variant refuses, never rewrites: {harvested:?}"
+                );
+            }
+        }
+
         for (gate_state, expected) in [
             (json!("pass"), Some("pass")),
-            (json!(" Pass "), Some("pass")),
-            (json!("FAIL\t"), Some("fail")),
+            (json!("fail"), Some("fail")),
             (Value::Null, None),
         ] {
             let result = block(&implement_json_with_gate_state(PKT, SCHEMA, 1, gate_state));
