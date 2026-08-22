@@ -156,11 +156,11 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
   function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
-  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(queue==="planned"||["cancelled","superseded"].includes(outcome)||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
-  function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
   function semanticReason(conditions) { const item=conditions.find(row=>row?.condition==="revoking");return item?.evidence?.reason||item?.detail||""; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${fmt(missing)} unpriced`:""}`; }
-  function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);if(group)return num(group.total??group.count);const fallback=code==="running"?data?.counts?.live:code==="ready-to-merge"?data?.counts?.reviewReady:undefined;return typeof fallback==="number"?fallback:null; }
+  function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
   function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${fmt(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${fmt(items.length)} of ${fmt(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   function envelopeFrom(params) {
@@ -316,7 +316,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const data = state.data;
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
     byId("scope").textContent = data.scope?.repository || "All repositories";
-    const headline=fullHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;
+    const headline=fullHeadline(data);byId("headline").textContent=headline;byId("headline").title=headline;state.lastHeadline=headline;
     const health = byId("health"); health.append(healthPill("ledger", data.sourceHealth?.ledger)); health.append(healthPill("beads", data.sourceHealth?.beads)); health.append(healthPill("plan", data.sourceHealth?.plan));
     const stats = byId("stats");
     for (const [value, label] of [[data.coverage?.total,"work"],[data.counts?.live,"live"],[data.counts?.attention,"attention"],[data.counts?.planOnly,"plan only"],[spendText(data.spend)??"—","known spend"]]) {
@@ -380,7 +380,6 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     const degraded = [];
     for (const name of ["ledger", "beads", "plan"]) {
       const source = data.sourceHealth?.[name];
-      if (!source) continue;
       const state = source?.state || "unknown";
       if (state === "available") continue;
       const error = typeof source?.error === "string" && source.error ? `: ${source.error.slice(0, 400)}` : "";
@@ -391,7 +390,9 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   function pushModelContext(data) {
     if (!host.capabilities.updateModelContext) return;
     const degraded = degradedSources(data);
-    const lines = [fullHeadline(data)];
+    // The rendered headline string verbatim: recomputing it here would let
+    // the human and the model disagree at a time-formatting boundary.
+    const lines = [state.lastHeadline ?? fullHeadline(data)];
     if (degraded.length) lines.push(`Source degradation, counts below are NOT authoritative coverage — ${degraded.join("; ")}`);
     lines.push(
       `Forged Operations for ${data.scope?.repository || "all repositories"}: ${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)} matching`,

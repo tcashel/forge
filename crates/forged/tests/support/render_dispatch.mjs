@@ -38,7 +38,7 @@ const lines = readFileSync(asset, "utf8").split("\n");
  * breaks this loudly instead of silently rendering stale code.
  */
 function lift(name) {
-  const heads = [`  function ${name}(`, `  const ${name} = `];
+  const heads = [`  function ${name}(`, `  const ${name} = `, `  let ${name} = `];
   const start = lines.findIndex((line) => heads.some((head) => line.startsWith(head)));
   if (start < 0) throw new Error(`overview.html no longer declares ${name}`);
   if (lines[start].endsWith(";") || (lines[start].startsWith("  function") && lines[start].endsWith(" }"))) return lines[start];
@@ -46,10 +46,6 @@ function lift(name) {
   const end = lines.findIndex((line, i) => i > start && line === closer);
   if (end < 0) throw new Error(`overview.html: no closer for ${name}`);
   return lines.slice(start, end + 1).join("\n");
-}
-
-function maybeLift(name) {
-  try { return lift(name); } catch { return ""; }
 }
 
 function element(tag) {
@@ -143,8 +139,7 @@ const semanticSource = [
   "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "conditionRows", "semanticState", "semanticLabel",
   "degradedSources", "queueCount", "spendText", "fullHeadline", "pushPortfolioModelContext",
 ]
-  .map(maybeLift)
-  .filter(Boolean)
+  .map(lift)
   .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
 // writes through, and substituting our own would test the substitute.
@@ -168,7 +163,7 @@ const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "headline",
   "host",
   "request",
-  `${lift("state")}\n${lift("nodes")}\n${semanticSource}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
+  `${lift("state")}\n${lift("nodes")}\n${lift("lastModelContext")}\n${semanticSource}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
 )(document, () => {}, () => {}, () => {}, () => [], () => ({}), host, request);
 
 let stdin = "";

@@ -411,7 +411,10 @@ fn semantic_operations_scenario() -> Value {
         "Merged delivery",
         "stopped",
         Value::Null,
-        json!({"queueGroup": "Recent", "merged": true}),
+        // The projection's real shape: a landed run sits in the kind-blind
+        // stalled queue group with its terminal outcome — the classifier
+        // must rank the outcome above the group.
+        json!({"queueGroup": "Stalled or recoverable", "outcome": "landed"}),
     );
     let dormant = entry(
         "planned-work",
@@ -441,10 +444,10 @@ fn semantic_operations_scenario() -> Value {
                 {"subjectId": "deferred-plan", "subjectKind": "run", "condition": "admission-deferred", "severity": "medium", "openedAt": "2026-08-22T11:00:00Z", "detail": "repository capacity is occupied"}
             ],
             "queue": {"groups": [
+                {"code": "running", "label": "Running", "total": 1, "shown": 0, "entries": []},
                 {"code": "ready-to-merge", "label": "Ready to merge", "total": 1, "shown": 1, "entries": [ready]},
-                {"code": "stalled-or-recoverable", "label": "Stalled or recoverable", "total": 1, "shown": 1, "entries": [recovering]},
-                {"code": "planned", "label": "Planned", "total": 2, "shown": 2, "entries": [deferred, dormant]},
-                {"code": "recent", "label": "Recent", "total": 1, "shown": 1, "entries": [landed]}
+                {"code": "stalled-or-recoverable", "label": "Stalled or recoverable", "total": 2, "shown": 2, "entries": [recovering, landed]},
+                {"code": "planned", "label": "Planned", "total": 2, "shown": 2, "entries": [deferred, dormant]}
             ]}
         }}}
     })
@@ -567,8 +570,8 @@ fn five_state_mapping_is_total_precedence_ordered_and_keeps_internal_detail_stat
     assert!(
         session_rows[2]["class"]
             .as_str()
-            .is_some_and(|class| class.contains("semantic--stalled")),
-        "reclaimed attempts are stalled: {sessions}"
+            .is_some_and(|class| class.contains("semantic--dormant")),
+        "reclaimed attempts are terminal successor-ready work, dormant: {sessions}"
     );
     let session_text = sessions["text"].to_string();
     assert!(
@@ -658,6 +661,8 @@ fn row_cost_and_age_anatomy_distinguishes_unknown_partial_zero_and_thresholds() 
             }}}
         }),
     );
+    // Row-bound, not a multiset: render order follows entry order, so each
+    // anatomy result is pinned to the exact fixture row that produced it.
     let costs = report["nodes"]
         .as_array()
         .expect("rendered nodes")
@@ -665,34 +670,116 @@ fn row_cost_and_age_anatomy_distinguishes_unknown_partial_zero_and_thresholds() 
         .filter(|node| node["class"] == json!("cost"))
         .filter_map(|node| node["text"].as_str())
         .collect::<Vec<_>>();
-    assert!(
-        costs.contains(&"?"),
-        "zero known plus unpriced is unknown: {report}"
+    assert_eq!(
+        costs,
+        vec!["?", "$1.25 + 1 unpriced", "$0.00", "—"],
+        "unknown, partial, measured-zero, exempt — in their rows: {report}"
     );
-    assert!(
-        costs.contains(&"$1.25 + 1 unpriced"),
-        "partial spend keeps both facts: {report}"
-    );
-    assert!(
-        costs.contains(&"$0.00"),
-        "measured zero remains measured: {report}"
-    );
-    assert!(
-        costs.contains(&"—"),
-        "a structurally spendless row is exempt: {report}"
-    );
-    let classes = report["nodes"]
+    let ages = report["nodes"]
         .as_array()
         .expect("rendered nodes")
         .iter()
         .filter_map(|node| node["class"].as_str())
+        .filter(|class| class.starts_with("age "))
         .collect::<Vec<_>>();
-    for expected in ["age age--quiet", "age age--amber", "age age--loud"] {
+    assert_eq!(
+        ages,
+        vec![
+            "age age--quiet",
+            "age age--amber",
+            "age age--loud",
+            "age age--quiet"
+        ],
+        "each threshold bound to its row's timestamp: {report}"
+    );
+}
+
+#[test]
+fn headline_components_are_omitted_for_absent_fields_and_operations_states_its_cap() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    // No spend, no queue groups, attention capped at the payload boundary:
+    // absent components are OMITTED (never fabricated as zero) and the cap
+    // is stated.
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "now": "2026-08-22T12:00:00Z",
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1", "scope": {},
+                "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"}, "plan": {"state": "available"}},
+                "coverage": {"total": 2, "shown": 2},
+                "counts": {"live": 2},
+                "attention": [
+                    {"id": "capped-a", "subjectId": "capped-a", "condition": "blocked", "openedAt": "2026-08-22T11:00:00Z"},
+                    {"id": "capped-b", "subjectId": "capped-b", "condition": "merge-approval", "openedAt": "2026-08-22T10:00:00Z"}
+                ],
+                "attentionTotal": 7
+            }}}
+        }),
+    );
+    let headline = report["headline"].as_str().expect("Operations headline");
+    assert!(
+        headline.contains("2 of 7 attention conditions classified (capped)"),
+        "the Operations cap is stated: {headline}"
+    );
+    for fabricated in ["known spend", "running", "ready to merge"] {
         assert!(
-            classes.contains(&expected),
-            "age threshold {expected}: {report}"
+            !headline.contains(fabricated),
+            "absent {fabricated} component must be omitted, not fabricated: {headline}"
         );
     }
+}
+
+#[test]
+fn the_subject_context_push_leads_with_the_visible_headline_and_shares_one_cache() {
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("overview.html");
+    let html = std::fs::read_to_string(&asset).expect("read overview App");
+    // The model reads exactly the headline string the human sees, and both
+    // context pushes share ONE deduplication cache — separate caches
+    // suppressed the re-push after round-trip navigation.
+    assert!(
+        html.contains("pushModelContext(data, rows, head, items, subjectHeadline)"),
+        "the subject push carries the rendered headline"
+    );
+    assert!(html.contains("let lastModelContext"));
+    assert!(!html.contains("pushPortfolioModelContext.last"));
+    assert!(!html.contains("let lastContext"));
+}
+
+#[test]
+fn the_work_map_node_template_and_its_appended_cells_agree() {
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("work-map.html");
+    let html = std::fs::read_to_string(&asset).expect("read Work Map App");
+    let declaration = html
+        .split_once(".node {")
+        .and_then(|(_, rest)| rest.split_once('}'))
+        .map(|(rule, _)| rule.to_owned())
+        .expect("the .node rule");
+    let columns = declaration
+        .split_once("grid-template-columns:")
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(tracks, _)| tracks.matches("minmax(").count())
+        .expect("the .node column tracks");
+    let builder = html
+        .split_once("const button=el(\"button\",`node")
+        .and_then(|(_, rest)| rest.split_once("button.addEventListener"))
+        .map(|(body, _)| body.to_owned())
+        .expect("the node builder body");
+    let appended = builder.matches("button.append(").count();
+    assert_eq!(
+        appended, columns,
+        "a node appends exactly its declared grid columns; widen both in one diff"
+    );
 }
 
 #[test]
