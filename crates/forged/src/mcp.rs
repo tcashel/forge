@@ -853,8 +853,21 @@ impl McpState {
     /// The existence check is only the fast common-case refusal; the
     /// authority is [`McpState::open`]'s no-create open.
     async fn ctx(&self) -> Result<Arc<Ctx>, Failure> {
-        if !self.config.db_path.exists() {
-            return Err(self.uninitialized());
+        // Only PROVEN absence earns the setup guidance; an inspection error
+        // (permissions, an unreadable parent) is its own failure — routing
+        // it to "run forged init" would send the operator to re-initialize
+        // over state that exists.
+        match std::fs::metadata(&self.config.db_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.uninitialized());
+            }
+            Err(error) => {
+                return Err(Failure::internal(format!(
+                    "cannot inspect operator state at {}: {error}",
+                    self.config.db_path.display()
+                )));
+            }
         }
         self.ctx.get_or_try_init(|| self.open()).await.cloned()
     }
@@ -922,10 +935,17 @@ impl ForgedServer {
         let req = args.into_request();
         match self.state.ctx().await {
             Ok(ctx) => dispatch(&ctx, name, req).await,
-            Err(failure) => err_response(
-                &derive_key(name, req.run_id.as_deref(), None, None),
-                &failure,
-            ),
+            // An explicitly supplied idempotency key is echoed even on the
+            // gate's refusal — operationId is a pinned wire-shape contract,
+            // and only a keyless request falls back to the derived form.
+            Err(failure) => {
+                let key = if crate::core::key_absent(&req) {
+                    derive_key(name, req.run_id.as_deref(), None, None)
+                } else {
+                    req.idempotency_key.clone()
+                };
+                err_response(&key, &failure)
+            }
         }
     }
 
@@ -1456,6 +1476,56 @@ mod tests {
         assert!(Arc::ptr_eq(&a, &b), "both calls must observe one context");
         assert_eq!(state.opens.load(Ordering::SeqCst), 1);
         a.ledger.clone().close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_failed_migration_closes_the_ledger_and_does_not_latch() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let mut config = crate::config::scratch_config(dir.path());
+        // An invalid execution policy fails migrate_legacy_state AFTER the
+        // open succeeded — the arm that must close the ledger it opened.
+        config.stage_budget_s.clear();
+        let state = McpState::new(config);
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        for expected_opens in [1usize, 2] {
+            let failed = match state.ctx().await {
+                Ok(_) => panic!("an invalid execution policy cannot mount"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failed.code, forged_types::ErrorCode::InvalidRequest);
+            assert!(
+                failed.message.contains("execution policy"),
+                "{}",
+                failed.message
+            );
+            // Nothing latched and the writer was closed: every retry opens
+            // from scratch instead of replaying a stored failure or
+            // stacking a leaked writer thread per call.
+            assert!(state.ctx.get().is_none());
+            assert_eq!(state.opens.load(Ordering::SeqCst), expected_opens);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uninspectable_ledger_path_is_not_treated_as_absence() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let mut config = crate::config::scratch_config(dir.path());
+        // The PARENT is a file, so metadata on db_path errors with
+        // NotADirectory — an inspection failure, not proven absence.
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"not a directory").expect("blocking file");
+        config.db_path = parent.join("state.db");
+        let state = McpState::new(config);
+        let failed = match state.ctx().await {
+            Ok(_) => panic!("an uninspectable path cannot mount"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failed.code, forged_types::ErrorCode::Internal);
+        assert!(
+            failed.message.contains("cannot inspect operator state"),
+            "{}",
+            failed.message
+        );
     }
 
     #[tokio::test]

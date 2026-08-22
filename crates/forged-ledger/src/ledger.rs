@@ -95,9 +95,15 @@ impl Ledger {
         let mut conn = match Connection::open_with_flags(db_path, flags) {
             Ok(conn) => conn,
             // CANTOPEN over a still-present path is a real failure
-            // (permissions, a directory), not absence.
+            // (permissions, a directory), not absence — and only PROVEN
+            // absence answers `None`: a metadata error here is an
+            // inspection failure, not evidence the ledger is missing.
             Err(rusqlite::Error::SqliteFailure(e, _))
-                if e.code == rusqlite::ErrorCode::CannotOpen && !db_path.exists() =>
+                if e.code == rusqlite::ErrorCode::CannotOpen
+                    && matches!(
+                        std::fs::metadata(db_path),
+                        Err(ref meta) if meta.kind() == std::io::ErrorKind::NotFound
+                    ) =>
             {
                 return Ok(None);
             }

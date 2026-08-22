@@ -100,6 +100,20 @@ fn uninitialized_tool_calls_refuse_with_setup_guidance_and_create_nothing() {
         !bare.anvil().exists(),
         "uninitialized refusals must create nothing"
     );
+
+    // operationId is a pinned wire-shape contract: an explicitly supplied
+    // idempotency key is echoed even on the gate's refusal, and only a
+    // keyless request answers the derived form.
+    let keyed = mcp.call_tool(
+        "work_list",
+        json!({"idempotencyKey": "op:work_list:gate-echo"}),
+    );
+    assert_eq!(keyed["ok"], json!(false), "{keyed}");
+    assert_eq!(
+        keyed["operationId"],
+        json!("op:work_list:gate-echo"),
+        "{keyed}"
+    );
 }
 
 #[test]
