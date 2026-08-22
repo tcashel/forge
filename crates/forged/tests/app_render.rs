@@ -347,7 +347,6 @@ fn every_classifying_asset_pins_the_exact_attention_condition_partition() {
     let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
     for name in [
         "overview.html",
-        "operations-overview.html",
         "work-map.html",
         "work-detail.html",
         "agent-sessions.html",
@@ -364,6 +363,12 @@ fn every_classifying_asset_pins_the_exact_attention_condition_partition() {
             "{name}"
         );
     }
+    let operations = std::fs::read_to_string(root.join("operations-overview.html"))
+        .expect("read Operations App");
+    assert!(
+        !operations.contains("DECISION_CONDITIONS") && !operations.contains("SYMPTOM_CONDITIONS"),
+        "Operations consumes attention_list classification without a condition roster"
+    );
 }
 
 fn semantic_operations_scenario() -> Value {
@@ -423,10 +428,23 @@ fn semantic_operations_scenario() -> Value {
         Value::Null,
         json!({"source": "live-plan", "queueGroup": "Planned", "plan": {"status": "open"}, "detailTarget": Value::Null}),
     );
+    let revoking = json!({"subjectId": "recovering-run", "subjectKind": "run", "condition": "revoking", "severity": "medium", "openedAt": "2026-08-22T10:00:00Z", "updatedAt": "2026-08-22T10:00:00Z", "detail": "attempt is fenced", "evidence": {"reason": "controller heartbeat expired"}});
+    let admission = json!({"subjectId": "deferred-plan", "subjectKind": "run", "condition": "admission-deferred", "severity": "medium", "openedAt": "2026-08-22T11:00:00Z", "updatedAt": "2026-08-22T11:00:00Z", "detail": "repository capacity is occupied"});
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "admission-deferred", "classification": "symptom", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-22T11:00:00Z", "items": [admission.clone()]}),
+            json!({"condition": "revoking", "classification": "symptom", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-22T10:00:00Z", "items": [revoking.clone()]}),
+        ],
+        json!({"open": 2, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 2, "shown": 2, "total": 2}),
+    );
     json!({
         "now": "2026-08-22T12:00:00Z",
-        "hostCapabilities": {"updateModelContext": true},
-        "allowedTools": [],
+        "hostCapabilities": {"updateModelContext": true, "serverTools": true},
+        "allowedTools": ["attention_list", "work_map"],
+        "toolResponses": {
+            "attention_list": {"structuredContent": {"ok": true, "result": listed}},
+            "work_map": {"structuredContent": {"ok": true, "result": empty_work_map(vec![], vec![])}}
+        },
         "toolResult": {"structuredContent": {"ok": true, "result": {
             "schema": "forged.operations-overview/1",
             "scope": {"repository": "/repo"},
@@ -439,10 +457,7 @@ fn semantic_operations_scenario() -> Value {
             "counts": {"live": 1, "queued": 1, "attention": 2, "planOnly": 2, "reviewReady": 1},
             "spend": {"costUsdKnown": 0.0, "rowsMissingCost": 0},
             "attentionTotal": 2,
-            "attention": [
-                {"subjectId": "recovering-run", "subjectKind": "run", "condition": "revoking", "severity": "medium", "openedAt": "2026-08-22T10:00:00Z", "detail": "attempt is fenced", "evidence": {"reason": "controller heartbeat expired"}},
-                {"subjectId": "deferred-plan", "subjectKind": "run", "condition": "admission-deferred", "severity": "medium", "openedAt": "2026-08-22T11:00:00Z", "detail": "repository capacity is occupied"}
-            ],
+            "attention": [revoking, admission],
             "queue": {"groups": [
                 {"code": "running", "label": "Running", "total": 1, "shown": 0, "entries": []},
                 {"code": "ready-to-merge", "label": "Ready to merge", "total": 1, "shown": 1, "entries": [ready]},
@@ -725,7 +740,7 @@ fn headline_components_are_omitted_for_absent_fields_and_operations_states_its_c
     );
     let headline = report["headline"].as_str().expect("Operations headline");
     assert!(
-        headline.contains("2 of 7 attention conditions classified (capped)"),
+        headline.contains("2 of 7 embedded attention items shown (capped)"),
         "the Operations cap is stated: {headline}"
     );
     for fabricated in ["known spend", "running", "ready to merge"] {
@@ -1298,29 +1313,31 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let map = root.join("work-map.html");
     let sessions = root.join("agent-sessions.html");
 
-    for (path, schema, tool) in [
+    for (path, schema, tools) in [
         (
             &operations,
             "forged.operations-overview/1",
-            "operations_overview",
+            &["attention_list", "work_map"][..],
         ),
-        (&detail, "forged.work-detail/1", "work_detail"),
-        (&map, "forged.work-map/1", "work_map"),
+        (&detail, "forged.work-detail/1", &["work_detail"][..]),
+        (&map, "forged.work-map/1", &["work_map"][..]),
         (
             &sessions,
             "forged.provider-session-inventory/1",
-            "session_inventory",
+            &["session_inventory", "work_detail"][..],
         ),
     ] {
         let html = std::fs::read_to_string(path).expect("read split App");
         for required in [
             schema,
-            tool,
             "ui/initialize",
             "ui/notifications/tool-result",
             "ui/notifications/size-changed",
             "hostCapabilities",
-        ] {
+        ]
+        .into_iter()
+        .chain(tools.iter().copied())
+        {
             assert!(
                 html.contains(required),
                 "{} contains its {required} contract",
@@ -1352,6 +1369,8 @@ fn split_apps_are_dependency_free_safe_and_javascript_valid() {
     let html = std::fs::read_to_string(operations).expect("read Operations App");
     assert!(html.contains("entry.detailTarget"));
     assert!(html.contains("host.capabilities.serverTools"));
+    assert!(!html.contains("name: \"operations_overview\""));
+    assert!(!html.contains("name: \"work_detail\""));
     let html = std::fs::read_to_string(map).expect("read Work Map App");
     assert!(html.contains("node.detailTarget"));
     assert!(html.contains("subjectKind"));
@@ -1467,10 +1486,10 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
                 rows[0]["title"],
                 json!("Open the plan facts this row already carries")
             );
-            assert_eq!(rows[1]["disabled"], json!(true));
+            assert_eq!(rows[1]["disabled"], json!(false));
             assert_eq!(
                 rows[1]["title"],
-                json!("Exact detail target run:run-1; this host cannot call server tools")
+                json!("Open projected work facts for run:run-1")
             );
             assert!(
                 report["text"]
@@ -2201,11 +2220,9 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
         ],
         json!({"open": 3, "acknowledged": 1, "resolved": 0, "decisions": 2, "symptoms": 2, "shown": 4, "total": 4}),
     );
-    let report = run_split_app_host_scenario(
-        &node,
-        &asset,
-        &triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent")),
-    );
+    let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
+    scenario["actions"] = json!([{"type": "click", "class": "decision-row", "index": 0}]);
+    let report = run_split_app_host_scenario(&node, &asset, &scenario);
 
     assert_eq!(
         report["serverToolCalls"],
@@ -2258,6 +2275,36 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
     assert!(
         report["text"].to_string().contains("1 acknowledged"),
         "acknowledgements stay visible: {report}"
+    );
+    assert!(
+        report["text"].to_string().contains("recommended"),
+        "a decision row opens its carried facts without another tool: {report}"
+    );
+}
+
+#[test]
+fn operations_triage_manual_refresh_repeats_only_the_pinned_two_tool_read() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let listed = attention_list_fixture(
+        vec![],
+        json!({"open": 0, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 0, "shown": 0, "total": 0}),
+    );
+    let mut scenario = triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent"));
+    scenario["actions"] = json!([{"type": "click-id", "id": "refresh"}]);
+    let report = run_split_app_host_scenario(&node, &asset, &scenario);
+    let names = report["serverToolCalls"]
+        .as_array()
+        .expect("tool calls")
+        .iter()
+        .filter_map(|call| call["name"].as_str())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        names,
+        vec!["attention_list", "work_map", "attention_list", "work_map"],
+        "load and manual refresh use only the pinned pair: {report}"
     );
 }
 
@@ -2564,6 +2611,32 @@ fn operations_triage_degrades_to_the_embedded_rail_without_or_failed_tools() {
             .to_string()
             .contains("Triage degraded: attention unavailable"),
         "failed tool is stated: {listed_failure}"
+    );
+
+    let graph_refusal = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "now": "2026-08-22T12:00:00.000Z",
+            "hostCapabilities": {"updateModelContext": true, "serverTools": true},
+            "allowedTools": ["attention_list", "work_map"],
+            "storage": "absent",
+            "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}},
+            "toolResponses": {
+                "attention_list": {"structuredContent": {"ok": true, "result": attention_list_fixture(vec![], json!({"open": 0, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 0, "shown": 0, "total": 0}))}},
+                "work_map": {"structuredContent": {"ok": false, "error": {"code": "GRAPH_SCOPE_TOO_LARGE", "message": "graph exceeds maxNodes"}}}
+            }
+        }),
+    );
+    assert!(
+        graph_refusal["text"]
+            .to_string()
+            .contains("Embedded decision")
+            && graph_refusal["text"]
+                .to_string()
+                .contains("Triage degraded: graph exceeds maxNodes"),
+        "graph refusal keeps and labels the embedded rail: {graph_refusal}"
     );
 }
 

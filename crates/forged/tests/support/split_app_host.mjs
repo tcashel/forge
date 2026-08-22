@@ -458,6 +458,10 @@ for (const action of scenario?.actions || []) {
     const target = targets[action.index || 0];
     if (!target) throw new Error(`no clickable ${action.class} at index ${action.index || 0}`);
     target.click();
+  } else if (action.type === "click-id") {
+    const target = registry.get(action.id);
+    if (!target || target.disabled) throw new Error(`no clickable #${action.id}`);
+    target.click();
   } else {
     throw new Error(`unknown scenario action ${JSON.stringify(action)}`);
   }

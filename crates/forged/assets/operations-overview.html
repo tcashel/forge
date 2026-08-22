@@ -51,11 +51,20 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .rail__head { display: flex; justify-content: space-between; gap: 8px; padding: 7px 10px; background: var(--panel); font-size: 11px; }
 .rail__head b, .rail__head span { font-family: var(--mono); }
 .rail__head span { color: var(--muted); }
+.rail__summary { display: flex; gap: 10px; align-items: center; color: var(--muted); font: 11px/1.4 var(--mono); }
 .rail__note { color: var(--muted); font-size: 11px; }
 .attention { border-left: 3px solid var(--bad); background: var(--panel); padding: 8px 10px; }
+.decision-row { appearance: none; width: 100%; color: inherit; border: 0; border-left: 3px solid var(--bad); border-radius: 0; text-align: left; display: grid; gap: 3px; }
+.decision-row:hover { background: color-mix(in srgb, var(--panel) 80%, var(--accent)); }
+.decision__verb { font-weight: 650; }
+.attention--new { border-left-color: var(--accent); }
+.attention__new { color: var(--accent); font: 650 10px/1.2 var(--mono); text-transform: uppercase; }
 .attention b { font-weight: 600; margin-right: 6px; }
 .attention .act { margin-top: 3px; }
 .attention .meta { margin-top: 2px; }
+.symptom-line { padding: 8px 10px; border-left: 3px solid var(--warn); background: var(--panel); display: grid; gap: 4px; }
+.symptom-summary { font-weight: 600; }
+.symptom-item, .symptom-root { color: var(--muted); font-size: 11px; }
 .groups { display: grid; gap: 12px; }
 .group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .group__head { padding: 9px 11px; background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
@@ -131,15 +140,27 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     });
   }
   const host = { connected: false, capabilities: {}, context: {} };
-  const state = { data: null, error: null, args: null, loading: false, detail: null, detailError: null, plan: null };
+  const state = {
+    data: null, error: null, args: null,
+    triage: null, triageMap: null, triageError: null, triageLoading: false, triageStarted: false,
+    detail: null, detailError: null, plan: null, entry: null, attentionSelection: null,
+    lastOpenedAt: null, openedAt: new Date(Date.now()).toISOString(),
+  };
   const byId = id => document.getElementById(id);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; };
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const fmt = value => Math.round(num(value)).toLocaleString();
-  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
-  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
-
+  const LAST_OPENED_KEY = "forged.operations-overview.lastOpenedAt";
+  // Storage is optional and may be present but read-only. Read the previous
+  // cursor before best-effort writing this view's timestamp; never replace
+  // the host's localStorage object.
+  try {
+    const storage = globalThis.localStorage;
+    const previous = storage?.getItem?.(LAST_OPENED_KEY);
+    if (typeof previous === "string" && previous) state.lastOpenedAt = previous;
+    try { storage?.setItem?.(LAST_OPENED_KEY, state.openedAt); } catch { /* read-only storage */ }
+  } catch { /* absent or inaccessible storage */ }
   // Time and chips, one format across all five Apps. An operator reads an
   // AGE; a raw ISO stamp asks them to subtract it from now themselves.
   const stamp = ts => (ts ? Date.parse(ts) : NaN);
@@ -156,12 +177,13 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
   function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
-  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function conditionClass(name) { return arr(state.triage?.groups).find(group=>group?.condition===name)?.classification||null; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>conditionClass(name)==="decision"))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&conditionClass(name)==="symptom"))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
   function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
   function semanticReason(conditions) { const item=conditions.find(row=>row?.condition==="revoking");return item?.evidence?.reason||item?.detail||""; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${fmt(missing)} unpriced`:""}`; }
   function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
-  function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${fmt(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${fmt(items.length)} of ${fmt(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
+  function fullHeadline(data) { const list=state.triage;const hasEmbedded=Array.isArray(data?.attention),items=arr(data?.attention),embeddedTotal=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisionGroups=arr(list?.groups).filter(group=>group?.classification==="decision"),symptomGroups=arr(list?.groups).filter(group=>group?.classification==="symptom");const decisions=num(list?.totals?.decisions),oldest=decisionGroups.flatMap(group=>arr(group?.items).map(item=>item?.openedAt)).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(list)parts.push(`${fmt(decisions)} decision${decisions===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);else if(hasEmbedded)parts.push(`${fmt(embeddedTotal)} embedded attention item${embeddedTotal===1?"":"s"}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=symptomGroups.map(group=>`${String(group?.condition||"symptom").replace(/-/g," ")} ${fmt(group?.total)}`).join(", ");if(list)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(!list&&hasEmbedded&&embeddedTotal>items.length)parts.push(`${fmt(items.length)} of ${fmt(embeddedTotal)} embedded attention items shown (capped)`);return `${parts.join("; ")}.`; }
 
   function envelopeFrom(params) {
     let value = params?.structuredContent;
@@ -179,6 +201,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       state.error = { message: "The host returned an unsupported Operations payload." }; state.data = null; render(); return;
     }
     state.error = null; state.data = data; render();
+    if (host.connected && !state.triageStarted) refreshTriage();
   }
   function healthPill(name, source) {
     const status = source?.state || "unknown";
@@ -208,7 +231,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    * point of it — neither is re-derived here, because this App has no ledger
    * to re-derive them against.
    */
-  function renderRail(data) {
+  function renderEmbeddedRail(data) {
     const rail = byId("attention");
     const items = arr(data.attention);
     const total = Math.max(num(data.attentionTotal ?? data.counts?.attention ?? items.length), items.length);
@@ -252,20 +275,133 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     if (drawn < total) rail.append(el("div", "rail__note", `${fmt(drawn)} of ${fmt(total)} items shown`));
   }
+  function isNewAttention(item) {
+    if (!state.lastOpenedAt) return false;
+    return [item?.openedAt, item?.updatedAt].some(value => typeof value === "string" && value > state.lastOpenedAt);
+  }
+  function selectAttention(item) {
+    state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = item;
+    renderDetail(); reportSize();
+  }
+  function renderDecision(item) {
+    const fresh = isNewAttention(item);
+    const row = el("button", `attention decision-row${fresh ? " attention--new" : ""}`); row.type = "button";
+    row.title = `Inspect ${item?.condition || "decision"} decision`;
+    row.append(el("span", "decision__verb", item?.recommendedAction?.text || "Inspect this decision"));
+    row.append(el("span", "decision__title", attentionTitle(item)));
+    if (fresh) row.append(el("span", "attention__new", "new"));
+    const meta = el("span", "meta");
+    const selector = attentionSelector(item); if (selector) meta.append(chip(selector, "id"));
+    if (item?.state) { meta.append(document.createTextNode(" ")); meta.append(chip(item.state, item.state === "resolved" ? "pass" : item.state === "acknowledged" ? "warn" : "idle")); }
+    if (item?.openedAt) meta.append(document.createTextNode(` · opened ${age(item.openedAt)}`));
+    row.append(meta);
+    row.addEventListener("click", () => selectAttention(item));
+    return row;
+  }
+  function itemBeadId(item) { return arr(item?.evidenceRefs).find(reference => reference?.kind === "bead")?.id || null; }
+  function blockedRoots(group, map) {
+    const nodes = new Map(arr(map?.nodes).map(node => [`${node?.workRef?.kind}:${node?.workRef?.id}`, node]));
+    const direct = new Map();
+    for (const edge of arr(map?.edges)) {
+      if (edge?.kind !== "blocks" || edge?.source?.kind !== "plan") continue;
+      const key = `plan:${edge.source.id}`;
+      if (!direct.has(key)) direct.set(key, edge.target);
+    }
+    const roots = new Map();
+    for (const item of arr(group?.items)) {
+      const bead = itemBeadId(item);
+      const target = bead ? direct.get(`plan:${bead}`) : null;
+      const key = target ? `${target.kind}:${target.id}` : `unresolved:${bead || item?.subjectId || item?.id}`;
+      const node = target ? nodes.get(key) : null;
+      const title = node?.titleSource?.value || node?.identity?.displayTitle || target?.id || "Root cause unavailable";
+      if (!roots.has(key)) roots.set(key, { title, count: 0 });
+      roots.get(key).count += 1;
+    }
+    return [...roots.values()];
+  }
+  function renderSymptom(group, map) {
+    const condition = String(group?.condition || "symptom");
+    const label = condition.replace(/-/g, " ");
+    const items = arr(group?.items);
+    const shown = num(group?.shown ?? items.length);
+    const total = Math.max(num(group?.total ?? shown), shown);
+    const line = el("div", "symptom-line");
+    if (condition === "blocked") {
+      const roots = blockedRoots(group, map);
+      const summary = shown < total
+        ? `${fmt(shown)} of ${fmt(total)} blocked · ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"} shown`
+        : `${fmt(total)} blocked on ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"}`;
+      line.append(el("span", "symptom-summary", summary));
+      for (const root of roots) line.append(el("span", "symptom-root", `${root.title} · ${fmt(root.count)} blocked`));
+    } else {
+      line.append(el("span", "symptom-summary", shown < total ? `${fmt(shown)} of ${fmt(total)} ${label}` : `${fmt(total)} ${label}`));
+      for (const item of items) line.append(el("span", "symptom-item", attentionTitle(item)));
+    }
+    return line;
+  }
+  function renderTriageRail(list, map) {
+    const rail = byId("attention");
+    const acknowledged = num(list?.totals?.acknowledged);
+    rail.append(el("div", "rail__summary", `${fmt(acknowledged)} acknowledged`));
+    let remaining = RAIL_CAP;
+    let decisionsDrawn = 0;
+    for (const group of arr(list?.groups)) {
+      const section = el("section", "rail__group");
+      const head = el("div", "rail__head");
+      head.append(el("b", "triage-heading", String(group?.condition || "attention").replace(/-/g, " ")));
+      const shown = num(group?.shown ?? arr(group?.items).length);
+      const total = Math.max(num(group?.total ?? shown), shown);
+      head.append(el("span", "", shown < total ? `${fmt(shown)} of ${fmt(total)}` : fmt(total)));
+      section.append(head);
+      if (group?.classification === "decision") {
+        const items = arr(group?.items);
+        const visible = items.slice(0, remaining);
+        remaining -= visible.length; decisionsDrawn += visible.length;
+        for (const item of visible) section.append(renderDecision(item));
+      } else {
+        section.append(renderSymptom(group, map));
+      }
+      rail.append(section);
+    }
+    const decisionTotal = num(list?.totals?.decisions);
+    if (decisionsDrawn < decisionTotal) rail.append(el("div", "rail__note", `${fmt(decisionsDrawn)} of ${fmt(decisionTotal)} decisions shown`));
+  }
+  function renderRail(data) {
+    if (state.triage && state.triageMap && !state.triageError) {
+      renderTriageRail(state.triage, state.triageMap);
+      return;
+    }
+    renderEmbeddedRail(data);
+    const reason = !host.capabilities.serverTools ? "server tools unavailable" : state.triageError;
+    if (reason) byId("attention").append(el("div", "rail__note", `Triage degraded: ${reason}; showing embedded attention.`));
+  }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
-    if (!state.detail && !state.detailError && !state.plan) { box.hidden = true; return; }
+    if (!state.detail && !state.detailError && !state.plan && !state.entry && !state.attentionSelection) { box.hidden = true; return; }
     box.hidden = false;
     const head = el("div", "drawer__head");
     const heading = el("div");
-    heading.append(el("h2", "", state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
-    if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
+    heading.append(el("h2", "", state.attentionSelection ? attentionTitle(state.attentionSelection) : state.plan ? titleFor(state.plan) : state.entry ? titleFor(state.entry) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
+    if (state.attentionSelection) { const selector=attentionSelector(state.attentionSelection); if(selector) heading.append(chip(selector,"id")); }
+    else if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
+    else if (state.entry?.detailTarget) heading.append(chip(`${state.entry.detailTarget.subjectKind}:${state.entry.detailTarget.subjectId}`, "id"));
     else if (state.detail) heading.append(chip(`${state.detail.workRef?.kind || state.detail.kind}:${state.detail.id}`, "id"));
     head.append(heading);
-    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; renderDetail(); }); head.append(close); box.append(head);
+    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = null; renderDetail(); }); head.append(close); box.append(head);
     if (state.detailError) { box.append(el("div", "error", state.detailError.message || String(state.detailError))); return; }
     const dl = el("dl", "kv");
     const add = (key, value) => { dl.append(el("dt", "", key)); dl.append(el("dd", "", value == null ? "—" : value)); };
+    if (state.attentionSelection) {
+      const item=state.attentionSelection;
+      add("decision", item.condition);
+      add("state", item.state);
+      add("recommended", item.recommendedAction?.text);
+      add("detail", item.detail);
+      add("opened", age(item.openedAt));
+      add("updated", age(item.updatedAt));
+      box.append(dl);
+      return;
+    }
     if (state.plan) {
       const entry = state.plan;
       add("plan facts", "from the live Beads read; no execution record exists yet");
@@ -283,6 +419,18 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       box.append(dl);
       return;
     }
+    if (state.entry) {
+      const entry=state.entry;
+      add("projected facts", "from the bounded Operations result");
+      add("state", entry.state || entry.outcome);
+      add("repository", repositoryLabel(entry.identity));
+      add("source", entry.source);
+      add("updated", age(entry.lastProgressAt || entry.updatedAt));
+      add("known spend", spendText(entry) || "—");
+      add("next action", entry.nextAction);
+      box.append(dl);
+      return;
+    }
     add("state", stateFor(state.detail));
     add("repository", repositoryLabel(state.detail.identity));
     add("workers", arr(state.detail.workers?.sessions).length);
@@ -294,24 +442,12 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    * A live-plan row is not a dead row: its whole Beads record already
    * travelled inside the projection, so opening it needs no tool call.
    */
-  function openPlan(entry) { state.detail = null; state.detailError = null; state.plan = entry; renderDetail(); reportSize(); }
-  async function openDetail(entry) {
-    if (!host.capabilities.serverTools || !entry?.detailTarget) return;
-    state.detail = null; state.detailError = null; state.plan = null; renderDetail();
-    try {
-      const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
-      const envelope = envelopeFrom(result);
-      if (envelope?.ok === false) throw new Error(envelope.error?.message || "Detail failed");
-      const detail = envelope?.result ?? envelope;
-      if (!detail || detail.schema !== "forged.work-detail/1") throw new Error("Unsupported Work Detail payload");
-      state.detail = detail;
-    } catch (error) { state.detailError = { message: String(error.message || error) }; }
-    renderDetail(); reportSize();
-  }
+  function openPlan(entry) { state.detail = null; state.detailError = null; state.entry = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
+  function openEntry(entry) { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; state.entry = entry; renderDetail(); reportSize(); }
   function render() {
     if (tornDown) return;
     byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
-    byId("refresh").disabled = state.loading || !host.capabilities.serverTools;
+    byId("refresh").disabled = state.triageLoading || !host.capabilities.serverTools;
     if (state.error) { byId("headline").textContent="";byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
     const data = state.data;
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
@@ -324,7 +460,6 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     renderRail(data);
     const groups = byId("groups");
-    const canDetail = !!host.capabilities.serverTools;
     for (const group of arr(data.queue?.groups)) {
       const section = el("section", "group"); const head = el("div", "group__head"); head.append(el("b", "", group.label || group.code)); head.append(el("span", "", `${fmt(group.shown)} / ${fmt(group.total)}`)); section.append(head);
       const rows = el("div", "rows");
@@ -337,11 +472,9 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // that needs no server tool.
         const planFacts = !target && !!entry.plan;
         const conditions=conditionRows(entry,data.attention);const semantic=semanticState(entry,group.code||group.label,conditions);const row = el("button", `row semantic--${semantic}`); row.type = "button";
-        row.disabled = target ? !canDetail : !planFacts;
+        row.disabled = !target && !planFacts;
         row.title = target
-          ? (canDetail
-            ? `Open exact work detail for ${selector}`
-            : `Exact detail target ${selector}; this host cannot call server tools`)
+          ? `Open projected work facts for ${selector}`
           : planFacts
             ? "Open the plan facts this row already carries"
             : "This row carries neither a durable detail target nor plan facts";
@@ -359,7 +492,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         const meta=el("span","meta");meta.append(document.createTextNode(entry.state||entry.outcome||"planned"));if(progressAt){meta.append(document.createTextNode(" · "));meta.append(ageNode(progressAt));}const reason=semanticReason(conditions);if(reason)meta.append(document.createTextNode(` · ${reason}`));row.append(meta);
         row.append(el("span","cost",spendText(entry)??"—"));
         row.append(el("span", "source", entry.source || "unknown"));
-        if (!row.disabled) row.addEventListener("click", () => (target ? openDetail(entry) : openPlan(entry))); rows.append(row);
+        if (!row.disabled) row.addEventListener("click", () => (target ? openEntry(entry) : openPlan(entry))); rows.append(row);
       }
       section.append(rows); groups.append(section);
     }
@@ -368,7 +501,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
     if (data.capturedAt?.ledger) byId("foot").append(el("span", "", `ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));
     if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
-    if (state.loading) byId("foot").append(el("span", "", "refreshing"));
+    if (state.triageLoading) byId("foot").append(el("span", "", "refreshing triage"));
     renderDetail(); pushModelContext(data); reportSize();
   }
   let lastContext = "";
@@ -407,14 +540,35 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     lastContext = text;
     request("ui/update-model-context", { content: [{ type: "text", text }] }).catch(() => {});
   }
-  async function refresh() {
-    if (!host.connected || !host.capabilities.serverTools || state.loading) return;
-    state.loading = true; render();
-    try { ingest(await request("tools/call", { name: "operations_overview", arguments: state.args || { schemaVersion: 1, params: {} } })); }
-    catch (error) { state.error = { message: String(error.message || error) }; }
-    finally { state.loading = false; render(); }
+  function triageResult(result, schema, label) {
+    const envelope = envelopeFrom(result);
+    if (envelope?.ok === false) throw new Error(envelope.error?.message || `${label} failed`);
+    const value = envelope?.result ?? envelope;
+    if (!value || value.schema !== schema) throw new Error(`${label} returned an unsupported payload`);
+    return value;
   }
-  byId("refresh").addEventListener("click", refresh);
+  async function refreshTriage() {
+    if (!host.connected || !host.capabilities.serverTools || state.triageLoading) return;
+    state.triageStarted = true; state.triageLoading = true; state.triageError = null; render();
+    const repo = state.args?.params?.repo || state.data?.scope?.repository;
+    const attentionParams = { state: "all", limit: 100 };
+    const mapParams = {};
+    if (typeof repo === "string" && repo) {
+      attentionParams.repo = repo;
+      mapParams.scope = "repository"; mapParams.repository = repo;
+    }
+    try {
+      const [attentionResult, mapResult] = await Promise.all([
+        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: attentionParams } }),
+        request("tools/call", { name: "work_map", arguments: { schemaVersion: 1, params: mapParams } }),
+      ]);
+      state.triage = triageResult(attentionResult, "forged.attention-list/1", "attention_list");
+      state.triageMap = triageResult(mapResult, "forged.work-map/1", "work_map");
+    } catch (error) {
+      state.triage = null; state.triageMap = null; state.triageError = String(error.message || error);
+    } finally { state.triageLoading = false; render(); }
+  }
+  byId("refresh").addEventListener("click", refreshTriage);
   // The handshake advertises fullscreen, so the surface has to offer the
   // control that asks for it. A host that declines leaves the view as it is.
   function applyDisplayMode(mode) {
@@ -459,7 +613,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     for (const timer of timers) clearTimeout(timer);
     timers.clear(); pending.clear();
-    byId("refresh").removeEventListener("click", refresh);
+    byId("refresh").removeEventListener("click", refreshTriage);
     byId("expand").removeEventListener("click", toggleDisplayMode);
     window.removeEventListener("message", onMessage);
   }
@@ -468,7 +622,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); clearTimeout(p.timer); timers.delete(p.timer); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
     if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
     else if (message.method === "ui/notifications/tool-result") ingest(message.params);
-    else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
+    else if (message.method === "ui/notifications/tool-cancelled") { state.error = { message: message.params?.reason || "Cancelled" }; render(); }
     else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
     else if (message.method === "ui/resource-teardown") { teardown(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
   }
@@ -476,6 +630,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   request("ui/initialize", { protocolVersion: PROTOCOL_VERSION, appInfo: APP_INFO, appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } }).then(result => {
     if (tornDown) return;
     host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); observer = new ResizeObserver(reportSize); observer.observe(document.body);
+    if (state.data && !state.triageStarted) refreshTriage();
   }).catch(() => { if (!tornDown) { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); } });
   render();
 })();
