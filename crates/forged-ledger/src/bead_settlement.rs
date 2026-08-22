@@ -151,24 +151,30 @@ impl Ledger {
     }
 
     /// Charge one mutating retry under the claim token, persisting the next
-    /// wake BEFORE any external write fires (charge-before-mutate). Refuses
-    /// when the token is stale or the budget is spent.
+    /// wake BEFORE any external write fires (charge-before-mutate) and
+    /// extending the claim lease to `lease_until`: the fence must outlive
+    /// the whole post-charge bd mutation chain, not just the claim-to-charge
+    /// window, or a slow chain hands a live executor's run to a rival.
+    /// Refuses when the token is stale or the budget is spent.
     pub fn charge_bead_settlement_retry(
         &self,
         run_id: &str,
         token: &str,
         next_wake_at: &str,
+        lease_until: &str,
     ) -> Result<BeadSettlementRetryRow, LedgerError> {
         let run_id = run_id.to_owned();
         let token = token.to_owned();
         let next_wake_at = next_wake_at.to_owned();
+        let lease_until = lease_until.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let affected = tx.execute(
                 "UPDATE bead_settlement_retry \
-                 SET used = used + 1, next_wake_at = ?1, updated_at = ?2 \
-                 WHERE run_id = ?3 AND claim_token = ?4 AND used < budget",
-                rusqlite::params![next_wake_at, now_iso(), run_id, token],
+                 SET used = used + 1, next_wake_at = ?1, claim_lease_until = ?2, \
+                     updated_at = ?3 \
+                 WHERE run_id = ?4 AND claim_token = ?5 AND used < budget",
+                rusqlite::params![next_wake_at, lease_until, now_iso(), run_id, token],
             )?;
             if affected != 1 {
                 return Err(refused(
@@ -410,16 +416,27 @@ mod tests {
             .expect("loser")
             .is_none());
         second
-            .charge_bead_settlement_retry("run-retry", "tick-b", lease)
+            .charge_bead_settlement_retry("run-retry", "tick-b", lease, lease)
             .expect_err("a stale token must not charge");
 
+        let mutation_lease = "2030-01-01T00:08:00.000000000Z";
         let charged = ledger
-            .charge_bead_settlement_retry("run-retry", "tick-a", "2030-01-01T00:00:30.000000000Z")
+            .charge_bead_settlement_retry(
+                "run-retry",
+                "tick-a",
+                "2030-01-01T00:00:30.000000000Z",
+                mutation_lease,
+            )
             .expect("charge");
         assert_eq!(charged.used, 1);
         assert_eq!(
             charged.next_wake_at.as_deref(),
             Some("2030-01-01T00:00:30.000000000Z")
+        );
+        assert_eq!(
+            charged.claim_lease_until.as_deref(),
+            Some(mutation_lease),
+            "the charge extends the fence over the mutation chain"
         );
         assert!(ledger
             .finish_bead_settlement_retry("run-retry", "tick-a", Some("still held".to_owned()))
@@ -443,11 +460,11 @@ mod tests {
             .expect("free row reclaims");
         for _ in reclaimed.used..reclaimed.budget {
             second
-                .charge_bead_settlement_retry("run-retry", "tick-c", lease)
+                .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease)
                 .expect("charge within budget");
         }
         second
-            .charge_bead_settlement_retry("run-retry", "tick-c", lease)
+            .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease)
             .expect_err("the budget bounds mutating charges");
     }
 }

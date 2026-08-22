@@ -9,6 +9,8 @@
 //!   bead and, when reality already matches the promised outcome, record
 //!   `run.bead-settlement.succeeded` without mutating the bead. Foreign
 //!   custody converges and hands off — a successor's claim is never touched.
+//!   Custody under [`FRONTIER_HOLDER`] is forged's own frontier claim, never
+//!   foreign: the settlement still owes it a finish.
 //!   The terminal marker comment is deliberately forfeited on
 //!   success-without-mutation: the settlement's job is custody and status,
 //!   and writing a comment would make convergence a mutation.
@@ -29,10 +31,16 @@ use crate::config::now_iso;
 
 use super::settlement::{self, Settlement};
 use super::supervise::deadline_after;
-use super::{on_ledger, run_holder, Ctx, Failure};
+use super::{lease_identity, on_ledger, run_holder, Ctx, Failure, FRONTIER_HOLDER};
 
 const REPORT_SCHEMA: &str = "forged.bead-settlement.report/1";
 const CLAIM_LEASE_SECONDS: u64 = 60;
+/// The post-charge fence: charging extends the per-run claim to this window
+/// so the fence provably outlives the longest bd mutation chain it guards —
+/// up to two guarded writes (each bounded by the shared flock wait plus the
+/// child run, 60s apiece) and four bounded 30s reads. A crashed executor
+/// therefore parks its run for at most one backoff-cap interval.
+const MUTATION_LEASE_SECONDS: u64 = 480;
 const BACKOFF_BASE_SECONDS: u64 = 30;
 const BACKOFF_CAP_SECONDS: u64 = 480;
 
@@ -63,11 +71,15 @@ enum Probe {
 /// Custody-only convergence predicates. "Already closed" means closed AND
 /// (unassigned OR foreign assignee); closed-but-held permits the one guarded
 /// release. Foreign custody converges the release-shaped outcomes — the
-/// holder is a successor and this settlement hands off.
+/// holder is a successor and this settlement hands off. Foreign means
+/// neither the expected assignee NOR [`FRONTIER_HOLDER`]: the frontier
+/// identity is forged's own pre-run claim, adopted by [`lease_identity`], so
+/// a claim-next-claimed bead is still this settlement's to finish — reading
+/// it as a successor would record success over a claim nobody ever clears.
 fn custody_probe(outcome: RunOutcome, issue: &IssueSummary, expected: &str) -> Probe {
     let holder = issue.assignee.as_deref();
     let unassigned = holder.is_none();
-    let foreign = holder.is_some_and(|holder| holder != expected);
+    let foreign = holder.is_some_and(|holder| holder != expected && holder != FRONTIER_HOLDER);
     if issue.status == "closed" {
         return if unassigned || foreign {
             Probe::Converged
@@ -273,21 +285,19 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
 
     let attempt = claimed.used + 1;
     let wake = deadline_after(&now, backoff_seconds(claimed.used))?;
+    let mutation_lease = deadline_after(&now, MUTATION_LEASE_SECONDS)?;
     let charged = {
         let run = run_id.clone();
         let charge_token = token.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.charge_bead_settlement_retry(&run, &charge_token, &wake)
+            ledger.charge_bead_settlement_retry(&run, &charge_token, &wake, &mutation_lease)
         })
         .await?
     };
     crate::failpoint::hit("bead-settlement.charge.after");
 
     let mutation = match decision {
-        Probe::ReleaseHeldClosed => forged_beads::release_issue(&bd, &bead_id, &expected)
-            .await
-            .map(|_| ())
-            .map_err(Failure::from),
+        Probe::ReleaseHeldClosed => release_held_closed(ctx, &bead_id, &run_id).await,
         _ => {
             // Rebuild the settlement from the run row; the pending payload
             // contributes only beadId/outcome/expectedAssignee.
@@ -355,6 +365,31 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             Ok(Value::Object(report))
         }
     }
+}
+
+/// The one guarded release for a closed-but-held bead, under the bd lease
+/// identity actually in force — the derived holder or an adopted frontier
+/// claim, resolved by [`lease_identity`] at mutation time, never a second
+/// derivation. The result is revalidated: the release CAS fences the
+/// assignee alone, so a reopen landing between the closed probe and the
+/// write yields an open, unassigned bead — not the promised settled shape —
+/// and must fail the attempt rather than record success over it.
+async fn release_held_closed(ctx: &Ctx, bead_id: &str, run_id: &str) -> Result<(), Failure> {
+    let bd = ctx.config.bd_config();
+    let actor = lease_identity(&bd, bead_id, run_id).await?;
+    let released = forged_beads::release_issue(&bd, bead_id, &actor).await?;
+    if released.status != "closed" {
+        return Err(Failure {
+            code: forged_types::ErrorCode::BeadsContention,
+            message: format!(
+                "guarded release of {bead_id} observed status {:?}: a concurrent reopen \
+                 outran the closed-bead probe",
+                released.status
+            ),
+            recoverable: true,
+        });
+    }
+    Ok(())
 }
 
 /// Release the per-run claim. A lost token is not an error — the lease is
@@ -484,6 +519,55 @@ mod tests {
             Probe::Retry,
             "landed promises a close; foreign custody alone is not delivery"
         );
+    }
+
+    #[test]
+    fn frontier_custody_is_own_custody_never_a_foreign_handoff() {
+        for outcome in [
+            RunOutcome::Blocked,
+            RunOutcome::InputRequired,
+            RunOutcome::Cancelled,
+            RunOutcome::Superseded,
+        ] {
+            assert_eq!(
+                custody_probe(
+                    outcome,
+                    &issue("in_progress", Some(FRONTIER_HOLDER)),
+                    EXPECTED
+                ),
+                Probe::Retry,
+                "{outcome:?} under the frontier claim still owes its release"
+            );
+        }
+        assert_eq!(
+            custody_probe(
+                RunOutcome::Landed,
+                &issue("in_progress", Some(FRONTIER_HOLDER)),
+                EXPECTED
+            ),
+            Probe::Retry,
+            "landed under the frontier claim still owes its close"
+        );
+        assert_eq!(
+            custody_probe(
+                RunOutcome::Landed,
+                &issue("closed", Some(FRONTIER_HOLDER)),
+                EXPECTED
+            ),
+            Probe::ReleaseHeldClosed,
+            "closed under the frontier claim permits the one guarded release"
+        );
+        for outcome in [RunOutcome::Clean, RunOutcome::AcceptedRisk] {
+            assert_eq!(
+                custody_probe(
+                    outcome,
+                    &issue("in_progress", Some(FRONTIER_HOLDER)),
+                    EXPECTED
+                ),
+                Probe::MarkerDecides,
+                "{outcome:?} under the frontier claim defers to the marker"
+            );
+        }
     }
 
     #[test]

@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::adapters::ports::ForgedPorts;
 use crate::core::{
-    default_key, derive_key, err_response, fenced, on_ledger, param_opt_str, param_str, run_holder,
-    Ctx, Failure,
+    default_key, derive_key, err_response, fenced, lease_identity, on_ledger, param_opt_str,
+    param_str, run_holder, Ctx, Failure,
 };
 
 /// One validated whole-run settlement request.
@@ -112,7 +112,11 @@ pub(super) async fn settle_bead(
     settlement: &Settlement,
 ) -> Result<Value, Failure> {
     let bd = ctx.config.bd_config();
-    let actor = run_holder(bead_id);
+    // The actor is the bd lease identity actually in force — the derived run
+    // holder or an adopted frontier claim from `claim-next` — read at
+    // settlement time. A hardcoded derived holder would wedge settlement of
+    // a frontier-claimed bead against forged's own lease.
+    let actor = lease_identity(&bd, bead_id, run_id).await?;
     let marker = settlement_marker(run_id, settlement.outcome);
     let detail = match settlement.outcome {
         RunOutcome::Landed => format!(
