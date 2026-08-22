@@ -36,6 +36,15 @@ pub enum HerdrCloseOutcome {
     AlreadyMissing,
 }
 
+/// Result of a read-only `pane.process_info` probe for an exact durable pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProcessInfoProbe {
+    /// Herdr returned a well-formed process-info result for the pane.
+    Info,
+    /// Herdr returned the exact protocol-19 `pane_not_found` code.
+    PaneNotFound,
+}
+
 /// Result of a projection-scoped report/release call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HerdrProjectionOutcome {
@@ -359,6 +368,44 @@ impl HerdrControl {
             });
         }
         Self::connect(identity.socket_path()).await
+    }
+
+    /// Probe the exact durable pane without changing it.
+    ///
+    /// Socket/protocol mismatch is refused before `pane.process_info`. Only
+    /// the exact protocol-19 `pane_not_found` code proves absence; transport
+    /// failures, other RPC errors, and malformed results remain unknown.
+    pub async fn probe_process_info(
+        &self,
+        identity: &HerdrSessionIdentity,
+    ) -> Result<HerdrProcessInfoProbe, HostError> {
+        if identity.protocol() != self.protocol {
+            return Err(HostError::ProtocolMismatch {
+                expected: self.protocol,
+                got: identity.protocol(),
+            });
+        }
+        if identity.socket_path() != self.socket_path || identity.pane_id().is_empty() {
+            return Err(HostError::SessionNotFound {
+                id: identity.pane_id().to_string(),
+            });
+        }
+        match self
+            .conn
+            .call("pane.process_info", json!({"pane_id": identity.pane_id()}))
+            .await
+        {
+            Ok(value) => {
+                serde_json::from_value::<ProcessInfoResponse>(value).map_err(|_| {
+                    HostError::unavailable("malformed pane.process_info result from herdr")
+                })?;
+                Ok(HerdrProcessInfoProbe::Info)
+            }
+            Err(CallError::Rpc(error)) if error.is_pane_not_found() => {
+                Ok(HerdrProcessInfoProbe::PaneNotFound)
+            }
+            Err(other) => Err(other.into_host_error()),
+        }
     }
 
     /// Close the exact durable Herdr identity this control was opened for.

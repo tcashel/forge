@@ -504,7 +504,9 @@ pub(crate) fn request_controller_cleanup_tx(
 ) -> Result<(), LedgerError> {
     let lifecycle = match reason {
         OwnedHerdrCleanupReason::ControllerTerminal => OwnedHerdrLifecycleState::OwnerTerminal,
-        OwnedHerdrCleanupReason::ControllerDead => OwnedHerdrLifecycleState::OwnerDead,
+        OwnedHerdrCleanupReason::ControllerDead | OwnedHerdrCleanupReason::OrphanedSubmit => {
+            OwnedHerdrLifecycleState::OwnerDead
+        }
         _ => {
             return Err(refused(
                 ErrorCode::InvalidRequest,
@@ -610,6 +612,9 @@ fn exact_controller_settled_tx(
             .is_some_and(|(value, state)| value == i64::from(generation) && state == "stopped"),
         (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::ControllerDead)) => {
             current.is_some_and(|(value, _)| value >= i64::from(generation))
+        }
+        (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::OrphanedSubmit)) => {
+            current.is_none_or(|(value, _)| value < i64::from(generation))
         }
         _ => false,
     })
@@ -772,6 +777,29 @@ impl Ledger {
         })
     }
 
+    /// Greatest controller generation that has ever owned a durable Herdr
+    /// pane for this exact subject. Released rows remain identity occupants,
+    /// so generation selection must skip them too.
+    pub fn max_owned_herdr_controller_generation(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<Option<u32>, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let value: Option<i64> = conn.query_row(
+                "SELECT MAX(controller_generation) FROM owned_herdr_sessions \
+                 WHERE owner_kind = 'controller' AND subject_kind = ?1 AND subject_id = ?2",
+                rusqlite::params![kind.as_str(), subject_id],
+                |row| row.get(0),
+            )?;
+            value
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|error| internal(format!("invalid owned controller generation: {error}")))
+        })
+    }
+
     /// Durable publication marker after the command was successfully sent.
     pub fn mark_owned_herdr_command_started(
         &self,
@@ -845,6 +873,51 @@ impl Ledger {
         generation: u32,
         reason: OwnedHerdrCleanupReason,
     ) -> Result<OwnedHerdrSessionRow, LedgerError> {
+        if !matches!(
+            reason,
+            OwnedHerdrCleanupReason::ControllerTerminal | OwnedHerdrCleanupReason::ControllerDead
+        ) {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "controller cleanup requires terminal or dead-controller evidence",
+            ));
+        }
+        self.request_owned_herdr_controller_cleanup_inner(
+            ownership_id,
+            kind,
+            subject_id,
+            generation,
+            reason,
+        )
+    }
+
+    /// Persist orphaned-submit cleanup eligibility after the caller's exact
+    /// recorded-socket `pane.process_info` probe returned `pane_not_found`.
+    /// The no-matching-desired-epoch predicate is rechecked transactionally.
+    pub fn request_orphaned_owned_herdr_controller_cleanup(
+        &self,
+        ownership_id: &str,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+        generation: u32,
+    ) -> Result<OwnedHerdrSessionRow, LedgerError> {
+        self.request_owned_herdr_controller_cleanup_inner(
+            ownership_id,
+            kind,
+            subject_id,
+            generation,
+            OwnedHerdrCleanupReason::OrphanedSubmit,
+        )
+    }
+
+    fn request_owned_herdr_controller_cleanup_inner(
+        &self,
+        ownership_id: &str,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+        generation: u32,
+        reason: OwnedHerdrCleanupReason,
+    ) -> Result<OwnedHerdrSessionRow, LedgerError> {
         let ownership_id = ownership_id.to_owned();
         let subject_id = subject_id.to_owned();
         self.submit(move |conn| {
@@ -877,6 +950,9 @@ impl Ledger {
                 OwnedHerdrCleanupReason::ControllerDead => current
                     .as_ref()
                     .is_some_and(|(value, _)| *value >= i64::from(generation)),
+                OwnedHerdrCleanupReason::OrphanedSubmit => current
+                    .as_ref()
+                    .is_none_or(|(value, _)| *value < i64::from(generation)),
                 _ => false,
             };
             if !durable {

@@ -9,9 +9,9 @@ use std::time::Duration;
 
 use forged_host::{
     Confirmed, HerdrAgentProjection, HerdrAgentRelease, HerdrCloseOutcome, HerdrControl, HerdrHost,
-    HerdrLayoutInspection, HerdrLayoutTarget, HerdrMetadataProjection, HerdrProjectionOutcome,
-    HerdrSessionIdentity, HerdrTabCreateError, HostError, Liveness, SessionHost,
-    HERDR_PROTOCOL_VERSION,
+    HerdrLayoutInspection, HerdrLayoutTarget, HerdrMetadataProjection, HerdrProcessInfoProbe,
+    HerdrProjectionOutcome, HerdrSessionIdentity, HerdrTabCreateError, HostError, Liveness,
+    SessionHost, HERDR_PROTOCOL_VERSION,
 };
 use forged_types::HerdrProjectionLifecycle;
 use serde_json::{json, Value};
@@ -546,6 +546,60 @@ async fn durable_close_distinguishes_closed_from_exact_missing() {
             .expect("already missing"),
         HerdrCloseOutcome::AlreadyMissing
     );
+}
+
+#[tokio::test]
+async fn durable_process_info_probe_treats_only_exact_missing_as_absence() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("pane.process_info", 1) => vec![Action::Respond(shell_ready("w1:live"))],
+        ("pane.process_info", 2) => vec![PANE_NOT_FOUND],
+        ("pane.process_info", 3) => vec![Action::RespondErr {
+            code: "INTERNAL",
+            message: "pane not found",
+        }],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let identity = |pane| {
+        HerdrSessionIdentity::from_durable(pane, mock.socket_path.clone(), HERDR_PROTOCOL_VERSION)
+    };
+    let live = identity("w1:live");
+    let control = HerdrControl::connect_for(&live).await.expect("connect");
+    assert_eq!(
+        control.probe_process_info(&live).await.expect("live probe"),
+        HerdrProcessInfoProbe::Info
+    );
+    assert_eq!(
+        control
+            .probe_process_info(&identity("w1:missing"))
+            .await
+            .expect("missing probe"),
+        HerdrProcessInfoProbe::PaneNotFound
+    );
+    assert!(matches!(
+        control.probe_process_info(&identity("w1:ambiguous")).await,
+        Err(HostError::Unavailable { .. })
+    ));
+    assert_eq!(mock.count_of("pane.close"), 0);
+}
+
+#[tokio::test]
+async fn durable_process_info_probe_rejects_malformed_info() {
+    let mock = Mock::start(|method, _params, n| match (method, n) {
+        ("ping", 1) => vec![Action::Respond(pong(HERDR_PROTOCOL_VERSION))],
+        ("pane.process_info", 1) => vec![Action::Respond(json!({"type": "ok"}))],
+        other => panic!("unexpected request {other:?}"),
+    });
+    let identity = HerdrSessionIdentity::from_durable(
+        TEST_PANE_ID,
+        mock.socket_path.clone(),
+        HERDR_PROTOCOL_VERSION,
+    );
+    let control = HerdrControl::connect_for(&identity).await.expect("connect");
+    assert!(matches!(
+        control.probe_process_info(&identity).await,
+        Err(HostError::Unavailable { .. })
+    ));
 }
 
 #[tokio::test]

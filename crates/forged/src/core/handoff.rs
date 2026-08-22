@@ -1441,6 +1441,24 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         .map(|value| generation(&value))
         .max()
         .unwrap_or(0);
+    let owned_generation = {
+        let kind = scope.desired_kind();
+        let subject_id = id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.max_owned_herdr_controller_generation(kind, &subject_id)
+        })
+        .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    max_generation = max_generation.max(owned_generation.unwrap_or(0));
     let mut latest_status = Value::Null;
     if let Ok(Some(record)) = latest_record(ctx, &id).await {
         max_generation = max_generation.max(generation(&record));
