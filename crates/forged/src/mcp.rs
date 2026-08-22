@@ -822,11 +822,14 @@ impl WorkDetailArgs {
 }
 
 /// The lazy ledger gate: durable state is created only by operator intent,
-/// never by a host handshaking this server. "Uninitialized" is a fresh
-/// `config.db_path` existence check on every call — latched in neither
-/// direction — and a successful open (with legacy-state migration completed
-/// before any dispatch observes the ledger) latches once for the mount's
-/// lifetime.
+/// never by a host handshaking this server. "Uninitialized" is decided
+/// fresh on every call — latched in neither direction — by a
+/// `config.db_path` existence precheck AND, authoritatively, by the
+/// no-create open itself: a ledger deleted after the precheck fails that
+/// call instead of being silently re-created blank (the precheck alone
+/// would race with deletion). A successful open (with legacy-state
+/// migration completed before any dispatch observes the ledger) latches
+/// once for the mount's lifetime.
 struct McpState {
     config: ForgedConfig,
     ctx: tokio::sync::OnceCell<Arc<Ctx>>,
@@ -847,26 +850,43 @@ impl McpState {
     /// The gate at the two dispatch seams. An uninitialized scope refuses —
     /// creating nothing — until the operator runs `forged init`; a failed
     /// open or migration is that call's failure and the next call retries.
+    /// The existence check is only the fast common-case refusal; the
+    /// authority is [`McpState::open`]'s no-create open.
     async fn ctx(&self) -> Result<Arc<Ctx>, Failure> {
         if !self.config.db_path.exists() {
-            return Err(Failure::invalid(format!(
-                "operator state does not exist at {}; a session mount creates \
-                 nothing — initialize it deliberately with `forged init` or \
-                 /forged:setup",
-                self.config.db_path.display()
-            )));
+            return Err(self.uninitialized());
         }
         self.ctx.get_or_try_init(|| self.open()).await.cloned()
+    }
+
+    /// The uninitialized-scope refusal: the session mount's answer wherever
+    /// it would otherwise have to create durable state.
+    fn uninitialized(&self) -> Failure {
+        Failure::invalid(format!(
+            "operator state does not exist at {}; a session mount creates \
+             nothing — initialize it deliberately with `forged init` or \
+             /forged:setup",
+            self.config.db_path.display()
+        ))
     }
 
     async fn open(&self) -> Result<Arc<Ctx>, Failure> {
         #[cfg(test)]
         self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         let db_path = self.config.db_path.clone();
-        let ledger = tokio::task::spawn_blocking(move || forged_ledger::Ledger::open(&db_path))
-            .await
-            .map_err(|e| Failure::internal(format!("blocking task join failure: {e}")))?
-            .map_err(|e| Failure::internal(format!("cannot open ledger: {e}")))?;
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::failpoint::hit("mcp.ledger.open.before");
+            forged_ledger::Ledger::open_existing(&db_path)
+        })
+        .await
+        .map_err(|e| Failure::internal(format!("blocking task join failure: {e}")))?
+        .map_err(|e| Failure::internal(format!("cannot open ledger: {e}")))?;
+        // The precheck passed but the ledger vanished before the open: the
+        // no-create open is the authority, so the race refuses exactly as
+        // the check would have — creating nothing.
+        let Some(ledger) = opened else {
+            return Err(self.uninitialized());
+        };
         let ctx = Arc::new(Ctx {
             config: self.config.clone(),
             ledger,
