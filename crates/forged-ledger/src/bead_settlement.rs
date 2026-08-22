@@ -130,11 +130,7 @@ impl Ledger {
                    (run_id, budget, used, created_at, updated_at) \
                  VALUES (?1, ?2, 0, ?3, ?3) \
                  ON CONFLICT(run_id) DO NOTHING",
-                rusqlite::params![
-                    run_id,
-                    i64::from(BEAD_SETTLEMENT_RETRY_BUDGET),
-                    now_iso()
-                ],
+                rusqlite::params![run_id, i64::from(BEAD_SETTLEMENT_RETRY_BUDGET), now_iso()],
             )?;
             let affected = tx.execute(
                 "UPDATE bead_settlement_retry \

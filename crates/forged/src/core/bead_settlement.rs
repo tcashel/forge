@@ -97,10 +97,7 @@ fn custody_probe(outcome: RunOutcome, issue: &IssueSummary, expected: &str) -> P
 /// One supervisor pass over every run whose latest bead-settlement event is
 /// still pending. Per-run failures are report entries, never a tick failure.
 pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
-    let pending = on_ledger(&ctx.ledger, |ledger| {
-        ledger.list_pending_bead_settlements()
-    })
-    .await?;
+    let pending = on_ledger(&ctx.ledger, |ledger| ledger.list_pending_bead_settlements()).await?;
     let mut actions = Vec::new();
     for row in &pending {
         let entry = match reconcile_run(ctx, row).await {
@@ -216,8 +213,7 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
             // the standing pending evidence once so attention carries the
             // exhaustion; the derivation is deterministic, so concurrent
             // executors collapse to one appended event.
-            let stamped = if payload.get("retriesExhausted").and_then(Value::as_bool)
-                == Some(true)
+            let stamped = if payload.get("retriesExhausted").and_then(Value::as_bool) == Some(true)
             {
                 false
             } else {
@@ -432,7 +428,11 @@ mod tests {
                 "{outcome:?} closed+unassigned"
             );
             assert_eq!(
-                custody_probe(outcome, &issue("closed", Some("forged:successor:0")), EXPECTED),
+                custody_probe(
+                    outcome,
+                    &issue("closed", Some("forged:successor:0")),
+                    EXPECTED
+                ),
                 Probe::Converged,
                 "{outcome:?} closed+foreign"
             );
