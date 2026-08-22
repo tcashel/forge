@@ -64,7 +64,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .attention .meta { margin-top: 2px; }
 .symptom-line { padding: 8px 10px; border-left: 3px solid var(--warn); background: var(--panel); display: grid; gap: 4px; }
 .symptom-summary { font-weight: 600; }
-.symptom-item, .symptom-root { color: var(--muted); font-size: 11px; }
+.symptom-item, .symptom-root, .symptom-unresolved { color: var(--muted); font-size: 11px; }
 .groups { display: grid; gap: 12px; }
 .group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .group__head { padding: 9px 11px; background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
@@ -222,6 +222,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // it did not draw is stated, never dropped.
   const RAIL_CAP = 12;
   const BLOCKER_ROOT_CAP = 5;
+  const SYMPTOM_ITEM_CAP = 5;
+  const SETTLED_CAP = 5;
   function severityTone(severity) { return severity === "critical" || severity === "high" ? "block" : severity === "medium" ? "warn" : "idle"; }
   function attentionTitle(item) { return item?.subjectTitle?.value || item?.subjectId || item?.id || "unknown subject"; }
   function attentionSelector(item) { const id = item?.subjectId || item?.id; return id ? `${item?.subjectKind || "run"}:${id}` : null; }
@@ -284,7 +286,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     return [item?.openedAt, item?.updatedAt].some(value => typeof value === "string" && value > state.lastOpenedAt);
   }
   function selectAttention(item) {
-    state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = item;
+    state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = item;
     renderDetail(); reportSize();
   }
   function renderDecision(item) {
@@ -318,17 +320,20 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       const bead = itemBeadId(item);
       const targets = bead ? arr(direct.get(`plan:${bead}`)) : [];
       if (!targets.length) { unresolved += 1; continue; }
-      let missing = false;
+      // ONE root per blocked item — the first resolvable blocker — so the
+      // per-root counts sum to the blocked total instead of counting edges.
+      let attributed = false;
       for (const target of targets) {
         const key = `${target?.kind}:${target?.id}`;
         const node = nodes.get(key);
-        if (!node) { missing = true; continue; }
-        const title = node?.titleSource?.value || node?.identity?.displayTitle || target?.id;
-        if (!title) { missing = true; continue; }
+        const title = node?.titleSource?.value || node?.identity?.displayTitle || (node ? target?.id : null);
+        if (!title) continue;
         if (!roots.has(key)) roots.set(key, { title, count: 0 });
         roots.get(key).count += 1;
+        attributed = true;
+        break;
       }
-      if (missing) unresolved += 1;
+      if (!attributed) unresolved += 1;
     }
     return { roots: [...roots.values()], unresolved };
   }
@@ -352,7 +357,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       if (result.unresolved) line.append(el("span", "symptom-unresolved", `Root cause unavailable · ${fmt(result.unresolved)} blocked`));
     } else {
       line.append(el("span", "symptom-summary", shown < total ? `${fmt(shown)} of ${fmt(total)} ${label}` : `${fmt(total)} ${label}`));
-      for (const item of items) line.append(el("span", "symptom-item", attentionTitle(item)));
+      for (const item of items.slice(0, SYMPTOM_ITEM_CAP)) line.append(el("span", "symptom-item", attentionTitle(item)));
+      if (items.length > SYMPTOM_ITEM_CAP) line.append(el("span", "rail__note", `${fmt(SYMPTOM_ITEM_CAP)} of ${fmt(items.length)} shown`));
     }
     return line;
   }
@@ -382,6 +388,17 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     const decisionTotal = num(list?.totals?.decisions);
     if (decisionsDrawn < decisionTotal) rail.append(el("div", "rail__note", `${fmt(decisionsDrawn)} of ${fmt(decisionTotal)} decisions shown`));
+    const settled = arr(list?.settled);
+    if (settled.length) {
+      const section = el("section", "rail__group");
+      const head = el("div", "rail__head");
+      head.append(el("b", "triage-heading", "recently settled"));
+      head.append(el("span", "", fmt(num(list?.settledTotal ?? settled.length))));
+      section.append(head);
+      for (const item of settled.slice(0, SETTLED_CAP)) section.append(renderDecision(item));
+      if (settled.length > SETTLED_CAP) section.append(el("div", "rail__note", `${fmt(SETTLED_CAP)} of ${fmt(settled.length)} settled shown`));
+      rail.append(section);
+    }
   }
   function renderRail(data) {
     if (state.triage && state.triageMap && !state.triageError) {
@@ -394,17 +411,16 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
-    if (!state.detail && !state.detailError && !state.plan && !state.entry && !state.attentionSelection) { box.hidden = true; return; }
+    if (!state.detail && !state.detailError && !state.plan && !state.attentionSelection) { box.hidden = true; return; }
     box.hidden = false;
     const head = el("div", "drawer__head");
     const heading = el("div");
-    heading.append(el("h2", "", state.attentionSelection ? attentionTitle(state.attentionSelection) : state.plan ? titleFor(state.plan) : state.entry ? titleFor(state.entry) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
+    heading.append(el("h2", "", state.attentionSelection ? attentionTitle(state.attentionSelection) : state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
     if (state.attentionSelection) { const selector=attentionSelector(state.attentionSelection); if(selector) heading.append(chip(selector,"id")); }
     else if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
-    else if (state.entry?.detailTarget) heading.append(chip(`${state.entry.detailTarget.subjectKind}:${state.entry.detailTarget.subjectId}`, "id"));
     else if (state.detail) heading.append(chip(`${state.detail.workRef?.kind || state.detail.kind}:${state.detail.id}`, "id"));
     head.append(heading);
-    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = null; renderDetail(); }); head.append(close); box.append(head);
+    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail(); }); head.append(close); box.append(head);
     if (state.detailError) { box.append(el("div", "error", state.detailError.message || String(state.detailError))); return; }
     const dl = el("dl", "kv");
     const add = (key, value) => { dl.append(el("dt", "", key)); dl.append(el("dd", "", value == null ? "—" : value)); };
@@ -436,18 +452,6 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
       box.append(dl);
       return;
     }
-    if (state.entry) {
-      const entry=state.entry;
-      add("projected facts", "from the bounded Operations result");
-      add("state", entry.state || entry.outcome);
-      add("repository", repositoryLabel(entry.identity));
-      add("source", entry.source);
-      add("updated", age(entry.lastProgressAt || entry.updatedAt));
-      add("known spend", spendText(entry) || "—");
-      add("next action", entry.nextAction);
-      box.append(dl);
-      return;
-    }
     add("state", stateFor(state.detail));
     add("repository", repositoryLabel(state.detail.identity));
     add("workers", arr(state.detail.workers?.sessions).length);
@@ -459,11 +463,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    * A live-plan row is not a dead row: its whole Beads record already
    * travelled inside the projection, so opening it needs no tool call.
    */
-  function openPlan(entry) { state.detail = null; state.detailError = null; state.entry = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
-  function openEntry(entry) { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; state.entry = entry; renderDetail(); reportSize(); }
+  function openPlan(entry) { state.detail = null; state.detailError = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
   async function openDetail(entry) {
-    if (!host.capabilities.serverTools || !entry?.detailTarget) { openEntry(entry); return; }
-    state.detail = null; state.detailError = null; state.plan = null; state.entry = null; state.attentionSelection = null; renderDetail();
+    if (!host.capabilities.serverTools || !entry?.detailTarget) return;
+    state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail();
     try {
       const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
       const envelope = envelopeFrom(result);
@@ -501,10 +504,13 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // live-plan row already carries its whole Beads record, and opening
         // that needs no server tool.
         const planFacts = !target && !!entry.plan;
+        const canDetail = !!target && host.capabilities.serverTools;
         const conditions=conditionRows(entry,data.attention);const semantic=semanticState(entry,group.code||group.label,conditions);const row = el("button", `row semantic--${semantic}`); row.type = "button";
-        row.disabled = !target && !planFacts;
+        row.disabled = target ? !canDetail : !planFacts;
         row.title = target
-          ? (host.capabilities.serverTools ? `Open exact work detail for ${selector}` : `Open projected work facts for ${selector}`)
+          ? (canDetail
+            ? `Open exact work detail for ${selector}`
+            : `Exact detail target ${selector}; this host cannot call server tools`)
           : planFacts
             ? "Open the plan facts this row already carries"
             : "This row carries neither a durable detail target nor plan facts";
@@ -579,44 +585,28 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     return value;
   }
   function mergeTriage(active, settlements) {
-    const activeGroups = arr(active?.groups);
-    const allGroups = arr(settlements?.groups);
-    const activeByCondition = new Map(activeGroups.map(group=>[group?.condition,group]));
-    const allByCondition = new Map(allGroups.map(group=>[group?.condition,group]));
-    const conditions = [...activeGroups.map(group=>group?.condition), ...allGroups.map(group=>group?.condition).filter(condition=>!activeByCondition.has(condition))];
-    const merged = conditions.map((condition,index) => {
-      const activeGroup = activeByCondition.get(condition);
-      const allGroup = allByCondition.get(condition);
-      const activeItems = arr(activeGroup?.items).filter(item=>item?.state!=="resolved");
-      const resolvedItems = arr(allGroup?.items).filter(item=>item?.state==="resolved").sort((left,right)=>String(right?.updatedAt||right?.openedAt||"").localeCompare(String(left?.updatedAt||left?.openedAt||"")));
-      const activeTotal = num(activeGroup?.total);
-      const resolvedTotal = Math.max(resolvedItems.length, num(allGroup?.total)-activeTotal);
-      return {
-        condition,
-        classification: activeGroup?.classification || allGroup?.classification,
-        total: activeTotal + resolvedTotal,
-        shown: activeItems.length + resolvedItems.length,
-        oldestOpenedAt: activeGroup?.oldestOpenedAt || allGroup?.oldestOpenedAt,
-        items: [...activeItems, ...resolvedItems],
-        active: !!activeGroup,
-        index,
-        resolvedTotal,
-      };
-    });
-    merged.sort((left,right)=>(left.classification!=="decision")-(right.classification!=="decision")||(right.active-left.active)||left.index-right.index);
-    const groups = merged.map(({active: _active, index: _index, resolvedTotal: _resolvedTotal, ...group})=>group);
-    const resolvedDecisions = merged.filter(group=>group.classification==="decision").reduce((total,group)=>total+group.resolvedTotal,0);
-    const resolvedSymptoms = merged.filter(group=>group.classification==="symptom").reduce((total,group)=>total+group.resolvedTotal,0);
-    const totals = {
-      open: num(active?.totals?.open),
-      acknowledged: num(active?.totals?.acknowledged),
-      resolved: num(settlements?.totals?.resolved),
-      decisions: num(active?.totals?.decisions) + resolvedDecisions,
-      symptoms: num(active?.totals?.symptoms) + resolvedSymptoms,
-      shown: groups.reduce((total,group)=>total+group.shown,0),
-      total: num(active?.totals?.total) + num(settlements?.totals?.resolved),
-    };
-    return { ...active, filters: { ...active?.filters, settlements: "all" }, totals, groups };
+    // Spec amendment (adjudicated on the bead): the settlements query is a
+    // separate, PRESENTATION-ONLY surface. totals/decisions/symptoms,
+    // group membership, and oldest ages come from the ACTIVE payload
+    // verbatim — resolved history never counts as outstanding work. A
+    // resolved item whose occurrence is also active (a transition racing
+    // the two snapshots) is dropped: the active snapshot wins.
+    const activeKeys = new Set();
+    for (const group of arr(active?.groups))
+      for (const item of arr(group?.items))
+        activeKeys.add(`${item?.attentionId}:${item?.occurrenceId}`);
+    const settledSeen = new Set();
+    const settled = [];
+    for (const group of arr(settlements?.groups))
+      for (const item of arr(group?.items)) {
+        if (item?.state !== "resolved") continue;
+        const key = `${item?.attentionId}:${item?.occurrenceId}`;
+        if (activeKeys.has(key) || settledSeen.has(key)) continue;
+        settledSeen.add(key);
+        settled.push(item);
+      }
+    settled.sort((left,right)=>String(right?.updatedAt||right?.openedAt||"").localeCompare(String(left?.updatedAt||left?.openedAt||"")));
+    return { ...active, settled, settledTotal: num(settlements?.totals?.resolved ?? settled.length) };
   }
   async function refreshTriage() {
     if (!host.connected || !host.capabilities.serverTools || state.triageLoading) return;
@@ -708,7 +698,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); clearTimeout(p.timer); timers.delete(p.timer); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
     if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
     else if (message.method === "ui/notifications/tool-result") ingest(message.params);
-    else if (message.method === "ui/notifications/tool-cancelled") { state.error = { message: message.params?.reason || "Cancelled" }; render(); }
+    else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.triageLoading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
     else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
     else if (message.method === "ui/resource-teardown") { teardown(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
   }

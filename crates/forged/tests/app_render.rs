@@ -1481,10 +1481,10 @@ fn split_apps_obey_the_host_lifecycle_without_trusting_tool_text() {
                 rows[0]["title"],
                 json!("Open the plan facts this row already carries")
             );
-            assert_eq!(rows[1]["disabled"], json!(false));
+            assert_eq!(rows[1]["disabled"], json!(true));
             assert_eq!(
                 rows[1]["title"],
-                json!("Open projected work facts for run:run-1")
+                json!("Exact detail target run:run-1; this host cannot call server tools")
             );
             assert!(
                 report["text"]
@@ -2554,7 +2554,7 @@ fn operations_triage_groups_blocked_items_by_their_direct_named_blocker() {
 }
 
 #[test]
-fn operations_blocked_roots_keep_all_edges_and_collapse_unresolved_evidence() {
+fn operations_blocked_roots_attribute_one_root_per_item_and_collapse_unresolved() {
     let Some(node) = require_node() else { return };
     let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
         .join("assets")
@@ -2630,7 +2630,9 @@ fn operations_blocked_roots_keep_all_edges_and_collapse_unresolved_evidence() {
         &triage_scenario(listed, map, json!("absent")),
     );
     let text = report["text"].to_string();
-    assert!(text.contains("3 blocked on 2 root causes"), "{report}");
+    // ONE root per blocked item: the per-root counts plus the unresolved
+    // line sum to the blocked total instead of counting edges.
+    assert!(text.contains("3 blocked on 1 root cause"), "{report}");
     let roots = report["nodes"]
         .as_array()
         .expect("rendered nodes")
@@ -2640,8 +2642,8 @@ fn operations_blocked_roots_keep_all_edges_and_collapse_unresolved_evidence() {
         .collect::<Vec<_>>();
     assert_eq!(
         roots,
-        vec!["Release gate A · 1 blocked", "Release gate B · 1 blocked"],
-        "one blocked item retains both direct blockers: {report}"
+        vec!["Release gate A · 1 blocked"],
+        "a multi-blocker item attributes to exactly one root: {report}"
     );
     assert_eq!(
         report["nodes"]
@@ -2824,21 +2826,36 @@ fn operations_active_decisions_lead_the_bounded_recent_settlement_feed() {
                 .is_some_and(|class| class.contains("decision-row"))
         })
         .collect::<Vec<_>>();
+    // The amended contract: settlements are presentation-only. The active
+    // decision leads, the settled feed renders in its own capped section,
+    // and neither the totals nor the headline count resolved history.
     assert_eq!(
         decisions.len(),
-        12,
-        "the client decision cap still applies: {report}"
+        1 + 5,
+        "one active decision plus the capped settled feed: {report}"
     );
     assert_eq!(
         decisions[0]["childText"][1],
         json!("Active decision must remain visible"),
         "resolved history cannot displace active work: {report}"
     );
+    let text = report["text"].to_string();
     assert!(
-        report["text"]
-            .to_string()
-            .contains("12 of 21 decisions shown"),
-        "the combined active plus settlement bound reconciles: {report}"
+        text.contains("5 of 20 settled shown"),
+        "the settled feed states its cap: {report}"
+    );
+    assert!(
+        text.contains("recently settled"),
+        "settlements render in their own section: {report}"
+    );
+    let headline = report["headline"].as_str().expect("headline");
+    assert!(
+        headline.contains("1 decision, oldest 2h00m ago"),
+        "totals and oldest come from the ACTIVE payload alone: {headline}"
+    );
+    assert!(
+        !headline.contains("21"),
+        "resolved history never counts as outstanding work: {headline}"
     );
 }
 
