@@ -127,6 +127,89 @@ fn a_crash_between_the_convergence_read_and_the_append_charges_nothing() {
     );
 }
 
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let start = std::time::Instant::now();
+    while !done() {
+        assert!(
+            start.elapsed() < std::time::Duration::from_secs(30),
+            "timed out waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(25));
+    }
+}
+
+fn latest_pending(env: &TestEnv, run: &str) -> Value {
+    let ledger = env.ledger();
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    ledger.close().expect("close");
+    events
+        .into_iter()
+        .rev()
+        .find(|event| event.kind == "run.bead-settlement.pending")
+        .map(|event| serde_json::from_str(&event.payload_json).expect("stored payload"))
+        .expect("a pending event exists")
+}
+
+/// The guarded release CAS fences the assignee alone: a reopen landing
+/// between the closed-bead probe and the release yields an open, unassigned
+/// bead. The attempt must fail with that evidence — never record settlement
+/// success over a bead that no longer matches the promise.
+#[test]
+fn a_reopen_between_the_charge_and_the_release_fails_the_attempt_not_the_promise() {
+    let env = TestEnv::new("km-bead-settlement-reopen");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let run = "km-bsr-reopen";
+    let bead = seed_pending(&env, run, "bd timed out mid-close");
+    env.set_bead_field(&bead, "status", "closed");
+    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+
+    let fp = env.anvil.join("failpoints");
+    std::fs::create_dir_all(&fp).expect("failpoint dir");
+    let mut paused = env
+        .forged_cmd(&["supervise", "--once"])
+        .env("FORGED_FAILPOINT", "bead-settlement.charge.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("supervise child spawns");
+    wait_until("the charged executor pauses before its release", || {
+        fp.join("bead-settlement.charge.after.reached").exists()
+    });
+    // The concurrent reopen: the closed bead goes back to open while the
+    // charged executor is parked between its charge and its guarded release.
+    env.set_bead_field(&bead, "status", "open");
+    std::fs::write(fp.join("bead-settlement.charge.after.release"), b"").expect("release");
+    assert!(
+        paused.wait().expect("supervise completes").success(),
+        "the tick itself survives the failed attempt"
+    );
+
+    assert_eq!(env.assignee(&bead), None, "the release CAS itself fired");
+    assert_eq!(
+        used(&env, run),
+        Some(1),
+        "one charge for the failed attempt"
+    );
+    assert_eq!(
+        event_count(&env, run, "run.bead-settlement.succeeded"),
+        0,
+        "no success is recorded over the reopened bead"
+    );
+    let repended = latest_pending(&env, run);
+    assert!(
+        repended["error"]
+            .as_str()
+            .is_some_and(|error| error.contains("concurrent reopen")),
+        "the failed attempt records the race as evidence: {repended}"
+    );
+
+    // The promise stays owed: a later pass still refuses to call it settled.
+    supervise_once(&env);
+    assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 0);
+}
+
 #[test]
 fn a_crash_after_the_charged_mutation_converges_without_repeating_it() {
     let env = TestEnv::new("km-bead-settlement-mutate");

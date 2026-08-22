@@ -324,6 +324,82 @@ fn per_outcome_convergence_hands_off_foreign_custody_and_releases_held_closed() 
 }
 
 #[test]
+fn frontier_custody_is_settled_under_the_frontier_actor_never_read_as_foreign() {
+    let env = TestEnv::new("bsr-frontier");
+    env.forged(&["init"]);
+
+    // Cancelled, with the bead still held under the frontier identity from
+    // its claim-next dispatch: this is forged's OWN claim, not a successor
+    // handoff — the release is owed, and it must be guarded by the frontier
+    // actor the bead is actually held under.
+    let cancelled_bead = seed_pending(
+        &env,
+        "bsr-fr-cancel",
+        RunOutcome::Cancelled,
+        "operator cancelled",
+        None,
+        None,
+        None,
+        "bd was unreachable",
+    );
+    env.set_bead_field(&cancelled_bead, "status", "in_progress");
+    env.set_assignee(&cancelled_bead, "forged:frontier:0");
+
+    // Landed, closed but still held by the frontier claim: exactly one
+    // guarded release, under the frontier actor.
+    let held_bead = seed_pending(
+        &env,
+        "bsr-fr-held",
+        RunOutcome::Landed,
+        "delivery verified",
+        Some(124),
+        Some("d".repeat(40)),
+        None,
+        "bd timed out mid-close",
+    );
+    env.set_bead_field(&held_bead, "status", "closed");
+    env.set_assignee(&held_bead, "forged:frontier:0");
+
+    let report = supervise_once(&env);
+    for run in ["bsr-fr-cancel", "bsr-fr-held"] {
+        let action = settlement_action(&report, run);
+        assert_eq!(
+            action["action"],
+            json!("retried"),
+            "{run} mutates under its own frontier claim, never converges \
+             read-only over it: {report}"
+        );
+        assert_eq!(action["settled"], json!(true), "{report}");
+        assert_eq!(
+            settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
+            1,
+            "{run} records succeeded"
+        );
+    }
+
+    let cancel_updates: Vec<String> = mutation_calls(&env, &cancelled_bead)
+        .into_iter()
+        .filter(|call| call.starts_with("update "))
+        .collect();
+    assert_eq!(cancel_updates.len(), 1, "{cancel_updates:?}");
+    assert!(
+        cancel_updates[0].contains("--if-assignee forged:frontier:0")
+            && cancel_updates[0].contains("--actor forged:frontier:0"),
+        "the release CAS names the frontier claim: {cancel_updates:?}"
+    );
+    assert_eq!(env.assignee(&cancelled_bead), None);
+
+    let releases = mutation_calls(&env, &held_bead);
+    assert_eq!(releases.len(), 1, "one guarded release: {releases:?}");
+    assert!(
+        releases[0].contains("--if-assignee forged:frontier:0")
+            && !releases[0].contains("--status"),
+        "the release is the frontier-guarded assignee CAS alone: {releases:?}"
+    );
+    assert_eq!(env.assignee(&held_bead), None);
+}
+
+#[test]
 fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_survives() {
     let env = TestEnv::new("bsr-stuck");
     env.forged(&["init"]);
