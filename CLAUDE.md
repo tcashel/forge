@@ -66,15 +66,6 @@ scratch run is a test failure). Never run package managers (`brew`, `cargo
 install` into PATH, etc.) from an agent — the live bd binary is pinned by
 the operator.
 
-## License boundary (hard exclusion)
-
-This repo is MIT + OpenAI/Anthropic rider (see LICENSE). The
-Dicklesworthstone portfolio (`beads_rust`, `fastmcp_rust`, `frankenterm`,
-`asupersync`) carries a rider that defines restricted *use* to include
-**analyzing** the code: do not read, clone, vendor, or derive from those
-repositories in any agent session here. beads itself (gastownhall/beads, MIT)
-and rmcp (the official MCP Rust SDK) are the sanctioned dependencies.
-
 ## Conventions
 
 Conventional commits, lowercase, ≤ 70 chars. PRs target `main`; only the
