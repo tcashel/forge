@@ -48,6 +48,10 @@ function lift(name) {
   return lines.slice(start, end + 1).join("\n");
 }
 
+function maybeLift(name) {
+  try { return lift(name); } catch { return ""; }
+}
+
 function element(tag) {
   const node = {
     tag,
@@ -135,11 +139,25 @@ const source = [
 ]
   .map(lift)
   .join("\n");
+const semanticSource = [
+  "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "conditionRows", "semanticState", "semanticLabel",
+  "degradedSources", "queueCount", "spendText", "fullHeadline", "pushPortfolioModelContext",
+]
+  .map(maybeLift)
+  .filter(Boolean)
+  .join("\n");
 // `state` and `nodes` are lifted too — they are the objects the dispatch
 // writes through, and substituting our own would test the substitute.
 const host = {
   connected: true,
-  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
+  capabilities: { serverTools: process.env.SERVER_TOOLS !== "0", updateModelContext: true },
+};
+const modelContext = [];
+const request = (method, params) => {
+  if (method === "ui/update-model-context") {
+    modelContext.push((params?.content || []).map((part) => part.text).join("\n"));
+  }
+  return Promise.resolve({});
 };
 const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "document",
@@ -149,8 +167,9 @@ const { capabilitiesSettled, ingest, state, nodes } = new Function(
   "packetRows",
   "headline",
   "host",
-  `${lift("state")}\n${lift("nodes")}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
-)(document, () => {}, () => {}, () => {}, () => [], () => ({}), host);
+  "request",
+  `${lift("state")}\n${lift("nodes")}\n${semanticSource}\n${source}\nreturn { capabilitiesSettled, ingest, state, nodes };`,
+)(document, () => {}, () => {}, () => {}, () => [], () => ({}), host, request);
 
 let stdin = "";
 process.stdin.setEncoding("utf8");
@@ -212,5 +231,7 @@ process.stdout.write(
     controlsHidden: nodes.controls.hidden,
     args: state.args,
     error: state.error,
+    headline: registry.get("headline")?.textContent || "",
+    modelContext,
   }),
 );

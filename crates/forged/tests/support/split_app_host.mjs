@@ -16,6 +16,7 @@ const agentSessions = asset.endsWith("agent-sessions.html");
 const html = readFileSync(asset, "utf8");
 const match = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!match) throw new Error(`${asset} has no inline script`);
+if (scenario?.now) Date.now = () => Date.parse(scenario.now);
 
 let innerHTMLWrites = 0;
 function element(tag) {
@@ -399,7 +400,7 @@ for (const action of scenario?.actions || []) {
     const live = [];
     const walkLive = node => { live.push(node); for (const kid of node.kids) walkLive(kid); };
     for (const root of registry.values()) walkLive(root);
-    const targets = live.filter(node => node.className === action.class && !node.disabled);
+    const targets = live.filter(node => node.className.split(/\s+/).includes(action.class) && !node.disabled);
     const target = targets[action.index || 0];
     if (!target) throw new Error(`no clickable ${action.class} at index ${action.index || 0}`);
     target.click();
@@ -524,9 +525,9 @@ function flatten(root) {
   return out;
 }
 const nodes = [...registry.values()].flatMap(flatten);
-const rows = nodes.filter((node) => node.class === "row");
+const rows = nodes.filter((node) => node.class.split(/\s+/).includes("row"));
 const mapNodes = nodes.filter((node) => node.class.startsWith("node"));
-const sessionRows = nodes.filter((node) => node.class === "session-row");
+const sessionRows = nodes.filter((node) => node.class.split(/\s+/).includes("session-row"));
 const text = nodes.map((node) => node.text).filter((value) => value !== undefined).map(String);
 const sizeNotifications = posted.filter((message) => message.method === "ui/notifications/size-changed");
 const modelContext = posted
@@ -554,6 +555,7 @@ process.stdout.write(JSON.stringify({
   changedVariable,
   sizeNotifications,
   modelContext,
+  headline: registry.get("headline")?.textContent || "",
   beforeTeardown,
   afterTeardown: {
     timers: activeTimers.size,

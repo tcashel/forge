@@ -312,6 +312,381 @@ fn portfolio(entries: Vec<Value>, attention: Vec<Value>) -> Value {
     })
 }
 
+fn literal_array(asset: &str, name: &str) -> Vec<String> {
+    let marker = format!("const {name} = ");
+    let literal = asset
+        .split_once(&marker)
+        .and_then(|(_, rest)| rest.split_once(';'))
+        .map(|(literal, _)| literal)
+        .unwrap_or_else(|| panic!("asset carries literal {name}"));
+    serde_json::from_str(literal).unwrap_or_else(|error| panic!("{name} is JSON: {error}"))
+}
+
+#[test]
+fn every_classifying_asset_pins_the_exact_attention_condition_partition() {
+    let decisions = vec![
+        "input-required",
+        "merge-approval",
+        "quarantined",
+        "missing-cost",
+        "retry-exhausted",
+        "reviewer-disagreement",
+        "ambiguous-effect",
+        "restart-budget-exhausted",
+        "missing-evidence",
+    ];
+    let symptoms = vec![
+        "blocked",
+        "beads-settlement-pending",
+        "revoking",
+        "controller-dead",
+        "failed-gate",
+        "provider-degraded",
+        "admission-deferred",
+    ];
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for name in [
+        "overview.html",
+        "operations-overview.html",
+        "work-map.html",
+        "work-detail.html",
+        "agent-sessions.html",
+    ] {
+        let asset = std::fs::read_to_string(root.join(name)).expect("read classifying App");
+        assert_eq!(
+            literal_array(&asset, "DECISION_CONDITIONS"),
+            decisions,
+            "{name}"
+        );
+        assert_eq!(
+            literal_array(&asset, "SYMPTOM_CONDITIONS"),
+            symptoms,
+            "{name}"
+        );
+    }
+}
+
+fn semantic_operations_scenario() -> Value {
+    let entry = |id: &str, title: &str, state: &str, outcome: Value, extra: Value| {
+        let mut value = json!({
+            "id": id,
+            "state": state,
+            "outcome": outcome,
+            "source": "durable",
+            "identity": {"displayTitle": title},
+            "titleSource": {"known": true, "value": title, "source": "identity.displayTitle"},
+            "lastProgressAt": "2026-08-22T11:30:00Z",
+            "costUsdKnown": 0.0,
+            "rowsMissingCost": 0,
+            "detailTarget": {"subjectKind": "run", "subjectId": id},
+        });
+        if let (Some(object), Some(extra)) = (value.as_object_mut(), extra.as_object()) {
+            object.extend(extra.clone());
+        }
+        value
+    };
+    let ready = entry(
+        "ready-clean",
+        "Clean delivery candidate",
+        "stopped",
+        json!("clean"),
+        json!({"queueGroup": "Ready to merge"}),
+    );
+    let recovering = entry(
+        "recovering-run",
+        "Recover fenced worker",
+        "active",
+        json!("blocked"),
+        json!({"queueGroup": "Stalled or recoverable"}),
+    );
+    let deferred = entry(
+        "deferred-plan",
+        "Wait for capacity",
+        "planned",
+        Value::Null,
+        json!({"source": "live-plan", "queueGroup": "Planned", "plan": {"status": "open"}, "detailTarget": Value::Null}),
+    );
+    let landed = entry(
+        "landed-run",
+        "Merged delivery",
+        "stopped",
+        json!("landed"),
+        json!({"queueGroup": "Recent"}),
+    );
+    let dormant = entry(
+        "planned-work",
+        "Plan only",
+        "planned",
+        Value::Null,
+        json!({"source": "live-plan", "queueGroup": "Planned", "plan": {"status": "open"}, "detailTarget": Value::Null}),
+    );
+    json!({
+        "now": "2026-08-22T12:00:00Z",
+        "hostCapabilities": {"updateModelContext": true},
+        "allowedTools": [],
+        "toolResult": {"structuredContent": {"ok": true, "result": {
+            "schema": "forged.operations-overview/1",
+            "scope": {"repository": "/repo"},
+            "sourceHealth": {
+                "ledger": {"state": "available"},
+                "beads": {"state": "available"},
+                "plan": {"state": "available"}
+            },
+            "coverage": {"total": 5, "shown": 5, "matching": 5, "truncated": false},
+            "counts": {"live": 1, "queued": 1, "attention": 2, "planOnly": 2, "reviewReady": 1},
+            "spend": {"costUsdKnown": 0.0, "rowsMissingCost": 0},
+            "attentionTotal": 2,
+            "attention": [
+                {"subjectId": "recovering-run", "subjectKind": "run", "condition": "revoking", "severity": "medium", "openedAt": "2026-08-22T10:00:00Z", "detail": "attempt is fenced", "evidence": {"reason": "controller heartbeat expired"}},
+                {"subjectId": "deferred-plan", "subjectKind": "run", "condition": "admission-deferred", "severity": "medium", "openedAt": "2026-08-22T11:00:00Z", "detail": "repository capacity is occupied"}
+            ],
+            "queue": {"groups": [
+                {"code": "ready-to-merge", "label": "Ready to merge", "total": 1, "shown": 1, "entries": [ready]},
+                {"code": "stalled-or-recoverable", "label": "Stalled or recoverable", "total": 1, "shown": 1, "entries": [recovering]},
+                {"code": "planned", "label": "Planned", "total": 2, "shown": 2, "entries": [deferred, dormant]},
+                {"code": "recent", "label": "Recent", "total": 1, "shown": 1, "entries": [landed]}
+            ]}
+        }}}
+    })
+}
+
+#[test]
+fn five_state_mapping_is_total_precedence_ordered_and_keeps_internal_detail_state() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    let report = run_split_app_host_scenario(
+        &node,
+        &root.join("operations-overview.html"),
+        &semantic_operations_scenario(),
+    );
+    let rows = report["rows"].as_array().expect("semantic Operations rows");
+    let class_for = |title: &str| {
+        rows.iter()
+            .find(|row| row.pointer("/childText/0") == Some(&json!(title)))
+            .and_then(|row| row["class"].as_str())
+            .unwrap_or_else(|| panic!("row {title}: {report}"))
+    };
+    assert!(
+        class_for("Clean delivery candidate").contains("semantic--attend"),
+        "clean ready work must attend, never land: {report}"
+    );
+    assert!(
+        class_for("Recover fenced worker").contains("semantic--running"),
+        "revoking outranks stalled: {report}"
+    );
+    assert!(
+        class_for("Wait for capacity").contains("semantic--stalled"),
+        "admission deferral outranks plan-only: {report}"
+    );
+    assert!(
+        class_for("Merged delivery").contains("semantic--landed"),
+        "landed outcome: {report}"
+    );
+    assert!(
+        class_for("Plan only").contains("semantic--dormant"),
+        "plan-only fallback: {report}"
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("recovering") && text.contains("controller heartbeat expired"),
+        "revocation renders its evidence reason without inventing a saga stage: {report}"
+    );
+
+    let detail = run_split_app_host(&node, &root.join("work-detail.html"));
+    let detail_text = detail["text"].to_string();
+    assert!(
+        detail_text.contains("active"),
+        "the precise internal state remains visible: {detail}"
+    );
+}
+
+#[test]
+fn row_cost_and_age_anatomy_distinguishes_unknown_partial_zero_and_thresholds() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let row = |id: &str, updated: &str, cost: Value, missing: Value| {
+        let mut value = json!({
+            "id": id, "state": "active", "source": "durable",
+            "identity": {"displayTitle": id},
+            "lastProgressAt": updated,
+            "detailTarget": {"subjectKind": "run", "subjectId": id}
+        });
+        if !cost.is_null() {
+            value["costUsdKnown"] = cost;
+        }
+        if !missing.is_null() {
+            value["rowsMissingCost"] = missing;
+        }
+        value
+    };
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "now": "2026-08-22T12:00:00Z",
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "toolResult": {"structuredContent": {"ok": true, "result": {
+                "schema": "forged.operations-overview/1", "scope": {},
+                "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"}, "plan": {"state": "available"}},
+                "coverage": {"total": 4, "shown": 4},
+                "counts": {"live": 4, "attention": 0, "reviewReady": 0},
+                "spend": {"costUsdKnown": 1.25, "rowsMissingCost": 3},
+                "attention": [], "attentionTotal": 0,
+                "queue": {"groups": [{"code": "running", "label": "Running", "total": 4, "shown": 4, "entries": [
+                    row("unknown-cost", "2026-08-22T11:30:00Z", json!(0.0), json!(2)),
+                    row("partial-cost", "2026-08-22T10:00:00Z", json!(1.25), json!(1)),
+                    row("known-zero", "2026-08-21T11:59:00Z", json!(0.0), json!(0)),
+                    row("spendless", "2026-08-22T11:45:00Z", Value::Null, Value::Null)
+                ]}]}
+            }}}
+        }),
+    );
+    let costs = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|node| node["class"] == json!("cost"))
+        .filter_map(|node| node["text"].as_str())
+        .collect::<Vec<_>>();
+    assert!(
+        costs.contains(&"?"),
+        "zero known plus unpriced is unknown: {report}"
+    );
+    assert!(
+        costs.contains(&"$1.25 + 1 unpriced"),
+        "partial spend keeps both facts: {report}"
+    );
+    assert!(
+        costs.contains(&"$0.00"),
+        "measured zero remains measured: {report}"
+    );
+    assert!(
+        costs.contains(&"—"),
+        "a structurally spendless row is exempt: {report}"
+    );
+    let classes = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter_map(|node| node["class"].as_str())
+        .collect::<Vec<_>>();
+    for expected in ["age age--quiet", "age age--amber", "age age--loud"] {
+        assert!(
+            classes.contains(&expected),
+            "age threshold {expected}: {report}"
+        );
+    }
+}
+
+#[test]
+fn every_surface_opens_with_the_same_headline_it_pushes_to_model_context() {
+    let Some(node) = require_node() else { return };
+    let root = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("assets");
+    for name in [
+        "operations-overview.html",
+        "work-detail.html",
+        "work-map.html",
+        "agent-sessions.html",
+    ] {
+        let report = run_split_app_host(&node, &root.join(name));
+        let headline = report["headline"]
+            .as_str()
+            .unwrap_or_else(|| panic!("{name} headline: {report}"));
+        assert!(
+            !headline.is_empty(),
+            "{name} opens with a headline: {report}"
+        );
+        let context = report["modelContext"]
+            .as_array()
+            .and_then(|values| values.last())
+            .and_then(Value::as_str)
+            .unwrap_or_else(|| panic!("{name} model context: {report}"));
+        assert_eq!(context.lines().next(), Some(headline), "{name}: {context}");
+    }
+
+    let operations = run_split_app_host_scenario(
+        &node,
+        &root.join("operations-overview.html"),
+        &semantic_operations_scenario(),
+    );
+    let headline = operations["headline"]
+        .as_str()
+        .expect("Operations headline");
+    for expected in [
+        "0 decisions",
+        "1 running",
+        "1 ready to merge",
+        "symptoms: admission deferred 1, revoking 1",
+        "$0.00 known spend",
+    ] {
+        assert!(
+            headline.contains(expected),
+            "Operations headline carries {expected}: {headline}"
+        );
+    }
+}
+
+#[test]
+fn portfolio_headline_is_full_capped_degradation_first_and_model_identical() {
+    let Some(node) = require_node() else { return };
+    let mut payload = portfolio(
+        vec![json!({
+            "id": "ready", "kind": "slice", "state": "stopped", "outcome": "clean",
+            "queueGroup": "Ready to merge", "identity": {"displayTitle": "Ready"},
+            "costUsdKnown": 1.25, "rowsMissingCost": 3,
+        })],
+        vec![
+            json!({"subjectId": "ready", "condition": "merge-approval", "openedAt": "2026-08-20T12:00:00Z"}),
+            json!({"subjectId": "blocked", "condition": "blocked", "openedAt": "2026-08-21T12:00:00Z"}),
+        ],
+    );
+    payload["attentionTotal"] = json!(5);
+    payload["counts"] = json!({"live": 1, "reviewReady": 1});
+    payload["queue"] = json!({"groups": [
+        {"name": "Running", "count": 1, "entries": []},
+        {"name": "Ready to merge", "count": 1, "entries": []}
+    ]});
+    payload["sourceHealth"] = json!({
+        "ledger": {"state": "available"},
+        "beads": {"state": "available"},
+        "plan": {"state": "partial"}
+    });
+    let dispatched = render_dispatch(&node, &json!({"ok": true, "result": payload}));
+    assert!(
+        dispatched
+            .headline
+            .starts_with("Degraded sources: plan partial; "),
+        "degradation precedes counts: {}",
+        dispatched.headline
+    );
+    for expected in [
+        "1 decision, oldest",
+        "1 running",
+        "1 ready to merge",
+        "symptoms: blocked 1",
+        "$1.25 known spend + 3 unpriced",
+        "2 of 5 attention conditions classified (capped)",
+    ] {
+        assert!(
+            dispatched.headline.contains(expected),
+            "portfolio headline carries {expected}: {}",
+            dispatched.headline
+        );
+    }
+    let context = dispatched
+        .model_context
+        .last()
+        .expect("portfolio context push");
+    assert_eq!(
+        context.lines().next(),
+        Some(dispatched.headline.as_str()),
+        "human and model headline must be byte-identical: {context}"
+    );
+}
+
 /// The root view, entered where the host enters. Lifting `viewPortfolio` and
 /// calling it directly would prove the grid draws and prove nothing about
 /// whether a portfolio payload ever reaches it — the gap the dispatch
@@ -1008,6 +1383,11 @@ fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
         .and_then(|texts| texts.last())
         .and_then(Value::as_str)
         .unwrap_or_else(|| panic!("the App pushed no model context: {degraded}"));
+    assert_eq!(
+        context.lines().next(),
+        degraded["headline"].as_str(),
+        "the degraded visual headline still leads model context: {context}"
+    );
     let degradation = context
         .find("plan unavailable")
         .unwrap_or_else(|| panic!("the degraded plan source is not named: {context}"));
@@ -1053,9 +1433,16 @@ fn operations_model_context_names_a_degraded_plan_source_before_its_counts() {
         !context.contains("Source degradation"),
         "an available source stays concise: {context}"
     );
+    assert_eq!(
+        context.lines().next(),
+        healthy["headline"].as_str(),
+        "the visible headline is the first model-context line: {context}"
+    );
     assert!(
-        context.starts_with("Forged Operations for /repo: 1 shown of 1 matching"),
-        "the ordinary context is unchanged: {context}"
+        context
+            .lines()
+            .any(|line| line.starts_with("Forged Operations for /repo: 1 shown of 1 matching")),
+        "the wave-2 counts line is retained: {context}"
     );
     assert!(
         context.contains("- planned: plan-one Planned slice"),
@@ -1249,7 +1636,9 @@ fn every_app_row_leads_with_its_display_title_and_keeps_the_selector() {
         .expect("Work Map nodes")
         .iter()
         .filter(|entry| {
-            entry["class"] == json!("node") || entry["class"] == json!("node node--context")
+            entry["class"]
+                .as_str()
+                .is_some_and(|class| class.split_whitespace().any(|part| part == "node"))
         })
         .collect::<Vec<_>>();
     assert_eq!(map_rows.len(), 2, "both Work Map nodes render: {map}");
