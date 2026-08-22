@@ -6,7 +6,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::{fabricate_run, TestEnv};
+use support::{fabricate_run, McpClient, TestEnv};
 
 /// A run whose bead is claimable plus a `forged.controller.started` record
 /// carrying a generation but NO durable driver identity — the exact legacy
@@ -419,6 +419,76 @@ fn a_closed_bead_converges_for_every_outcome() {
         );
         ledger.close().expect("close");
     }
+}
+
+/// An envelope runId that disagrees with params.run is refused before
+/// anything durable exists: the effect settles params.run while the
+/// operation row would record the envelope's run, and the two must never
+/// diverge. Only the MCP surface can express the disagreement — the CLI
+/// derives both from `--run`.
+#[test]
+fn a_conflicting_envelope_run_id_is_refused_before_anything_durable() {
+    let env = TestEnv::new("forged-adjudicate-envelope-run");
+    env.forged(&["init"]);
+    let run = "adj-envelope";
+    seed_legacy(&env, run);
+
+    let mut mcp = McpClient::new(&env);
+    let response = mcp.call_tool(
+        "run_adjudicate_settlement",
+        json!({
+            "schemaVersion": 1,
+            "runId": "adj-envelope-other",
+            "params": {
+                "run": run,
+                "outcome": "cancelled",
+                "pr": null,
+                "sha": null,
+                "supersededBy": null,
+                "actor": "operator",
+                "rationale": "legacy run",
+                "evidenceGap": "controller.started carries no /driver/pid and no lstart",
+            },
+        }),
+    );
+    assert_eq!(response["ok"], json!(false), "{response}");
+    assert_eq!(
+        response["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{response}"
+    );
+    assert!(
+        response["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("params.run"),
+        "the refusal names the disagreement: {response}"
+    );
+
+    let ledger = env.ledger();
+    let row = ledger.get_run(run).expect("run");
+    assert_eq!(
+        row.state,
+        forged_ledger::RunState::Active,
+        "nothing settled"
+    );
+    assert!(
+        ledger
+            .list_events(Some(run), 0, 4096)
+            .expect("events")
+            .iter()
+            .all(|event| event.kind != "forged.settlement-adjudication"),
+        "a refusal records no adjudication"
+    );
+    assert!(
+        ledger
+            .list_inflight_operations(None)
+            .expect("inflight")
+            .iter()
+            .all(|op| op.name != "run_adjudicate_settlement"),
+        "the refusal mints no operation row"
+    );
+    ledger.close().expect("close");
 }
 
 /// A re-assertion under a FRESH key never adopts the standing adjudication:

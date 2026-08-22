@@ -487,6 +487,16 @@ fn required_trimmed<'p>(
 
 fn parse_adjudication(req: &OperationRequest) -> Result<(String, Adjudication), Failure> {
     let run_id = param_str(&req.params, "run")?.to_owned();
+    // The durable operation row records the envelope runId while the effect
+    // settles params.run; a disagreement would settle one run and pin the
+    // human-ambiguous record to another, so it refuses before anything else.
+    if let Some(envelope) = req.run_id.as_deref() {
+        if envelope != run_id {
+            return Err(Failure::invalid(format!(
+                "envelope runId {envelope:?} conflicts with params.run {run_id:?}"
+            )));
+        }
+    }
     let outcome = outcome(param_str(&req.params, "outcome")?)?;
     if !matches!(
         outcome,
@@ -705,8 +715,11 @@ async fn record_adjudication(
 /// adjudication stands in for the verified-kill step, because no durable
 /// driver identity exists to verify. Everything else is the fenced
 /// settlement path: the recorded generation is durably revoked in the same
-/// transaction as the terminal projection, and machine-effect containment
-/// is re-checked after that revocation commits.
+/// transaction as the terminal projection, and that transaction refuses
+/// while any machine effect lacks containment — no confirmed kill exists to
+/// contain a ticket admitted after the precheck, so admission racing that
+/// precheck must lose to the terminal write itself, never be discovered
+/// after it commits.
 ///
 /// The caller holds the run submit singleton for the WHOLE window — from the
 /// operation-row probe through this effect — so a concurrent same-key retry
@@ -726,7 +739,7 @@ async fn adjudicate_locked(
         let run_id = run_id.to_owned();
         let settlement = settlement.clone();
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.settle_run_fencing_controller(
+            ledger.settle_run_fencing_controller_refusing_machine_effects(
                 &run_id,
                 RunSettlement {
                     outcome: settlement.outcome,
@@ -738,27 +751,16 @@ async fn adjudicate_locked(
                 generation,
             )
         })
-        .await?
+        .await
+        .map_err(|mut failure| {
+            // The in-transaction containment refusal is the precheck's
+            // failure: retryable once the in-flight ticket resolves.
+            if failure.code == ErrorCode::HostUnavailable {
+                failure.recoverable = true;
+            }
+            failure
+        })?
     };
-    // Mirrors settle(): the durable revocation commits first, so this read
-    // sees every machine ticket that could ever join the fenced generation.
-    let unsafe_operations = {
-        let run_id = run_id.to_owned();
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.uncontained_machine_operations(&run_id, None)
-        })
-        .await?
-    };
-    if !unsafe_operations.is_empty() {
-        return Err(Failure {
-            code: ErrorCode::HostUnavailable,
-            message: format!(
-                "run {run_id:?} is terminal but machine effects lack a confirmed-dead controller: {}",
-                unsafe_operations.join(", ")
-            ),
-            recoverable: true,
-        });
-    }
     let (stopped_attempts, bead, retired, cleanup_error) =
         settle_aftermath(ctx, run_id, &settlement, &run, true).await?;
     Ok(json!({
@@ -911,6 +913,7 @@ pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) ->
     // The submit singleton is held from the operation-row probe through the
     // effect: a same-key retry that arrives mid-takeover waits here and then
     // reads the sealed terminal row instead of re-executing the aftermath.
+    crate::failpoint::hit("run.adjudicate.submit.before");
     let _submit_guard = match super::handoff::acquire_run_submit(ctx, &run_id).await {
         Ok(guard) => guard,
         Err(error) => return err_response(&req.idempotency_key, &error),

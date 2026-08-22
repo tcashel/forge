@@ -1061,6 +1061,7 @@ impl Ledger {
                 superseded_by,
             },
             None,
+            false,
         )
     }
 
@@ -1073,7 +1074,22 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: u32,
     ) -> Result<RunRow, LedgerError> {
-        self.settle_run_inner(run_id, settlement, Some(controller_generation))
+        self.settle_run_inner(run_id, settlement, Some(controller_generation), false)
+    }
+
+    /// [`Ledger::settle_run_fencing_controller`] for callers with no
+    /// controller death to confirm: the transaction additionally refuses
+    /// while any in-flight machine operation is uncontained. Admission joins
+    /// the same fence, so a machine ticket either commits first — refusing
+    /// this settlement before anything terminal exists — or observes the
+    /// stopped run and is never admitted.
+    pub fn settle_run_fencing_controller_refusing_machine_effects(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: u32,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(run_id, settlement, Some(controller_generation), true)
     }
 
     fn settle_run_inner(
@@ -1081,6 +1097,7 @@ impl Ledger {
         run_id: &str,
         settlement: RunSettlement,
         controller_generation: Option<u32>,
+        refuse_uncontained_machine_effects: bool,
     ) -> Result<RunRow, LedgerError> {
         let RunSettlement {
             outcome,
@@ -1139,6 +1156,23 @@ impl Ledger {
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let current = get_run_tx(&tx, &run_id)?;
+            if refuse_uncontained_machine_effects {
+                // Checked ahead of the replay branch as well: a resumed
+                // settlement re-verifies containment before re-running any
+                // aftermath, exactly like a fresh one.
+                let unsafe_operations =
+                    crate::operations::uncontained_machine_operations_tx(&tx, &run_id, None)?;
+                if !unsafe_operations.is_empty() {
+                    return Err(refused(
+                        ErrorCode::HostUnavailable,
+                        format!(
+                            "run {run_id:?} has machine effects without a confirmed-dead \
+                             controller: {}",
+                            unsafe_operations.join(", ")
+                        ),
+                    ));
+                }
+            }
             if current.state == RunState::Stopped {
                 if current.terminal_outcome == Some(outcome)
                     && current.stop_reason.as_deref() == Some(reason.as_str())

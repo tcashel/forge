@@ -971,7 +971,7 @@ fn adjudication_takeover_holds_the_singleton_and_a_rival_replays() {
     // singleton, at the same recorded-event seam.
     let fp = env.root.join("fp-adjudicate-pause");
     std::fs::create_dir_all(&fp).expect("fp dir");
-    let mut winner = env
+    let winner = env
         .forged_cmd(&args)
         .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
         .env("FORGED_FAILPOINT_MODE", "pause")
@@ -983,12 +983,29 @@ fn adjudication_takeover_holds_the_singleton_and_a_rival_replays() {
     let reached = fp.join("run.adjudicate.recorded.after.reached");
     wait_until("winner reaches the recorded seam", || reached.exists());
 
+    // The rival pauses at the arrival boundary immediately before the submit
+    // singleton, so its contention with the held lock is proven, not
+    // inferred from scheduling luck.
+    let rival_fp = env.root.join("fp-adjudicate-rival");
+    std::fs::create_dir_all(&rival_fp).expect("rival fp dir");
     let mut rival = env
         .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.submit.before")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &rival_fp)
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
         .expect("rival spawns");
+    let rival_arrived = rival_fp.join("run.adjudicate.submit.before.reached");
+    wait_until("rival reaches the singleton boundary", || {
+        rival_arrived.exists()
+    });
+    std::fs::write(rival_fp.join("run.adjudicate.submit.before.release"), b"")
+        .expect("release rival");
+    wait_until("rival enters the singleton wait", || {
+        !rival_arrived.exists()
+    });
     std::thread::sleep(Duration::from_millis(400));
     assert!(
         rival.try_wait().expect("rival poll").is_none(),
@@ -1035,6 +1052,117 @@ fn adjudication_takeover_holds_the_singleton_and_a_rival_replays() {
             .count(),
         1,
         "the generation is revoked exactly once"
+    );
+    assert!(
+        ledger
+            .list_inflight_operations(None)
+            .expect("inflight")
+            .iter()
+            .all(|op| op.name != "run_adjudicate_settlement"),
+        "no stranded rows"
+    );
+    ledger.close().expect("close");
+}
+
+/// A machine ticket admitted AFTER the adjudication's precheck loses to the
+/// terminal write ITSELF: the fencing transaction refuses before anything
+/// terminal commits, so the run stays Active instead of settling over an
+/// in-flight machine effect. The standing adjudication event survives for
+/// the sanctioned same-key resume once the ticket resolves.
+#[test]
+fn adjudication_terminal_write_refuses_a_ticket_admitted_after_the_precheck() {
+    let env = TestEnv::new("km-adjudicate-late-ticket");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let run = "adj-late-ticket";
+    let mut args = seed_legacy_adjudication(&env, run);
+    args[3] = run;
+
+    let fp = env.root.join("fp-adjudicate-late");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let winner = env
+        .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("adjudication spawns");
+    let reached = fp.join("run.adjudicate.recorded.after.reached");
+    wait_until("adjudication reaches the recorded seam", || {
+        reached.exists()
+    });
+
+    // Past the precheck, paused before the terminal write: admit the exact
+    // ticket the precheck could not see.
+    let ticket = {
+        let ledger = env.ledger();
+        let request = forged_types::OperationRequest {
+            schema_version: 1,
+            idempotency_key: format!("op:push:{run}:-:-"),
+            run_id: Some(run.to_owned()),
+            params: serde_json::Map::new(),
+        };
+        let outcome = ledger
+            .begin_operation(
+                "push",
+                &request,
+                forged_ledger::EffectClass::ObserveOnly,
+                None,
+            )
+            .expect("in-flight machine ticket");
+        let forged_ledger::OperationOutcome::Fresh(ticket) = outcome else {
+            panic!("expected a fresh machine ticket, got {outcome:?}");
+        };
+        ledger.close().expect("close");
+        ticket.operation_id
+    };
+
+    std::fs::write(fp.join("run.adjudicate.recorded.after.release"), b"").expect("release");
+    let out = winner.wait_with_output().expect("adjudication completes");
+    let refused: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("HOST_UNAVAILABLE"),
+        "{refused}"
+    );
+
+    let ledger = env.ledger();
+    let row = ledger.get_run(run).expect("run");
+    assert_eq!(
+        row.state,
+        forged_ledger::RunState::Active,
+        "the fencing transaction refused; nothing terminal committed"
+    );
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    assert!(
+        events
+            .iter()
+            .all(|row| row.kind != "run.settled" && row.kind != "forged.controller.revoked"),
+        "no terminal projection or revocation committed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|row| row.kind == "forged.settlement-adjudication")
+            .count(),
+        1,
+        "the recorded adjudication survives for the same-key resume"
+    );
+    ledger.release_operation(&ticket).expect("ticket resolves");
+    ledger.close().expect("close");
+
+    // The sanctioned recovery: the identical decision under the same key
+    // seals the interrupted row and completes the terminal projection.
+    let (code, resumed) = env.forged(&args);
+    assert_eq!(code, 0, "resume: {resumed}");
+    assert_eq!(resumed["ok"], json!(true), "{resumed}");
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger.get_run(run).expect("run").state,
+        forged_ledger::RunState::Stopped
     );
     assert!(
         ledger

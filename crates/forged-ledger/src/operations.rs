@@ -295,6 +295,59 @@ pub(crate) fn settle_operation(
     Ok(())
 }
 
+/// The containment scan behind [`Ledger::uncontained_machine_operations`],
+/// shared with the terminalization transaction that must refuse BEFORE the
+/// terminal write commits when no controller death will ever contain a
+/// ticket admitted after the caller's precheck.
+pub(crate) fn uncontained_machine_operations_tx(
+    conn: &Connection,
+    run_id: &str,
+    contained_generation: Option<u32>,
+) -> Result<Vec<String>, LedgerError> {
+    let machine_names = ["resolve", "gate", "regate", "push", "draftpr"];
+    let mut statement = conn.prepare(
+        "SELECT operation_id, name FROM operations \
+         WHERE run_id = ?1 AND state = 'in_progress' ORDER BY rowid",
+    )?;
+    let rows = statement.query_map([run_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+    })?;
+    let rows = rows.collect::<Result<Vec<_>, _>>()?;
+    let mut unsafe_operations = Vec::new();
+    for (operation_id, name) in rows {
+        if !machine_names.contains(&name.as_str()) {
+            continue;
+        }
+        let mut events = conn.prepare(
+            "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+        )?;
+        let payloads = events.query_map(rusqlite::params![run_id, MACHINE_ADMITTED], |row| {
+            row.get::<_, String>(0)
+        })?;
+        let mut admitted_generation = None;
+        let mut found = false;
+        for payload in payloads {
+            let payload: serde_json::Value = serde_json::from_str(&payload?)?;
+            if payload
+                .get("operationId")
+                .and_then(serde_json::Value::as_str)
+                == Some(operation_id.as_str())
+            {
+                found = true;
+                admitted_generation = payload
+                    .get("generation")
+                    .and_then(serde_json::Value::as_u64)
+                    .and_then(|value| u32::try_from(value).ok());
+                break;
+            }
+        }
+        if !found || admitted_generation != contained_generation || contained_generation.is_none() {
+            unsafe_operations.push(operation_id);
+        }
+    }
+    Ok(unsafe_operations)
+}
+
 impl Ledger {
     /// Reclaim a stale in-progress `review_publish` ObserveOnly wrapper.
     ///
@@ -668,47 +721,7 @@ impl Ledger {
     ) -> Result<Vec<String>, LedgerError> {
         let run_id = run_id.to_owned();
         self.submit(move |conn| {
-            let machine_names = ["resolve", "gate", "regate", "push", "draftpr"];
-            let mut statement = conn.prepare(
-                "SELECT operation_id, name FROM operations \
-                 WHERE run_id = ?1 AND state = 'in_progress' ORDER BY rowid",
-            )?;
-            let rows = statement.query_map([&run_id], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
-            })?;
-            let rows = rows.collect::<Result<Vec<_>, _>>()?;
-            let mut unsafe_operations = Vec::new();
-            for (operation_id, name) in rows {
-                if !machine_names.contains(&name.as_str()) {
-                    continue;
-                }
-                let mut events = conn.prepare(
-                    "SELECT payload_json FROM events WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
-                )?;
-                let payloads = events.query_map(
-                    rusqlite::params![run_id, MACHINE_ADMITTED],
-                    |row| row.get::<_, String>(0),
-                )?;
-                let mut admitted_generation = None;
-                let mut found = false;
-                for payload in payloads {
-                    let payload: serde_json::Value = serde_json::from_str(&payload?)?;
-                    if payload.get("operationId").and_then(serde_json::Value::as_str)
-                        == Some(operation_id.as_str())
-                    {
-                        found = true;
-                        admitted_generation = payload
-                            .get("generation")
-                            .and_then(serde_json::Value::as_u64)
-                            .and_then(|value| u32::try_from(value).ok());
-                        break;
-                    }
-                }
-                if !found || admitted_generation != contained_generation || contained_generation.is_none() {
-                    unsafe_operations.push(operation_id);
-                }
-            }
-            Ok(unsafe_operations)
+            uncontained_machine_operations_tx(conn, &run_id, contained_generation)
         })
     }
 

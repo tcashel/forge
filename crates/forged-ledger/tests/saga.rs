@@ -865,6 +865,53 @@ fn controller_generation_settlement_fences_new_effects_and_replays_once() {
 }
 
 #[test]
+fn containment_refusing_settlement_loses_to_an_admitted_ticket_in_transaction() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    let run = make_run(&ledger, "run-adjudicated-containment");
+    let ticket = request("machine:push:uncontained", Some(&run));
+    let operation_id = fresh(
+        ledger
+            .begin_machine_operation("push", &ticket, EffectClass::ObserveOnly, None)
+            .expect("foreground machine admission"),
+    );
+
+    let settlement = || RunSettlement {
+        outcome: RunOutcome::Cancelled,
+        reason: "operator cancelled".to_owned(),
+        delivery_pr: None,
+        delivery_sha: None,
+        superseded_by: None,
+    };
+    let error = ledger
+        .settle_run_fencing_controller_refusing_machine_effects(&run, settlement(), 4)
+        .expect_err("the terminal write refuses inside its own transaction");
+    assert_eq!(error.code(), ErrorCode::HostUnavailable);
+    assert_eq!(
+        ledger.get_run(&run).expect("run").state,
+        RunState::Active,
+        "nothing terminal committed"
+    );
+    assert!(
+        ledger
+            .list_events(Some(&run), 0, 100)
+            .expect("events")
+            .iter()
+            .all(|event| event.kind != "run.settled" && event.kind != "forged.controller.revoked"),
+        "the refusal leaves no terminal or revocation event"
+    );
+
+    ledger
+        .complete_operation(&operation_id, &ok_response(&operation_id))
+        .expect("ticket resolves");
+    ledger
+        .settle_run_fencing_controller_refusing_machine_effects(&run, settlement(), 4)
+        .expect("a contained history settles");
+    assert_eq!(ledger.get_run(&run).expect("run").state, RunState::Stopped);
+    ledger.close().expect("close");
+}
+
+#[test]
 fn foreground_machine_ticket_is_not_mistaken_for_a_killed_generation() {
     let dir = tempfile::tempdir().expect("tempdir");
     let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
