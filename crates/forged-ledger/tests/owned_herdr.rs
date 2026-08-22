@@ -420,13 +420,23 @@ fn orphaned_submit_requires_no_current_or_later_desired_epoch_and_rechecks_due()
         .expect("due with desired")
         .is_empty());
 
-    let conn = rusqlite::Connection::open(&path).expect("open fixture database");
-    conn.execute(
-        "DELETE FROM desired_work WHERE subject_kind = 'run' AND subject_id = 'orphan-run'",
-        [],
-    )
-    .expect("remove raced desired fixture");
-    drop(conn);
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, "orphan-run", 3)
+        .expect("normal resubmit advances beyond the orphan");
+    assert_eq!(
+        ledger
+            .list_due_owned_herdr_cleanup("2099-01-01T00:00:00.000000000Z", 10)
+            .expect("later generation keeps cleanup due")
+            .len(),
+        1
+    );
+    assert_eq!(
+        ledger
+            .earliest_owned_herdr_cleanup_wake("2099-01-01T00:00:00.000000000Z")
+            .expect("later generation keeps cleanup wakeable")
+            .as_deref(),
+        Some("2099-01-01T00:00:00.000000000Z")
+    );
     let claimed = ledger
         .claim_owned_herdr_cleanup(
             "own-orphan",
@@ -455,7 +465,7 @@ fn orphaned_submit_requires_no_current_or_later_desired_epoch_and_rechecks_due()
 }
 
 #[test]
-fn controller_generation_inventory_includes_released_and_registered_rows() {
+fn controller_generation_inventory_includes_only_released_rows() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("state.db");
     let ledger = Ledger::open(&path).expect("ledger");
@@ -494,6 +504,14 @@ fn controller_generation_inventory_includes_released_and_registered_rows() {
         ledger
             .max_owned_herdr_controller_generation(DesiredSubjectKind::Run, "generation-run")
             .expect("max generation"),
+        Some(1)
+    );
+    assert_eq!(
+        ledger
+            .find_unreleased_owned_herdr_controller(DesiredSubjectKind::Run, "generation-run")
+            .expect("unreleased controller")
+            .expect("generation three remains fenced")
+            .controller_generation,
         Some(3)
     );
 }

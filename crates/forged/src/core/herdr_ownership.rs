@@ -463,7 +463,7 @@ fn ownership_id(owner: &OwnedHerdrOwnerV1) -> Result<String, Failure> {
 mod tests {
     use super::*;
     use forged_ledger::{Ledger, NewPacket, NewRun, OwnedHerdrCleanupState, SpecFence};
-    use forged_types::{RunId, Stage};
+    use forged_types::{ErrorCode, OperationRequest, RunId, Stage};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -1054,11 +1054,21 @@ mod tests {
             };
             let db_path = root.path().join("state.db");
             let ledger = Ledger::open(&db_path).expect("ledger");
+            let subject_id = format!("fenced-{name}-run");
+            ledger
+                .create_run(NewRun {
+                    run_id: RunId::new(&subject_id).expect("run id"),
+                    bead_id: format!("bead-fenced-{name}"),
+                    repo: "/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: format!("work/fenced-{name}"),
+                })
+                .expect("run");
             seed_controller_fixture(
                 &db_path,
                 &socket,
                 &format!("fenced-{name}"),
-                &format!("fenced-{name}-run"),
+                &subject_id,
                 "command-started",
             );
             let ctx = Ctx {
@@ -1089,6 +1099,22 @@ mod tests {
                     methods.lock().expect("methods lock").as_slice(),
                     expected_methods
                 );
+            }
+            if name == "live" {
+                let mut request = OperationRequest {
+                    schema_version: 1,
+                    idempotency_key: String::new(),
+                    run_id: Some(subject_id.clone()),
+                    params: json!({"run": subject_id})
+                        .as_object()
+                        .expect("submit params")
+                        .clone(),
+                };
+                let refused = super::super::handoff::run_submit(&ctx, &mut request).await;
+                assert!(!refused.ok, "live pane must fence submit: {refused:?}");
+                let error = refused.error.expect("submit refusal");
+                assert_eq!(error.code, ErrorCode::HostUnavailable);
+                assert!(error.message.contains("unreleased durable Herdr pane"));
             }
         }
     }

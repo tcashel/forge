@@ -614,7 +614,7 @@ fn exact_controller_settled_tx(
             current.is_some_and(|(value, _)| value >= i64::from(generation))
         }
         (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::OrphanedSubmit)) => {
-            current.is_none_or(|(value, _)| value < i64::from(generation))
+            current.is_none_or(|(value, _)| value != i64::from(generation))
         }
         _ => false,
     })
@@ -777,9 +777,32 @@ impl Ledger {
         })
     }
 
-    /// Greatest controller generation that has ever owned a durable Herdr
-    /// pane for this exact subject. Released rows remain identity occupants,
-    /// so generation selection must skip them too.
+    /// An unreleased controller pane is an external-effect fence: a submit
+    /// may not replace it until cleanup confirms the exact pane absent.
+    pub fn find_unreleased_owned_herdr_controller(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<Option<OwnedHerdrSessionRow>, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM owned_herdr_sessions WHERE owner_kind = 'controller' \
+                 AND subject_kind = ?1 AND subject_id = ?2 AND cleanup_state != 'released' \
+                 ORDER BY controller_generation DESC LIMIT 1"
+            );
+            conn.query_row(
+                &sql,
+                rusqlite::params![kind.as_str(), subject_id],
+                owned_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// Greatest released controller generation for this exact subject.
+    /// Unreleased rows fence submission separately and cannot advance it.
     pub fn max_owned_herdr_controller_generation(
         &self,
         kind: DesiredSubjectKind,
@@ -789,7 +812,8 @@ impl Ledger {
         self.submit(move |conn| {
             let value: Option<i64> = conn.query_row(
                 "SELECT MAX(controller_generation) FROM owned_herdr_sessions \
-                 WHERE owner_kind = 'controller' AND subject_kind = ?1 AND subject_id = ?2",
+                 WHERE owner_kind = 'controller' AND subject_kind = ?1 AND subject_id = ?2 \
+                 AND cleanup_state = 'released'",
                 rusqlite::params![kind.as_str(), subject_id],
                 |row| row.get(0),
             )?;

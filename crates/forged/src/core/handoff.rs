@@ -1441,24 +1441,6 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         .map(|value| generation(&value))
         .max()
         .unwrap_or(0);
-    let owned_generation = {
-        let kind = scope.desired_kind();
-        let subject_id = id.clone();
-        match on_ledger(&ctx.ledger, move |ledger| {
-            ledger.max_owned_herdr_controller_generation(kind, &subject_id)
-        })
-        .await
-        {
-            Ok(generation) => generation,
-            Err(error) => {
-                return err_response(
-                    &derive_key(scope.operation(), Some(&id), None, None),
-                    &error,
-                )
-            }
-        }
-    };
-    max_generation = max_generation.max(owned_generation.unwrap_or(0));
     let mut latest_status = Value::Null;
     if let Ok(Some(record)) = latest_record(ctx, &id).await {
         max_generation = max_generation.max(generation(&record));
@@ -1625,6 +1607,59 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
             );
         }
     }
+
+    // Check the external-effect fence before reading released generation
+    // history. Cleanup can only move an owned pane from unreleased to
+    // released, so this order cannot miss its generation during that race.
+    let unreleased = {
+        let kind = scope.desired_kind();
+        let subject_id = id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_unreleased_owned_herdr_controller(kind, &subject_id)
+        })
+        .await
+        {
+            Ok(row) => row,
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    if let Some(owned) = unreleased {
+        let generation = owned.controller_generation.unwrap_or(0);
+        return err_response(
+            &derive_key(scope.operation(), Some(&id), None, None),
+            &Failure {
+                code: ErrorCode::HostUnavailable,
+                message: format!(
+                    "{} {id} generation {generation} owns an unreleased durable Herdr pane; refusing a duplicate spawn",
+                    scope.noun()
+                ),
+                recoverable: true,
+            },
+        );
+    }
+    let owned_generation = {
+        let kind = scope.desired_kind();
+        let subject_id = id.clone();
+        match on_ledger(&ctx.ledger, move |ledger| {
+            ledger.max_owned_herdr_controller_generation(kind, &subject_id)
+        })
+        .await
+        {
+            Ok(generation) => generation,
+            Err(error) => {
+                return err_response(
+                    &derive_key(scope.operation(), Some(&id), None, None),
+                    &error,
+                )
+            }
+        }
+    };
+    max_generation = max_generation.max(owned_generation.unwrap_or(0));
 
     let stopped = match scope {
         Scope::Run => match super::drive::project(ctx, &id).await {
