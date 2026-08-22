@@ -7,6 +7,7 @@
 pub(crate) mod admission;
 pub(crate) mod artifacts;
 pub(crate) mod attention;
+mod bead_settlement;
 mod claimnext;
 mod drive;
 mod epic;

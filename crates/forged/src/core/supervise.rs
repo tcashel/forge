@@ -85,7 +85,7 @@ fn scope(kind: DesiredSubjectKind) -> Scope {
     }
 }
 
-fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
+pub(super) fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
     let timestamp: jiff::Timestamp = anchor.parse().map_err(|error| {
         Failure::internal(format!(
             "cannot parse supervisor timestamp {anchor:?}: {error}"
@@ -824,6 +824,10 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     // Root anchors are eligible only after every exact linked pane cleanup
     // has converged, so this pass deliberately follows pane reconciliation.
     let layout_cleanup = super::herdr_layout::reconcile(ctx).await;
+    // Pending bead settlements are a third independent durable queue: the
+    // read-only convergence probe runs every tick; mutating retries are
+    // budgeted and per-run fenced inside the pass.
+    let bead_settlement = super::bead_settlement::reconcile(ctx).await?;
     let orphaned = {
         let now = started_at.clone();
         on_ledger(&ctx.ledger, move |ledger| {
@@ -1018,6 +1022,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "subjects": subjects,
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
+        "beadSettlement": bead_settlement,
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))

@@ -37,6 +37,25 @@ fn outcome(value: &str) -> Result<RunOutcome, Failure> {
     RunOutcome::try_from(value).map_err(Failure::from)
 }
 
+/// The deterministic marker addressing a run's terminal Beads comment. The
+/// settlement write and the supervisor's convergence probe must derive the
+/// identical string or the probe can never observe a delivered comment.
+pub(super) fn settlement_marker(run_id: &str, outcome: RunOutcome) -> String {
+    format!("[forged-run:{run_id}:{}]", outcome.as_str())
+}
+
+/// The exact `run.bead-settlement.succeeded` payload. Shared with the
+/// supervisor retry pass so convergence from either writer is one event
+/// shape, deduplicable by byte equality.
+pub(super) fn succeeded_payload(bead_id: &str, outcome: RunOutcome) -> Value {
+    json!({
+        "schema": "forged.bead-settlement/1",
+        "beadId": bead_id,
+        "outcome": outcome.as_str(),
+        "settled": true,
+    })
+}
+
 fn parse(req: &OperationRequest) -> Result<(String, Settlement), Failure> {
     let run_id = param_str(&req.params, "run")?.to_owned();
     let outcome = outcome(param_str(&req.params, "outcome")?)?;
@@ -86,7 +105,7 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
     }
 }
 
-async fn settle_bead(
+pub(super) async fn settle_bead(
     ctx: &Ctx,
     run_id: &str,
     bead_id: &str,
@@ -94,7 +113,7 @@ async fn settle_bead(
 ) -> Result<Value, Failure> {
     let bd = ctx.config.bd_config();
     let actor = run_holder(bead_id);
-    let marker = format!("[forged-run:{run_id}:{}]", settlement.outcome.as_str());
+    let marker = settlement_marker(run_id, settlement.outcome);
     let detail = match settlement.outcome {
         RunOutcome::Landed => format!(
             "{}; landed in PR #{} at {}",
@@ -259,12 +278,7 @@ pub(crate) async fn settle(
     };
     if bead.get("settled").and_then(Value::as_bool) == Some(true) {
         let event_run = run_id.to_owned();
-        let event = json!({
-            "schema": "forged.bead-settlement/1",
-            "beadId": run.bead_id,
-            "outcome": settlement.outcome.as_str(),
-            "settled": true,
-        });
+        let event = succeeded_payload(&run.bead_id, settlement.outcome);
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.append_event_once(
                 &event_run,
