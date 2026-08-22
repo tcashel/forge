@@ -199,6 +199,33 @@ pub struct DesiredReconcileUpdate {
     pub attention_condition: Option<String>,
 }
 
+/// One durable retry record for a pending whole-run bead settlement. The
+/// budget bounds MUTATING retries only; the read-only convergence probe is
+/// not charged and outlives exhaustion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BeadSettlementRetryRow {
+    pub run_id: String,
+    pub budget: u32,
+    pub used: u32,
+    pub next_wake_at: Option<String>,
+    pub last_error: Option<String>,
+    pub claim_token: Option<String>,
+    pub claim_lease_until: Option<String>,
+    pub created_at: String,
+    pub updated_at: String,
+}
+
+/// One run whose LATEST bead-settlement event is still pending — the durable
+/// promise `run stop` recorded and never delivered.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingBeadSettlementRow {
+    pub run_id: String,
+    /// The latest pending event's append position.
+    pub event_id: i64,
+    /// The latest pending event's stored payload, verbatim.
+    pub payload_json: String,
+}
+
 /// Closed lifecycle of one durable capacity reservation. Expiry moves a row
 /// to `Orphaned`; it never frees capacity by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
