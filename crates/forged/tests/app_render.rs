@@ -2067,10 +2067,10 @@ fn triage_item(
     condition: &str,
     title: &str,
     state: &str,
-    opened_at: &str,
-    updated_at: &str,
+    timestamps: (&str, &str),
     action: &str,
 ) -> Value {
+    let (opened_at, updated_at) = timestamps;
     json!({
         "schema": "forged.attention-item/1",
         "id": id,
@@ -2138,8 +2138,7 @@ fn triage_scenario(attention_list: Value, work_map: Value, storage: Value) -> Va
         "input-required",
         "Embedded fallback decision",
         "open",
-        "2026-08-20T10:00:00.000Z",
-        "2026-08-20T10:00:00.000Z",
+        ("2026-08-20T10:00:00.000Z", "2026-08-20T10:00:00.000Z"),
         "Use the embedded action",
     );
     json!({
@@ -2179,8 +2178,7 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
         "merge-approval",
         "Second alphabetically",
         "acknowledged",
-        "2026-08-22T10:00:00.000Z",
-        "2026-08-22T10:30:00.000Z",
+        ("2026-08-22T10:00:00.000Z", "2026-08-22T10:30:00.000Z"),
         "Merge the reviewed pull request",
     );
     let decision_a = triage_item(
@@ -2189,8 +2187,7 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
         "merge-approval",
         "First alphabetically",
         "open",
-        "2026-08-21T10:00:00.000Z",
-        "2026-08-21T10:30:00.000Z",
+        ("2026-08-21T10:00:00.000Z", "2026-08-21T10:30:00.000Z"),
         "Adjudicate the final review",
     );
     let symptom_b = triage_item(
@@ -2199,8 +2196,7 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
         "admission-deferred",
         "Capacity wait two",
         "open",
-        "2026-08-22T09:00:00.000Z",
-        "2026-08-22T09:30:00.000Z",
+        ("2026-08-22T09:00:00.000Z", "2026-08-22T09:30:00.000Z"),
         "Wait for capacity",
     );
     let symptom_a = triage_item(
@@ -2209,8 +2205,7 @@ fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements(
         "admission-deferred",
         "Capacity wait one",
         "open",
-        "2026-08-21T09:00:00.000Z",
-        "2026-08-21T09:30:00.000Z",
+        ("2026-08-21T09:00:00.000Z", "2026-08-21T09:30:00.000Z"),
         "Wait for capacity",
     );
     let listed = attention_list_fixture(
@@ -2327,8 +2322,7 @@ fn operations_triage_groups_blocked_items_by_their_direct_named_blocker() {
             "blocked",
             title,
             "open",
-            "2026-08-22T08:00:00.000Z",
-            "2026-08-22T08:30:00.000Z",
+            ("2026-08-22T08:00:00.000Z", "2026-08-22T08:30:00.000Z"),
             "Resolve the blocker",
         )
     })
@@ -2408,8 +2402,7 @@ fn operations_triage_reconciles_client_and_server_truncation() {
                 "input-required",
                 &format!("Decision {index}"),
                 "open",
-                "2026-08-20T08:00:00.000Z",
-                "2026-08-20T08:30:00.000Z",
+                ("2026-08-20T08:00:00.000Z", "2026-08-20T08:30:00.000Z"),
                 "Answer the packet",
             )
         })
@@ -2422,8 +2415,7 @@ fn operations_triage_reconciles_client_and_server_truncation() {
                 "blocked",
                 &format!("Blocked {index}"),
                 "open",
-                "2026-08-20T08:00:00.000Z",
-                "2026-08-20T08:30:00.000Z",
+                ("2026-08-20T08:00:00.000Z", "2026-08-20T08:30:00.000Z"),
                 "Resolve the blocker",
             )
         })
@@ -2463,8 +2455,7 @@ fn operations_triage_markers_are_scoped_safe_and_include_recent_settlement() {
         "input-required",
         "Old decision",
         "open",
-        "2026-08-20T08:00:00.000Z",
-        "2026-08-20T09:00:00.000Z",
+        ("2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z"),
         "Answer old",
     );
     let recent = triage_item(
@@ -2473,8 +2464,7 @@ fn operations_triage_markers_are_scoped_safe_and_include_recent_settlement() {
         "input-required",
         "Recent decision",
         "open",
-        "2026-08-22T10:00:00.000Z",
-        "2026-08-22T10:30:00.000Z",
+        ("2026-08-22T10:00:00.000Z", "2026-08-22T10:30:00.000Z"),
         "Answer recent",
     );
     let settled = triage_item(
@@ -2483,8 +2473,7 @@ fn operations_triage_markers_are_scoped_safe_and_include_recent_settlement() {
         "merge-approval",
         "Recently settled",
         "resolved",
-        "2026-08-20T08:00:00.000Z",
-        "2026-08-22T11:00:00.000Z",
+        ("2026-08-20T08:00:00.000Z", "2026-08-22T11:00:00.000Z"),
         "Review settlement",
     );
     let listed = attention_list_fixture(
@@ -2571,7 +2560,7 @@ fn operations_triage_degrades_to_the_embedded_rail_without_or_failed_tools() {
             "hostCapabilities": {"updateModelContext": true},
             "allowedTools": [],
             "storage": "absent",
-            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}}
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", ("2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z"), "Use embedded")])}}
         }),
     );
     assert_eq!(no_tools["toolCalls"], json!(0));
@@ -2593,7 +2582,7 @@ fn operations_triage_degrades_to_the_embedded_rail_without_or_failed_tools() {
             "allowedTools": ["attention_list", "work_map"],
             "storage": "absent",
             "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
-            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}},
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", ("2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z"), "Use embedded")])}},
             "toolResponses": {
                 "attention_list": {"structuredContent": {"ok": false, "error": {"code": "INTERNAL", "message": "attention unavailable"}}},
                 "work_map": {"structuredContent": {"ok": true, "result": empty_work_map(vec![], vec![])}}
@@ -2622,7 +2611,7 @@ fn operations_triage_degrades_to_the_embedded_rail_without_or_failed_tools() {
             "allowedTools": ["attention_list", "work_map"],
             "storage": "absent",
             "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
-            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}},
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", ("2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z"), "Use embedded")])}},
             "toolResponses": {
                 "attention_list": {"structuredContent": {"ok": true, "result": attention_list_fixture(vec![], json!({"open": 0, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 0, "shown": 0, "total": 0}))}},
                 "work_map": {"structuredContent": {"ok": false, "error": {"code": "GRAPH_SCOPE_TOO_LARGE", "message": "graph exceeds maxNodes"}}}
