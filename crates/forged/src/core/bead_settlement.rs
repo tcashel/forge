@@ -348,8 +348,9 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         let appended = {
             let run = run_id.clone();
             let event = settlement::succeeded_payload(&bead_id, outcome);
+            let pending_event = pending.event_id;
             on_ledger(&ctx.ledger, move |ledger| {
-                ledger.append_bead_settlement_succeeded_if_pending(&run, event)
+                ledger.append_bead_settlement_succeeded_if_pending(&run, pending_event, event)
             })
             .await?
         };
@@ -380,8 +381,9 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 evidence["retriesExhausted"] = json!(true);
                 evidence["attempts"] = json!(row.used);
                 let run = run_id.clone();
+                let pending_event = pending.event_id;
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_bead_settlement_pending_if_pending(&run, evidence)
+                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, evidence)
                 })
                 .await?
             };
@@ -535,8 +537,13 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 let appended = {
                     let run = run_id.clone();
                     let event = settlement::succeeded_payload(&bead_id, outcome);
+                    let pending_event = pending.event_id;
                     on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_bead_settlement_succeeded_if_pending(&run, event)
+                        ledger.append_bead_settlement_succeeded_if_pending(
+                            &run,
+                            pending_event,
+                            event,
+                        )
                     })
                     .await?
                 };
@@ -571,8 +578,13 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 }
                 {
                     let run = run_id.clone();
+                    let pending_event = pending.event_id;
                     on_ledger(&ctx.ledger, move |ledger| {
-                        ledger.append_bead_settlement_pending_if_pending(&run, repended)
+                        ledger.append_bead_settlement_pending_if_pending(
+                            &run,
+                            pending_event,
+                            repended,
+                        )
                     })
                     .await?;
                 }

@@ -4,9 +4,10 @@
 //! Discovery is positional, never a bare pending scan: a run is owed work
 //! only while its LATEST bead-settlement event is `pending`, so a later
 //! `succeeded` retires it at the stream itself and no pass can race a
-//! settlement that already converged. The conditional appends below share
-//! that guard: neither event kind is ever appended after the stream has
-//! moved past it.
+//! settlement that already converged. The conditional appends below carry a
+//! stronger fence: each requires the stream head to still BE the exact
+//! pending event the pass discovered, so a pass racing a newer run-stop
+//! episode can neither retire nor shadow a promise it never probed.
 
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 
@@ -70,17 +71,18 @@ fn get_tx(conn: &Connection, run_id: &str) -> Result<Option<BeadSettlementRetryR
         .map_err(Into::into)
 }
 
-/// The run's newest bead-settlement event, if any: `(kind, payload_json)`.
+/// The run's newest bead-settlement event, if any:
+/// `(event_id, kind, payload_json)`.
 fn latest_settlement_tx(
     conn: &Connection,
     run_id: &str,
-) -> Result<Option<(String, String)>, LedgerError> {
+) -> Result<Option<(i64, String, String)>, LedgerError> {
     conn.query_row(
-        "SELECT kind, payload_json FROM events \
+        "SELECT event_id, kind, payload_json FROM events \
          WHERE run_id = ?1 AND kind IN (?2, ?3) \
          ORDER BY event_id DESC LIMIT 1",
         rusqlite::params![run_id, PENDING, SUCCEEDED],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
     )
     .optional()
     .map_err(Into::into)
@@ -322,7 +324,11 @@ impl Ledger {
     }
 
     /// Append `run.bead-settlement.succeeded` only while the run's latest
-    /// settlement event is still `pending`.
+    /// settlement event is still the pending event the caller discovered:
+    /// `expected_event_id` must be the stream head inside the transaction.
+    /// A pass whose episode was superseded mid-flight by a fresh run-stop
+    /// pending therefore refuses instead of retiring a promise it never
+    /// probed.
     ///
     /// Positional, deliberately NOT payload-deduplicated: an identical
     /// succeeded event may already exist earlier in the stream (settled,
@@ -332,13 +338,14 @@ impl Ledger {
     pub fn append_bead_settlement_succeeded_if_pending(
         &self,
         run_id: &str,
+        expected_event_id: i64,
         payload: serde_json::Value,
     ) -> Result<bool, LedgerError> {
         let run_id = run_id.to_owned();
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let appended = match latest_settlement_tx(&tx, &run_id)? {
-                Some((kind, _)) if kind == PENDING => {
+                Some((event_id, kind, _)) if kind == PENDING && event_id == expected_event_id => {
                     append_event_tx(&tx, Some(&run_id), SUCCEEDED, &payload)?;
                     true
                 }
@@ -350,9 +357,11 @@ impl Ledger {
     }
 
     /// Re-record `run.bead-settlement.pending` only while the run's latest
-    /// settlement event is still `pending` AND the payload actually changed.
-    /// A converged run is never resurrected, and byte-identical retries do
-    /// not multiply evidence.
+    /// settlement event is still the pending event the caller discovered
+    /// (`expected_event_id` at the stream head, in-transaction) AND the
+    /// payload actually changed. A converged run is never resurrected,
+    /// byte-identical retries do not multiply evidence, and a stale pass
+    /// can never shadow a fresh run-stop episode with its old promise.
     ///
     /// The append stamps the retry row's episode watermark to the new
     /// event's id in the same transaction: every pending event the retry
@@ -361,6 +370,7 @@ impl Ledger {
     pub fn append_bead_settlement_pending_if_pending(
         &self,
         run_id: &str,
+        expected_event_id: i64,
         payload: serde_json::Value,
     ) -> Result<bool, LedgerError> {
         let run_id = run_id.to_owned();
@@ -368,7 +378,9 @@ impl Ledger {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let serialized = serde_json::to_string(&payload)?;
             let appended = match latest_settlement_tx(&tx, &run_id)? {
-                Some((kind, latest)) if kind == PENDING && latest != serialized => {
+                Some((event_id, kind, latest))
+                    if kind == PENDING && event_id == expected_event_id && latest != serialized =>
+                {
                     append_event_tx(&tx, Some(&run_id), PENDING, &payload)?;
                     tx.execute(
                         "UPDATE bead_settlement_retry \
@@ -435,10 +447,12 @@ mod tests {
             .expect("pending discovery");
         assert_eq!(discovered.len(), 1);
         assert_eq!(discovered[0].run_id, "run-retry");
+        let pending_id = discovered[0].event_id;
 
         assert!(ledger
             .append_bead_settlement_succeeded_if_pending(
                 "run-retry",
+                pending_id,
                 json!({"schema": "forged.bead-settlement/1", "settled": true}),
             )
             .expect("conditional succeeded"));
@@ -451,11 +465,16 @@ mod tests {
         assert!(!ledger
             .append_bead_settlement_succeeded_if_pending(
                 "run-retry",
+                pending_id,
                 json!({"schema": "forged.bead-settlement/1", "settled": true}),
             )
             .expect("succeeded replay"));
         assert!(!ledger
-            .append_bead_settlement_pending_if_pending("run-retry", pending_payload("again"))
+            .append_bead_settlement_pending_if_pending(
+                "run-retry",
+                pending_id,
+                pending_payload("again")
+            )
             .expect("pending after succeeded"));
     }
 
@@ -467,16 +486,28 @@ mod tests {
         ledger
             .append_event(Some("run-retry"), PENDING, pending_payload("first"))
             .expect("pending");
+        let first = ledger
+            .list_pending_bead_settlements()
+            .expect("first discovery")
+            .remove(0);
         assert!(ledger
-            .append_bead_settlement_succeeded_if_pending("run-retry", succeeded.clone())
+            .append_bead_settlement_succeeded_if_pending(
+                "run-retry",
+                first.event_id,
+                succeeded.clone()
+            )
             .expect("first convergence"));
         // An interrupted replay re-pends after the settlement already
         // succeeded once; the identical succeeded payload must still land.
         ledger
             .append_event(Some("run-retry"), PENDING, pending_payload("re-pended"))
             .expect("re-pend");
+        let repended = ledger
+            .list_pending_bead_settlements()
+            .expect("re-pend discovery")
+            .remove(0);
         assert!(ledger
-            .append_bead_settlement_succeeded_if_pending("run-retry", succeeded)
+            .append_bead_settlement_succeeded_if_pending("run-retry", repended.event_id, succeeded)
             .expect("second convergence"));
         assert!(ledger
             .list_pending_bead_settlements()
@@ -491,11 +522,23 @@ mod tests {
         ledger
             .append_event(Some("run-retry"), PENDING, pending_payload("same"))
             .expect("pending");
+        let discovered = ledger
+            .list_pending_bead_settlements()
+            .expect("discovery")
+            .remove(0);
         assert!(!ledger
-            .append_bead_settlement_pending_if_pending("run-retry", pending_payload("same"))
+            .append_bead_settlement_pending_if_pending(
+                "run-retry",
+                discovered.event_id,
+                pending_payload("same")
+            )
             .expect("identical re-record"));
         assert!(ledger
-            .append_bead_settlement_pending_if_pending("run-retry", pending_payload("changed"))
+            .append_bead_settlement_pending_if_pending(
+                "run-retry",
+                discovered.event_id,
+                pending_payload("changed")
+            )
             .expect("changed re-record"));
         assert_eq!(
             ledger
@@ -506,6 +549,61 @@ mod tests {
                 .count(),
             2
         );
+    }
+
+    #[test]
+    fn stale_pass_appends_refuse_when_a_newer_episode_pended() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = ledger_with_run(&dir, "run-retry");
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("episode one"))
+            .expect("pending");
+        let stale = ledger
+            .list_pending_bead_settlements()
+            .expect("discovery")
+            .remove(0);
+        // A fresh run-stop episode pends while the first pass is mid-flight.
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("episode two"))
+            .expect("new episode");
+        let fresh = ledger
+            .list_pending_bead_settlements()
+            .expect("fresh discovery")
+            .remove(0);
+
+        // The stale pass can neither retire the fresh promise nor shadow it.
+        assert!(!ledger
+            .append_bead_settlement_succeeded_if_pending(
+                "run-retry",
+                stale.event_id,
+                json!({"schema": "forged.bead-settlement/1", "settled": true}),
+            )
+            .expect("stale succeeded"));
+        assert!(!ledger
+            .append_bead_settlement_pending_if_pending(
+                "run-retry",
+                stale.event_id,
+                pending_payload("stale re-pend")
+            )
+            .expect("stale re-pend"));
+        let standing = ledger
+            .list_pending_bead_settlements()
+            .expect("standing discovery")
+            .remove(0);
+        assert_eq!(standing.event_id, fresh.event_id);
+
+        // The fresh episode still settles under its own discovered id.
+        assert!(ledger
+            .append_bead_settlement_succeeded_if_pending(
+                "run-retry",
+                fresh.event_id,
+                json!({"schema": "forged.bead-settlement/1", "settled": true}),
+            )
+            .expect("fresh succeeded"));
+        assert!(ledger
+            .list_pending_bead_settlements()
+            .expect("retired discovery")
+            .is_empty());
     }
 
     #[test]
@@ -609,7 +707,11 @@ mod tests {
 
         // The pass's own re-record moves the watermark with the append.
         assert!(ledger
-            .append_bead_settlement_pending_if_pending("run-retry", pending_payload("re-pended"))
+            .append_bead_settlement_pending_if_pending(
+                "run-retry",
+                discovered.event_id,
+                pending_payload("re-pended")
+            )
             .expect("re-record"));
         let repended = ledger
             .list_pending_bead_settlements()

@@ -443,6 +443,7 @@ fn bead_settlement_seam_members_are_consumable() {
     assert!(ledger
         .append_bead_settlement_pending_if_pending(
             "run-settle",
+            pending.event_id,
             json!({"schemaVersion": 1, "beadId": "bead-settle", "outcome": "landed",
                    "settled": false, "pending": true, "error": "still held", "attempt": 1}),
         )
@@ -506,6 +507,7 @@ fn bead_settlement_seam_members_are_consumable() {
     assert!(ledger
         .append_bead_settlement_succeeded_if_pending(
             "run-settle",
+            fresh.event_id,
             json!({"schema": "forged.bead-settlement/1", "beadId": "bead-settle",
                    "outcome": "landed", "settled": true}),
         )
