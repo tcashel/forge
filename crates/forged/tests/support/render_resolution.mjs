@@ -31,7 +31,7 @@ function lift(name) {
   const heads = [`  function ${name}(`, `  const ${name} = `];
   const start = lines.findIndex((line) => heads.some((head) => line.startsWith(head)));
   if (start < 0) throw new Error(`overview.html no longer declares ${name}`);
-  if (lines[start].endsWith(";")) return lines[start];
+  if (lines[start].endsWith(";") || (lines[start].startsWith("  function") && lines[start].endsWith(" }"))) return lines[start];
   const closer = lines[start].startsWith("  function") ? "  }" : "  };";
   const end = lines.findIndex((line, i) => i > start && line === closer);
   if (end < 0) throw new Error(`overview.html: no closer for ${name}`);
@@ -77,7 +77,11 @@ const host = {
   connected: true,
   capabilities: { serverTools: process.env.SERVER_TOOLS !== "0" },
 };
-const source = ["el", "arr", "num", "int", "stamp", "ms", "ago", "chip", "panel", "pickGrid", "choose", "viewResolution"]
+const source = [
+  "el", "arr", "num", "int", "DECISION_CONDITIONS", "SYMPTOM_CONDITIONS", "stamp", "ms", "ago",
+  "ageTone", "ageNode", "conditionRows", "semanticState", "semanticLabel", "spendText", "chip", "panel",
+  "pickGrid", "choose", "viewResolution",
+]
   .map(lift)
   .join("\n");
 const { viewResolution, choose } = new Function(
