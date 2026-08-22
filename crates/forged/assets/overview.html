@@ -37,6 +37,11 @@
      that is still thinking has not passed anything yet. */
   --live: light-dark(#0e7d72, #2fc2ae);
   --idle: var(--color-text-tertiary);
+  --state-attend: light-dark(#a62f48, #ff879a);
+  --state-running: light-dark(#176f9f, #66c7f2);
+  --state-stalled: light-dark(#93610b, #e8b34f);
+  --state-landed: light-dark(#287a43, #76cf8b);
+  --state-dormant: light-dark(#6d6875, #aaa4b2);
 
   --u: 4px;
   --rule: 1px solid var(--color-border-primary);
@@ -79,6 +84,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
 .bar { display: flex; align-items: flex-start; gap: calc(var(--u) * 4); flex-wrap: wrap; }
 .bar__id { flex: 1 1 260px; }
+.headline { margin: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--color-text-secondary); }
 
 /* The run id set large in mono: the run's identity IS a machine string. */
 .ident {
@@ -134,6 +140,11 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 .chip--block { color: var(--color-text-danger); }
 .chip--warn { color: var(--color-text-warning); }
 .chip--idle { color: var(--idle); }
+.chip--attend, .semantic-chip--attend { color: var(--state-attend); }
+.chip--running, .semantic-chip--running { color: var(--state-running); }
+.chip--stalled, .semantic-chip--stalled { color: var(--state-stalled); }
+.chip--landed, .semantic-chip--landed { color: var(--state-landed); }
+.chip--dormant, .semantic-chip--dormant { color: var(--state-dormant); }
 
 @keyframes pulse { 0%, 100% { opacity: 1; } 50% { opacity: .25; } }
 
@@ -333,11 +344,22 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 .wave__head { display: flex; align-items: baseline; gap: calc(var(--u) * 2); margin-bottom: calc(var(--u) * 2.5); }
 .wave__head b { font: 500 12px/1 var(--font-mono); }
 .beads { display: grid; gap: calc(var(--u) * 2); grid-template-columns: repeat(auto-fill, minmax(228px, 1fr)); }
-.bead { border: var(--rule); border-radius: var(--border-radius-md); padding: calc(var(--u) * 2.5); display: flex; flex-direction: column; gap: var(--u); }
+.bead { border: var(--rule); border-left: 4px solid transparent; border-radius: var(--border-radius-md); padding: calc(var(--u) * 2.5); display: flex; flex-direction: column; gap: var(--u); }
+.bead.semantic--attend { border-left-color: var(--state-attend); }
+.bead.semantic--running { border-left-color: var(--state-running); }
+.bead.semantic--stalled { border-left-color: var(--state-stalled); }
+.bead.semantic--landed { border-left-color: var(--state-landed); }
+.bead.semantic--dormant { border-left-color: var(--state-dormant); }
 .bead__top { display: flex; align-items: center; justify-content: space-between; gap: var(--u); }
 .bead__id { font: 500 11px/1 var(--font-mono); }
 .bead__title { font-size: 12px; line-height: 1.4; }
 .bead__foot { font-family: var(--font-mono); font-size: 10.5px; color: var(--color-text-tertiary); display: flex; gap: calc(var(--u) * 2); flex-wrap: wrap; }
+.semantic-chip { display: inline-flex; align-items: center; gap: 5px; font: 500 10px/1.4 var(--font-sans); text-transform: uppercase; letter-spacing: .08em; }
+.semantic-chip::before { content: ""; width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+.age--quiet { color: var(--color-text-tertiary); }
+.age--amber { color: var(--color-text-warning); }
+.age--loud { color: var(--color-text-danger); font-weight: 600; }
+.cost { font-variant-numeric: tabular-nums; }
 /* A candidate is a bead card the operator can pick. */
 .bead--pick { text-align: left; width: 100%; }
 
@@ -374,6 +396,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       <button type="button" id="expand" hidden>Expand</button>
     </div>
   </div>
+  <p class="headline" id="headline"></p>
   <div id="rail"></div>
   <div class="tabs" id="tabs" role="tablist" hidden></div>
   <div class="view" id="view"><div class="empty">Waiting for a projection.</div></div>
@@ -434,6 +457,8 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
   const at = (obj, path) => path.split(".").reduce((v, k) => (v == null ? v : v[k]), obj);
   const num = (value) => (typeof value === "number" && Number.isFinite(value) ? value : 0);
   const int = (value) => Math.round(num(value)).toLocaleString();
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
 
   function ms(value) {
     if (!Number.isFinite(value) || value < 0) return "—";
@@ -461,6 +486,16 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     if (delta < 0) return "just now";
     return `${ms(delta)} ago`;
   }
+
+  function ageTone(ts) { const elapsed=Date.now()-stamp(ts); return !Number.isFinite(elapsed)||elapsed<3600000?"quiet":elapsed<86400000?"amber":"loud"; }
+  function ageNode(ts) { return el("span",`age age--${ageTone(ts)}`,ago(ts)||String(ts||"—")); }
+  function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
+  function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(queue==="planned"||["cancelled","superseded"].includes(outcome)||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
+  function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
+  function degradedSources(data) { const degraded=[];for(const name of ["ledger","beads","plan"]){const source=data?.sourceHealth?.[name];if(!source)continue;const state=source.state||"unknown";if(state!=="available")degraded.push(`${name} ${state}`);}return degraded; }
+  function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);if(group)return num(group.total??group.count);const fallback=code==="running"?data?.counts?.live:code==="ready-to-merge"?data?.counts?.reviewReady:undefined;return typeof fallback==="number"?fallback:null; }
+  function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${int(missing)} unpriced`:""}`; }
+  function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${int(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${ago(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${int(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${int(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${int(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${int(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${int(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${int(items.length)} of ${int(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   const VERDICT = {
     approve: { label: "approve", tone: "pass" },
@@ -1336,7 +1371,9 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
         for (const id of group.ids) {
           const child = byId.get(id);
           if (!child) continue;
-          const card = el("div", "bead");
+          const conditions = conditionRows(child, data.attention);
+          const semantic = semanticState(child, child.queueGroup, conditions);
+          const card = el("div", `bead semantic--${semantic}`);
           const top = el("div", "bead__top");
           top.append(chip(child.id, "id"));
           // Beads status outranks "has a run": a blocked bead with a live run
@@ -1347,10 +1384,14 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
             : child.beadsStatus === "blocked" ? ["blocked", "block"]
             : child.runId && child.beadsStatus === "in_progress" ? ["running", "live"]
             : [child.beadsStatus || "unknown", "idle"];
-          top.append(chip(label, tone));
+          top.append(el("span", `semantic-chip semantic-chip--${semantic}`, semanticLabel(child, conditions, semantic)));
           card.append(top);
           card.append(el("div", "bead__title", child.title || ""));
           const foot = el("div", "bead__foot");
+          foot.append(el("span", `chip--${tone}`, label));
+          const recovering = conditions.find((item) => item?.condition === "revoking");
+          const recoveryReason = recovering?.evidence?.reason || recovering?.detail;
+          if (recoveryReason) foot.append(el("span", "", recoveryReason));
           if (child.beadsStatus) foot.append(el("span", "", `bd ${child.beadsStatus}`));
           if (child.runId && child.runId !== child.id) foot.append(el("span", "trunc", child.runId));
           if (child.generation) foot.append(el("span", "", `gen ${child.generation}`));
@@ -1691,7 +1732,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
    * carry — spend, on a candidate — renders nothing rather than a zero it
    * was never told.
    */
-  function pickGrid(entries) {
+  function pickGrid(entries, attentionItems=[], groupName="") {
     // Pickable only where a pick can be served. This grid draws the
     // chooser AND the portfolio, so gating it here covers both; gating
     // only the chooser would leave every portfolio row firing a call
@@ -1699,7 +1740,9 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     const canPick = !!host.capabilities.serverTools;
     const grid = el("div", "beads");
     for (const entry of entries) {
-      const card = el("button", canPick ? "bead bead--pick" : "bead");
+      const conditions = conditionRows(entry, attentionItems);
+      const semantic = semanticState(entry, groupName, conditions);
+      const card = el("button", `${canPick ? "bead bead--pick" : "bead"} semantic--${semantic}`);
       card.type = "button";
       card.disabled = !canPick;
       // The display title leads the card. The canonical id keeps its place
@@ -1709,7 +1752,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       card.append(el("div", "bead__title", displayTitle));
       const top = el("div", "bead__top");
       top.append(chip(entry.id, "id"));
-      top.append(chip(entry.kind || "unknown", entry.kind === "epic" ? "warn" : "idle"));
+      top.append(el("span", `semantic-chip semantic-chip--${semantic}`, semanticLabel(entry, conditions, semantic)));
       card.append(top);
       // The title states its authority: an id form reads as an id, and a
       // current Beads read is marked live rather than as launch evidence.
@@ -1723,15 +1766,17 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       // Staleness is presentation only: the row keeps its true ledger state
       // and gains the age beside it, never a derived `stale` condition.
       foot.append(el("span", "", entry.state || "unknown"));
+      const recovering = conditions.find((item) => item?.condition === "revoking");
+      const recoveryReason = recovering?.evidence?.reason || recovering?.detail;
+      if (recoveryReason) foot.append(el("span", "", recoveryReason));
       const progress = ago(entry.lastProgressAt || entry.updatedAt);
-      if (progress) foot.append(el("span", "", progress));
+      if (progress) foot.append(ageNode(entry.lastProgressAt || entry.updatedAt));
+      if (entry.kind) foot.append(el("span", "", entry.kind));
       if (num(entry.liveSeats)) foot.append(el("span", "", `${int(entry.liveSeats)} live`));
       // Key PRESENCE, not truthiness: a measured $0.00 is a fact, and
       // hiding it exactly like an absent key would tell the operator the
       // same thing about two different states.
-      if (entry.costUsdKnown !== undefined && entry.costUsdKnown !== null) {
-        foot.append(el("span", "", `$${num(entry.costUsdKnown).toFixed(2)}`));
-      }
+      foot.append(el("span", "cost", spendText(entry) ?? "—"));
       if (entry.branch) foot.append(el("span", "trunc", entry.branch));
       card.append(foot);
       if (entry.blocker) card.append(el("div", "empty", `Blocked: ${entry.blocker}`));
@@ -1780,7 +1825,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       : planned ? `+${int(planned)} planned`
       : waiting ? `${int(waiting)} open · see the rail`
       : "nothing is waiting");
-    stat(`$${num(at(data, "spend.costUsdKnown")).toFixed(2)}`, "known spend",
+    stat(spendText(data.spend) ?? "—", "known spend",
       missing ? `${int(missing)} rows carry no cost` : "every row priced");
     head.body.append(stats);
 
@@ -1799,12 +1844,12 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
         heading.append(el("strong", "", group.name || "Work"));
         heading.append(el("span", "", `${int(group.count)} total`));
         body.append(heading);
-        if (grouped.length) body.append(pickGrid(grouped));
+        if (grouped.length) body.append(pickGrid(grouped, data.attention, group.name || group.code));
         else body.append(el("div", "empty", "None"));
       }
     } else {
       // Compatibility for an older daemon feeding a newer cached App.
-      body.append(pickGrid(entries));
+      body.append(pickGrid(entries, data.attention));
     }
     return [head, box];
   }
@@ -1850,6 +1895,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     identText: document.getElementById("identText"),
     subident: document.getElementById("subident"),
     controls: document.getElementById("controls"),
+    headline: document.getElementById("headline"),
     rail: document.getElementById("rail"),
     tabs: document.getElementById("tabs"),
     view: document.getElementById("view"),
@@ -1897,6 +1943,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     nodes.view.textContent = "";
     nodes.rail.textContent = "";
     nodes.foot.textContent = "";
+    nodes.headline.textContent = "";
 
     if (state.error) {
       nodes.identText.textContent = "forged";
@@ -1945,6 +1992,9 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
     // tabs and no seats: the rail names what needs a human, the view lists
     // what exists, and a click on any entry drills in.
     if (data.kind === "portfolio") {
+      const portfolioHeadline = fullHeadline(data);
+      nodes.headline.textContent = portfolioHeadline;
+      nodes.headline.title = portfolioHeadline;
       nodes.identText.textContent = "all work";
       nodes.ident.querySelectorAll(".chip, .ident__copy").forEach((node) => node.remove());
       const needsMe = arr(at(data, "queue.groups")).find((group) => group.name === "Needs me");
@@ -1971,6 +2021,7 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
       nodes.view.className = "view view--enter";
       for (const node of viewPortfolio(data)) nodes.view.append(node);
       nodes.foot.append(el("span", "", `schema ${data.schema}`));
+      pushPortfolioModelContext(data);
       reportSize();
       setTimeout(reportSize, 250);
       return;
@@ -1978,6 +2029,9 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
 
     const rows = data.kind === "epic" ? [] : packetRows(data);
     const head = headline(data);
+    const subjectHeadline = `forged ${data.kind} ${data.id}: ${head.label}${head.detail ? ` (${head.detail})` : ""}`;
+    nodes.headline.textContent = subjectHeadline;
+    nodes.headline.title = subjectHeadline;
 
     // A subject view is headed by what the work IS. The epic path already
     // carried its title down in `bits` while the slice path carried none at
@@ -2073,6 +2127,19 @@ a { color: inherit; text-decoration-color: var(--color-text-tertiary); text-unde
   }
 
   /** Keep the model's picture of the run current without a tool round-trip. */
+  function pushPortfolioModelContext(data) {
+    if (!host.capabilities.updateModelContext) return;
+    const lines = [fullHeadline(data)];
+    const degraded = degradedSources(data);
+    if (degraded.length) lines.push(`Source degradation, counts below are NOT authoritative coverage — ${degraded.join("; ")}`);
+    lines.push(`Forged Portfolio: ${int(data.total)} work items; ${int(data.liveSeats)} live seats; ${int(data.attentionTotal)} attention conditions`);
+    for (const group of arr(data?.queue?.groups)) lines.push(`- ${group.name || group.label || group.code}: ${int(group.count ?? group.total)}`);
+    const text = lines.join("\n").slice(0, 4000);
+    if (text === pushPortfolioModelContext.last) return;
+    pushPortfolioModelContext.last = text;
+    request("ui/update-model-context", { content: [{ type: "text", text }] }).catch(() => {});
+  }
+
   let lastContext = "";
   function pushModelContext(data, rows, head, items) {
     if (!host.capabilities.updateModelContext) return;
