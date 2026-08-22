@@ -411,6 +411,17 @@ fn a_failing_close_charges_monotonically_backs_off_and_exhausts_while_the_probe_
         vec![json!("beads-settlement-pending")],
         "the standing condition keeps flagging the owed promise"
     );
+    let (code, overview) = env.forged(&["overview"]);
+    assert_eq!(code, 0, "overview: {overview}");
+    let evidence = overview["result"]["attention"]
+        .as_array()
+        .expect("attention rail")
+        .iter()
+        .find(|item| item["id"] == json!(run))
+        .expect("exhausted settlement item")["evidence"]
+        .clone();
+    assert_eq!(evidence["retriesExhausted"], json!(true), "{evidence}");
+    assert_eq!(evidence["attempts"], json!(8), "{evidence}");
 
     // Manual repair: the operator closes the bead by hand. The eternal
     // probe converges it read-only on the next pass.
