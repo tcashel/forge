@@ -191,6 +191,14 @@ clean squash-merged worktree safe to retire without pretending the topic
 branch is an ancestor of the base. Dirty or unresolved worktrees remain for
 inspection and are reported in the settlement result.
 
+When `run stop` refuses with `ADJUDICATION_REQUIRED` — the run's latest
+controller record carries no durable driver identity, so no death fence is
+possible — the settlement path is `run adjudicate-settlement`: an explicitly
+destructive operator adjudication of the evidence gap that records the
+decision durably and settles the run (`landed`/`superseded`/`cancelled`),
+converging an already-closed Bead and releasing forged's stale custody on
+it. It refuses any run the normal fence can settle.
+
 `run status` reports the terminal outcome, delivery evidence, successor, and
 `claimHealth`. An `in_progress` Bead with neither a live controller nor a live
 attempt is marked `staleInProgress: true` instead of silently looking active.

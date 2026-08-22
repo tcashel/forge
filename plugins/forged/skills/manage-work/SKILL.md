@@ -34,6 +34,7 @@ execution, or an existing-work control become a new submission.
 | Change native priority | One guarded `bd update` and readback | That Bead's priority only |
 | Pause or resume an existing epic | One typed epic control and readback | That already-started epic only |
 | Cancel an existing slice run | Confirm, then one `run stop` with `cancelled` | That run's terminal transition only |
+| Settle a run whose `run stop` refuses for missing durable driver identity | Confirm the evidence gap, then one `run adjudicate-settlement` | That run's terminal transition only |
 | Acknowledge, resolve, or reopen attention | One occurrence-fenced attention control and readback | Custody only |
 | Inspect provider work | Agent Sessions, only when explicitly requested | Diagnostic only |
 
@@ -276,7 +277,42 @@ forged work detail --subject-kind run --subject-id "$RUN_ID"
 
 Never infer `clean`, `blocked`, `input-required`, `superseded`, or `landed`
 from the word “stop.” Cancellation does not declare the Bead complete. Do not
-use attempt-level stop or several child mutations as a substitute.
+use attempt-level stop or several child mutations as a substitute. When
+`run stop` refuses with the typed code `ADJUDICATION_REQUIRED` — the run's
+controller record carries no durable driver identity — do not retry it or
+emulate settlement with child mutations: route exactly that refusal, and
+only that code, through the adjudication below.
+
+## Adjudicate settlement of an unfenceable run
+
+`run stop` fails closed with `ADJUDICATION_REQUIRED` when a run's latest
+controller record lacks durable driver identity (a missing pid or a missing
+start identity), because no controller death can be verified. Only for that
+exact refusal, `run adjudicate-settlement` records an explicit operator
+adjudication of the evidence gap and settles the run. It is explicitly
+destructive: after a fresh confirmation naming the exact run, the observed
+refusal, the asserted terminal outcome, and the evidence gap being
+adjudicated, invoke:
+
+```bash
+forged run adjudicate-settlement --run "$RUN_ID" --outcome "$OUTCOME" \
+  --actor "$OPERATOR_ACTOR" --rationale "$RATIONALE" \
+  --evidence-gap "$EVIDENCE_GAP"
+forged work detail --subject-kind run --subject-id "$RUN_ID"
+```
+
+Never pass `--idempotency-key` here: the operation derives ONE key per run,
+and that derived identity is the crash-recovery handle — an interrupted
+adjudication resumes only under it, so a custom key would strand the
+interrupted row behind a permanent conflict.
+
+The outcome set is `landed` (additionally requires `--pr` and the exact
+`--sha`), `superseded` (requires `--superseded-by`), and `cancelled`. The
+operation refuses a run whose record the normal fence can settle — `run
+stop` stays the only path there — and refuses while any recorded machine
+effect lacks a confirmed-dead controller. Never use it to bypass a live
+fence, and never infer the outcome: it must come from durable evidence such
+as the Bead's recorded close reason.
 
 ## Accept review risk only as a human decision
 

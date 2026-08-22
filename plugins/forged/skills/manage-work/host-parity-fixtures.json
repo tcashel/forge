@@ -33,7 +33,7 @@
     "portfolioControl": {
       "path": "portfolio-control-fixtures.json",
       "schema": "forged.manage-work-portfolio-control-fixtures/1",
-      "caseCount": 31,
+      "caseCount": 33,
       "caseIds": [
         "status-unscoped",
         "status-repository",
@@ -65,7 +65,9 @@
         "review-risk-acceptance",
         "merge-approval",
         "session-diagnostic",
-        "session-stop-substitution"
+        "session-stop-substitution",
+        "adjudicate-unfenceable",
+        "adjudicate-fenceable-refused"
       ],
       "comparisonFields": [
         "route",
@@ -142,6 +144,7 @@
     "reconcile",
     "review_publish",
     "run_accept_risk",
+    "run_adjudicate_settlement",
     "run_advance",
     "run_revise_roster",
     "run_start",

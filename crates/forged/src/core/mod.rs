@@ -450,7 +450,7 @@ pub fn key_absent(req: &OperationRequest) -> bool {
 
 /// Validate `schemaVersion == 1` for read paths (mutating paths get the
 /// same check from `begin_operation`).
-fn check_schema_version(req: &OperationRequest) -> Result<(), Failure> {
+pub(crate) fn check_schema_version(req: &OperationRequest) -> Result<(), Failure> {
     if req.schema_version != 1 {
         return Err(Failure::invalid(format!(
             "unsupported schemaVersion {}",
@@ -784,6 +784,7 @@ pub async fn dispatch(ctx: &Ctx, name: &str, mut req: OperationRequest) -> Opera
         "run_submit" => handoff::run_submit(ctx, &mut req).await,
         "run_status" => ops::run_status(ctx, &req).await,
         "run_stop" => settlement::run_stop(ctx, &mut req).await,
+        "run_adjudicate_settlement" => settlement::run_adjudicate_settlement(ctx, &mut req).await,
         "run_revise_roster" => ops::run_revise_roster(ctx, &mut req).await,
         "run_accept_risk" => ops::run_accept_risk(ctx, &mut req).await,
         "epic_start" => epic::epic_start(ctx, &mut req).await,

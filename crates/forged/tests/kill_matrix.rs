@@ -696,6 +696,485 @@ fn settlement_kills_draft_pr_generation_before_gh_can_fire() {
     assert_eq!(creates_after, 0, "gh.call.before never crossed into POST");
 }
 
+// ------------------------------------------- settlement adjudication saga
+
+/// A run whose bead is claimable plus a legacy `forged.controller.started`
+/// record with a generation but no durable driver identity, and the exact
+/// re-assertable adjudication arguments for it.
+fn seed_legacy_adjudication(env: &TestEnv, run: &str) -> [&'static str; 12] {
+    support::fabricate_run(env, run);
+    let bead = format!("bead-{run}");
+    env.set_bead_field(&bead, "status", "in_progress");
+    env.set_assignee(&bead, &format!("forged:{bead}:0"));
+    let ledger = env.ledger();
+    ledger
+        .append_event(
+            Some(run),
+            "forged.controller.started",
+            json!({"scope": "run", "id": run, "generation": 1}),
+        )
+        .expect("legacy controller record");
+    ledger.close().expect("close");
+    [
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        "", // caller substitutes the run id
+        "--outcome",
+        "cancelled",
+        "--actor",
+        "operator",
+        "--rationale",
+        "legacy run predates durable driver identity",
+        "--evidence-gap",
+        "controller.started carries no /driver/pid and no lstart",
+    ]
+}
+
+fn crash_adjudication_at_recorded_seam(env: &TestEnv, args: &[&str]) {
+    let fp = env.root.join("fp-adjudicate-crash");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let status = env
+        .forged_cmd(args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("adjudicator spawns");
+    assert!(!status.success(), "adjudication crash failpoint fired");
+}
+
+fn interrupted_adjudication_operation(env: &TestEnv) -> String {
+    let ledger = env.ledger();
+    let inflight = ledger.list_inflight_operations(None).expect("inflight");
+    let operation = inflight
+        .iter()
+        .find(|op| op.name == "run_adjudicate_settlement")
+        .unwrap_or_else(|| panic!("an interrupted adjudication row exists: {inflight:?}"))
+        .operation_id
+        .clone();
+    ledger.close().expect("close");
+    operation
+}
+
+/// Crash between the durable adjudication event and the fencing terminal
+/// write. A DIFFERENT outcome re-asserted after the crash maps to the SAME
+/// derived key and refuses as an idempotency conflict; a fresh explicit key
+/// refuses toward the recorded operation instead of adopting its event; and
+/// the SAME decision re-asserted verbatim adopts the standing event, seals
+/// the interrupted human-ambiguous row, and completes the terminal
+/// projection with the generation revocation.
+#[test]
+fn adjudication_crash_between_event_and_terminal_write_recovers() {
+    let env = TestEnv::new("km-adjudicate-crash");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let run = "adj-crash";
+    let mut args = seed_legacy_adjudication(&env, run);
+    args[3] = run;
+    crash_adjudication_at_recorded_seam(&env, &args);
+    {
+        let ledger = env.ledger();
+        let row = ledger.get_run(run).expect("run");
+        assert_eq!(
+            row.state,
+            forged_ledger::RunState::Active,
+            "the terminal write never happened"
+        );
+        let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.settlement-adjudication")
+                .count(),
+            1,
+            "the adjudication event is durable before the crash seam"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.controller.revoked")
+                .count(),
+            0
+        );
+        ledger.close().expect("close");
+    }
+    let interrupted = interrupted_adjudication_operation(&env);
+
+    // The derived key binds the outcome: a different assertion collides with
+    // the stored request instead of minting a row that dead-ends.
+    let (_, conflict) = env.forged(&[
+        "run",
+        "adjudicate-settlement",
+        "--run",
+        run,
+        "--outcome",
+        "superseded",
+        "--superseded-by",
+        "adj-next",
+        "--actor",
+        "operator",
+        "--rationale",
+        "legacy run predates durable driver identity",
+        "--evidence-gap",
+        "controller.started carries no /driver/pid and no lstart",
+    ]);
+    assert_eq!(conflict["ok"], json!(false), "{conflict}");
+    assert_eq!(
+        conflict["error"]["code"],
+        json!("IDEMPOTENCY_CONFLICT"),
+        "{conflict}"
+    );
+
+    // A fresh key cannot settle around the interrupted row: the standing
+    // event names its operation and the refusal points recovery back at it.
+    let mut fresh: Vec<&str> = args.to_vec();
+    fresh.extend(["--idempotency-key", "op:manual:adj-crash-retry"]);
+    let (_, refused) = env.forged(&fresh);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("IDEMPOTENCY_CONFLICT"),
+        "{refused}"
+    );
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&interrupted),
+        "the refusal names the recorded operation: {refused}"
+    );
+    assert_eq!(
+        interrupted_adjudication_operation(&env),
+        interrupted,
+        "neither conflict released or replaced the interrupted row"
+    );
+
+    let (code, recovered) = env.forged(&args);
+    assert_eq!(code, 0, "recovered adjudication: {recovered}");
+    assert_eq!(recovered["ok"], json!(true), "{recovered}");
+    assert_eq!(recovered["result"]["outcome"], json!("cancelled"));
+    assert_eq!(
+        recovered["operationId"],
+        json!(interrupted),
+        "recovery seals the interrupted row, never a second one"
+    );
+    {
+        let ledger = env.ledger();
+        let row = ledger.get_run(run).expect("run");
+        assert_eq!(row.state, forged_ledger::RunState::Stopped);
+        assert_eq!(
+            row.terminal_outcome,
+            Some(forged_ledger::RunOutcome::Cancelled)
+        );
+        let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.settlement-adjudication")
+                .count(),
+            1,
+            "recovery adopts the standing event instead of duplicating it"
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|row| row.kind == "forged.controller.revoked")
+                .count(),
+            1,
+            "the recorded generation is revoked exactly once"
+        );
+        let stuck = ledger.list_inflight_operations(None).expect("inflight");
+        assert!(
+            stuck
+                .iter()
+                .all(|op| op.name != "run_adjudicate_settlement"),
+            "the interrupted row was sealed, not stranded: {stuck:?}"
+        );
+        ledger.close().expect("close");
+    }
+
+    let (code, replay) = env.forged(&args);
+    assert_eq!(code, 0, "replay: {replay}");
+    assert_eq!(replay["reused"], json!(true), "{replay}");
+}
+
+/// A refusal after the probe has an operation row in hand reports that row's
+/// REAL operation id — mirroring the fenced path — never the derived key.
+#[test]
+fn adjudication_resume_refusal_names_the_stored_operation() {
+    let env = TestEnv::new("km-adjudicate-refusal-id");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let run = "adj-refusal";
+    let mut args = seed_legacy_adjudication(&env, run);
+    args[3] = run;
+    crash_adjudication_at_recorded_seam(&env, &args);
+    let interrupted = interrupted_adjudication_operation(&env);
+
+    {
+        let ledger = env.ledger();
+        let request = forged_types::OperationRequest {
+            schema_version: 1,
+            idempotency_key: format!("op:push:{run}:-:-"),
+            run_id: Some(run.to_owned()),
+            params: serde_json::Map::new(),
+        };
+        ledger
+            .begin_operation(
+                "push",
+                &request,
+                forged_ledger::EffectClass::ObserveOnly,
+                None,
+            )
+            .expect("in-flight machine ticket");
+        ledger.close().expect("close");
+    }
+
+    let (_, refused) = env.forged(&args);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("HOST_UNAVAILABLE"),
+        "{refused}"
+    );
+    assert_eq!(
+        refused["operationId"],
+        json!(interrupted),
+        "the refusal names the stored operation, not the derived key: {refused}"
+    );
+    assert_eq!(
+        interrupted_adjudication_operation(&env),
+        interrupted,
+        "the human-ambiguous row survives the refusal for a later resume"
+    );
+}
+
+/// The interrupted-row takeover holds the run submit singleton for the whole
+/// verify-and-re-execute window: a concurrent same-key invocation cannot
+/// take the row over mid-flight, waits the winner out, and then reads the
+/// sealed terminal row as a benign replay instead of an error.
+#[test]
+fn adjudication_takeover_holds_the_singleton_and_a_rival_replays() {
+    let env = TestEnv::new("km-adjudicate-rival");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let run = "adj-rival";
+    let mut args = seed_legacy_adjudication(&env, run);
+    args[3] = run;
+    crash_adjudication_at_recorded_seam(&env, &args);
+    let interrupted = interrupted_adjudication_operation(&env);
+
+    // The winner resumes the interrupted row and pauses INSIDE the held
+    // singleton, at the same recorded-event seam.
+    let fp = env.root.join("fp-adjudicate-pause");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let winner = env
+        .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("winner spawns");
+    let reached = fp.join("run.adjudicate.recorded.after.reached");
+    wait_until("winner reaches the recorded seam", || reached.exists());
+
+    // The rival pauses at the arrival boundary immediately before the submit
+    // singleton, so its contention with the held lock is proven, not
+    // inferred from scheduling luck.
+    let rival_fp = env.root.join("fp-adjudicate-rival");
+    std::fs::create_dir_all(&rival_fp).expect("rival fp dir");
+    let mut rival = env
+        .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.submit.before")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &rival_fp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("rival spawns");
+    let rival_arrived = rival_fp.join("run.adjudicate.submit.before.reached");
+    wait_until("rival reaches the singleton boundary", || {
+        rival_arrived.exists()
+    });
+    std::fs::write(rival_fp.join("run.adjudicate.submit.before.release"), b"")
+        .expect("release rival");
+    wait_until("rival enters the singleton wait", || {
+        !rival_arrived.exists()
+    });
+    std::thread::sleep(Duration::from_millis(400));
+    assert!(
+        rival.try_wait().expect("rival poll").is_none(),
+        "the rival waits on the submit singleton instead of taking over"
+    );
+
+    std::fs::write(fp.join("run.adjudicate.recorded.after.release"), b"").expect("release winner");
+    let winner_out = winner.wait_with_output().expect("winner completes");
+    let rival_out = rival.wait_with_output().expect("rival completes");
+    assert!(winner_out.status.success(), "winner exit");
+    assert!(rival_out.status.success(), "rival exit");
+    let winner_json: Value = serde_json::from_slice(&winner_out.stdout).expect("winner envelope");
+    let rival_json: Value = serde_json::from_slice(&rival_out.stdout).expect("rival envelope");
+    assert_eq!(winner_json["ok"], json!(true), "{winner_json}");
+    assert_eq!(
+        winner_json["operationId"],
+        json!(interrupted),
+        "{winner_json}"
+    );
+    assert_eq!(rival_json["ok"], json!(true), "{rival_json}");
+    assert_eq!(
+        rival_json["reused"],
+        json!(true),
+        "the rival replays the sealed row instead of erroring: {rival_json}"
+    );
+    assert_eq!(rival_json["result"], winner_json["result"], "one outcome");
+
+    let ledger = env.ledger();
+    let row = ledger.get_run(run).expect("run");
+    assert_eq!(row.state, forged_ledger::RunState::Stopped);
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    assert_eq!(
+        events
+            .iter()
+            .filter(|row| row.kind == "forged.settlement-adjudication")
+            .count(),
+        1,
+        "one adjudication event, no matter how many rivals raced"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|row| row.kind == "forged.controller.revoked")
+            .count(),
+        1,
+        "the generation is revoked exactly once"
+    );
+    assert!(
+        ledger
+            .list_inflight_operations(None)
+            .expect("inflight")
+            .iter()
+            .all(|op| op.name != "run_adjudicate_settlement"),
+        "no stranded rows"
+    );
+    ledger.close().expect("close");
+}
+
+/// A machine ticket admitted AFTER the adjudication's precheck loses to the
+/// terminal write ITSELF: the fencing transaction refuses before anything
+/// terminal commits, so the run stays Active instead of settling over an
+/// in-flight machine effect. The standing adjudication event survives for
+/// the sanctioned same-key resume once the ticket resolves.
+#[test]
+fn adjudication_terminal_write_refuses_a_ticket_admitted_after_the_precheck() {
+    let env = TestEnv::new("km-adjudicate-late-ticket");
+    let (code, init) = env.forged(&["init"]);
+    assert_eq!(code, 0, "init: {init}");
+    let run = "adj-late-ticket";
+    let mut args = seed_legacy_adjudication(&env, run);
+    args[3] = run;
+
+    let fp = env.root.join("fp-adjudicate-late");
+    std::fs::create_dir_all(&fp).expect("fp dir");
+    let winner = env
+        .forged_cmd(&args)
+        .env("FORGED_FAILPOINT", "run.adjudicate.recorded.after")
+        .env("FORGED_FAILPOINT_MODE", "pause")
+        .env("FORGED_FAILPOINT_DIR", &fp)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("adjudication spawns");
+    let reached = fp.join("run.adjudicate.recorded.after.reached");
+    wait_until("adjudication reaches the recorded seam", || {
+        reached.exists()
+    });
+
+    // Past the precheck, paused before the terminal write: admit the exact
+    // ticket the precheck could not see.
+    let ticket = {
+        let ledger = env.ledger();
+        let request = forged_types::OperationRequest {
+            schema_version: 1,
+            idempotency_key: format!("op:push:{run}:-:-"),
+            run_id: Some(run.to_owned()),
+            params: serde_json::Map::new(),
+        };
+        let outcome = ledger
+            .begin_operation(
+                "push",
+                &request,
+                forged_ledger::EffectClass::ObserveOnly,
+                None,
+            )
+            .expect("in-flight machine ticket");
+        let forged_ledger::OperationOutcome::Fresh(ticket) = outcome else {
+            panic!("expected a fresh machine ticket, got {outcome:?}");
+        };
+        ledger.close().expect("close");
+        ticket.operation_id
+    };
+
+    std::fs::write(fp.join("run.adjudicate.recorded.after.release"), b"").expect("release");
+    let out = winner.wait_with_output().expect("adjudication completes");
+    let refused: Value = serde_json::from_slice(&out.stdout).expect("envelope");
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("HOST_UNAVAILABLE"),
+        "{refused}"
+    );
+
+    let ledger = env.ledger();
+    let row = ledger.get_run(run).expect("run");
+    assert_eq!(
+        row.state,
+        forged_ledger::RunState::Active,
+        "the fencing transaction refused; nothing terminal committed"
+    );
+    let events = ledger.list_events(Some(run), 0, 65_536).expect("events");
+    assert!(
+        events
+            .iter()
+            .all(|row| row.kind != "run.settled" && row.kind != "forged.controller.revoked"),
+        "no terminal projection or revocation committed"
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|row| row.kind == "forged.settlement-adjudication")
+            .count(),
+        1,
+        "the recorded adjudication survives for the same-key resume"
+    );
+    ledger.release_operation(&ticket).expect("ticket resolves");
+    ledger.close().expect("close");
+
+    // The sanctioned recovery: the identical decision under the same key
+    // seals the interrupted row and completes the terminal projection.
+    let (code, resumed) = env.forged(&args);
+    assert_eq!(code, 0, "resume: {resumed}");
+    assert_eq!(resumed["ok"], json!(true), "{resumed}");
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger.get_run(run).expect("run").state,
+        forged_ledger::RunState::Stopped
+    );
+    assert!(
+        ledger
+            .list_inflight_operations(None)
+            .expect("inflight")
+            .iter()
+            .all(|op| op.name != "run_adjudicate_settlement"),
+        "no stranded rows"
+    );
+    ledger.close().expect("close");
+}
+
 // ------------------------------------------------------- epic merge recovery
 
 #[test]

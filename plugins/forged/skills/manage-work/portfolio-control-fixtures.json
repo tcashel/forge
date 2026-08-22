@@ -2,8 +2,21 @@
   "schema": "forged.manage-work-portfolio-control-fixtures/1",
   "purpose": "validation-only",
   "isolation": {
-    "requiredTemporaryEnv": ["HOME", "ANVIL_HOME", "BEADS_DIR"],
-    "fakeBoundaries": ["bd", "forged-cli", "forged-mcp", "service", "provider", "git", "github", "app-host"],
+    "requiredTemporaryEnv": [
+      "HOME",
+      "ANVIL_HOME",
+      "BEADS_DIR"
+    ],
+    "fakeBoundaries": [
+      "bd",
+      "forged-cli",
+      "forged-mcp",
+      "service",
+      "provider",
+      "git",
+      "github",
+      "app-host"
+    ],
     "liveEffects": "forbidden"
   },
   "schemas": {
@@ -21,7 +34,28 @@
       "route": "operations-overview",
       "confirmation": "none",
       "postcondition": "bounded-portfolio",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "status-repository",
@@ -29,7 +63,28 @@
       "route": "operations-overview",
       "confirmation": "none",
       "postcondition": "exact-repository-only",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "needs-me",
@@ -37,7 +92,28 @@
       "route": "operations-overview",
       "confirmation": "none",
       "postcondition": "needs-me-group",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "app-unavailable",
@@ -45,7 +121,28 @@
       "route": "operations-overview",
       "confirmation": "none",
       "postcondition": "structured-fallback",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "detail-exact",
@@ -53,7 +150,28 @@
       "route": "work-detail",
       "confirmation": "none",
       "postcondition": "exact-work-ref",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "title-unique",
@@ -61,7 +179,28 @@
       "route": "operations-then-detail",
       "confirmation": "none",
       "postcondition": "unique-canonical-target",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "title-zero",
@@ -69,7 +208,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "not-found-no-mutation",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "title-ambiguous",
@@ -77,7 +237,28 @@
       "route": "refuse",
       "confirmation": "bounded-target",
       "postcondition": "disambiguate-no-mutation",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "blocker-explanation",
@@ -85,7 +266,28 @@
       "route": "work-detail",
       "confirmation": "none",
       "postcondition": "evidence-and-next-action",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "spend-known",
@@ -93,7 +295,28 @@
       "route": "work-detail",
       "confirmation": "none",
       "postcondition": "known-spend",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "spend-unknown",
@@ -101,7 +324,28 @@
       "route": "work-detail",
       "confirmation": "none",
       "postcondition": "unknown-not-zero",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "plan-only-detail",
@@ -109,7 +353,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "plan-summary-only",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "priority-change",
@@ -117,7 +382,28 @@
       "route": "bd-priority",
       "confirmation": "none",
       "postcondition": "priority-only-lower-wins-later-no-preemption",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 1, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 1,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "epic-pause",
@@ -125,7 +411,28 @@
       "route": "epic-pause",
       "confirmation": "none",
       "postcondition": "paused-readback",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 1, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 1,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "epic-resume",
@@ -133,7 +440,28 @@
       "route": "epic-resume",
       "confirmation": "none",
       "postcondition": "active-readback-no-submit",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 1, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 1,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "input-required-resume",
@@ -141,7 +469,28 @@
       "route": "work-detail",
       "confirmation": "not-applicable",
       "postcondition": "resolve-domain-first",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "slice-cancel",
@@ -149,7 +498,28 @@
       "route": "run-stop-cancelled",
       "confirmation": "destructive",
       "postcondition": "cancelled-terminal-readback",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 1, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 1,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "slice-pause-unsupported",
@@ -157,7 +527,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "unsupported-no-session-stop",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "epic-stop-unsupported",
@@ -165,7 +556,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "offer-pause-boundary",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "stale-precondition",
@@ -173,7 +585,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "stale-input-required",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "duplicate-response",
@@ -181,7 +614,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "readback-no-retry",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-acknowledge-lead",
@@ -189,7 +643,28 @@
       "route": "attention-acknowledge",
       "confirmation": "none",
       "postcondition": "acknowledged-still-active",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 1, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 1,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-resolve-lead",
@@ -197,7 +672,28 @@
       "route": "attention-resolve",
       "confirmation": "none",
       "postcondition": "accepted-unknown-readback",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 1, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 1,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-resolve-human",
@@ -205,7 +701,28 @@
       "route": "attention-resolve",
       "confirmation": "human-decision",
       "postcondition": "resolved-after-domain-evidence",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 1, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 1,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-source-backed",
@@ -213,7 +730,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "domain-transition-only",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-stale-occurrence",
@@ -221,7 +759,28 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "stale-occurrence-no-mutation",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "attention-reopen",
@@ -229,7 +788,28 @@
       "route": "attention-reopen",
       "confirmation": "none",
       "postcondition": "open-new-decision-required",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 1, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 1,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "review-risk-acceptance",
@@ -237,7 +817,28 @@
       "route": "run-accept-risk",
       "confirmation": "human-decision",
       "postcondition": "accepted-risk-readback",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 1, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 1,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "merge-approval",
@@ -245,7 +846,28 @@
       "route": "refuse",
       "confirmation": "human-decision",
       "postcondition": "human-github-boundary",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "session-diagnostic",
@@ -253,7 +875,28 @@
       "route": "session-diagnostic",
       "confirmation": "none",
       "postcondition": "read-only-attempt-detail",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     },
     {
       "id": "session-stop-substitution",
@@ -261,7 +904,86 @@
       "route": "refuse",
       "confirmation": "not-applicable",
       "postcondition": "work-control-required",
-      "effectBudget": {"beadClaims": 0, "beadPriorityUpdates": 0, "beadOtherWrites": 0, "epicPauses": 0, "epicResumes": 0, "runStops": 0, "riskAcceptances": 0, "attentionAcknowledgements": 0, "attentionResolutions": 0, "attentionReopens": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "sessionStops": 0, "serviceMutations": 0, "providerCalls": 0, "repositoryWrites": 0, "githubWrites": 0}
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
+    },
+    {
+      "id": "adjudicate-unfenceable",
+      "request": "Run stop for run-a refused with ADJUDICATION_REQUIRED; settle it as cancelled with this rationale and evidence gap.",
+      "route": "run-adjudicate-settlement",
+      "confirmation": "destructive",
+      "postcondition": "adjudicated-terminal-readback",
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 1
+      }
+    },
+    {
+      "id": "adjudicate-fenceable-refused",
+      "request": "Adjudicate-settle run-b directly; its run stop works normally.",
+      "route": "refuse",
+      "confirmation": "not-applicable",
+      "postcondition": "live-fence-run-stop-only",
+      "effectBudget": {
+        "beadClaims": 0,
+        "beadPriorityUpdates": 0,
+        "beadOtherWrites": 0,
+        "epicPauses": 0,
+        "epicResumes": 0,
+        "runStops": 0,
+        "riskAcceptances": 0,
+        "attentionAcknowledgements": 0,
+        "attentionResolutions": 0,
+        "attentionReopens": 0,
+        "runStarts": 0,
+        "runSubmits": 0,
+        "epicStarts": 0,
+        "epicSubmits": 0,
+        "sessionStops": 0,
+        "serviceMutations": 0,
+        "providerCalls": 0,
+        "repositoryWrites": 0,
+        "githubWrites": 0,
+        "runAdjudications": 0
+      }
     }
   ]
 }

@@ -41,6 +41,12 @@
 //! `epic.resolve.desired.after` is the inverse seam: the identified
 //! INPUT_RESOLVED event and due wake are committed, but the safe-effect
 //! operation has not yet been settled.
+//! `run.adjudicate.recorded.after` is the settlement adjudication's seam:
+//! the operator's adjudication event is durable, but the generation-fencing
+//! terminal write has not committed. `run.adjudicate.submit.before` is the
+//! arrival boundary immediately before that operation's submit singleton: a
+//! rival paused there is provably at contention while the holder still owns
+//! the lock.
 //! `run.start.bundle.after` and `epic.start.bundle.after` sit after the
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use
