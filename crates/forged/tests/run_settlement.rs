@@ -218,6 +218,11 @@ fn landed_predecessor_leaves_successor_ownership_unchanged_and_visible() {
         payload["expectedAssignee"],
         json!(format!("forged:{bead}:0"))
     );
+    assert_eq!(
+        payload["observedHolder"],
+        json!(format!("forged:{bead}:0")),
+        "run stop records the lease holder in force at pend time"
+    );
     assert!(
         payload["error"]
             .as_str()
