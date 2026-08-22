@@ -1685,6 +1685,10 @@ pub struct Dispatched {
     pub controls_hidden: bool,
     pub args: Value,
     pub error: Value,
+    /// The one visible sentence that opens the rendered surface.
+    pub headline: String,
+    /// Every model-context push captured from the same render dispatch.
+    pub model_context: Vec<String>,
 }
 
 impl Dispatched {
@@ -1786,6 +1790,17 @@ fn dispatched(out: Value) -> Dispatched {
         controls_hidden: out["controlsHidden"].as_bool().unwrap_or(false),
         args: out["args"].clone(),
         error: out["error"].clone(),
+        headline: out["headline"].as_str().unwrap_or_default().to_owned(),
+        model_context: out["modelContext"]
+            .as_array()
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_owned)
+                    .collect()
+            })
+            .unwrap_or_default(),
     }
 }
 
