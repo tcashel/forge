@@ -933,20 +933,31 @@ CREATE INDEX review_finding_delivery_state
 /// Migration 020: the durable mirror of pending whole-run bead settlement.
 ///
 /// The budget bounds MUTATING retries only; the read-only convergence probe
-/// runs on every supervisor tick regardless of `used`. The claim columns are
-/// the same cross-process singleton fence `desired_work` carries, so two
-/// concurrent tick executors cannot double-comment or double-charge.
+/// runs regardless of `used`, throttled by `probe_wake_at` and reset to the
+/// floor whenever the live bead differs from the `last_observed_*` snapshot.
+/// The claim columns are the same cross-process singleton fence
+/// `desired_work` carries, so two concurrent tick executors cannot
+/// double-comment or double-charge. `event_id` is the episode watermark:
+/// stamped transactionally with every charge and every pass-minted pending
+/// re-record, so only a pending event NEWER than it — one minted by a fresh
+/// `run stop` settlement episode — may reset the budget.
 const MIGRATION_020: &str = "
 CREATE TABLE bead_settlement_retry (
-  run_id            TEXT PRIMARY KEY REFERENCES runs(run_id),
-  budget            INTEGER NOT NULL CHECK (budget > 0),
-  used              INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0 AND used <= budget),
-  next_wake_at      TEXT,
-  last_error        TEXT,
-  claim_token       TEXT,
-  claim_lease_until TEXT,
-  created_at        TEXT NOT NULL,
-  updated_at        TEXT NOT NULL
+  run_id                 TEXT PRIMARY KEY REFERENCES runs(run_id),
+  budget                 INTEGER NOT NULL CHECK (budget > 0),
+  used                   INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0 AND used <= budget),
+  next_wake_at           TEXT,
+  last_error             TEXT,
+  claim_token            TEXT,
+  claim_lease_until      TEXT,
+  event_id               INTEGER,
+  probe_wake_at          TEXT,
+  probe_interval_s       INTEGER,
+  last_observed_status   TEXT,
+  last_observed_assignee TEXT,
+  last_observed_revision TEXT,
+  created_at             TEXT NOT NULL,
+  updated_at             TEXT NOT NULL
 );
 ";
 

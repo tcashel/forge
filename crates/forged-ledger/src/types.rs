@@ -211,6 +211,19 @@ pub struct BeadSettlementRetryRow {
     pub last_error: Option<String>,
     pub claim_token: Option<String>,
     pub claim_lease_until: Option<String>,
+    /// Episode watermark: the newest pending event id this row has charged
+    /// against or minted itself. Only a pending event NEWER than it — a
+    /// fresh `run stop` settlement episode — may reset the budget.
+    pub event_id: Option<i64>,
+    /// The read-only probe's next due time; `None` means never probed.
+    pub probe_wake_at: Option<String>,
+    /// The backoff interval that produced `probe_wake_at`: 60s doubling,
+    /// capped at 480s, reset to the floor when the live bead differs from
+    /// the stored observation.
+    pub probe_interval_s: Option<u32>,
+    pub last_observed_status: Option<String>,
+    pub last_observed_assignee: Option<String>,
+    pub last_observed_revision: Option<String>,
     pub created_at: String,
     pub updated_at: String,
 }
@@ -224,6 +237,9 @@ pub struct PendingBeadSettlementRow {
     pub event_id: i64,
     /// The latest pending event's stored payload, verbatim.
     pub payload_json: String,
+    /// The retry row's probe schedule, when one exists: the pass probes a
+    /// run only when this is absent or due.
+    pub probe_wake_at: Option<String>,
 }
 
 /// Closed lifecycle of one durable capacity reservation. Expiry moves a row

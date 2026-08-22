@@ -27,7 +27,9 @@ const SUCCEEDED: &str = "run.bead-settlement.succeeded";
 pub const BEAD_SETTLEMENT_RETRY_BUDGET: u32 = 8;
 
 const COLUMNS: &str = "run_id, budget, used, next_wake_at, last_error, \
-    claim_token, claim_lease_until, created_at, updated_at";
+    claim_token, claim_lease_until, event_id, probe_wake_at, probe_interval_s, \
+    last_observed_status, last_observed_assignee, last_observed_revision, \
+    created_at, updated_at";
 
 fn retry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadSettlementRetryRow> {
     let unsigned = |index: usize, raw: i64| {
@@ -47,8 +49,17 @@ fn retry_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<BeadSettlementRetryRow
         last_error: row.get(4)?,
         claim_token: row.get(5)?,
         claim_lease_until: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        event_id: row.get(7)?,
+        probe_wake_at: row.get(8)?,
+        probe_interval_s: row
+            .get::<_, Option<i64>>(9)?
+            .map(|raw| unsigned(9, raw))
+            .transpose()?,
+        last_observed_status: row.get(10)?,
+        last_observed_assignee: row.get(11)?,
+        last_observed_revision: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -83,7 +94,9 @@ impl Ledger {
     ) -> Result<Vec<PendingBeadSettlementRow>, LedgerError> {
         self.submit(move |conn| {
             let mut statement = conn.prepare(
-                "SELECT e.run_id, e.event_id, e.payload_json FROM events e \
+                "SELECT e.run_id, e.event_id, e.payload_json, r.probe_wake_at \
+                 FROM events e \
+                 LEFT JOIN bead_settlement_retry r ON r.run_id = e.run_id \
                  WHERE e.kind = ?1 AND e.run_id IS NOT NULL \
                    AND e.event_id = (SELECT MAX(e2.event_id) FROM events e2 \
                      WHERE e2.run_id = e.run_id AND e2.kind IN (?1, ?2)) \
@@ -94,9 +107,86 @@ impl Ledger {
                     run_id: row.get(0)?,
                     event_id: row.get(1)?,
                     payload_json: row.get(2)?,
+                    probe_wake_at: row.get(3)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Reset the mutating budget for a NEW settlement episode: zero `used`,
+    /// clear `next_wake_at`/`last_error`, and advance the watermark to
+    /// `latest_event_id` — but ONLY when that id is newer than the stamped
+    /// watermark. Every charge and every pass-minted pending re-record
+    /// stamps the watermark transactionally, so a newer pending event can
+    /// only be one minted by a fresh `run stop` settlement episode, never
+    /// this pass's own re-pend. The predicate is the CAS: a concurrent
+    /// stale reset (an older latest id) loses. Probe schedule columns are
+    /// deliberately untouched — a new episode does not imply the bead moved.
+    pub fn reset_bead_settlement_retry_for_new_episode(
+        &self,
+        run_id: &str,
+        latest_event_id: i64,
+    ) -> Result<bool, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let affected = tx.execute(
+                "UPDATE bead_settlement_retry \
+                 SET used = 0, next_wake_at = NULL, last_error = NULL, \
+                     event_id = ?1, updated_at = ?2 \
+                 WHERE run_id = ?3 AND (event_id IS NULL OR event_id < ?1)",
+                rusqlite::params![latest_event_id, now_iso(), run_id],
+            )?;
+            tx.commit()?;
+            Ok(affected == 1)
+        })
+    }
+
+    /// Record one read-only probe observation, creating the retry row on
+    /// first contact. Budget fields are untouched on an existing row: the
+    /// probe never opens, spends, or resets the mutating budget.
+    #[allow(clippy::too_many_arguments)]
+    pub fn record_bead_settlement_probe(
+        &self,
+        run_id: &str,
+        probe_wake_at: &str,
+        probe_interval_s: u32,
+        status: &str,
+        assignee: Option<String>,
+        revision: Option<String>,
+    ) -> Result<(), LedgerError> {
+        let run_id = run_id.to_owned();
+        let probe_wake_at = probe_wake_at.to_owned();
+        let status = status.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            tx.execute(
+                "INSERT INTO bead_settlement_retry \
+                   (run_id, budget, used, probe_wake_at, probe_interval_s, \
+                    last_observed_status, last_observed_assignee, \
+                    last_observed_revision, created_at, updated_at) \
+                 VALUES (?1, ?2, 0, ?3, ?4, ?5, ?6, ?7, ?8, ?8) \
+                 ON CONFLICT(run_id) DO UPDATE SET \
+                   probe_wake_at = excluded.probe_wake_at, \
+                   probe_interval_s = excluded.probe_interval_s, \
+                   last_observed_status = excluded.last_observed_status, \
+                   last_observed_assignee = excluded.last_observed_assignee, \
+                   last_observed_revision = excluded.last_observed_revision, \
+                   updated_at = excluded.updated_at",
+                rusqlite::params![
+                    run_id,
+                    i64::from(BEAD_SETTLEMENT_RETRY_BUDGET),
+                    probe_wake_at,
+                    i64::from(probe_interval_s),
+                    status,
+                    assignee,
+                    revision,
+                    now_iso(),
+                ],
+            )?;
+            tx.commit()?;
+            Ok(())
         })
     }
 
@@ -155,13 +245,18 @@ impl Ledger {
     /// extending the claim lease to `lease_until`: the fence must outlive
     /// the whole post-charge bd mutation chain, not just the claim-to-charge
     /// window, or a slow chain hands a live executor's run to a rival.
-    /// Refuses when the token is stale or the budget is spent.
+    /// `pending_event_id` — the discovered pending event this attempt
+    /// settles — stamps the episode watermark in the same transaction, so a
+    /// crash after the charge can never read the already-charged episode as
+    /// a new one and reset the budget. Refuses when the token is stale or
+    /// the budget is spent.
     pub fn charge_bead_settlement_retry(
         &self,
         run_id: &str,
         token: &str,
         next_wake_at: &str,
         lease_until: &str,
+        pending_event_id: i64,
     ) -> Result<BeadSettlementRetryRow, LedgerError> {
         let run_id = run_id.to_owned();
         let token = token.to_owned();
@@ -172,9 +267,16 @@ impl Ledger {
             let affected = tx.execute(
                 "UPDATE bead_settlement_retry \
                  SET used = used + 1, next_wake_at = ?1, claim_lease_until = ?2, \
-                     updated_at = ?3 \
+                     event_id = MAX(COALESCE(event_id, 0), ?6), updated_at = ?3 \
                  WHERE run_id = ?4 AND claim_token = ?5 AND used < budget",
-                rusqlite::params![next_wake_at, lease_until, now_iso(), run_id, token],
+                rusqlite::params![
+                    next_wake_at,
+                    lease_until,
+                    now_iso(),
+                    run_id,
+                    token,
+                    pending_event_id
+                ],
             )?;
             if affected != 1 {
                 return Err(refused(
@@ -251,6 +353,11 @@ impl Ledger {
     /// settlement event is still `pending` AND the payload actually changed.
     /// A converged run is never resurrected, and byte-identical retries do
     /// not multiply evidence.
+    ///
+    /// The append stamps the retry row's episode watermark to the new
+    /// event's id in the same transaction: every pending event the retry
+    /// pass mints itself is covered, so its own re-record can never read as
+    /// a fresh settlement episode and reset the budget.
     pub fn append_bead_settlement_pending_if_pending(
         &self,
         run_id: &str,
@@ -263,6 +370,11 @@ impl Ledger {
             let appended = match latest_settlement_tx(&tx, &run_id)? {
                 Some((kind, latest)) if kind == PENDING && latest != serialized => {
                     append_event_tx(&tx, Some(&run_id), PENDING, &payload)?;
+                    tx.execute(
+                        "UPDATE bead_settlement_retry \
+                         SET event_id = ?1, updated_at = ?2 WHERE run_id = ?3",
+                        rusqlite::params![tx.last_insert_rowid(), now_iso(), run_id],
+                    )?;
                     true
                 }
                 _ => false,
@@ -416,7 +528,7 @@ mod tests {
             .expect("loser")
             .is_none());
         second
-            .charge_bead_settlement_retry("run-retry", "tick-b", lease, lease)
+            .charge_bead_settlement_retry("run-retry", "tick-b", lease, lease, 1)
             .expect_err("a stale token must not charge");
 
         let mutation_lease = "2030-01-01T00:08:00.000000000Z";
@@ -426,6 +538,7 @@ mod tests {
                 "tick-a",
                 "2030-01-01T00:00:30.000000000Z",
                 mutation_lease,
+                1,
             )
             .expect("charge");
         assert_eq!(charged.used, 1);
@@ -437,6 +550,11 @@ mod tests {
             charged.claim_lease_until.as_deref(),
             Some(mutation_lease),
             "the charge extends the fence over the mutation chain"
+        );
+        assert_eq!(
+            charged.event_id,
+            Some(1),
+            "the charge stamps the episode watermark transactionally"
         );
         assert!(ledger
             .finish_bead_settlement_retry("run-retry", "tick-a", Some("still held".to_owned()))
@@ -460,11 +578,169 @@ mod tests {
             .expect("free row reclaims");
         for _ in reclaimed.used..reclaimed.budget {
             second
-                .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease)
+                .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, 1)
                 .expect("charge within budget");
         }
         second
-            .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease)
+            .charge_bead_settlement_retry("run-retry", "tick-c", lease, lease, 1)
             .expect_err("the budget bounds mutating charges");
+    }
+
+    #[test]
+    fn own_re_records_stamp_the_watermark_and_only_a_newer_episode_resets() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = ledger_with_run(&dir, "run-retry");
+        let now = "2030-01-01T00:00:00.000000000Z";
+        let lease = "2030-01-01T00:01:00.000000000Z";
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("episode one"))
+            .expect("pending");
+        let discovered = ledger
+            .list_pending_bead_settlements()
+            .expect("discovery")
+            .remove(0);
+        ledger
+            .claim_bead_settlement_retry("run-retry", "tick-a", now, lease)
+            .expect("claim")
+            .expect("winner");
+        ledger
+            .charge_bead_settlement_retry("run-retry", "tick-a", lease, lease, discovered.event_id)
+            .expect("charge");
+
+        // The pass's own re-record moves the watermark with the append.
+        assert!(ledger
+            .append_bead_settlement_pending_if_pending("run-retry", pending_payload("re-pended"))
+            .expect("re-record"));
+        let repended = ledger
+            .list_pending_bead_settlements()
+            .expect("re-discovery")
+            .remove(0);
+        let row = ledger
+            .get_bead_settlement_retry("run-retry")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.event_id, Some(repended.event_id));
+        assert!(
+            !ledger
+                .reset_bead_settlement_retry_for_new_episode("run-retry", repended.event_id)
+                .expect("own re-pend reset"),
+            "the pass's own re-record never reads as a new episode"
+        );
+        assert_eq!(
+            ledger
+                .get_bead_settlement_retry("run-retry")
+                .expect("get")
+                .expect("row")
+                .used,
+            1
+        );
+
+        // A pending minted by a NEW run-stop episode resets the budget; a
+        // concurrent stale reset loses the CAS.
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("episode two"))
+            .expect("new episode");
+        let fresh = ledger
+            .list_pending_bead_settlements()
+            .expect("fresh discovery")
+            .remove(0);
+        assert!(!ledger
+            .reset_bead_settlement_retry_for_new_episode("run-retry", repended.event_id)
+            .expect("stale reset"));
+        assert!(ledger
+            .reset_bead_settlement_retry_for_new_episode("run-retry", fresh.event_id)
+            .expect("fresh reset"));
+        let reset = ledger
+            .get_bead_settlement_retry("run-retry")
+            .expect("get")
+            .expect("row");
+        assert_eq!(reset.used, 0);
+        assert_eq!(reset.next_wake_at, None);
+        assert_eq!(reset.last_error, None);
+        assert_eq!(reset.event_id, Some(fresh.event_id));
+        assert!(
+            !ledger
+                .reset_bead_settlement_retry_for_new_episode("run-retry", fresh.event_id)
+                .expect("replayed reset"),
+            "a second reset against the same episode loses"
+        );
+    }
+
+    #[test]
+    fn probe_upsert_creates_the_row_and_never_touches_budget_fields() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger = ledger_with_run(&dir, "run-retry");
+        ledger
+            .record_bead_settlement_probe(
+                "run-retry",
+                "2030-01-01T00:01:00.000000000Z",
+                60,
+                "open",
+                None,
+                Some("-42".to_owned()),
+            )
+            .expect("first probe");
+        let row = ledger
+            .get_bead_settlement_retry("run-retry")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.used, 0);
+        assert_eq!(row.budget, BEAD_SETTLEMENT_RETRY_BUDGET);
+        assert_eq!(
+            row.probe_wake_at.as_deref(),
+            Some("2030-01-01T00:01:00.000000000Z")
+        );
+        assert_eq!(row.probe_interval_s, Some(60));
+        assert_eq!(row.last_observed_status.as_deref(), Some("open"));
+        assert_eq!(row.last_observed_assignee, None);
+        assert_eq!(row.last_observed_revision.as_deref(), Some("-42"));
+
+        let now = "2030-01-01T00:00:00.000000000Z";
+        let lease = "2030-01-01T00:01:00.000000000Z";
+        ledger
+            .append_event(Some("run-retry"), PENDING, pending_payload("stuck"))
+            .expect("pending");
+        ledger
+            .claim_bead_settlement_retry("run-retry", "tick-a", now, lease)
+            .expect("claim")
+            .expect("winner");
+        ledger
+            .charge_bead_settlement_retry("run-retry", "tick-a", lease, lease, 1)
+            .expect("charge");
+        ledger
+            .record_bead_settlement_probe(
+                "run-retry",
+                "2030-01-01T00:03:00.000000000Z",
+                120,
+                "in_progress",
+                Some("forged:thief:0".to_owned()),
+                None,
+            )
+            .expect("second probe");
+        let row = ledger
+            .get_bead_settlement_retry("run-retry")
+            .expect("get")
+            .expect("row");
+        assert_eq!(row.used, 1, "the probe upsert never touches the budget");
+        assert_eq!(
+            row.claim_token.as_deref(),
+            Some("tick-a"),
+            "the probe upsert never touches the claim fence"
+        );
+        assert_eq!(row.probe_interval_s, Some(120));
+        assert_eq!(
+            row.last_observed_assignee.as_deref(),
+            Some("forged:thief:0")
+        );
+        assert_eq!(row.last_observed_revision, None);
+        let discovered = ledger
+            .list_pending_bead_settlements()
+            .expect("discovery")
+            .remove(0);
+        assert_eq!(
+            discovered.probe_wake_at.as_deref(),
+            Some("2030-01-01T00:03:00.000000000Z"),
+            "discovery carries the probe schedule for due selection"
+        );
     }
 }

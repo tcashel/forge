@@ -51,7 +51,9 @@
 //! is the response-lost seam after GitHub returns and before delivery settles.
 //! `bead-settlement.read.after` sits between the retry pass's convergence
 //! read and any append or charge; `bead-settlement.charge.after` is after the
-//! durable budget charge and before the bd mutation; and
+//! durable budget charge and before the bd mutation;
+//! `bead-settlement.landed-claim.after` is between the landed retry's
+//! guarded claim of an unassigned bead and its held close; and
 //! `bead-settlement.mutate.after` is the response-lost seam after the bd
 //! write and before `run.bead-settlement.succeeded` lands.
 //!
@@ -59,7 +61,11 @@
 //! is the contract and which no external condition can provoke:
 //! `host.fallback.record` is the ledger write that makes a preferred-Herdr
 //! fallback visible, sitting post-claim and pre-spawn where nothing may
-//! propagate over a `running` attempt row.
+//! propagate over a `running` attempt row. The bead settlement pass fences
+//! every exit after a successful per-run claim — `bead-settlement
+//! .wake-deadline`, `.charge`, `.get-run`, `.mutation`,
+//! `.append-succeeded`, and `.append-pending` — because each must release
+//! the claim token on failure rather than leave the run contended.
 
 /// Hit a failpoint site. A no-op unless the `failpoints` feature is on AND
 /// `FORGED_FAILPOINT` names this exact site.
