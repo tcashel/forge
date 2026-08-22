@@ -930,6 +930,26 @@ CREATE INDEX review_finding_delivery_state
   ON review_finding_deliveries(run_id, snapshot_sha256, state, delivery_lease_until);
 ";
 
+/// Migration 020: the durable mirror of pending whole-run bead settlement.
+///
+/// The budget bounds MUTATING retries only; the read-only convergence probe
+/// runs on every supervisor tick regardless of `used`. The claim columns are
+/// the same cross-process singleton fence `desired_work` carries, so two
+/// concurrent tick executors cannot double-comment or double-charge.
+const MIGRATION_020: &str = "
+CREATE TABLE bead_settlement_retry (
+  run_id            TEXT PRIMARY KEY REFERENCES runs(run_id),
+  budget            INTEGER NOT NULL CHECK (budget > 0),
+  used              INTEGER NOT NULL DEFAULT 0 CHECK (used >= 0 AND used <= budget),
+  next_wake_at      TEXT,
+  last_error        TEXT,
+  claim_token       TEXT,
+  claim_lease_until TEXT,
+  created_at        TEXT NOT NULL,
+  updated_at        TEXT NOT NULL
+);
+";
+
 /// Embedded ordered migrations; `user_version` records the last applied index.
 const MIGRATIONS: &[&str] = &[
     MIGRATION_001,
@@ -951,6 +971,7 @@ const MIGRATIONS: &[&str] = &[
     MIGRATION_017,
     MIGRATION_018,
     MIGRATION_019,
+    MIGRATION_020,
 ];
 
 /// Configure pragmas and apply pending migrations on a fresh connection.
@@ -1073,7 +1094,7 @@ mod tests {
         assert_eq!(pragmas.synchronous, 2);
         assert!(pragmas.foreign_keys);
         assert_eq!(pragmas.busy_timeout_ms, 5000);
-        assert_eq!(pragmas.user_version, 19);
+        assert_eq!(pragmas.user_version, 20);
         ledger.close().expect("close");
 
         // Table names via a separate connection: sqlite_master is data, and
@@ -1102,6 +1123,7 @@ mod tests {
             "herdr_layouts",
             "herdr_pane_projections",
             "review_finding_deliveries",
+            "bead_settlement_retry",
         ] {
             let found: String = conn
                 .query_row(
@@ -1151,8 +1173,8 @@ mod tests {
     }
 
     #[test]
-    fn representative_v10_v12_v15_v16_v17_and_exact_v18_upgrades_preserve_rows_and_reach_v19() {
-        for version in [10usize, 12, 15, 16, 17, 18] {
+    fn representative_v10_v12_v15_v16_v17_v18_and_exact_v19_upgrades_preserve_rows_and_reach_v20() {
+        for version in [10usize, 12, 15, 16, 17, 18, 19] {
             let dir = tempfile::tempdir().expect("tempdir");
             let path = dir.path().join(format!("state-v{version}.db"));
             {
@@ -1177,7 +1199,7 @@ mod tests {
 
             let ledger = Ledger::open(&path)
                 .unwrap_or_else(|error| panic!("upgrade from v{version} failed: {error}"));
-            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
+            assert_eq!(ledger.pragmas().expect("pragmas").user_version, 20);
             assert_eq!(
                 ledger
                     .list_events_by_kind("legacy.progress")
@@ -1212,7 +1234,7 @@ mod tests {
             .close()
             .expect("close");
         let ledger = Ledger::open(&path).expect("second open");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 20);
         ledger.close().expect("close");
     }
 
@@ -1273,7 +1295,7 @@ mod tests {
                 .expect("mark v0");
         }
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 20);
         let old = ledger.get_run("old-run").expect("old run");
         assert_eq!(old.bead_id, "old-bead");
         assert_eq!(old.stop_reason.as_deref(), Some("legacy stop"));
@@ -1316,7 +1338,7 @@ mod tests {
         }
 
         let ledger = Ledger::open(&path).expect("migrate");
-        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 19);
+        assert_eq!(ledger.pragmas().expect("pragmas").user_version, 20);
         let first = ledger.get_attempt(1).expect("attempt 1 survived");
         assert_eq!(first.claim_token, "tok-1");
         assert_eq!(first.state, crate::AttemptState::Reclaimed);

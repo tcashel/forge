@@ -19,6 +19,7 @@
 mod admission;
 mod artifacts;
 mod attempts;
+mod bead_settlement;
 mod desired;
 mod error;
 mod events;
@@ -41,6 +42,7 @@ mod types;
 mod usage;
 mod work_identity;
 
+pub use bead_settlement::BEAD_SETTLEMENT_RETRY_BUDGET;
 pub use error::LedgerError;
 pub use herdr_layouts::HERDR_LAYOUT_CLEANUP_RETRY_BUDGET;
 pub use herdr_projections::{ClaimedHerdrProjectionEffect, HERDR_PROJECTION_RETRY_BUDGET};
@@ -59,7 +61,8 @@ pub use provider_session_inventory::{
 pub use types::{
     AdmissionBatchWrite, AdmissionDurableCandidate, AdmissionLedgerSnapshot,
     AdmissionReservationRow, AdmissionReservationState, AttemptArtifactCompactionRow,
-    AttemptArtifactRow, AttemptRow, AttemptState, ClaimedAttempt, DesiredReconcileOutcome,
+    AttemptArtifactRow, AttemptRow, AttemptState, BeadSettlementRetryRow, ClaimedAttempt,
+    DesiredReconcileOutcome,
     DesiredReconcileUpdate, DesiredRestartReservation, DesiredState, DesiredSubjectKind,
     DesiredWorkRow, EffectClass, EventRow, HerdrLayoutCleanupReason, HerdrLayoutCleanupRelease,
     HerdrLayoutCleanupRetry, HerdrLayoutCleanupState, HerdrLayoutCreation,
@@ -68,8 +71,9 @@ pub use types::{
     NewAttemptArtifact, NewPacket, NewReviewFindingDelivery, NewRun, NewRunDefinition, NewUsage,
     OperationOutcome, OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
-    OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow, Pragmas,
-    ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome,
+    OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow,
+    PendingBeadSettlementRow, Pragmas, ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey,
+    ReviewFindingDeliveryOutcome,
     ReviewFindingDeliveryRow, ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope,
     RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement,
     RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
