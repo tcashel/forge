@@ -916,6 +916,21 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
             "implement result gateState must be \"pass\" or \"fail\", got {prose:?}"
         ))
     );
+    let (retry_code, retry_response) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &claim.claim_token,
+        "--result",
+        result_file.to_str().expect("utf8 result path"),
+    ]);
+    assert_ne!(retry_code, 0, "identical invalid retry must be refused");
+    assert_eq!(retry_response["error"]["code"], json!("INVALID_REQUEST"));
+
     let ledger = env.ledger();
     assert_eq!(
         ledger
@@ -924,6 +939,66 @@ fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
             .state,
         forged_ledger::AttemptState::Running
     );
+    assert!(
+        ledger
+            .find_operation(
+                "packet_complete",
+                "op:packet_complete:complete-gate-state:implement:1",
+            )
+            .expect("query packet_complete operation")
+            .is_none(),
+        "invalid PacketResult must not reserve the HumanAmbiguous fence"
+    );
+    ledger.close().expect("close ledger");
+
+    std::fs::write(
+        &result_file,
+        serde_json::to_vec(&forged_types::PacketResult {
+            schema: "forged.result/1".to_owned(),
+            packet_id: packet_id.clone(),
+            outcome: forged_types::Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: "corrected fixture".to_owned(),
+                gate_state: Some(" Pass \t".to_owned()),
+                note: None,
+            },
+        })
+        .expect("corrected result json"),
+    )
+    .expect("write corrected result fixture");
+    let (corrected_code, corrected_response) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &claim.claim_token,
+        "--result",
+        result_file.to_str().expect("utf8 result path"),
+    ]);
+    assert_eq!(
+        corrected_code, 0,
+        "corrected result must land under the default key: {corrected_response}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger
+        .get_attempt(claim.attempt_id)
+        .expect("completed attempt");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Completed);
+    let landed: forged_types::PacketResult = serde_json::from_str(
+        attempt
+            .result_json
+            .as_deref()
+            .expect("completed result is stored"),
+    )
+    .expect("stored PacketResult");
+    let forged_types::Outcome::Implement { gate_state, .. } = landed.outcome else {
+        panic!("wrong landed outcome");
+    };
+    assert_eq!(gate_state.as_deref(), Some("pass"));
     ledger.close().expect("close ledger");
 }
 

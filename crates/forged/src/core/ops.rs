@@ -13,8 +13,8 @@ use forged_ledger::{
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
-    AttentionState, ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, Outcome,
-    RunId, WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
+    AttentionState, ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
+    WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
 };
 use serde_json::{json, Value};
 
@@ -1401,6 +1401,27 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
     if req.run_id.is_none() {
         req.run_id = Some(run_id.clone());
     }
+    let result_value = match req.params.get("result").cloned() {
+        Some(result) => result,
+        None => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid("missing required param \"result\""),
+            )
+        }
+    };
+    let mut result: forged_types::PacketResult = match serde_json::from_value(result_value) {
+        Ok(result) => result,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!("result is not a PacketResult: {error}")),
+            )
+        }
+    };
+    if let Err(message) = crate::adapters::extract::normalize_implement_gate_state(&mut result) {
+        return err_response(&req.idempotency_key, &Failure::invalid(message));
+    }
     let params = req.params.clone();
     fenced(
         ctx,
@@ -1415,23 +1436,6 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     .and_then(Value::as_i64)
                     .ok_or_else(|| Failure::invalid("missing required param \"attempt\""))?;
                 let claim_token = param_str(&params, "claimToken")?.to_owned();
-                let result_value = params
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| Failure::invalid("missing required param \"result\""))?;
-                let result: forged_types::PacketResult = serde_json::from_value(result_value)
-                    .map_err(|e| Failure::invalid(format!("result is not a PacketResult: {e}")))?;
-                if let Outcome::Implement {
-                    gate_state: Some(gate_state),
-                    ..
-                } = &result.outcome
-                {
-                    if !matches!(gate_state.as_str(), "pass" | "fail") {
-                        return Err(Failure::invalid(format!(
-                            "implement result gateState must be \"pass\" or \"fail\", got {gate_state:?}"
-                        )));
-                    }
-                }
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
                 let outcome = forged_proto::land_packet_result(
                     &ctx.ledger,

@@ -30,6 +30,24 @@ pub fn is_transport_message(message: &str) -> bool {
     TRANSPORT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Normalize the closed implement-gate vocabulary at either ingestion path.
+pub(crate) fn normalize_implement_gate_state(result: &mut PacketResult) -> Result<(), String> {
+    if let forged_types::Outcome::Implement {
+        gate_state: Some(gate_state),
+        ..
+    } = &mut result.outcome
+    {
+        let normalized = gate_state.trim().to_ascii_lowercase();
+        if !matches!(normalized.as_str(), "pass" | "fail") {
+            return Err(format!(
+                "implement result gateState must be \"pass\" or \"fail\", got {gate_state:?}"
+            ));
+        }
+        *gate_state = normalized;
+    }
+    Ok(())
+}
+
 /// Extract the packet result from a provider's final message text.
 ///
 /// Recognizes only a three-backtick opening fence whose info string is
@@ -71,7 +89,7 @@ pub fn extract_forged_result(
         .iter()
         .rev()
         .find_map(|c| serde_json::from_str::<PacketResult>(c).ok());
-    let Some(result) = selected else {
+    let Some(mut result) = selected else {
         return Err("malformed forged-result block".to_owned());
     };
     if result.schema != expected_schema {
@@ -80,17 +98,7 @@ pub fn extract_forged_result(
     if result.packet_id != packet_id {
         return Err("forged-result packetId mismatch".to_owned());
     }
-    if let forged_types::Outcome::Implement {
-        gate_state: Some(gate_state),
-        ..
-    } = &result.outcome
-    {
-        if !matches!(gate_state.as_str(), "pass" | "fail") {
-            return Err(format!(
-                "implement result gateState must be \"pass\" or \"fail\", got {gate_state:?}"
-            ));
-        }
-    }
+    normalize_implement_gate_state(&mut result)?;
     Ok(result)
 }
 
@@ -421,7 +429,7 @@ mod tests {
     }
 
     #[test]
-    fn implement_gate_state_is_closed_at_both_harvesters() {
+    fn implement_gate_state_is_normalized_and_closed_at_both_harvesters() {
         let stream = "{\"type\":\"turn.completed\",\"usage\":{}}";
         let prose = block(&implement_json_with_gate_state(
             PKT,
@@ -446,7 +454,12 @@ mod tests {
             Harvest::Semantic(actual) if actual == note
         ));
 
-        for gate_state in [json!("pass"), Value::Null] {
+        for (gate_state, expected) in [
+            (json!("pass"), Some("pass")),
+            (json!(" Pass "), Some("pass")),
+            (json!("FAIL\t"), Some("fail")),
+            (Value::Null, None),
+        ] {
             let result = block(&implement_json_with_gate_state(PKT, SCHEMA, 1, gate_state));
             let claude = json!({
                 "type": "result",
@@ -454,14 +467,18 @@ mod tests {
                 "result": result,
             })
             .to_string();
-            assert!(matches!(
+            for harvested in [
                 harvest_claude(&claude, SCHEMA, PKT),
-                Harvest::Result(_)
-            ));
-            assert!(matches!(
                 harvest_codex(stream, Some(&result), SCHEMA, PKT),
-                Harvest::Result(_)
-            ));
+            ] {
+                let Harvest::Result(result) = harvested else {
+                    panic!("normalized gateState was not harvested: {harvested:?}");
+                };
+                let forged_types::Outcome::Implement { gate_state, .. } = &result.outcome else {
+                    panic!("wrong outcome: {:?}", result.outcome);
+                };
+                assert_eq!(gate_state.as_deref(), expected);
+            }
         }
     }
 }
