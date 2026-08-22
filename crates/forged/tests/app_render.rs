@@ -1979,6 +1979,16 @@ fn work_detail_renders_the_attention_delivery_gates_and_addressed_findings() {
         !text.contains("/home/op/forge"),
         "the repository renders from its label: {text}"
     );
+    assert!(
+        text.contains("1 of 2 passed · 1 unknown"),
+        "the gate header excludes unknown rows from its denominator: {text}"
+    );
+    assert!(
+        text.contains(
+            "unknown · all five gates pass: build, test, clippy, fmt, docs · run-1/implementation/legacy"
+        ),
+        "a legacy row is labeled unknown WITH its stored prose kept visible: {text}"
+    );
 }
 
 /// Truncation is stated, never silent.

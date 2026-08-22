@@ -1050,16 +1050,23 @@ fn gate_rows(results: &BTreeMap<i64, PacketResult>) -> Vec<Value> {
                 summary,
                 gate_state: Some(gate_state),
                 note,
-            } => Some(json!({
-                "attemptId": attempt_id,
-                "packetId": result.packet_id,
-                "implemented": implemented,
-                "commitsAhead": commits_ahead,
-                "summary": summary,
-                "gateState": gate_state,
-                "passed": gate_state == "pass",
-                "note": note,
-            })),
+            } => {
+                let passed = match gate_state.as_str() {
+                    "pass" => Some(true),
+                    "fail" => Some(false),
+                    _ => None,
+                };
+                Some(json!({
+                    "attemptId": attempt_id,
+                    "packetId": result.packet_id,
+                    "implemented": implemented,
+                    "commitsAhead": commits_ahead,
+                    "summary": summary,
+                    "gateState": gate_state,
+                    "passed": passed,
+                    "note": note,
+                }))
+            }
             _ => None,
         })
         .collect()
@@ -1881,7 +1888,12 @@ fn observation_attention(
                         && desired.subject_kind == forged_ledger::DesiredSubjectKind::Epic
                         && desired.subject_id == snapshot.subject.id))
         });
-        if state == "pass" || live || scheduled {
+        match state {
+            "pass" => continue,
+            "fail" => {}
+            _ => continue,
+        }
+        if live || scheduled {
             continue;
         }
         let (kind, subject, repository) = attention_subject(snapshot, &run_id);

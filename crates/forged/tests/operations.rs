@@ -778,6 +778,230 @@ fn work_detail_bounds_history_uses_only_manifest_metadata_and_fails_closed_on_re
     );
 }
 
+#[test]
+fn work_detail_projects_legacy_gate_prose_as_unknown_without_failed_gate_attention() {
+    let env = TestEnv::new("forged-work-detail-legacy-gate");
+    env.forged(&["init"]);
+    fabricate_run(&env, "detail-legacy-gate");
+    let packet_id = seed_packet(
+        &env,
+        "detail-legacy-gate",
+        1,
+        forged_types::Stage::Implement,
+    );
+    let prose = "all five gates pass: build, test, clippy, fmt, docs";
+    let gate_states = ["pass", "fail", prose];
+    let mut connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open fixture db");
+    let transaction = connection.transaction().expect("fixture transaction");
+    for (offset, gate_state) in gate_states.into_iter().enumerate() {
+        let attempt_id = i64::try_from(offset + 1).expect("small fixture id");
+        let result = serde_json::to_string(&forged_types::PacketResult {
+            schema: "forged.result/1".to_owned(),
+            packet_id: packet_id.clone(),
+            outcome: forged_types::Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: format!("fixture {gate_state}"),
+                gate_state: Some(gate_state.to_owned()),
+                note: None,
+            },
+        })
+        .expect("result json");
+        transaction
+            .execute(
+                "INSERT INTO attempts (
+                   attempt_id, packet_id, claim_token, claimant, state, result_json,
+                   started_at, updated_at, ended_at
+                 ) VALUES (?1, ?2, ?3, 'fixture', 'completed', ?4,
+                   '2026-08-14T12:00:00Z', '2026-08-14T12:00:01Z',
+                   '2026-08-14T12:00:01Z')",
+                rusqlite::params![attempt_id, packet_id, format!("claim-{attempt_id}"), result,],
+            )
+            .expect("insert stored result_json fixture");
+    }
+    transaction.commit().expect("commit fixture");
+    drop(connection);
+    env.set_bd_list_unreachable(true);
+
+    let (code, response) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "run",
+        "--subject-id",
+        "detail-legacy-gate",
+    ]);
+    assert_eq!(code, 0, "work detail: {response}");
+    let gates = response["result"]["gates"]["items"]
+        .as_array()
+        .expect("gate rows");
+    assert_eq!(gates.len(), 3, "{response}");
+    assert_eq!(gates[0]["passed"], json!(true));
+    assert_eq!(gates[1]["passed"], json!(false));
+    assert_eq!(gates[2]["gateState"], json!(prose));
+    assert_eq!(gates[2]["passed"], Value::Null);
+    assert!(
+        response["result"]["attention"]
+            .as_array()
+            .expect("attention rows")
+            .iter()
+            .all(|item| item["condition"] != "failed-gate"),
+        "a latest legacy gate value is unknown, not failed: {response}"
+    );
+}
+
+#[test]
+fn packet_complete_rejects_a_non_closed_gate_state_by_field_and_value() {
+    let env = TestEnv::new("forged-packet-complete-gate-state");
+    env.forged(&["init"]);
+    fabricate_run(&env, "complete-gate-state");
+    let packet_id = seed_packet(
+        &env,
+        "complete-gate-state",
+        1,
+        forged_types::Stage::Implement,
+    );
+    let claim = {
+        let ledger = env.ledger();
+        let claim = ledger
+            .claim_packet(
+                &packet_id,
+                "fixture-seat",
+                &forged_ledger::SpecFence::Revision {
+                    revision: "fixture-revision".to_owned(),
+                    body_sha256: "a".repeat(64),
+                },
+            )
+            .expect("claim packet");
+        ledger.close().expect("close ledger");
+        claim
+    };
+    let prose = "all five gates pass: build, test, clippy, fmt, docs";
+    let result_file = env.root.join("invalid-gate-result.json");
+    std::fs::write(
+        &result_file,
+        serde_json::to_vec(&forged_types::PacketResult {
+            schema: "forged.result/1".to_owned(),
+            packet_id: packet_id.clone(),
+            outcome: forged_types::Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: "fixture".to_owned(),
+                gate_state: Some(prose.to_owned()),
+                note: None,
+            },
+        })
+        .expect("result json"),
+    )
+    .expect("write result fixture");
+    let attempt_id = claim.attempt_id.to_string();
+    let (code, response) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &claim.claim_token,
+        "--result",
+        result_file.to_str().expect("utf8 result path"),
+    ]);
+    assert_ne!(code, 0, "non-closed gateState must be refused");
+    assert_eq!(response["error"]["code"], json!("INVALID_REQUEST"));
+    assert_eq!(
+        response["error"]["message"],
+        json!(format!(
+            "implement result gateState must be exactly \"pass\" or \"fail\", got {prose:?}"
+        ))
+    );
+    let (retry_code, retry_response) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &claim.claim_token,
+        "--result",
+        result_file.to_str().expect("utf8 result path"),
+    ]);
+    assert_ne!(retry_code, 0, "identical invalid retry must be refused");
+    assert_eq!(retry_response["error"]["code"], json!("INVALID_REQUEST"));
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .get_attempt(claim.attempt_id)
+            .expect("attempt remains")
+            .state,
+        forged_ledger::AttemptState::Running
+    );
+    assert!(
+        ledger
+            .find_operation(
+                "packet_complete",
+                "op:packet_complete:complete-gate-state:implement:1",
+            )
+            .expect("query packet_complete operation")
+            .is_none(),
+        "invalid PacketResult must not reserve the HumanAmbiguous fence"
+    );
+    ledger.close().expect("close ledger");
+
+    std::fs::write(
+        &result_file,
+        serde_json::to_vec(&forged_types::PacketResult {
+            schema: "forged.result/1".to_owned(),
+            packet_id: packet_id.clone(),
+            outcome: forged_types::Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: "corrected fixture".to_owned(),
+                gate_state: Some("pass".to_owned()),
+                note: None,
+            },
+        })
+        .expect("corrected result json"),
+    )
+    .expect("write corrected result fixture");
+    let (corrected_code, corrected_response) = env.forged(&[
+        "packet",
+        "complete",
+        "--packet",
+        &packet_id,
+        "--attempt",
+        &attempt_id,
+        "--claim-token",
+        &claim.claim_token,
+        "--result",
+        result_file.to_str().expect("utf8 result path"),
+    ]);
+    assert_eq!(
+        corrected_code, 0,
+        "corrected result must land under the default key: {corrected_response}"
+    );
+    let ledger = env.ledger();
+    let attempt = ledger
+        .get_attempt(claim.attempt_id)
+        .expect("completed attempt");
+    assert_eq!(attempt.state, forged_ledger::AttemptState::Completed);
+    let landed: forged_types::PacketResult = serde_json::from_str(
+        attempt
+            .result_json
+            .as_deref()
+            .expect("completed result is stored"),
+    )
+    .expect("stored PacketResult");
+    let forged_types::Outcome::Implement { gate_state, .. } = landed.outcome else {
+        panic!("wrong landed outcome");
+    };
+    assert_eq!(gate_state.as_deref(), Some("pass"));
+    ledger.close().expect("close ledger");
+}
+
 /// Two runs legitimately share one Bead — a resubmission, a superseded
 /// attempt, an epic child re-driven. The exact-hydrate contract requires one
 /// row per requested id, so an undeduplicated projection failed the WHOLE

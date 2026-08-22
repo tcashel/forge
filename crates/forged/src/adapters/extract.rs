@@ -30,6 +30,27 @@ pub fn is_transport_message(message: &str) -> bool {
     TRANSPORT_MARKERS.iter().any(|m| lower.contains(m))
 }
 
+/// Normalize the closed implement-gate vocabulary at either ingestion path.
+/// Fence the closed gateState vocabulary on a FRESH implement result: the
+/// wire contract is EXACTLY "pass" or "fail" (or null for unknown), and the
+/// seat template promises that vocabulary verbatim — so case or whitespace
+/// variants refuse instead of being silently rewritten, and the stored
+/// request payload and the recorded result stay byte-identical.
+pub(crate) fn validate_implement_gate_state(result: &PacketResult) -> Result<(), String> {
+    if let forged_types::Outcome::Implement {
+        gate_state: Some(gate_state),
+        ..
+    } = &result.outcome
+    {
+        if !matches!(gate_state.as_str(), "pass" | "fail") {
+            return Err(format!(
+                "implement result gateState must be exactly \"pass\" or \"fail\", got {gate_state:?}"
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Extract the packet result from a provider's final message text.
 ///
 /// Recognizes only a three-backtick opening fence whose info string is
@@ -80,6 +101,7 @@ pub fn extract_forged_result(
     if result.packet_id != packet_id {
         return Err("forged-result packetId mismatch".to_owned());
     }
+    validate_implement_gate_state(&result)?;
     Ok(result)
 }
 
@@ -186,6 +208,7 @@ fn finish(text: &str, expected_schema: &str, packet_id: &str) -> Harvest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use serde_json::json;
 
     const SCHEMA: &str = "forged.result.implement/1";
     const PKT: &str = "run-1/implement/1";
@@ -195,11 +218,27 @@ mod tests {
     }
 
     fn implement_json(packet: &str, schema: &str, commits: u32) -> String {
-        format!(
-            "{{\"schema\": \"{schema}\", \"packetId\": \"{packet}\", \"outcome\": \
-             {{\"implement\": {{\"implemented\": true, \"commitsAhead\": {commits}, \
-             \"summary\": \"s\", \"gateState\": \"pass\", \"note\": null}}}}}}"
-        )
+        implement_json_with_gate_state(packet, schema, commits, json!("pass"))
+    }
+
+    fn implement_json_with_gate_state(
+        packet: &str,
+        schema: &str,
+        commits: u32,
+        gate_state: Value,
+    ) -> String {
+        json!({
+            "schema": schema,
+            "packetId": packet,
+            "outcome": {"implement": {
+                "implemented": true,
+                "commitsAhead": commits,
+                "summary": "s",
+                "gateState": gate_state,
+                "note": null,
+            }},
+        })
+        .to_string()
     }
 
     #[test]
@@ -390,5 +429,78 @@ mod tests {
             harvest_codex(stream, None, SCHEMA, PKT),
             Harvest::Semantic(note) if note == "no forged-result block"
         ));
+    }
+
+    #[test]
+    fn implement_gate_state_is_exact_and_closed_at_both_harvesters() {
+        let stream = "{\"type\":\"turn.completed\",\"usage\":{}}";
+        let prose = block(&implement_json_with_gate_state(
+            PKT,
+            SCHEMA,
+            1,
+            json!("all five gates pass: build, test, clippy, fmt, docs"),
+        ));
+        let claude_prose = json!({
+            "type": "result",
+            "is_error": false,
+            "result": prose,
+        })
+        .to_string();
+        let note = "implement result gateState must be exactly \"pass\" or \"fail\", got \
+                    \"all five gates pass: build, test, clippy, fmt, docs\"";
+        assert!(matches!(
+            harvest_claude(&claude_prose, SCHEMA, PKT),
+            Harvest::Semantic(actual) if actual == note
+        ));
+        assert!(matches!(
+            harvest_codex(stream, Some(&prose), SCHEMA, PKT),
+            Harvest::Semantic(actual) if actual == note
+        ));
+
+        for variant in [json!(" Pass "), json!("FAIL\t"), json!("Pass")] {
+            let result = block(&implement_json_with_gate_state(PKT, SCHEMA, 1, variant));
+            let claude = json!({
+                "type": "result",
+                "is_error": false,
+                "result": result,
+            })
+            .to_string();
+            for harvested in [
+                harvest_claude(&claude, SCHEMA, PKT),
+                harvest_codex(stream, Some(&result), SCHEMA, PKT),
+            ] {
+                assert!(
+                    matches!(harvested, Harvest::Semantic(ref note)
+                        if note.contains("must be exactly")),
+                    "a case or whitespace variant refuses, never rewrites: {harvested:?}"
+                );
+            }
+        }
+
+        for (gate_state, expected) in [
+            (json!("pass"), Some("pass")),
+            (json!("fail"), Some("fail")),
+            (Value::Null, None),
+        ] {
+            let result = block(&implement_json_with_gate_state(PKT, SCHEMA, 1, gate_state));
+            let claude = json!({
+                "type": "result",
+                "is_error": false,
+                "result": result,
+            })
+            .to_string();
+            for harvested in [
+                harvest_claude(&claude, SCHEMA, PKT),
+                harvest_codex(stream, Some(&result), SCHEMA, PKT),
+            ] {
+                let Harvest::Result(result) = harvested else {
+                    panic!("normalized gateState was not harvested: {harvested:?}");
+                };
+                let forged_types::Outcome::Implement { gate_state, .. } = &result.outcome else {
+                    panic!("wrong outcome: {:?}", result.outcome);
+                };
+                assert_eq!(gate_state.as_deref(), expected);
+            }
+        }
     }
 }

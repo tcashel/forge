@@ -1401,6 +1401,47 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
     if req.run_id.is_none() {
         req.run_id = Some(run_id.clone());
     }
+    let result_value = match req.params.get("result").cloned() {
+        Some(result) => result,
+        None => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid("missing required param \"result\""),
+            )
+        }
+    };
+    let result: forged_types::PacketResult = match serde_json::from_value(result_value) {
+        Ok(result) => result,
+        Err(error) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::invalid(format!("result is not a PacketResult: {error}")),
+            )
+        }
+    };
+    // Replay and in-progress recovery come BEFORE the closed-set gate: a
+    // request stored before this vocabulary existed (legacy prose
+    // gateState) must keep replaying its stored response verbatim on a
+    // byte-identical retry, and an in-flight row keeps answering through
+    // the fence. Only a FRESH request faces validation; a fresh writer
+    // racing itself stores the identical already-valid payload, so the
+    // probe-then-validate window cannot strand anything.
+    let existing = {
+        let key = req.idempotency_key.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation("packet_complete", &key)
+        })
+        .await
+    };
+    let existing = match existing {
+        Ok(row) => row,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    if existing.is_none() {
+        if let Err(message) = crate::adapters::extract::validate_implement_gate_state(&result) {
+            return err_response(&req.idempotency_key, &Failure::invalid(message));
+        }
+    }
     let params = req.params.clone();
     fenced(
         ctx,
@@ -1415,12 +1456,6 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     .and_then(Value::as_i64)
                     .ok_or_else(|| Failure::invalid("missing required param \"attempt\""))?;
                 let claim_token = param_str(&params, "claimToken")?.to_owned();
-                let result_value = params
-                    .get("result")
-                    .cloned()
-                    .ok_or_else(|| Failure::invalid("missing required param \"result\""))?;
-                let result: forged_types::PacketResult = serde_json::from_value(result_value)
-                    .map_err(|e| Failure::invalid(format!("result is not a PacketResult: {e}")))?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
                 let outcome = forged_proto::land_packet_result(
                     &ctx.ledger,

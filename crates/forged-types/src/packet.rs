@@ -227,6 +227,10 @@ pub enum Outcome {
         implemented: bool,
         commits_ahead: u32,
         summary: String,
+        /// Closed vocabulary: exactly `"pass"` or `"fail"`; `None` means
+        /// the gate outcome is UNKNOWN (a legacy result that predates the
+        /// vocabulary), never a failure. Ingestion fences fresh results to
+        /// this set; consumers must not string-match prose.
         gate_state: Option<String>,
         note: Option<String>,
     },

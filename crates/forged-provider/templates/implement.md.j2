@@ -30,8 +30,9 @@ Operator interventions recorded before this provider boundary:
    committed — check `git -C {{ worktree }} rev-list --count {{ base_ref }}..HEAD`
    and put that number in commitsAhead. If you could not finish, say so with
    implemented=false and the reason in note: a half-built worktree reported as
-   done costs the reviewer far more than an honest failure does. Put the gate's
-   final state in gateState, and 2-4 sentences on what you changed in summary.
+   done costs the reviewer far more than an honest failure does. gateState is
+   exactly "pass" or "fail" (or null when unknown); put articulate gate detail
+   in summary/note, and put 2-4 sentences on what you changed in summary.
    If repository evidence proves the spec contradictory or unsafe, do not
    guess. Return this result instead of an implement outcome:
      {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
@@ -43,7 +44,7 @@ Operator interventions recorded before this provider boundary:
    and no prose —
      {"schema": "{{ result_schema }}", "packetId": "{{ packet_id }}",
       "outcome": {"implement": {"implemented": true, "commitsAhead": 0,
-      "summary": "...", "gateState": "...", "note": null}}}
+      "summary": "...", "gateState": "pass", "note": null}}}
    filled in with your real values from step 5 (or the amendment result shown
    there): note carries the reason when implemented is false, and is null when
    you finished.

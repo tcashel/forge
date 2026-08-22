@@ -115,6 +115,29 @@ fn render_succeeds_for_all_three_stages() {
 }
 
 #[test]
+fn implement_render_names_the_closed_gate_state_contract() {
+    let rendered = PromptTemplates::load()
+        .expect("loads")
+        .render(PromptStage::Implement, &implement_context())
+        .expect("implement renders");
+    // Whitespace-normalized so a template reflow cannot fail an intact
+    // contract: the assertion pins the words, not the wrap points.
+    let flattened = rendered.split_whitespace().collect::<Vec<_>>().join(" ");
+    assert!(
+        flattened.contains("gateState is exactly \"pass\" or \"fail\" (or null when unknown)"),
+        "the prompt names the closed machine vocabulary: {rendered}"
+    );
+    assert!(
+        flattened.contains("put articulate gate detail in summary/note"),
+        "the prompt directs prose to free-text fields: {rendered}"
+    );
+    assert!(
+        rendered.contains("\"gateState\": \"pass\""),
+        "the result example uses a valid closed value: {rendered}"
+    );
+}
+
+#[test]
 fn a_context_missing_one_variable_errors() {
     let templates = PromptTemplates::load().expect("loads");
     let Value::Object(mut context) = implement_context() else {

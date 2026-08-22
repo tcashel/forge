@@ -9,7 +9,7 @@ use std::collections::HashMap;
 
 use forged_ledger::{Ledger, NewPacket, NewRun, SpecFence};
 use forged_proto::{land_packet_result, reconcile, widen_rfc3339, LandOutcome, ReconcileConfig};
-use forged_types::{RunId, Stage};
+use forged_types::{Outcome, RunId, Stage};
 use support::*;
 
 const RUN: &str = "run-1";
@@ -305,6 +305,99 @@ async fn matching_ground_truth_records_no_mismatch() {
         report.harvest_mismatches.is_empty(),
         "{:?}",
         report.harvest_mismatches
+    );
+    ledger.close().expect("close");
+}
+
+#[tokio::test]
+async fn legacy_gate_prose_is_unknown_and_does_not_rerun_or_mismatch_gates() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    ledger
+        .create_run(NewRun {
+            run_id: RunId::new(RUN).expect("run id"),
+            bead_id: "bead-1".to_owned(),
+            repo: "octo/demo".to_owned(),
+            base_ref: "main".to_owned(),
+            branch: "feat/x".to_owned(),
+        })
+        .expect("create run");
+    let pid = ledger
+        .open_packet(NewPacket {
+            run_id: RUN.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: "spec.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: "{}".to_owned(),
+        })
+        .expect("open packet");
+    let claim = ledger
+        .claim_packet(
+            &pid,
+            "claude:sess-a:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+
+    let revoke_ports = FakePorts::new();
+    reconcile(&ledger, RUN, &revoke_ports, &config(), &now_stamp())
+        .await
+        .expect("revoke stale attempt");
+    let legacy_result = result_for(
+        &pid,
+        Outcome::Implement {
+            implemented: true,
+            commits_ahead: 5,
+            summary: "legacy stored claim".to_owned(),
+            gate_state: Some("all five gates pass: build, test, clippy, fmt, docs".to_owned()),
+            note: None,
+        },
+    );
+    assert_eq!(
+        land_packet_result(
+            &ledger,
+            &revoke_ports,
+            RUN,
+            &pid,
+            claim.attempt_id,
+            &claim.claim_token,
+            &legacy_result,
+        )
+        .await
+        .expect("quarantine legacy result"),
+        LandOutcome::Quarantined
+    );
+
+    let verify_ports = FakePorts::new();
+    verify_ports
+        .commits_script
+        .lock()
+        .expect("lock")
+        .push_back(5);
+    let report = reconcile(&ledger, RUN, &verify_ports, &config(), &now_stamp())
+        .await
+        .expect("verify legacy claim");
+    assert!(
+        report.harvest_mismatches.is_empty(),
+        "legacy unknown gate claims cannot mismatch: {:?}",
+        report.harvest_mismatches
+    );
+    let calls = verify_ports.recorded();
+    assert_eq!(
+        calls
+            .iter()
+            .filter(|call| matches!(call, PortCall::CommitsAhead(_)))
+            .count(),
+        1,
+        "commit claims are still verified: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .all(|call| !matches!(call, PortCall::RerunGates { .. })),
+        "no closed gate claim means no gate re-run: {calls:?}"
     );
     ledger.close().expect("close");
 }

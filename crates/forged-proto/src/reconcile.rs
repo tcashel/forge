@@ -739,7 +739,9 @@ async fn observe(
 
 /// Harvest-and-verify: a quarantined `Outcome::Implement` claim from a
 /// revoked attempt is a claim to check, never a result to trust — the
-/// recomputed `commits_ahead` and the re-run gates decide.
+/// recomputed `commits_ahead` decides every claim, and re-run gates decide
+/// claims carrying the closed `pass` or `fail` vocabulary. Legacy prose is
+/// unknown and carries no gate claim to verify.
 ///
 /// Ground truth is established **once per pass**, not once per claim. Both
 /// ports are run-scoped — `commits_ahead(run_id)` and `rerun_gates(run_id,
@@ -747,8 +749,9 @@ async fn observe(
 /// and the quarantine events are a growing history that every later pass
 /// replays: re-running the gates once per historical event would make
 /// reconcile cost more the longer a run has been alive. A pass with no
-/// implement claim to check touches neither port, and identical mismatch
-/// lines are reported once.
+/// implement claim to check touches neither port; a pass with implement
+/// claims but no closed gate value touches only the commit port. Identical
+/// mismatch lines are reported once.
 async fn harvest_and_verify(
     ports: &dyn ReconcilePorts,
     run_id: &str,
@@ -790,11 +793,18 @@ async fn harvest_and_verify(
         .commits_ahead(run_id)
         .await
         .map_err(|source| port_failure(**first_attempt, "commits_ahead", source))?;
-    let rows = ports
-        .rerun_gates(run_id, &config.gate_commands)
-        .await
-        .map_err(|source| port_failure(**first_attempt, "rerun_gates", source))?;
-    let gates_pass = rows.iter().all(|r| r.exit_code == Some(0) && !r.timed_out);
+    let closed_gate_attempt = claims.iter().find_map(|(attempt_id, _, _, gate_state)| {
+        matches!(gate_state, Some("pass" | "fail")).then_some(**attempt_id)
+    });
+    let gates_pass = if let Some(attempt_id) = closed_gate_attempt {
+        let rows = ports
+            .rerun_gates(run_id, &config.gate_commands)
+            .await
+            .map_err(|source| port_failure(attempt_id, "rerun_gates", source))?;
+        Some(rows.iter().all(|r| r.exit_code == Some(0) && !r.timed_out))
+    } else {
+        None
+    };
 
     for (attempt_id, packet_id, commits_ahead, gate_state) in claims {
         if truth_commits != commits_ahead {
@@ -806,8 +816,15 @@ async fn harvest_and_verify(
                 ),
             );
         }
-        let claimed_pass = gate_state == Some("pass");
-        if claimed_pass != gates_pass {
+        let claimed_pass = match gate_state {
+            Some("pass") => Some(true),
+            Some("fail") => Some(false),
+            _ => None,
+        };
+        if let (Some(claimed_pass), Some(gates_pass)) = (claimed_pass, gates_pass) {
+            if claimed_pass == gates_pass {
+                continue;
+            }
             push_mismatch(
                 report,
                 format!(
