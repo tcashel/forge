@@ -142,6 +142,7 @@
     "reconcile",
     "review_publish",
     "run_accept_risk",
+    "run_adjudicate_settlement",
     "run_advance",
     "run_revise_roster",
     "run_start",

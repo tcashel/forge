@@ -3,14 +3,17 @@
 
 use std::path::Path;
 
-use forged_ledger::{EffectClass, RevokeScope, RunOutcome, RunSettlement};
-use forged_types::{OperationRequest, OperationResponse};
+use forged_ledger::{
+    EffectClass, OperationState, RevokeScope, RunOutcome, RunRow, RunSettlement, RunState,
+};
+use forged_types::{ErrorCode, OperationRequest, OperationResponse};
 use serde_json::{json, Value};
 
 use crate::adapters::ports::ForgedPorts;
+use crate::config::now_iso;
 use crate::core::{
-    default_key, derive_key, err_response, fenced, lease_identity, on_ledger, param_opt_str,
-    param_str, run_holder, Ctx, Failure,
+    default_key, derive_key, err_response, fenced, lease_identity, ok_response, on_ledger,
+    param_opt_str, param_str, run_holder, Ctx, Failure,
 };
 
 /// One validated whole-run settlement request.
@@ -200,6 +203,136 @@ pub(super) async fn settle_bead(
     }
 }
 
+/// Post-terminal aftermath shared by fenced settlement and pid-less
+/// adjudication: stop every live attempt, reconcile the Bead, retire a
+/// landed worktree. Every step is replay-idempotent, so an interrupted
+/// settlement resumes here without duplicating any effect.
+///
+/// `closed_bead_converges` is the adjudication path's contract: a legacy
+/// run's Bead was usually closed by hand long ago, and an adjudicated
+/// terminal outcome must read that closed Bead as already converged — for
+/// every outcome — rather than error into permanent settlement-pending
+/// noise. The live `run stop` path keeps the strict guarded mutations.
+async fn settle_aftermath(
+    ctx: &Ctx,
+    run_id: &str,
+    settlement: &Settlement,
+    run: &RunRow,
+    closed_bead_converges: bool,
+) -> Result<(Vec<i64>, Value, bool, Option<String>), Failure> {
+    // Every token is invalidated durably before confirmed death. This loop
+    // also catches an attempt that raced the terminal state write.
+    let stopped_attempts =
+        stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
+    let converged = if closed_bead_converges {
+        match forged_beads::show_issue(&ctx.config.bd_config(), &run.bead_id).await {
+            Ok(issue) if issue.status == "closed" => Some(json!({
+                "id": run.bead_id,
+                "settled": true,
+                "status": issue.status,
+                "assignee": issue.assignee,
+                "closed": true,
+                "alreadyClosed": true,
+                "released": issue.assignee.is_none(),
+            })),
+            // An open Bead — or one this read cannot reach — belongs to the
+            // live settlement path below, whose pending fallback stays
+            // retryable against the same evidence.
+            _ => None,
+        }
+    } else {
+        None
+    };
+    let bead = if let Some(converged) = converged {
+        converged
+    } else {
+        // Resolve the custody identity once, before the mutation chain: the
+        // pending payload must record the holder actually in force AT PEND TIME
+        // (`observedHolder`), because the retry pass discriminates custody
+        // epochs by that recorded data, never by the live holder string. When
+        // the resolution itself fails — the same bd outage that pends — the
+        // payload marks `observedHolderUnresolved` instead: a failed resolution
+        // is not a legacy non-record, and the retry pass re-resolves it on a
+        // later successful read rather than parking conservative-foreign
+        // forever.
+        let (settled, observed_holder) =
+            match lease_identity(&ctx.config.bd_config(), &run.bead_id, run_id).await {
+                Ok(actor) => (
+                    settle_bead(ctx, run_id, &run.bead_id, settlement, &actor).await,
+                    Some(actor),
+                ),
+                Err(error) => (Err(error), None),
+            };
+        match settled {
+            Ok(value) => value,
+            Err(error) => {
+                let mut pending = json!({
+                    "schemaVersion": 1,
+                    "beadId": run.bead_id,
+                    "outcome": settlement.outcome.as_str(),
+                    "expectedAssignee": run_holder(&run.bead_id),
+                    "settled": false,
+                    "pending": true,
+                    "error": error.to_string(),
+                });
+                match observed_holder {
+                    Some(holder) => pending["observedHolder"] = json!(holder),
+                    None => pending["observedHolderUnresolved"] = json!(true),
+                }
+                let event_run = run_id.to_owned();
+                let event = pending.clone();
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_event_once(&event_run, "run.bead-settlement.pending", event)?;
+                    Ok(())
+                })
+                .await?;
+                pending
+            }
+        }
+    };
+    if bead.get("settled").and_then(Value::as_bool) == Some(true) {
+        let event_run = run_id.to_owned();
+        let event = succeeded_payload(&run.bead_id, settlement.outcome);
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.append_event_once(
+                &event_run,
+                super::attention::BEAD_SETTLEMENT_SUCCEEDED,
+                event,
+            )?;
+            Ok(())
+        })
+        .await?;
+    }
+
+    // Squash merge ancestry is deliberately irrelevant: a clean linked
+    // worktree may retire once exact delivery evidence is stored. Dirt still
+    // refuses — a merge SHA proves the pushed delivery, not that unrelated
+    // local edits are disposable.
+    let (retired, cleanup_error) = if settlement.outcome == RunOutcome::Landed {
+        match forged_git::retire_worktree(
+            Path::new(&run.repo),
+            &ctx.config.runs_root,
+            run_id,
+            &forged_git::RetireOptions {
+                force: false,
+                run_state_terminal: true,
+            },
+        )
+        .await
+        {
+            Ok(()) => (true, None),
+            Err(
+                error @ (forged_git::GitError::WorktreeDirty { .. }
+                | forged_git::GitError::WorktreeUnresolved { .. }),
+            ) => (false, Some(error.to_string())),
+            Err(error) => return Err(error.into()),
+        }
+    } else {
+        (false, None)
+    };
+    Ok((stopped_attempts, bead, retired, cleanup_error))
+}
+
 /// Execute a validated settlement. Kept reusable for the review acceptance
 /// operation, which owns the evidence contract for `accepted-risk`.
 pub(crate) async fn settle(
@@ -269,93 +402,8 @@ pub(crate) async fn settle(
         });
     }
 
-    // Every token is invalidated durably before confirmed death. This loop
-    // also catches an attempt that raced the terminal state write.
-    let stopped_attempts =
-        stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
-    // Resolve the custody identity once, before the mutation chain: the
-    // pending payload must record the holder actually in force AT PEND TIME
-    // (`observedHolder`), because the retry pass discriminates custody
-    // epochs by that recorded data, never by the live holder string. When
-    // the resolution itself fails — the same bd outage that pends — the
-    // payload marks `observedHolderUnresolved` instead: a failed resolution
-    // is not a legacy non-record, and the retry pass re-resolves it on a
-    // later successful read rather than parking conservative-foreign
-    // forever.
-    let (settled, observed_holder) =
-        match lease_identity(&ctx.config.bd_config(), &run.bead_id, run_id).await {
-            Ok(actor) => (
-                settle_bead(ctx, run_id, &run.bead_id, &settlement, &actor).await,
-                Some(actor),
-            ),
-            Err(error) => (Err(error), None),
-        };
-    let bead = match settled {
-        Ok(value) => value,
-        Err(error) => {
-            let mut pending = json!({
-                "schemaVersion": 1,
-                "beadId": run.bead_id,
-                "outcome": settlement.outcome.as_str(),
-                "expectedAssignee": run_holder(&run.bead_id),
-                "settled": false,
-                "pending": true,
-                "error": error.to_string(),
-            });
-            match observed_holder {
-                Some(holder) => pending["observedHolder"] = json!(holder),
-                None => pending["observedHolderUnresolved"] = json!(true),
-            }
-            let event_run = run_id.to_owned();
-            let event = pending.clone();
-            on_ledger(&ctx.ledger, move |ledger| {
-                ledger.append_event_once(&event_run, "run.bead-settlement.pending", event)?;
-                Ok(())
-            })
-            .await?;
-            pending
-        }
-    };
-    if bead.get("settled").and_then(Value::as_bool) == Some(true) {
-        let event_run = run_id.to_owned();
-        let event = succeeded_payload(&run.bead_id, settlement.outcome);
-        on_ledger(&ctx.ledger, move |ledger| {
-            ledger.append_event_once(
-                &event_run,
-                super::attention::BEAD_SETTLEMENT_SUCCEEDED,
-                event,
-            )?;
-            Ok(())
-        })
-        .await?;
-    }
-
-    // Squash merge ancestry is deliberately irrelevant: a clean linked
-    // worktree may retire once exact delivery evidence is stored. Dirt still
-    // refuses — a merge SHA proves the pushed delivery, not that unrelated
-    // local edits are disposable.
-    let (retired, cleanup_error) = if settlement.outcome == RunOutcome::Landed {
-        match forged_git::retire_worktree(
-            Path::new(&run.repo),
-            &ctx.config.runs_root,
-            run_id,
-            &forged_git::RetireOptions {
-                force: false,
-                run_state_terminal: true,
-            },
-        )
-        .await
-        {
-            Ok(()) => (true, None),
-            Err(
-                error @ (forged_git::GitError::WorktreeDirty { .. }
-                | forged_git::GitError::WorktreeUnresolved { .. }),
-            ) => (false, Some(error.to_string())),
-            Err(error) => return Err(error.into()),
-        }
-    } else {
-        (false, None)
-    };
+    let (stopped_attempts, bead, retired, cleanup_error) =
+        settle_aftermath(ctx, run_id, &settlement, &run, false).await?;
 
     Ok(json!({
         "runId": run_id,
@@ -404,5 +452,508 @@ pub async fn run_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespons
     fenced(ctx, "run_stop", EffectClass::SafeRetry, req, None, {
         move |_operation| async move { settle(ctx, &run_id, settlement).await }
     })
+    .await
+}
+
+// ------------------------------------------- run adjudicate-settlement
+
+/// The event kind carrying one operator settlement adjudication. At most one
+/// stands per run; a conflicting second adjudication is refused so the event
+/// stream can never disagree with the run's terminal record.
+pub(crate) const SETTLEMENT_ADJUDICATION: &str = "forged.settlement-adjudication";
+
+const ADJUDICATE_NAME: &str = "run_adjudicate_settlement";
+
+/// One validated settlement adjudication: the terminal outcome plus the
+/// human assertion that substitutes for the verified-kill step.
+#[derive(Debug, Clone)]
+struct Adjudication {
+    settlement: Settlement,
+    actor: String,
+    rationale: String,
+    evidence_gap: String,
+}
+
+fn required_trimmed<'p>(
+    params: &'p serde_json::Map<String, Value>,
+    key: &str,
+) -> Result<&'p str, Failure> {
+    let value = param_str(params, key)?;
+    if value.trim().is_empty() {
+        return Err(Failure::invalid(format!("{key} must not be empty")));
+    }
+    Ok(value)
+}
+
+fn parse_adjudication(req: &OperationRequest) -> Result<(String, Adjudication), Failure> {
+    let run_id = param_str(&req.params, "run")?.to_owned();
+    let outcome = outcome(param_str(&req.params, "outcome")?)?;
+    if !matches!(
+        outcome,
+        RunOutcome::Landed | RunOutcome::Superseded | RunOutcome::Cancelled
+    ) {
+        return Err(Failure::invalid(
+            "settlement adjudication settles an abandoned run as landed, superseded, or cancelled",
+        ));
+    }
+    let actor = required_trimmed(&req.params, "actor")?.to_owned();
+    let rationale = required_trimmed(&req.params, "rationale")?.to_owned();
+    let evidence_gap = required_trimmed(&req.params, "evidenceGap")?.to_owned();
+    let delivery_pr = req.params.get("pr").and_then(Value::as_u64);
+    let delivery_sha = param_opt_str(&req.params, "sha").map(str::to_owned);
+    let superseded_by = param_opt_str(&req.params, "supersededBy").map(str::to_owned);
+    // Evidence shape is validated before anything durable exists: a refusal
+    // from the terminal write would otherwise land AFTER the adjudication
+    // event and strand a human-ambiguous row over a mere argument error.
+    match outcome {
+        RunOutcome::Landed => {
+            let valid_sha = delivery_sha.as_deref().is_some_and(|sha| {
+                matches!(sha.len(), 40 | 64) && sha.bytes().all(|byte| byte.is_ascii_hexdigit())
+            });
+            if delivery_pr.is_none() || !valid_sha {
+                return Err(Failure::invalid(
+                    "landed requires a PR number and an exact 40- or 64-hex commit SHA",
+                ));
+            }
+            if superseded_by.is_some() {
+                return Err(Failure::invalid("landed cannot name a successor run"));
+            }
+        }
+        RunOutcome::Superseded => {
+            if superseded_by.is_none() {
+                return Err(Failure::invalid("superseded requires a successor run id"));
+            }
+            if delivery_pr.is_some() || delivery_sha.is_some() {
+                return Err(Failure::invalid(
+                    "superseded cannot carry landed delivery evidence",
+                ));
+            }
+        }
+        _ => {
+            if delivery_pr.is_some() || delivery_sha.is_some() || superseded_by.is_some() {
+                return Err(Failure::invalid(
+                    "only landed carries delivery evidence and only superseded names a successor",
+                ));
+            }
+        }
+    }
+    let reason = format!("settlement adjudicated by {actor}: {rationale}");
+    Ok((
+        run_id,
+        Adjudication {
+            settlement: Settlement {
+                outcome,
+                reason,
+                delivery_pr,
+                delivery_sha,
+                superseded_by,
+            },
+            actor,
+            rationale,
+            evidence_gap,
+        },
+    ))
+}
+
+/// Verify the run is exactly the case adjudication exists for: a recorded
+/// controller generation whose durable driver identity (pid AND lstart) is
+/// gone, so the normal fence can never verify its death. A record that CAN
+/// be fenced is refused — `run stop` stays the only path for fenceable runs
+/// — and recorded machine effects without containment refuse outright:
+/// adjudicating identity absence never authorizes ignoring them.
+async fn verify_adjudicable(
+    ctx: &Ctx,
+    run_id: &str,
+    adjudication: &Adjudication,
+) -> Result<(RunRow, u32), Failure> {
+    let run = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
+    };
+    if run.state == RunState::Stopped {
+        let settlement = &adjudication.settlement;
+        let identical = run.terminal_outcome == Some(settlement.outcome)
+            && run.stop_reason.as_deref() == Some(settlement.reason.as_str())
+            && run.delivery_pr == settlement.delivery_pr
+            && run.delivery_sha == settlement.delivery_sha
+            && run.superseded_by == settlement.superseded_by;
+        if !identical {
+            return Err(Failure::refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "run {run_id:?} is already stopped with outcome {:?}",
+                    run.terminal_outcome
+                ),
+            ));
+        }
+    }
+    let record = super::handoff::latest_record(ctx, run_id)
+        .await?
+        .filter(|record| super::handoff::generation(record) > 0)
+        .ok_or_else(|| {
+            Failure::refused(
+                ErrorCode::InvalidRequest,
+                format!(
+                    "run {run_id:?} has no recorded controller generation; run stop settles it"
+                ),
+            )
+        })?;
+    let (pid, lstart) = super::handoff::record_driver_identity(&record);
+    if pid.is_some() && lstart.is_some() {
+        return Err(Failure::refused(
+            ErrorCode::InvalidRequest,
+            format!(
+                "run {run_id:?} controller record carries durable driver identity; run stop owns fencing it"
+            ),
+        ));
+    }
+    // No controller death was ever confirmed, so NO generation is contained:
+    // any in-flight machine ticket refuses the adjudication outright.
+    let unsafe_operations = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.uncontained_machine_operations(&run_id, None)
+        })
+        .await?
+    };
+    if !unsafe_operations.is_empty() {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "run {run_id:?} has machine effects without a confirmed-dead controller: {}",
+                unsafe_operations.join(", ")
+            ),
+            recoverable: true,
+        });
+    }
+    Ok((run, super::handoff::generation(&record)))
+}
+
+/// The standing adjudication event, if one was ever durably recorded.
+async fn standing_adjudication(ctx: &Ctx, run_id: &str) -> Result<Option<Value>, Failure> {
+    Ok(super::handoff::events(ctx, run_id)
+        .await?
+        .into_iter()
+        .rev()
+        .find(|row| row.kind == SETTLEMENT_ADJUDICATION)
+        .and_then(|row| serde_json::from_str::<Value>(&row.payload_json).ok()))
+}
+
+/// Record the adjudication as the run's singleton durable event, or adopt a
+/// standing identical one. The payload is deterministic apart from the
+/// first-append `adjudicatedAt`, so an interrupted adjudication replays into
+/// exactly one event; a semantically different standing adjudication is an
+/// idempotency conflict. The payload carries the delivery evidence and the
+/// originating operation identity, so a retry under a fresh key can never
+/// adopt the event while settling different evidence — it is pushed back to
+/// the original operation row instead of orphaning it. Callers hold the run
+/// submit singleton, which serializes the standing read with the append.
+async fn record_adjudication(
+    ctx: &Ctx,
+    run_id: &str,
+    adjudication: &Adjudication,
+    generation: u32,
+    operation_id: &str,
+) -> Result<Value, Failure> {
+    let semantic = json!({
+        "schema": "forged.settlement-adjudication/1",
+        "runId": run_id,
+        "actor": adjudication.actor,
+        "rationale": adjudication.rationale,
+        "evidenceGap": adjudication.evidence_gap,
+        "outcome": adjudication.settlement.outcome.as_str(),
+        "generation": generation,
+        "delivery": {
+            "pr": adjudication.settlement.delivery_pr,
+            "sha": adjudication.settlement.delivery_sha,
+        },
+        "supersededBy": adjudication.settlement.superseded_by,
+        "operationId": operation_id,
+    });
+    if let Some(standing) = standing_adjudication(ctx, run_id).await? {
+        let mut stripped = standing.clone();
+        if let Some(map) = stripped.as_object_mut() {
+            map.remove("adjudicatedAt");
+        }
+        if stripped == semantic {
+            return Ok(standing);
+        }
+        return Err(Failure::refused(
+            ErrorCode::IdempotencyConflict,
+            format!(
+                "run {run_id:?} already carries a different settlement adjudication recorded by operation {:?}",
+                standing.get("operationId").and_then(Value::as_str).unwrap_or("unknown")
+            ),
+        ));
+    }
+    let mut payload = semantic;
+    payload
+        .as_object_mut()
+        .expect("adjudication payload is an object")
+        .insert("adjudicatedAt".to_owned(), Value::String(now_iso()));
+    let event_run = run_id.to_owned();
+    let event = payload.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.append_event(Some(&event_run), SETTLEMENT_ADJUDICATION, event)
+    })
+    .await?;
+    Ok(payload)
+}
+
+/// Settle a run whose controller record cannot be fenced. The reclaim-saga
+/// ordering is preserved with ONE substitution: the recorded human
+/// adjudication stands in for the verified-kill step, because no durable
+/// driver identity exists to verify. Everything else is the fenced
+/// settlement path: the recorded generation is durably revoked in the same
+/// transaction as the terminal projection, and machine-effect containment
+/// is re-checked after that revocation commits.
+///
+/// The caller holds the run submit singleton for the WHOLE window — from the
+/// operation-row probe through this effect — so a concurrent same-key retry
+/// can never observe a half-executed takeover and re-run the aftermath.
+async fn adjudicate_locked(
+    ctx: &Ctx,
+    run_id: &str,
+    adjudication: Adjudication,
+    operation_id: &str,
+) -> Result<Value, Failure> {
+    let (_run, generation) = verify_adjudicable(ctx, run_id, &adjudication).await?;
+    let recorded =
+        record_adjudication(ctx, run_id, &adjudication, generation, operation_id).await?;
+    crate::failpoint::hit("run.adjudicate.recorded.after");
+    let settlement = adjudication.settlement;
+    let run = {
+        let run_id = run_id.to_owned();
+        let settlement = settlement.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.settle_run_fencing_controller(
+                &run_id,
+                RunSettlement {
+                    outcome: settlement.outcome,
+                    reason: settlement.reason,
+                    delivery_pr: settlement.delivery_pr,
+                    delivery_sha: settlement.delivery_sha,
+                    superseded_by: settlement.superseded_by,
+                },
+                generation,
+            )
+        })
+        .await?
+    };
+    // Mirrors settle(): the durable revocation commits first, so this read
+    // sees every machine ticket that could ever join the fenced generation.
+    let unsafe_operations = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.uncontained_machine_operations(&run_id, None)
+        })
+        .await?
+    };
+    if !unsafe_operations.is_empty() {
+        return Err(Failure {
+            code: ErrorCode::HostUnavailable,
+            message: format!(
+                "run {run_id:?} is terminal but machine effects lack a confirmed-dead controller: {}",
+                unsafe_operations.join(", ")
+            ),
+            recoverable: true,
+        });
+    }
+    let (stopped_attempts, bead, retired, cleanup_error) =
+        settle_aftermath(ctx, run_id, &settlement, &run, true).await?;
+    Ok(json!({
+        "runId": run_id,
+        "outcome": settlement.outcome.as_str(),
+        "reason": run.stop_reason,
+        "delivery": {
+            "pr": settlement.delivery_pr,
+            "sha": settlement.delivery_sha,
+        },
+        "supersededBy": settlement.superseded_by,
+        "adjudication": recorded,
+        "stoppedAttempts": stopped_attempts,
+        "controllerGeneration": generation,
+        "controllerStopped": false,
+        "bead": bead,
+        "worktreeRetired": retired,
+        "worktreeCleanupError": cleanup_error,
+    }))
+}
+
+/// Probe the operation store BEFORE any precondition: a stored terminal
+/// response replays verbatim, a stored different request is an idempotency
+/// conflict, and an interrupted row with the identical request resumes.
+/// The interrupted row is human-ambiguous, so no reconciler will ever retry
+/// it; the SAME human decision re-asserted under its exact key and request
+/// is the sanctioned recovery, and it seals the interrupted row with the
+/// real outcome instead of minting a second operation.
+///
+/// Errors carry the id the response must name: the derived key before a row
+/// exists or when the stored request conflicts (mirroring `fenced_inner`'s
+/// pre-admission probe), and the row's REAL operation id for every failure
+/// after the row is in hand.
+async fn probe_existing(
+    ctx: &Ctx,
+    req: &OperationRequest,
+    run_id: &str,
+    adjudication: &Adjudication,
+) -> Result<Option<OperationResponse>, (String, Failure)> {
+    let key = req.idempotency_key.clone();
+    let row = {
+        let probe_key = key.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation(ADJUDICATE_NAME, &probe_key)
+        })
+        .await
+        .map_err(|error| (key.clone(), error))?
+    };
+    let Some(row) = row else {
+        return Ok(None);
+    };
+    let hash = forged_types::request_sha256(req).map_err(|error| {
+        (
+            key.clone(),
+            Failure::invalid(format!("params cannot be canonicalized: {error}")),
+        )
+    })?;
+    if row.request_sha256 != hash {
+        return Err((
+            key,
+            Failure::refused(
+                ErrorCode::IdempotencyConflict,
+                format!(
+                    "operation {ADJUDICATE_NAME:?} key {:?} was stored with a different request",
+                    row.idempotency_key
+                ),
+            ),
+        ));
+    }
+    if row.state == OperationState::Terminal {
+        let stored = row.response_json.ok_or_else(|| {
+            (
+                row.operation_id.clone(),
+                Failure::internal("terminal operation row has no stored response"),
+            )
+        })?;
+        let mut response: OperationResponse = serde_json::from_str(&stored).map_err(|error| {
+            (
+                row.operation_id.clone(),
+                Failure::internal(format!("stored response does not parse: {error}")),
+            )
+        })?;
+        response.reused = true;
+        return Ok(Some(response));
+    }
+    let result = adjudicate_locked(ctx, run_id, adjudication.clone(), &row.operation_id)
+        .await
+        .map_err(|error| (row.operation_id.clone(), error))?;
+    let response = ok_response(&row.operation_id, false, result);
+    let resolved = {
+        let operation_id = row.operation_id.clone();
+        let stored = response.clone();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.resolve_interrupted_operation(&operation_id, &stored)
+        })
+        .await
+    };
+    if let Err(error) = resolved {
+        // A concurrent same-key invocation may have sealed the row between
+        // our read and this resolve. A terminal row holding our exact
+        // request is that invocation's identical outcome: replay it as
+        // benign instead of surfacing the lost race to the operator.
+        let sealed = {
+            let key = row.idempotency_key.clone();
+            on_ledger(&ctx.ledger, move |ledger| {
+                ledger.find_operation(ADJUDICATE_NAME, &key)
+            })
+            .await
+            .ok()
+            .flatten()
+        };
+        if let Some(sealed) = sealed {
+            if sealed.state == OperationState::Terminal && sealed.request_sha256 == hash {
+                if let Some(stored) = sealed.response_json {
+                    if let Ok(mut replay) = serde_json::from_str::<OperationResponse>(&stored) {
+                        replay.reused = true;
+                        return Ok(Some(replay));
+                    }
+                }
+            }
+        }
+        return Err((row.operation_id, error));
+    }
+    Ok(Some(response))
+}
+
+/// `run adjudicate-settlement` — the explicitly destructive settlement of a
+/// run whose latest controller record lacks durable driver identity. A
+/// distinct operation with its own name and human-ambiguous effect class,
+/// never a flag on `run stop`: the live fence path is not weakened.
+pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let (run_id, adjudication) = match parse_adjudication(req) {
+        Ok(value) => value,
+        Err(error) => {
+            return err_response(
+                &derive_key(ADJUDICATE_NAME, req.run_id.as_deref(), None, None),
+                &error,
+            )
+        }
+    };
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.clone());
+    }
+    // ONE derived key per run, the outcome deliberately excluded: the key
+    // binds whichever outcome was first asserted under it, so a crash retry
+    // that asserts a DIFFERENT outcome collides with the stored request and
+    // refuses as an idempotency conflict — visible and recoverable — instead
+    // of minting a fresh row that the standing-event guard dead-ends.
+    default_key(req, derive_key(ADJUDICATE_NAME, Some(&run_id), None, None));
+    // The submit singleton is held from the operation-row probe through the
+    // effect: a same-key retry that arrives mid-takeover waits here and then
+    // reads the sealed terminal row instead of re-executing the aftermath.
+    let _submit_guard = match super::handoff::acquire_run_submit(ctx, &run_id).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    };
+    match probe_existing(ctx, req, &run_id, &adjudication).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err((operation_id, error)) => return err_response(&operation_id, &error),
+    }
+    // No row exists under this key, so a standing adjudication belongs to a
+    // DIFFERENT operation identity — refuse before minting a row that the
+    // in-effect guard would strand in progress. Recovery re-asserts the same
+    // decision under the original operation's key, sealing its row.
+    match standing_adjudication(ctx, &run_id).await {
+        Ok(Some(standing)) => {
+            return err_response(
+                &req.idempotency_key,
+                &Failure::refused(
+                    ErrorCode::IdempotencyConflict,
+                    format!(
+                        "run {run_id:?} settlement was already adjudicated by operation {:?}; re-assert it under that operation's key",
+                        standing.get("operationId").and_then(Value::as_str).unwrap_or("unknown")
+                    ),
+                ),
+            )
+        }
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+    // Preconditions refuse BEFORE any operation row exists: a human-ambiguous
+    // row stranded in progress by a mere precondition would itself become
+    // permanent attention noise. The effect re-verifies under the submit
+    // singleton, so this early pass is a clean refusal, not the authority.
+    if let Err(error) = verify_adjudicable(ctx, &run_id, &adjudication).await {
+        return err_response(&req.idempotency_key, &error);
+    }
+    fenced(
+        ctx,
+        ADJUDICATE_NAME,
+        EffectClass::HumanAmbiguous,
+        req,
+        None,
+        move |operation| async move { adjudicate_locked(ctx, &run_id, adjudication, &operation).await },
+    )
     .await
 }

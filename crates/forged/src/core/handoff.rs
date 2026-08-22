@@ -497,13 +497,11 @@ pub(super) async fn controller_fence_target(
     controller_fence_target_from_record(&record)
 }
 
-fn controller_fence_target_from_record(
-    record: &Value,
-) -> Result<Option<ControllerFenceTarget>, Failure> {
-    let generation = generation(record);
-    if generation == 0 {
-        return Ok(None);
-    }
+/// The durable driver identity a record must carry to be fenced: pid and
+/// lstart, each read inline or through its published path. Settlement
+/// adjudication keys off exactly this pair — a record missing either piece
+/// cannot have its death verified and fails the normal fence closed.
+pub(super) fn record_driver_identity(record: &Value) -> (Option<i32>, Option<String>) {
     let pid = record
         .pointer("/driver/pid")
         .and_then(Value::as_i64)
@@ -514,8 +512,7 @@ fn controller_fence_target_from_record(
                 .and_then(Value::as_str)
                 .map(Path::new)
                 .and_then(read_pid)
-        })
-        .ok_or_else(|| Failure::internal("controller record has no driver pid"))?;
+        });
     let lstart = record
         .pointer("/driver/lstart")
         .and_then(Value::as_str)
@@ -527,7 +524,20 @@ fn controller_fence_target_from_record(
                 .and_then(|path| std::fs::read_to_string(path).ok())
                 .map(|value| value.trim().to_owned())
                 .filter(|value| !value.is_empty())
-        })
+        });
+    (pid, lstart)
+}
+
+fn controller_fence_target_from_record(
+    record: &Value,
+) -> Result<Option<ControllerFenceTarget>, Failure> {
+    let generation = generation(record);
+    if generation == 0 {
+        return Ok(None);
+    }
+    let (pid, lstart) = record_driver_identity(record);
+    let pid = pid.ok_or_else(|| Failure::internal("controller record has no driver pid"))?;
+    let lstart = lstart
         .ok_or_else(|| Failure::internal("controller record has no driver start identity"))?;
     let scope = match record.get("scope").and_then(Value::as_str) {
         Some("run") => Scope::Run,
