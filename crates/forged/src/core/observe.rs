@@ -1615,12 +1615,14 @@ fn observation_attention(
                 attempt.attempt_id.to_string(),
             );
         }
+        // Only completed/failed attempts ever owed a manifest — the exact
+        // set of the ledger anti-join. An interrupted (reclaimed/stopped)
+        // exit is not a defect, and counting it here would derive an
+        // occurrence id the attention rail never serves, so no resolve
+        // could ever validate against it.
         if matches!(
             attempt.state,
-            AttemptState::Completed
-                | AttemptState::Failed
-                | AttemptState::Reclaimed
-                | AttemptState::Stopped
+            AttemptState::Completed | AttemptState::Failed
         ) && !artifacts.contains(&attempt.attempt_id)
         {
             attention_source(

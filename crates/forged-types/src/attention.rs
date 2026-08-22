@@ -106,6 +106,14 @@ pub enum AttentionResolutionDisposition {
     AcceptedRisk,
     AcceptedUnknown,
     Superseded,
+    /// The durable evidence was never captured and can never be
+    /// reconstructed, so the operator records its absence as the auditable
+    /// decision. Grown for missing-evidence occurrences that predate the
+    /// artifact manifest; the resolve handler accepts it ONLY on
+    /// missing-evidence and accepts no other disposition there, so this
+    /// closed vocabulary cannot claim absence for repairable conditions or
+    /// launder missing evidence under a softer word.
+    EvidenceAbsent,
     Automatic,
 }
 

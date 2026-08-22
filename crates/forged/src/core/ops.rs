@@ -4264,7 +4264,7 @@ async fn control_attention(
                         return err_response(
                             &operation_key,
                             &Failure::invalid(
-                                "attention disposition must be fixed, accepted-risk, accepted-unknown, superseded, or automatic",
+                                "attention disposition must be fixed, accepted-risk, accepted-unknown, superseded, evidence-absent, or automatic",
                             ),
                         )
                     }
@@ -4276,6 +4276,26 @@ async fn control_attention(
                     &operation_key,
                     &Failure::invalid(
                         "missing-cost can only be resolved with accepted-unknown while pricing remains absent",
+                    ),
+                );
+            }
+            if item.condition == forged_types::AttentionCondition::MissingEvidence
+                && disposition != AttentionResolutionDisposition::EvidenceAbsent
+            {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "missing-evidence can only be resolved with evidence-absent, the explicit record that the evidence was never captured",
+                    ),
+                );
+            }
+            if disposition == AttentionResolutionDisposition::EvidenceAbsent
+                && item.condition != forged_types::AttentionCondition::MissingEvidence
+            {
+                return err_response(
+                    &operation_key,
+                    &Failure::invalid(
+                        "evidence-absent records absent evidence and cannot resolve any other condition",
                     ),
                 );
             }
@@ -4293,6 +4313,21 @@ async fn control_attention(
             payload["disposition"] =
                 serde_json::to_value(disposition).expect("closed attention disposition serializes");
             payload["note"] = json!(note);
+            // A missing-evidence occurrence aggregates every manifest-less
+            // attempt of its run; the durable record must state that full
+            // scope, so the adjudicated attempt ids ride in this transition
+            // payload (the wire item is unchanged).
+            if item.condition == forged_types::AttentionCondition::MissingEvidence {
+                let attempt_ids: Vec<&str> = item
+                    .evidence_refs
+                    .iter()
+                    .filter(|evidence| {
+                        evidence.kind == forged_types::AttentionEvidenceKind::Attempt
+                    })
+                    .map(|evidence| evidence.id.as_str())
+                    .collect();
+                payload["attemptIds"] = json!(attempt_ids);
+            }
             AttentionState::Resolved
         }
         AttentionControl::Reopen => AttentionState::Open,

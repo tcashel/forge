@@ -310,9 +310,12 @@ forged attention acknowledge --subject "$SUBJECT_ID" \
 ```
 
 Resolve only explicitly adjudicable custody conditions: `quarantined`,
-`missing-cost`, `retry-exhausted`, and `reviewer-disagreement`. Missing cost
-accepts only `accepted-unknown` while pricing remains absent. Every other
-condition clears only through the named domain transition:
+`missing-cost`, `retry-exhausted`, `reviewer-disagreement`, and
+`missing-evidence`. Missing cost accepts only `accepted-unknown` while
+pricing remains absent. Missing evidence accepts only `evidence-absent`, the
+explicit record that the evidence was never captured and cannot be
+reconstructed. Every other condition clears only through the named domain
+transition:
 
 ```bash
 forged attention resolve --subject "$SUBJECT_ID" \

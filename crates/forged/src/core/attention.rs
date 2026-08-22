@@ -1167,6 +1167,7 @@ pub(crate) fn resolution_allowed(condition: AttentionCondition) -> bool {
             | AttentionCondition::MissingCost
             | AttentionCondition::RetryExhausted
             | AttentionCondition::ReviewerDisagreement
+            | AttentionCondition::MissingEvidence
     )
 }
 

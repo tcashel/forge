@@ -315,6 +315,349 @@ fn missing_cost_only_accepts_the_explicit_unknown_disposition() {
     assert!(attention(&overview(&env), "attention-cost", "missing-cost").is_none());
 }
 
+/// One open implement packet for `run`, stored as a decodable WorkPacket
+/// body. Returns the packet id and the pinned spec sha for later claims.
+fn open_implement_packet(env: &TestEnv, run: &str, seq: i64) -> (String, String) {
+    let sha = "a".repeat(64);
+    let packet = forged_types::WorkPacket {
+        schema: "forged.packet/1".to_owned(),
+        packet_id: format!("{run}/implement/{seq}"),
+        run_id: run.to_owned(),
+        bead_id: format!("bead-{run}"),
+        stage: forged_types::Stage::Implement,
+        execution: None,
+        lane_seq: None,
+        spec: forged_types::SpecRef {
+            path: "beads://fixture".to_owned(),
+            sha256: sha.clone(),
+            revision: None,
+        },
+        worktree: std::path::PathBuf::from("/unread/worktree"),
+        branch: format!("work/{run}"),
+        base_ref: "main".to_owned(),
+        contract: forged_types::StageContract {
+            instructions: "fixture".to_owned(),
+            gate_commands: Vec::new(),
+            deliverable: forged_types::Deliverable::CommitsInWorktree,
+            budget_s: 60,
+        },
+        result_schema: "forged.result/1".to_owned(),
+        provider_hints: forged_types::ProviderHints {
+            provider: "fixture".to_owned(),
+            model: "fixture".to_owned(),
+            effort: None,
+            sandbox: forged_types::Sandbox::ReadOnly,
+        },
+        field_notes: Vec::new(),
+    };
+    let ledger = env.ledger();
+    let packet_id = ledger
+        .open_packet(forged_ledger::NewPacket {
+            run_id: run.to_owned(),
+            stage: forged_types::Stage::Implement,
+            seq,
+            spec_path: packet.spec.path.clone(),
+            spec_sha256: sha.clone(),
+            spec_revision: None,
+            body_json: packet.stored_body().expect("stored packet"),
+        })
+        .expect("open packet");
+    ledger.close().expect("close ledger");
+    (packet_id, sha)
+}
+
+/// Claim and terminally fail one attempt with NO artifact manifest — the
+/// exact shape of a legacy pre-manifest attempt. Returns the attempt id.
+fn fail_manifest_less_attempt(env: &TestEnv, packet_id: &str, sha: &str) -> i64 {
+    let ledger = env.ledger();
+    let claimed = ledger
+        .claim_packet(
+            packet_id,
+            &format!("forged:{packet_id}:0"),
+            &forged_ledger::SpecFence::Sha256(sha.to_owned()),
+        )
+        .expect("claim packet");
+    ledger
+        .fail_packet(
+            packet_id,
+            &claimed.claim_token,
+            "session vanished before any manifest",
+        )
+        .expect("fail packet");
+    ledger.close().expect("close ledger");
+    claimed.attempt_id
+}
+
+#[test]
+fn missing_evidence_is_adjudicated_per_occurrence_with_its_full_attempt_scope() {
+    let env = TestEnv::new("forged-attention-missing-evidence");
+    env.forged(&["init"]);
+    fabricate_run(&env, "attention-evidence");
+    let (packet_id, sha) = open_implement_packet(&env, "attention-evidence", 0);
+    let first = fail_manifest_less_attempt(&env, &packet_id, &sha);
+    let second = fail_manifest_less_attempt(&env, &packet_id, &sha);
+    let mut expected = vec![first.to_string(), second.to_string()];
+    expected.sort();
+
+    let item = attention(&overview(&env), "attention-evidence", "missing-evidence")
+        .expect("missing-evidence attention");
+    assert_eq!(item["state"], json!("open"));
+    let attempt_refs: Vec<String> = item["evidenceRefs"]
+        .as_array()
+        .expect("evidence refs")
+        .iter()
+        .filter(|reference| reference["kind"] == json!("attempt"))
+        .map(|reference| {
+            reference["id"]
+                .as_str()
+                .expect("attempt evidence id")
+                .to_owned()
+        })
+        .collect();
+    assert_eq!(attempt_refs, expected, "{item}");
+    let attention_id = item["attentionId"].as_str().expect("attention id");
+    let occurrence_id = item["occurrenceId"].as_str().expect("occurrence id");
+
+    // Surface parity while open: work_detail names the same occurrence, so
+    // the address it serves can pass resolve validation.
+    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    assert_eq!(code, 0, "{detail}");
+    let observed = attention(&detail["result"], "attention-evidence", "missing-evidence")
+        .expect("work_detail missing-evidence");
+    assert_eq!(observed["occurrenceId"], json!(occurrence_id), "{observed}");
+
+    // Every other disposition refuses by name.
+    let (_, refused) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-evidence",
+        "--attention-id",
+        attention_id,
+        "--occurrence-id",
+        occurrence_id,
+        "--actor",
+        "operator",
+        "--disposition",
+        "fixed",
+        "--note",
+        "nothing was repaired",
+    ]);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("evidence-absent"),
+        "{refused}"
+    );
+
+    let (code, resolved) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-evidence",
+        "--attention-id",
+        attention_id,
+        "--occurrence-id",
+        occurrence_id,
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "attempts predate the artifact manifest",
+    ]);
+    assert_eq!(code, 0, "{resolved}");
+    assert_eq!(resolved["ok"], json!(true), "{resolved}");
+
+    // The durable transition records actor, rationale, and EVERY attempt id
+    // from the occurrence's evidence.
+    let ledger = env.ledger();
+    let transitions = ledger
+        .list_events_by_kind("forged.attention.resolved")
+        .expect("resolved transitions");
+    ledger.close().expect("close ledger");
+    assert_eq!(transitions.len(), 1, "one durable resolution");
+    let payload: Value =
+        serde_json::from_str(&transitions[0].payload_json).expect("transition payload");
+    assert_eq!(payload["actor"], json!("operator"));
+    assert_eq!(payload["disposition"], json!("evidence-absent"));
+    assert_eq!(
+        payload["note"],
+        json!("attempts predate the artifact manifest")
+    );
+    assert_eq!(payload["attemptIds"], json!(expected), "{payload}");
+
+    // Resolved custody strips the occurrence from the attention list and
+    // the same run's work_detail alike.
+    assert!(attention(&overview(&env), "attention-evidence", "missing-evidence").is_none());
+    let listed = attention_list(&env, &[]);
+    assert!(
+        listed["groups"]
+            .as_array()
+            .expect("groups")
+            .iter()
+            .all(|group| group["condition"] != json!("missing-evidence")),
+        "{listed}"
+    );
+    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-evidence"]);
+    assert_eq!(code, 0, "{detail}");
+    assert!(
+        attention(&detail["result"], "attention-evidence", "missing-evidence").is_none(),
+        "{detail}"
+    );
+
+    // A later manifest-less terminal attempt on the SAME run raises a fresh
+    // open occurrence under the stable attention id.
+    fail_manifest_less_attempt(&env, &packet_id, &sha);
+    let recurrence = attention(&overview(&env), "attention-evidence", "missing-evidence")
+        .expect("fresh occurrence");
+    assert_eq!(recurrence["attentionId"], json!(attention_id));
+    assert_ne!(recurrence["occurrenceId"], json!(occurrence_id));
+    assert_eq!(recurrence["state"], json!("open"));
+}
+
+#[test]
+fn evidence_absent_binds_to_missing_evidence_in_both_directions() {
+    let env = TestEnv::new("forged-attention-evidence-absent-guard");
+    env.forged(&["init"]);
+
+    // On a different adjudicable condition the reverse guard refuses: the
+    // audit vocabulary cannot claim absence where evidence exists.
+    fabricate_run(&env, "attention-run");
+    append(
+        &env,
+        "attention-run",
+        "proto.quarantine",
+        json!({
+            "packetId": "attention-run/implement/0",
+            "attemptId": 7,
+            "reason": "claim token is stale",
+        }),
+    );
+    let item = quarantine(&overview(&env));
+    let (_, refused) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-run",
+        "--attention-id",
+        item["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        item["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "wrong vocabulary",
+    ]);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    assert!(
+        refused["error"]["message"]
+            .as_str()
+            .expect("refusal message")
+            .contains("evidence-absent"),
+        "{refused}"
+    );
+    assert_eq!(quarantine(&overview(&env))["state"], json!("open"));
+
+    // On a source-backed condition the domain-transition refusal still wins.
+    fabricate_run(&env, "attention-blocked");
+    let ledger = env.ledger();
+    ledger
+        .settle_run(
+            "attention-blocked",
+            forged_ledger::RunOutcome::Blocked,
+            "operator decision required".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("settle blocked");
+    ledger.close().expect("close ledger");
+    let blocked =
+        attention(&overview(&env), "attention-blocked", "blocked").expect("blocked attention");
+    let (_, refused) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-blocked",
+        "--attention-id",
+        blocked["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        blocked["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "this must not bypass run settlement",
+    ]);
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(refused["error"]["code"], json!("INVALID_REQUEST"));
+    assert_eq!(
+        refused["error"]["message"],
+        json!("this source-backed condition clears only through its domain transition"),
+        "{refused}"
+    );
+}
+
+#[test]
+fn interrupted_attempts_never_owe_a_manifest_on_any_surface() {
+    let env = TestEnv::new("forged-attention-interrupted");
+    env.forged(&["init"]);
+    fabricate_run(&env, "attention-interrupted");
+    let (packet_id, sha) = open_implement_packet(&env, "attention-interrupted", 0);
+    let ledger = env.ledger();
+    let reclaimed = ledger
+        .claim_packet(
+            &packet_id,
+            &format!("forged:{packet_id}:0"),
+            &forged_ledger::SpecFence::Sha256(sha.clone()),
+        )
+        .expect("claim for reclaim");
+    ledger
+        .revoke_attempt(reclaimed.attempt_id, "driver died mid-flight")
+        .expect("revoke before reclaim");
+    ledger
+        .mark_reclaimed(reclaimed.attempt_id)
+        .expect("mark reclaimed");
+    let stopped = ledger
+        .claim_packet(
+            &packet_id,
+            &format!("forged:{packet_id}:1"),
+            &forged_ledger::SpecFence::Sha256(sha),
+        )
+        .expect("claim for stop");
+    ledger
+        .revoke_attempt(stopped.attempt_id, "operator stop")
+        .expect("revoke before stop");
+    ledger
+        .mark_stopped(stopped.attempt_id)
+        .expect("mark stopped");
+    ledger.close().expect("close ledger");
+
+    assert!(
+        attention(&overview(&env), "attention-interrupted", "missing-evidence").is_none(),
+        "an interrupted attempt never owed a manifest"
+    );
+    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-interrupted"]);
+    assert_eq!(code, 0, "{detail}");
+    assert!(
+        attention(
+            &detail["result"],
+            "attention-interrupted",
+            "missing-evidence"
+        )
+        .is_none(),
+        "{detail}"
+    );
+}
+
 #[test]
 fn exact_replay_survives_authoritative_source_clearance() {
     let env = TestEnv::new("forged-attention-replay-after-clear");
