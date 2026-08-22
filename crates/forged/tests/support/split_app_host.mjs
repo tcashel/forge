@@ -18,6 +18,37 @@ const match = html.match(/<script>([\s\S]*?)<\/script>/);
 if (!match) throw new Error(`${asset} has no inline script`);
 if (scenario?.now) Date.now = () => Date.parse(scenario.now);
 
+// Storage is a host capability, not a Node default. Scenarios install it
+// deterministically and the non-writable global property catches Apps that
+// try to replace localStorage instead of feature-detecting it.
+const storageValues = new Map();
+let storageSetAttempts = 0;
+const storageMode = scenario?.storage;
+if (storageMode && typeof storageMode === "object" && Object.hasOwn(storageMode, "seed")) {
+  for (const [key, value] of Object.entries(storageMode.seed || {})) storageValues.set(key, String(value));
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    writable: false,
+    value: Object.freeze({
+      getItem(key) { return storageValues.has(String(key)) ? storageValues.get(String(key)) : null; },
+      setItem(key, value) { storageSetAttempts += 1; storageValues.set(String(key), String(value)); },
+      removeItem(key) { storageValues.delete(String(key)); },
+    }),
+  });
+} else if (storageMode === "readonly") {
+  Object.defineProperty(globalThis, "localStorage", {
+    configurable: true,
+    writable: false,
+    value: Object.freeze({
+      getItem() { return null; },
+      setItem() { storageSetAttempts += 1; throw new Error("localStorage is read-only"); },
+      removeItem() { throw new Error("localStorage is read-only"); },
+    }),
+  });
+} else {
+  delete globalThis.localStorage;
+}
+
 let innerHTMLWrites = 0;
 function element(tag) {
   const listeners = new Map();
@@ -375,12 +406,40 @@ function resultParams(result, transport) {
   if (transport === "text") return { content: result.content || [], isError: !!result.isError };
   return result;
 }
+const answeredToolCalls = new Set();
+const toolResponseCounts = new Map();
+async function settleToolResponses() {
+  for (let pass = 0; pass < 20; pass += 1) {
+    await Promise.resolve();
+    let answered = false;
+    for (const call of posted.filter(message => message.method === "tools/call")) {
+      if (answeredToolCalls.has(call.id)) continue;
+      const name = call?.params?.name;
+      if (!Object.hasOwn(scenario?.toolResponses || {}, name)) continue;
+      answeredToolCalls.add(call.id);
+      const configuredResponses = scenario.toolResponses[name];
+      const responseIndex = toolResponseCounts.get(name) || 0;
+      toolResponseCounts.set(name, responseIndex + 1);
+      const configured = Array.isArray(configuredResponses)
+        ? configuredResponses[responseIndex % configuredResponses.length]
+        : configuredResponses;
+      if (configured?.rpcError) {
+        dispatch({ jsonrpc: "2.0", id: call.id, error: configured.rpcError });
+      } else {
+        dispatch({ jsonrpc: "2.0", id: call.id, result: configured });
+      }
+      answered = true;
+    }
+    if (!answered) break;
+  }
+  await Promise.resolve();
+}
 dispatch({
   jsonrpc: "2.0",
   method: "ui/notifications/tool-result",
   params: resultParams(scenario?.toolResult, scenario?.transport),
 });
-await Promise.resolve();
+await settleToolResponses();
 documentElement.scrollHeight = 640;
 flushFrames();
 
@@ -405,10 +464,14 @@ for (const action of scenario?.actions || []) {
     const target = targets[action.index || 0];
     if (!target) throw new Error(`no clickable ${action.class} at index ${action.index || 0}`);
     target.click();
+  } else if (action.type === "click-id") {
+    const target = registry.get(action.id);
+    if (!target || target.disabled) throw new Error(`no clickable #${action.id}`);
+    target.click();
   } else {
     throw new Error(`unknown scenario action ${JSON.stringify(action)}`);
   }
-  await Promise.resolve();
+  await settleToolResponses();
   flushFrames();
 }
 
@@ -548,6 +611,7 @@ process.stdout.write(JSON.stringify({
   innerHTMLWrites,
   injected: !!globalThis.injected,
   toolCalls: posted.filter((message) => message.method === "tools/call").length,
+  serverToolCalls: posted.filter((message) => message.method === "tools/call").map(message => message.params),
   automaticToolCalls,
   interactiveCalls: interactiveCalls.map(message => message.params),
   initialTheme,
@@ -557,6 +621,8 @@ process.stdout.write(JSON.stringify({
   sizeNotifications,
   modelContext,
   headline: registry.get("headline")?.textContent || "",
+  storage: storageMode === "absent" || !storageMode ? null : Object.fromEntries(storageValues),
+  storageSetAttempts,
   beforeTeardown,
   afterTeardown: {
     timers: activeTimers.size,

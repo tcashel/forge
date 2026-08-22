@@ -51,11 +51,20 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
 .rail__head { display: flex; justify-content: space-between; gap: 8px; padding: 7px 10px; background: var(--panel); font-size: 11px; }
 .rail__head b, .rail__head span { font-family: var(--mono); }
 .rail__head span { color: var(--muted); }
+.rail__summary { display: flex; gap: 10px; align-items: center; color: var(--muted); font: 11px/1.4 var(--mono); }
 .rail__note { color: var(--muted); font-size: 11px; }
 .attention { border-left: 3px solid var(--bad); background: var(--panel); padding: 8px 10px; }
+.decision-row { appearance: none; width: 100%; color: inherit; border: 0; border-left: 3px solid var(--bad); border-radius: 0; text-align: left; display: grid; gap: 3px; }
+.decision-row:hover { background: color-mix(in srgb, var(--panel) 80%, var(--accent)); }
+.decision__verb { font-weight: 650; }
+.attention--new { border-left-color: var(--accent); }
+.attention__new { color: var(--accent); font: 650 10px/1.2 var(--mono); text-transform: uppercase; }
 .attention b { font-weight: 600; margin-right: 6px; }
 .attention .act { margin-top: 3px; }
 .attention .meta { margin-top: 2px; }
+.symptom-line { padding: 8px 10px; border-left: 3px solid var(--warn); background: var(--panel); display: grid; gap: 4px; }
+.symptom-summary { font-weight: 600; }
+.symptom-item, .symptom-root, .symptom-unresolved { color: var(--muted); font-size: 11px; }
 .groups { display: grid; gap: 12px; }
 .group { border: 1px solid var(--line); border-radius: 9px; overflow: hidden; }
 .group__head { padding: 9px 11px; background: var(--panel); display: flex; justify-content: space-between; gap: 8px; }
@@ -131,15 +140,27 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     });
   }
   const host = { connected: false, capabilities: {}, context: {} };
-  const state = { data: null, error: null, args: null, loading: false, detail: null, detailError: null, plan: null };
+  const state = {
+    data: null, error: null, args: null, loading: false,
+    triage: null, triageMap: null, triageError: null, triageLoading: false, triageStarted: false,
+    detail: null, detailError: null, plan: null, entry: null, attentionSelection: null,
+    lastOpenedAt: null, openedAt: new Date(Date.now()).toISOString(),
+  };
   const byId = id => document.getElementById(id);
   const el = (tag, cls, text) => { const n = document.createElement(tag); if (cls) n.className = cls; if (text != null) n.textContent = String(text); return n; };
   const arr = value => Array.isArray(value) ? value : [];
   const num = value => typeof value === "number" && Number.isFinite(value) ? value : 0;
   const fmt = value => Math.round(num(value)).toLocaleString();
-  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
-  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
-
+  const LAST_OPENED_KEY = "forged.operations-overview.lastOpenedAt";
+  // Storage is optional and may be present but read-only. Read the previous
+  // cursor before best-effort writing this view's timestamp; never replace
+  // the host's localStorage object.
+  try {
+    const storage = globalThis.localStorage;
+    const previous = storage?.getItem?.(LAST_OPENED_KEY);
+    if (typeof previous === "string" && previous) state.lastOpenedAt = previous;
+    try { storage?.setItem?.(LAST_OPENED_KEY, state.openedAt); } catch { /* read-only storage */ }
+  } catch { /* absent or inaccessible storage */ }
   // Time and chips, one format across all five Apps. An operator reads an
   // AGE; a raw ISO stamp asks them to subtract it from now themselves.
   const stamp = ts => (ts ? Date.parse(ts) : NaN);
@@ -155,13 +176,15 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // The label is the operator-facing repository name; the absolute path is
   // addressing, and belongs in the tool call rather than on the screen.
   function repositoryLabel(identity) { return identity?.repository?.label || identity?.repository?.path; }
+  const DECISION_CONDITIONS = ["input-required","merge-approval","quarantined","missing-cost","retry-exhausted","reviewer-disagreement","ambiguous-effect","restart-budget-exhausted","missing-evidence"];
+  const SYMPTOM_CONDITIONS = ["blocked","beads-settlement-pending","revoking","controller-dead","failed-gate","provider-degraded","admission-deferred"];
   function conditionRows(value, all=[]) { const own=arr(value?.attention?.items??value?.attentionItems?.items??value?.attention);if(own.length)return own;const id=value?.subjectId||value?.id||value?.runId||value?.workRef?.id;return id?arr(all).filter(item=>(item?.subjectId||item?.id)===id):[]; }
   function semanticState(value, group, conditions=conditionRows(value)) { const queue=String(group||value?.queueGroup||value?.queue?.group||"").toLowerCase().replace(/\s+/g,"-");const outcome=value?.outcome||value?.execution?.outcome||value?.status?.outcome||value?.status?.terminalOutcome;const attempt=value?.attempt?.activity||value?.attempt?.state;const names=conditions.map(item=>typeof item==="string"?item:item?.condition).filter(Boolean);if(["needs-me","ready-to-merge"].includes(queue)||["clean","accepted-risk","input-required"].includes(outcome)||names.some(name=>DECISION_CONDITIONS.includes(name)))return "attend";if(queue==="running"||attempt==="running"||names.includes("revoking"))return "running";if(outcome==="landed"||value?.merged===true||value?.execution?.merged===true||value?.status?.merged===true)return "landed";if(["cancelled","superseded"].includes(outcome))return "dormant";if(queue==="stalled-or-recoverable"||outcome==="blocked"||names.some(name=>name!=="revoking"&&SYMPTOM_CONDITIONS.includes(name)))return "stalled";if(queue==="planned"||value?.source==="live-plan"||value?.workRef?.kind==="plan")return "dormant";return "dormant"; }
   function semanticLabel(value, conditions, semantic=semanticState(value,null,conditions)) { return semantic==="running"&&conditions.some(item=>(typeof item==="string"?item:item?.condition)==="revoking")?"recovering":semantic; }
   function semanticReason(conditions) { const item=conditions.find(row=>row?.condition==="revoking");return item?.evidence?.reason||item?.detail||""; }
   function spendText(spend) { if(!spend||(!Object.hasOwn(spend,"costUsdKnown")&&!Object.hasOwn(spend,"rowsMissingCost")))return null;const known=num(spend.costUsdKnown),missing=num(spend.rowsMissingCost);if(missing>0&&known===0)return "?";return `$${known.toFixed(2)}${missing>0?` + ${fmt(missing)} unpriced`:""}`; }
   function queueCount(data, code, label) { const group=arr(data?.queue?.groups).find(row=>row?.code===code||row?.label===label||row?.name===label);return group?num(group.total??group.count):null; }
-  function fullHeadline(data) { const hasAttention=Array.isArray(data?.attention),items=arr(data?.attention),total=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const symptoms=new Map();for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))symptoms.set(item.condition,(symptoms.get(item.condition)||0)+1);const oldest=decisions.map(item=>item?.openedAt).filter(Boolean).sort()[0];const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(hasAttention)parts.push(`${fmt(decisions.length)} decision${decisions.length===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=[...symptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(hasAttention)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(hasAttention&&total>items.length)parts.push(`${fmt(items.length)} of ${fmt(total)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
+  function fullHeadline(data) { const list=state.triage;const hasEmbedded=Array.isArray(data?.attention),items=arr(data?.attention),embeddedTotal=typeof data?.attentionTotal==="number"?data.attentionTotal:typeof data?.counts?.attention==="number"?data.counts.attention:items.length;const decisionGroups=list?arr(list.groups).filter(group=>group?.classification==="decision"):[];const symptomGroups=list?arr(list.groups).filter(group=>group?.classification==="symptom"):[];const embeddedDecisions=items.filter(item=>DECISION_CONDITIONS.includes(item?.condition));const decisions=list?num(list?.totals?.decisions):embeddedDecisions.length;const oldest=(list?decisionGroups.flatMap(group=>arr(group?.items)):embeddedDecisions).map(item=>item?.openedAt).filter(Boolean).sort()[0];const embeddedSymptoms=new Map();if(!list)for(const item of items)if(SYMPTOM_CONDITIONS.includes(item?.condition))embeddedSymptoms.set(item.condition,(embeddedSymptoms.get(item.condition)||0)+1);const parts=[];const degraded=degradedSources(data);if(degraded.length)parts.push(`Degraded sources: ${degraded.join(", ")}`);if(list||hasEmbedded)parts.push(`${fmt(decisions)} decision${decisions===1?"":"s"}${oldest?`, oldest ${age(oldest)}`:""}`);const running=queueCount(data,"running","Running");if(running!=null)parts.push(`${fmt(running)} running`);const ready=queueCount(data,"ready-to-merge","Ready to merge");if(ready!=null)parts.push(`${fmt(ready)} ready to merge`);const grouped=list?symptomGroups.map(group=>`${String(group?.condition||"symptom").replace(/-/g," ")} ${fmt(group?.total)}`).join(", "):[...embeddedSymptoms].sort(([a],[b])=>a.localeCompare(b)).map(([name,count])=>`${name.replace(/-/g," ")} ${fmt(count)}`).join(", ");if(list||hasEmbedded)parts.push(grouped?`symptoms: ${grouped}`:"0 symptoms");if(data?.spend){const known=num(data.spend.costUsdKnown),missing=num(data.spend.rowsMissingCost);parts.push(missing>0&&known===0?`? known spend (${fmt(missing)} unpriced)`:`$${known.toFixed(2)} known spend${missing?` + ${fmt(missing)} unpriced`:""}`);}if(!list&&hasEmbedded&&embeddedTotal>items.length)parts.push(`${fmt(items.length)} of ${fmt(embeddedTotal)} attention conditions classified (capped)`);return `${parts.join("; ")}.`; }
 
   function envelopeFrom(params) {
     let value = params?.structuredContent;
@@ -178,7 +201,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (!data || data.schema !== "forged.operations-overview/1") {
       state.error = { message: "The host returned an unsupported Operations payload." }; state.data = null; render(); return;
     }
-    state.error = null; state.data = data; render();
+    state.error = null; state.data = data;
+    state.triage = null; state.triageMap = null; state.triageError = null; state.triageStarted = false;
+    render();
+    if (host.connected) refreshTriage();
   }
   function healthPill(name, source) {
     const status = source?.state || "unknown";
@@ -195,6 +221,9 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   // The rail is bounded so it stays a rail rather than a second queue. What
   // it did not draw is stated, never dropped.
   const RAIL_CAP = 12;
+  const BLOCKER_ROOT_CAP = 5;
+  const SYMPTOM_ITEM_CAP = 5;
+  const SETTLED_CAP = 5;
   function severityTone(severity) { return severity === "critical" || severity === "high" ? "block" : severity === "medium" ? "warn" : "idle"; }
   function attentionTitle(item) { return item?.subjectTitle?.value || item?.subjectId || item?.id || "unknown subject"; }
   function attentionSelector(item) { const id = item?.subjectId || item?.id; return id ? `${item?.subjectKind || "run"}:${id}` : null; }
@@ -208,7 +237,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    * point of it — neither is re-derived here, because this App has no ledger
    * to re-derive them against.
    */
-  function renderRail(data) {
+  function renderEmbeddedRail(data) {
     const rail = byId("attention");
     const items = arr(data.attention);
     const total = Math.max(num(data.attentionTotal ?? data.counts?.attention ?? items.length), items.length);
@@ -252,20 +281,160 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     if (drawn < total) rail.append(el("div", "rail__note", `${fmt(drawn)} of ${fmt(total)} items shown`));
   }
+  function isNewAttention(item) {
+    if (!state.lastOpenedAt) return false;
+    return [item?.openedAt, item?.updatedAt].some(value => typeof value === "string" && value > state.lastOpenedAt);
+  }
+  function selectAttention(item) {
+    state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = item;
+    renderDetail(); reportSize();
+  }
+  function renderDecision(item) {
+    const fresh = isNewAttention(item);
+    const row = el("button", `attention decision-row${fresh ? " attention--new" : ""}`); row.type = "button";
+    row.title = `Inspect ${item?.condition || "decision"} decision`;
+    row.append(el("span", "decision__verb", item?.recommendedAction?.text || "Inspect this decision"));
+    row.append(el("span", "decision__title", attentionTitle(item)));
+    if (fresh) row.append(el("span", "attention__new", "new"));
+    const meta = el("span", "meta");
+    const selector = attentionSelector(item); if (selector) meta.append(chip(selector, "id"));
+    if (item?.state) { meta.append(document.createTextNode(" ")); meta.append(chip(item.state, item.state === "resolved" ? "pass" : item.state === "acknowledged" ? "warn" : "idle")); }
+    if (item?.openedAt) meta.append(document.createTextNode(` · opened ${age(item.openedAt)}`));
+    row.append(meta);
+    row.addEventListener("click", () => selectAttention(item));
+    return row;
+  }
+  function itemBeadId(item) { return arr(item?.evidenceRefs).find(reference => reference?.kind === "bead")?.id || null; }
+  function blockedRoots(group, map) {
+    const nodes = new Map(arr(map?.nodes).map(node => [`${node?.workRef?.kind}:${node?.workRef?.id}`, node]));
+    const direct = new Map();
+    for (const edge of arr(map?.edges)) {
+      if (edge?.kind !== "blocks" || edge?.source?.kind !== "plan") continue;
+      const key = `plan:${edge.source.id}`;
+      if (!direct.has(key)) direct.set(key, []);
+      if (!direct.get(key).some(target=>target?.kind===edge?.target?.kind&&target?.id===edge?.target?.id)) direct.get(key).push(edge.target);
+    }
+    const roots = new Map();
+    let unresolved = 0;
+    for (const item of arr(group?.items)) {
+      const bead = itemBeadId(item);
+      const targets = bead ? arr(direct.get(`plan:${bead}`)) : [];
+      if (!targets.length) { unresolved += 1; continue; }
+      // ONE root per blocked item — the first resolvable blocker — so the
+      // per-root counts sum to the blocked total instead of counting edges.
+      let attributed = false;
+      for (const target of targets) {
+        const key = `${target?.kind}:${target?.id}`;
+        const node = nodes.get(key);
+        const title = node?.titleSource?.value || node?.identity?.displayTitle || (node ? target?.id : null);
+        if (!title) continue;
+        if (!roots.has(key)) roots.set(key, { title, count: 0 });
+        roots.get(key).count += 1;
+        attributed = true;
+        break;
+      }
+      if (!attributed) unresolved += 1;
+    }
+    return { roots: [...roots.values()], unresolved };
+  }
+  function renderSymptom(group, map) {
+    const condition = String(group?.condition || "symptom");
+    const label = condition.replace(/-/g, " ");
+    const items = arr(group?.items);
+    const shown = num(group?.shown ?? items.length);
+    const total = Math.max(num(group?.total ?? shown), shown);
+    const line = el("div", "symptom-line");
+    if (condition === "blocked") {
+      const result = blockedRoots(group, map);
+      const roots = result.roots;
+      const blockedSummary = shown < total ? `${fmt(shown)} of ${fmt(total)} blocked` : `${fmt(total)} blocked`;
+      const summary = roots.length
+        ? `${blockedSummary} on ${fmt(roots.length)} root cause${roots.length === 1 ? "" : "s"}`
+        : `${blockedSummary} · root cause mapping unavailable`;
+      line.append(el("span", "symptom-summary", summary));
+      for (const root of roots.slice(0, BLOCKER_ROOT_CAP)) line.append(el("span", "symptom-root", `${root.title} · ${fmt(root.count)} blocked`));
+      if (roots.length > BLOCKER_ROOT_CAP) line.append(el("span", "rail__note", `${fmt(BLOCKER_ROOT_CAP)} of ${fmt(roots.length)} root causes shown`));
+      if (result.unresolved) line.append(el("span", "symptom-unresolved", `Root cause unavailable · ${fmt(result.unresolved)} blocked`));
+    } else {
+      line.append(el("span", "symptom-summary", shown < total ? `${fmt(shown)} of ${fmt(total)} ${label}` : `${fmt(total)} ${label}`));
+      for (const item of items.slice(0, SYMPTOM_ITEM_CAP)) line.append(el("span", "symptom-item", attentionTitle(item)));
+      if (items.length > SYMPTOM_ITEM_CAP) line.append(el("span", "rail__note", `${fmt(SYMPTOM_ITEM_CAP)} of ${fmt(items.length)} shown`));
+    }
+    return line;
+  }
+  function renderTriageRail(list, map) {
+    const rail = byId("attention");
+    const acknowledged = num(list?.totals?.acknowledged);
+    rail.append(el("div", "rail__summary", `${fmt(acknowledged)} acknowledged`));
+    let remaining = RAIL_CAP;
+    let decisionsDrawn = 0;
+    for (const group of arr(list?.groups)) {
+      const section = el("section", "rail__group");
+      const head = el("div", "rail__head");
+      head.append(el("b", "triage-heading", String(group?.condition || "attention").replace(/-/g, " ")));
+      const shown = num(group?.shown ?? arr(group?.items).length);
+      const total = Math.max(num(group?.total ?? shown), shown);
+      head.append(el("span", "", shown < total ? `${fmt(shown)} of ${fmt(total)}` : fmt(total)));
+      section.append(head);
+      if (group?.classification === "decision") {
+        const items = arr(group?.items);
+        const visible = items.slice(0, remaining);
+        remaining -= visible.length; decisionsDrawn += visible.length;
+        for (const item of visible) section.append(renderDecision(item));
+      } else {
+        section.append(renderSymptom(group, map));
+      }
+      rail.append(section);
+    }
+    const decisionTotal = num(list?.totals?.decisions);
+    if (decisionsDrawn < decisionTotal) rail.append(el("div", "rail__note", `${fmt(decisionsDrawn)} of ${fmt(decisionTotal)} decisions shown`));
+    const settled = arr(list?.settled);
+    if (settled.length) {
+      const section = el("section", "rail__group");
+      const head = el("div", "rail__head");
+      head.append(el("b", "triage-heading", "recently settled"));
+      head.append(el("span", "", fmt(num(list?.settledTotal ?? settled.length))));
+      section.append(head);
+      for (const item of settled.slice(0, SETTLED_CAP)) section.append(renderDecision(item));
+      if (settled.length > SETTLED_CAP) section.append(el("div", "rail__note", `${fmt(SETTLED_CAP)} of ${fmt(settled.length)} settled shown`));
+      rail.append(section);
+    }
+  }
+  function renderRail(data) {
+    if (state.triage && state.triageMap && !state.triageError) {
+      renderTriageRail(state.triage, state.triageMap);
+      return;
+    }
+    renderEmbeddedRail(data);
+    const reason = !host.capabilities.serverTools ? "server tools unavailable" : state.triageError;
+    if (reason) byId("attention").append(el("div", "rail__note", `Triage degraded: ${reason}; showing embedded attention.`));
+  }
   function renderDetail() {
     const box = byId("drawer"); box.replaceChildren();
-    if (!state.detail && !state.detailError && !state.plan) { box.hidden = true; return; }
+    if (!state.detail && !state.detailError && !state.plan && !state.attentionSelection) { box.hidden = true; return; }
     box.hidden = false;
     const head = el("div", "drawer__head");
     const heading = el("div");
-    heading.append(el("h2", "", state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
-    if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
+    heading.append(el("h2", "", state.attentionSelection ? attentionTitle(state.attentionSelection) : state.plan ? titleFor(state.plan) : state.detail ? (state.detail.titleSource?.value || state.detail.identity?.displayTitle || state.detail.id) : "Detail unavailable"));
+    if (state.attentionSelection) { const selector=attentionSelector(state.attentionSelection); if(selector) heading.append(chip(selector,"id")); }
+    else if (state.plan) heading.append(chip(`${state.plan.kind || "plan"}:${state.plan.id}`, "id"));
     else if (state.detail) heading.append(chip(`${state.detail.workRef?.kind || state.detail.kind}:${state.detail.id}`, "id"));
     head.append(heading);
-    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; renderDetail(); }); head.append(close); box.append(head);
+    const close = el("button", "", "Close"); close.type = "button"; close.addEventListener("click", () => { state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail(); }); head.append(close); box.append(head);
     if (state.detailError) { box.append(el("div", "error", state.detailError.message || String(state.detailError))); return; }
     const dl = el("dl", "kv");
     const add = (key, value) => { dl.append(el("dt", "", key)); dl.append(el("dd", "", value == null ? "—" : value)); };
+    if (state.attentionSelection) {
+      const item=state.attentionSelection;
+      add("decision", item.condition);
+      add("state", item.state);
+      add("recommended", item.recommendedAction?.text);
+      add("detail", item.detail);
+      add("opened", age(item.openedAt));
+      add("updated", age(item.updatedAt));
+      box.append(dl);
+      return;
+    }
     if (state.plan) {
       const entry = state.plan;
       add("plan facts", "from the live Beads read; no execution record exists yet");
@@ -294,10 +463,10 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
    * A live-plan row is not a dead row: its whole Beads record already
    * travelled inside the projection, so opening it needs no tool call.
    */
-  function openPlan(entry) { state.detail = null; state.detailError = null; state.plan = entry; renderDetail(); reportSize(); }
+  function openPlan(entry) { state.detail = null; state.detailError = null; state.attentionSelection = null; state.plan = entry; renderDetail(); reportSize(); }
   async function openDetail(entry) {
     if (!host.capabilities.serverTools || !entry?.detailTarget) return;
-    state.detail = null; state.detailError = null; state.plan = null; renderDetail();
+    state.detail = null; state.detailError = null; state.plan = null; state.attentionSelection = null; renderDetail();
     try {
       const result = await request("tools/call", { name: "work_detail", arguments: { schemaVersion: 1, params: entry.detailTarget } });
       const envelope = envelopeFrom(result);
@@ -311,7 +480,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   function render() {
     if (tornDown) return;
     byId("health").replaceChildren(); byId("stats").replaceChildren(); byId("attention").replaceChildren(); byId("groups").replaceChildren(); byId("foot").replaceChildren();
-    byId("refresh").disabled = state.loading || !host.capabilities.serverTools;
+    byId("refresh").disabled = state.loading || state.triageLoading || !host.capabilities.serverTools;
     if (state.error) { byId("headline").textContent="";byId("scope").textContent = "Projection unavailable"; byId("groups").append(el("div", "error", state.error.message || String(state.error))); renderDetail(); reportSize(); return; }
     const data = state.data;
     if (!data) { byId("groups").append(el("div", "empty", "Waiting for work.")); renderDetail(); reportSize(); return; }
@@ -324,7 +493,6 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     }
     renderRail(data);
     const groups = byId("groups");
-    const canDetail = !!host.capabilities.serverTools;
     for (const group of arr(data.queue?.groups)) {
       const section = el("section", "group"); const head = el("div", "group__head"); head.append(el("b", "", group.label || group.code)); head.append(el("span", "", `${fmt(group.shown)} / ${fmt(group.total)}`)); section.append(head);
       const rows = el("div", "rows");
@@ -336,6 +504,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
         // live-plan row already carries its whole Beads record, and opening
         // that needs no server tool.
         const planFacts = !target && !!entry.plan;
+        const canDetail = !!target && host.capabilities.serverTools;
         const conditions=conditionRows(entry,data.attention);const semantic=semanticState(entry,group.code||group.label,conditions);const row = el("button", `row semantic--${semantic}`); row.type = "button";
         row.disabled = target ? !canDetail : !planFacts;
         row.title = target
@@ -368,7 +537,8 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     byId("foot").append(el("span", "", `${fmt(data.coverage?.shown)} shown of ${fmt(data.coverage?.total)}`));
     if (data.capturedAt?.ledger) byId("foot").append(el("span", "", `ledger read ${clock(data.capturedAt.ledger)} · ${age(data.capturedAt.ledger)}`));
     if (data.coverage?.truncated) byId("foot").append(el("span", "", "bounded result"));
-    if (state.loading) byId("foot").append(el("span", "", "refreshing"));
+    if (state.loading) byId("foot").append(el("span", "", "refreshing portfolio"));
+    if (state.triageLoading) byId("foot").append(el("span", "", "refreshing triage"));
     renderDetail(); pushModelContext(data); reportSize();
   }
   let lastContext = "";
@@ -407,8 +577,68 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     lastContext = text;
     request("ui/update-model-context", { content: [{ type: "text", text }] }).catch(() => {});
   }
+  function triageResult(result, schema, label) {
+    const envelope = envelopeFrom(result);
+    if (envelope?.ok === false) throw new Error(envelope.error?.message || `${label} failed`);
+    const value = envelope?.result ?? envelope;
+    if (!value || value.schema !== schema) throw new Error(`${label} returned an unsupported payload`);
+    return value;
+  }
+  function mergeTriage(active, settlements) {
+    // Spec amendment (adjudicated on the bead): the settlements query is a
+    // separate, PRESENTATION-ONLY surface. totals/decisions/symptoms,
+    // group membership, and oldest ages come from the ACTIVE payload
+    // verbatim — resolved history never counts as outstanding work. A
+    // resolved item whose occurrence is also active (a transition racing
+    // the two snapshots) is dropped: the active snapshot wins.
+    const activeKeys = new Set();
+    for (const group of arr(active?.groups))
+      for (const item of arr(group?.items))
+        activeKeys.add(`${item?.attentionId}:${item?.occurrenceId}`);
+    const settledSeen = new Set();
+    const settled = [];
+    for (const group of arr(settlements?.groups))
+      for (const item of arr(group?.items)) {
+        if (item?.state !== "resolved") continue;
+        const key = `${item?.attentionId}:${item?.occurrenceId}`;
+        if (activeKeys.has(key) || settledSeen.has(key)) continue;
+        settledSeen.add(key);
+        settled.push(item);
+      }
+    settled.sort((left,right)=>String(right?.updatedAt||right?.openedAt||"").localeCompare(String(left?.updatedAt||left?.openedAt||"")));
+    return { ...active, settled, settledTotal: num(settlements?.totals?.resolved ?? settled.length) };
+  }
+  async function refreshTriage() {
+    if (!host.connected || !host.capabilities.serverTools || state.triageLoading) return;
+    state.triageStarted = true; state.triageLoading = true; state.triageError = null; render();
+    const repo = state.args?.params?.repo || state.data?.scope?.repository;
+    const activeParams = { state: "active", limit: 100 };
+    const settlementParams = { state: "all", limit: 500 };
+    const mapParams = {};
+    if (typeof repo === "string" && repo) {
+      activeParams.repo = repo;
+      settlementParams.repo = repo;
+      mapParams.scope = "repository"; mapParams.repository = repo;
+    }
+    try {
+      const [activeResult, settlementResult, mapResult] = await Promise.all([
+        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: activeParams } }),
+        request("tools/call", { name: "attention_list", arguments: { schemaVersion: 1, params: settlementParams } }),
+        request("tools/call", { name: "work_map", arguments: { schemaVersion: 1, params: mapParams } }),
+      ]);
+      const active = triageResult(activeResult, "forged.attention-list/1", "attention_list active");
+      const settlements = triageResult(settlementResult, "forged.attention-list/1", "attention_list settlements");
+      state.triage = mergeTriage(active, settlements);
+      state.triageMap = triageResult(mapResult, "forged.work-map/1", "work_map");
+    } catch (error) {
+      state.triage = null; state.triageMap = null; state.triageError = String(error.message || error);
+    } finally {
+      state.triageLoading = false; render();
+      if (!state.triageStarted && host.connected) refreshTriage();
+    }
+  }
   async function refresh() {
-    if (!host.connected || !host.capabilities.serverTools || state.loading) return;
+    if (!host.connected || !host.capabilities.serverTools || state.loading || state.triageLoading) return;
     state.loading = true; render();
     try { ingest(await request("tools/call", { name: "operations_overview", arguments: state.args || { schemaVersion: 1, params: {} } })); }
     catch (error) { state.error = { message: String(error.message || error) }; }
@@ -468,7 +698,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
     if (message.id !== undefined && pending.has(message.id)) { const p = pending.get(message.id); pending.delete(message.id); clearTimeout(p.timer); timers.delete(p.timer); message.error ? p.reject(new Error(message.error.message || "request failed")) : p.resolve(message.result); return; }
     if (message.method === "ui/notifications/tool-input") state.args = message.params?.arguments || state.args;
     else if (message.method === "ui/notifications/tool-result") ingest(message.params);
-    else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
+    else if (message.method === "ui/notifications/tool-cancelled") { state.loading = false; state.triageLoading = false; state.error = { message: message.params?.reason || "Cancelled" }; render(); }
     else if (message.method === "ui/notifications/host-context-changed") applyContext(message.params);
     else if (message.method === "ui/resource-teardown") { teardown(); if (message.id !== undefined) post({ jsonrpc: "2.0", id: message.id, result: {} }); }
   }
@@ -476,6 +706,7 @@ h1 { margin: 0; font: 600 20px/1.2 var(--sans); letter-spacing: -.02em; }
   request("ui/initialize", { protocolVersion: PROTOCOL_VERSION, appInfo: APP_INFO, appCapabilities: { availableDisplayModes: ["inline", "fullscreen"] } }).then(result => {
     if (tornDown) return;
     host.connected = true; host.capabilities = result?.hostCapabilities || {}; applyContext(result?.hostContext); notify("ui/notifications/initialized", {}); render(); observer = new ResizeObserver(reportSize); observer.observe(document.body);
+    if (state.data && !state.triageStarted) refreshTriage();
   }).catch(() => { if (!tornDown) { state.error = { message: "The host did not complete the MCP Apps handshake." }; render(); } });
   render();
 })();
