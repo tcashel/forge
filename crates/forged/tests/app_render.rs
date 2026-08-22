@@ -2042,6 +2042,531 @@ fn work_detail_states_a_finding_bound_rather_than_slicing_silently() {
     );
 }
 
+fn triage_item(
+    id: &str,
+    bead: &str,
+    condition: &str,
+    title: &str,
+    state: &str,
+    opened_at: &str,
+    updated_at: &str,
+    action: &str,
+) -> Value {
+    json!({
+        "schema": "forged.attention-item/1",
+        "id": id,
+        "kind": "slice",
+        "attentionId": format!("attention-{id}-{condition}"),
+        "occurrenceId": format!("occurrence-{id}-{condition}"),
+        "subjectKind": "run",
+        "subjectId": id,
+        "subjectTitle": {"known": true, "value": title, "source": "beads.title", "beadId": bead},
+        "repository": "/repo",
+        "condition": condition,
+        "severity": "high",
+        "owner": "human",
+        "state": state,
+        "openedAt": opened_at,
+        "updatedAt": updated_at,
+        "detail": format!("{title} needs attention"),
+        "evidence": {},
+        "evidenceRefs": [{"kind": "bead", "id": bead}],
+        "recommendedAction": {"code": "provide-input", "text": action},
+        "acknowledgement": if state == "acknowledged" { json!({"actor": "operator", "at": updated_at}) } else { Value::Null },
+        "resolution": if state == "resolved" { json!({"actor": "operator", "disposition": "fixed", "note": "settled", "at": updated_at}) } else { Value::Null },
+    })
+}
+
+fn embedded_operations(attention: Vec<Value>) -> Value {
+    let total = attention.len();
+    json!({
+        "schema": "forged.operations-overview/1",
+        "scope": {"repository": "/repo"},
+        "sourceHealth": {
+            "ledger": {"state": "available"},
+            "beads": {"state": "available"},
+            "plan": {"state": "available"}
+        },
+        "coverage": {"total": 0, "shown": 0, "matching": 0, "truncated": false},
+        "counts": {"live": 0, "queued": 0, "attention": total, "planOnly": 0, "reviewReady": 0},
+        "spend": {"costUsdKnown": 0.0, "rowsMissingCost": 0},
+        "attention": attention,
+        "attentionTotal": total,
+        "queue": {"groups": []},
+    })
+}
+
+fn empty_work_map(nodes: Vec<Value>, edges: Vec<Value>) -> Value {
+    json!({
+        "schema": "forged.work-map/1",
+        "scope": {"kind": "repository", "repository": "/repo", "epicId": Value::Null},
+        "filters": {"group": Value::Null, "source": Value::Null, "from": Value::Null, "to": Value::Null, "maxNodes": 250},
+        "focus": Value::Null,
+        "capturedAt": {"ledger": "2026-08-22T12:00:00.000Z", "beads": "2026-08-22T12:00:00.000Z", "history": Value::Null},
+        "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"}, "plan": {"state": "available"}, "history": {"state": "available"}},
+        "counts": {"nodes": nodes.len(), "plan": nodes.len(), "runs": 0, "epics": 0, "contextOnly": 0, "edges": edges.len(), "attention": 0, "historyAttached": 0, "historyUnattached": 0},
+        "nodes": nodes,
+        "edges": edges,
+        "graphHealth": {"healthy": true, "cycleNodes": [], "danglingTargets": [], "missingBlockerStatus": []},
+        "historyCoverage": {},
+    })
+}
+
+fn triage_scenario(attention_list: Value, work_map: Value, storage: Value) -> Value {
+    let embedded = triage_item(
+        "embedded-run",
+        "embedded-bead",
+        "input-required",
+        "Embedded fallback decision",
+        "open",
+        "2026-08-20T10:00:00.000Z",
+        "2026-08-20T10:00:00.000Z",
+        "Use the embedded action",
+    );
+    json!({
+        "now": "2026-08-22T12:00:00.000Z",
+        "hostCapabilities": {"updateModelContext": true, "serverTools": true},
+        "allowedTools": ["attention_list", "work_map"],
+        "storage": storage,
+        "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
+        "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![embedded])}},
+        "toolResponses": {
+            "attention_list": {"structuredContent": {"ok": true, "result": attention_list}},
+            "work_map": {"structuredContent": {"ok": true, "result": work_map}}
+        }
+    })
+}
+
+fn attention_list_fixture(groups: Vec<Value>, totals: Value) -> Value {
+    json!({
+        "schema": "forged.attention-list/1",
+        "capturedAt": {"ledger": "2026-08-22T12:00:00.000Z", "beads": "2026-08-22T12:00:00.000Z"},
+        "filters": {"repo": "/repo", "state": "all", "condition": Value::Null, "classification": Value::Null, "limit": 100},
+        "sourceHealth": {"ledger": {"state": "available"}, "beads": {"state": "available"}},
+        "totals": totals,
+        "groups": groups,
+    })
+}
+
+#[test]
+fn operations_triage_consumes_server_classes_order_actions_and_acknowledgements() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let decision_b = triage_item(
+        "decision-b",
+        "bead-decision-b",
+        "merge-approval",
+        "Second alphabetically",
+        "acknowledged",
+        "2026-08-22T10:00:00.000Z",
+        "2026-08-22T10:30:00.000Z",
+        "Merge the reviewed pull request",
+    );
+    let decision_a = triage_item(
+        "decision-a",
+        "bead-decision-a",
+        "merge-approval",
+        "First alphabetically",
+        "open",
+        "2026-08-21T10:00:00.000Z",
+        "2026-08-21T10:30:00.000Z",
+        "Adjudicate the final review",
+    );
+    let symptom_b = triage_item(
+        "symptom-b",
+        "bead-symptom-b",
+        "admission-deferred",
+        "Capacity wait two",
+        "open",
+        "2026-08-22T09:00:00.000Z",
+        "2026-08-22T09:30:00.000Z",
+        "Wait for capacity",
+    );
+    let symptom_a = triage_item(
+        "symptom-a",
+        "bead-symptom-a",
+        "admission-deferred",
+        "Capacity wait one",
+        "open",
+        "2026-08-21T09:00:00.000Z",
+        "2026-08-21T09:30:00.000Z",
+        "Wait for capacity",
+    );
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "merge-approval", "classification": "decision", "total": 2, "shown": 2, "oldestOpenedAt": "2026-08-21T10:00:00.000Z", "items": [decision_b, decision_a]}),
+            json!({"condition": "admission-deferred", "classification": "symptom", "total": 2, "shown": 2, "oldestOpenedAt": "2026-08-21T09:00:00.000Z", "items": [symptom_b, symptom_a]}),
+        ],
+        json!({"open": 3, "acknowledged": 1, "resolved": 0, "decisions": 2, "symptoms": 2, "shown": 4, "total": 4}),
+    );
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent")),
+    );
+
+    assert_eq!(
+        report["serverToolCalls"],
+        json!([
+            {"name": "attention_list", "arguments": {"schemaVersion": 1, "params": {"repo": "/repo", "state": "all", "limit": 100}}},
+            {"name": "work_map", "arguments": {"schemaVersion": 1, "params": {"scope": "repository", "repository": "/repo"}}}
+        ]),
+        "load fires the pinned two-tool set with the initiating repository scope: {report}"
+    );
+    let nodes = report["nodes"].as_array().expect("rendered nodes");
+    let headings = nodes
+        .iter()
+        .filter(|entry| entry["class"] == json!("triage-heading"))
+        .map(|entry| entry["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        headings,
+        vec!["merge approval", "admission deferred"],
+        "server group order: {report}"
+    );
+    let decisions = nodes
+        .iter()
+        .filter(|entry| entry["class"] == json!("attention decision-row"))
+        .collect::<Vec<_>>();
+    assert_eq!(decisions.len(), 2, "decisions are rows: {report}");
+    assert_eq!(decisions[0]["tag"], json!("button"));
+    assert_eq!(
+        decisions[0]["childText"][0],
+        json!("Merge the reviewed pull request")
+    );
+    assert_eq!(
+        decisions[1]["childText"][0],
+        json!("Adjudicate the final review")
+    );
+    let symptoms = nodes
+        .iter()
+        .filter(|entry| entry["class"] == json!("symptom-item"))
+        .collect::<Vec<_>>();
+    assert_eq!(
+        symptoms.len(),
+        2,
+        "symptoms are grouped status lines: {report}"
+    );
+    assert!(
+        symptoms.iter().all(|entry| entry["tag"] != json!("button")),
+        "symptoms have no click affordance: {report}"
+    );
+    assert_eq!(symptoms[0]["text"], json!("Capacity wait two"));
+    assert_eq!(symptoms[1]["text"], json!("Capacity wait one"));
+    assert!(
+        report["text"].to_string().contains("1 acknowledged"),
+        "acknowledgements stay visible: {report}"
+    );
+}
+
+#[test]
+fn operations_triage_groups_blocked_items_by_their_direct_named_blocker() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let blocked = [
+        ("blocked-a", "plan-a", "Blocked A"),
+        ("blocked-b", "plan-b", "Blocked B"),
+        ("blocked-c", "plan-c", "Blocked C"),
+    ]
+    .into_iter()
+    .map(|(id, bead, title)| {
+        triage_item(
+            id,
+            bead,
+            "blocked",
+            title,
+            "open",
+            "2026-08-22T08:00:00.000Z",
+            "2026-08-22T08:30:00.000Z",
+            "Resolve the blocker",
+        )
+    })
+    .collect::<Vec<_>>();
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "blocked", "classification": "symptom", "total": 3, "shown": 3, "oldestOpenedAt": "2026-08-22T08:00:00.000Z", "items": blocked}),
+        ],
+        json!({"open": 3, "acknowledged": 0, "resolved": 0, "decisions": 0, "symptoms": 3, "shown": 3, "total": 3}),
+    );
+    let plan = |id: &str, title: &str| {
+        json!({
+            "workRef": {"schema": "forged.work-ref/1", "kind": "plan", "id": id},
+            "source": "live-plan", "contextOnly": false,
+            "identity": Value::Null,
+            "titleSource": {"known": true, "value": title, "source": "beads.title", "beadId": id},
+            "repository": "/repo", "epicId": Value::Null, "plan": {}, "queue": {}, "execution": {}, "history": Value::Null,
+            "attention": [], "detailTarget": Value::Null,
+        })
+    };
+    let edge = |source: &str, target: &str| {
+        json!({
+            "source": {"schema": "forged.work-ref/1", "kind": "plan", "id": source},
+            "target": {"schema": "forged.work-ref/1", "kind": "plan", "id": target},
+            "kind": "blocks", "contextOnly": false, "evidence": ["plan.dependencies"],
+        })
+    };
+    let map = empty_work_map(
+        vec![
+            plan("shared-root", "Shared release gate"),
+            plan("plan-a", "Intermediate blocker"),
+        ],
+        vec![
+            edge("plan-a", "shared-root"),
+            edge("plan-b", "shared-root"),
+            edge("plan-c", "plan-a"),
+        ],
+    );
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, map, json!("absent")),
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("3 blocked on 2 root causes"),
+        "one-hop root count: {report}"
+    );
+    let roots = report["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| entry["class"] == json!("symptom-root"))
+        .map(|entry| entry["text"].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        roots,
+        vec![
+            "Shared release gate · 2 blocked",
+            "Intermediate blocker · 1 blocked"
+        ],
+        "direct blockers, in first-item order: {report}"
+    );
+}
+
+#[test]
+fn operations_triage_reconciles_client_and_server_truncation() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let decisions = (0..13)
+        .map(|index| {
+            triage_item(
+                &format!("decision-{index}"),
+                &format!("bead-{index}"),
+                "input-required",
+                &format!("Decision {index}"),
+                "open",
+                "2026-08-20T08:00:00.000Z",
+                "2026-08-20T08:30:00.000Z",
+                "Answer the packet",
+            )
+        })
+        .collect::<Vec<_>>();
+    let symptoms = (0..2)
+        .map(|index| {
+            triage_item(
+                &format!("blocked-{index}"),
+                &format!("blocked-bead-{index}"),
+                "blocked",
+                &format!("Blocked {index}"),
+                "open",
+                "2026-08-20T08:00:00.000Z",
+                "2026-08-20T08:30:00.000Z",
+                "Resolve the blocker",
+            )
+        })
+        .collect::<Vec<_>>();
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "input-required", "classification": "decision", "total": 13, "shown": 13, "oldestOpenedAt": "2026-08-20T08:00:00.000Z", "items": decisions}),
+            json!({"condition": "blocked", "classification": "symptom", "total": 4, "shown": 2, "oldestOpenedAt": "2026-08-20T08:00:00.000Z", "items": symptoms}),
+        ],
+        json!({"open": 17, "acknowledged": 0, "resolved": 0, "decisions": 13, "symptoms": 4, "shown": 15, "total": 17}),
+    );
+    let report = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(listed, empty_work_map(vec![], vec![]), json!("absent")),
+    );
+    let text = report["text"].to_string();
+    assert!(
+        text.contains("12 of 13 decisions shown"),
+        "client cap is stated: {report}"
+    );
+    assert!(
+        text.contains("2 of 4 blocked"),
+        "server group truncation is stated: {report}"
+    );
+}
+
+#[test]
+fn operations_triage_markers_are_scoped_safe_and_include_recent_settlement() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let old = triage_item(
+        "old",
+        "old-bead",
+        "input-required",
+        "Old decision",
+        "open",
+        "2026-08-20T08:00:00.000Z",
+        "2026-08-20T09:00:00.000Z",
+        "Answer old",
+    );
+    let recent = triage_item(
+        "recent",
+        "recent-bead",
+        "input-required",
+        "Recent decision",
+        "open",
+        "2026-08-22T10:00:00.000Z",
+        "2026-08-22T10:30:00.000Z",
+        "Answer recent",
+    );
+    let settled = triage_item(
+        "settled",
+        "settled-bead",
+        "merge-approval",
+        "Recently settled",
+        "resolved",
+        "2026-08-20T08:00:00.000Z",
+        "2026-08-22T11:00:00.000Z",
+        "Review settlement",
+    );
+    let listed = attention_list_fixture(
+        vec![
+            json!({"condition": "input-required", "classification": "decision", "total": 2, "shown": 2, "oldestOpenedAt": "2026-08-20T08:00:00.000Z", "items": [old, recent]}),
+            json!({"condition": "merge-approval", "classification": "decision", "total": 1, "shown": 1, "oldestOpenedAt": "2026-08-20T08:00:00.000Z", "items": [settled]}),
+        ],
+        json!({"open": 2, "acknowledged": 0, "resolved": 1, "decisions": 3, "symptoms": 0, "shown": 3, "total": 3}),
+    );
+    let seeded = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &triage_scenario(
+            listed.clone(),
+            empty_work_map(vec![], vec![]),
+            json!({"seed": {"forged.operations-overview.lastOpenedAt": "2026-08-21T12:00:00.000Z"}}),
+        ),
+    );
+    let marked = seeded["nodes"]
+        .as_array()
+        .expect("rendered nodes")
+        .iter()
+        .filter(|entry| {
+            entry["class"]
+                .as_str()
+                .is_some_and(|class| class.contains("attention--new"))
+        })
+        .map(|entry| entry["childText"][1].as_str().unwrap_or_default())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        marked,
+        vec!["Recent decision", "Recently settled"],
+        "openedAt or updatedAt after the prior open marks the row: {seeded}"
+    );
+    assert_eq!(
+        seeded["storage"]["forged.operations-overview.lastOpenedAt"],
+        json!("2026-08-22T12:00:00.000Z")
+    );
+
+    for storage in [json!({"seed": {}}), json!("absent"), json!("readonly")] {
+        let first = run_split_app_host_scenario(
+            &node,
+            &asset,
+            &triage_scenario(
+                listed.clone(),
+                empty_work_map(vec![], vec![]),
+                storage.clone(),
+            ),
+        );
+        assert!(
+            !first["nodes"]
+                .as_array()
+                .expect("rendered nodes")
+                .iter()
+                .any(|entry| entry["class"]
+                    .as_str()
+                    .is_some_and(|class| class.contains("attention--new"))),
+            "storage mode {storage} starts without markers: {first}"
+        );
+        assert!(
+            !first["headline"].as_str().unwrap_or_default().is_empty(),
+            "storage mode {storage} renders without error: {first}"
+        );
+        if storage.is_object() {
+            assert_eq!(
+                first["storage"]["forged.operations-overview.lastOpenedAt"],
+                json!("2026-08-22T12:00:00.000Z")
+            );
+        }
+    }
+}
+
+#[test]
+fn operations_triage_degrades_to_the_embedded_rail_without_or_failed_tools() {
+    let Some(node) = require_node() else { return };
+    let asset = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("assets")
+        .join("operations-overview.html");
+    let no_tools = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "now": "2026-08-22T12:00:00.000Z",
+            "hostCapabilities": {"updateModelContext": true},
+            "allowedTools": [],
+            "storage": "absent",
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}}
+        }),
+    );
+    assert_eq!(no_tools["toolCalls"], json!(0));
+    assert!(
+        no_tools["text"].to_string().contains("Embedded decision"),
+        "embedded rail remains: {no_tools}"
+    );
+    assert!(
+        no_tools["text"].to_string().contains("Triage degraded"),
+        "degradation is stated: {no_tools}"
+    );
+
+    let listed_failure = run_split_app_host_scenario(
+        &node,
+        &asset,
+        &json!({
+            "now": "2026-08-22T12:00:00.000Z",
+            "hostCapabilities": {"updateModelContext": true, "serverTools": true},
+            "allowedTools": ["attention_list", "work_map"],
+            "storage": "absent",
+            "toolInput": {"schemaVersion": 1, "params": {"repo": "/repo"}},
+            "toolResult": {"structuredContent": {"ok": true, "result": embedded_operations(vec![triage_item("embedded", "embedded-bead", "input-required", "Embedded decision", "open", "2026-08-20T08:00:00.000Z", "2026-08-20T09:00:00.000Z", "Use embedded")])}},
+            "toolResponses": {
+                "attention_list": {"structuredContent": {"ok": false, "error": {"code": "INTERNAL", "message": "attention unavailable"}}},
+                "work_map": {"structuredContent": {"ok": true, "result": empty_work_map(vec![], vec![])}}
+            }
+        }),
+    );
+    assert!(
+        listed_failure["text"]
+            .to_string()
+            .contains("Embedded decision"),
+        "failed tool keeps embedded rail: {listed_failure}"
+    );
+    assert!(
+        listed_failure["text"]
+            .to_string()
+            .contains("Triage degraded: attention unavailable"),
+        "failed tool is stated: {listed_failure}"
+    );
+}
+
 /// The rail answers "what needs a human", so it has to be readable as one.
 ///
 /// Ungrouped, untitled, unordered `condition · id · detail` lines made a
