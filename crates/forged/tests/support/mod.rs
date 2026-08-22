@@ -1953,8 +1953,13 @@ impl McpClient {
     /// Spawn `forged mcp` in the environment and complete the initialize
     /// handshake.
     pub fn new(env: &TestEnv) -> Self {
-        let mut child = env
-            .forged_cmd(&["mcp"])
+        Self::from_command(env.forged_cmd(&["mcp"]))
+    }
+
+    /// Spawn a prepared `forged mcp` command (e.g. over a bare HOME) and
+    /// complete the initialize handshake.
+    pub fn from_command(mut cmd: Command) -> Self {
+        let mut child = cmd
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .stderr(Stdio::null())
