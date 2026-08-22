@@ -167,9 +167,12 @@ pub(crate) fn policy(
             Action::AdjudicateEffect,
             "Observe and adjudicate the exact ambiguous external effect",
         ),
+        // Recording evidence-absent is a durable, irreversible claim about
+        // the audit trail; both exits — repairing the delivery PR or
+        // adjudicating absence — are the operator's call, never an agent's.
         Condition::MissingEvidence => (
             Severity::High,
-            Owner::LeadAgent,
+            Owner::Human,
             Action::RepairEvidence,
             "Repair or explicitly adjudicate the missing durable evidence",
         ),
@@ -1160,14 +1163,24 @@ fn transition_state(
 
 /// Conditions for which attention itself owns explicit custody. Other
 /// conditions clear only through their authoritative domain transition.
-pub(crate) fn resolution_allowed(condition: AttentionCondition) -> bool {
-    matches!(
-        condition,
+/// Missing evidence is source-qualified, not condition-wide: only an
+/// occurrence composed entirely of manifest-less attempts is adjudicable.
+/// A clean/accepted-risk run whose delivery PR is missing or wrong-based
+/// raises the same condition from settlement evidence, but that gap is
+/// repairable — recording the exact-base PR clears it — so any occurrence
+/// carrying non-attempt evidence refuses explicit resolution.
+pub(crate) fn resolution_allowed(item: &AttentionItemV1) -> bool {
+    match item.condition {
         AttentionCondition::Quarantined
-            | AttentionCondition::MissingCost
-            | AttentionCondition::RetryExhausted
-            | AttentionCondition::ReviewerDisagreement
-    )
+        | AttentionCondition::MissingCost
+        | AttentionCondition::RetryExhausted
+        | AttentionCondition::ReviewerDisagreement => true,
+        AttentionCondition::MissingEvidence => item
+            .evidence_refs
+            .iter()
+            .all(|evidence| evidence.kind == AttentionEvidenceKind::Attempt),
+        _ => false,
+    }
 }
 
 /// The two triage classes: a `decision` waits on operator judgment or
@@ -1182,6 +1195,10 @@ pub(crate) enum AttentionClass {
 
 /// The fixed condition-to-class mapping every surface consumes. Exhaustive
 /// on purpose: a new condition fails the build until it is classified.
+/// Missing evidence is a decision condition-wide even though only
+/// attempt-only occurrences accept explicit resolution: both of its exits
+/// — record the exact-base delivery PR or adjudicate evidence-absent —
+/// wait on operator judgment, never on a supervisor-owned transition.
 pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
     use AttentionCondition as Condition;
     match condition {
@@ -1192,15 +1209,15 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::RetryExhausted
         | Condition::ReviewerDisagreement
         | Condition::AmbiguousEffect
-        | Condition::RestartBudgetExhausted => AttentionClass::Decision,
+        | Condition::RestartBudgetExhausted
+        | Condition::MissingEvidence => AttentionClass::Decision,
         Condition::Blocked
         | Condition::BeadsSettlementPending
         | Condition::Revoking
         | Condition::ControllerDead
         | Condition::FailedGate
         | Condition::ProviderDegraded
-        | Condition::AdmissionDeferred
-        | Condition::MissingEvidence => AttentionClass::Symptom,
+        | Condition::AdmissionDeferred => AttentionClass::Symptom,
     }
 }
 
@@ -1623,6 +1640,7 @@ mod tests {
             Condition::ReviewerDisagreement,
             Condition::AmbiguousEffect,
             Condition::RestartBudgetExhausted,
+            Condition::MissingEvidence,
         ];
         let symptoms = [
             Condition::Blocked,
@@ -1632,10 +1650,9 @@ mod tests {
             Condition::FailedGate,
             Condition::ProviderDegraded,
             Condition::AdmissionDeferred,
-            Condition::MissingEvidence,
         ];
-        assert_eq!(decisions.len(), 8);
-        assert_eq!(symptoms.len(), 8);
+        assert_eq!(decisions.len(), 9);
+        assert_eq!(symptoms.len(), 7);
         for condition in decisions {
             assert_eq!(
                 classification(condition),

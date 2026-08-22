@@ -1202,6 +1202,7 @@ pub enum AttentionDisposition {
     AcceptedRisk,
     AcceptedUnknown,
     Superseded,
+    EvidenceAbsent,
     Automatic,
 }
 
@@ -1212,6 +1213,7 @@ impl AttentionDisposition {
             Self::AcceptedRisk => "accepted-risk",
             Self::AcceptedUnknown => "accepted-unknown",
             Self::Superseded => "superseded",
+            Self::EvidenceAbsent => "evidence-absent",
             Self::Automatic => "automatic",
         }
     }

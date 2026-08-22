@@ -310,9 +310,15 @@ forged attention acknowledge --subject "$SUBJECT_ID" \
 ```
 
 Resolve only explicitly adjudicable custody conditions: `quarantined`,
-`missing-cost`, `retry-exhausted`, and `reviewer-disagreement`. Missing cost
-accepts only `accepted-unknown` while pricing remains absent. Every other
-condition clears only through the named domain transition:
+`missing-cost`, `retry-exhausted`, `reviewer-disagreement`, and
+`missing-evidence`. Missing cost accepts only `accepted-unknown` while
+pricing remains absent. Missing evidence accepts only `evidence-absent` —
+the explicit record, with a mandatory nonblank note, that the evidence was
+never captured and cannot be reconstructed — and only when every source in
+the occurrence is a manifest-less attempt. A clean or accepted-risk run
+whose delivery PR is missing or wrong-based raises the same condition but is
+repairable: record the exact-base PR instead of adjudicating absence. Every
+other condition clears only through the named domain transition:
 
 ```bash
 forged attention resolve --subject "$SUBJECT_ID" \
@@ -323,8 +329,8 @@ forged attention resolve --subject "$SUBJECT_ID" \
 
 Lead-agent-owned routine items may be acknowledged or acted on within already
 granted authority. Every item whose owner is human—including input, blocker,
-quarantine, ambiguous-effect, restart, review-risk, and merge decisions—requires
-the user's exact decision. Observe the relevant domain result before resolving
+quarantine, ambiguous-effect, restart, review-risk, missing-evidence, and merge
+decisions—requires the user's exact decision. Observe the relevant domain result before resolving
 custody. Merge approval remains a human/GitHub boundary outside this skill.
 
 Reopen only the exact resolved occurrence named by prior durable transition
