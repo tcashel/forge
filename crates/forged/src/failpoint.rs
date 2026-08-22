@@ -56,6 +56,9 @@
 //! guarded claim of an unassigned bead and its held close; and
 //! `bead-settlement.mutate.after` is the response-lost seam after the bd
 //! write and before `run.bead-settlement.succeeded` lands.
+//! `mcp.ledger.open.before` sits between the MCP gate's existence precheck
+//! and its no-create open — the deletion-race window the gate must refuse
+//! without creating state.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

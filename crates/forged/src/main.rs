@@ -109,6 +109,18 @@ async fn run(args: cli::Cli) -> i32 {
         cli::Command::Service { command } => {
             return emit_response(runtime::dispatch_service(&config, command).await)
         }
+        // The MCP surface never creates operator state: a host handshake is
+        // not operator intent, so the ledger (and legacy-state migration)
+        // opens lazily inside the tool-call gate, never here.
+        cli::Command::Mcp => {
+            return match mcp::serve(config).await {
+                Ok(()) => 0,
+                Err(message) => {
+                    eprintln!("forged: {message}");
+                    1
+                }
+            }
+        }
         command => command,
     };
     let ledger = match forged_ledger::Ledger::open(&config.db_path) {
@@ -129,19 +141,6 @@ async fn run(args: cli::Cli) -> i32 {
     }
     if let Err(failure) = core::migrate_legacy_state(&ctx).await {
         let code = pre_dispatch_failure(name, failure.code, failure.message);
-        close(&ctx);
-        return code;
-    }
-
-    if matches!(command, cli::Command::Mcp) {
-        let result = mcp::serve(Arc::clone(&ctx)).await;
-        let code = match result {
-            Ok(()) => 0,
-            Err(message) => {
-                eprintln!("forged: {message}");
-                1
-            }
-        };
         close(&ctx);
         return code;
     }

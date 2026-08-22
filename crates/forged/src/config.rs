@@ -909,6 +909,34 @@ pub fn now_iso() -> String {
     forged_proto::widen_rfc3339(&jiff::Timestamp::now().to_string())
 }
 
+/// A complete default config over one scratch operator scope, for unit
+/// tests that never call `load`.
+#[cfg(test)]
+pub(crate) fn scratch_config(anvil_home: &std::path::Path) -> ForgedConfig {
+    ForgedConfig {
+        anvil_home: anvil_home.to_path_buf(),
+        runs_root: anvil_home.join("runs"),
+        db_path: anvil_home.join("state.db"),
+        config_path: anvil_home.join("config.yaml"),
+        config_file_read: false,
+        roster: default_legacy_roster(),
+        profiles: default_profiles(),
+        rosters: default_rosters(),
+        default_profile: "standard".to_owned(),
+        default_roster: "default".to_owned(),
+        gate_commands: default_gate_commands(),
+        stage_budget_s: default_stage_budget_s(),
+        transport_retry_budget: DEFAULT_TRANSPORT_RETRY_BUDGET,
+        bd_path: anvil_home.join("tools/bd-1.2.1/bin/bd"),
+        beads_dir: anvil_home.join("beads"),
+        codex_home: anvil_home.join("codex-home"),
+        host_policy: HostPolicy::Preferred,
+        herdr_sock: None,
+        pricing: crate::pricing::default_rate_card(),
+        admission: AdmissionPolicy::default(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

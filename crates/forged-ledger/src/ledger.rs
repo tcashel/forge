@@ -80,7 +80,46 @@ impl Ledger {
         let mut conn = Connection::open(db_path)
             .map_err(|err| internal(format!("cannot open {}: {err}", db_path.display())))?;
         configure_connection(&mut conn)?;
+        Self::start_writer(conn)
+    }
 
+    /// Open the ledger at `db_path` WITHOUT creating anything: no parent
+    /// directory, no database file. `Ok(None)` means no database exists at
+    /// the path — decided by the no-create open itself, so no interleaving
+    /// with a concurrent deletion can mint a blank database the way a
+    /// caller-side existence check followed by [`Ledger::open`] can.
+    pub fn open_existing(db_path: &Path) -> Result<Option<Ledger>, LedgerError> {
+        let flags = rusqlite::OpenFlags::SQLITE_OPEN_READ_WRITE
+            | rusqlite::OpenFlags::SQLITE_OPEN_URI
+            | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX;
+        let mut conn = match Connection::open_with_flags(db_path, flags) {
+            Ok(conn) => conn,
+            // CANTOPEN over a still-present path is a real failure
+            // (permissions, a directory), not absence — and only PROVEN
+            // absence answers `None`: a metadata error here is an
+            // inspection failure, not evidence the ledger is missing.
+            Err(rusqlite::Error::SqliteFailure(e, _))
+                if e.code == rusqlite::ErrorCode::CannotOpen
+                    && matches!(
+                        std::fs::metadata(db_path),
+                        Err(ref meta) if meta.kind() == std::io::ErrorKind::NotFound
+                    ) =>
+            {
+                return Ok(None);
+            }
+            Err(err) => {
+                return Err(internal(format!(
+                    "cannot open {}: {err}",
+                    db_path.display()
+                )))
+            }
+        };
+        configure_connection(&mut conn)?;
+        Self::start_writer(conn).map(Some)
+    }
+
+    /// Hand a configured connection to a fresh writer thread.
+    fn start_writer(conn: Connection) -> Result<Ledger, LedgerError> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let handle = std::thread::Builder::new()
             .name("forged-ledger-writer".to_owned())
@@ -211,5 +250,45 @@ mod tests {
     #[test]
     fn busy_timeout_constant_matches_the_contract() {
         assert_eq!(BUSY_TIMEOUT_MS, 5000);
+    }
+
+    #[test]
+    fn open_existing_refuses_to_create_a_missing_ledger() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let db = dir.path().join("nested").join("state.db");
+        assert!(
+            matches!(Ledger::open_existing(&db), Ok(None)),
+            "a missing database must read as absent, not as an error"
+        );
+        assert!(
+            !db.parent().expect("nested parent").exists(),
+            "a no-create open must create neither the database nor its parents"
+        );
+
+        // The same path, once created by an operator-intent open, opens.
+        Ledger::open(&db)
+            .expect("create-enabled open")
+            .close()
+            .expect("close created ledger");
+        Ledger::open_existing(&db)
+            .expect("no-create open of an existing ledger")
+            .expect("the database exists")
+            .close()
+            .expect("close reopened ledger");
+    }
+
+    #[test]
+    fn open_existing_reports_an_unopenable_present_path_as_a_failure() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        // The path EXISTS but cannot open: a directory is not a database.
+        let db = dir.path().join("state.db");
+        std::fs::create_dir_all(&db).expect("db path dir");
+        assert!(
+            matches!(
+                Ledger::open_existing(&db),
+                Err(LedgerError::Internal { .. })
+            ),
+            "a present-but-unopenable path is a failure, never absence"
+        );
     }
 }

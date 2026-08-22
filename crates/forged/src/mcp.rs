@@ -25,7 +25,8 @@ use serde_json::Value;
 
 use forged_types::OperationRequest;
 
-use crate::core::{dispatch, Ctx};
+use crate::config::ForgedConfig;
+use crate::core::{derive_key, dispatch, err_response, migrate_legacy_state, Ctx, Failure};
 
 const OVERVIEW_URI: &str = "ui://forged/overview.html";
 const OPERATIONS_OVERVIEW_URI: &str = "ui://forged/operations-overview.html";
@@ -820,31 +821,143 @@ impl WorkDetailArgs {
     }
 }
 
+/// The lazy ledger gate: durable state is created only by operator intent,
+/// never by a host handshaking this server. "Uninitialized" is decided
+/// fresh on every call — latched in neither direction — by a
+/// `config.db_path` existence precheck AND, authoritatively, by the
+/// no-create open itself: a ledger deleted after the precheck fails that
+/// call instead of being silently re-created blank (the precheck alone
+/// would race with deletion). A successful open (with legacy-state
+/// migration completed before any dispatch observes the ledger) latches
+/// once for the mount's lifetime.
+struct McpState {
+    config: ForgedConfig,
+    ctx: tokio::sync::OnceCell<Arc<Ctx>>,
+    #[cfg(test)]
+    opens: std::sync::atomic::AtomicUsize,
+}
+
+impl McpState {
+    fn new(config: ForgedConfig) -> Self {
+        Self {
+            config,
+            ctx: tokio::sync::OnceCell::new(),
+            #[cfg(test)]
+            opens: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// The gate at the two dispatch seams. An uninitialized scope refuses —
+    /// creating nothing — until the operator runs `forged init`; a failed
+    /// open or migration is that call's failure and the next call retries.
+    /// The existence check is only the fast common-case refusal; the
+    /// authority is [`McpState::open`]'s no-create open.
+    async fn ctx(&self) -> Result<Arc<Ctx>, Failure> {
+        // Only PROVEN absence earns the setup guidance; an inspection error
+        // (permissions, an unreadable parent) is its own failure — routing
+        // it to "run forged init" would send the operator to re-initialize
+        // over state that exists.
+        match std::fs::metadata(&self.config.db_path) {
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(self.uninitialized());
+            }
+            Err(error) => {
+                return Err(Failure::internal(format!(
+                    "cannot inspect operator state at {}: {error}",
+                    self.config.db_path.display()
+                )));
+            }
+        }
+        self.ctx.get_or_try_init(|| self.open()).await.cloned()
+    }
+
+    /// The uninitialized-scope refusal: the session mount's answer wherever
+    /// it would otherwise have to create durable state.
+    fn uninitialized(&self) -> Failure {
+        Failure::invalid(format!(
+            "operator state does not exist at {}; a session mount creates \
+             nothing — initialize it deliberately with `forged init` or \
+             /forged:setup",
+            self.config.db_path.display()
+        ))
+    }
+
+    async fn open(&self) -> Result<Arc<Ctx>, Failure> {
+        #[cfg(test)]
+        self.opens.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let db_path = self.config.db_path.clone();
+        let opened = tokio::task::spawn_blocking(move || {
+            crate::failpoint::hit("mcp.ledger.open.before");
+            forged_ledger::Ledger::open_existing(&db_path)
+        })
+        .await
+        .map_err(|e| Failure::internal(format!("blocking task join failure: {e}")))?
+        .map_err(|e| Failure::internal(format!("cannot open ledger: {e}")))?;
+        // The precheck passed but the ledger vanished before the open: the
+        // no-create open is the authority, so the race refuses exactly as
+        // the check would have — creating nothing.
+        let Some(ledger) = opened else {
+            return Err(self.uninitialized());
+        };
+        let ctx = Arc::new(Ctx {
+            config: self.config.clone(),
+            ledger,
+        });
+        if let Err(failure) = migrate_legacy_state(&ctx).await {
+            // A half-initialized mount must not leak the writer thread: the
+            // retrying call reopens from scratch.
+            let _ = ctx.ledger.clone().close();
+            return Err(failure);
+        }
+        Ok(ctx)
+    }
+}
+
 /// The forged MCP server: a thin adapter over the shared core.
 #[derive(Clone)]
 pub struct ForgedServer {
-    ctx: Arc<Ctx>,
+    state: Arc<McpState>,
     tool_router: ToolRouter<Self>,
 }
 
 impl ForgedServer {
-    /// Build the server over the shared context.
-    pub fn new(ctx: Arc<Ctx>) -> Self {
+    /// Build the server over the once-read config; the ledger stays shut
+    /// until a tool call needs it.
+    fn new(state: Arc<McpState>) -> Self {
         Self {
-            ctx,
+            state,
             tool_router: Self::tool_router(),
         }
     }
 
+    async fn respond(&self, name: &str, args: EnvelopeArgs) -> forged_types::OperationResponse {
+        let req = args.into_request();
+        match self.state.ctx().await {
+            Ok(ctx) => dispatch(&ctx, name, req).await,
+            // An explicitly supplied idempotency key is echoed even on the
+            // gate's refusal — operationId is a pinned wire-shape contract,
+            // and only a keyless request falls back to the derived form.
+            Err(failure) => {
+                let key = if crate::core::key_absent(&req) {
+                    derive_key(name, req.run_id.as_deref(), None, None)
+                } else {
+                    req.idempotency_key.clone()
+                };
+                err_response(&key, &failure)
+            }
+        }
+    }
+
     async fn call(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
-        let resp = dispatch(&self.ctx, name, args.into_request()).await;
+        let resp = self.respond(name, args).await;
         let text = serde_json::to_string(&resp)
             .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
         CallToolResult::success(vec![ContentBlock::text(text)])
     }
 
     async fn call_structured(&self, name: &str, args: EnvelopeArgs) -> CallToolResult {
-        let resp = dispatch(&self.ctx, name, args.into_request()).await;
+        let resp = self.respond(name, args).await;
         let structured = serde_json::to_value(&resp).unwrap_or(Value::Null);
         let text = serde_json::to_string(&resp)
             .unwrap_or_else(|e| format!("{{\"ok\":false,\"error\":\"unserializable: {e}\"}}"));
@@ -1317,16 +1430,121 @@ impl ServerHandler for ForgedServer {
 }
 
 /// Serve MCP over stdio until the client disconnects. The one command that
-/// prints no envelope: it serves the protocol instead.
-pub async fn serve(ctx: Arc<Ctx>) -> Result<(), String> {
-    let server = ForgedServer::new(ctx);
-    let service = server
-        .serve(rmcp::transport::stdio())
-        .await
-        .map_err(|e| format!("mcp serve failed: {e}"))?;
-    service
-        .waiting()
-        .await
-        .map_err(|e| format!("mcp session failed: {e}"))?;
-    Ok(())
+/// prints no envelope: it serves the protocol instead. Initialize,
+/// tools/list, and resources never touch the ledger; the two dispatch seams
+/// open it lazily through the gate.
+pub async fn serve(config: ForgedConfig) -> Result<(), String> {
+    let state = Arc::new(McpState::new(config));
+    let server = ForgedServer::new(Arc::clone(&state));
+    let result = async {
+        let service = server
+            .serve(rmcp::transport::stdio())
+            .await
+            .map_err(|e| format!("mcp serve failed: {e}"))?;
+        service
+            .waiting()
+            .await
+            .map_err(|e| format!("mcp session failed: {e}"))?;
+        Ok(())
+    }
+    .await;
+    // Close deliberately on the way out; a never-opened gate has nothing to
+    // close.
+    if let Some(ctx) = state.ctx.get() {
+        let _ = ctx.ledger.clone().close();
+    }
+    result
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::atomic::Ordering;
+
+    use super::*;
+
+    fn scratch_state(root: &std::path::Path) -> McpState {
+        McpState::new(crate::config::scratch_config(root))
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_calls_share_exactly_one_open() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let state = scratch_state(dir.path());
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        let (a, b) = tokio::join!(state.ctx(), state.ctx());
+        let (a, b) = (a.expect("first call opens"), b.expect("second call joins"));
+        assert!(Arc::ptr_eq(&a, &b), "both calls must observe one context");
+        assert_eq!(state.opens.load(Ordering::SeqCst), 1);
+        a.ledger.clone().close().expect("close");
+    }
+
+    #[tokio::test]
+    async fn a_failed_migration_closes_the_ledger_and_does_not_latch() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let mut config = crate::config::scratch_config(dir.path());
+        // An invalid execution policy fails migrate_legacy_state AFTER the
+        // open succeeded — the arm that must close the ledger it opened.
+        config.stage_budget_s.clear();
+        let state = McpState::new(config);
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        for expected_opens in [1usize, 2] {
+            let failed = match state.ctx().await {
+                Ok(_) => panic!("an invalid execution policy cannot mount"),
+                Err(failure) => failure,
+            };
+            assert_eq!(failed.code, forged_types::ErrorCode::InvalidRequest);
+            assert!(
+                failed.message.contains("execution policy"),
+                "{}",
+                failed.message
+            );
+            // Nothing latched and the writer was closed: every retry opens
+            // from scratch instead of replaying a stored failure or
+            // stacking a leaked writer thread per call.
+            assert!(state.ctx.get().is_none());
+            assert_eq!(state.opens.load(Ordering::SeqCst), expected_opens);
+        }
+    }
+
+    #[tokio::test]
+    async fn an_uninspectable_ledger_path_is_not_treated_as_absence() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let mut config = crate::config::scratch_config(dir.path());
+        // The PARENT is a file, so metadata on db_path errors with
+        // NotADirectory — an inspection failure, not proven absence.
+        let parent = dir.path().join("blocked");
+        std::fs::write(&parent, b"not a directory").expect("blocking file");
+        config.db_path = parent.join("state.db");
+        let state = McpState::new(config);
+        let failed = match state.ctx().await {
+            Ok(_) => panic!("an uninspectable path cannot mount"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failed.code, forged_types::ErrorCode::Internal);
+        assert!(
+            failed.message.contains("cannot inspect operator state"),
+            "{}",
+            failed.message
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_open_is_that_calls_failure_and_does_not_latch() {
+        let dir = tempfile::tempdir().expect("scratch scope");
+        let state = scratch_state(dir.path());
+        // db_path EXISTS but cannot open: a directory is not a database.
+        std::fs::create_dir_all(&state.config.db_path).expect("db path dir");
+        let failed = match state.ctx().await {
+            Ok(_) => panic!("a directory cannot open"),
+            Err(failure) => failure,
+        };
+        assert_eq!(failed.code, forged_types::ErrorCode::Internal);
+        // The operator initializes properly; the very next call reopens
+        // from scratch instead of replaying the stored failure.
+        std::fs::remove_dir_all(&state.config.db_path).expect("clear db dir");
+        std::fs::write(&state.config.db_path, b"").expect("touch state.db");
+        let ctx = state.ctx().await.expect("the retrying call opens");
+        assert_eq!(state.opens.load(Ordering::SeqCst), 2);
+        ctx.ledger.clone().close().expect("close");
+    }
 }
