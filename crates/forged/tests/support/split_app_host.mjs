@@ -331,8 +331,9 @@ const payload = operations
         items: [
           { attemptId: 1, packetId: "run-1/implementation/0", implemented: true, commitsAhead: 2, summary: "Implemented the slice", gateState: "pass", passed: true, note: null },
           { attemptId: 2, packetId: "run-1/review/0", implemented: false, commitsAhead: 0, summary: "The gate refused the change", gateState: "fail", passed: false, note: "clippy denied a warning" },
+          { attemptId: 3, packetId: "run-1/implementation/legacy", implemented: true, commitsAhead: 2, summary: "Legacy articulate result", gateState: "all five gates pass: build, test, clippy, fmt, docs", passed: null, note: null },
         ],
-        total: 2,
+        total: 3,
         limit: 200,
         truncated: false,
       },

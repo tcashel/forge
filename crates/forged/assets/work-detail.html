@@ -154,9 +154,10 @@ h1 { margin: 0; font: 600 19px/1.25 var(--mono); overflow-wrap: anywhere; }
     if(!delivery||delivery.known===false)ship.body.append(el("div","empty","No pull request is recorded for this work."));
     else{const dd=el("dl","kv");const shipped=(k,v)=>{dd.append(el("dt","",k));dd.append(el("dd","",v==null?"—":v));};shipped("pull request",delivery.pr);shipped("head sha",delivery.sha);shipped("base",delivery.base??data.identity?.baseRef);shipped("source",delivery.source);ship.body.append(dd);}
     grid.append(ship.box);
-    const gate=panel("Gates",gates.length?`${gates.filter(row=>row.passed).length} of ${gates.length} passed${gateTotal>gates.length?` · ${bound(gates.length,gateTotal)}`:""}`:"none");
+    const knownGates=gates.filter(row=>row.passed===true||row.passed===false),unknownGates=gates.length-knownGates.length;
+    const gate=panel("Gates",gates.length?`${knownGates.filter(row=>row.passed===true).length} of ${knownGates.length} passed${unknownGates?` · ${unknownGates} unknown`:""}${gateTotal>gates.length?` · ${bound(gates.length,gateTotal)}`:""}`:"none");
     if(!gates.length)gate.body.append(el("div","empty",gateTotal?`${gateTotal} gate results counted; none carried in this page.`:"No gate result is recorded."));
-    for(const row of gates)item(gate.body,`${row.gateState||(row.passed?"pass":"unknown")} · ${row.packetId||`attempt ${row.attemptId}`}`,row.summary,row.note);
+    for(const row of gates){const gateLabel=row.passed===null?"unknown":row.gateState||(row.passed===true?"pass":row.passed===false?"fail":"unknown");item(gate.body,`${gateLabel} · ${row.packetId||`attempt ${row.attemptId}`}`,row.summary,row.note);}
     grid.append(gate.box);
     const work=panel("Workers"); if(!workers.length)work.body.append(el("div","empty","No provider session is live.")); for(const worker of workers)item(work.body,worker.seat||worker.provider||worker.sessionId,`${worker.state||"unknown"}${worker.model?` · ${worker.model}`:""}`);grid.append(work.box);
     // Every finding the payload carried, addressed and tallied. The panel
