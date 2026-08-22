@@ -9,8 +9,8 @@ use serde_json::{json, Value};
 
 use crate::adapters::ports::ForgedPorts;
 use crate::core::{
-    default_key, derive_key, err_response, fenced, on_ledger, param_opt_str, param_str, run_holder,
-    Ctx, Failure,
+    default_key, derive_key, err_response, fenced, lease_identity, on_ledger, param_opt_str,
+    param_str, run_holder, Ctx, Failure,
 };
 
 /// One validated whole-run settlement request.
@@ -35,6 +35,25 @@ pub(crate) fn accepted_risk_reason(acceptance: &forged_types::AcceptedRisk) -> S
 
 fn outcome(value: &str) -> Result<RunOutcome, Failure> {
     RunOutcome::try_from(value).map_err(Failure::from)
+}
+
+/// The deterministic marker addressing a run's terminal Beads comment. The
+/// settlement write and the supervisor's convergence probe must derive the
+/// identical string or the probe can never observe a delivered comment.
+pub(super) fn settlement_marker(run_id: &str, outcome: RunOutcome) -> String {
+    format!("[forged-run:{run_id}:{}]", outcome.as_str())
+}
+
+/// The exact `run.bead-settlement.succeeded` payload. Shared with the
+/// supervisor retry pass so convergence from either writer is one event
+/// shape, deduplicable by byte equality.
+pub(super) fn succeeded_payload(bead_id: &str, outcome: RunOutcome) -> Value {
+    json!({
+        "schema": "forged.bead-settlement/1",
+        "beadId": bead_id,
+        "outcome": outcome.as_str(),
+        "settled": true,
+    })
 }
 
 fn parse(req: &OperationRequest) -> Result<(String, Settlement), Failure> {
@@ -86,15 +105,34 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
     }
 }
 
-async fn settle_bead(
+/// Settle the bead under `actor` — the caller's resolved custody identity.
+///
+/// The primary `run stop` path passes the bd lease identity actually in
+/// force — the derived run holder or an adopted frontier claim from
+/// `claim-next` — read at settlement time. A hardcoded derived holder would
+/// wedge settlement of a frontier-claimed bead against forged's own lease.
+/// The supervisor retry pass instead passes the custody epoch RECORDED in
+/// the pending payload, so a later claim-next's live frontier claim is
+/// never adopted by an old settlement's retry.
+///
+/// Residual window, accepted: holder strings cannot name epochs, so a
+/// custody change to the SAME string between the identity read and the
+/// CAS write — a released-then-re-claimed frontier claim, or a repeated
+/// `run stop` for the same run whose earlier settlement is still pending —
+/// is indistinguishable here. The ledger bounds it from both sides: the
+/// retry pass's charge and succeeded appends are fenced on the pending
+/// event still heading the stream, and every bd write is CAS-guarded on
+/// the exact holder, so the window needs a byte-identical claim taken
+/// while a terminal run's settlement is still pending.
+pub(super) async fn settle_bead(
     ctx: &Ctx,
     run_id: &str,
     bead_id: &str,
     settlement: &Settlement,
+    actor: &str,
 ) -> Result<Value, Failure> {
     let bd = ctx.config.bd_config();
-    let actor = run_holder(bead_id);
-    let marker = format!("[forged-run:{run_id}:{}]", settlement.outcome.as_str());
+    let marker = settlement_marker(run_id, settlement.outcome);
     let detail = match settlement.outcome {
         RunOutcome::Landed => format!(
             "{}; landed in PR #{} at {}",
@@ -115,8 +153,8 @@ async fn settle_bead(
             // atomic update. A successor or an unowned Bead therefore gets
             // neither closed nor annotated by this predecessor. Close and
             // release are one CAS, removing the old partially-closed seam.
-            let closed = forged_beads::close_held_issue(&bd, bead_id, &actor).await?;
-            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
+            let closed = forged_beads::close_held_issue(&bd, bead_id, actor).await?;
+            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -127,8 +165,8 @@ async fn settle_bead(
             }))
         }
         RunOutcome::Blocked | RunOutcome::InputRequired => {
-            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
-            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, &actor, true).await?;
+            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
+            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, actor, true).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -138,8 +176,8 @@ async fn settle_bead(
             }))
         }
         RunOutcome::Cancelled | RunOutcome::Superseded => {
-            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
-            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, &actor, false).await?;
+            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
+            let issue = forged_beads::release_unresolved_issue(&bd, bead_id, actor, false).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -152,7 +190,7 @@ async fn settle_bead(
         // explicit landed settlement. AcceptedRisk is rejected by parse and
         // owned by the review acceptance operation.
         RunOutcome::Clean | RunOutcome::AcceptedRisk => {
-            forged_beads::comment_once(&bd, bead_id, &actor, &marker, &detail).await?;
+            forged_beads::comment_once(&bd, bead_id, actor, &marker, &detail).await?;
             Ok(json!({
                 "id": bead_id,
                 "settled": true,
@@ -235,10 +273,27 @@ pub(crate) async fn settle(
     // also catches an attempt that raced the terminal state write.
     let stopped_attempts =
         stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
-    let bead = match settle_bead(ctx, run_id, &run.bead_id, &settlement).await {
+    // Resolve the custody identity once, before the mutation chain: the
+    // pending payload must record the holder actually in force AT PEND TIME
+    // (`observedHolder`), because the retry pass discriminates custody
+    // epochs by that recorded data, never by the live holder string. When
+    // the resolution itself fails — the same bd outage that pends — the
+    // payload marks `observedHolderUnresolved` instead: a failed resolution
+    // is not a legacy non-record, and the retry pass re-resolves it on a
+    // later successful read rather than parking conservative-foreign
+    // forever.
+    let (settled, observed_holder) =
+        match lease_identity(&ctx.config.bd_config(), &run.bead_id, run_id).await {
+            Ok(actor) => (
+                settle_bead(ctx, run_id, &run.bead_id, &settlement, &actor).await,
+                Some(actor),
+            ),
+            Err(error) => (Err(error), None),
+        };
+    let bead = match settled {
         Ok(value) => value,
         Err(error) => {
-            let pending = json!({
+            let mut pending = json!({
                 "schemaVersion": 1,
                 "beadId": run.bead_id,
                 "outcome": settlement.outcome.as_str(),
@@ -247,6 +302,10 @@ pub(crate) async fn settle(
                 "pending": true,
                 "error": error.to_string(),
             });
+            match observed_holder {
+                Some(holder) => pending["observedHolder"] = json!(holder),
+                None => pending["observedHolderUnresolved"] = json!(true),
+            }
             let event_run = run_id.to_owned();
             let event = pending.clone();
             on_ledger(&ctx.ledger, move |ledger| {
@@ -259,12 +318,7 @@ pub(crate) async fn settle(
     };
     if bead.get("settled").and_then(Value::as_bool) == Some(true) {
         let event_run = run_id.to_owned();
-        let event = json!({
-            "schema": "forged.bead-settlement/1",
-            "beadId": run.bead_id,
-            "outcome": settlement.outcome.as_str(),
-            "settled": true,
-        });
+        let event = succeeded_payload(&run.bead_id, settlement.outcome);
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.append_event_once(
                 &event_run,

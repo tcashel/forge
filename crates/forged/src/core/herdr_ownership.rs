@@ -688,7 +688,10 @@ mod tests {
             ledger: ledger.clone(),
         };
 
-        let report = super::super::supervise::tick(&ctx).await.expect("tick");
+        let mut settlement = super::super::supervise::BeadSettlementPass::new();
+        let report = super::super::supervise::tick(&ctx, &mut settlement, true)
+            .await
+            .expect("tick");
         assert!(report["subjects"].as_array().expect("subjects").is_empty());
         assert_eq!(report["cleanup"]["effects"][0]["outcome"], "closed");
         assert_eq!(report["nextWakeAt"], Value::Null);

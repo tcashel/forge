@@ -78,6 +78,95 @@ impl Drop for ProjectionPassTask {
     }
 }
 
+/// The bead settlement pass slot, owned by the supervise session ACROSS
+/// ticks. Its per-run probes and guarded writes are bounded only by bd's
+/// own timeouts, so it must never sit in front of due-work claiming and
+/// admission: a wedged bd — the exact condition that creates pending
+/// settlements — delays only settlement work, never packet admission, on
+/// this tick or the next. The tick spawns a new pass only when the previous
+/// pass's handle has finished (a non-blocking poll) and NEVER awaits a
+/// running one; the tick report carries the last COMPLETED pass's report.
+/// `supervise --once` joins the pass fully, so single-tick runs stay
+/// deterministic; a pass failure is folded into the report it carries,
+/// never propagated — supervision and admission outlive any settlement
+/// wedge.
+/// An abort on drop is equivalent to a crash: the persisted charge and
+/// claim lease are the recovery evidence.
+pub(super) struct BeadSettlementPass {
+    handle: Option<tokio::task::JoinHandle<Result<Value, Failure>>>,
+    last_report: Value,
+}
+
+impl BeadSettlementPass {
+    pub(super) fn new() -> Self {
+        Self {
+            handle: None,
+            last_report: Value::Null,
+        }
+    }
+
+    /// Harvest a FINISHED pass without blocking, then spawn a new one when
+    /// idle. A pass still running is left alone: no second pass spawns
+    /// while one runs, and the tick never waits.
+    async fn poll(&mut self, ctx: &Ctx) {
+        if self
+            .handle
+            .as_ref()
+            .is_some_and(tokio::task::JoinHandle::is_finished)
+        {
+            self.harvest().await;
+        }
+        if self.handle.is_none() {
+            let pass_ctx = Ctx {
+                config: ctx.config.clone(),
+                ledger: ctx.ledger.clone(),
+            };
+            self.handle = Some(tokio::spawn(async move {
+                super::bead_settlement::reconcile(&pass_ctx).await
+            }));
+        }
+    }
+
+    /// Join the current pass to completion — the `--once` determinism seam.
+    async fn join(&mut self) {
+        self.harvest().await;
+    }
+
+    /// Fold the finished pass into the report — NEVER a propagated error.
+    /// A pass failure or panic is a per-pass fact the next tick's report
+    /// carries; propagating it would let a settlement wedge skip due-work
+    /// claiming or terminate long-running supervision, the exact coupling
+    /// the decoupled pass exists to prevent.
+    async fn harvest(&mut self) {
+        let Some(handle) = self.handle.take() else {
+            return;
+        };
+        self.last_report = match handle.await {
+            Ok(Ok(report)) => report,
+            Ok(Err(failure)) => json!({
+                "schema": "forged.bead-settlement.report/1",
+                "error": failure.to_string(),
+            }),
+            Err(error) => json!({
+                "schema": "forged.bead-settlement.report/1",
+                "error": format!("bead settlement task failed: {error}"),
+            }),
+        };
+    }
+
+    fn report(&self) -> Value {
+        self.last_report.clone()
+    }
+}
+
+impl Drop for BeadSettlementPass {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 fn scope(kind: DesiredSubjectKind) -> Scope {
     match kind {
         DesiredSubjectKind::Run => Scope::Run,
@@ -85,7 +174,7 @@ fn scope(kind: DesiredSubjectKind) -> Scope {
     }
 }
 
-fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
+pub(super) fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
     let timestamp: jiff::Timestamp = anchor.parse().map_err(|error| {
         Failure::internal(format!(
             "cannot parse supervisor timestamp {anchor:?}: {error}"
@@ -811,13 +900,23 @@ async fn finish_spawn_failure(
     .await
 }
 
-pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
+pub(super) async fn tick(
+    ctx: &Ctx,
+    settlement: &mut BeadSettlementPass,
+    join_settlement: bool,
+) -> Result<Value, Failure> {
     let started_at = now_iso();
     // Give terminal custom-source release an opportunity to race independent
     // close, but never put Herdr's network latency in front of cleanup or
     // runnable work. The durable projection lease makes cancellation safe:
     // an ambiguous request is retried later at a strictly newer sequence.
     let projection_task = ProjectionPassTask::start(ctx);
+    // Pending bead settlements are a third independent durable queue: the
+    // read-only convergence probe and the budgeted, per-run-fenced mutating
+    // retries live inside the pass. It runs beside the tick, decoupled from
+    // the tick join, never in front of due-work claiming — see
+    // [`BeadSettlementPass`].
+    settlement.poll(ctx).await;
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
     let cleanup = super::herdr_ownership::reconcile(ctx).await?;
@@ -989,6 +1088,10 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         }
     }
     let projection = projection_task.finish().await;
+    if join_settlement {
+        settlement.join().await;
+    }
+    let bead_settlement = settlement.report();
     let wake_now = now_iso();
     let desired_now = wake_now.clone();
     let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
@@ -1018,6 +1121,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "subjects": subjects,
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
+        "beadSettlement": bead_settlement,
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))
@@ -1119,7 +1223,9 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
         );
     }
     if once {
-        return match tick(ctx).await {
+        // One deterministic tick: the settlement pass is joined fully.
+        let mut settlement = BeadSettlementPass::new();
+        return match tick(ctx, &mut settlement, true).await {
             Ok(report) => ok_response(&key, false, report),
             Err(error) => err_response(&key, &error),
         };
@@ -1141,8 +1247,9 @@ pub async fn supervise(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
     let started_at = now_iso();
     let mut ticks = 0u64;
     let mut last_report = Value::Null;
+    let mut settlement = BeadSettlementPass::new();
     loop {
-        match tick(ctx).await {
+        match tick(ctx, &mut settlement, false).await {
             Ok(report) => {
                 ticks = ticks.saturating_add(1);
                 if let Some(observer) = observer.as_mut() {

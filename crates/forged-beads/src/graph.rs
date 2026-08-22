@@ -1237,8 +1237,7 @@ pub async fn comment_once(
     marker: &str,
     body: &str,
 ) -> Result<bool, BdError> {
-    let current = invoke::read(cfg, &["comments", id, "--json"]).await?;
-    if current.to_string().contains(marker) {
+    if comment_present(cfg, id, marker).await? {
         return Ok(false);
     }
     let text = format!("{marker} {body}");
@@ -1253,6 +1252,14 @@ pub async fn comment_once(
     )
     .await?;
     Ok(true)
+}
+
+/// Whether a marker-addressed lifecycle comment is already present. This is
+/// the read half of [`comment_once`], exposed so a convergence probe can
+/// observe a delivered comment without ever holding write authority.
+pub async fn comment_present(cfg: &BdConfig, id: &str, marker: &str) -> Result<bool, BdError> {
+    let current = invoke::read(cfg, &["comments", id, "--json"]).await?;
+    Ok(current.to_string().contains(marker))
 }
 
 /// Idempotently clear the run holder after terminal settlement.
