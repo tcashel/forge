@@ -536,9 +536,23 @@ fn controller_fence_target_from_record(
         return Ok(None);
     }
     let (pid, lstart) = record_driver_identity(record);
-    let pid = pid.ok_or_else(|| Failure::internal("controller record has no driver pid"))?;
-    let lstart = lstart
-        .ok_or_else(|| Failure::internal("controller record has no driver start identity"))?;
+    // A missing pid OR a missing lstart makes the death fence impossible;
+    // the typed refusal routes the operator to `run adjudicate-settlement`
+    // instead of reading as an internal bug.
+    let pid = pid.ok_or_else(|| {
+        Failure::refused(
+            forged_types::ErrorCode::AdjudicationRequired,
+            "controller record has no driver pid; settlement of this run requires \
+             the explicit `run adjudicate-settlement` decision",
+        )
+    })?;
+    let lstart = lstart.ok_or_else(|| {
+        Failure::refused(
+            forged_types::ErrorCode::AdjudicationRequired,
+            "controller record has no driver start identity; settlement of this run \
+             requires the explicit `run adjudicate-settlement` decision",
+        )
+    })?;
     let scope = match record.get("scope").and_then(Value::as_str) {
         Some("run") => Scope::Run,
         Some("epic") => Scope::Epic,

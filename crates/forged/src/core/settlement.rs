@@ -226,15 +226,44 @@ async fn settle_aftermath(
         stop_live_attempts(ctx, run_id, &run.stop_reason.clone().unwrap()).await?;
     let converged = if closed_bead_converges {
         match forged_beads::show_issue(&ctx.config.bd_config(), &run.bead_id).await {
-            Ok(issue) if issue.status == "closed" => Some(json!({
-                "id": run.bead_id,
-                "settled": true,
-                "status": issue.status,
-                "assignee": issue.assignee,
-                "closed": true,
-                "alreadyClosed": true,
-                "released": issue.assignee.is_none(),
-            })),
+            Ok(issue) if issue.status == "closed" => {
+                // The closed Bead converges every adjudicated outcome, but
+                // stale forged custody is still released — leaving
+                // forged:<bead>:0 on a closed Bead forever is the exact
+                // noise this operation retires. Foreign custody is a
+                // successor's and stays untouched; a failed release is
+                // reported honestly, never read as settled custody.
+                let expected = run_holder(&run.bead_id);
+                let (assignee, released, release_error) = match issue.assignee.as_deref() {
+                    None => (None, true, None),
+                    Some(holder) if holder == expected => {
+                        match forged_beads::release_issue(
+                            &ctx.config.bd_config(),
+                            &run.bead_id,
+                            holder,
+                        )
+                        .await
+                        {
+                            Ok(after) => (after.assignee, true, None),
+                            Err(error) => (issue.assignee.clone(), false, Some(error.to_string())),
+                        }
+                    }
+                    Some(_) => (issue.assignee.clone(), false, None),
+                };
+                let mut converged = json!({
+                    "id": run.bead_id,
+                    "settled": true,
+                    "status": issue.status,
+                    "assignee": assignee,
+                    "closed": true,
+                    "alreadyClosed": true,
+                    "released": released,
+                });
+                if let Some(error) = release_error {
+                    converged["releaseError"] = json!(error);
+                }
+                Some(converged)
+            }
             // An open Bead — or one this read cannot reach — belongs to the
             // live settlement path below, whose pending fallback stays
             // retryable against the same evidence.
@@ -819,8 +848,10 @@ async fn probe_existing(
         )
     })?;
     if row.request_sha256 != hash {
+        // The row is in hand, so the error names its REAL operation id —
+        // the recovery/audit handle — never the incoming key.
         return Err((
-            key,
+            row.operation_id.clone(),
             Failure::refused(
                 ErrorCode::IdempotencyConflict,
                 format!(
@@ -859,29 +890,10 @@ async fn probe_existing(
         .await
     };
     if let Err(error) = resolved {
-        // A concurrent same-key invocation may have sealed the row between
-        // our read and this resolve. A terminal row holding our exact
-        // request is that invocation's identical outcome: replay it as
-        // benign instead of surfacing the lost race to the operator.
-        let sealed = {
-            let key = row.idempotency_key.clone();
-            on_ledger(&ctx.ledger, move |ledger| {
-                ledger.find_operation(ADJUDICATE_NAME, &key)
-            })
-            .await
-            .ok()
-            .flatten()
-        };
-        if let Some(sealed) = sealed {
-            if sealed.state == OperationState::Terminal && sealed.request_sha256 == hash {
-                if let Some(stored) = sealed.response_json {
-                    if let Ok(mut replay) = serde_json::from_str::<OperationResponse>(&stored) {
-                        replay.reused = true;
-                        return Ok(Some(replay));
-                    }
-                }
-            }
-        }
+        // No concurrent same-key seal can exist here: the run submit
+        // singleton is held from the operation-row probe through this
+        // resolve, so a failed seal is a real ledger failure carried under
+        // the row's operation id, never a lost race to paper over.
         return Err((row.operation_id, error));
     }
     Ok(Some(response))
@@ -892,6 +904,15 @@ async fn probe_existing(
 /// distinct operation with its own name and human-ambiguous effect class,
 /// never a flag on `run stop`: the live fence path is not weakened.
 pub async fn run_adjudicate_settlement(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    // The envelope gate runs BEFORE the operation-store probe: an
+    // unsupported schemaVersion must not execute, resume, or replay a
+    // destructive adjudication through the existing-row path.
+    if let Err(error) = super::check_schema_version(req) {
+        return err_response(
+            &derive_key(ADJUDICATE_NAME, req.run_id.as_deref(), None, None),
+            &error,
+        );
+    }
     let (run_id, adjudication) = match parse_adjudication(req) {
         Ok(value) => value,
         Err(error) => {

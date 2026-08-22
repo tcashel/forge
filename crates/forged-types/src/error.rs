@@ -28,13 +28,17 @@ pub enum ErrorCode {
     GraphScopeTooLarge,
     GhError,
     Internal,
+    /// The run's controller record lacks durable driver identity, so no
+    /// death fence is possible: settlement requires the explicit
+    /// `run adjudicate-settlement` decision, never a retry.
+    AdjudicationRequired,
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const ALL: [(ErrorCode, &str); 19] = [
+    const ALL: [(ErrorCode, &str); 20] = [
         (ErrorCode::InvalidRequest, "INVALID_REQUEST"),
         (ErrorCode::RunNotFound, "RUN_NOT_FOUND"),
         (ErrorCode::PacketNotClaimable, "PACKET_NOT_CLAIMABLE"),
@@ -57,11 +61,12 @@ mod tests {
         (ErrorCode::GraphScopeTooLarge, "GRAPH_SCOPE_TOO_LARGE"),
         (ErrorCode::GhError, "GH_ERROR"),
         (ErrorCode::Internal, "INTERNAL"),
+        (ErrorCode::AdjudicationRequired, "ADJUDICATION_REQUIRED"),
     ];
 
     #[test]
-    fn serializes_to_exactly_the_nineteen_screaming_snake_strings() {
-        assert_eq!(ALL.len(), 19);
+    fn serializes_to_exactly_the_twenty_screaming_snake_strings() {
+        assert_eq!(ALL.len(), 20);
         for (code, expected) in ALL {
             let json = serde_json::to_value(code).expect("serializes");
             assert_eq!(json, serde_json::Value::String(expected.to_owned()));

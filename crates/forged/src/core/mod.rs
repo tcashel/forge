@@ -450,7 +450,7 @@ pub fn key_absent(req: &OperationRequest) -> bool {
 
 /// Validate `schemaVersion == 1` for read paths (mutating paths get the
 /// same check from `begin_operation`).
-fn check_schema_version(req: &OperationRequest) -> Result<(), Failure> {
+pub(crate) fn check_schema_version(req: &OperationRequest) -> Result<(), Failure> {
     if req.schema_version != 1 {
         return Err(Failure::invalid(format!(
             "unsupported schemaVersion {}",

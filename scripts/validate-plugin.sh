@@ -174,6 +174,8 @@ const requiredSkillText = [
   'accepted-unknown',
   'evidence-absent',
   'manifest-less attempt',
+  'forged run adjudicate-settlement',
+  'ADJUDICATION_REQUIRED',
   'session stop',
   'portfolio-control-fixtures.json',
 ];
@@ -241,10 +243,15 @@ const expected = new Map(Object.entries({
   'merge-approval': ['refuse', 'human-decision', 'human-github-boundary'],
   'session-diagnostic': ['session-diagnostic', 'none', 'read-only-attempt-detail'],
   'session-stop-substitution': ['refuse', 'not-applicable', 'work-control-required'],
+  'adjudicate-unfenceable': ['run-adjudicate-settlement', 'destructive',
+    'adjudicated-terminal-readback', {runAdjudications: 1}],
+  'adjudicate-fenceable-refused': ['refuse', 'not-applicable',
+    'live-fence-run-stop-only'],
 }));
 const effectKeys = [
   'beadClaims', 'beadPriorityUpdates', 'beadOtherWrites',
-  'epicPauses', 'epicResumes', 'runStops', 'riskAcceptances',
+  'epicPauses', 'epicResumes', 'runStops', 'runAdjudications',
+  'riskAcceptances',
   'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens',
   'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits', 'sessionStops',
   'serviceMutations', 'providerCalls', 'repositoryWrites', 'githubWrites',
@@ -685,7 +692,7 @@ function validateParityFixture(registration) {
       {
         path: 'portfolio-control-fixtures.json',
         schema: 'forged.manage-work-portfolio-control-fixtures/1',
-        caseCount: 31,
+        caseCount: 33,
         comparisonFields: ['route', 'confirmation', 'postcondition', 'effectBudget'],
       },
     ),

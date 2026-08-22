@@ -76,6 +76,11 @@ fn legacy_record_settles_with_revocation_terminal_and_adjudication_event() {
         "operator cancelled",
     ]);
     assert_eq!(stopped["ok"], json!(false), "{stopped}");
+    assert_eq!(
+        stopped["error"]["code"],
+        json!("ADJUDICATION_REQUIRED"),
+        "the refusal is typed so hosts route on the code, not free text: {stopped}"
+    );
 
     let (code, response) = env.forged(&[
         "run",
@@ -395,11 +400,30 @@ fn a_closed_bead_converges_for_every_outcome() {
             json!(true),
             "{run}: {response}"
         );
-        assert_eq!(
-            mutation_calls(&env, &bead).len(),
-            before,
-            "{run}: a closed Bead converges without a single bd mutation"
+        let mutations: Vec<String> = mutation_calls(&env, &bead)
+            .into_iter()
+            .skip(before)
+            .collect();
+        // The one guarded release: forged's stale custody comes off the
+        // closed Bead, and nothing else is written.
+        let expected_holder = format!("forged:{bead}:0");
+        assert_eq!(mutations.len(), 1, "{run}: {mutations:?}");
+        assert!(
+            mutations[0].contains("--assignee ")
+                && mutations[0].contains(&format!("--if-assignee {expected_holder}")),
+            "{run}: the release is CAS-guarded on the stale holder: {mutations:?}"
         );
+        assert_eq!(
+            response["result"]["bead"]["released"],
+            json!(true),
+            "{run}: {response}"
+        );
+        assert_eq!(
+            response["result"]["bead"]["assignee"],
+            json!(null),
+            "{run}: {response}"
+        );
+        assert_eq!(env.assignee(&bead), None, "{run}: custody is released");
 
         let ledger = env.ledger();
         let row = ledger.get_run(run).expect("run");
@@ -419,6 +443,58 @@ fn a_closed_bead_converges_for_every_outcome() {
         );
         ledger.close().expect("close");
     }
+}
+
+/// An unsupported schemaVersion refuses BEFORE the operation-store probe:
+/// it can neither execute a fresh destructive adjudication nor resume or
+/// replay one through the existing-row path.
+#[test]
+fn an_unsupported_schema_version_never_executes_or_replays_adjudication() {
+    let env = TestEnv::new("forged-adjudicate-schema");
+    env.forged(&["init"]);
+    let run = "adj-schema";
+    seed_legacy(&env, run);
+
+    let params = json!({
+        "run": run,
+        "outcome": "cancelled",
+        "pr": null,
+        "sha": null,
+        "supersededBy": null,
+        "actor": "operator",
+        "rationale": "legacy run",
+        "evidenceGap": "controller.started carries no /driver/pid and no lstart",
+    });
+    let mut mcp = McpClient::new(&env);
+    let refused = mcp.call_tool(
+        "run_adjudicate_settlement",
+        json!({"schemaVersion": 99, "runId": run, "params": params}),
+    );
+    assert_eq!(refused["ok"], json!(false), "{refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{refused}"
+    );
+
+    // A durable terminal row exists now; the bad envelope still refuses
+    // instead of replaying the stored destructive response.
+    let accepted = mcp.call_tool(
+        "run_adjudicate_settlement",
+        json!({"schemaVersion": 1, "runId": run, "params": params}),
+    );
+    assert_eq!(accepted["ok"], json!(true), "{accepted}");
+    let replay_refused = mcp.call_tool(
+        "run_adjudicate_settlement",
+        json!({"schemaVersion": 99, "runId": run, "params": params}),
+    );
+    assert_eq!(replay_refused["ok"], json!(false), "{replay_refused}");
+    assert_eq!(
+        replay_refused["error"]["code"],
+        json!("INVALID_REQUEST"),
+        "{replay_refused}"
+    );
+    assert_eq!(replay_refused["reused"], json!(false), "{replay_refused}");
 }
 
 /// An envelope runId that disagrees with params.run is refused before
