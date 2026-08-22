@@ -410,8 +410,8 @@ fn semantic_operations_scenario() -> Value {
         "landed-run",
         "Merged delivery",
         "stopped",
-        json!("landed"),
-        json!({"queueGroup": "Recent"}),
+        Value::Null,
+        json!({"queueGroup": "Recent", "merged": true}),
     );
     let dormant = entry(
         "planned-work",
