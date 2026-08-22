@@ -7,10 +7,12 @@
 
 use std::path::PathBuf;
 
-use forged_host::{HerdrCloseOutcome, HerdrControl, HerdrSessionIdentity, PreparedSession};
+use forged_host::{
+    HerdrCloseOutcome, HerdrControl, HerdrProcessInfoProbe, HerdrSessionIdentity, PreparedSession,
+};
 use forged_ledger::{
     DesiredState, DesiredSubjectKind, OwnedHerdrCleanupReason, OwnedHerdrCleanupRelease,
-    OwnedHerdrCleanupRetry, OwnedHerdrCleanupState, OwnedHerdrSessionRow,
+    OwnedHerdrCleanupRetry, OwnedHerdrCleanupState, OwnedHerdrLifecycleState, OwnedHerdrSessionRow,
 };
 use forged_types::{
     OwnedHerdrOwnerV1, OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1,
@@ -85,16 +87,70 @@ async fn request_controller_cleanup(
         .controller_generation
         .ok_or_else(|| Failure::internal("owned controller has no generation"))?;
     on_ledger(&ctx.ledger, move |ledger| {
-        ledger.request_owned_herdr_controller_cleanup(
-            &ownership_id,
-            kind,
-            &subject_id,
-            generation,
-            reason,
-        )?;
+        if reason == OwnedHerdrCleanupReason::OrphanedSubmit {
+            ledger.request_orphaned_owned_herdr_controller_cleanup(
+                &ownership_id,
+                kind,
+                &subject_id,
+                generation,
+            )?;
+        } else {
+            ledger.request_owned_herdr_controller_cleanup(
+                &ownership_id,
+                kind,
+                &subject_id,
+                generation,
+                reason,
+            )?;
+        }
         Ok(())
     })
     .await
+}
+
+async fn request_abandoned_cleanup(ctx: &Ctx, row: &OwnedHerdrSessionRow) -> Result<(), Failure> {
+    let ownership_id = row.ownership_id.clone();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.request_abandoned_owned_herdr_cleanup(&ownership_id)?;
+        Ok(())
+    })
+    .await
+}
+
+/// Confirmed-death argument for an owned submit with no durable desired epoch
+/// at or after its controller generation:
+/// (a) `prepare()` creates the pane before ownership registration, so a live
+/// submit in this seam can only answer `Info`; (b) protocol 19 pins pane ids as
+/// never reused, and future reuse could only answer `Info` and re-fence; (c) a
+/// controller surviving a Herdr-only restart cannot dispatch machine effects
+/// until the matching running desired epoch exists, which this branch has
+/// rechecked as absent.
+async fn observe_submit_without_matching_desired(
+    ctx: &Ctx,
+    row: &OwnedHerdrSessionRow,
+) -> Result<&'static str, Failure> {
+    let identity = host_identity(row);
+    let control = HerdrControl::connect_for(&identity).await?;
+    match control.probe_process_info(&identity).await? {
+        HerdrProcessInfoProbe::Info => Ok("submit-pane-present"),
+        HerdrProcessInfoProbe::PaneNotFound => {
+            crate::failpoint::hit("controller.orphaned-submit.probe.after");
+            match row.lifecycle_state {
+                OwnedHerdrLifecycleState::Registered => {
+                    request_abandoned_cleanup(ctx, row).await?;
+                    Ok("abandoned-submit-pane-not-found")
+                }
+                OwnedHerdrLifecycleState::CommandStarted => {
+                    request_controller_cleanup(ctx, row, OwnedHerdrCleanupReason::OrphanedSubmit)
+                        .await?;
+                    Ok("orphaned-submit-pane-not-found")
+                }
+                OwnedHerdrLifecycleState::OwnerTerminal | OwnedHerdrLifecycleState::OwnerDead => {
+                    Ok("already-requested")
+                }
+            }
+        }
+    }
 }
 
 /// Turn exact durable controller observations into cleanup eligibility.
@@ -119,7 +175,7 @@ async fn observe_controller(
         .await?
     };
     let Some(current) = current else {
-        return Ok("unknown-no-desired-work");
+        return observe_submit_without_matching_desired(ctx, row).await;
     };
     if current.controller_generation > generation {
         // A later generation can exist only after the desired-work restart
@@ -128,7 +184,7 @@ async fn observe_controller(
         return Ok("dead-predecessor");
     }
     if current.controller_generation < generation {
-        return Ok("unknown-future-generation");
+        return observe_submit_without_matching_desired(ctx, row).await;
     }
     if current.desired_state == DesiredState::Stopped {
         request_controller_cleanup(ctx, row, OwnedHerdrCleanupReason::ControllerTerminal).await?;
@@ -407,7 +463,7 @@ fn ownership_id(owner: &OwnedHerdrOwnerV1) -> Result<String, Failure> {
 mod tests {
     use super::*;
     use forged_ledger::{Ledger, NewPacket, NewRun, OwnedHerdrCleanupState, SpecFence};
-    use forged_types::{RunId, Stage};
+    use forged_types::{ErrorCode, OperationRequest, RunId, Stage};
     use serde_json::{json, Value};
     use std::collections::{BTreeMap, HashMap};
     use std::sync::{Arc, Mutex};
@@ -475,6 +531,114 @@ mod tests {
             }
         });
         methods
+    }
+
+    #[derive(Clone, Copy)]
+    enum ProbeAnswer {
+        Info,
+        PaneNotFound,
+        ProtocolMismatch,
+        MalformedPong,
+    }
+
+    async fn probe_server(
+        socket: &std::path::Path,
+        answer: ProbeAnswer,
+    ) -> Arc<Mutex<Vec<String>>> {
+        let listener = UnixListener::bind(socket).expect("bind probe socket");
+        let methods = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&methods);
+        tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let recorded = Arc::clone(&recorded);
+                tokio::spawn(async move {
+                    let (read, mut write) = stream.into_split();
+                    let mut lines = BufReader::new(read).lines();
+                    let Ok(Some(line)) = lines.next_line().await else {
+                        return;
+                    };
+                    let request: Value = serde_json::from_str(&line).expect("request json");
+                    let id = request["id"].as_str().expect("request id");
+                    let method = request["method"].as_str().expect("method").to_owned();
+                    recorded.lock().expect("methods lock").push(method.clone());
+                    let frame = match method.as_str() {
+                        "ping" if matches!(answer, ProbeAnswer::MalformedPong) => {
+                            json!({"id": id, "result": {"type": "ok"}})
+                        }
+                        "ping" => json!({
+                            "id": id,
+                            "result": {
+                                "type": "pong",
+                                "version": "test",
+                                "protocol": if matches!(answer, ProbeAnswer::ProtocolMismatch) {
+                                    18
+                                } else {
+                                    19
+                                },
+                                "capabilities": {},
+                            },
+                        }),
+                        "pane.process_info" if matches!(answer, ProbeAnswer::Info) => json!({
+                            "id": id,
+                            "result": {
+                                "type": "pane_process_info",
+                                "process_info": {
+                                    "pane_id": "owned-pane",
+                                    "shell_pid": 42,
+                                    "foreground_process_group_id": 42,
+                                    "foreground_processes": [],
+                                },
+                            },
+                        }),
+                        "pane.process_info" | "pane.close"
+                            if matches!(answer, ProbeAnswer::PaneNotFound) =>
+                        {
+                            json!({
+                                "id": id,
+                                "error": {"code": "pane_not_found", "message": "gone"},
+                            })
+                        }
+                        other => panic!("unexpected probe request {other}"),
+                    };
+                    write
+                        .write_all(format!("{frame}\n").as_bytes())
+                        .await
+                        .expect("write response");
+                });
+            }
+        });
+        methods
+    }
+
+    fn seed_controller_fixture(
+        db_path: &std::path::Path,
+        socket: &std::path::Path,
+        ownership_id: &str,
+        subject_id: &str,
+        lifecycle: &str,
+    ) {
+        let conn = rusqlite::Connection::open(db_path).expect("open fixture database");
+        conn.execute(
+            "INSERT INTO owned_herdr_sessions (
+               ownership_id, schema, owner_kind, subject_kind, subject_id,
+               controller_generation, pane_id, socket_path, protocol, sentinel_path,
+               lifecycle_state, cleanup_state, cleanup_retry_budget,
+               cleanup_retry_used, registered_at, command_started_at, updated_at
+             ) VALUES (?1, 'forged.owned-herdr-session/1', 'controller', 'run', ?2,
+                       1, ?3, ?4, 19, ?5, ?6, 'not-requested', 8, 0,
+                       '2026-01-01T00:00:00.000000000Z', ?7,
+                       '2026-01-01T00:00:00.000000000Z')",
+            rusqlite::params![
+                ownership_id,
+                subject_id,
+                format!("pane-{ownership_id}"),
+                socket.to_string_lossy(),
+                format!("/tmp/{ownership_id}/status"),
+                lifecycle,
+                (lifecycle == "command-started").then_some("2026-01-01T00:00:01.000000000Z"),
+            ],
+        )
+        .expect("seed controller ownership");
     }
 
     async fn loss_then_missing_server(socket: &std::path::Path) -> Arc<Mutex<Vec<String>>> {
@@ -781,6 +945,178 @@ mod tests {
                 .cleanup_state,
             OwnedHerdrCleanupState::Released
         );
+    }
+
+    #[tokio::test]
+    async fn missing_command_started_submit_releases_with_durable_orphan_evidence() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let methods = probe_server(&socket, ProbeAnswer::PaneNotFound).await;
+        let db_path = root.path().join("state.db");
+        let ledger = Ledger::open(&db_path).expect("ledger");
+        seed_controller_fixture(
+            &db_path,
+            &socket,
+            "orphaned-command-started",
+            "orphaned-run",
+            "command-started",
+        );
+        let ctx = Ctx {
+            config: config(root.path()),
+            ledger: ledger.clone(),
+        };
+
+        let report = reconcile(&ctx).await.expect("ownership pass");
+        assert_eq!(
+            report["observedControllers"][0]["observation"],
+            "orphaned-submit-pane-not-found"
+        );
+        assert_eq!(report["effects"][0]["outcome"], "pane-not-found");
+        let row = ledger
+            .get_owned_herdr_session("orphaned-command-started")
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.cleanup_reason,
+            Some(OwnedHerdrCleanupReason::OrphanedSubmit)
+        );
+        assert_eq!(
+            row.cleanup_release,
+            Some(OwnedHerdrCleanupRelease::PaneNotFound)
+        );
+        assert_eq!(row.cleanup_state, OwnedHerdrCleanupState::Released);
+        assert_eq!(
+            methods.lock().expect("methods lock").as_slice(),
+            ["ping", "pane.process_info", "ping", "pane.close"]
+        );
+    }
+
+    #[tokio::test]
+    async fn missing_registered_submit_uses_typed_abandoned_cleanup() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let methods = probe_server(&socket, ProbeAnswer::PaneNotFound).await;
+        let db_path = root.path().join("state.db");
+        let ledger = Ledger::open(&db_path).expect("ledger");
+        seed_controller_fixture(
+            &db_path,
+            &socket,
+            "orphaned-registered",
+            "registered-run",
+            "registered",
+        );
+        let ctx = Ctx {
+            config: config(root.path()),
+            ledger: ledger.clone(),
+        };
+
+        let report = reconcile(&ctx).await.expect("ownership pass");
+        assert_eq!(
+            report["observedControllers"][0]["observation"],
+            "abandoned-submit-pane-not-found"
+        );
+        let row = ledger
+            .get_owned_herdr_session("orphaned-registered")
+            .expect("get")
+            .expect("row");
+        assert_eq!(
+            row.cleanup_reason,
+            Some(OwnedHerdrCleanupReason::CommandNotStarted)
+        );
+        assert_eq!(row.cleanup_state, OwnedHerdrCleanupState::Released);
+        assert_eq!(
+            methods.lock().expect("methods lock").as_slice(),
+            ["ping", "pane.process_info", "ping", "pane.close"]
+        );
+    }
+
+    #[tokio::test]
+    async fn live_unreachable_protocol_and_malformed_orphans_stay_fenced() {
+        for (name, answer, expected_methods) in [
+            (
+                "live",
+                Some(ProbeAnswer::Info),
+                vec!["ping", "pane.process_info"],
+            ),
+            ("unreachable", None, Vec::new()),
+            (
+                "protocol",
+                Some(ProbeAnswer::ProtocolMismatch),
+                vec!["ping"],
+            ),
+            ("malformed", Some(ProbeAnswer::MalformedPong), vec!["ping"]),
+        ] {
+            let root = tempfile::tempdir().expect("tempdir");
+            let socket = root.path().join("herdr.sock");
+            let methods = match answer {
+                Some(answer) => Some(probe_server(&socket, answer).await),
+                None => None,
+            };
+            let db_path = root.path().join("state.db");
+            let ledger = Ledger::open(&db_path).expect("ledger");
+            let subject_id = format!("fenced-{name}-run");
+            ledger
+                .create_run(NewRun {
+                    run_id: RunId::new(&subject_id).expect("run id"),
+                    bead_id: format!("bead-fenced-{name}"),
+                    repo: "/repo".to_owned(),
+                    base_ref: "main".to_owned(),
+                    branch: format!("work/fenced-{name}"),
+                })
+                .expect("run");
+            seed_controller_fixture(
+                &db_path,
+                &socket,
+                &format!("fenced-{name}"),
+                &subject_id,
+                "command-started",
+            );
+            let ctx = Ctx {
+                config: config(root.path()),
+                ledger: ledger.clone(),
+            };
+
+            let report = reconcile(&ctx).await.expect("ownership pass");
+            if name == "live" {
+                assert_eq!(
+                    report["observedControllers"][0]["observation"],
+                    "submit-pane-present"
+                );
+            } else {
+                assert_eq!(report["observedControllers"][0]["observation"], "attention");
+            }
+            assert!(report["effects"].as_array().expect("effects").is_empty());
+            assert_eq!(
+                ledger
+                    .get_owned_herdr_session(&format!("fenced-{name}"))
+                    .expect("get")
+                    .expect("row")
+                    .cleanup_state,
+                OwnedHerdrCleanupState::NotRequested
+            );
+            if let Some(methods) = methods {
+                assert_eq!(
+                    methods.lock().expect("methods lock").as_slice(),
+                    expected_methods
+                );
+            }
+            if name == "live" {
+                let mut request = OperationRequest {
+                    schema_version: 1,
+                    idempotency_key: String::new(),
+                    run_id: Some(subject_id.clone()),
+                    params: json!({"run": subject_id})
+                        .as_object()
+                        .expect("submit params")
+                        .clone(),
+                };
+                let refused = super::super::handoff::run_submit(&ctx, &mut request).await;
+                assert!(!refused.ok, "live pane must fence submit: {refused:?}");
+                let error = refused.error.expect("submit refusal");
+                assert_eq!(error.code, ErrorCode::HostUnavailable);
+                assert!(error.message.contains("unreleased durable Herdr pane"));
+            }
+        }
     }
 
     #[tokio::test]

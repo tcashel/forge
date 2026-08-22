@@ -504,7 +504,9 @@ pub(crate) fn request_controller_cleanup_tx(
 ) -> Result<(), LedgerError> {
     let lifecycle = match reason {
         OwnedHerdrCleanupReason::ControllerTerminal => OwnedHerdrLifecycleState::OwnerTerminal,
-        OwnedHerdrCleanupReason::ControllerDead => OwnedHerdrLifecycleState::OwnerDead,
+        OwnedHerdrCleanupReason::ControllerDead | OwnedHerdrCleanupReason::OrphanedSubmit => {
+            OwnedHerdrLifecycleState::OwnerDead
+        }
         _ => {
             return Err(refused(
                 ErrorCode::InvalidRequest,
@@ -610,6 +612,16 @@ fn exact_controller_settled_tx(
             .is_some_and(|(value, state)| value == i64::from(generation) && state == "stopped"),
         (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::ControllerDead)) => {
             current.is_some_and(|(value, _)| value >= i64::from(generation))
+        }
+        (OwnedHerdrLifecycleState::OwnerDead, Some(OwnedHerdrCleanupReason::OrphanedSubmit)) => {
+            // Exact-generation absence, deliberately admitting LATER desired
+            // epochs: the pane is generation-scoped, so a successor proves
+            // this generation was abandoned and releasing its pane cannot
+            // touch the successor's. A desired row at exactly this
+            // generation means the generation is live, not orphaned. The
+            // strict at-or-above form would strand a requested cleanup the
+            // moment recovery resubmits, wedging the submit fence forever.
+            current.is_none_or(|(value, _)| value != i64::from(generation))
         }
         _ => false,
     })
@@ -772,6 +784,53 @@ impl Ledger {
         })
     }
 
+    /// An unreleased controller pane is an external-effect fence: a submit
+    /// may not replace it until cleanup confirms the exact pane absent.
+    pub fn find_unreleased_owned_herdr_controller(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<Option<OwnedHerdrSessionRow>, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let sql = format!(
+                "SELECT {COLUMNS} FROM owned_herdr_sessions WHERE owner_kind = 'controller' \
+                 AND subject_kind = ?1 AND subject_id = ?2 AND cleanup_state != 'released' \
+                 ORDER BY controller_generation DESC LIMIT 1"
+            );
+            conn.query_row(
+                &sql,
+                rusqlite::params![kind.as_str(), subject_id],
+                owned_row,
+            )
+            .optional()
+            .map_err(Into::into)
+        })
+    }
+
+    /// Greatest released controller generation for this exact subject.
+    /// Unreleased rows fence submission separately and cannot advance it.
+    pub fn max_owned_herdr_controller_generation(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<Option<u32>, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let value: Option<i64> = conn.query_row(
+                "SELECT MAX(controller_generation) FROM owned_herdr_sessions \
+                 WHERE owner_kind = 'controller' AND subject_kind = ?1 AND subject_id = ?2 \
+                 AND cleanup_state = 'released'",
+                rusqlite::params![kind.as_str(), subject_id],
+                |row| row.get(0),
+            )?;
+            value
+                .map(u32::try_from)
+                .transpose()
+                .map_err(|error| internal(format!("invalid owned controller generation: {error}")))
+        })
+    }
+
     /// Durable publication marker after the command was successfully sent.
     pub fn mark_owned_herdr_command_started(
         &self,
@@ -845,6 +904,51 @@ impl Ledger {
         generation: u32,
         reason: OwnedHerdrCleanupReason,
     ) -> Result<OwnedHerdrSessionRow, LedgerError> {
+        if !matches!(
+            reason,
+            OwnedHerdrCleanupReason::ControllerTerminal | OwnedHerdrCleanupReason::ControllerDead
+        ) {
+            return Err(refused(
+                ErrorCode::InvalidRequest,
+                "controller cleanup requires terminal or dead-controller evidence",
+            ));
+        }
+        self.request_owned_herdr_controller_cleanup_inner(
+            ownership_id,
+            kind,
+            subject_id,
+            generation,
+            reason,
+        )
+    }
+
+    /// Persist orphaned-submit cleanup eligibility after the caller's exact
+    /// recorded-socket `pane.process_info` probe returned `pane_not_found`.
+    /// The no-matching-desired-epoch predicate is rechecked transactionally.
+    pub fn request_orphaned_owned_herdr_controller_cleanup(
+        &self,
+        ownership_id: &str,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+        generation: u32,
+    ) -> Result<OwnedHerdrSessionRow, LedgerError> {
+        self.request_owned_herdr_controller_cleanup_inner(
+            ownership_id,
+            kind,
+            subject_id,
+            generation,
+            OwnedHerdrCleanupReason::OrphanedSubmit,
+        )
+    }
+
+    fn request_owned_herdr_controller_cleanup_inner(
+        &self,
+        ownership_id: &str,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+        generation: u32,
+        reason: OwnedHerdrCleanupReason,
+    ) -> Result<OwnedHerdrSessionRow, LedgerError> {
         let ownership_id = ownership_id.to_owned();
         let subject_id = subject_id.to_owned();
         self.submit(move |conn| {
@@ -877,6 +981,12 @@ impl Ledger {
                 OwnedHerdrCleanupReason::ControllerDead => current
                     .as_ref()
                     .is_some_and(|(value, _)| *value >= i64::from(generation)),
+                // Mirrors the settle-time predicate exactly — see
+                // exact_controller_settled_tx for why later epochs are
+                // deliberately admitted.
+                OwnedHerdrCleanupReason::OrphanedSubmit => current
+                    .as_ref()
+                    .is_none_or(|(value, _)| *value != i64::from(generation)),
                 _ => false,
             };
             if !durable {
@@ -1081,6 +1191,32 @@ impl Ledger {
             } else {
                 OwnedHerdrCleanupRetry::Scheduled(row)
             })
+        })
+    }
+
+    /// Requeue every attention-parked controller cleanup for one subject.
+    /// A fresh submit is operator intent that the host is expected back, so
+    /// the exhausted budget resets and the pass retries — the submit fence
+    /// must never refuse forever on a terminal parked row. Returns how many
+    /// rows requeued.
+    pub fn requeue_owned_herdr_cleanup_attention(
+        &self,
+        kind: DesiredSubjectKind,
+        subject_id: &str,
+    ) -> Result<u32, LedgerError> {
+        let subject_id = subject_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let now = now_iso();
+            let affected = tx.execute(
+                "UPDATE owned_herdr_sessions SET cleanup_state = 'pending', \
+                   cleanup_retry_used = 0, next_cleanup_at = ?1, updated_at = ?1 \
+                 WHERE owner_kind = 'controller' AND subject_kind = ?2 \
+                   AND subject_id = ?3 AND cleanup_state = 'attention'",
+                rusqlite::params![now, kind.as_str(), subject_id],
+            )?;
+            tx.commit()?;
+            Ok(u32::try_from(affected).unwrap_or(u32::MAX))
         })
     }
 

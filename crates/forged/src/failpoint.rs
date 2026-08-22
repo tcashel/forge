@@ -65,6 +65,9 @@
 //! `mcp.ledger.open.before` sits between the MCP gate's existence precheck
 //! and its no-create open — the deletion-race window the gate must refuse
 //! without creating state.
+//! `controller.orphaned-submit.probe.after` sits after the recorded Herdr
+//! socket returned exact `pane_not_found` and before any cleanup request is
+//! durable; a crash there must leave the row fenced for the next tick.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:

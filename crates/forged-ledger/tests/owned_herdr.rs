@@ -7,7 +7,7 @@ use forged_ledger::{
 };
 use forged_types::{
     AdmissionCandidateV1, AdmissionDecisionV1, AdmissionInputsV1, AdmissionOutcome,
-    AdmissionReason, AdmissionResourceClass, AdmissionSubjectKind, OwnedHerdrOwnerV1,
+    AdmissionReason, AdmissionResourceClass, AdmissionSubjectKind, ErrorCode, OwnedHerdrOwnerV1,
     OwnedHerdrSessionV1, OwnedHerdrSubjectKind, OwnedHerdrSubjectV1, RunId, Stage,
     ADMISSION_DECISION_SCHEMA_V1, ADMISSION_INPUTS_SCHEMA_V1, OWNED_HERDR_SESSION_SCHEMA_V1,
 };
@@ -95,6 +95,37 @@ fn controller_identity(id: &str, run: &str, generation: u32) -> OwnedHerdrSessio
         sentinel_path: format!("/tmp/exact controller/{generation}/status"),
         layout_id: None,
     }
+}
+
+fn insert_controller_fixture(
+    path: &std::path::Path,
+    ownership_id: &str,
+    run: &str,
+    generation: u32,
+    lifecycle: &str,
+) {
+    let conn = rusqlite::Connection::open(path).expect("open fixture database");
+    conn.execute(
+        "INSERT INTO owned_herdr_sessions (
+           ownership_id, schema, owner_kind, subject_kind, subject_id,
+           controller_generation, pane_id, socket_path, protocol, sentinel_path,
+           lifecycle_state, cleanup_state, cleanup_retry_budget,
+           cleanup_retry_used, registered_at, command_started_at, updated_at
+         ) VALUES (?1, 'forged.owned-herdr-session/1', 'controller', 'run', ?2,
+                   ?3, ?4, '/tmp/herdr.sock', 19, ?5, ?6, 'not-requested',
+                   8, 0, '2026-01-01T00:00:00.000000000Z', ?7,
+                   '2026-01-01T00:00:00.000000000Z')",
+        rusqlite::params![
+            ownership_id,
+            run,
+            i64::from(generation),
+            format!("pane-{ownership_id}"),
+            format!("/tmp/{ownership_id}/status"),
+            lifecycle,
+            (lifecycle == "command-started").then_some("2026-01-01T00:00:01.000000000Z"),
+        ],
+    )
+    .expect("insert controller fixture");
 }
 
 #[test]
@@ -341,6 +372,147 @@ fn exact_controller_generation_and_terminal_state_gate_cleanup() {
             .expect("controllers")
             .len(),
         1
+    );
+}
+
+#[test]
+fn orphaned_submit_requires_no_current_or_later_desired_epoch_and_rechecks_due() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let ledger = Ledger::open(&path).expect("ledger");
+    insert_controller_fixture(&path, "own-orphan", "orphan-run", 2, "command-started");
+    let generic = ledger
+        .request_owned_herdr_controller_cleanup(
+            "own-orphan",
+            DesiredSubjectKind::Run,
+            "orphan-run",
+            2,
+            OwnedHerdrCleanupReason::OrphanedSubmit,
+        )
+        .expect_err("generic cleanup cannot assert probe evidence");
+    assert_eq!(generic.code(), ErrorCode::InvalidRequest);
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, "orphan-run", 1)
+        .expect("older desired epoch does not match the orphan");
+
+    let requested = ledger
+        .request_orphaned_owned_herdr_controller_cleanup(
+            "own-orphan",
+            DesiredSubjectKind::Run,
+            "orphan-run",
+            2,
+        )
+        .expect("request orphaned submit cleanup");
+    assert_eq!(
+        requested.cleanup_reason,
+        Some(OwnedHerdrCleanupReason::OrphanedSubmit)
+    );
+    assert_eq!(
+        requested.lifecycle_state,
+        OwnedHerdrLifecycleState::OwnerDead
+    );
+
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, "orphan-run", 2)
+        .expect("race in matching desired epoch");
+    assert!(ledger
+        .list_due_owned_herdr_cleanup("2099-01-01T00:00:00.000000000Z", 10)
+        .expect("due with desired")
+        .is_empty());
+
+    ledger
+        .authorize_desired_work(DesiredSubjectKind::Run, "orphan-run", 3)
+        .expect("normal resubmit advances beyond the orphan");
+    assert_eq!(
+        ledger
+            .list_due_owned_herdr_cleanup("2099-01-01T00:00:00.000000000Z", 10)
+            .expect("later generation keeps cleanup due")
+            .len(),
+        1
+    );
+    assert_eq!(
+        ledger
+            .earliest_owned_herdr_cleanup_wake("2099-01-01T00:00:00.000000000Z")
+            .expect("later generation keeps cleanup wakeable")
+            .as_deref(),
+        Some("2099-01-01T00:00:00.000000000Z")
+    );
+    let claimed = ledger
+        .claim_owned_herdr_cleanup(
+            "own-orphan",
+            "cleanup-orphan",
+            "2099-01-01T00:00:00.000000000Z",
+            "2099-01-01T00:01:00.000000000Z",
+        )
+        .expect("claim")
+        .expect("eligible again");
+    assert_eq!(
+        claimed.cleanup_reason,
+        Some(OwnedHerdrCleanupReason::OrphanedSubmit)
+    );
+    let released = ledger
+        .ack_owned_herdr_cleanup(
+            "own-orphan",
+            "cleanup-orphan",
+            OwnedHerdrCleanupRelease::PaneNotFound,
+        )
+        .expect("release");
+    assert_eq!(released.cleanup_state, OwnedHerdrCleanupState::Released);
+    assert_eq!(
+        released.cleanup_release,
+        Some(OwnedHerdrCleanupRelease::PaneNotFound)
+    );
+}
+
+#[test]
+fn controller_generation_inventory_includes_only_released_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("state.db");
+    let ledger = Ledger::open(&path).expect("ledger");
+    insert_controller_fixture(&path, "own-generation-1", "generation-run", 1, "registered");
+    insert_controller_fixture(
+        &path,
+        "own-generation-3",
+        "generation-run",
+        3,
+        "command-started",
+    );
+    ledger
+        .request_abandoned_owned_herdr_cleanup("own-generation-1")
+        .expect("registered controller uses abandoned cleanup");
+    let claimed = ledger
+        .claim_owned_herdr_cleanup(
+            "own-generation-1",
+            "cleanup-generation-1",
+            "2099-01-01T00:00:00.000000000Z",
+            "2099-01-01T00:01:00.000000000Z",
+        )
+        .expect("claim")
+        .expect("due");
+    assert_eq!(
+        claimed.cleanup_reason,
+        Some(OwnedHerdrCleanupReason::CommandNotStarted)
+    );
+    ledger
+        .ack_owned_herdr_cleanup(
+            "own-generation-1",
+            "cleanup-generation-1",
+            OwnedHerdrCleanupRelease::PaneNotFound,
+        )
+        .expect("release generation one");
+    assert_eq!(
+        ledger
+            .max_owned_herdr_controller_generation(DesiredSubjectKind::Run, "generation-run")
+            .expect("max generation"),
+        Some(1)
+    );
+    assert_eq!(
+        ledger
+            .find_unreleased_owned_herdr_controller(DesiredSubjectKind::Run, "generation-run")
+            .expect("unreleased controller")
+            .expect("generation three remains fenced")
+            .controller_generation,
+        Some(3)
     );
 }
 

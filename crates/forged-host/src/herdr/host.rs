@@ -36,6 +36,15 @@ pub enum HerdrCloseOutcome {
     AlreadyMissing,
 }
 
+/// Result of a read-only `pane.process_info` probe for an exact durable pane.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HerdrProcessInfoProbe {
+    /// Herdr returned a well-formed process-info result for the pane.
+    Info,
+    /// Herdr returned the exact protocol-19 `pane_not_found` code.
+    PaneNotFound,
+}
+
 /// Result of a projection-scoped report/release call.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum HerdrProjectionOutcome {
@@ -304,6 +313,30 @@ pub struct HerdrControl {
     protocol: u32,
 }
 
+/// The ONE absence contract for `pane.process_info`, shared by every probe:
+/// a well-formed result is the live info, the exact protocol-19
+/// `pane_not_found` code is proof of death (herdr pane ids are never
+/// reused), and everything else — transport failure, other RPC errors,
+/// malformed results — proves nothing and surfaces as its own error.
+async fn probe_pane_process_info(
+    conn: &Connection,
+    pane_id: &str,
+) -> Result<Option<ProcessInfo>, HostError> {
+    match conn
+        .call("pane.process_info", json!({"pane_id": pane_id}))
+        .await
+    {
+        Ok(value) => {
+            let response: ProcessInfoResponse = serde_json::from_value(value).map_err(|_| {
+                HostError::unavailable("malformed pane.process_info result from herdr")
+            })?;
+            Ok(Some(response.process_info))
+        }
+        Err(CallError::Rpc(error)) if error.is_pane_not_found() => Ok(None),
+        Err(other) => Err(other.into_host_error()),
+    }
+}
+
 /// Plain-text pane output safe to expose through CLI/MCP.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -359,6 +392,32 @@ impl HerdrControl {
             });
         }
         Self::connect(identity.socket_path()).await
+    }
+
+    /// Probe the exact durable pane without changing it.
+    ///
+    /// Socket/protocol mismatch is refused before `pane.process_info`. Only
+    /// the exact protocol-19 `pane_not_found` code proves absence; transport
+    /// failures, other RPC errors, and malformed results remain unknown.
+    pub async fn probe_process_info(
+        &self,
+        identity: &HerdrSessionIdentity,
+    ) -> Result<HerdrProcessInfoProbe, HostError> {
+        if identity.protocol() != self.protocol {
+            return Err(HostError::ProtocolMismatch {
+                expected: self.protocol,
+                got: identity.protocol(),
+            });
+        }
+        if identity.socket_path() != self.socket_path || identity.pane_id().is_empty() {
+            return Err(HostError::SessionNotFound {
+                id: identity.pane_id().to_string(),
+            });
+        }
+        match probe_pane_process_info(&self.conn, identity.pane_id()).await? {
+            Some(_) => Ok(HerdrProcessInfoProbe::Info),
+            None => Ok(HerdrProcessInfoProbe::PaneNotFound),
+        }
     }
 
     /// Close the exact durable Herdr identity this control was opened for.
@@ -790,20 +849,9 @@ impl HerdrHost {
     /// response (transport failure, RPC timeout, connection loss) is
     /// [`HostError::Unavailable`] and proves nothing.
     async fn probe_pane(&self, pane_id: &str) -> Result<PaneProbe, HostError> {
-        match self
-            .conn
-            .call("pane.process_info", json!({"pane_id": pane_id}))
-            .await
-        {
-            Ok(value) => {
-                let response: ProcessInfoResponse =
-                    serde_json::from_value(value).map_err(|_| {
-                        HostError::unavailable("malformed pane.process_info result from herdr")
-                    })?;
-                Ok(PaneProbe::Info(response.process_info))
-            }
-            Err(CallError::Rpc(e)) if e.is_pane_not_found() => Ok(PaneProbe::Gone),
-            Err(other) => Err(other.into_host_error()),
+        match probe_pane_process_info(&self.conn, pane_id).await? {
+            Some(info) => Ok(PaneProbe::Info(info)),
+            None => Ok(PaneProbe::Gone),
         }
     }
 

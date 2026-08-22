@@ -336,7 +336,7 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         .expect("seed v14");
     }
     let ledger = Ledger::open(&path).expect("migrate 015");
-    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 20);
+    assert_eq!(ledger.pragmas().expect("pragmas").user_version, 21);
     let epic = ledger
         .get_work_identity(WorkIdentitySubjectKind::Epic, "epic-one")
         .expect("read")

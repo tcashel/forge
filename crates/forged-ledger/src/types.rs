@@ -483,6 +483,7 @@ pub enum OwnedHerdrCleanupReason {
     AttemptSettled,
     ControllerTerminal,
     ControllerDead,
+    OrphanedSubmit,
 }
 
 impl OwnedHerdrCleanupReason {
@@ -492,6 +493,7 @@ impl OwnedHerdrCleanupReason {
             Self::AttemptSettled => "attempt-settled",
             Self::ControllerTerminal => "controller-terminal",
             Self::ControllerDead => "controller-dead",
+            Self::OrphanedSubmit => "orphaned-submit",
         }
     }
 }
@@ -505,6 +507,7 @@ impl TryFrom<&str> for OwnedHerdrCleanupReason {
             "attempt-settled" => Ok(Self::AttemptSettled),
             "controller-terminal" => Ok(Self::ControllerTerminal),
             "controller-dead" => Ok(Self::ControllerDead),
+            "orphaned-submit" => Ok(Self::OrphanedSubmit),
             other => Err(refused(
                 ErrorCode::InvalidRequest,
                 format!("unknown owned Herdr cleanup reason: {other:?}"),
