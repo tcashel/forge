@@ -62,7 +62,10 @@ fn rereview_merge(claude: forged_types::Outcome, codex: forged_types::Outcome) -
 
 fn done(verdict: Verdict) -> NextAction {
     NextAction::Stop(Terminal::Done {
+        review_rounds: 2,
         final_verdict: Some(verdict),
+        final_verdict_is_durable: true,
+        failed_review_seats: 0,
     })
 }
 
@@ -153,7 +156,15 @@ fn approve_plus_semantic_failure_merges_to_request_changes() {
         .completed(Stage::ReviewClaude, 2, review(Verdict::Approve))
         .failed(Stage::ReviewCodex, 2, "reviewer crashed mid-thought")
         .build();
-    assert_eq!(advance(&view), done(Verdict::RequestChanges));
+    assert_eq!(
+        advance(&view),
+        NextAction::Stop(Terminal::Done {
+            review_rounds: 2,
+            final_verdict: Some(Verdict::RequestChanges),
+            final_verdict_is_durable: false,
+            failed_review_seats: 1,
+        })
+    );
 }
 
 #[test]
@@ -206,7 +217,10 @@ fn no_leg_ever_speaking_yields_done_with_no_final_verdict() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: None
+            review_rounds: 2,
+            final_verdict: None,
+            final_verdict_is_durable: false,
+            failed_review_seats: 0,
         })
     );
 }

@@ -23,7 +23,10 @@ fn spent_round_stops_done_with_the_final_verdict_not_another_fix() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::RequestChanges)
+            review_rounds: 2,
+            final_verdict: Some(Verdict::RequestChanges),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }
@@ -154,7 +157,10 @@ fn semantic_failure_consumes_the_round_and_stops_done() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::RequestChanges)
+            review_rounds: 1,
+            final_verdict: Some(Verdict::RequestChanges),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }
@@ -206,7 +212,10 @@ fn empty_and_missing_notes_count_as_semantic() {
     assert_eq!(
         advance(&view),
         NextAction::Stop(Terminal::Done {
-            final_verdict: Some(Verdict::RequestChanges)
+            review_rounds: 1,
+            final_verdict: Some(Verdict::RequestChanges),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         })
     );
 }

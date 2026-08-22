@@ -1668,6 +1668,152 @@ fn high_profile_runs_three_reviews_and_a_synthesis_seat() {
 }
 
 #[test]
+fn synthetic_review_failure_is_honest_and_both_new_terminals_accept_risk() {
+    let env = TestEnv::new("forged-review-terminal-exits");
+    env.forged(&["init"]);
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("config"))
+            .expect("config json");
+    config["profiles"] = json!({
+        "standard": {
+            "schema": "forged.profile/1",
+            "name": "standard",
+            "protocol": {"name": "slice", "version": 1},
+            "seats": [
+                {"id": "implementation", "role": "implementation", "purpose": "implement"},
+                {"id": "review-1", "role": "review.primary", "purpose": "review"},
+                {"id": "review-2", "role": "review.secondary", "purpose": "review"},
+                {"id": "remediation", "role": "remediation", "purpose": "fix"}
+            ],
+            "riskContext": "Exercise review verdict provenance.",
+            "fixRoundBudget": 1,
+            "escalateOn": []
+        }
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_string_pretty(&config).expect("config json"),
+    )
+    .expect("write config");
+    env.set_scenario("reviewclaude", "approve", 1);
+    env.set_scenario("reviewcodex", "no-block", 1);
+    env.set_scenario("fix", "no-block", 1);
+
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-review-provenance",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+    env.authorize_run("bead-review-provenance");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-review-provenance"]);
+    assert_eq!(code, 0, "drive: {driven}");
+    assert_eq!(
+        driven["result"]["terminal"]["remediationFailed"],
+        json!({
+            "round": 1,
+            "finalVerdict": "requestChanges",
+            "finalVerdictDurable": false,
+            "failedReviewSeats": 1,
+        }),
+        "control still fails closed, but the synthetic verdict is attributed"
+    );
+
+    let (_, status) = env.forged(&["run", "status", "--run", "bead-review-provenance"]);
+    assert_eq!(status["result"]["run"]["outcome"], json!("blocked"));
+    assert_eq!(
+        status["result"]["run"]["stopReason"],
+        json!("verdict unavailable: 1 review seat(s) failed without a result")
+    );
+    let (_, events) = env.forged(&["events", "--run", "bead-review-provenance"]);
+    let durable_verdicts = events["result"]["events"]
+        .as_array()
+        .expect("events")
+        .iter()
+        .filter(|event| event["kind"] == json!("forged.review.seat.settled"))
+        .map(|event| event["payload"]["verdict"].clone())
+        .collect::<Vec<_>>();
+    assert_eq!(durable_verdicts, vec![json!("approve")]);
+
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-review-provenance",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the failed review seat is bounded by deployment controls",
+    ]);
+    assert_eq!(code, 0, "accept remediation-failed risk: {accepted}");
+    assert_eq!(accepted["result"]["reviewRounds"], json!(1));
+
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-done-risk",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start done fixture: {started}");
+    let ledger = env.ledger();
+    ledger
+        .append_event_kind_once(
+            "bead-done-risk",
+            "run.protocol-terminal",
+            json!({
+                "schemaVersion": 1,
+                "terminal": {
+                    "done": {
+                        "reviewRounds": 4,
+                        "finalVerdict": "block",
+                    }
+                }
+            }),
+        )
+        .expect("done terminal");
+    ledger
+        .settle_run(
+            "bead-done-risk",
+            forged_ledger::RunOutcome::Blocked,
+            "protocol exhausted its review rounds with verdict block".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("block done fixture");
+    ledger.close().expect("close ledger");
+
+    let (code, accepted) = env.forged(&[
+        "run",
+        "accept-risk",
+        "--run",
+        "bead-done-risk",
+        "--accepted-by",
+        "lead-agent",
+        "--rationale",
+        "the blocking verdict is accepted for this deployment",
+    ]);
+    assert_eq!(code, 0, "accept non-approve done risk: {accepted}");
+    assert_eq!(accepted["result"]["reviewRounds"], json!(4));
+}
+
+#[test]
 fn review_budget_above_one_exhausts_exactly_and_accept_risk_is_durable() {
     let env = TestEnv::new("forged-review-budget");
     env.forged(&["init"]);

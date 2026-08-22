@@ -210,7 +210,7 @@ pub enum RunCmd {
     Stop(RunStopArgs),
     /// Append an explicit roster revision at a durable boundary.
     ReviseRoster(RunReviseRosterArgs),
-    /// Accept the final deduplicated findings after review-budget exhaustion.
+    /// Accept the final deduplicated findings after a terminal review failure.
     AcceptRisk(RunAcceptRiskArgs),
 }
 
@@ -401,7 +401,7 @@ pub struct RunReviseRosterArgs {
 /// `run accept-risk` flags.
 #[derive(Debug, Args)]
 pub struct RunAcceptRiskArgs {
-    /// Run whose review budget is exhausted.
+    /// Run stopped with a terminal non-approve review outcome.
     #[arg(long)]
     pub run: String,
     /// Operator or lead-agent identity making the decision.

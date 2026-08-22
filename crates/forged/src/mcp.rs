@@ -1029,10 +1029,10 @@ impl ForgedServer {
         self.call("run_revise_roster", args.0).await
     }
 
-    /// Accept the final deduplicated findings after review exhaustion.
+    /// Accept the final deduplicated findings after a terminal review failure.
     #[tool(
         name = "run_accept_risk",
-        description = "Record an operator's auditable accepted-risk decision after review-budget exhaustion."
+        description = "Record an operator's auditable accepted-risk decision after a terminal non-approve review outcome."
     )]
     pub async fn run_accept_risk(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("run_accept_risk", args.0).await

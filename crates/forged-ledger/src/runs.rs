@@ -9,7 +9,7 @@ use forged_types::{
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
-use serde_json::json;
+use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::error::{column_decode_error, refused, LedgerError};
@@ -76,6 +76,90 @@ const EFFECTIVE_DEFINITION_COLUMNS: &str = "d.run_id, d.protocol_ref_json, d.pro
     d.created_at";
 const EXECUTION_POLICY_MIGRATION: &str = "forged.run.execution-policy/1";
 const CONTROLLER_REVOKED: &str = "forged.controller.revoked";
+
+struct ReviewRiskTerminal {
+    review_rounds: u8,
+    blocked_reason: String,
+}
+
+fn review_risk_terminal(payload: &Value) -> Option<ReviewRiskTerminal> {
+    let terminal = payload.get("terminal")?;
+    if let Some(value) = terminal.get("reviewBudgetExhausted") {
+        let review_rounds = terminal_round(value, "reviewRounds")?;
+        let verdict = terminal_verdict(value)?;
+        if verdict == "approve" {
+            return None;
+        }
+        let blocked_reason = review_terminal_reason(value).unwrap_or_else(|| {
+            format!(
+                "review budget exhausted after {review_rounds} rounds with verdict {}",
+                verdict
+            )
+        });
+        return Some(ReviewRiskTerminal {
+            review_rounds,
+            blocked_reason,
+        });
+    }
+    if let Some(value) = terminal.get("remediationFailed") {
+        let review_rounds = terminal_round(value, "round")?;
+        let verdict = terminal_verdict(value)?;
+        if verdict == "approve" {
+            return None;
+        }
+        let blocked_reason = review_terminal_reason(value).unwrap_or_else(|| {
+            format!(
+                "remediation failed in round {review_rounds} with verdict {}",
+                verdict
+            )
+        });
+        return Some(ReviewRiskTerminal {
+            review_rounds,
+            blocked_reason,
+        });
+    }
+    let value = terminal.get("done")?;
+    let verdict = terminal_verdict(value)?;
+    if verdict == "approve" {
+        return None;
+    }
+    let review_rounds = terminal_round(value, "reviewRounds")?;
+    let blocked_reason = review_terminal_reason(value)
+        .unwrap_or_else(|| format!("protocol exhausted its review rounds with verdict {verdict}"));
+    Some(ReviewRiskTerminal {
+        review_rounds,
+        blocked_reason,
+    })
+}
+
+fn terminal_round(value: &Value, field: &str) -> Option<u8> {
+    value
+        .get(field)
+        .and_then(Value::as_u64)
+        .and_then(|round| u8::try_from(round).ok())
+}
+
+fn terminal_verdict(value: &Value) -> Option<&str> {
+    match value.get("finalVerdict") {
+        None | Some(Value::Null) => Some("unavailable"),
+        Some(Value::String(verdict))
+            if matches!(verdict.as_str(), "approve" | "requestChanges" | "block") =>
+        {
+            Some(verdict)
+        }
+        _ => None,
+    }
+}
+
+fn review_terminal_reason(value: &Value) -> Option<String> {
+    terminal_verdict(value)?;
+    if value.get("finalVerdictDurable").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    let failures = value.get("failedReviewSeats").and_then(Value::as_u64)?;
+    (failures > 0)
+        .then(|| format!("verdict unavailable: {failures} review seat(s) failed without a result"))
+}
 
 fn append_controller_revocation_tx(
     conn: &Connection,
@@ -1235,9 +1319,12 @@ impl Ledger {
         })
     }
 
-    /// Atomically accept the residual findings from an exhausted review run.
+    /// Atomically accept residual findings from a terminal non-approve review.
     ///
-    /// The exhaustion evidence, singleton acceptance event, and durable
+    /// Review-budget exhaustion, remediation failure, and non-approve done
+    /// terminals are accepted-risk exits. Any blocked terminal also retains
+    /// the standing `blocked -> superseded` exit through [`Ledger::settle_run`].
+    /// The terminal evidence, singleton acceptance event, and durable
     /// `blocked -> accepted-risk` transition are one immediate transaction.
     /// Exact replay returns the standing row. A competing payload or terminal
     /// transition is refused, so the event stream can never disagree with the
@@ -1336,42 +1423,33 @@ impl Ledger {
                 .ok_or_else(|| {
                     refused(
                         ErrorCode::InvalidRequest,
-                        format!("run {run_id:?} has no persisted review-exhaustion evidence"),
+                        format!("run {run_id:?} has no persisted review-terminal evidence"),
                     )
                 })?;
-            let terminal: serde_json::Value = serde_json::from_str(&terminal_payload)?;
-            let exhausted = terminal
-                .pointer("/terminal/reviewBudgetExhausted")
-                .and_then(serde_json::Value::as_object)
+            let terminal: Value = serde_json::from_str(&terminal_payload)?;
+            let terminal = review_risk_terminal(&terminal)
                 .ok_or_else(|| {
                     refused(
                         ErrorCode::InvalidRequest,
-                        format!("run {run_id:?} did not stop for review-budget exhaustion"),
+                        format!(
+                            "run {run_id:?} did not stop with an acceptable non-approve review terminal"
+                        ),
                     )
                 })?;
-            let stored_rounds = exhausted
-                .get("reviewRounds")
-                .and_then(serde_json::Value::as_u64);
-            if stored_rounds != Some(u64::from(review_rounds)) {
+            if terminal.review_rounds != review_rounds {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     format!(
-                        "accepted-risk review rounds {review_rounds} do not match persisted exhaustion evidence {stored_rounds:?}"
+                        "accepted-risk review rounds {review_rounds} do not match persisted terminal evidence {}",
+                        terminal.review_rounds
                     ),
                 ));
             }
-            let final_verdict = exhausted
-                .get("finalVerdict")
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("unavailable");
-            let blocked_reason = format!(
-                "review budget exhausted after {review_rounds} rounds with verdict {final_verdict}"
-            );
-            if current.stop_reason.as_deref() != Some(blocked_reason.as_str()) {
+            if current.stop_reason.as_deref() != Some(terminal.blocked_reason.as_str()) {
                 return Err(refused(
                     ErrorCode::InvalidRequest,
                     format!(
-                        "run {run_id:?} blocked reason does not match its review-exhaustion evidence"
+                        "run {run_id:?} blocked reason does not match its review-terminal evidence"
                     ),
                 ));
             }

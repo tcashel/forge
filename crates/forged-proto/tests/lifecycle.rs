@@ -262,7 +262,10 @@ async fn full_slice_v1_lifecycle_in_process() {
     assert_eq!(
         stop,
         Terminal::Done {
-            final_verdict: Some(Verdict::Approve)
+            review_rounds: 2,
+            final_verdict: Some(Verdict::Approve),
+            final_verdict_is_durable: true,
+            failed_review_seats: 0,
         }
     );
 

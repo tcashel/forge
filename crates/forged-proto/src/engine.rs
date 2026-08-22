@@ -171,8 +171,14 @@ pub enum Terminal {
     /// `ReReview`'s verdict when a fix round ran, otherwise the standing
     /// `Review` verdict — and `None` only when no review leg ever spoke.
     Done {
+        /// Review invocations completed, including the initial review.
+        review_rounds: u8,
         /// The final merged verdict, when any leg ever spoke.
         final_verdict: Option<Verdict>,
+        /// Whether a durable review result carried `final_verdict`.
+        final_verdict_is_durable: bool,
+        /// Review seats that failed without producing a result.
+        failed_review_seats: u32,
     },
     /// The configured review/fix loop ran to its immutable limit.
     ReviewBudgetExhausted {
@@ -180,6 +186,10 @@ pub enum Terminal {
         review_rounds: u8,
         /// The last review's merged verdict.
         final_verdict: Option<Verdict>,
+        /// Whether a durable review result carried `final_verdict`.
+        final_verdict_is_durable: bool,
+        /// Review seats that failed without producing a result.
+        failed_review_seats: u32,
     },
     /// A remediation provider ran but could not apply the standing findings.
     RemediationFailed {
@@ -187,6 +197,10 @@ pub enum Terminal {
         round: u8,
         /// Review verdict that requested the remediation.
         final_verdict: Option<Verdict>,
+        /// Whether a durable review result carried `final_verdict`.
+        final_verdict_is_durable: bool,
+        /// Review seats that failed without producing a result.
+        failed_review_seats: u32,
     },
     /// A provider found that continuing requires changing the specification.
     SpecAmendmentProposed {
@@ -431,14 +445,28 @@ pub fn advance(view: &RunView) -> NextAction {
     let Some(&first_seq) = review_seqs.first() else {
         return open_review_fanout(view);
     };
-    let (first_verdict, first_produced) = match eval_fanout(view, first_seq) {
-        FanoutJoin::NotDone(action) => return action,
-        FanoutJoin::Done { control, produced } => (control, produced),
-    };
+    let (first_verdict, first_produced, first_produced_is_durable, first_failed_without_result) =
+        match eval_fanout(view, first_seq) {
+            FanoutJoin::NotDone(action) => return action,
+            FanoutJoin::Done {
+                control,
+                produced,
+                produced_is_durable,
+                failed_without_result,
+            } => (
+                control,
+                produced,
+                produced_is_durable,
+                failed_without_result,
+            ),
+        };
 
     if first_verdict == Verdict::Approve {
         return NextAction::Stop(Terminal::Done {
+            review_rounds: 1,
             final_verdict: first_produced,
+            final_verdict_is_durable: first_produced_is_durable,
+            failed_review_seats: first_failed_without_result,
         });
     }
 
@@ -465,7 +493,10 @@ pub fn advance(view: &RunView) -> NextAction {
         // `Done` carrying the standing review verdict.
         LegState::FailedSemantic => {
             return NextAction::Stop(Terminal::Done {
+                review_rounds: 1,
                 final_verdict: first_produced,
+                final_verdict_is_durable: first_produced_is_durable,
+                failed_review_seats: first_failed_without_result,
             })
         }
         LegState::Completed {
@@ -494,8 +525,22 @@ pub fn advance(view: &RunView) -> NextAction {
     };
     match eval_fanout(view, second_seq) {
         FanoutJoin::NotDone(action) => action,
-        FanoutJoin::Done { produced, .. } => NextAction::Stop(Terminal::Done {
-            final_verdict: produced.or(first_produced),
+        FanoutJoin::Done {
+            produced: Some(produced),
+            produced_is_durable,
+            failed_without_result,
+            ..
+        } => NextAction::Stop(Terminal::Done {
+            review_rounds: 2,
+            final_verdict: Some(produced),
+            final_verdict_is_durable: produced_is_durable,
+            failed_review_seats: failed_without_result,
+        }),
+        FanoutJoin::Done { produced: None, .. } => NextAction::Stop(Terminal::Done {
+            review_rounds: 2,
+            final_verdict: first_produced,
+            final_verdict_is_durable: first_produced_is_durable,
+            failed_review_seats: first_failed_without_result,
         }),
     }
 }
@@ -578,13 +623,18 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
         }
         if reviewed.control == Verdict::Approve {
             return NextAction::Stop(Terminal::Done {
+                review_rounds: review_round.saturating_add(1),
                 final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
             });
         }
         if review_round == profile.fix_round_budget {
             return NextAction::Stop(Terminal::ReviewBudgetExhausted {
                 review_rounds: review_round.saturating_add(1),
                 final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
             });
         }
 
@@ -599,6 +649,8 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
             return NextAction::Stop(Terminal::RemediationFailed {
                 round: review_round.saturating_add(1),
                 final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
             });
         }
         let machine_round = u32::from(review_round) + 1;
@@ -685,6 +737,8 @@ fn escalation_action(
 struct AdaptiveDone {
     control: Verdict,
     produced: Option<Verdict>,
+    produced_is_durable: bool,
+    failed_without_result: u32,
     semantic_failure: bool,
     amendment: Option<(String, SpecAmendment)>,
 }
@@ -712,6 +766,7 @@ fn adaptive_group(
 
     let mut pending = Vec::new();
     let mut verdicts = Vec::new();
+    let mut failed_without_result = 0u32;
     let mut semantic_failure = false;
     let mut amendment = None;
     for seat in seats {
@@ -735,14 +790,15 @@ fn adaptive_group(
             }
             LegState::FailedSemantic => {
                 semantic_failure = true;
-                verdicts.push(Verdict::RequestChanges);
+                failed_without_result = failed_without_result.saturating_add(1);
+                verdicts.push((Verdict::RequestChanges, false));
             }
             LegState::Completed { outcome } => match outcome {
                 Some(Outcome::Review {
                     verdict,
                     available: true,
                     ..
-                }) => verdicts.push(*verdict),
+                }) => verdicts.push((*verdict, true)),
                 Some(Outcome::Review {
                     available: false, ..
                 }) => {}
@@ -757,7 +813,8 @@ fn adaptive_group(
                 }
                 _ => {
                     semantic_failure = true;
-                    verdicts.push(Verdict::RequestChanges);
+                    failed_without_result = failed_without_result.saturating_add(1);
+                    verdicts.push((Verdict::RequestChanges, false));
                 }
             },
             LegState::Missing => unreachable!("missing packets returned above"),
@@ -771,11 +828,18 @@ fn adaptive_group(
     }
     let produced = verdicts
         .iter()
-        .copied()
+        .map(|(verdict, _)| *verdict)
         .max_by_key(|value| severity(*value));
+    let produced_is_durable = produced.is_some_and(|produced| {
+        verdicts
+            .iter()
+            .any(|(verdict, durable)| *durable && *verdict == produced)
+    });
     AdaptiveGroup::Done(AdaptiveDone {
         control: produced.unwrap_or(Verdict::RequestChanges),
         produced,
+        produced_is_durable,
+        failed_without_result,
         semantic_failure,
         amendment,
     })
@@ -881,6 +945,10 @@ enum FanoutJoin {
         /// The merged verdict when at least one leg contributed; `None` when
         /// no leg spoke.
         produced: Option<Verdict>,
+        /// Whether a durable review result carried `produced`.
+        produced_is_durable: bool,
+        /// Review legs that failed without producing a result.
+        failed_without_result: u32,
     },
 }
 
@@ -940,19 +1008,34 @@ fn eval_fanout(view: &RunView, seq: i64) -> FanoutJoin {
     // terminally failed with a semantic note tried and died, contributing
     // `RequestChanges`; zero contributing legs fail closed to
     // `RequestChanges`.
-    let contributions: Vec<Verdict> = [&claude, &codex]
+    let contributions: Vec<(Verdict, bool)> = [&claude, &codex]
         .into_iter()
         .filter_map(contribution)
         .collect();
-    let produced = contributions.iter().copied().max_by_key(|v| severity(*v));
+    let produced = contributions
+        .iter()
+        .map(|(verdict, _)| *verdict)
+        .max_by_key(|verdict| severity(*verdict));
+    let produced_is_durable = produced.is_some_and(|produced| {
+        contributions
+            .iter()
+            .any(|(verdict, durable)| *durable && *verdict == produced)
+    });
     FanoutJoin::Done {
         control: produced.unwrap_or(Verdict::RequestChanges),
         produced,
+        produced_is_durable,
+        failed_without_result: contributions
+            .iter()
+            .filter(|(_, durable)| !durable)
+            .count()
+            .try_into()
+            .unwrap_or(u32::MAX),
     }
 }
 
 /// What a terminal review leg contributes to the merge.
-fn contribution(leg: &LegState<'_>) -> Option<Verdict> {
+fn contribution(leg: &LegState<'_>) -> Option<(Verdict, bool)> {
     match leg {
         LegState::Completed {
             outcome: Some(Outcome::Review {
@@ -960,15 +1043,15 @@ fn contribution(leg: &LegState<'_>) -> Option<Verdict> {
             }),
         } => {
             if *available {
-                Some(*verdict)
+                Some((*verdict, true))
             } else {
                 None
             }
         }
         // A completed leg that landed no parseable review verdict neither
         // spoke nor honestly reported absence: fail closed.
-        LegState::Completed { outcome: _ } => Some(Verdict::RequestChanges),
-        LegState::FailedSemantic => Some(Verdict::RequestChanges),
+        LegState::Completed { outcome: _ } => Some((Verdict::RequestChanges, false)),
+        LegState::FailedSemantic => Some((Verdict::RequestChanges, false)),
         _ => None,
     }
 }
