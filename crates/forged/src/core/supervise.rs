@@ -78,6 +78,51 @@ impl Drop for ProjectionPassTask {
     }
 }
 
+/// The bead settlement pass, run beside the tick like the projection pass.
+/// Its per-run probes and guarded writes are bounded only by bd's own
+/// timeouts, so it must never sit in front of due-work claiming and
+/// admission: a wedged bd — the exact condition that creates pending
+/// settlements — would stall the whole hot path by 30s per pending run.
+/// The tick still joins it before reporting, so `--once` stays one complete
+/// pass and a pass failure still fails the tick. An abort mid-chain is
+/// equivalent to a crash: the persisted charge and claim lease are the
+/// recovery evidence.
+struct BeadSettlementPassTask {
+    handle: Option<tokio::task::JoinHandle<Result<Value, Failure>>>,
+}
+
+impl BeadSettlementPassTask {
+    fn start(ctx: &Ctx) -> Self {
+        let pass_ctx = Ctx {
+            config: ctx.config.clone(),
+            ledger: ctx.ledger.clone(),
+        };
+        let handle =
+            tokio::spawn(async move { super::bead_settlement::reconcile(&pass_ctx).await });
+        Self {
+            handle: Some(handle),
+        }
+    }
+
+    async fn finish(mut self) -> Result<Value, Failure> {
+        let handle = self.handle.take().expect("bead settlement task handle");
+        match handle.await {
+            Ok(report) => report,
+            Err(error) => Err(Failure::internal(format!(
+                "bead settlement task failed: {error}"
+            ))),
+        }
+    }
+}
+
+impl Drop for BeadSettlementPassTask {
+    fn drop(&mut self) {
+        if let Some(handle) = self.handle.take() {
+            handle.abort();
+        }
+    }
+}
+
 fn scope(kind: DesiredSubjectKind) -> Scope {
     match kind {
         DesiredSubjectKind::Run => Scope::Run,
@@ -85,7 +130,7 @@ fn scope(kind: DesiredSubjectKind) -> Scope {
     }
 }
 
-fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
+pub(super) fn deadline_after(anchor: &str, seconds: u64) -> Result<String, Failure> {
     let timestamp: jiff::Timestamp = anchor.parse().map_err(|error| {
         Failure::internal(format!(
             "cannot parse supervisor timestamp {anchor:?}: {error}"
@@ -818,6 +863,11 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
     // runnable work. The durable projection lease makes cancellation safe:
     // an ambiguous request is retried later at a strictly newer sequence.
     let projection_task = ProjectionPassTask::start(ctx);
+    // Pending bead settlements are a third independent durable queue: the
+    // read-only convergence probe runs every tick; mutating retries are
+    // budgeted and per-run fenced inside the pass. It runs beside the tick,
+    // never in front of due-work claiming — see [`BeadSettlementPassTask`].
+    let bead_settlement_task = BeadSettlementPassTask::start(ctx);
     // Pane cleanup is an independent durable work queue. Run it even when no
     // desired subject is due; attempt settlement never waits on this effect.
     let cleanup = super::herdr_ownership::reconcile(ctx).await?;
@@ -989,6 +1039,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         }
     }
     let projection = projection_task.finish().await;
+    let bead_settlement = bead_settlement_task.finish().await?;
     let wake_now = now_iso();
     let desired_now = wake_now.clone();
     let desired_wake_at = on_ledger(&ctx.ledger, move |ledger| {
@@ -1018,6 +1069,7 @@ pub(super) async fn tick(ctx: &Ctx) -> Result<Value, Failure> {
         "subjects": subjects,
         "cleanup": cleanup,
         "layoutCleanup": layout_cleanup,
+        "beadSettlement": bead_settlement,
         "herdrProjection": projection,
         "nextWakeAt": next_wake_at,
     }))

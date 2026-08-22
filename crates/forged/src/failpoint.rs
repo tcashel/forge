@@ -49,6 +49,11 @@
 //! exact-marker observation. `review.publish.post.before` is after uncertain
 //! intent is durable but before GitHub is called; `review.publish.post.after`
 //! is the response-lost seam after GitHub returns and before delivery settles.
+//! `bead-settlement.read.after` sits between the retry pass's convergence
+//! read and any append or charge; `bead-settlement.charge.after` is after the
+//! durable budget charge and before the bd mutation; and
+//! `bead-settlement.mutate.after` is the response-lost seam after the bd
+//! write and before `run.bead-settlement.succeeded` lands.
 //!
 //! `fail`-mode sites are separate, and exist for the seams whose OWN failure
 //! is the contract and which no external condition can provoke:
