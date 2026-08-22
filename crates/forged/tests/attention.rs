@@ -722,6 +722,49 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
         "{refused}"
     );
 
+    // Known divergence, pinned: work_detail projects from the ledger alone
+    // and cannot name the settlement source (its id embeds a bd feed
+    // cursor), so while the delivery gap is live its attempt-only
+    // occurrence id differs from the rail's merged id and a resolve
+    // against it fails closed as stale. The rail is the resolve surface.
+    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    assert_eq!(code, 0, "{detail}");
+    let derived = attention(&detail["result"], "attention-merged", "missing-evidence")
+        .expect("work_detail missing-evidence");
+    assert!(
+        derived["evidenceRefs"]
+            .as_array()
+            .expect("evidence refs")
+            .iter()
+            .all(|reference| reference["kind"] == json!("attempt")),
+        "{derived}"
+    );
+    assert_ne!(derived["occurrenceId"], merged["occurrenceId"], "{detail}");
+    let (_, stale) = env.forged(&[
+        "attention",
+        "resolve",
+        "--subject",
+        "attention-merged",
+        "--attention-id",
+        derived["attentionId"].as_str().expect("attention id"),
+        "--occurrence-id",
+        derived["occurrenceId"].as_str().expect("occurrence id"),
+        "--actor",
+        "operator",
+        "--disposition",
+        "evidence-absent",
+        "--note",
+        "the delivery gap is still live",
+    ]);
+    assert_eq!(stale["ok"], json!(false), "{stale}");
+    assert!(
+        stale["error"]["message"]
+            .as_str()
+            .expect("stale message")
+            .contains("stale because newer causal evidence exists"),
+        "{stale}"
+    );
+
     // Recording the exact-base PR repairs the delivery gap; the surviving
     // occurrence covers only the manifest-less attempt and is adjudicable.
     append(
@@ -748,6 +791,16 @@ fn merged_delivery_evidence_defers_adjudication_until_the_pr_is_repaired() {
             .iter()
             .all(|reference| reference["kind"] == json!("attempt")),
         "{remaining}"
+    );
+    // With the settlement source gone the anti-joins agree again, so the
+    // occurrence id work_detail prints is the one the rail validates.
+    let (code, detail) = env.forged(&["work", "detail", "--id", "attention-merged"]);
+    assert_eq!(code, 0, "{detail}");
+    let repaired_view = attention(&detail["result"], "attention-merged", "missing-evidence")
+        .expect("work_detail attempt-scoped missing-evidence");
+    assert_eq!(
+        repaired_view["occurrenceId"], remaining["occurrenceId"],
+        "{detail}"
     );
     let (code, resolved) = env.forged(&[
         "attention",

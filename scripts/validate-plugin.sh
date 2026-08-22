@@ -172,6 +172,8 @@ const requiredSkillText = [
   'lower numbers win',
   'never preempts active work',
   'accepted-unknown',
+  'evidence-absent',
+  'manifest-less attempt',
   'session stop',
   'portfolio-control-fixtures.json',
 ];

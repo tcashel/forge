@@ -167,9 +167,12 @@ pub(crate) fn policy(
             Action::AdjudicateEffect,
             "Observe and adjudicate the exact ambiguous external effect",
         ),
+        // Recording evidence-absent is a durable, irreversible claim about
+        // the audit trail; both exits — repairing the delivery PR or
+        // adjudicating absence — are the operator's call, never an agent's.
         Condition::MissingEvidence => (
             Severity::High,
-            Owner::LeadAgent,
+            Owner::Human,
             Action::RepairEvidence,
             "Repair or explicitly adjudicate the missing durable evidence",
         ),
@@ -1192,6 +1195,10 @@ pub(crate) enum AttentionClass {
 
 /// The fixed condition-to-class mapping every surface consumes. Exhaustive
 /// on purpose: a new condition fails the build until it is classified.
+/// Missing evidence is a decision condition-wide even though only
+/// attempt-only occurrences accept explicit resolution: both of its exits
+/// — record the exact-base delivery PR or adjudicate evidence-absent —
+/// wait on operator judgment, never on a supervisor-owned transition.
 pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
     use AttentionCondition as Condition;
     match condition {
@@ -1202,15 +1209,15 @@ pub(crate) fn classification(condition: AttentionCondition) -> AttentionClass {
         | Condition::RetryExhausted
         | Condition::ReviewerDisagreement
         | Condition::AmbiguousEffect
-        | Condition::RestartBudgetExhausted => AttentionClass::Decision,
+        | Condition::RestartBudgetExhausted
+        | Condition::MissingEvidence => AttentionClass::Decision,
         Condition::Blocked
         | Condition::BeadsSettlementPending
         | Condition::Revoking
         | Condition::ControllerDead
         | Condition::FailedGate
         | Condition::ProviderDegraded
-        | Condition::AdmissionDeferred
-        | Condition::MissingEvidence => AttentionClass::Symptom,
+        | Condition::AdmissionDeferred => AttentionClass::Symptom,
     }
 }
 
@@ -1633,6 +1640,7 @@ mod tests {
             Condition::ReviewerDisagreement,
             Condition::AmbiguousEffect,
             Condition::RestartBudgetExhausted,
+            Condition::MissingEvidence,
         ];
         let symptoms = [
             Condition::Blocked,
@@ -1642,10 +1650,9 @@ mod tests {
             Condition::FailedGate,
             Condition::ProviderDegraded,
             Condition::AdmissionDeferred,
-            Condition::MissingEvidence,
         ];
-        assert_eq!(decisions.len(), 8);
-        assert_eq!(symptoms.len(), 8);
+        assert_eq!(decisions.len(), 9);
+        assert_eq!(symptoms.len(), 7);
         for condition in decisions {
             assert_eq!(
                 classification(condition),

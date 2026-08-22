@@ -1616,10 +1616,13 @@ fn observation_attention(
             );
         }
         // Only completed/failed attempts ever owed a manifest — the exact
-        // set of the ledger anti-join. An interrupted (reclaimed/stopped)
-        // exit is not a defect, and counting it here would derive an
-        // occurrence id the attention rail never serves, so no resolve
-        // could ever validate against it.
+        // set of the ledger anti-join, so an attempt-only occurrence here
+        // hashes to the id the rail serves. Parity ends there: when live
+        // settlement evidence (a clean/accepted-risk run with a missing or
+        // wrong-base delivery PR) merges into the rail's occurrence, this
+        // ledger-side projection cannot name that source — its id embeds a
+        // bd feed cursor — so the rail is the only surface whose occurrence
+        // id a resolve validates against while the delivery gap is live.
         if matches!(
             attempt.state,
             AttemptState::Completed | AttemptState::Failed

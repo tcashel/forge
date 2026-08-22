@@ -329,8 +329,8 @@ forged attention resolve --subject "$SUBJECT_ID" \
 
 Lead-agent-owned routine items may be acknowledged or acted on within already
 granted authority. Every item whose owner is human—including input, blocker,
-quarantine, ambiguous-effect, restart, review-risk, and merge decisions—requires
-the user's exact decision. Observe the relevant domain result before resolving
+quarantine, ambiguous-effect, restart, review-risk, missing-evidence, and merge
+decisions—requires the user's exact decision. Observe the relevant domain result before resolving
 custody. Merge approval remains a human/GitHub boundary outside this skill.
 
 Reopen only the exact resolved occurrence named by prior durable transition
