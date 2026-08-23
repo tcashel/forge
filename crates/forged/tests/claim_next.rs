@@ -396,7 +396,7 @@ fn an_unheld_bead_resumes_and_retakes_the_lease() {
 }
 
 #[test]
-fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
+fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identity() {
     // The composed path, end to end: claim-next pulls a FRESH bead, the
     // caller starts the run from it, and `run drive` resolves — which claims
     // the same bead again. One identity throughout, so the second claim is
@@ -404,6 +404,11 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
     // itself. The operator's `--holder` never reaches bd.
     let env = TestEnv::new("forged-claim-next-composed");
     env.forged(&["init"]);
+    env.seed_bead_spec(
+        "bead-composed",
+        "## Context\\n\\nthe frontier claim composes with run start.",
+        "- the claimed bead starts and drives",
+    );
     env.seed_frontier("bead-composed");
 
     let (code, claimed) = env.forged(&[
@@ -419,6 +424,17 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
         claimed["result"]["claimed"]["bead_id"],
         json!("bead-composed")
     );
+    assert_eq!(
+        std::fs::read_to_string(env.beads_dir.join("shim-state/bead-composed.status"))
+            .expect("claimed bead status"),
+        "in_progress",
+        "claim-next must move the ready bead to bd's claimed status"
+    );
+    assert_eq!(
+        env.assignee("bead-composed").as_deref(),
+        Some("forged:frontier:0"),
+        "the fresh bead is held under the pre-run frontier identity"
+    );
     assert_ne!(
         env.assignee("bead-composed").as_deref(),
         Some("operator:laptop:4242"),
@@ -426,7 +442,7 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
     );
 
     let repo = env.repos.repo.to_string_lossy().into_owned();
-    let spec = env.spec.to_string_lossy().into_owned();
+    let calls_before_start = env.bd_calls().len();
     let (code, started) = env.forged(&[
         "run",
         "start",
@@ -434,12 +450,17 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
         "bead-composed",
         "--repo",
         &repo,
-        "--spec",
-        &spec,
         "--base-ref",
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    let start_calls = env.bd_calls();
+    assert!(
+        !start_calls[calls_before_start..]
+            .iter()
+            .any(|call| call.starts_with("ready ")),
+        "run start must accept the exact frontier-held in_progress shape without re-reading the open frontier: {start_calls:?}"
+    );
     env.authorize_run("bead-composed");
 
     let (code, driven) = env.forged(&["run", "drive", "--run", "bead-composed"]);
@@ -465,6 +486,33 @@ fn the_frontier_claim_and_run_drive_share_one_lease_identity() {
             .iter()
             .any(|l| l.starts_with("heartbeat bead-composed") && l.contains(&holder)),
         "the guardian heartbeats the identity actually in force ({holder}): {calls:?}"
+    );
+
+    env.seed_bead_spec(
+        "bead-foreign-claimed",
+        "## Context\\n\\na foreign claim must not start.",
+        "- only frontier custody is accepted",
+    );
+    env.set_bead_field("bead-foreign-claimed", "status", "in_progress");
+    env.set_assignee("bead-foreign-claimed", "other-worker");
+    let (code, refused) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-foreign-claimed",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(
+        code, 0,
+        "an in_progress bead held outside the frontier must not start: {refused}"
+    );
+    let message = refused["error"]["message"].as_str().unwrap_or_default();
+    assert!(
+        message.contains("in_progress") && message.contains("other-worker"),
+        "the refusal must identify the rejected status and holder: {refused}"
     );
 }
 
