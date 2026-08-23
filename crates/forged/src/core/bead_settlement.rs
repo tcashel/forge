@@ -80,7 +80,10 @@ const MECHANISM_REFUSED_FIELD: &str = "mechanismRefused";
 /// a fresh run-stop pending event omits the marker and may try again.
 enum MutationFailure {
     Retry(Failure),
-    MechanismRefused,
+    /// The custody mechanism was answered deterministically — the carried
+    /// string is the observed refusal (or shape guard), the durable park
+    /// evidence.
+    MechanismRefused(String),
 }
 
 /// Delay charged attempt `used + 1` schedules before the next mutating
@@ -417,6 +420,40 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         report.insert("holder".to_owned(), json!(FRONTIER_HOLDER));
         return Ok(Value::Object(report));
     }
+    // Recognition is durable TWICE over: the park marker rides the pending
+    // re-record, and the refusal string persists in the retry row's
+    // last_error at the moment of classification — so a crash between the
+    // refusal and the park append still recognizes the episode here and
+    // repairs the marker without spending another attempt.
+    let last_error_refusal = standing
+        .as_ref()
+        .and_then(|row| row.last_error.as_deref())
+        .filter(|error| error.contains(forged_beads::CLAIM_REFUSAL_PREFIX))
+        .map(str::to_owned);
+    if payload
+        .get(MECHANISM_REFUSED_FIELD)
+        .and_then(Value::as_bool)
+        != Some(true)
+    {
+        if let Some(refusal) = last_error_refusal.as_deref() {
+            let mut repended = payload.clone();
+            repended[MECHANISM_REFUSED_FIELD] = json!(true);
+            repended["retriesExhausted"] = json!(true);
+            repended["error"] = json!(refusal);
+            let stamped = {
+                let run = run_id.clone();
+                let pending_event = pending.event_id;
+                on_ledger(&ctx.ledger, move |ledger| {
+                    ledger.append_bead_settlement_pending_if_pending(&run, pending_event, repended)
+                })
+                .await?
+            };
+            let mut report = entry("exhausted");
+            report.insert("stamped".to_owned(), json!(stamped));
+            report.insert("error".to_owned(), json!(refusal));
+            return Ok(Value::Object(report));
+        }
+    }
     if payload
         .get(MECHANISM_REFUSED_FIELD)
         .and_then(Value::as_bool)
@@ -432,7 +469,10 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
         report.insert("stamped".to_owned(), json!(false));
         report.insert(
             "error".to_owned(),
-            json!(forged_beads::BLOCKED_CLAIM_REFUSAL),
+            payload
+                .get("error")
+                .cloned()
+                .unwrap_or_else(|| json!(forged_beads::BLOCKED_CLAIM_REFUSAL)),
         );
         return Ok(Value::Object(report));
     }
@@ -574,19 +614,39 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                     };
                     // A landed promise over a BLOCKED-UNASSIGNED residue or
                     // an operator-unblocked OPEN-UNASSIGNED bead takes
-                    // guarded custody first. Plain assignment intentionally
-                    // bypasses bd's claimable-status rule; assignee and
-                    // status move together under the null-assignee CAS. A
-                    // crash after it leaves a held in_progress bead the next
-                    // attempt's close path already converges.
+                    // guarded custody first — and ONLY over those two
+                    // shapes: any other unassigned status (deferred,
+                    // pinned, hooked) is state this settlement must not
+                    // overwrite, so it parks as mechanism-refused instead.
+                    // Assignee and status move together under BOTH guards
+                    // (`--if-assignee ''` plus `--if-status <observed>`),
+                    // so a status that moved after the probe refuses. A
+                    // crash after the update leaves a held in_progress bead
+                    // the next attempt's close path already converges.
                     let reclaimed = if outcome == RunOutcome::Landed && issue.assignee.is_none() {
-                        match forged_beads::assign_unassigned_issue(&bd, &bead_id, &expected).await
-                        {
-                            Ok(_) => Ok(true),
-                            Err(error) if error.is_blocked_claim_refusal() => {
-                                Err(MutationFailure::MechanismRefused)
+                        if !matches!(issue.status.as_str(), "blocked" | "open") {
+                            Err(MutationFailure::MechanismRefused(format!(
+                                "{}{} is not a shape landed custody may overwrite",
+                                forged_beads::CLAIM_REFUSAL_PREFIX,
+                                issue.status
+                            )))
+                        } else {
+                            match forged_beads::assign_unassigned_issue(
+                                &bd,
+                                &bead_id,
+                                &expected,
+                                &issue.status,
+                            )
+                            .await
+                            {
+                                Ok(_) => Ok(true),
+                                Err(error) => match error.claim_refusal() {
+                                    Some(refusal) => {
+                                        Err(MutationFailure::MechanismRefused(refusal))
+                                    }
+                                    None => Err(MutationFailure::Retry(error.into())),
+                                },
                             }
-                            Err(error) => Err(MutationFailure::Retry(error.into())),
                         }
                     } else {
                         Ok(false)
@@ -633,8 +693,8 @@ async fn reconcile_run(ctx: &Ctx, pending: &PendingBeadSettlementRow) -> Result<
                 report.insert("appended".to_owned(), json!(appended));
                 Ok((report, RetryErrorUpdate::Clear))
             }
-            Err(MutationFailure::MechanismRefused) => {
-                let refusal = forged_beads::BLOCKED_CLAIM_REFUSAL;
+            Err(MutationFailure::MechanismRefused(refusal)) => {
+                let refusal = refusal.as_str();
                 let mut repended = json!({
                     "schemaVersion": 1,
                     "beadId": bead_id,

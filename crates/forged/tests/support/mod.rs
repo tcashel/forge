@@ -687,12 +687,16 @@ case "$cmd" in
     [ -n "$new_status" ] || new_status=$(val -s "$@")
     new_assignee=$(val --assignee "$@")
     [ -n "$new_assignee" ] || new_assignee=$(val -a "$@")
-    has_assignee=0; has_if_assignee=0; has_claim=0; expected_assignee=""; prev=""
+    has_assignee=0; has_if_assignee=0; has_if_status=0; has_claim=0; expected_assignee=""; expected_status=""; prev=""
     for a in "$@"; do
       { [ "$prev" = "--assignee" ] || [ "$prev" = "-a" ]; } && has_assignee=1
       if [ "$prev" = "--if-assignee" ]; then
         has_if_assignee=1
         expected_assignee=$a
+      fi
+      if [ "$prev" = "--if-status" ]; then
+        has_if_status=1
+        expected_status=$a
       fi
       [ "$a" = "--claim" ] && has_claim=1
       prev=$a
@@ -710,6 +714,10 @@ case "$cmd" in
     fi
     if [ "$has_if_assignee" = 1 ] && [ "$cur" != "$expected_assignee" ]; then
       printf '{"schema_version":1,"data":{"error":"stale --if-assignee guard: expected %s, found %s"}}\n' "$expected_assignee" "$cur"
+      exit 13
+    fi
+    if [ "$has_if_status" = 1 ] && [ "$(cat "$state/$id.status" 2>/dev/null || echo open)" != "$expected_status" ]; then
+      printf '{"schema_version":1,"data":{"error":"stale --if-status guard: expected %s"}}\n' "$expected_status"
       exit 13
     fi
     # An explicit scenario for a future/incompatible bd applying its claim
@@ -739,28 +747,29 @@ case "$cmd" in
       exit 0
     fi
     if [ "$has_claim" = 1 ]; then
+      # Pinned bd's claim contract, in ITS order: the ownership CAS first
+      # (a foreign holder answers "issue already claimed by <holder>",
+      # which forged classifies as a held lease), then the
+      # claimable-status rule, then assignee AND status move together.
+      if [ -n "$cur" ] && [ "$cur" != "$actor" ]; then
+        printf '{"schema_version":1,"data":{"error":"issue already claimed by %s"}}\n' "$cur"
+        exit 1
+      fi
+      if [ "$cur" = "$actor" ]; then
+        printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s","status":"in_progress"}]}\n' "$id" "$actor"
+        exit 0
+      fi
       status=$(cat "$state/$id.status" 2>/dev/null || echo open)
       case "$status" in
         open) ;;
-        in_progress)
-          if [ "$cur" = "$actor" ]; then
-            printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s","status":"in_progress"}]}\n' "$id" "$actor"
-            exit 0
-          fi
-          printf '{"schema_version":1,"data":{"error":"issue not claimable: status %s"}}\n' "$status"
-          exit 1 ;;
         *)
           printf '{"schema_version":1,"data":{"error":"issue not claimable: status %s"}}\n' "$status"
           exit 1 ;;
       esac
-    fi
-    if [ "$has_claim" = 1 ] && { [ -z "$cur" ] || [ "$cur" = "$actor" ]; }; then
       printf '%s' "$actor" > "$state/$id.assignee"
       printf 'in_progress' > "$state/$id.status"
       bump_revision "$id"
       printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s","status":"in_progress"}]}\n' "$id" "$actor"
-    elif [ "$has_claim" = 1 ]; then
-      printf '{"schema_version":1,"data":[{"id":"%s","assignee":"%s"}]}\n' "$id" "$cur"
     else
       printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n'
     fi ;;
@@ -915,6 +924,11 @@ case "$cmd" in
     elif [ -s "$front" ]; then
       id=$(head -1 "$front")
       status=$(cat "$state/$id.status" 2>/dev/null || echo open)
+      cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
+      if [ -n "$cur" ] && [ "$cur" != "$actor" ]; then
+        printf '{"schema_version":1,"data":{"error":"issue already claimed by %s"}}\n' "$cur"
+        exit 1
+      fi
       case "$status" in
         open)
           tail -n +2 "$front" > "$front.tmp" && mv "$front.tmp" "$front"

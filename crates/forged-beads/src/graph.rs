@@ -727,6 +727,28 @@ pub async fn list_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<IssueSumm
     })
 }
 
+/// Hydrate an exact, bounded set of PLAN rows — issue plus bounded
+/// dependency summaries — in one `bd show <ids...> --brief-deps --json`
+/// call, so a caller can evaluate [`PlanIssue::readiness`] for specific
+/// beads without an operator-wide inventory scan.
+pub async fn plan_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<PlanIssue>, BdError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = Vec::with_capacity(ids.len() + 3);
+    args.push("show");
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--brief-deps");
+    args.push("--json");
+    let hydrated_json = invoke::read(cfg, &args).await?;
+    let hydrated_rows =
+        envelope::as_list(&hydrated_json).unwrap_or_else(|| vec![hydrated_json.clone()]);
+    hydrated_plan_rows(&hydrated_rows, ids, None).map_err(|detail| BdError::Envelope {
+        context: "bd show exact plan rows".to_owned(),
+        detail,
+    })
+}
+
 /// Read an exact, bounded set of issues whose `metadata.repository` equals
 /// `repository`, in one native `bd list` invocation.
 ///
@@ -1175,7 +1197,12 @@ pub async fn assign_unassigned_issue(
     cfg: &BdConfig,
     id: &str,
     actor: &str,
+    observed_status: &str,
 ) -> Result<IssueSummary, BdError> {
+    // Both guards ride one field update: `--if-assignee ''` requires the
+    // bead unassigned and `--if-status` pins the exact status the caller
+    // probed — a deferred/pinned/hooked bead whose status moved after the
+    // probe refuses instead of being overwritten and closed.
     let args = [
         "update",
         id,
@@ -1185,6 +1212,8 @@ pub async fn assign_unassigned_issue(
         "in_progress",
         "--if-assignee",
         "",
+        "--if-status",
+        observed_status,
         "--actor",
         actor,
         "--json",

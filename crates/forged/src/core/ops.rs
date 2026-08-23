@@ -196,7 +196,11 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 /// one alternative shape is the exact `in_progress` custody `claim-next`
 /// obtains from that frontier under [`crate::core::FRONTIER_HOLDER`]: pinned
 /// bd moves a successful claim out of `open`, so requiring it to remain in
-/// `bd ready` would make the composed claim-next -> run-start path impossible.
+/// `bd ready` would make the composed claim-next -> run-start path
+/// impossible — but the blocker gate does NOT drop for that shape: the
+/// issue's own hydrated dependencies must still prove no active blocker,
+/// so a blocker added between claim-next and run start (or standing behind
+/// a stale frontier claim) refuses exactly as the frontier read would.
 /// A non-code Bead has an explicit route instead of being forced through a
 /// commit-and-PR protocol that cannot represent its correct result.
 async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSummary, Failure> {
@@ -226,6 +230,24 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
             return Err(Failure::invalid(format!(
                 "bead {bead} has unsupported issue type {other:?}"
             )))
+        }
+    }
+    if frontier_claimed {
+        let rows =
+            forged_beads::plan_issues(&ctx.config.bd_config(), std::slice::from_ref(&issue.id))
+                .await
+                .map_err(|error| {
+                    super::spec::read_failure("hydrating the frontier-claimed bead", error)
+                })?;
+        let readiness = rows
+            .iter()
+            .find(|row| row.issue.id == issue.id)
+            .map(forged_beads::PlanIssue::readiness);
+        if readiness != Some(forged_beads::PlanReadiness::Claimed) {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is frontier-claimed but its dependencies do not prove it ready \
+                 ({readiness:?}); resolve its blockers before starting a run"
+            )));
         }
     }
     if !frontier_claimed {

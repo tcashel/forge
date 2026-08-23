@@ -201,14 +201,14 @@ async fn claimable_statuses_are_pinned_and_plain_guarded_assignment_takes_both_l
 
     let cfg = support::cfg_for(&bd, &s);
     let blocked = blocked.expect("blocked fixture");
-    let assigned = assign_unassigned_issue(&cfg, &blocked, actor)
+    let assigned = assign_unassigned_issue(&cfg, &blocked, actor, "blocked")
         .await
         .expect("plain guarded assignment must bypass blocked claimability");
     assert_eq!(assigned.status, "in_progress");
     assert_eq!(assigned.assignee.as_deref(), Some(actor));
 
     let open = create_status_bead(&bd, &s, "guarded open custody", "open");
-    let assigned = assign_unassigned_issue(&cfg, &open, actor)
+    let assigned = assign_unassigned_issue(&cfg, &open, actor, "open")
         .await
         .expect("plain guarded assignment must take open custody");
     assert_eq!(assigned.status, "in_progress");

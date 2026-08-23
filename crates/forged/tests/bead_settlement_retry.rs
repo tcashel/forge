@@ -672,6 +672,17 @@ fn a_landed_promise_over_a_blocked_unassigned_bead_takes_guarded_custody_then_cl
         None,
         "the blocked settlement released the claim: {blocked}"
     );
+    assert_eq!(
+        std::fs::read_to_string(
+            env.beads_dir
+                .join("shim-state")
+                .join(format!("{bead}.status"))
+        )
+        .expect("bead status")
+        .trim(),
+        "blocked",
+        "the residue this fixture exists for IS blocked-unassigned: {blocked}"
+    );
     // The review-exhaustion evidence accept-risk requires is protocol
     // state, not settlement state — the one fabricated precondition.
     let ledger = env.ledger();
@@ -1028,26 +1039,24 @@ fn a_deterministic_custody_refusal_parks_after_one_charge_and_a_new_episode_retr
             .join(format!("{bead}.refuse-guarded-custody")),
     )
     .expect("clear deterministic refusal");
-    let ledger = env.ledger();
-    ledger
-        .append_event(
-            Some(run),
-            "run.bead-settlement.pending",
-            pending_payload(
-                &bead,
-                "landed",
-                "fresh run-stop episode",
-                Some(&format!("forged:{bead}:0")),
-            ),
-        )
-        .expect("new episode pending");
-    ledger.close().expect("close");
-    rewind_wake(&env, run);
+    env.set_bead_field(&bead, "status", "closed");
+    rewind_probe(&env, run);
     let resumed = settlement_action(&supervise_once(&env), run);
-    assert_eq!(resumed["action"], json!("retried"), "{resumed}");
-    assert_eq!(resumed["attempt"], json!(1));
-    assert_eq!(resumed["settled"], json!(true));
-    assert_eq!(retry_row(&env, run).expect("row").used, 1);
+    assert_eq!(
+        resumed["action"],
+        json!("converged"),
+        "the eternal probe is the park's public recovery: {resumed}"
+    );
+    assert_eq!(
+        retry_row(&env, run).expect("row").used,
+        1,
+        "recovery through the probe spends nothing beyond the one parked charge"
+    );
+    assert_eq!(
+        settlement_events(&env, run, "run.bead-settlement.succeeded").len(),
+        1,
+        "the parked promise retires durably"
+    );
 }
 
 #[test]

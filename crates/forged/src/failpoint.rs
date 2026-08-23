@@ -58,7 +58,7 @@
 //! `bead-settlement.read.after` sits between the retry pass's convergence
 //! read and any append or charge; `bead-settlement.charge.after` is after the
 //! durable budget charge and before the bd mutation;
-//! `bead-settlement.landed-claim.after` is between the landed retry's
+//! `bead-settlement.landed-custody.after` is between the landed retry's
 //! guarded claim of an unassigned bead and its held close; and
 //! `bead-settlement.mutate.after` is the response-lost seam after the bd
 //! write and before `run.bead-settlement.succeeded` lands.

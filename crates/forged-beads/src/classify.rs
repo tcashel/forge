@@ -40,6 +40,12 @@ pub(crate) const CLAIM_REFUSAL_MARKERS: [&str; 2] = ["already claimed", "already
 /// than spending the rest of a settlement retry budget on the same answer.
 pub const BLOCKED_CLAIM_REFUSAL: &str = "issue not claimable: status blocked";
 
+/// The status-parameterized prefix of bd 1.2.1's claimable-status refusal:
+/// "issue not claimable: status <status>". Classification matches the
+/// PREFIX so a refusal naming any non-claimable status parks instead of
+/// burning the retry budget on an unchangeable answer.
+pub const CLAIM_REFUSAL_PREFIX: &str = "issue not claimable: status ";
+
 /// The crate-local error type for every bd outcome.
 ///
 /// Wire mapping (strings match the shared `ErrorCode` serialization in
@@ -145,6 +151,19 @@ impl BdError {
     /// refusal on any preserved output stream.
     pub fn is_blocked_claim_refusal(&self) -> bool {
         self.haystack().contains(BLOCKED_CLAIM_REFUSAL)
+    }
+
+    /// The claimable-status refusal this error carries, when it carries
+    /// one: the "issue not claimable: status <status>" fragment for ANY
+    /// status, extracted for durable park evidence.
+    pub fn claim_refusal(&self) -> Option<String> {
+        let haystack = self.haystack();
+        let start = haystack.find(CLAIM_REFUSAL_PREFIX)?;
+        let fragment = &haystack[start..];
+        let end = fragment
+            .find(['\n', '"'])
+            .unwrap_or(fragment.len());
+        Some(fragment[..end].trim_end().to_owned())
     }
 
     /// Whether bd never ANSWERED — the only class a caller may charge to a
