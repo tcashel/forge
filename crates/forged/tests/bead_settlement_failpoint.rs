@@ -272,31 +272,35 @@ fn comment_calls(env: &TestEnv, bead: &str) -> usize {
         .count()
 }
 
-fn claim_calls(env: &TestEnv, bead: &str) -> usize {
+fn custody_calls(env: &TestEnv, bead: &str) -> usize {
     env.bd_calls()
         .iter()
-        .filter(|call| call.starts_with(&format!("update {bead} ")) && call.contains("--claim"))
+        .filter(|call| {
+            call.starts_with(&format!("update {bead} "))
+                && call.contains("--status in_progress")
+                && call.contains("--if-assignee")
+        })
         .count()
 }
 
-/// The blocked→accept-risk→landed crash window: the guarded claim of the
-/// open, unassigned bead landed, the process died before the close. The
+/// The blocked→accept-risk→landed crash window: guarded custody of the
+/// blocked/open, unassigned bead landed, the process died before the close. The
 /// next attempt finds a held bead and closes it — one close, one comment,
-/// no second claim.
+/// no second custody write.
 #[test]
-fn a_crash_between_the_guarded_claim_and_the_close_converges_without_a_duplicate_comment() {
-    let env = TestEnv::new("km-bead-settlement-claim");
+fn a_crash_between_guarded_custody_and_close_converges_without_a_duplicate_comment() {
+    let env = TestEnv::new("km-bead-settlement-custody");
     assert_eq!(env.forged(&["init"]).0, 0);
     let run = "km-bsr-claim";
     let bead = seed_pending(&env, run, "bead is open and unassigned");
     env.set_bead_field(&bead, "status", "open");
     let expected = format!("forged:{bead}:0");
 
-    crash_supervise_at(&env, "bead-settlement.landed-claim.after");
+    crash_supervise_at(&env, "bead-settlement.landed-custody.after");
     assert_eq!(
         env.assignee(&bead).as_deref(),
         Some(expected.as_str()),
-        "the crash leaves the guarded claim held"
+        "the crash leaves guarded custody held"
     );
     assert_eq!(
         used(&env, run),
@@ -319,9 +323,9 @@ fn a_crash_between_the_guarded_claim_and_the_close_converges_without_a_duplicate
     assert_eq!(event_count(&env, run, "run.bead-settlement.succeeded"), 1);
     assert_eq!(comment_calls(&env, &bead), 1, "no duplicate comment");
     assert_eq!(
-        claim_calls(&env, &bead),
+        custody_calls(&env, &bead),
         1,
-        "the recovery attempt closes the held bead without re-claiming"
+        "the recovery attempt closes the held bead without retaking custody"
     );
     assert_eq!(used(&env, run), Some(2));
 }

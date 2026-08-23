@@ -727,6 +727,28 @@ pub async fn list_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<IssueSumm
     })
 }
 
+/// Hydrate an exact, bounded set of PLAN rows — issue plus bounded
+/// dependency summaries — in one `bd show <ids...> --brief-deps --json`
+/// call, so a caller can evaluate [`PlanIssue::readiness`] for specific
+/// beads without an operator-wide inventory scan.
+pub async fn plan_issues(cfg: &BdConfig, ids: &[String]) -> Result<Vec<PlanIssue>, BdError> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = Vec::with_capacity(ids.len() + 3);
+    args.push("show");
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--brief-deps");
+    args.push("--json");
+    let hydrated_json = invoke::read(cfg, &args).await?;
+    let hydrated_rows =
+        envelope::as_list(&hydrated_json).unwrap_or_else(|| vec![hydrated_json.clone()]);
+    hydrated_plan_rows(&hydrated_rows, ids, None).map_err(|detail| BdError::Envelope {
+        context: "bd show exact plan rows".to_owned(),
+        detail,
+    })
+}
+
 /// Read an exact, bounded set of issues whose `metadata.repository` equals
 /// `repository`, in one native `bd list` invocation.
 ///
@@ -1162,6 +1184,61 @@ pub async fn close_issue(
     )
     .await?;
     show_issue(cfg, id).await
+}
+
+/// Atomically assign an unassigned issue and move it to `in_progress`.
+///
+/// This is deliberately a guarded FIELD update, not `--claim`: pinned bd
+/// 1.2.1 refuses claims on `blocked` issues, while plain assignment permits
+/// the blocked-settlement residue to be retaken. `--if-assignee ''` preserves
+/// the ownership CAS, and the status and assignee move in the same write so
+/// neither the blocked nor open unassigned input has an intermediate shape.
+pub async fn assign_unassigned_issue(
+    cfg: &BdConfig,
+    id: &str,
+    actor: &str,
+    observed_status: &str,
+) -> Result<IssueSummary, BdError> {
+    // Both guards ride one field update: `--if-assignee ''` requires the
+    // bead unassigned and `--if-status` pins the exact status the caller
+    // probed — a deferred/pinned/hooked bead whose status moved after the
+    // probe refuses instead of being overwritten and closed.
+    let args = [
+        "update",
+        id,
+        "--assignee",
+        actor,
+        "--status",
+        "in_progress",
+        "--if-assignee",
+        "",
+        "--if-status",
+        observed_status,
+        "--actor",
+        actor,
+        "--json",
+    ];
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    let assigned = show_issue(cfg, id).await?;
+    if assigned.status == "in_progress" && assigned.assignee.as_deref() == Some(actor) {
+        Ok(assigned)
+    } else {
+        Err(BdError::Beads {
+            context: format!("bd update {id} (guarded assignment)"),
+            exit: None,
+            stdout: serde_json::to_string(&assigned).unwrap_or_default(),
+            stderr: "guarded assignment did not produce an in_progress issue under the expected assignee"
+                .to_owned(),
+        })
+    }
 }
 
 /// Atomically close a run-owned issue and clear that exact run holder.
