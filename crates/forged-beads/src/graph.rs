@@ -1164,6 +1164,54 @@ pub async fn close_issue(
     show_issue(cfg, id).await
 }
 
+/// Atomically assign an unassigned issue and move it to `in_progress`.
+///
+/// This is deliberately a guarded FIELD update, not `--claim`: pinned bd
+/// 1.2.1 refuses claims on `blocked` issues, while plain assignment permits
+/// the blocked-settlement residue to be retaken. `--if-assignee ''` preserves
+/// the ownership CAS, and the status and assignee move in the same write so
+/// neither the blocked nor open unassigned input has an intermediate shape.
+pub async fn assign_unassigned_issue(
+    cfg: &BdConfig,
+    id: &str,
+    actor: &str,
+) -> Result<IssueSummary, BdError> {
+    let args = [
+        "update",
+        id,
+        "--assignee",
+        actor,
+        "--status",
+        "in_progress",
+        "--if-assignee",
+        "",
+        "--actor",
+        actor,
+        "--json",
+    ];
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    let assigned = show_issue(cfg, id).await?;
+    if assigned.status == "in_progress" && assigned.assignee.as_deref() == Some(actor) {
+        Ok(assigned)
+    } else {
+        Err(BdError::Beads {
+            context: format!("bd update {id} (guarded assignment)"),
+            exit: None,
+            stdout: serde_json::to_string(&assigned).unwrap_or_default(),
+            stderr: "guarded assignment did not produce an in_progress issue under the expected assignee"
+                .to_owned(),
+        })
+    }
+}
+
 /// Atomically close a run-owned issue and clear that exact run holder.
 ///
 /// The initial read gives foreign or absent ownership a mutation-free refusal.

@@ -32,6 +32,14 @@ pub(crate) const DOLT_LOCK_REFUSAL: &str = "database is locked by another dolt p
 /// envelope's `data.failed[].error`).
 pub(crate) const CLAIM_REFUSAL_MARKERS: [&str; 2] = ["already claimed", "already assigned"];
 
+/// bd 1.2.1's exact refusal when `--claim` is attempted on a blocked issue.
+///
+/// A guarded plain assignment intentionally bypasses this claimable-status
+/// rule. Forged retains the exact copy so a binary that unexpectedly applies
+/// the rule to that guarded assignment can be parked deterministically rather
+/// than spending the rest of a settlement retry budget on the same answer.
+pub const BLOCKED_CLAIM_REFUSAL: &str = "issue not claimable: status blocked";
+
 /// The crate-local error type for every bd outcome.
 ///
 /// Wire mapping (strings match the shared `ErrorCode` serialization in
@@ -133,6 +141,12 @@ pub enum BdError {
 }
 
 impl BdError {
+    /// Whether this error carries bd 1.2.1's exact blocked-status claim
+    /// refusal on any preserved output stream.
+    pub fn is_blocked_claim_refusal(&self) -> bool {
+        self.haystack().contains(BLOCKED_CLAIM_REFUSAL)
+    }
+
     /// Whether bd never ANSWERED — the only class a caller may charge to a
     /// bounded transport-retry budget.
     ///

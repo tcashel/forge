@@ -17,7 +17,8 @@ mod support;
 use std::path::Path;
 
 use forged_beads::{
-    plan_inventory, show_issue, PlanDependencyStatus, PlanDependencyType, PlanReadiness,
+    assign_unassigned_issue, plan_inventory, show_issue, PlanDependencyStatus, PlanDependencyType,
+    PlanReadiness, BLOCKED_CLAIM_REFUSAL,
 };
 use serde_json::{json, Value};
 
@@ -82,6 +83,136 @@ fn create_spec_bead(bd: &Path, s: &support::Scratch) -> String {
         .and_then(Value::as_str)
         .expect("created bead id")
         .to_owned()
+}
+
+/// Create one unassigned bead in an exact built-in status.
+fn create_status_bead(bd: &Path, s: &support::Scratch, title: &str, status: &str) -> String {
+    let out = support::raw_bd(bd, s, &["create", title, "--status", status, "--json"])
+        .output()
+        .expect("spawning bd create with status");
+    assert!(
+        out.status.success(),
+        "bd create --status {status} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value =
+        serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).expect("create envelope");
+    value
+        .get("data")
+        .and_then(|data| data.get("id"))
+        .and_then(Value::as_str)
+        .expect("created bead id")
+        .to_owned()
+}
+
+/// The landed settlement custody contract against pinned bd itself.
+///
+/// `--claim` is legal only over open (apart from an idempotent re-claim by
+/// the actor already holding an in_progress bead). In particular it refuses
+/// blocked with the exact copy that caused the live retry loop, while one
+/// null-assignee-guarded field update can take either blocked or open custody
+/// without `--force`.
+#[tokio::test]
+async fn claimable_statuses_are_pinned_and_plain_guarded_assignment_takes_both_landed_shapes() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("spec-contract-claimable-status");
+    support::init_store(&bd, &s);
+    let actor = "forged:claim-contract";
+
+    let id = create_status_bead(&bd, &s, "claimable open", "open");
+    let out = support::raw_bd(
+        &bd,
+        &s,
+        &["update", &id, "--claim", "--actor", actor, "--json"],
+    )
+    .output()
+    .expect("spawning claim over open");
+    assert!(
+        out.status.success(),
+        "bd must claim status open: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let issue = show_issue(&support::cfg_for(&bd, &s), &id)
+        .await
+        .expect("show claimed bead");
+    assert_eq!(issue.status, "in_progress");
+    assert_eq!(issue.assignee.as_deref(), Some(actor));
+
+    let replay = support::raw_bd(
+        &bd,
+        &s,
+        &["update", &id, "--claim", "--actor", actor, "--json"],
+    )
+    .output()
+    .expect("spawning idempotent claim replay");
+    assert!(
+        replay.status.success(),
+        "the current actor may replay its in_progress claim: stdout={} stderr={}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+
+    let mut blocked = None;
+    for status in [
+        "in_progress",
+        "blocked",
+        "deferred",
+        "closed",
+        "pinned",
+        "hooked",
+    ] {
+        let id = create_status_bead(&bd, &s, &format!("not claimable {status}"), status);
+        let out = support::raw_bd(
+            &bd,
+            &s,
+            &["update", &id, "--claim", "--actor", actor, "--json"],
+        )
+        .output()
+        .expect("spawning claim over a non-claimable status");
+        assert!(
+            !out.status.success(),
+            "bd must refuse --claim over {status}: {}",
+            String::from_utf8_lossy(&out.stdout)
+        );
+        let answer = format!(
+            "{}\n{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let refusal = format!("issue not claimable: status {status}");
+        assert!(
+            answer.contains(&refusal),
+            "bd's {status} refusal must retain the pinned claim rule: {answer}"
+        );
+        let issue = show_issue(&support::cfg_for(&bd, &s), &id)
+            .await
+            .expect("show refused bead");
+        assert_eq!(issue.status, status, "a refused claim changes no status");
+        assert_eq!(issue.assignee, None, "a refused claim assigns nobody");
+        if status == "blocked" {
+            assert_eq!(refusal, BLOCKED_CLAIM_REFUSAL);
+            blocked = Some(id);
+        }
+    }
+
+    let cfg = support::cfg_for(&bd, &s);
+    let blocked = blocked.expect("blocked fixture");
+    let assigned = assign_unassigned_issue(&cfg, &blocked, actor)
+        .await
+        .expect("plain guarded assignment must bypass blocked claimability");
+    assert_eq!(assigned.status, "in_progress");
+    assert_eq!(assigned.assignee.as_deref(), Some(actor));
+
+    let open = create_status_bead(&bd, &s, "guarded open custody", "open");
+    let assigned = assign_unassigned_issue(&cfg, &open, actor)
+        .await
+        .expect("plain guarded assignment must take open custody");
+    assert_eq!(assigned.status, "in_progress");
+    assert_eq!(assigned.assignee.as_deref(), Some(actor));
 }
 
 #[tokio::test]
