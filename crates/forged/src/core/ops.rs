@@ -192,15 +192,21 @@ pub async fn init(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
 ///
 /// `bd ready` is the authority for dependency readiness. Reading the issue
 /// first makes the refusal useful (status and type), while the frontier read
-/// prevents an open issue with active blockers from being dispatched. A
-/// non-code Bead has an explicit route instead of being forced through a
+/// prevents an open issue with active blockers from being dispatched. The
+/// one alternative shape is the exact `in_progress` custody `claim-next`
+/// obtains from that frontier under [`crate::core::FRONTIER_HOLDER`]: pinned
+/// bd moves a successful claim out of `open`, so requiring it to remain in
+/// `bd ready` would make the composed claim-next -> run-start path impossible.
+/// A non-code Bead has an explicit route instead of being forced through a
 /// commit-and-PR protocol that cannot represent its correct result.
 async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSummary, Failure> {
     let issue = super::spec::read_bead(ctx, bead).await?;
-    if issue.status != "open" {
+    let frontier_claimed = issue.status == "in_progress"
+        && issue.assignee.as_deref() == Some(crate::core::FRONTIER_HOLDER);
+    if issue.status != "open" && !frontier_claimed {
         return Err(Failure::invalid(format!(
-            "bead {bead} is {:?}, not open and ready",
-            issue.status
+            "bead {bead} is {:?} under assignee {:?}, not open and ready or held by the forged frontier",
+            issue.status, issue.assignee
         )));
     }
     match issue.issue_type.as_str() {
@@ -222,13 +228,17 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
             )))
         }
     }
-    let ready = forged_beads::ready_issues(&ctx.config.bd_config())
-        .await
-        .map_err(|error| super::spec::read_failure("reading the Beads ready frontier", error))?;
-    if !ready.iter().any(|candidate| candidate.id == bead) {
-        return Err(Failure::invalid(format!(
-            "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
-        )));
+    if !frontier_claimed {
+        let ready = forged_beads::ready_issues(&ctx.config.bd_config())
+            .await
+            .map_err(|error| {
+                super::spec::read_failure("reading the Beads ready frontier", error)
+            })?;
+        if !ready.iter().any(|candidate| candidate.id == bead) {
+            return Err(Failure::invalid(format!(
+                "bead {bead} is absent from `bd ready`; resolve its blockers before starting a run"
+            )));
+        }
     }
     Ok(issue)
 }

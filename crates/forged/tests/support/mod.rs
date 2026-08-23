@@ -785,6 +785,7 @@ case "$cmd" in
       printf '{"schema_version":1,"data":{"count":0,"reclaimed":null,"scoped":true}}\n'
     elif [ -n "$cur" ] && [ "$cur" = "$assignee" ]; then
       rm -f "$state/$id.assignee"
+      printf 'open' > "$state/$id.status"
       bump_revision "$id"
       printf '{"schema_version":1,"data":{"count":1,"reclaimed":[{"id":"%s","previous_owner":"%s"}],"scoped":true}}\n' "$id" "$cur"
     else
