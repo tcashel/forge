@@ -148,9 +148,11 @@ or a portfolio control is not execution approval.
 
 Before asking, resolve the base branch and use `forged definition validate
 --repo "$TARGET_REPO" --base-ref "$BASE_REF"` with the intended profile and
-roster. Retain the returned `baseSha`, `packageSha256`, `profileSha256`, and
-`rosterSha256`; names alone are mutable authoring references. Present one
-bounded confirmation tuple:
+roster. For an epic, add `--epic "$BEAD_ID"`; this freezes the sorted child
+ids, revisions, and spec digests into the returned `inventorySha256`. Retain
+the returned `baseSha`, `packageSha256`, `profileSha256`, `rosterSha256`, and
+epic-only `inventorySha256`; names alone are mutable authoring references.
+Present one bounded confirmation tuple:
 
 - slice or epic;
 - Bead id, title, and observed revision;
@@ -158,6 +160,7 @@ bounded confirmation tuple:
 - base branch and exact remote base SHA;
 - resolved profile and roster references plus their exact SHA-256 values;
 - complete execution-package SHA-256;
+- for an epic, the complete frozen child-inventory SHA-256;
 - the exact start-then-submit action being authorized.
 
 A short reply such as “yes” or “do it” is valid only when it immediately and
@@ -181,6 +184,7 @@ outside the repository:
   "roster": {"name": "<roster name>", "version": <roster version>},
   "rosterSha256": "<exact roster SHA-256>",
   "packageSha256": "<exact execution-package SHA-256>",
+  "inventorySha256": "<required exact child-inventory SHA-256 for epic; omit this member for slice>",
   "action": "<run-start-submit|epic-start-submit>",
   "approvedAt": "<ISO-8601 UTC>",
   "actor": "<operator identity>",

@@ -668,6 +668,7 @@ impl Ledger {
                     || approval.roster_sha256 != roster_sha256
                     || approval.package_sha256 != package_sha256
                     || approval.package_sha256 != definition.package_sha256
+                    || approval.inventory_sha256.is_some()
                 {
                     return Err(mismatch(
                         "execution approval does not match the frozen run tuple".to_owned(),

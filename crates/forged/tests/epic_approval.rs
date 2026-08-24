@@ -83,6 +83,7 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
             "forged-execution-approval/2",
             "baseSha",
             "packageSha256",
+            "inventorySha256",
             "before any effect",
         ] {
             assert!(
@@ -181,6 +182,23 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
     ];
     let (code, started) = env.forged(&args);
     assert_eq!(code, 0, "approved epic start: {started}");
+    assert_eq!(
+        started["result"]["inventorySha256"], approval["inventorySha256"],
+        "the retained start binds the exact approved inventory"
+    );
+    let frozen_child = &started["result"]["children"][0];
+    assert_eq!(frozen_child["id"], json!("approval-bound-child"));
+    assert!(
+        frozen_child["revision"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()),
+        "the frozen child carries its Beads revision"
+    );
+    assert_eq!(
+        frozen_child["specSha256"].as_str().map(str::len),
+        Some(64),
+        "the frozen child carries its exact spec digest"
+    );
 
     // A terminal replay is reconstructed from the durable bundle and does
     // not re-read mutable Beads authoring state.
@@ -218,6 +236,58 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
             .expect("identity read")
             .and_then(|identity| identity.bead.revision),
         Some(revision)
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn epic_child_start_refuses_spec_edits_after_the_inventory_was_approved() {
+    let env = TestEnv::new("forged-epic-approved-child-drift");
+    env.seed_epic(
+        "approved-child-drift-epic",
+        &[("approved-child-drift", &env.spec, true)],
+    );
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "approved-child-drift-epic",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "approved epic start: {started}");
+    env.authorize_epic("approved-child-drift-epic");
+
+    std::fs::write(&env.spec, "changed after approval\n").expect("edit child spec");
+    for _ in 0..2 {
+        let (code, advanced) =
+            env.forged(&["epic", "advance", "--epic", "approved-child-drift-epic"]);
+        assert_eq!(code, 0, "advance before child launch: {advanced}");
+    }
+    let (code, refused) = env.forged(&["epic", "advance", "--epic", "approved-child-drift-epic"]);
+    assert_ne!(code, 0, "changed child spec must refuse: {refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+    let ledger = env.ledger();
+    assert!(
+        ledger.get_run("approved-child-drift").is_err(),
+        "drift refusal precedes child run creation"
+    );
+    assert!(
+        ledger
+            .find_operation("run_start", "op:run_start:approved-child-drift:-:-")
+            .expect("operation lookup")
+            .is_none(),
+        "drift refusal precedes the child start fence"
     );
     ledger.close().expect("close ledger");
 }

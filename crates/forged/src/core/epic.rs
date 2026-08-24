@@ -12,12 +12,13 @@ use forged_ledger::{
 };
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
-    AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode,
+    canonical_json_bytes, AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode,
     ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV2, ExecutionPackageV1,
     OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
     WorkIdentityContextV1, WorkIdentitySubjectKind, EXECUTION_APPROVAL_SCHEMA_V2,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::adapters::ports::repo_slug;
 use crate::core::{
@@ -52,6 +53,12 @@ struct FrozenChild {
     id: String,
     title: String,
     issue_type: String,
+    /// Exact Beads revision observed in the approved inventory. Missing only
+    /// on start events written before child-inventory approval binding.
+    revision: Option<String>,
+    /// SHA-256 of the exact bead-rendered or file bytes approved for launch.
+    /// Missing only on legacy start events.
+    spec_sha256: Option<String>,
     /// The child's frozen spec FILE, when it has one. `None` is the
     /// bead-sourced child: its run start reads the spec from the bead.
     spec_path: Option<String>,
@@ -103,8 +110,14 @@ struct PreparedEpicStart {
     issue: forged_beads::IssueSummary,
     epic_spec_sha256: String,
     children: Vec<Value>,
+    inventory_sha256: String,
     base_ref: String,
     base_sha: String,
+}
+
+struct FrozenInventory {
+    children: Vec<Value>,
+    sha256: String,
 }
 
 fn payload(row: &forged_ledger::EventRow) -> Result<Value, Failure> {
@@ -136,6 +149,14 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
                     .and_then(Value::as_str)
                     .unwrap_or("task")
                     .to_owned(),
+                revision: child
+                    .get("revision")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
+                spec_sha256: child
+                    .get("specSha256")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned),
                 spec_path: child
                     .get("specPath")
                     .and_then(Value::as_str)
@@ -531,6 +552,88 @@ fn is_no_diff(issue_type: &str) -> bool {
     matches!(issue_type, "chore" | "decision" | "milestone")
 }
 
+fn sha256_bytes(bytes: &[u8]) -> String {
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        use std::fmt::Write as _;
+        let _ = write!(hex, "{byte:02x}");
+    }
+    hex
+}
+
+pub(super) fn canonical_inventory_sha256(value: &Value) -> Result<String, Failure> {
+    let bytes = canonical_json_bytes(value)
+        .map_err(|error| Failure::internal(format!("canonicalizing epic inventory: {error}")))?;
+    Ok(sha256_bytes(&bytes))
+}
+
+async fn freeze_inventory(ctx: &Ctx, epic: &str) -> Result<FrozenInventory, Failure> {
+    let inventory = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
+    if inventory.is_empty() {
+        return Err(Failure::invalid(format!(
+            "epic {epic} has no Beads children"
+        )));
+    }
+    let mut children = Vec::with_capacity(inventory.len());
+    for child in inventory {
+        let revision = child.revision.clone().ok_or_else(|| {
+            Failure::invalid(format!(
+                "epic child {} reports no revision; its approved snapshot cannot be frozen",
+                child.id
+            ))
+        })?;
+        // The bead's own fields win, but only when they are a WHOLE spec. A
+        // child missing either required section falls back to its `spec:`
+        // pointer rather than freezing a fragment as bead-sourced.
+        let no_diff = is_no_diff(&child.issue_type);
+        let child_spec = if no_diff || super::spec::carries_spec(&child) {
+            None
+        } else {
+            let missing = super::spec::missing_spec_fields(&child).join(", ");
+            let pointer = spec_pointer(&child.description).ok_or_else(|| {
+                Failure::invalid(format!(
+                    "epic child {} has no spec: {missing} empty and it carries no spec: pointer",
+                    child.id
+                ))
+            })?;
+            if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
+                return Err(Failure::invalid(format!(
+                    "epic child {} spec {:?} is not an existing absolute path",
+                    child.id, pointer
+                )));
+            }
+            Some(pointer)
+        };
+        let spec_sha256 = match child_spec.as_deref() {
+            Some(path) => super::spec::resolve_file(path)?.sha256,
+            None if no_diff && !super::spec::carries_spec(&child) => {
+                sha256_bytes(super::spec::render_body(&child).as_bytes())
+            }
+            None => super::spec::resolve_issue(&child)?.sha256,
+        };
+        children.push(json!({
+            "id": child.id,
+            "title": child.title,
+            "issueType": child.issue_type,
+            "revision": revision,
+            "specSha256": spec_sha256,
+            "specPath": child_spec,
+            "initiallyClosed": child.status == "closed",
+        }));
+    }
+    children.sort_by(|left, right| {
+        left.get("id")
+            .and_then(Value::as_str)
+            .cmp(&right.get("id").and_then(Value::as_str))
+    });
+    let sha256 = canonical_inventory_sha256(&Value::Array(children.clone()))?;
+    Ok(FrozenInventory { children, sha256 })
+}
+
+pub(super) async fn inventory_sha256(ctx: &Ctx, epic: &str) -> Result<String, Failure> {
+    Ok(freeze_inventory(ctx, epic).await?.sha256)
+}
+
 async fn prepare_epic_start(
     ctx: &Ctx,
     params: &Map<String, Value>,
@@ -565,44 +668,7 @@ async fn prepare_epic_start(
         )));
     }
     let epic_spec = super::spec::resolve_issue(&issue)?;
-    let inventory = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
-    if inventory.is_empty() {
-        return Err(Failure::invalid(format!(
-            "epic {epic} has no Beads children"
-        )));
-    }
-    let mut children = Vec::new();
-    for child in inventory {
-        // The bead's own fields win, but only when they are a WHOLE spec. A
-        // child missing either required section falls back to its `spec:`
-        // pointer rather than freezing a fragment as bead-sourced.
-        let no_diff = is_no_diff(&child.issue_type);
-        let child_spec = if no_diff || super::spec::carries_spec(&child) {
-            None
-        } else {
-            let missing = super::spec::missing_spec_fields(&child).join(", ");
-            let pointer = spec_pointer(&child.description).ok_or_else(|| {
-                Failure::invalid(format!(
-                    "epic child {} has no spec: {missing} empty and it carries no spec: pointer",
-                    child.id
-                ))
-            })?;
-            if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
-                return Err(Failure::invalid(format!(
-                    "epic child {} spec {:?} is not an existing absolute path",
-                    child.id, pointer
-                )));
-            }
-            Some(pointer)
-        };
-        children.push(json!({
-            "id": child.id,
-            "title": child.title,
-            "issueType": child.issue_type,
-            "specPath": child_spec,
-            "initiallyClosed": child.status == "closed",
-        }));
-    }
+    let inventory = freeze_inventory(ctx, epic).await?;
     let base_ref = match param_opt_str(params, "baseRef") {
         Some(value) => value.to_owned(),
         None => super::ops::default_branch_of(&repo).await,
@@ -614,7 +680,8 @@ async fn prepare_epic_start(
         compiled,
         issue,
         epic_spec_sha256: epic_spec.sha256,
-        children,
+        children: inventory.children,
+        inventory_sha256: inventory.sha256,
         base_ref,
         base_sha,
     })
@@ -679,9 +746,10 @@ fn validate_epic_start_approval(
         || approval.profile_sha256 != prepared.compiled.package.profile_sha256
         || approval.roster_sha256 != prepared.compiled.package.roster_sha256
         || approval.package_sha256 != prepared.compiled.package_sha256
+        || approval.inventory_sha256.as_deref() != Some(prepared.inventory_sha256.as_str())
     {
         return Err(mismatch(
-            "execution approval does not match bead, repository, base ref/SHA, profile, roster, package, or action"
+            "execution approval does not match bead, repository, base ref/SHA, profile, roster, package, child inventory, or action"
                 .to_owned(),
         ));
     }
@@ -1070,6 +1138,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     issue,
                     epic_spec_sha256,
                     children,
+                    inventory_sha256,
                     base_ref,
                     base_sha,
                 } = prepared;
@@ -1102,6 +1171,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "profile": compiled.package.profile_ref.name,
                     "roster": compiled.package.roster_ref.name,
                     "packageSha256": compiled.package_sha256,
+                    "inventorySha256": inventory_sha256,
                     "executionApprovalSchema": EXECUTION_APPROVAL_SCHEMA_V2,
                     "executionPackage": compiled.package,
                     "children": children,
@@ -1171,6 +1241,8 @@ fn child_json(
         "identity": identity,
         "title": child.title,
         "issueType": child.issue_type,
+        "revision": child.revision,
+        "specSha256": child.spec_sha256,
         "specPath": child.spec_path,
         "beadsStatus": bead_status,
         "runId": state.map(|value| value.run_id.as_str()),
@@ -1763,8 +1835,15 @@ async fn start_child(
         },
     };
     let started = response(
-        super::ops::run_start_from_approved_epic(ctx, &mut request, compiled, &config.epic_id)
-            .await,
+        super::ops::run_start_from_approved_epic(
+            ctx,
+            &mut request,
+            compiled,
+            &config.epic_id,
+            child.revision.as_deref(),
+            child.spec_sha256.as_deref(),
+        )
+        .await,
     )?;
     let event = json!({
         "childId": child.id,

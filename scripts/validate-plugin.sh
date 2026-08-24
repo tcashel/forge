@@ -81,6 +81,7 @@ const requiredSkillText = [
   'packageSha256',
   'profileSha256',
   'rosterSha256',
+  'inventorySha256',
   'forged definition validate',
   'forged doctor',
   'forged service status',
@@ -911,6 +912,8 @@ check_epic_approval_handoff() {
   local token
   for token in \
     'forged-execution-approval/2' \
+    'inventorySha256' \
+    'forged definition validate --epic "$EPIC_ID"' \
     '--expected-bead-revision "$OBSERVED_REVISION"' \
     '--approval "$APPROVAL_FILE"' \
     'EXECUTION_APPROVAL_MISMATCH' \

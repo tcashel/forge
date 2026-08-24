@@ -35,6 +35,71 @@ fn canonical_sha256<T: Serialize>(value: &T) -> Result<String, LedgerError> {
     Ok(hex)
 }
 
+fn bound_epic_inventory(event: &Value) -> Result<Option<String>, LedgerError> {
+    let Some(expected) = event.get("inventorySha256").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let children = event
+        .get("children")
+        .and_then(Value::as_array)
+        .ok_or_else(|| {
+            refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                "epic start inventory digest has no child array",
+            )
+        })?;
+    if children.is_empty() {
+        return Err(refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            "epic start inventory digest cannot bind an empty child array",
+        ));
+    }
+    let mut previous: Option<&str> = None;
+    for child in children {
+        let id = child
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| {
+                refused(
+                    ErrorCode::ExecutionApprovalMismatch,
+                    "epic start child inventory has no id",
+                )
+            })?;
+        if previous.is_some_and(|value| value >= id) {
+            return Err(refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                "epic start child inventory is not strictly sorted by id",
+            ));
+        }
+        previous = Some(id);
+        if child
+            .get("revision")
+            .and_then(Value::as_str)
+            .is_none_or(str::is_empty)
+            || child
+                .get("specSha256")
+                .and_then(Value::as_str)
+                .is_none_or(|digest| {
+                    digest.len() != 64 || !digest.bytes().all(|byte| byte.is_ascii_hexdigit())
+                })
+        {
+            return Err(refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic start child {id:?} has no valid revision/spec digest"),
+            ));
+        }
+    }
+    let actual = canonical_sha256(&Value::Array(children.clone()))?;
+    if actual != expected {
+        return Err(refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            "epic start child inventory digest mismatch",
+        ));
+    }
+    Ok(Some(actual))
+}
+
 pub(crate) const IDENTITY_COLUMNS: &str = "schema, subject_kind, subject_id, bead_id, bead_title, \
     bead_revision, repository_path, repository_label, project_id, project_title, \
     epic_id, epic_title, display_title, captured_at, source";
@@ -642,6 +707,13 @@ impl Ledger {
                     "epic start event repository does not match its identity",
                 ));
             }
+            let inventory_sha256 = bound_epic_inventory(&event)?;
+            if inventory_sha256.is_some() && approval.is_none() {
+                return Err(refused(
+                    ErrorCode::ExecutionApprovalMismatch,
+                    "content-bound epic inventory requires a retained execution approval",
+                ));
+            }
             if let Some(approval) = approval.as_ref() {
                 let mismatch =
                     |message: String| refused(ErrorCode::ExecutionApprovalMismatch, message);
@@ -683,6 +755,7 @@ impl Ledger {
                     || approval.profile_sha256 != profile_sha256
                     || approval.roster_sha256 != roster_sha256
                     || approval.package_sha256 != package_sha256
+                    || approval.inventory_sha256 != inventory_sha256
                     || package.profile_sha256 != profile_sha256
                     || package.roster_sha256 != roster_sha256
                     || event_package_sha256.as_deref() != Some(package_sha256.as_str())

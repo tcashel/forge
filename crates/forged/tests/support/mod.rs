@@ -1344,10 +1344,13 @@ impl TestEnv {
         if let Some(roster) = roster {
             args.extend(["--roster", roster]);
         }
+        if subject_kind == "epic" {
+            args.extend(["--epic", bead]);
+        }
         let (code, definition) = self.forged_without_test_approval(&args);
         assert_eq!(code, 0, "definition validation: {definition}");
         assert_eq!(definition["result"]["valid"], json!(true));
-        json!({
+        let mut approval = json!({
             "schema": "forged-execution-approval/2",
             "subjectKind": subject_kind,
             "beadId": bead,
@@ -1368,7 +1371,11 @@ impl TestEnv {
             "approvedAt": "2026-08-24T12:00:00Z",
             "actor": "test-operator",
             "basis": "integration test exact tuple",
-        })
+        });
+        if subject_kind == "epic" {
+            approval["inventorySha256"] = definition["result"]["inventorySha256"].clone();
+        }
+        approval
     }
 
     fn test_approved_start_args(&self, args: &[&str]) -> Option<Vec<String>> {

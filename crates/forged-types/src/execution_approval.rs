@@ -94,6 +94,11 @@ pub struct ExecutionApprovalV2 {
     pub roster_sha256: String,
     /// SHA-256 of the complete frozen execution package.
     pub package_sha256: String,
+    /// SHA-256 of the canonical frozen child inventory for an epic launch.
+    /// Required for new epic approvals and absent for slice approvals and
+    /// legacy in-flight epic approvals created before inventory binding.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_sha256: Option<String>,
     /// Exact lifecycle action authorized.
     pub action: ExecutionApprovalAction,
     /// Operator-supplied RFC 3339 timestamp.

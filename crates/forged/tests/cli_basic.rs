@@ -89,6 +89,7 @@ fn help_lists_every_command_and_subcommand_flags() {
         "--roster",
         "--repo",
         "--base-ref",
+        "--epic",
         "--idempotency-key",
     ] {
         assert!(

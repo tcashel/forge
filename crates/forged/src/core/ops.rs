@@ -14,8 +14,8 @@ use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
     AttentionState, ErrorCode, ExecutionApprovalAction, ExecutionApprovalSubjectKind,
-    ExecutionApprovalV2, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
-    WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
+    ExecutionApprovalV2, ExecutionPackageV1, OperationRequest, OperationResponse, RosterRevisionV1,
+    RunId, WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
     EXECUTION_APPROVAL_SCHEMA_V2,
 };
 use serde_json::{json, Value};
@@ -380,6 +380,7 @@ fn validate_run_start_approval(
         || approval.profile_sha256 != package.profile_sha256
         || approval.roster_sha256 != package.roster_sha256
         || approval.package_sha256 != definition.package_sha256
+        || approval.inventory_sha256.is_some()
     {
         return Err(mismatch(
             "execution approval does not match bead, repository, base ref/SHA, profile, roster, package, or action"
@@ -423,21 +424,73 @@ async fn validate_retained_epic_approval(
     };
     let started: Value = serde_json::from_str(&started.payload_json)
         .map_err(|error| Failure::internal(format!("malformed epic start bundle: {error}")))?;
-    let frozen: ExecutionPackageV1 = serde_json::from_value(
-        started
-            .get("executionPackage")
-            .cloned()
-            .ok_or_else(|| Failure::internal("epic start bundle has no execution package"))?,
-    )
-    .map_err(|error| Failure::internal(format!("malformed epic execution package: {error}")))?;
-    if frozen != definition.package
-        || started.get("packageSha256").and_then(Value::as_str)
-            != Some(definition.package_sha256.as_str())
-    {
+    let migrations = events
+        .iter()
+        .filter(|event| event.kind == "forged.epic.execution-package.migrated")
+        .collect::<Vec<_>>();
+    let migration = match migrations.as_slice() {
+        [] => None,
+        [migration] => Some(
+            serde_json::from_str::<Value>(&migration.payload_json).map_err(|error| {
+                Failure::internal(format!("malformed epic package migration: {error}"))
+            })?,
+        ),
+        _ => {
+            return Err(Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic {epic} has ambiguous frozen package migrations"),
+            ))
+        }
+    };
+    let package_value = started
+        .get("executionPackage")
+        .or_else(|| {
+            migration
+                .as_ref()
+                .and_then(|value| value.get("executionPackage"))
+        })
+        .cloned()
+        .ok_or_else(|| Failure::internal("epic has no frozen execution package"))?;
+    let frozen: ExecutionPackageV1 = serde_json::from_value(package_value)
+        .map_err(|error| Failure::internal(format!("malformed epic execution package: {error}")))?;
+    let original = crate::config::compile_frozen_package(frozen.clone()).map_err(|errors| {
+        Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!(
+                "epic {epic} original frozen package is invalid: {}",
+                serde_json::to_string(&errors).unwrap_or_default()
+            ),
+        )
+    })?;
+    let recorded_package_sha256 = if started.get("executionPackage").is_some() {
+        started.get("packageSha256").and_then(Value::as_str)
+    } else {
+        migration
+            .as_ref()
+            .and_then(|value| value.get("packageSha256"))
+            .and_then(Value::as_str)
+    };
+    if recorded_package_sha256 != Some(original.package_sha256.as_str()) {
         return Err(Failure::refused(
             ErrorCode::ExecutionApprovalMismatch,
-            format!("epic {epic} child definition differs from its frozen parent package"),
+            format!("epic {epic} original frozen package digest is inconsistent"),
         ));
+    }
+
+    let inventory_sha256 = started.get("inventorySha256").and_then(Value::as_str);
+    if let Some(expected) = inventory_sha256 {
+        let children = started.get("children").cloned().ok_or_else(|| {
+            Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic {epic} bound inventory has no child array"),
+            )
+        })?;
+        if super::epic::canonical_inventory_sha256(&children)? != expected {
+            return Err(Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic {epic} retained child inventory digest is inconsistent"),
+            ));
+        }
     }
 
     match started
@@ -447,11 +500,11 @@ async fn validate_retained_epic_approval(
         // Epics durably started before content-bound approvals existed remain
         // driveable. New starts always carry the v2 marker atomically, so
         // this compatibility branch cannot be selected by request JSON.
-        None if approvals.len() <= 1 => Ok(()),
+        None if approvals.len() <= 1 => {}
         None => Err(Failure::refused(
             ErrorCode::ExecutionApprovalMismatch,
             format!("epic {epic} has conflicting legacy execution approvals"),
-        )),
+        ))?,
         Some(EXECUTION_APPROVAL_SCHEMA_V2) => {
             let [approval] = approvals.as_slice() else {
                 return Err(Failure::refused(
@@ -474,24 +527,84 @@ async fn validate_retained_epic_approval(
                     != Some(approval.base_ref.as_str())
                 || started.get("baseSha").and_then(Value::as_str)
                     != Some(approval.base_sha.as_str())
-                || approval.profile != definition.package.profile_ref
-                || approval.roster != definition.package.roster_ref
-                || approval.profile_sha256 != definition.package.profile_sha256
-                || approval.roster_sha256 != definition.package.roster_sha256
-                || approval.package_sha256 != definition.package_sha256
+                || approval.profile != original.package.profile_ref
+                || approval.roster != original.package.roster_ref
+                || approval.profile_sha256 != original.package.profile_sha256
+                || approval.roster_sha256 != original.package.roster_sha256
+                || approval.package_sha256 != original.package_sha256
+                || approval.inventory_sha256.as_deref() != inventory_sha256
             {
                 return Err(Failure::refused(
                     ErrorCode::ExecutionApprovalMismatch,
                     format!("epic {epic} retained approval does not match its frozen package"),
                 ));
             }
-            Ok(())
         }
         Some(other) => Err(Failure::refused(
             ErrorCode::ExecutionApprovalMismatch,
             format!("epic {epic} has unsupported retained approval schema {other:?}"),
-        )),
+        ))?,
     }
+
+    // The operator approved the original package. A durable roster revision
+    // is separate provenance, not a retroactive rewrite of that approval.
+    // Rebuild the active package only from the retained ordered revision
+    // events, validate every overlay, then compare it with the definition the
+    // controller is about to give the child.
+    let mut active = frozen;
+    let mut expected_revision = 2_u32;
+    for event in events
+        .iter()
+        .filter(|event| event.kind == "forged.epic.roster.revised")
+    {
+        let revision: RosterRevisionV1 =
+            serde_json::from_str(&event.payload_json).map_err(|error| {
+                Failure::refused(
+                    ErrorCode::ExecutionApprovalMismatch,
+                    format!("epic {epic} retained roster revision is malformed: {error}"),
+                )
+            })?;
+        if revision.revision != expected_revision || revision.reason.trim().is_empty() {
+            return Err(Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic {epic} retained roster revision chain is not contiguous"),
+            ));
+        }
+        active.roster_ref = revision.roster_ref;
+        active.roster_sha256 = revision.roster_sha256;
+        active.roster = revision.roster;
+        crate::config::compile_frozen_package(active.clone()).map_err(|errors| {
+            Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!(
+                    "epic {epic} retained roster revision is invalid: {}",
+                    serde_json::to_string(&errors).unwrap_or_default()
+                ),
+            )
+        })?;
+        expected_revision = expected_revision.checked_add(1).ok_or_else(|| {
+            Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                format!("epic {epic} retained roster revision counter overflowed"),
+            )
+        })?;
+    }
+    let active = crate::config::compile_frozen_package(active).map_err(|errors| {
+        Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!(
+                "epic {epic} active package is invalid: {}",
+                serde_json::to_string(&errors).unwrap_or_default()
+            ),
+        )
+    })?;
+    if active.package != definition.package || active.package_sha256 != definition.package_sha256 {
+        return Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("epic {epic} child definition lacks retained roster provenance"),
+        ));
+    }
+    Ok(())
 }
 
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
@@ -626,7 +739,11 @@ async fn replay_terminal_run_start_before_compile(
 
 enum RunStartAuthority {
     Direct,
-    ApprovedEpic(String),
+    ApprovedEpic {
+        parent_epic: String,
+        child_revision: Option<String>,
+        child_spec_sha256: Option<String>,
+    },
 }
 
 /// Start a child run from the exact package retained by its parent epic.
@@ -637,14 +754,59 @@ pub(crate) async fn run_start_from_approved_epic(
     req: &mut OperationRequest,
     compiled: crate::config::CompiledDefinition,
     parent_epic: &str,
+    child_revision: Option<&str>,
+    child_spec_sha256: Option<&str>,
 ) -> OperationResponse {
     run_start_with_definition(
         ctx,
         req,
         compiled,
-        RunStartAuthority::ApprovedEpic(parent_epic.to_owned()),
+        RunStartAuthority::ApprovedEpic {
+            parent_epic: parent_epic.to_owned(),
+            child_revision: child_revision.map(str::to_owned),
+            child_spec_sha256: child_spec_sha256.map(str::to_owned),
+        },
     )
     .await
+}
+
+fn validate_epic_child_snapshot(
+    prepared: &PreparedRunStart,
+    child_revision: Option<&str>,
+    child_spec_sha256: Option<&str>,
+) -> Result<(), Failure> {
+    match (child_revision, child_spec_sha256) {
+        // Start events created before inventory binding remain driveable. No
+        // current request can select this branch because the snapshot comes
+        // only from the durable parent event.
+        (None, None) => return Ok(()),
+        (Some(_), None) | (None, Some(_)) => {
+            return Err(Failure::refused(
+                ErrorCode::ExecutionApprovalMismatch,
+                "epic child has a partial frozen approval snapshot",
+            ))
+        }
+        (Some(_), Some(_)) => {}
+    }
+    let expected_revision = child_revision.expect("matched above");
+    let expected_spec_sha256 = child_spec_sha256.expect("matched above");
+    let actual_spec_sha256 = match &prepared.source {
+        super::spec::SpecSource::Bead(_) => super::spec::resolve_issue(&prepared.issue)?.sha256,
+        super::spec::SpecSource::FrozenBead(frozen) => super::spec::resolve_frozen(frozen)?.sha256,
+        super::spec::SpecSource::File(path) => super::spec::resolve_file(path)?.sha256,
+    };
+    if prepared.issue.revision.as_deref() != Some(expected_revision)
+        || actual_spec_sha256 != expected_spec_sha256
+    {
+        return Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!(
+                "epic child {} differs from its approved revision/spec digest",
+                prepared.issue.id
+            ),
+        ));
+    }
+    Ok(())
 }
 
 async fn run_start_with_definition(
@@ -774,11 +936,26 @@ async fn run_start_with_definition(
             };
             (Some(prepared), Some(approval))
         }
-        RunStartAuthority::ApprovedEpic(parent_epic) => {
+        RunStartAuthority::ApprovedEpic {
+            parent_epic,
+            child_revision,
+            child_spec_sha256,
+        } => {
             if let Err(error) = validate_retained_epic_approval(ctx, parent_epic, &compiled).await {
                 return err_response(&req.idempotency_key, &error);
             }
-            (None, None)
+            let prepared = match prepare_run_start(ctx, &params, &bead).await {
+                Ok(prepared) => prepared,
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            };
+            if let Err(error) = validate_epic_child_snapshot(
+                &prepared,
+                child_revision.as_deref(),
+                child_spec_sha256.as_deref(),
+            ) {
+                return err_response(&req.idempotency_key, &error);
+            }
+            (Some(prepared), None)
         }
     };
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
@@ -1384,6 +1561,15 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
                         ))
                     }
                 };
+                let inventory_sha256 = match param_opt_str(&req.params, "epic") {
+                    Some(_) if base.is_none() => {
+                        return Err(Failure::invalid(
+                            "epic inventory validation requires repo and baseRef",
+                        ))
+                    }
+                    Some(epic) => Some(super::epic::inventory_sha256(ctx, epic).await?),
+                    None => None,
+                };
                 let package = compiled.package;
                 Ok(json!({
                     "valid": true,
@@ -1396,6 +1582,7 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
                     "rosterSha256": package.roster_sha256,
                     "baseRef": base.as_ref().map(|(base_ref, _)| base_ref),
                     "baseSha": base.as_ref().map(|(_, base_sha)| base_sha),
+                    "inventorySha256": inventory_sha256,
                     "roles": package.roster.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
                     "seats": package.profile.seats,
                     "policy": package.policy,

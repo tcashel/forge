@@ -501,6 +501,9 @@ pub struct DefinitionValidateArgs {
     /// Base ref whose exact remote object id should be returned.
     #[arg(long, requires = "repo")]
     pub base_ref: Option<String>,
+    /// Beads epic whose exact frozen child-inventory digest should be returned.
+    #[arg(long, requires = "repo")]
+    pub epic: Option<String>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1465,6 +1468,7 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                         "roster": a.roster,
                         "repo": a.repo,
                         "baseRef": a.base_ref,
+                        "epic": a.epic,
                     }),
                 ),
             ),

@@ -49,8 +49,10 @@ warrants more. The profile's loop budget is the stopping rule.
 
 Consume the exact observed epic revision and strict
 `forged-execution-approval/2` scratch file supplied by the execution gate,
-including the exact approved base SHA and definition digests. Do not write
-approval to a Bead comment. The ordered handoff contains no spec-file argument:
+including the exact approved base SHA, definition digests, and
+`inventorySha256` returned by `forged definition validate --epic "$EPIC_ID"`.
+Do not write approval to a Bead comment. The ordered handoff contains no
+spec-file argument:
 
 ```bash
 PROFILE="${PROFILE:-standard}"
@@ -65,8 +67,9 @@ forged epic submit --epic "$EPIC_ID"
 ```
 
 The start atomically checks the epic id, revision, repository, base ref and
-remote SHA, exact profile/roster/package content, and `epic-start-submit`
-action, then retains that approval with the frozen epic.
+remote SHA, exact profile/roster/package content, sorted child revisions/spec
+digests, and `epic-start-submit` action, then retains that approval with the
+frozen epic.
 `EXECUTION_APPROVAL_MISMATCH` creates no new epic or external effect: stop for
 a fresh tuple and never retry unguarded. Use output from `start` to verify the
 frozen inventory and branches before submitting. Submit the exact epic id and

@@ -162,6 +162,10 @@ pub struct ExecutionApprovalArgs {
     /// Required for every fresh launch: SHA-256 returned by definition_validate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub package_sha256: Option<String>,
+    /// Required for an epic launch: exact frozen child-inventory SHA-256
+    /// returned by definition_validate when params.epic is supplied.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub inventory_sha256: Option<String>,
     pub action: String,
     pub approved_at: String,
     pub actor: String,
@@ -1130,7 +1134,7 @@ impl ForgedServer {
     /// Resolve and validate a profile/roster selection.
     #[tool(
         name = "definition_validate",
-        description = "Resolve and validate an execution definition. Returns exact packageSha256, profileSha256, and rosterSha256 for approval. Pass params.repo and params.baseRef together to also resolve the exact remote baseSha required by forged-execution-approval/2."
+        description = "Resolve and validate an execution definition. Returns exact packageSha256, profileSha256, and rosterSha256 for approval. Pass params.repo and params.baseRef together to also resolve the exact remote baseSha required by forged-execution-approval/2. For an epic approval, also pass params.epic to return the exact inventorySha256 over its sorted child revisions and spec digests."
     )]
     pub async fn definition_validate(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("definition_validate", args.0).await
@@ -1208,7 +1212,7 @@ impl ForgedServer {
     /// Freeze an epic inventory and child execution defaults.
     #[tool(
         name = "epic_start",
-        description = "Start one durable Beads epic. Every fresh launch requires params.expectedBeadRevision and a forged-execution-approval/2 object in params.approval containing exact baseSha, packageSha256, profileSha256, and rosterSha256 values returned by definition_validate. Forged validates the epic/revision/repository/base ref/base SHA/profile/roster/content/action tuple before any effect and retains approval atomically with the frozen epic. Omission is accepted only for byte-identical replay of a terminal legacy operation."
+        description = "Start one durable Beads epic. Every fresh launch requires params.expectedBeadRevision and a forged-execution-approval/2 object in params.approval containing exact baseSha, packageSha256, profileSha256, rosterSha256, and inventorySha256 values returned by definition_validate with params.epic. Forged validates the epic/revision/repository/base ref/base SHA/profile/roster/content/sorted child inventory/action tuple before any effect and retains approval atomically with the frozen epic. Omission is accepted only for byte-identical replay of a terminal legacy operation."
     )]
     pub async fn epic_start(&self, args: Parameters<EpicStartArgs>) -> CallToolResult {
         self.call("epic_start", args.0.into_envelope()).await
