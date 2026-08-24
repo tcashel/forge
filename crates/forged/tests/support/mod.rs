@@ -1319,6 +1319,7 @@ impl TestEnv {
     }
 
     /// Build the exact content-bound approval used by launch tests.
+    #[allow(clippy::too_many_arguments)]
     pub fn execution_approval(
         &self,
         subject_kind: &str,
