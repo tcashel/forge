@@ -95,11 +95,13 @@ Named skills remain available as explicit power-user and debugging surfaces:
 - `/forged:dispatch`
 - `/forged:run-epic`
 
-The dispatch skills call `forged run start` followed by `forged run submit`, or
-the corresponding epic commands, and return immediately with durable
-inspection commands. They do not shell-detach jobs or keep the lead session
-alive. Slice work stops at a reviewed draft pull request. An epic may integrate
-mechanically clean children, but default-branch merge remains human-owned.
+Slice dispatch binds the operator's exact Bead revision and approval tuple
+atomically at `forged run start`, then calls `forged run submit`; epic dispatch
+uses the corresponding epic commands. The skills return immediately with
+durable inspection commands and do not shell-detach jobs or keep the lead
+session alive. Slice work stops at a reviewed draft pull request. An epic may
+integrate mechanically clean children, but default-branch merge remains
+human-owned.
 
 ## Operator scope
 
