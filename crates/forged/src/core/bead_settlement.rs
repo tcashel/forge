@@ -1,4 +1,5 @@
-//! Supervisor-owned retry of pending whole-run bead settlement.
+//! Supervisor-owned retry of pending whole-run settlement aftermath and
+//! Bead settlement.
 //!
 //! `run stop` records `run.bead-settlement.pending` when the terminal Beads
 //! write fails, and its stored response replays verbatim forever after —
@@ -183,6 +184,36 @@ fn custody_probe(
 /// older wake and therefore sort to the front of the next pass. Per-run
 /// failures are report entries, never a pass failure.
 pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
+    // Terminal run state and this promise commit atomically. Re-enter the
+    // ordinary idempotent aftermath before probing Beads-only promises, so a
+    // crash after terminalization cannot strand revoking attempts or their
+    // capacity reservations after desired work has already stopped.
+    let pending_aftermath = on_ledger(&ctx.ledger, |ledger| {
+        ledger.list_pending_settlement_aftermaths()
+    })
+    .await?;
+    let mut aftermath_actions = Vec::new();
+    // Do not page this queue by stable run id: one permanently failing first
+    // page would otherwise starve every later run and leak their capacity.
+    // Each replay is idempotent, so give every durable promise one attempt
+    // per supervisor pass. The Beads-only queue below retains its due-time
+    // backoff and bounded probing contract.
+    for row in &pending_aftermath {
+        let action = match settlement::replay_pending_aftermath(ctx, &row.run_id).await {
+            Ok(result) => json!({
+                "runId": row.run_id,
+                "action": "replayed",
+                "result": result,
+            }),
+            Err(error) => json!({
+                "runId": row.run_id,
+                "action": "error",
+                "error": error.to_string(),
+            }),
+        };
+        aftermath_actions.push(action);
+    }
+
     let pending = on_ledger(&ctx.ledger, |ledger| ledger.list_pending_bead_settlements()).await?;
     let now = now_iso();
     let mut due: Vec<&PendingBeadSettlementRow> = pending
@@ -216,6 +247,9 @@ pub(super) async fn reconcile(ctx: &Ctx) -> Result<Value, Failure> {
     }
     Ok(json!({
         "schema": REPORT_SCHEMA,
+        "aftermathPending": pending_aftermath.len(),
+        "aftermathTruncated": 0,
+        "aftermath": aftermath_actions,
         "pending": pending.len(),
         "truncated": truncated,
         "actions": actions,

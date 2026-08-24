@@ -26,6 +26,26 @@ pub(crate) struct Settlement {
     pub(crate) superseded_by: Option<String>,
 }
 
+fn settlement_from_run(run: &RunRow) -> Result<Settlement, Failure> {
+    Ok(Settlement {
+        outcome: run.terminal_outcome.ok_or_else(|| {
+            Failure::internal(format!(
+                "stopped run {:?} has no terminal outcome to replay",
+                run.run_id
+            ))
+        })?,
+        reason: run.stop_reason.clone().ok_or_else(|| {
+            Failure::internal(format!(
+                "stopped run {:?} has no terminal reason to replay",
+                run.run_id
+            ))
+        })?,
+        delivery_pr: run.delivery_pr,
+        delivery_sha: run.delivery_sha.clone(),
+        superseded_by: run.superseded_by.clone(),
+    })
+}
+
 /// One stable explanation shared by controller settlement and the explicit
 /// acceptance operation. Keeping this byte-for-byte identical makes crash
 /// recovery an idempotent replay instead of a competing terminal decision.
@@ -364,16 +384,17 @@ async fn settle_aftermath(
 
 /// Execute a validated settlement. Kept reusable for the review acceptance
 /// operation, which owns the evidence contract for `accepted-risk`.
-pub(crate) async fn settle(
+async fn settle_with_submit_guard(
     ctx: &Ctx,
     run_id: &str,
     settlement: Settlement,
+    submit_guard: &super::handoff::SubmitGuard,
 ) -> Result<Value, Failure> {
+    submit_guard.verify(super::handoff::Scope::Run, run_id)?;
     // Serialize generation discovery with detached submit. The ledger write
     // below revokes that exact generation atomically with the terminal run
     // projection; confirmed process-group death closes the opposite race,
     // where a machine effect already received its ticket.
-    let _submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
     let controller = super::handoff::controller_fence_target(ctx, run_id).await?;
     // Stop the state machine first. A crash after this point cannot open new
     // protocol work; replay resumes the identical terminal settlement.
@@ -382,7 +403,7 @@ pub(crate) async fn settle(
         let settlement = settlement.clone();
         let generation = controller.as_ref().map(|target| target.generation);
         on_ledger(&ctx.ledger, move |ledger| match generation {
-            Some(generation) => ledger.settle_run_fencing_controller(
+            Some(generation) => ledger.settle_run_fencing_controller_with_aftermath(
                 &run_id,
                 RunSettlement {
                     outcome: settlement.outcome,
@@ -393,7 +414,7 @@ pub(crate) async fn settle(
                 },
                 generation,
             ),
-            None => ledger.settle_run(
+            None => ledger.settle_run_with_aftermath(
                 &run_id,
                 settlement.outcome,
                 settlement.reason,
@@ -401,6 +422,16 @@ pub(crate) async fn settle(
                 settlement.delivery_sha,
                 settlement.superseded_by,
             ),
+        })
+        .await?
+    };
+    let aftermath = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            Ok(ledger
+                .list_pending_settlement_aftermaths()?
+                .into_iter()
+                .find(|row| row.run_id == run_id))
         })
         .await?
     };
@@ -433,6 +464,21 @@ pub(crate) async fn settle(
 
     let (stopped_attempts, bead, retired, cleanup_error) =
         settle_aftermath(ctx, run_id, &settlement, &run, false).await?;
+    let aftermath_completed = if let Some(aftermath) = aftermath {
+        let event_run = run_id.to_owned();
+        let event_id = aftermath.event_id;
+        let event = json!({
+            "schema": "forged.settlement-aftermath/1",
+            "outcome": settlement.outcome.as_str(),
+            "settled": true,
+        });
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger.finish_settlement_aftermath(&event_run, event_id, event)
+        })
+        .await?
+    } else {
+        false
+    };
 
     Ok(json!({
         "runId": run_id,
@@ -449,7 +495,42 @@ pub(crate) async fn settle(
         "bead": bead,
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,
+        "aftermathCompleted": aftermath_completed,
     }))
+}
+
+/// Execute settlement when the caller does not already own its run submit
+/// singleton.
+pub(crate) async fn settle(
+    ctx: &Ctx,
+    run_id: &str,
+    settlement: Settlement,
+) -> Result<Value, Failure> {
+    let submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
+    settle_with_submit_guard(ctx, run_id, settlement, &submit_guard).await
+}
+
+/// Execute settlement under the exact run submit singleton already held by
+/// submit/supervisor recovery. Reacquiring a non-reentrant cross-process
+/// slot would otherwise self-contend for its full 30 second wait.
+pub(crate) async fn settle_held(
+    ctx: &Ctx,
+    run_id: &str,
+    settlement: Settlement,
+    submit_guard: &super::handoff::SubmitGuard,
+) -> Result<Value, Failure> {
+    settle_with_submit_guard(ctx, run_id, settlement, submit_guard).await
+}
+
+/// Replay a durable post-terminal aftermath promise through the same
+/// idempotent attempt/Bead/worktree machinery as the original settlement.
+pub(super) async fn replay_pending_aftermath(ctx: &Ctx, run_id: &str) -> Result<Value, Failure> {
+    let run = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
+    };
+    let settlement = settlement_from_run(&run)?;
+    settle(ctx, run_id, settlement).await
 }
 
 /// `run stop` — the explicit whole-run terminal operation.

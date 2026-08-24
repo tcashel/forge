@@ -533,7 +533,7 @@ async fn reconcile_claimed(
     // transition may clear our token while we wait; the reservation write
     // below re-checks it before any spawn.
     let subject_scope = scope(row.subject_kind);
-    let _submit_guard = handoff::acquire_submit(ctx, &row.subject_id, subject_scope).await?;
+    let submit_guard = handoff::acquire_submit(ctx, &row.subject_id, subject_scope).await?;
     let kind = row.subject_kind;
     let id = row.subject_id.clone();
     let lookup_id = id.clone();
@@ -739,7 +739,14 @@ async fn reconcile_claimed(
             }
         }
     }
-    handoff::recover_abandoned(ctx, &row.subject_id, subject_scope, observed_generation).await?;
+    handoff::recover_abandoned(
+        ctx,
+        &row.subject_id,
+        subject_scope,
+        observed_generation,
+        &submit_guard,
+    )
+    .await?;
     crate::failpoint::hit("supervisor.recover.after");
 
     if recovery_generation.is_some() {

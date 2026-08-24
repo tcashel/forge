@@ -825,6 +825,28 @@ pub(crate) async fn settle_stage_deadlines(
     run_id: &str,
     attempt_ids: &[i64],
 ) -> Result<bool, Failure> {
+    settle_stage_deadlines_inner(ctx, run_id, attempt_ids, None).await
+}
+
+/// Deadline settlement while abandoned-controller recovery already owns the
+/// exact run submit singleton. The guard is an explicit proof parameter:
+/// this path cannot silently skip serialization, and it cannot recursively
+/// reacquire the non-reentrant slot.
+pub(crate) async fn settle_stage_deadlines_held(
+    ctx: &Ctx,
+    run_id: &str,
+    attempt_ids: &[i64],
+    submit_guard: &super::handoff::SubmitGuard,
+) -> Result<bool, Failure> {
+    settle_stage_deadlines_inner(ctx, run_id, attempt_ids, Some(submit_guard)).await
+}
+
+async fn settle_stage_deadlines_inner(
+    ctx: &Ctx,
+    run_id: &str,
+    attempt_ids: &[i64],
+    submit_guard: Option<&super::handoff::SubmitGuard>,
+) -> Result<bool, Failure> {
     let Some(attempt_id) = attempt_ids.iter().copied().min() else {
         return Ok(false);
     };
@@ -832,29 +854,39 @@ pub(crate) async fn settle_stage_deadlines(
         let run_id = run_id.to_owned();
         on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
     };
-    if current_run.state == RunState::Stopped {
-        return Ok(true);
-    }
-    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
-    let reason = attempt
-        .revoke_reason
-        .unwrap_or_else(|| format!("stage deadline exceeded for attempt {attempt_id}"));
-    let settlement = super::settlement::Settlement {
-        outcome: RunOutcome::Blocked,
-        reason,
-        delivery_pr: None,
-        delivery_sha: None,
-        superseded_by: None,
-    };
-    if let Err(error) = super::settlement::settle(ctx, run_id, settlement).await {
-        let latest = {
-            let run_id = run_id.to_owned();
-            on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
-        };
-        if latest.state != RunState::Stopped {
-            return Err(error);
+    let settlement = if current_run.state == RunState::Stopped {
+        super::settlement::Settlement {
+            outcome: current_run.terminal_outcome.ok_or_else(|| {
+                Failure::internal(format!(
+                    "stopped run {run_id:?} has no terminal outcome for deadline aftermath replay"
+                ))
+            })?,
+            reason: current_run.stop_reason.ok_or_else(|| {
+                Failure::internal(format!(
+                    "stopped run {run_id:?} has no terminal reason for deadline aftermath replay"
+                ))
+            })?,
+            delivery_pr: current_run.delivery_pr,
+            delivery_sha: current_run.delivery_sha,
+            superseded_by: current_run.superseded_by,
         }
-    }
+    } else {
+        let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+        let reason = attempt
+            .revoke_reason
+            .unwrap_or_else(|| format!("stage deadline exceeded for attempt {attempt_id}"));
+        super::settlement::Settlement {
+            outcome: RunOutcome::Blocked,
+            reason,
+            delivery_pr: None,
+            delivery_sha: None,
+            superseded_by: None,
+        }
+    };
+    match submit_guard {
+        Some(guard) => super::settlement::settle_held(ctx, run_id, settlement, guard).await?,
+        None => super::settlement::settle(ctx, run_id, settlement).await?,
+    };
     Ok(true)
 }
 

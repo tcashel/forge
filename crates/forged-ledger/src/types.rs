@@ -242,6 +242,16 @@ pub struct PendingBeadSettlementRow {
     pub probe_wake_at: Option<String>,
 }
 
+/// One terminal run whose post-terminal attempt/Bead/worktree aftermath has
+/// not yet durably converged. The run settlement transaction creates this
+/// promise; a later positional succeeded event retires it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PendingSettlementAftermathRow {
+    pub run_id: String,
+    /// The latest pending event's append position.
+    pub event_id: i64,
+}
+
 /// Closed lifecycle of one durable capacity reservation. Expiry moves a row
 /// to `Orphaned`; it never frees capacity by itself.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

@@ -1223,6 +1223,35 @@ impl Ledger {
             },
             None,
             false,
+            false,
+        )
+    }
+
+    /// Settle a run while atomically recording the durable promise that its
+    /// post-terminal aftermath must converge. Production settlement uses
+    /// this path; low-level ledger fixtures can retain the terminal-row-only
+    /// seam above.
+    pub fn settle_run_with_aftermath(
+        &self,
+        run_id: &str,
+        outcome: RunOutcome,
+        reason: String,
+        delivery_pr: Option<u64>,
+        delivery_sha: Option<String>,
+        superseded_by: Option<String>,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(
+            run_id,
+            RunSettlement {
+                outcome,
+                reason,
+                delivery_pr,
+                delivery_sha,
+                superseded_by,
+            },
+            None,
+            false,
+            true,
         )
     }
 
@@ -1235,7 +1264,25 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: u32,
     ) -> Result<RunRow, LedgerError> {
-        self.settle_run_inner(run_id, settlement, Some(controller_generation), false)
+        self.settle_run_inner(
+            run_id,
+            settlement,
+            Some(controller_generation),
+            false,
+            false,
+        )
+    }
+
+    /// Controller-fenced settlement plus an atomic durable aftermath
+    /// promise. The controller revocation and recovery record share the same
+    /// transaction as terminal run state.
+    pub fn settle_run_fencing_controller_with_aftermath(
+        &self,
+        run_id: &str,
+        settlement: RunSettlement,
+        controller_generation: u32,
+    ) -> Result<RunRow, LedgerError> {
+        self.settle_run_inner(run_id, settlement, Some(controller_generation), false, true)
     }
 
     /// [`Ledger::settle_run_fencing_controller`] for callers with no
@@ -1250,7 +1297,7 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: u32,
     ) -> Result<RunRow, LedgerError> {
-        self.settle_run_inner(run_id, settlement, Some(controller_generation), true)
+        self.settle_run_inner(run_id, settlement, Some(controller_generation), true, false)
     }
 
     fn settle_run_inner(
@@ -1259,6 +1306,7 @@ impl Ledger {
         settlement: RunSettlement,
         controller_generation: Option<u32>,
         refuse_uncontained_machine_effects: bool,
+        record_aftermath: bool,
     ) -> Result<RunRow, LedgerError> {
         let RunSettlement {
             outcome,
@@ -1344,6 +1392,11 @@ impl Ledger {
                     if let Some(generation) = controller_generation {
                         append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
                     }
+                    if record_aftermath {
+                        crate::bead_settlement::ensure_settlement_aftermath_pending_tx(
+                            &tx, &run_id, outcome,
+                        )?;
+                    }
                     crate::desired::stop_desired_work_tx(
                         &tx,
                         DesiredSubjectKind::Run,
@@ -1415,6 +1468,11 @@ impl Ledger {
                     "supersededBy": superseded_by,
                 }),
             )?;
+            if record_aftermath {
+                crate::bead_settlement::ensure_settlement_aftermath_pending_tx(
+                    &tx, &run_id, outcome,
+                )?;
+            }
             if let Some(generation) = controller_generation {
                 append_controller_revocation_tx(&tx, &run_id, generation, &reason)?;
             }

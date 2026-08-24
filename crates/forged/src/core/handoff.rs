@@ -37,7 +37,7 @@ const CONTROLLER_SCOPE_ENV: &str = "FORGED_CONTROLLER_SCOPE";
 const CONTROLLER_ID_ENV: &str = "FORGED_CONTROLLER_ID";
 const CONTROLLER_GENERATION_ENV: &str = "FORGED_CONTROLLER_GENERATION";
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum Scope {
     Run,
     Epic,
@@ -195,6 +195,25 @@ pub(crate) struct SubmitGuard {
     ledger: Ledger,
     slot: String,
     holder: String,
+    scope: Scope,
+    id: String,
+}
+
+impl SubmitGuard {
+    /// Prove that a caller using the held-guard settlement path owns the
+    /// exact run singleton it claims. This keeps "already held" explicit
+    /// rather than turning settlement locking into an optional convention.
+    pub(super) fn verify(&self, scope: Scope, id: &str) -> Result<(), Failure> {
+        if self.scope == scope && self.id == id {
+            return Ok(());
+        }
+        Err(Failure::internal(format!(
+            "submit guard for {} {:?} cannot fence {} {id:?}",
+            self.scope.noun(),
+            self.id,
+            scope.noun()
+        )))
+    }
 }
 
 impl Drop for SubmitGuard {
@@ -240,6 +259,8 @@ pub(super) async fn acquire_submit(
                     ledger: ctx.ledger.clone(),
                     slot,
                     holder,
+                    scope,
+                    id: id.to_owned(),
                 });
             }
             SlotOutcome::Held(row) => {
@@ -1051,7 +1072,9 @@ pub(super) async fn recover_abandoned(
     id: &str,
     scope: Scope,
     generation: u32,
+    submit_guard: &SubmitGuard,
 ) -> Result<(), Failure> {
+    submit_guard.verify(scope, id)?;
     let id_for_rows = id.to_owned();
     let inflight = on_ledger(&ctx.ledger, move |ledger| {
         ledger.list_inflight_operations(Some(&id_for_rows))
@@ -1071,7 +1094,13 @@ pub(super) async fn recover_abandoned(
                 crate::adapters::ports::ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
             let report =
                 forged_proto::reconcile(&ctx.ledger, id, &ports, &config, &now_iso()).await?;
-            super::drive::settle_stage_deadlines(ctx, id, &report.deadline_exceeded).await?;
+            super::drive::settle_stage_deadlines_held(
+                ctx,
+                id,
+                &report.deadline_exceeded,
+                submit_guard,
+            )
+            .await?;
             crate::adapters::ports::report_json(&report)
         }
         Scope::Epic => {
@@ -1416,7 +1445,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     if req.run_id.is_none() {
         req.run_id = Some(id.clone());
     }
-    let _submit_guard = match acquire_submit(ctx, &id, scope).await {
+    let submit_guard = match acquire_submit(ctx, &id, scope).await {
         Ok(guard) => guard,
         Err(error) => {
             return err_response(
@@ -1601,7 +1630,9 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 },
             );
         }
-        if let Err(error) = recover_abandoned(ctx, &id, scope, generation(&status)).await {
+        if let Err(error) =
+            recover_abandoned(ctx, &id, scope, generation(&status), &submit_guard).await
+        {
             return err_response(
                 &derive_key(scope.operation(), Some(&id), None, None),
                 &error,

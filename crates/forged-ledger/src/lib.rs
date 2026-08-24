@@ -71,8 +71,9 @@ pub use types::{
     OperationOutcome, OperationRow, OperationState, OperationTicket, OwnedHerdrCleanupReason,
     OwnedHerdrCleanupRelease, OwnedHerdrCleanupRetry, OwnedHerdrCleanupState,
     OwnedHerdrLifecycleState, OwnedHerdrOwnerKind, OwnedHerdrSessionRow, PacketRow,
-    PendingBeadSettlementRow, Pragmas, ReviewFindingDeliveryClaim, ReviewFindingDeliveryKey,
-    ReviewFindingDeliveryOutcome, ReviewFindingDeliveryRow, ReviewFindingDeliveryState,
-    ReviewPublicationSource, RevokeScope, RosterRevisionBatch, RosterRevisionRow, RunDefinitionRow,
-    RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome, SpecFence, UsageRecord, UsageTotals,
+    PendingBeadSettlementRow, PendingSettlementAftermathRow, Pragmas, ReviewFindingDeliveryClaim,
+    ReviewFindingDeliveryKey, ReviewFindingDeliveryOutcome, ReviewFindingDeliveryRow,
+    ReviewFindingDeliveryState, ReviewPublicationSource, RevokeScope, RosterRevisionBatch,
+    RosterRevisionRow, RunDefinitionRow, RunOutcome, RunRow, RunSettlement, RunState, SlotOutcome,
+    SpecFence, UsageRecord, UsageTotals,
 };

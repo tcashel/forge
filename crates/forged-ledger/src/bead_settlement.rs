@@ -15,12 +15,58 @@ use crate::error::{refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{BeadSettlementRetryRow, PendingBeadSettlementRow};
+use crate::types::{
+    BeadSettlementRetryRow, PendingBeadSettlementRow, PendingSettlementAftermathRow, RunOutcome,
+};
 
 use forged_types::ErrorCode;
 
 const PENDING: &str = "run.bead-settlement.pending";
 const SUCCEEDED: &str = "run.bead-settlement.succeeded";
+pub(crate) const AFTERMATH_PENDING: &str = "run.settlement-aftermath.pending";
+const AFTERMATH_SUCCEEDED: &str = "run.settlement-aftermath.succeeded";
+
+/// Ensure one positional aftermath promise for this terminal outcome inside
+/// the caller's run-settlement transaction. Exact settlement replay keeps a
+/// standing pending or succeeded episode; an allowed outcome advance opens
+/// a new one.
+pub(crate) fn ensure_settlement_aftermath_pending_tx(
+    conn: &Connection,
+    run_id: &str,
+    outcome: RunOutcome,
+) -> Result<(), LedgerError> {
+    let latest = conn
+        .query_row(
+            "SELECT payload_json FROM events WHERE run_id = ?1 \
+             AND kind IN (?2, ?3) ORDER BY event_id DESC LIMIT 1",
+            rusqlite::params![run_id, AFTERMATH_PENDING, AFTERMATH_SUCCEEDED],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let same_outcome = latest
+        .as_deref()
+        .and_then(|payload| serde_json::from_str::<serde_json::Value>(payload).ok())
+        .and_then(|payload| {
+            payload
+                .get("outcome")
+                .and_then(serde_json::Value::as_str)
+                .map(str::to_owned)
+        })
+        .as_deref()
+        == Some(outcome.as_str());
+    if !same_outcome {
+        append_event_tx(
+            conn,
+            Some(run_id),
+            AFTERMATH_PENDING,
+            &serde_json::json!({
+                "schema": "forged.settlement-aftermath/1",
+                "outcome": outcome.as_str(),
+            }),
+        )?;
+    }
+    Ok(())
+}
 
 /// Mutating-retry budget. With the supervisor's 30s-doubling backoff capped
 /// at 8 minutes, eight charges span well past the 5+ minute bd lease TTL
@@ -103,6 +149,64 @@ fn latest_settlement_tx(
 }
 
 impl Ledger {
+    /// Every run whose latest settlement-aftermath event is still pending.
+    /// The promise is born in the same transaction as terminal run state, so
+    /// a crash can never strand live attempts without a supervisor-visible
+    /// recovery record.
+    pub fn list_pending_settlement_aftermaths(
+        &self,
+    ) -> Result<Vec<PendingSettlementAftermathRow>, LedgerError> {
+        self.submit(move |conn| {
+            let mut statement = conn.prepare(
+                "SELECT e.run_id, e.event_id FROM events e \
+                 WHERE e.kind = ?1 AND e.run_id IS NOT NULL \
+                   AND e.event_id = (SELECT MAX(e2.event_id) FROM events e2 \
+                     WHERE e2.run_id = e.run_id AND e2.kind IN (?1, ?2)) \
+                 ORDER BY e.run_id",
+            )?;
+            let rows = statement.query_map([AFTERMATH_PENDING, AFTERMATH_SUCCEEDED], |row| {
+                Ok(PendingSettlementAftermathRow {
+                    run_id: row.get(0)?,
+                    event_id: row.get(1)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>().map_err(Into::into)
+        })
+    }
+
+    /// Retire one exact aftermath promise only while it is still the stream
+    /// head. A replay racing a later terminal-outcome advance cannot clear
+    /// the newer episode.
+    pub fn finish_settlement_aftermath(
+        &self,
+        run_id: &str,
+        expected_event_id: i64,
+        payload: serde_json::Value,
+    ) -> Result<bool, LedgerError> {
+        let run_id = run_id.to_owned();
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let latest = tx
+                .query_row(
+                    "SELECT event_id, kind FROM events WHERE run_id = ?1 \
+                     AND kind IN (?2, ?3) ORDER BY event_id DESC LIMIT 1",
+                    rusqlite::params![run_id, AFTERMATH_PENDING, AFTERMATH_SUCCEEDED],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?)),
+                )
+                .optional()?;
+            let appended = matches!(
+                latest,
+                Some((event_id, ref kind))
+                    if event_id == expected_event_id && kind == AFTERMATH_PENDING
+            );
+            if appended {
+                append_event_tx(&tx, Some(&run_id), AFTERMATH_SUCCEEDED, &payload)?;
+            }
+            tx.commit()?;
+            Ok(appended)
+        })
+    }
+
     /// Every run whose latest bead-settlement event is still `pending`, with
     /// that event's stored payload, in run order.
     pub fn list_pending_bead_settlements(

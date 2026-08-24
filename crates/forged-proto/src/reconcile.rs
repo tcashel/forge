@@ -279,9 +279,11 @@ pub async fn reconcile(
             },
             AttemptState::Running => {
                 let started = parse_stamp(&attempt.started_at)?;
-                let budget_i64 = i64::try_from(budget).unwrap_or(i64::MAX);
-                let deadline_reached =
-                    now_ts.as_second().saturating_sub(started.as_second()) >= budget_i64;
+                let budget_nanos = i128::from(budget).saturating_mul(1_000_000_000);
+                let deadline_reached = now_ts
+                    .as_nanosecond()
+                    .saturating_sub(started.as_nanosecond())
+                    >= budget_nanos;
                 let (dead, reason, scope) = if deadline_reached {
                     (
                         true,
