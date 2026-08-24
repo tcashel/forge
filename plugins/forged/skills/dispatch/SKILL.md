@@ -69,14 +69,20 @@ PROFILE="${PROFILE:-standard}"
 ROSTER="${ROSTER:-default}"
 START_JSON="$(
   forged run start --bead "$BEAD_ID" --repo "$TARGET_REPO" \
-    --profile "$PROFILE" --roster "$ROSTER"
+    --base-ref "$BASE_REF" --profile "$PROFILE" --roster "$ROSTER" \
+    --expected-bead-revision "$OBSERVED_REVISION" \
+    --approval "$APPROVAL_FILE"
 )"
 RUN_ID="$(printf '%s' "$START_JSON" | jq -er '.result.run_id')"
 forged run submit --run "$RUN_ID"
 ```
 
-Capture the immutable run id returned by `start`; submit that exact id. Do not
-modify the Bead or repository between freeze and submit. A successful submit is
+`OBSERVED_REVISION` is the opaque revision in the approved tuple and
+`APPROVAL_FILE` is its strict `forged-execution-approval/1` JSON. Start checks
+the latest Bead revision and complete tuple before any effect, then retains the
+approval in the same ledger transaction as the run. Capture the immutable run
+id returned by `start`; submit that exact id. Do not modify the Bead or
+repository between preflight, freeze, and submit. A successful submit is
 detached: do not poll in this turn.
 
 ## Return to the operator

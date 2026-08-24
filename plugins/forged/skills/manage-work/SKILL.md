@@ -161,8 +161,8 @@ A short reply such as “yes” or “do it” is valid only when it immediately
 unambiguously answers that one tuple. A later reply, general approval, different
 subject, or changed normative field requires a new tuple.
 
-After approval and before start, store exactly one JSON record in a Bead
-comment, fenced as `forged-execution-approval`:
+After approval, prepare exactly one strict JSON record in a scratch file
+outside the repository:
 
 ```forged-execution-approval
 {
@@ -172,8 +172,8 @@ comment, fenced as `forged-execution-approval`:
   "observedRevision": "<revision shown in the tuple>",
   "repository": "<canonical absolute root>",
   "baseRef": "<base>",
-  "profile": "<resolved profile>",
-  "roster": "<resolved roster>",
+  "profile": {"name": "<profile name>", "version": <profile version>},
+  "roster": {"name": "<roster name>", "version": <roster version>},
   "action": "<run-start-submit|epic-start-submit>",
   "approvedAt": "<ISO-8601 UTC>",
   "actor": "<operator identity>",
@@ -181,19 +181,24 @@ comment, fenced as `forged-execution-approval`:
 }
 ```
 
-Prepare the complete fenced comment in a scratch file outside the repository.
-Add it with pinned `bd comments add` and explicit `BEADS_DIR`, then read the
-Bead and comments back. Verify that title, description, design, acceptance
-criteria, notes, repository, parent, dependencies, issue type, readiness, and
-ready-frontier membership are unchanged. Retain the post-comment revision as
-the handoff snapshot. Normative drift requires fresh approval.
+Do not write this record to the Bead. Immediately before start, perform one
+target-only exact Bead read and confirm its revision still equals
+`observedRevision`. Do not mix a portfolio or ready-frontier listing into this
+preflight. Pass the revision and scratch approval file to the typed start; the
+ledger validates the complete tuple and retains the approval atomically with
+the run. `EXECUTION_APPROVAL_MISMATCH` means no run or external effect was
+created and requires a fresh tuple. Slice dispatch passes the exact pair as
+`--expected-bead-revision` and `--approval`; never downgrade to an unguarded
+start after a mismatch.
 
 Before promising unattended continuation, run only the installed CLI's
 read-only `forged doctor` and `forged service status`. Do not install, start,
 restart, or repair the service here.
 
-For a slice, follow `../dispatch/SKILL.md` and invoke exactly one typed start
-and one submit using the returned run id. For an epic, follow
+For a slice, follow `../dispatch/SKILL.md` and invoke exactly one
+revision-bound typed start and one submit using the returned run id. After
+approval, the only allowed sequence is target preflight, start, submit: no
+portfolio query, critique, comment, or unrelated work may intervene. For an epic, follow
 `../run-epic/SKILL.md`, verify the frozen inventory, and invoke exactly one
 typed start and submit. Perform no Bead or repository mutation between them.
 Return the sibling skill's durable identifiers and reconnect commands, then

@@ -80,7 +80,8 @@ const requiredSkillText = [
   'forged definition validate',
   'forged doctor',
   'forged service status',
-  'bd comments add',
+  '--expected-bead-revision',
+  '--approval',
   'metadata.repository',
   'BEADS_DIR',
 ];
@@ -127,9 +128,9 @@ for (const entry of fixture.cases) {
   if (!Object.values(budget).every((value) => Number.isInteger(value) && value >= 0)) process.exit(1);
 
   const expectedNonzero = entry.id === 'execute-slice'
-    ? {approvalComments: 1, runStarts: 1, runSubmits: 1}
+    ? {runStarts: 1, runSubmits: 1}
     : entry.id === 'execute-epic'
-      ? {approvalComments: 1, epicStarts: 1, epicSubmits: 1}
+      ? {epicStarts: 1, epicSubmits: 1}
       : {};
   for (const key of effectKeys) {
     if (budget[key] !== (expectedNonzero[key] || 0)) process.exit(1);
