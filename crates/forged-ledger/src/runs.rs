@@ -3,9 +3,10 @@
 use std::fmt::Write as _;
 
 use forged_types::{
-    canonical_json_bytes, normalize_repository_path, AcceptedRisk, ErrorCode, ExecutionPackageV1,
+    canonical_json_bytes, normalize_repository_path, AcceptedRisk, ErrorCode,
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
     ExecutionPolicyV1, ResolvedRosterV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentityV1, EXECUTION_PACKAGE_SCHEMA_V1,
+    WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V1, EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -546,6 +547,20 @@ impl Ledger {
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
     ) -> Result<RunRow, LedgerError> {
+        self.create_run_with_identity_and_approval(new_run, definition, spec_event, identity, None)
+    }
+
+    /// Atomically create the complete run launch bundle and, when supplied,
+    /// retain the exact operator approval in the same transaction. The
+    /// legacy method above remains the low-level no-approval entrypoint.
+    pub fn create_run_with_identity_and_approval(
+        &self,
+        new_run: NewRun,
+        definition: NewRunDefinition,
+        spec_event: serde_json::Value,
+        identity: WorkIdentityV1,
+        approval: Option<ExecutionApprovalV1>,
+    ) -> Result<RunRow, LedgerError> {
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
                 refused(
@@ -620,6 +635,45 @@ impl Ledger {
                     "execution package roster ref does not match resolved roster",
                 ));
             }
+            if let Some(approval) = approval.as_ref() {
+                let mismatch =
+                    |message: String| refused(ErrorCode::ExecutionApprovalMismatch, message);
+                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1 {
+                    return Err(mismatch(format!(
+                        "unsupported execution approval schema {:?}",
+                        approval.schema
+                    )));
+                }
+                if approval.subject_kind != ExecutionApprovalSubjectKind::Slice
+                    || approval.action != ExecutionApprovalAction::RunStartSubmit
+                {
+                    return Err(mismatch(
+                        "run launch approval must authorize slice run-start-submit".to_owned(),
+                    ));
+                }
+                if approval.bead_id != new_run.bead_id
+                    || Some(approval.observed_revision.as_str())
+                        != identity.bead.revision.as_deref()
+                    || approval.repository != normalized_repo
+                    || approval.base_ref != new_run.base_ref
+                    || approval.profile != package.profile_ref
+                    || approval.roster != package.roster_ref
+                {
+                    return Err(mismatch(
+                        "execution approval does not match the frozen run tuple".to_owned(),
+                    ));
+                }
+                if approval.actor.trim().is_empty()
+                    || approval.basis.trim().is_empty()
+                    || approval.approved_at.parse::<jiff::Timestamp>().is_err()
+                {
+                    return Err(mismatch(
+                        "execution approval requires actor, basis, and an RFC 3339 approvedAt"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let approval_payload = approval.as_ref().map(serde_json::to_value).transpose()?;
             let (profile_json, profile_sha256) = canonical(&package.profile)?;
             let (roster_json, roster_sha256) = canonical(&package.roster)?;
             let (package_json, package_sha256) = canonical(package)?;
@@ -697,6 +751,20 @@ impl Ledger {
                         .is_ok_and(|stored| stored == spec_event),
                     _ => false,
                 };
+                let stored_approvals = {
+                    let mut statement = tx.prepare(
+                        "SELECT payload_json FROM events WHERE run_id = ?1 \
+                         AND kind = 'forged.run.execution-approval' ORDER BY event_id",
+                    )?;
+                    let rows = statement.query_map([run_id], |row| row.get::<_, String>(0))?;
+                    rows.collect::<Result<Vec<_>, _>>()?
+                };
+                let approval_matches = match (&approval_payload, stored_approvals.as_slice()) {
+                    (None, []) => true,
+                    (Some(expected), [payload]) => serde_json::from_str::<Value>(payload)
+                        .is_ok_and(|stored| stored == *expected),
+                    _ => false,
+                };
                 let identity_matches =
                     get_work_identity_tx(&tx, WorkIdentitySubjectKind::Run, run_id)?
                         .is_some_and(|standing| identity_replay_matches(&standing, &identity));
@@ -704,6 +772,7 @@ impl Ledger {
                     || !definition_matches
                     || !revision_matches
                     || !event_matches
+                    || !approval_matches
                     || !identity_matches
                 {
                     return Err(refused(
@@ -742,6 +811,14 @@ impl Ledger {
                 rusqlite::params![row.run_id, roster_ref_json, roster_sha256, roster_json, now],
             )?;
             append_event_tx(&tx, Some(&row.run_id), "forged.run.spec", &spec_event)?;
+            if let Some(approval) = approval_payload.as_ref() {
+                append_event_tx(
+                    &tx,
+                    Some(&row.run_id),
+                    "forged.run.execution-approval",
+                    approval,
+                )?;
+            }
             insert_work_identity_tx(&tx, &identity)?;
             drop(profile_json);
             tx.commit()?;

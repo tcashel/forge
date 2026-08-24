@@ -58,6 +58,8 @@ fn help_lists_every_command_and_subcommand_flags() {
         "--base-ref",
         "--profile",
         "--roster",
+        "--expected-bead-revision",
+        "--approval",
         "--idempotency-key",
     ] {
         assert!(

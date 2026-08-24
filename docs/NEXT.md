@@ -142,9 +142,19 @@ an observable pane.
 
 ```sh
 forged run start --bead <id> --repo /absolute/repo \
-  --profile standard --roster default
+  --profile standard --roster default \
+  --expected-bead-revision <opaque-revision> \
+  --approval /private/tmp/forged-execution-approval.json
 forged run submit --run <id>
 ```
+
+`--approval` accepts one strict `forged-execution-approval/1` JSON record and
+requires `--expected-bead-revision`. Before creating an operation or run,
+Forged checks its slice, Bead, revision, canonical repository, base ref,
+resolved `{name,version}` profile and roster references, and
+`run-start-submit` action. The exact record is then retained as
+`forged.run.execution-approval` in the same transaction as the frozen run.
+Low-level callers may omit both flags for backward compatibility.
 
 The spec is the bead: its `description`, `acceptance_criteria`, `design`, and
 `notes` fields become the body every seat reads, and the packet is fenced on
