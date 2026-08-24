@@ -36,7 +36,7 @@ use rusqlite::{params, Connection, Transaction, TransactionBehavior};
 use sha2::{Digest, Sha256};
 
 use crate::archive::{compress_block, read_block, PreparedBlock, ARCHIVE_BLOCK_TARGET_BYTES};
-use crate::error::{invalid, HistoryError};
+use crate::error::{internal, invalid, HistoryError};
 use crate::history::{current_host_id, History};
 use crate::migrations::CODEC_SCHEMA;
 use crate::open::lexically_normalize_absolute;
@@ -110,6 +110,13 @@ impl History {
     /// Establishes the session and source observation rows, discards any
     /// never-committed staging left by a previous attempt at the SAME
     /// logical event, and opens a fresh staging revision.
+    ///
+    /// The discard is what makes retry-after-crash converge instead of
+    /// accumulating. It is scoped to this event's own staging token, so a
+    /// concurrent ingest of a DIFFERENT event is never disturbed; a
+    /// concurrent ingest of the same one loses its staging and refuses at
+    /// publication, which is the correct answer to two writers claiming one
+    /// identity.
     pub fn begin_event(
         &self,
         header: PreparedEventHeader,
@@ -225,6 +232,11 @@ impl History {
     /// A committed revision, its parts, its chunks, its usage, and every
     /// block they reference are unreachable from this path by construction —
     /// cleanup is not a retention policy and cannot become one.
+    ///
+    /// This is a RECOVERY pass, meant for startup or between ingestion runs.
+    /// It reclaims every staging row in the archive, including one an
+    /// [`EventIngest`] still holds open: that ingest then refuses at
+    /// publication rather than publishing content it can no longer see.
     pub fn cleanup_staging(&self) -> Result<StagingCleanup, HistoryError> {
         let mut total = StagingCleanup::default();
         loop {
@@ -612,7 +624,7 @@ fn publish_tx(conn: &mut Connection, req: PublishRequest) -> Result<Decision, Hi
         )?;
     }
 
-    tx.execute(
+    let published = tx.execute(
         "UPDATE event_revisions
             SET event_id = ?2, revision = ?3, visibility = 'committed',
                 content_sha256 = ?4, byte_length = ?5, ingested_at = ?6,
@@ -627,6 +639,15 @@ fn publish_tx(conn: &mut Connection, req: PublishRequest) -> Result<Decision, Hi
             now
         ],
     )?;
+    if published != 1 {
+        // The staging revision this publication was built for is gone or
+        // already committed. Rolling back is the only safe answer: committing
+        // would leave an event row pointing at content nobody staged.
+        return Err(internal(format!(
+            "revision {} was not in staging at publication",
+            req.revision_id
+        )));
+    }
     tx.execute(
         "UPDATE event_parts SET visibility = 'committed' WHERE revision_id = ?1",
         [req.revision_id],
@@ -892,22 +913,28 @@ fn discard_staged_revision_tx(
         return Ok((true, reclaimed));
     }
 
-    let session_id: i64 = tx.query_row(
-        "SELECT session_id FROM event_revisions WHERE revision_id = ?1",
-        [revision_id],
-        |row| row.get(0),
-    )?;
+    // A concurrent cleanup may already have taken this revision; that is a
+    // finished job, not a failure.
+    let session_id: Option<i64> = tx
+        .query_row(
+            "SELECT session_id FROM event_revisions WHERE revision_id = ?1",
+            [revision_id],
+            |row| row.get(0),
+        )
+        .ok();
     reclaimed.revisions += tx.execute(
         "DELETE FROM event_revisions WHERE revision_id = ?1 AND visibility = ?2",
         params![revision_id, staging],
     )? as i64;
     reclaimed.merge(reclaim_orphan_staging_tx(tx)?);
-    reclaimed.sessions += tx.execute(
-        "DELETE FROM sessions
-          WHERE session_id = ?1 AND visibility = ?2
-            AND NOT EXISTS (SELECT 1 FROM event_revisions r WHERE r.session_id = ?1)",
-        params![session_id, staging],
-    )? as i64;
+    if let Some(session_id) = session_id {
+        reclaimed.sessions += tx.execute(
+            "DELETE FROM sessions
+              WHERE session_id = ?1 AND visibility = ?2
+                AND NOT EXISTS (SELECT 1 FROM event_revisions r WHERE r.session_id = ?1)",
+            params![session_id, staging],
+        )? as i64;
+    }
     Ok((false, reclaimed))
 }
 

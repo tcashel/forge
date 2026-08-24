@@ -6,8 +6,8 @@ mod support;
 use std::io::Write;
 
 use forged_history::{
-    EventCursor, EventRole, HistoryFilter, SessionCursor, SourceFamily, UsageFact,
-    ARCHIVE_BLOCK_TARGET_BYTES, HISTORY_SCHEMA_VERSION, MAX_PAGE_ROWS,
+    EventCursor, EventKeyKind, EventRole, HistoryFilter, Lineage, LineageKind, SessionCursor,
+    SourceFamily, UsageFact, ARCHIVE_BLOCK_TARGET_BYTES, HISTORY_SCHEMA_VERSION, MAX_PAGE_ROWS,
 };
 use support::{header, header_derived, header_with, open, scratch};
 
@@ -353,5 +353,158 @@ fn status_reports_the_schema_and_the_standing_index() {
         .list_events(&HistoryFilter::default(), None, MAX_PAGE_ROWS * 10)
         .expect("events");
     assert_eq!(page.rows.len(), 1);
+    history.close().expect("close");
+}
+
+#[test]
+fn a_host_predicate_narrows_and_a_foreign_host_matches_nothing() {
+    let s = scratch("reads-host");
+    let history = open(&s);
+    history
+        .ingest_event(
+            header("s-1", "a.jsonl", 0, Some("/repos/forge")),
+            &b"{\"n\":0}"[..],
+            &b"host scoped wording"[..],
+            [],
+        )
+        .expect("ingest");
+    let host = history.host_id().expect("host id");
+
+    let mine = HistoryFilter {
+        host_id: Some(host.clone()),
+        ..HistoryFilter::default()
+    };
+    assert_eq!(
+        history
+            .list_sessions(&mine, None, 10)
+            .expect("sessions")
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(
+        history
+            .list_events(&mine, None, 10)
+            .expect("events")
+            .rows
+            .len(),
+        1
+    );
+    assert_eq!(history.usage_totals(&mine).expect("usage").records, 0);
+
+    // A host id this archive was not opened under is a legitimate predicate
+    // that simply matches nothing — future cross-host archives depend on it.
+    let elsewhere = HistoryFilter {
+        host_id: Some(format!("{host}-elsewhere")),
+        ..HistoryFilter::default()
+    };
+    assert!(history
+        .list_sessions(&elsewhere, None, 10)
+        .expect("sessions")
+        .rows
+        .is_empty());
+    match history
+        .search("wording", &elsewhere, None, 10)
+        .expect("search")
+    {
+        forged_history::SearchOutcome::Ready(page) => assert!(page.rows.is_empty()),
+        other => panic!("expected a ready search, got {other:?}"),
+    }
+    history.close().expect("close");
+}
+
+#[test]
+fn a_repository_fact_keeps_the_observed_cwd_and_a_normalized_path_beside_it() {
+    let s = scratch("reads-repository");
+    let history = open(&s);
+    // A cwd with `..` and `.` segments, naming a directory that does not
+    // exist: normalization is lexical and never consults the filesystem.
+    let observed = "/repos/other/../forge/./worktrees/wd5";
+    history
+        .ingest_event(
+            header("s-1", "a.jsonl", 0, Some(observed)),
+            &b"{\"n\":0}"[..],
+            std::io::empty(),
+            [],
+        )
+        .expect("ingest");
+    // A session whose cwd is relative gets no repository identity rather
+    // than one guessed from this process's working directory.
+    history
+        .ingest_event(
+            header("s-2", "b.jsonl", 0, Some("relative/path")),
+            &b"{\"n\":1}"[..],
+            std::io::empty(),
+            [],
+        )
+        .expect("ingest");
+
+    let sessions = history
+        .list_sessions(&HistoryFilter::default(), None, 10)
+        .expect("sessions");
+    assert_eq!(sessions.rows[0].observed_cwd.as_deref(), Some(observed));
+    assert_eq!(
+        sessions.rows[0].repository_path.as_deref(),
+        Some("/repos/forge/worktrees/wd5"),
+        "the normalized form sits beside the observation, never replacing it"
+    );
+    assert_eq!(
+        sessions.rows[1].observed_cwd.as_deref(),
+        Some("relative/path")
+    );
+    assert_eq!(sessions.rows[1].repository_path, None);
+
+    // The normalized path is the repository predicate, and it matches even
+    // though no such directory exists on this machine.
+    assert_eq!(
+        history
+            .list_sessions(
+                &HistoryFilter {
+                    repository_path: Some("/repos/forge/worktrees/wd5".to_owned()),
+                    ..HistoryFilter::default()
+                },
+                None,
+                10
+            )
+            .expect("sessions")
+            .rows
+            .len(),
+        1
+    );
+    history.close().expect("close");
+}
+
+#[test]
+fn lineage_and_key_kind_round_trip_on_every_revision() {
+    let s = scratch("reads-lineage");
+    let history = open(&s);
+    let mut sidechain = header("s-1", "a.jsonl", 0, Some("/repos/forge"));
+    sidechain.lineage = Lineage {
+        kind: LineageKind::Sidechain,
+        parent_event_key: Some("s-1-evt-parent".to_owned()),
+    };
+    history
+        .ingest_event(sidechain, &b"{\"n\":0}"[..], std::io::empty(), [])
+        .expect("sidechain");
+
+    let mut derived = header_derived("s-1", "a.jsonl", 1);
+    derived.lineage = Lineage {
+        kind: LineageKind::Summary,
+        parent_event_key: None,
+    };
+    history
+        .ingest_event(derived, &b"{\"n\":1}"[..], std::io::empty(), [])
+        .expect("summary");
+
+    let rows = history
+        .list_events(&HistoryFilter::default(), None, 10)
+        .expect("events")
+        .rows;
+    assert_eq!(rows[0].lineage_kind, LineageKind::Sidechain);
+    assert_eq!(rows[0].parent_event_key.as_deref(), Some("s-1-evt-parent"));
+    assert_eq!(rows[0].event_key_kind, EventKeyKind::Native);
+    assert_eq!(rows[1].lineage_kind, LineageKind::Summary);
+    assert_eq!(rows[1].parent_event_key, None);
+    assert_eq!(rows[1].event_key_kind, EventKeyKind::Derived);
     history.close().expect("close");
 }

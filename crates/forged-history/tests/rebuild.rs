@@ -255,3 +255,77 @@ fn rebuilding_replaces_only_the_index_generation_and_the_virtual_table() {
     );
     assert_eq!(superseded, 1, "the prior generation is retained as history");
 }
+
+#[test]
+fn an_externally_dropped_index_is_recovered_from_retained_chunks_alone() {
+    let s = scratch("rebuild-external-drop");
+    let history = open(&s);
+    seed(&history);
+    let before = ready(
+        history
+            .search("corpus", &HistoryFilter::default(), None, 50)
+            .expect("search"),
+    );
+    assert_eq!(before.len(), 12);
+    history.close().expect("close");
+
+    // Delete and recreate ONLY the virtual table, behind the crate's back:
+    // exactly what an external repair or a corrupted index leaves.
+    let conn = raw(&s.db());
+    conn.execute_batch(
+        "DROP TABLE search_fts;
+         CREATE VIRTUAL TABLE search_fts USING fts5(text, content='', contentless_delete=1);",
+    )
+    .expect("drop and recreate the index");
+    assert_eq!(
+        support::count(&conn, "SELECT COUNT(*) FROM search_fts"),
+        0,
+        "the index really is empty"
+    );
+    // The archived content is all still here — that is what makes this
+    // recoverable at all.
+    assert_eq!(
+        support::count(&conn, "SELECT COUNT(*) FROM search_chunks"),
+        12
+    );
+    drop(conn);
+
+    let history = History::open(&s.db()).expect("reopen");
+    let generation = history.begin_index_rebuild().expect("begin rebuild");
+    assert!(matches!(
+        history.search("corpus", &HistoryFilter::default(), None, 50),
+        Ok(SearchOutcome::Rebuilding { .. })
+    ));
+    let progress = history.rebuild_index(4).expect("rebuild");
+    assert!(progress.complete);
+    assert_eq!(progress.generation, generation);
+
+    let after = ready(
+        history
+            .search("corpus", &HistoryFilter::default(), None, 50)
+            .expect("search"),
+    );
+    assert_eq!(
+        after.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+        before.iter().map(|m| m.text.clone()).collect::<Vec<_>>(),
+        "no source file was consulted, and the matches are identical"
+    );
+    for index in 0..12_u64 {
+        assert_eq!(
+            ready(
+                history
+                    .search(
+                        &format!("lexeme{index}"),
+                        &HistoryFilter::default(),
+                        None,
+                        5
+                    )
+                    .expect("search")
+            )
+            .len(),
+            1,
+            "every distinctive term is indexed again"
+        );
+    }
+    history.close().expect("close");
+}

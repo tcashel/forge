@@ -516,9 +516,10 @@ pub struct HistoryFilter {
     pub model: Option<String>,
     /// Restrict to one session row id.
     pub session_id: Option<i64>,
-    /// Inclusive lower bound on `occurred_at`.
+    /// Inclusive lower bound: `occurred_at` for events, usage, and search;
+    /// `last_event_at` for sessions.
     pub since: Option<String>,
-    /// Exclusive upper bound on `occurred_at`.
+    /// Exclusive upper bound, on the same column `since` bounds.
     pub until: Option<String>,
 }
 

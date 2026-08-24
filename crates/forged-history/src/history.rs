@@ -76,6 +76,11 @@ impl History {
     /// cannot serve as an archive — a directory, a device node, a symlink, a
     /// foreign-owned file — is a REFUSAL, never absence: answering `None`
     /// there would invite a caller to create over it.
+    ///
+    /// No-create refers to the archive and its parents. An existing archive
+    /// found with looser-than-owner-only permissions is still tightened here:
+    /// owner-only access is PRESERVED by both modes, not only established by
+    /// the creating one.
     pub fn open_existing(db_path: &Path) -> Result<Option<History>, HistoryError> {
         if !validate_database_file(db_path)? {
             return Ok(None);
