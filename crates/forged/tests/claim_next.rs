@@ -517,13 +517,10 @@ fn a_frontier_claimed_in_progress_bead_starts_and_drives_under_one_lease_identit
 }
 
 #[test]
-fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
-    // The crash-resume path for the supported route. `claim-next` RECLAIMS
-    // and then RE-CLAIMS the run's bd lease before it re-reads the spec, and
-    // each of those writes mints a fresh bd revision — so the revision the
-    // packet was opened at is already gone by the time the fence is checked.
-    // Fenced on that token, this resume would fail SpecDrift, non-recoverably
-    // and forever; fenced on the rendered body, it resumes.
+fn an_approved_bead_packet_resumes_while_reclaim_preserves_its_frozen_revision() {
+    // `claim-next` RECLAIMS and then RE-CLAIMS the run's bd lease. Those
+    // authorization writes mint fresh mutable Bead revisions, but they must
+    // not move the execution contract retained by the approved run start.
     let env = TestEnv::new("forged-claim-next-bead");
     env.forged(&["init"]);
     env.seed_bead_spec(
@@ -594,8 +591,8 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
     assert_eq!(claimed["resumed"], json!(true), "ledger first: {resumed}");
     assert_eq!(claimed["packet_id"], json!(packet.packet_id));
 
-    // The lease writes really did move the token, and the claim re-pinned
-    // the row to where bd is now rather than leaving a dead value behind.
+    // Lease authorization advanced, while the approved spec coordinates did
+    // not: mutable custody and immutable execution authority are independent.
     let ledger = env.ledger();
     let row = ledger.get_packet(&packet.packet_id).expect("packet row");
     ledger.close().expect("close");
@@ -605,9 +602,14 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
         "the reclaim and re-claim must have moved the write token"
     );
     assert_eq!(
+        env.assignee("bead-resume").as_deref(),
+        Some("forged:bead-resume:0"),
+        "the reclaimed lease is authorized under the run identity"
+    );
+    assert_eq!(
         row.spec_revision.as_deref(),
-        Some(env.bead_revision("bead-resume").as_str()),
-        "the resuming claim re-pins the write token: {row:?}"
+        Some(opened_at.as_str()),
+        "the resuming claim preserves the approved frozen revision: {row:?}"
     );
     assert_eq!(
         row.spec_sha256, packet.spec_sha256,
@@ -626,22 +628,16 @@ fn a_bead_sourced_packet_resumes_though_the_reclaim_moved_its_revision() {
     );
 }
 
-/// The ledger-first resume must recover a spec edit, exactly as `run advance`
-/// does.
-///
-/// `beads-fbt` taught `execute_packet` to re-pin an edited bead under an open
-/// packet, because a packet pinned to bytes nobody can reach refuses every
-/// claim as drift, forever. `claim-next` is the OTHER claim path and it did
-/// not get that fix — so the recovery workflow an operator reaches for by
-/// hand was the one that could not recover.
+/// The ledger-first resume uses the same frozen approval authority as every
+/// other packet path, even if the mutable Bead is edited while it is idle.
 #[test]
-fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
+fn an_approved_bead_edit_does_not_repin_the_resumed_packet() {
     let env = TestEnv::new("forged-claim-next-repin");
     env.forged(&["init"]);
     env.seed_bead_spec(
         "bead-repin",
         "## Context\\n\\nthe bead is the spec.",
-        "- the resume re-pins an edited spec",
+        "- the resume preserves its approved spec",
     );
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let (code, started) = env.forged(&[
@@ -694,8 +690,9 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
         .expect("fail packet");
     ledger.close().expect("close");
 
-    // The operator revises the spec while the packet sits open and unclaimed
-    // — the whole reason the bead is the source of truth.
+    let opened_at_revision = packet.spec_revision.clone().expect("bead-sourced");
+
+    // A later Bead edit is unapproved for this already-started run.
     env.set_bead_field("bead-repin", "acceptance", "- revised acceptance");
 
     let (code, resumed) = env.forged(&[
@@ -707,7 +704,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
     ]);
     assert_eq!(
         code, 0,
-        "an edited bead must not wedge the resume: {resumed}"
+        "an approved frozen packet must resume despite later Bead drift: {resumed}"
     );
     assert_eq!(
         resumed["result"]["claimed"]["packet_id"],
@@ -717,18 +714,33 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_by_the_resume() {
     let ledger = env.ledger();
     let row = ledger.get_packet(&packet.packet_id).expect("packet row");
     ledger.close().expect("close");
-    assert_ne!(
+    assert_eq!(
         row.spec_sha256, opened_at_body,
-        "the row must be re-pinned to the body the bead carries now: {row:?}"
+        "the row must retain the approved body digest: {row:?}"
+    );
+    assert_eq!(
+        row.spec_revision.as_deref(),
+        Some(opened_at_revision.as_str()),
+        "the row must retain the approved frozen revision: {row:?}"
+    );
+    assert_ne!(
+        env.bead_revision("bead-repin"),
+        opened_at_revision,
+        "the fixture must prove the mutable Bead actually moved"
+    );
+    assert_eq!(
+        env.assignee("bead-repin").as_deref(),
+        Some("forged:bead-repin:0"),
+        "resume still advances lease authorization under the run identity"
     );
 
-    // And the resumed seat reads the REVISED body, not the one the packet
-    // was opened at — a re-pin that left the file behind would hand the
-    // worker bytes the ledger no longer fences.
+    // The resumed seat receives exactly the approved bytes, not the later
+    // mutable edit.
     let body = std::fs::read_to_string(&row.spec_path)
         .unwrap_or_else(|e| panic!("resumed seat spec at {}: {e}", row.spec_path));
     assert!(
-        body.contains("revised acceptance"),
-        "the seat reads the revised spec: {body}"
+        body.contains("- the resume preserves its approved spec")
+            && !body.contains("revised acceptance"),
+        "the seat reads the approved frozen spec: {body}"
     );
 }
