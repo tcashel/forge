@@ -44,11 +44,13 @@ workers never write bd.
 | `forged-beads` | bd lease wrapper: claim/heartbeat/scoped reclaim, TTL/3 guardian, contention classifier |
 | `forged-provider` | Claude + Codex drivers; usage parsers golden-tested against real captures |
 | `forged-proto` | The slice/v1 advance engine and the kill-confirmed reclaim saga |
+| `forged-history` | Durable session archive (`history.db`): exact record bytes in Zstandard blocks, contentless FTS5, staged publication ([ADR-0034](docs/adr/0034-durable-session-history-archive.md)) |
 | `forged` (bin) | clap CLI + rmcp MCP/App server over one shared core; detached slice/epic submission, reconnect overview, and session controls |
 
 All operator state lives out-of-repo under `~/.anvil/` (ledger at
-`~/.anvil/state.db`, run artifacts under `~/.anvil/runs/`). forged imposes
-nothing on the repositories it targets.
+`~/.anvil/state.db`, session archive at `~/.anvil/history/history.db`, run
+artifacts under `~/.anvil/runs/`). forged imposes nothing on the
+repositories it targets.
 
 Beads may remain embedded or use one central Dolt SQL database for a team.
 The latter centralizes specs, dependencies, readiness, and leases only;
