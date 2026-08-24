@@ -242,23 +242,23 @@ async fn claim_next_effect(ctx: &Ctx, holder: &str) -> Result<Value, Failure> {
         // Untracked, an unreachable bd would refuse here for free, forever —
         // and `claim-next` is the path an operator retries by hand, so
         // "for free, forever" is a loop with a human in it.
-        let resolved =
-            match crate::core::spec::resolve_for_packet(ctx, &candidate.spec, &candidate.bead_id)
-                .await
-            {
-                Ok(resolved) => resolved,
-                Err(failure) if failure.recoverable => {
-                    let note = format!("transport: the resume could not read the spec: {failure}");
-                    crate::adapters::execute::grant_pre_claim_retry(
-                        ctx,
-                        &candidate.packet_id,
-                        note,
-                    )
+        let resolved = match crate::core::spec::resolve_for_packet(
+            ctx,
+            &candidate.run_id,
+            &candidate.spec,
+            &candidate.bead_id,
+        )
+        .await
+        {
+            Ok(resolved) => resolved,
+            Err(failure) if failure.recoverable => {
+                let note = format!("transport: the resume could not read the spec: {failure}");
+                crate::adapters::execute::grant_pre_claim_retry(ctx, &candidate.packet_id, note)
                     .await?;
-                    return Err(failure);
-                }
-                Err(failure) => return Err(failure),
-            };
+                return Err(failure);
+            }
+            Err(failure) => return Err(failure),
+        };
         // Re-pin BEFORE claiming. A bead edited under this open packet leaves
         // the row pinned to bytes no seat can reach, and `claim_packet` would
         // refuse the current body as drift — forever, since nothing else on

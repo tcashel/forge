@@ -14,8 +14,8 @@ use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
 use forged_types::{
-    AdmissionOutcome, AdmissionReason, AdmissionSubjectKind, ExecutionPolicyV1, OperationRequest,
-    OperationResponse, Outcome, Stage, Verdict,
+    AdmissionOutcome, AdmissionReason, AdmissionSubjectKind, ExecutionPolicyV1, FrozenBeadSpecV1,
+    OperationRequest, OperationResponse, Outcome, Stage, Verdict,
 };
 use serde_json::{json, Map, Value};
 
@@ -97,7 +97,7 @@ fn round_of(view: &RunView, step: MachineStage) -> u32 {
 /// A payload carrying `specPath` is the deprecated file route — including
 /// every run started before the bead became the source of truth, which is
 /// why the path is still read first.
-pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failure> {
+async fn spec_event_of(ctx: &Ctx, run_id: &str) -> Result<Value, Failure> {
     let run_id_owned = run_id.to_owned();
     let events = on_ledger(&ctx.ledger, move |l| {
         l.list_events(Some(&run_id_owned), 0, 4096)
@@ -105,18 +105,63 @@ pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failu
     .await?;
     for row in &events {
         if row.kind == "forged.run.spec" {
-            if let Ok(payload) = serde_json::from_str::<Value>(&row.payload_json) {
-                if let Some(path) = payload.get("specPath").and_then(Value::as_str) {
-                    return Ok(SpecSource::File(path.to_owned()));
-                }
-                if let Some(bead) = payload.get("beadId").and_then(Value::as_str) {
-                    return Ok(SpecSource::Bead(bead.to_owned()));
-                }
-            }
+            return serde_json::from_str::<Value>(&row.payload_json).map_err(|error| {
+                Failure::internal(format!("run {run_id} has malformed spec event: {error}"))
+            });
         }
     }
     Err(Failure::internal(format!(
         "run {run_id} has no recorded spec source"
+    )))
+}
+
+fn frozen_spec_from_event(
+    run_id: &str,
+    payload: &Value,
+) -> Result<Option<FrozenBeadSpecV1>, Failure> {
+    let Some(value) = payload.get("frozenSpec") else {
+        return Ok(None);
+    };
+    let frozen: FrozenBeadSpecV1 = serde_json::from_value(value.clone()).map_err(|error| {
+        Failure::refused(
+            forged_types::ErrorCode::ExecutionApprovalMismatch,
+            format!("run {run_id} has malformed frozen approved spec: {error}"),
+        )
+    })?;
+    frozen.validate().map_err(|error| {
+        Failure::refused(
+            forged_types::ErrorCode::ExecutionApprovalMismatch,
+            format!("run {run_id} has invalid frozen approved spec: {error}"),
+        )
+    })?;
+    Ok(Some(frozen))
+}
+
+/// The immutable Bead bytes retained by an approved direct start.
+///
+/// Absence is the compatibility signal for pre-policy and epic-child runs,
+/// which continue resolving their historical mutable source.
+pub(crate) async fn frozen_spec_of(
+    ctx: &Ctx,
+    run_id: &str,
+) -> Result<Option<FrozenBeadSpecV1>, Failure> {
+    let payload = spec_event_of(ctx, run_id).await?;
+    frozen_spec_from_event(run_id, &payload)
+}
+
+pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failure> {
+    let payload = spec_event_of(ctx, run_id).await?;
+    if let Some(frozen) = frozen_spec_from_event(run_id, &payload)? {
+        return Ok(SpecSource::FrozenBead(frozen));
+    }
+    if let Some(path) = payload.get("specPath").and_then(Value::as_str) {
+        return Ok(SpecSource::File(path.to_owned()));
+    }
+    if let Some(bead) = payload.get("beadId").and_then(Value::as_str) {
+        return Ok(SpecSource::Bead(bead.to_owned()));
+    }
+    Err(Failure::internal(format!(
+        "run {run_id} has no usable recorded spec source"
     )))
 }
 

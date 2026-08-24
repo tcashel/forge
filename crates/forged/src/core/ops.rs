@@ -271,6 +271,7 @@ struct PreparedRunStart {
     repo: String,
     issue: forged_beads::IssueSummary,
     source: super::spec::SpecSource,
+    resolved_bead_spec: Option<super::spec::ResolvedSpec>,
     base_ref: String,
     base_sha: String,
 }
@@ -283,7 +284,7 @@ async fn prepare_run_start(
     let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
     let spec = param_opt_str(params, "spec").map(str::to_owned);
     let issue = ready_slice_bead(ctx, bead).await?;
-    let source = match &spec {
+    let (source, resolved_bead_spec) = match &spec {
         Some(path) => {
             if !Path::new(path).exists() {
                 return Err(Failure::invalid(format!("spec {path:?} does not exist")));
@@ -293,11 +294,14 @@ async fn prepare_run_start(
                 spec = %path,
                 "--spec is deprecated: the bead's own fields are the spec"
             );
-            super::spec::SpecSource::File(path.clone())
+            (super::spec::SpecSource::File(path.clone()), None)
         }
         None => {
-            super::spec::resolve_issue(&issue)?;
-            super::spec::SpecSource::Bead(bead.to_owned())
+            let resolved = super::spec::resolve_issue(&issue)?;
+            (
+                super::spec::SpecSource::Bead(bead.to_owned()),
+                Some(resolved),
+            )
         }
     };
     let base_ref = match param_opt_str(params, "baseRef") {
@@ -309,6 +313,7 @@ async fn prepare_run_start(
         repo,
         issue,
         source,
+        resolved_bead_spec,
         base_ref,
         base_sha,
     })
@@ -515,6 +520,11 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
         req.run_id = Some(run_id.as_str().to_owned());
     }
     match replay_terminal_run_start_before_compile(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+    match recover_applied_run_start(ctx, req, &run_id).await {
         Ok(Some(response)) => return response,
         Ok(None) => {}
         Err(error) => return err_response(&req.idempotency_key, &error),
@@ -777,6 +787,7 @@ async fn run_start_with_definition(
                 repo,
                 issue,
                 source,
+                resolved_bead_spec,
                 base_ref,
                 base_sha,
             } = match prepared {
@@ -814,6 +825,12 @@ async fn run_start_with_definition(
                 project,
                 epic,
             )?;
+            let frozen_spec = match (&source, resolved_bead_spec.as_ref(), approval.as_ref()) {
+                (super::spec::SpecSource::Bead(bead_id), Some(resolved), Some(_)) => {
+                    Some(super::spec::freeze_bead(bead_id, resolved)?)
+                }
+                _ => None,
+            };
             let payload = match &source {
                 super::spec::SpecSource::File(path) => json!({
                     "runId": run_id.as_str(),
@@ -826,25 +843,48 @@ async fn run_start_with_definition(
                     "repo": repo,
                     "baseSha": base_sha,
                     "operationId": operation_id,
+                    "startRequestParams": params.clone(),
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
                     "project": identity.project.clone(),
                     "epic": identity.epic.clone(),
                 }),
-                super::spec::SpecSource::Bead(bead_id) => json!({
-                    "runId": run_id.as_str(),
-                    "source": "bead",
-                    "beadId": bead_id,
-                    "beadTitle": identity.bead.title.clone(),
-                    "beadRevision": issue.revision,
-                    "repo": repo,
-                    "baseSha": base_sha,
-                    "operationId": operation_id,
-                    "issueType": issue.issue_type,
-                    "metadata": issue.metadata,
-                    "project": identity.project.clone(),
-                    "epic": identity.epic.clone(),
-                }),
+                super::spec::SpecSource::Bead(bead_id) => {
+                    let mut payload = json!({
+                        "runId": run_id.as_str(),
+                        "source": "bead",
+                        "beadId": bead_id,
+                        "beadTitle": identity.bead.title.clone(),
+                        "beadRevision": issue.revision,
+                        "repo": repo,
+                        "baseSha": base_sha,
+                        "operationId": operation_id,
+                        "startRequestParams": params.clone(),
+                        "issueType": issue.issue_type,
+                        "metadata": issue.metadata,
+                        "project": identity.project.clone(),
+                        "epic": identity.epic.clone(),
+                    });
+                    if let Some(frozen_spec) = frozen_spec {
+                        payload
+                            .as_object_mut()
+                            .expect("run spec payload is an object")
+                            .insert(
+                                "frozenSpec".to_owned(),
+                                serde_json::to_value(frozen_spec).map_err(|error| {
+                                    Failure::internal(format!(
+                                        "cannot serialize frozen Bead spec: {error}"
+                                    ))
+                                })?,
+                            );
+                    }
+                    payload
+                }
+                super::spec::SpecSource::FrozenBead(_) => {
+                    return Err(Failure::internal(
+                        "a fresh run start cannot receive an already-frozen spec source",
+                    ));
+                }
             };
             let row = on_ledger(&ctx.ledger, move |ledger| {
                 ledger.create_run_with_identity_and_approval(
@@ -885,18 +925,47 @@ async fn recover_applied_run_start(
     let Some(row) = row.filter(|row| row.state == OperationState::InProgress) else {
         return Ok(None);
     };
-    let hash = request_sha256(request)
-        .map_err(|error| Failure::invalid(format!("params cannot be canonicalized: {error}")))?;
-    if row.request_sha256 != hash {
+    let Some(applied) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
+        return Ok(None);
+    };
+
+    // The core adds packageSha256 before fencing a current start. Recover
+    // that internal field from the durable bundle, never mutable config. A
+    // stored request snapshot is stronger: verify it still hashes to the
+    // operation row, then compare the caller's raw params after adding only
+    // that internal field. Raw explicit nulls therefore remain part of MCP
+    // request identity instead of being silently normalized away.
+    let mut candidates = vec![request.clone()];
+    let mut augmented = request.clone();
+    augmented
+        .params
+        .entry("packageSha256".to_owned())
+        .or_insert(Value::String(applied.package_sha256.clone()));
+    candidates.push(augmented);
+    if let Some(stored_params) = applied.start_request_params.as_ref() {
+        let mut stored = request.clone();
+        stored.params = stored_params.clone();
+        let stored_hash = request_sha256(&stored).map_err(|error| {
+            Failure::internal(format!(
+                "stored run start request cannot be canonicalized: {error}"
+            ))
+        })?;
+        if stored_hash != row.request_sha256 {
+            return Err(Failure::internal(
+                "atomic run creation stored a request that differs from its operation fence",
+            ));
+        }
+    }
+    let identity_matches = candidates
+        .into_iter()
+        .any(|candidate| request_sha256(&candidate).is_ok_and(|hash| hash == row.request_sha256));
+    if !identity_matches {
         return Err(Failure::refused(
             ErrorCode::IdempotencyConflict,
             "run start key was stored with a different request",
         ));
     }
-    let Some(result) = replay_atomic_run_start(ctx, run_id, &row.operation_id).await? else {
-        return Ok(None);
-    };
-    let response = ok_response(&row.operation_id, false, result);
+    let response = ok_response(&row.operation_id, false, applied.result);
     let operation_id = row.operation_id;
     let stored = response.clone();
     on_ledger(&ctx.ledger, move |ledger| {
@@ -908,6 +977,12 @@ async fn recover_applied_run_start(
     Ok(Some(replayed))
 }
 
+struct AppliedRunStart {
+    result: Value,
+    package_sha256: String,
+    start_request_params: Option<serde_json::Map<String, Value>>,
+}
+
 /// Recover the applied side of an interrupted atomic run creation without
 /// consulting Beads. The operation id is written into `forged.run.spec` in
 /// the same transaction as the run and identity, so a matching event proves
@@ -916,7 +991,7 @@ async fn replay_atomic_run_start(
     ctx: &Ctx,
     run_id: &RunId,
     operation_id: &str,
-) -> Result<Option<Value>, Failure> {
+) -> Result<Option<AppliedRunStart>, Failure> {
     let run_name = run_id.as_str().to_owned();
     let operation_id = operation_id.to_owned();
     let events = on_ledger(&ctx.ledger, {
@@ -924,21 +999,26 @@ async fn replay_atomic_run_start(
         move |ledger| ledger.list_events(Some(&run_name), 0, 4096)
     })
     .await?;
-    let landed = events.iter().any(|event| {
-        event.kind == "forged.run.spec"
-            && serde_json::from_str::<Value>(&event.payload_json)
-                .ok()
-                .and_then(|payload| {
-                    payload
-                        .get("operationId")
-                        .and_then(Value::as_str)
-                        .map(|stored| stored == operation_id)
-                })
-                .unwrap_or(false)
+    let spec_payload = events.iter().find_map(|event| {
+        if event.kind != "forged.run.spec" {
+            return None;
+        }
+        let payload = serde_json::from_str::<Value>(&event.payload_json).ok()?;
+        (payload.get("operationId").and_then(Value::as_str) == Some(operation_id.as_str()))
+            .then_some(payload)
     });
-    if !landed {
+    let Some(spec_payload) = spec_payload else {
         return Ok(None);
-    }
+    };
+    let start_request_params = match spec_payload.get("startRequestParams") {
+        None => None,
+        Some(Value::Object(params)) => Some(params.clone()),
+        Some(_) => {
+            return Err(Failure::internal(
+                "atomic run creation has malformed stored start request params",
+            ))
+        }
+    };
     let identity = on_ledger(&ctx.ledger, {
         let run_name = run_name.clone();
         move |ledger| ledger.get_work_identity(WorkIdentitySubjectKind::Run, &run_name)
@@ -959,7 +1039,7 @@ async fn replay_atomic_run_start(
         .ok_or_else(|| Failure::internal("atomic run creation has no durable definition"))?;
     let package: ExecutionPackageV1 = serde_json::from_str(&definition.package_json)
         .map_err(|error| Failure::internal(format!("stored execution package: {error}")))?;
-    Ok(Some(json!({
+    let mut result = json!({
         "run_id": run.run_id,
         "bead_id": run.bead_id,
         "branch": run.branch,
@@ -970,7 +1050,18 @@ async fn replay_atomic_run_start(
         "package_sha256": definition.package_sha256,
         "profile_sha256": definition.profile_sha256,
         "roster_sha256": definition.roster_sha256,
-    })))
+    });
+    if let Some(base_sha) = spec_payload.get("baseSha").and_then(Value::as_str) {
+        result
+            .as_object_mut()
+            .expect("run start recovery result is an object")
+            .insert("base_sha".to_owned(), Value::String(base_sha.to_owned()));
+    }
+    Ok(Some(AppliedRunStart {
+        result,
+        package_sha256: definition.package_sha256,
+        start_request_params,
+    }))
 }
 
 /// The repo's default branch, from its `origin/HEAD` symref; falls back to
@@ -1777,7 +1868,8 @@ pub async fn packet_claim(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
             // ledger compares and the bytes the seat will read.
             let spec_ref = forged_proto::packet_spec(&row);
             let resolved =
-                super::spec::resolve_for_packet(ctx, &spec_ref, &view.run.bead_id).await?;
+                super::spec::resolve_for_packet(ctx, &row.run_id, &spec_ref, &view.run.bead_id)
+                    .await?;
             let fence = resolved.fence.clone();
             let provider = admission
                 .packet_provider_hints

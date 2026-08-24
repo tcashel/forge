@@ -330,7 +330,7 @@ pub fn build_packet(
     };
     packet.spec.path = match source {
         SpecSource::File(path) => path.clone(),
-        SpecSource::Bead(_) => {
+        SpecSource::Bead(_) | SpecSource::FrozenBead(_) => {
             let (stage_key, seq) = packet_keys(&packet)?;
             ctx.config
                 .packet_dir_key(&run.run_id, &stage_key, seq)
@@ -622,7 +622,13 @@ pub async fn execute_packet(
     // token to fail one under, so a transport failure is charged to the
     // packet's bounded budget through its grant alone. Untracked, an
     // unreachable bd would refuse here for free, forever.
-    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    let spec = match crate::core::spec::resolve_for_packet(
+        ctx,
+        &packet.run_id,
+        &packet.spec,
+        &packet.bead_id,
+    )
+    .await
     {
         Ok(spec) => spec,
         Err(failure) if failure.recoverable => {
@@ -805,7 +811,13 @@ pub async fn execute_adopted(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
-    let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
+    let spec = match crate::core::spec::resolve_for_packet(
+        ctx,
+        &packet.run_id,
+        &packet.spec,
+        &packet.bead_id,
+    )
+    .await
     {
         Ok(spec) => spec,
         Err(failure) => {

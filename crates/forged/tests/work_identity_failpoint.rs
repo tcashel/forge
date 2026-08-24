@@ -6,11 +6,11 @@ mod support;
 
 use std::process::Stdio;
 
-use serde_json::json;
-use support::TestEnv;
+use serde_json::{json, Value};
+use support::{McpClient, TestEnv};
 
 #[test]
-fn atomic_run_creation_replays_after_crash_without_beads() {
+fn approved_run_creation_replays_after_crash_from_frozen_request_and_definition() {
     let env = TestEnv::new("km-work-identity-run-bundle");
     env.seed_bead_spec(
         "identity-run-crash",
@@ -21,6 +21,23 @@ fn atomic_run_creation_replays_after_crash_without_beads() {
     env.seed_frontier("identity-run-crash");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
+    let revision = env.bead_revision("identity-run-crash");
+    let approval = env.execution_approval(
+        "slice",
+        "identity-run-crash",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let approval_path = env.root.join("identity-run-crash-approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval JSON"),
+    )
+    .expect("write approval");
+    let approval_arg = approval_path.to_string_lossy().into_owned();
     let args = [
         "run",
         "start",
@@ -30,6 +47,14 @@ fn atomic_run_creation_replays_after_crash_without_beads() {
         &repo,
         "--base-ref",
         "main",
+        "--profile",
+        "standard",
+        "--roster",
+        "default",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        &approval_arg,
     ];
     let fp = env.root.join("fp-work-identity-run-bundle");
     std::fs::create_dir_all(&fp).expect("failpoint dir");
@@ -44,10 +69,48 @@ fn atomic_run_creation_replays_after_crash_without_beads() {
         .expect("run start child");
     assert!(!crashed.wait().expect("run start crash").success());
 
+    // Change the selected package under the same profile/roster refs. The
+    // pre-fix recovery path compiled this mutable definition first and could
+    // no longer reproduce the in-progress operation's request hash.
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read config for replay drift"),
+    )
+    .expect("config JSON");
+    config["gate_commands"] = json!(["true", "git diff --check"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("drifted config JSON"),
+    )
+    .expect("write replay drift");
     env.set_bd_show_unreachable(true);
-    let (code, replayed) = env.forged(&args);
-    assert_eq!(code, 0, "run creation replay: {replayed}");
+    let mut mcp = McpClient::new(&env);
+    let replayed = mcp.call_tool(
+        "run_start",
+        json!({
+            "schemaVersion": 1,
+            "idempotencyKey": "op:run_start:identity-run-crash:-:-",
+            "runId": null,
+            "params": {
+                "bead": "identity-run-crash",
+                "repo": repo,
+                "spec": null,
+                "baseRef": "main",
+                "profile": "standard",
+                "roster": "default",
+                "expectedBeadRevision": revision,
+                "approval": approval
+            }
+        }),
+    );
+    assert_eq!(
+        replayed["ok"],
+        json!(true),
+        "run creation replay: {replayed}"
+    );
+    assert_eq!(replayed["reused"], json!(true));
     assert_eq!(replayed["result"]["run_id"], json!("identity-run-crash"));
+    assert_eq!(replayed["result"]["base_sha"], approval["baseSha"]);
     let ledger = env.ledger();
     let identity = ledger
         .get_work_identity(

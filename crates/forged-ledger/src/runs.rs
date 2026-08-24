@@ -5,8 +5,9 @@ use std::fmt::Write as _;
 use forged_types::{
     canonical_json_bytes, normalize_repository_path, AcceptedRisk, ErrorCode,
     ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV2, ExecutionPackageV1,
-    ExecutionPolicyV1, ResolvedRosterV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V2, EXECUTION_PACKAGE_SCHEMA_V1,
+    ExecutionPolicyV1, FrozenBeadSpecV1, ResolvedRosterV1, WorkIdentitySource,
+    WorkIdentitySubjectKind, WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V2,
+    EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -680,6 +681,28 @@ impl Ledger {
                         "execution approval requires actor, basis, and an RFC 3339 approvedAt"
                             .to_owned(),
                     ));
+                }
+                if spec_event.get("source").and_then(Value::as_str) == Some("bead") {
+                    let frozen: FrozenBeadSpecV1 = serde_json::from_value(
+                        spec_event.get("frozenSpec").cloned().ok_or_else(|| {
+                            mismatch(
+                                "approved bead-sourced run requires a frozen spec snapshot"
+                                    .to_owned(),
+                            )
+                        })?,
+                    )
+                    .map_err(|error| {
+                        mismatch(format!("approved run frozen spec is malformed: {error}"))
+                    })?;
+                    frozen.validate().map_err(mismatch)?;
+                    if frozen.bead_id != new_run.bead_id
+                        || frozen.revision != approval.observed_revision
+                    {
+                        return Err(mismatch(
+                            "approved run frozen spec does not match the approved Bead revision"
+                                .to_owned(),
+                        ));
+                    }
                 }
             }
             let approval_payload = approval.as_ref().map(serde_json::to_value).transpose()?;

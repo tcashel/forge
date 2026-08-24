@@ -44,6 +44,34 @@ fn wait_for(env: &TestEnv, args: &[&str], ready: impl Fn(&Value) -> bool) -> Val
     panic!("timed out waiting for forged {args:?}: {last}")
 }
 
+/// Remove fields newer binaries add to the launch event so compatibility
+/// tests exercise the mutable-spec behavior of a historical stored run.
+fn simulate_legacy_mutable_spec_run(env: &TestEnv, run: &str) {
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open legacy run fixture");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 \
+             AND kind = 'forged.run.spec' ORDER BY event_id LIMIT 1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("run spec event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("run spec payload");
+    let object = payload.as_object_mut().expect("run spec object");
+    object.remove("frozenSpec");
+    object.remove("startRequestParams");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("legacy run spec JSON"),
+                event_id
+            ],
+        )
+        .expect("downgrade run spec event");
+}
+
 #[test]
 fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
     let env = TestEnv::new("forged-bead-spec");
@@ -145,6 +173,67 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
         assert_eq!(seat_body, body, "every seat reads byte-identical bytes");
     }
     ledger.close().expect("close");
+}
+
+#[test]
+fn approved_run_uses_its_frozen_spec_after_bead_drift_and_bd_spec_outage() {
+    let env = TestEnv::new("forged-approved-frozen-spec");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    env.seed_bead_spec("approved-frozen", DESCRIPTION, ACCEPTANCE);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "approved-frozen",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "approved run start: {started}");
+
+    let ledger = env.ledger();
+    let event = ledger
+        .list_events(Some("approved-frozen"), 0, 100)
+        .expect("events")
+        .into_iter()
+        .find(|event| event.kind == "forged.run.spec")
+        .expect("run spec event");
+    ledger.close().expect("close");
+    let payload: Value = serde_json::from_str(&event.payload_json).expect("run spec payload");
+    let approved_body = payload["frozenSpec"]["body"]
+        .as_str()
+        .expect("frozen body")
+        .to_owned();
+    let approved_sha = payload["frozenSpec"]["bodySha256"]
+        .as_str()
+        .expect("frozen body digest")
+        .to_owned();
+    assert!(approved_body.contains(ACCEPTANCE));
+
+    // Approval is immutable execution authority: a later Bead edit neither
+    // changes a newly opened packet nor needs to remain readable at claim.
+    env.set_bead_field("approved-frozen", "acceptance", "- unapproved replacement");
+    env.authorize_run("approved-frozen");
+    let packet = advance_to_open_packet(&env, "approved-frozen");
+    assert_eq!(packet.spec_sha256, approved_sha);
+    env.set_bd_spec_show_unreachable(true);
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(
+        code, 0,
+        "frozen claim does not reread mutable Beads: {claimed}"
+    );
+
+    let ledger = env.ledger();
+    let row = ledger
+        .get_packet(&packet.packet_id)
+        .expect("claimed packet");
+    ledger.close().expect("close");
+    assert_eq!(row.spec_sha256, approved_sha);
+    let materialized = std::fs::read_to_string(&row.spec_path).expect("materialized frozen spec");
+    assert_eq!(materialized, approved_body);
+    assert!(!materialized.contains("unapproved replacement"));
 }
 
 #[test]
@@ -685,6 +774,7 @@ fn a_seat_claim_refuses_an_edited_bead_but_survives_a_moved_write_token() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-edited");
     env.authorize_run("bead-edited");
 
     let packet = advance_to_open_packet(&env, "bead-edited");
@@ -759,6 +849,7 @@ fn a_bead_edited_under_an_open_packet_is_re_pinned_and_claimed_at_the_new_body()
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-recovered");
     env.authorize_run("bead-recovered");
 
     let packet = advance_to_open_packet(&env, "bead-recovered");
@@ -818,6 +909,7 @@ fn an_adoption_that_finds_drift_settles_its_attempt_instead_of_looping() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-adopted");
     env.authorize_run("bead-adopted");
 
     // Claim without ever spawning a provider: exactly the crashed shape.
@@ -913,6 +1005,7 @@ fn a_spec_edit_between_stages_pins_the_new_body_on_the_next_packet_open() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-repinned");
     env.authorize_run("bead-repinned");
 
     let mut edited = false;
@@ -999,6 +1092,7 @@ fn a_bead_edited_back_to_the_body_the_packet_opened_at_still_re_pins() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-cycled");
     env.authorize_run("bead-cycled");
 
     let packet = advance_to_open_packet(&env, "bead-cycled");
@@ -1086,6 +1180,7 @@ fn the_re_pins_refusals_still_stand_now_that_it_bypasses_the_operation() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-guarded");
     env.authorize_run("bead-guarded");
     let packet = advance_to_open_packet(&env, "bead-guarded");
 
@@ -1269,6 +1364,7 @@ fn an_unreachable_bd_at_claim_time_is_transport_and_is_charged_to_the_budget() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-outage");
     env.authorize_run("bead-outage");
     let packet = advance_to_open_packet(&env, "bead-outage");
 
@@ -1363,6 +1459,7 @@ fn a_bd_outage_that_clears_inside_the_budget_lets_the_packet_recover() {
         "main",
     ]);
     assert_eq!(code, 0, "run start: {started}");
+    simulate_legacy_mutable_spec_run(&env, "bead-recovers");
     env.authorize_run("bead-recovers");
     let packet = advance_to_open_packet(&env, "bead-recovers");
 

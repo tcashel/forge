@@ -21,7 +21,7 @@ use std::path::Path;
 
 use forged_beads::{BdError, IssueSummary};
 use forged_ledger::SpecFence;
-use forged_types::{ErrorCode, SpecRef};
+use forged_types::{sha256_hex, ErrorCode, FrozenBeadSpecV1, SpecRef, FROZEN_BEAD_SPEC_SCHEMA_V1};
 
 use crate::adapters::execute::sha256_file;
 use crate::core::{Ctx, Failure};
@@ -86,6 +86,8 @@ const HEADINGS: [&str; 4] = [
 pub enum SpecSource {
     /// The bead's own fields — the supported route.
     Bead(String),
+    /// Exact Bead bytes retained by an approved direct launch.
+    FrozenBead(FrozenBeadSpecV1),
     /// A markdown file at this path — deprecated, honored for one release.
     File(String),
 }
@@ -172,16 +174,6 @@ pub fn carries_spec(issue: &IssueSummary) -> bool {
 }
 
 /// SHA-256 hex over in-memory bytes.
-fn sha256_bytes(bytes: &[u8]) -> String {
-    use sha2::{Digest, Sha256};
-    let mut hex = String::with_capacity(64);
-    for byte in Sha256::digest(bytes) {
-        use std::fmt::Write as _;
-        let _ = write!(hex, "{byte:02x}");
-    }
-    hex
-}
-
 /// A bd read that failed on the spec path is never drift and never
 /// terminal for the run: bd's answer, or its silence, says nothing about
 /// whether the spec changed. `SpecDrift` is deliberately unreachable here.
@@ -256,7 +248,7 @@ pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failur
         ))
     })?;
     let body = render_body(issue);
-    let body_sha256 = sha256_bytes(body.as_bytes());
+    let body_sha256 = sha256_hex(body.as_bytes());
     let mut bead_context = vec![
         format!("Bead title: {}", issue.title),
         format!("Bead issue type: {}", issue.issue_type),
@@ -278,6 +270,54 @@ pub(crate) fn resolve_issue(issue: &IssueSummary) -> Result<ResolvedSpec, Failur
     })
 }
 
+/// Freeze one already-resolved Bead spec at the approved start boundary.
+pub(crate) fn freeze_bead(
+    bead_id: &str,
+    resolved: &ResolvedSpec,
+) -> Result<FrozenBeadSpecV1, Failure> {
+    let Some(body) = resolved.body.clone() else {
+        return Err(Failure::internal(
+            "cannot freeze a file-sourced spec as Bead content",
+        ));
+    };
+    let Some(revision) = resolved.revision() else {
+        return Err(Failure::internal(
+            "cannot freeze a Bead spec without its observed revision",
+        ));
+    };
+    let frozen = FrozenBeadSpecV1 {
+        schema: FROZEN_BEAD_SPEC_SCHEMA_V1.to_owned(),
+        bead_id: bead_id.to_owned(),
+        revision,
+        body,
+        body_sha256: resolved.sha256.clone(),
+        bead_context: resolved.bead_context.clone(),
+    };
+    frozen
+        .validate()
+        .map_err(|error| Failure::internal(format!("invalid frozen Bead spec: {error}")))?;
+    Ok(frozen)
+}
+
+/// Rehydrate and integrity-check one durable frozen Bead spec.
+pub(crate) fn resolve_frozen(frozen: &FrozenBeadSpecV1) -> Result<ResolvedSpec, Failure> {
+    frozen.validate().map_err(|error| {
+        Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("invalid frozen approved Bead spec: {error}"),
+        )
+    })?;
+    Ok(ResolvedSpec {
+        body: Some(frozen.body.clone()),
+        sha256: frozen.body_sha256.clone(),
+        fence: SpecFence::Revision {
+            revision: frozen.revision.clone(),
+            body_sha256: frozen.body_sha256.clone(),
+        },
+        bead_context: frozen.bead_context.clone(),
+    })
+}
+
 /// Resolve a spec file: the deprecated route, fenced by content hash.
 pub fn resolve_file(path: &str) -> Result<ResolvedSpec, Failure> {
     let sha256 = sha256_file(Path::new(path))?;
@@ -293,6 +333,7 @@ pub fn resolve_file(path: &str) -> Result<ResolvedSpec, Failure> {
 pub async fn resolve(ctx: &Ctx, source: &SpecSource) -> Result<ResolvedSpec, Failure> {
     match source {
         SpecSource::Bead(bead_id) => resolve_bead(ctx, bead_id).await,
+        SpecSource::FrozenBead(frozen) => resolve_frozen(frozen),
         SpecSource::File(path) => resolve_file(path),
     }
 }
@@ -301,11 +342,26 @@ pub async fn resolve(ctx: &Ctx, source: &SpecSource) -> Result<ResolvedSpec, Fai
 /// about to fence on it. One bd read per claim, not per seat.
 pub async fn resolve_for_packet(
     ctx: &Ctx,
+    run_id: &str,
     spec: &SpecRef,
     bead_id: &str,
 ) -> Result<ResolvedSpec, Failure> {
     match spec.revision {
-        Some(_) => resolve_bead(ctx, bead_id).await,
+        Some(_) => match super::drive::frozen_spec_of(ctx, run_id).await? {
+            Some(frozen) => {
+                if frozen.bead_id != bead_id {
+                    return Err(Failure::refused(
+                        ErrorCode::ExecutionApprovalMismatch,
+                        format!(
+                            "run {run_id} frozen spec belongs to {:?}, not {bead_id:?}",
+                            frozen.bead_id
+                        ),
+                    ));
+                }
+                resolve_frozen(&frozen)
+            }
+            None => resolve_bead(ctx, bead_id).await,
+        },
         None => resolve_file(&spec.path),
     }
 }

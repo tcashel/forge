@@ -10,6 +10,7 @@ pub mod controller_env;
 pub mod envelope;
 pub mod error;
 pub mod execution_approval;
+pub mod frozen_spec;
 pub mod herdr_layout;
 pub mod herdr_ownership;
 pub mod herdr_projection;
@@ -50,6 +51,7 @@ pub use execution_approval::{
     ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1,
     ExecutionApprovalV2, EXECUTION_APPROVAL_SCHEMA_V1, EXECUTION_APPROVAL_SCHEMA_V2,
 };
+pub use frozen_spec::{sha256_hex, FrozenBeadSpecV1, FROZEN_BEAD_SPEC_SCHEMA_V1};
 pub use herdr_layout::{
     HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrLayoutValidationError,
     HERDR_LAYOUT_LABEL_MAX_BYTES, HERDR_LAYOUT_SCHEMA_V1,
