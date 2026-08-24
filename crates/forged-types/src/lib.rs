@@ -9,6 +9,7 @@ pub mod contract;
 pub mod controller_env;
 pub mod envelope;
 pub mod error;
+pub mod execution_approval;
 pub mod herdr_layout;
 pub mod herdr_ownership;
 pub mod herdr_projection;
@@ -45,6 +46,10 @@ pub use contract::{
 pub use controller_env::CONTROLLER_ENV;
 pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
+pub use execution_approval::{
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1,
+    EXECUTION_APPROVAL_SCHEMA_V1,
+};
 pub use herdr_layout::{
     HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrLayoutValidationError,
     HERDR_LAYOUT_LABEL_MAX_BYTES, HERDR_LAYOUT_SCHEMA_V1,

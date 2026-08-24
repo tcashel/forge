@@ -13,8 +13,10 @@ use forged_ledger::{
 use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
-    AttentionState, ErrorCode, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
+    AttentionState, ErrorCode, ExecutionApprovalAction, ExecutionApprovalSubjectKind,
+    ExecutionApprovalV1, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
     WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
+    EXECUTION_APPROVAL_SCHEMA_V1,
 };
 use serde_json::{json, Value};
 
@@ -265,6 +267,126 @@ async fn ready_slice_bead(ctx: &Ctx, bead: &str) -> Result<forged_beads::IssueSu
     Ok(issue)
 }
 
+struct PreparedRunStart {
+    repo: String,
+    issue: forged_beads::IssueSummary,
+    source: super::spec::SpecSource,
+    base_ref: String,
+}
+
+async fn prepare_run_start(
+    ctx: &Ctx,
+    params: &serde_json::Map<String, Value>,
+    bead: &str,
+) -> Result<PreparedRunStart, Failure> {
+    let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+    let spec = param_opt_str(params, "spec").map(str::to_owned);
+    let issue = ready_slice_bead(ctx, bead).await?;
+    let source = match &spec {
+        Some(path) => {
+            if !Path::new(path).exists() {
+                return Err(Failure::invalid(format!("spec {path:?} does not exist")));
+            }
+            tracing::warn!(
+                bead = %bead,
+                spec = %path,
+                "--spec is deprecated: the bead's own fields are the spec"
+            );
+            super::spec::SpecSource::File(path.clone())
+        }
+        None => {
+            super::spec::resolve_issue(&issue)?;
+            super::spec::SpecSource::Bead(bead.to_owned())
+        }
+    };
+    let base_ref = match param_opt_str(params, "baseRef") {
+        Some(base) => base.to_owned(),
+        None => default_branch_of(&repo).await,
+    };
+    Ok(PreparedRunStart {
+        repo,
+        issue,
+        source,
+        base_ref,
+    })
+}
+
+fn approval_param_present(params: &serde_json::Map<String, Value>) -> bool {
+    params
+        .get("expectedBeadRevision")
+        .is_some_and(|value| !value.is_null())
+        || params.get("approval").is_some_and(|value| !value.is_null())
+}
+
+fn validate_run_start_approval(
+    params: &serde_json::Map<String, Value>,
+    prepared: &PreparedRunStart,
+    bead: &str,
+    package: &ExecutionPackageV1,
+) -> Result<Option<ExecutionApprovalV1>, Failure> {
+    let mismatch =
+        |message: String| Failure::refused(ErrorCode::ExecutionApprovalMismatch, message);
+    let expected = match params.get("expectedBeadRevision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return Err(mismatch(
+                "expectedBeadRevision must be a non-empty string".to_owned(),
+            ))
+        }
+    };
+    if let Some(expected) = expected {
+        if prepared.issue.revision.as_deref() != Some(expected) {
+            return Err(mismatch(format!(
+                "bead {bead} revision does not match expectedBeadRevision"
+            )));
+        }
+    }
+
+    let Some(value) = params.get("approval").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let expected =
+        expected.ok_or_else(|| mismatch("approval requires expectedBeadRevision".to_owned()))?;
+    let approval: ExecutionApprovalV1 = serde_json::from_value(value.clone()).map_err(|error| {
+        mismatch(format!(
+            "approval is not forged-execution-approval/1: {error}"
+        ))
+    })?;
+    let bead_repository = prepared
+        .issue
+        .metadata
+        .get("repository")
+        .ok_or_else(|| mismatch("bead metadata.repository is missing".to_owned()))?;
+    let bead_repository = super::work_identity::canonical_repository(bead_repository)
+        .map_err(|error| mismatch(format!("bead metadata.repository is invalid: {error}")))?;
+    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1
+        || approval.subject_kind != ExecutionApprovalSubjectKind::Slice
+        || approval.action != ExecutionApprovalAction::RunStartSubmit
+        || approval.bead_id != bead
+        || approval.observed_revision != expected
+        || bead_repository != prepared.repo
+        || approval.repository != prepared.repo
+        || approval.base_ref != prepared.base_ref
+        || approval.profile != package.profile_ref
+        || approval.roster != package.roster_ref
+    {
+        return Err(mismatch(
+            "execution approval does not match bead, repository, base, profile, roster, or action"
+                .to_owned(),
+        ));
+    }
+    if approval.actor.trim().is_empty()
+        || approval.basis.trim().is_empty()
+        || approval.approved_at.parse::<jiff::Timestamp>().is_err()
+    {
+        return Err(mismatch(
+            "execution approval requires actor, basis, and an RFC 3339 approvedAt".to_owned(),
+        ));
+    }
+    Ok(Some(approval))
+}
+
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
 /// explicit child generation id) and fill `NewRun` from the config plus the
 /// `--repo` and `--base-ref` arguments. The spec comes from the bead;
@@ -369,36 +491,60 @@ pub(crate) async fn run_start_with_definition(
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
     let params = req.params.clone();
+    let approval_guarded = approval_param_present(&params);
+    if approval_guarded {
+        let key = req.idempotency_key.clone();
+        let standing = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation("run_start", &key)
+        })
+        .await;
+        match standing {
+            Ok(Some(row)) if row.state == OperationState::Terminal => {
+                return fenced(
+                    ctx,
+                    "run_start",
+                    EffectClass::SafeRetry,
+                    req,
+                    None,
+                    |_operation| async {
+                        Err(Failure::internal(
+                            "terminal run_start replay unexpectedly executed",
+                        ))
+                    },
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        }
+    }
+    // Guarded launches validate against one Beads snapshot before the
+    // operation fence records anything. That exact snapshot and approval are
+    // then moved into the atomic launch bundle.
+    let (prepared, approval) = if approval_guarded {
+        let prepared = match prepare_run_start(ctx, &params, &bead).await {
+            Ok(prepared) => prepared,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        };
+        let approval =
+            match validate_run_start_approval(&params, &prepared, &bead, &compiled.package) {
+                Ok(approval) => approval,
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            };
+        (Some(prepared), approval)
+    } else {
+        (None, None)
+    };
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
-            let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
-            let spec = param_opt_str(&params, "spec").map(str::to_owned);
-            let issue = ready_slice_bead(ctx, &bead).await?;
-            // The spec source is settled BEFORE the run row exists: a bead
-            // with no spec, or a spec path that is not there, must never
-            // reach a seat as an empty spec.
-            let source = match &spec {
-                Some(path) => {
-                    if !Path::new(path).exists() {
-                        return Err(Failure::invalid(format!("spec {path:?} does not exist")));
-                    }
-                    tracing::warn!(
-                        bead = %bead,
-                        spec = %path,
-                        "--spec is deprecated: the bead's own fields are the spec"
-                    );
-                    super::spec::SpecSource::File(path.clone())
-                }
-                None => {
-                    // Resolving proves the bead carries a spec, and names
-                    // every empty field when it does not.
-                    super::spec::resolve_issue(&issue)?;
-                    super::spec::SpecSource::Bead(bead.clone())
-                }
-            };
-            let base_ref = match param_opt_str(&params, "baseRef") {
-                Some(base) => base.to_owned(),
-                None => default_branch_of(&repo).await,
+            let PreparedRunStart {
+                repo,
+                issue,
+                source,
+                base_ref,
+            } = match prepared {
+                Some(prepared) => prepared,
+                None => prepare_run_start(ctx, &params, &bead).await?,
             };
             let branch = format!("forged/{run_id}");
             let new_run = NewRun {
@@ -462,7 +608,9 @@ pub(crate) async fn run_start_with_definition(
                 }),
             };
             let row = on_ledger(&ctx.ledger, move |ledger| {
-                ledger.create_run_with_identity(new_run, definition, payload, identity)
+                ledger.create_run_with_identity_and_approval(
+                    new_run, definition, payload, identity, approval,
+                )
             })
             .await?;
             crate::failpoint::hit("run.start.bundle.after");
