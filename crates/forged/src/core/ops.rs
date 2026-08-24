@@ -915,7 +915,7 @@ async fn run_start_with_definition(
     // A fresh direct launch is always guarded. The only unguarded-looking
     // path is crate-private child creation, and it proves the retained parent
     // approval rather than trusting a caller-supplied JSON escape hatch.
-    let (prepared, approval) = match &authority {
+    let (prepared, approval, retain_frozen_spec) = match &authority {
         RunStartAuthority::Direct => {
             if params.get("run").is_some_and(|value| !value.is_null()) {
                 return err_response(
@@ -934,7 +934,7 @@ async fn run_start_with_definition(
                 Ok(approval) => approval,
                 Err(error) => return err_response(&req.idempotency_key, &error),
             };
-            (Some(prepared), Some(approval))
+            (Some(prepared), Some(approval), true)
         }
         RunStartAuthority::ApprovedEpic {
             parent_epic,
@@ -955,7 +955,16 @@ async fn run_start_with_definition(
             ) {
                 return err_response(&req.idempotency_key, &error);
             }
-            (Some(prepared), None)
+            // A complete child snapshot came from the approved parent
+            // inventory. Retain the typed bytes in this child run just as a
+            // direct approval does, so every later packet is independent of
+            // mutable Beads. The absent/absent case is a legacy epic start
+            // event and deliberately keeps its historical mutable behavior.
+            (
+                Some(prepared),
+                None,
+                child_revision.is_some() && child_spec_sha256.is_some(),
+            )
         }
     };
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
@@ -1002,8 +1011,8 @@ async fn run_start_with_definition(
                 project,
                 epic,
             )?;
-            let frozen_spec = match (&source, resolved_bead_spec.as_ref(), approval.as_ref()) {
-                (super::spec::SpecSource::Bead(bead_id), Some(resolved), Some(_)) => {
+            let frozen_spec = match (&source, resolved_bead_spec.as_ref(), retain_frozen_spec) {
+                (super::spec::SpecSource::Bead(bead_id), Some(resolved), true) => {
                     Some(super::spec::freeze_bead(bead_id, resolved)?)
                 }
                 _ => None,

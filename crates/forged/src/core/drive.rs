@@ -137,10 +137,11 @@ fn frozen_spec_from_event(
     Ok(Some(frozen))
 }
 
-/// The immutable Bead bytes retained by an approved direct start.
+/// The immutable Bead bytes retained by an approved direct or epic start.
 ///
-/// Absence is the compatibility signal for pre-policy and epic-child runs,
-/// which continue resolving their historical mutable source.
+/// Absence is the compatibility signal for pre-policy and legacy epic-child
+/// runs whose parent start event had no frozen inventory; those continue
+/// resolving their historical mutable source.
 pub(crate) async fn frozen_spec_of(
     ctx: &Ctx,
     run_id: &str,

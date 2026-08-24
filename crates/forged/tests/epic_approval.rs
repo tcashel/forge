@@ -2,6 +2,9 @@
 
 mod support;
 
+#[cfg(feature = "failpoints")]
+use std::process::Stdio;
+
 use forged_types::WorkIdentitySubjectKind;
 use serde_json::{json, Value};
 use support::{McpClient, TestEnv};
@@ -290,4 +293,116 @@ fn epic_child_start_refuses_spec_edits_after_the_inventory_was_approved() {
         "drift refusal precedes the child start fence"
     );
     ledger.close().expect("close ledger");
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn approved_epic_child_uses_frozen_spec_after_start_drift_and_bd_outage() {
+    let env = TestEnv::new("forged-epic-child-frozen-spec");
+    let epic = "frozen-child-epic";
+    let child = "frozen-child";
+    env.seed_epic(epic, &[(child, &env.spec, true)]);
+    env.set_bead_field(
+        child,
+        "description",
+        "## Context\\n\\nthe parent approved these exact child bytes.",
+    );
+    env.set_bead_field(child, "acceptance", "- the approved child bytes execute");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "approved epic start: {started}");
+    env.authorize_epic(epic);
+
+    for step in ["integration", "wave"] {
+        let (code, advanced) = env.forged(&["epic", "advance", "--epic", epic]);
+        assert_eq!(code, 0, "{step} advance: {advanced}");
+    }
+    let status = env
+        .forged_cmd(&["epic", "advance", "--epic", epic])
+        .env("FORGED_FAILPOINT", "epic.child.started.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("crashing child launch");
+    assert!(!status.success(), "child-start failpoint must crash");
+
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_events(Some(epic), 0, 100)
+            .expect("epic events")
+            .iter()
+            .any(|event| event.kind == "forged.epic.child.started"),
+        "the crash is after CHILD_STARTED"
+    );
+    let spec_event = ledger
+        .list_events(Some(child), 0, 100)
+        .expect("child events")
+        .into_iter()
+        .find(|event| event.kind == "forged.run.spec")
+        .expect("child run spec event");
+    ledger.close().expect("close ledger");
+    let payload: Value = serde_json::from_str(&spec_event.payload_json).expect("run spec payload");
+    let approved_body = payload["frozenSpec"]["body"]
+        .as_str()
+        .expect("approved epic child frozen body")
+        .to_owned();
+    let approved_sha = payload["frozenSpec"]["bodySha256"]
+        .as_str()
+        .expect("approved epic child frozen digest")
+        .to_owned();
+
+    // Let the run take its Beads lease, but stop before any packet exists.
+    // The child run and CHILD_STARTED are already durable; every subsequent
+    // provider-facing spec read must come from that run's frozen bundle.
+    env.authorize_run(child);
+    let (code, resolved) = env.forged(&["run", "advance", "--run", child]);
+    assert_eq!(code, 0, "resolve frozen child: {resolved}");
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_packets(child)
+            .expect("child packets")
+            .is_empty(),
+        "the outage and edit occur before packet open"
+    );
+    ledger.close().expect("close ledger");
+
+    // Neither a later authoring edit nor an unavailable Beads spec read can
+    // change or block packet construction and materialization.
+    env.set_bead_field(child, "acceptance", "- unapproved replacement");
+    env.set_bd_spec_show_unreachable(true);
+    let packet = (0..40)
+        .find_map(|_| {
+            let ledger = env.ledger();
+            let packet = ledger
+                .list_packets(child)
+                .expect("child packets")
+                .into_iter()
+                .next();
+            ledger.close().expect("close ledger");
+            if packet.is_none() {
+                let (code, advanced) = env.forged(&["run", "advance", "--run", child]);
+                assert_eq!(code, 0, "advance frozen child: {advanced}");
+            }
+            packet
+        })
+        .expect("frozen child opens a packet without Beads spec access");
+    assert_eq!(packet.spec_sha256, approved_sha);
+    let (code, claimed) = env.forged(&["packet", "claim", "--packet", &packet.packet_id]);
+    assert_eq!(code, 0, "claim frozen child packet: {claimed}");
+    let materialized = std::fs::read_to_string(&packet.spec_path).expect("materialized child spec");
+    assert_eq!(materialized, approved_body);
+    assert!(!materialized.contains("unapproved replacement"));
 }

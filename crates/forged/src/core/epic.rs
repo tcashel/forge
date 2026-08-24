@@ -1854,6 +1854,7 @@ async fn start_child(
         "baseRef": config.integration_branch,
     });
     append(ctx, &config.epic_id, CHILD_STARTED, event.clone()).await?;
+    crate::failpoint::hit("epic.child.started.after");
     Ok(event)
 }
 

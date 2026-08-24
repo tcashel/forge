@@ -54,6 +54,8 @@
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use
 //! the durable bundle without consulting Beads again.
+//! `epic.child.started.after` is after the child run and CHILD_STARTED event
+//! are durable but before the epic submits the child controller.
 //! `review.publish.probe.before` and `review.publish.probe.after` bracket the
 //! exact-marker observation. `review.publish.post.before` is after uncertain
 //! intent is durable but before GitHub is called; `review.publish.post.after`
