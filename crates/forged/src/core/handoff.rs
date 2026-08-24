@@ -1821,7 +1821,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
         ),
     );
     let mut fresh_generation = next_generation;
-    let (reservation_id, spawn_generation, recovered_controller) = loop {
+    let (mut admission_reservation, spawn_generation, recovered_controller) = loop {
         let admission = match super::admission::admit(
             ctx,
             vec![(scope.desired_kind(), id.clone())],
@@ -1878,12 +1878,11 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 &Failure::internal("admitted submit has no capacity reservation"),
             );
         };
-        let reservation_id = reservation.reservation_id.clone();
         match (
             reservation.owner_kind.as_deref(),
             reservation.owner_id.as_deref(),
         ) {
-            (None, None) => break (reservation_id, fresh_generation, None),
+            (None, None) => break (reservation, fresh_generation, None),
             (Some("controller"), Some(owner)) => {
                 let Some((owner_scope, owner_id, owner_generation)) =
                     admission_controller_owner(owner)
@@ -1906,7 +1905,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                     Ok(Some(record)) if generation(&record) == owner_generation => {
                         let status = status_for(&record).await;
                         if is_active(&status) {
-                            break (reservation_id, owner_generation, Some(status));
+                            break (reservation, owner_generation, Some(status));
                         }
                         if is_unknown(&status) {
                             return err_response(
@@ -1964,10 +1963,10 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
                 // old authority and loop through a current Beads/policy read;
                 // never turn a stale admitted decision directly into a spawn.
                 if let Err(error) = on_ledger(&ctx.ledger, {
-                    let reservation_id = reservation_id.clone();
+                    let observed_reservation = reservation.clone();
                     move |ledger| {
                         ledger.release_admission_reservation(
-                            &reservation_id,
+                            &observed_reservation,
                             Some("owned controller confirmed absent; fresh admission required"),
                         )
                     }
@@ -1995,16 +1994,16 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     };
     if recovered_controller.is_none() {
         let owner_id = format!("{}:{id}:{spawn_generation}", scope.noun());
-        if let Err(error) = on_ledger(&ctx.ledger, {
-            let reservation_id = reservation_id.clone();
+        match on_ledger(&ctx.ledger, {
+            let reservation_id = admission_reservation.reservation_id.clone();
             move |ledger| {
-                ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)?;
-                Ok(())
+                ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)
             }
         })
         .await
         {
-            return err_response(&req.idempotency_key, &error);
+            Ok(active_reservation) => admission_reservation = active_reservation,
+            Err(error) => return err_response(&req.idempotency_key, &error),
         }
         crate::failpoint::hit("admission.reservation.transfer.after");
     }
@@ -2048,7 +2047,7 @@ async fn submit(ctx: &Ctx, req: &mut OperationRequest, scope: Scope) -> Operatio
     if response.ok {
         let _ = on_ledger(&ctx.ledger, move |ledger| {
             ledger.release_admission_reservation(
-                &reservation_id,
+                &admission_reservation,
                 Some("controller identity persisted"),
             )?;
             Ok(())

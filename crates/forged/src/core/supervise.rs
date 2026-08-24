@@ -519,9 +519,9 @@ async fn reconcile_claimed(
     admission_reservation: AdmissionReservationRow,
 ) -> Result<Value, Failure> {
     if let Some(stop) = settle_landed_reality(ctx, &row, &token).await? {
-        let reservation_id = admission_reservation.reservation_id;
+        let observed_reservation = admission_reservation;
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger.release_admission_reservation(&reservation_id, Some("subject settled"))?;
+            ledger.release_admission_reservation(&observed_reservation, Some("subject settled"))?;
             Ok(())
         })
         .await?;
@@ -692,10 +692,12 @@ async fn reconcile_claimed(
             },
         )
         .await?;
-        let reservation_id = admission_reservation.reservation_id;
+        let observed_reservation = admission_reservation;
         on_ledger(&ctx.ledger, move |ledger| {
-            ledger
-                .release_admission_reservation(&reservation_id, Some("live controller adopted"))?;
+            ledger.release_admission_reservation(
+                &observed_reservation,
+                Some("live controller adopted"),
+            )?;
             Ok(())
         })
         .await?;
@@ -744,10 +746,10 @@ async fn reconcile_claimed(
         // The exact owned effect is confirmed absent. Its old decision is no
         // longer launch authority: release capacity and make the subject due
         // so the next tick re-reads current Beads and policy before spawning.
-        let reservation_id = admission_reservation.reservation_id;
+        let observed_reservation = admission_reservation;
         on_ledger(&ctx.ledger, move |ledger| {
             ledger.release_admission_reservation(
-                &reservation_id,
+                &observed_reservation,
                 Some("owned controller confirmed absent; fresh admission required"),
             )?;
             Ok(())
@@ -807,9 +809,8 @@ async fn reconcile_claimed(
         subject_scope.noun(),
         reserved.subject_id
     );
-    on_ledger(&ctx.ledger, move |ledger| {
-        ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)?;
-        Ok(())
+    let active_reservation = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.activate_admission_reservation(&reservation_id, "controller", &owner_id)
     })
     .await?;
     crate::failpoint::hit("admission.reservation.transfer.after");
@@ -843,10 +844,10 @@ async fn reconcile_claimed(
             )
             .await?;
             crate::failpoint::hit("supervisor.reconcile.after");
-            let reservation_id = admission_reservation.reservation_id;
+            let observed_reservation = active_reservation;
             on_ledger(&ctx.ledger, move |ledger| {
                 ledger.release_admission_reservation(
-                    &reservation_id,
+                    &observed_reservation,
                     Some("controller identity persisted"),
                 )?;
                 Ok(())
