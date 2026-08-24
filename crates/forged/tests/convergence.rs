@@ -79,6 +79,26 @@ fn start_run(env: &TestEnv, run: &str) {
     assert_eq!(code, 0, "run start {run}: {started}");
 }
 
+/// Advance through the machine prologue until the first provider packet is
+/// open, but do not claim it. The next `run advance` then owns exactly one
+/// provider attempt and cannot silently continue into a successor.
+fn advance_to_open_packet(env: &TestEnv, run: &str) {
+    for _ in 0..40 {
+        let ledger = env.ledger();
+        let opened = !ledger
+            .list_packets(run)
+            .expect("list run packets")
+            .is_empty();
+        ledger.close().expect("close ledger");
+        if opened {
+            return;
+        }
+        let (code, advanced) = env.forged(&["run", "advance", "--run", run]);
+        assert_eq!(code, 0, "advance {run}: {advanced}");
+    }
+    panic!("{run} never opened a packet");
+}
+
 fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
     env.enable_dynamic_gh();
     env.seed_epic(epic, children);
@@ -1872,8 +1892,9 @@ fn convergence_attempt_evidence_is_complete() {
     start_run(&stopped, "conv-evidence-stopped");
     stopped.authorize_run("conv-evidence-stopped");
     stopped.set_scenario("implement", "hang", 1);
+    advance_to_open_packet(&stopped, "conv-evidence-stopped");
     let driver = stopped
-        .forged_cmd(&["run", "drive", "--run", "conv-evidence-stopped"])
+        .forged_cmd(&["run", "advance", "--run", "conv-evidence-stopped"])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -1906,7 +1927,13 @@ fn convergence_attempt_evidence_is_complete() {
         "convergence evidence fixture",
     ]);
     assert_eq!(code, 0, "session stop: {response}");
-    let _ = driver.wait_with_output().expect("stopped driver exits");
+    let driver = driver.wait_with_output().expect("stopped driver exits");
+    assert!(
+        driver.status.success(),
+        "stopped driver failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&driver.stdout),
+        String::from_utf8_lossy(&driver.stderr),
+    );
     wait_until("stopped attempt manifest", || {
         let ledger = stopped.ledger();
         let joined = ledger
@@ -1917,7 +1944,17 @@ fn convergence_attempt_evidence_is_complete() {
         joined
     });
     assert_terminal_artifacts(&stopped, "conv-evidence-stopped", &[AttemptState::Stopped]);
-    stop_run(&stopped, "conv-evidence-stopped");
+    let (code, cleaned) = stopped.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "conv-evidence-stopped",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "convergence fixture cleanup",
+    ]);
+    assert_eq!(code, 0, "cleanup stopped-attempt run: {cleaned}");
     no_live_reservations(&stopped);
 }
 
