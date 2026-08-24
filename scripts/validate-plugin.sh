@@ -75,6 +75,7 @@ const requiredSkillText = [
   '../adjudicate/SKILL.md',
   '../dispatch/SKILL.md',
   '../run-epic/SKILL.md',
+  '../triage/SKILL.md',
   'forged-execution-approval/1',
   'forged definition validate',
   'forged doctor',
@@ -93,6 +94,7 @@ if (Object.keys(fixture).sort().join('\n') !== ['budgetScope', 'cases', 'purpose
 
 const expected = new Map(Object.entries({
   observe: ['observe', 'none', 'read-only'],
+  triage: ['triage', 'triage', 'read-only-causal-report'],
   explore: ['explore', 'none', 'discuss'],
   plan: ['plan', 'plan', 'delegate'],
   revise: ['revise', 'plan', 'delegate'],
@@ -284,6 +286,115 @@ if (seen.size !== expected.size) process.exit(1);
 NODE
 }
 
+check_triage_contract() {
+  node - "$1" "$2" <<'NODE'
+const fs = require('fs');
+const [skillPath, fixturePath] = process.argv.slice(2);
+const skill = fs.readFileSync(skillPath, 'utf8');
+const fixture = JSON.parse(fs.readFileSync(fixturePath, 'utf8'));
+
+const requiredSkillText = [
+  'name: triage', '../manage-work/SKILL.md', 'forged operations overview --limit 500',
+  'forged attention list --state active --limit 500', '--max-nodes 500',
+  '--readonly show', 'Batch no more than 100 IDs total', 'at most ten exact durable roots',
+  'forged.operations-overview/1', 'forged.attention-list/1', 'forged.attention-item/1',
+  'generic plan-only', 'status-only-stale-candidate', 'custody-mismatch/revalidate',
+  'Human decision or gate', 'Failed execution', 'Runtime recovery',
+  'Dependency or capacity wait', 'Parked by design', 'Stale custody or candidates',
+  'Ready but not started', 'Unknown/degraded', 'Needs you', 'Agent can recover',
+  'Waiting normally', 'exactly one primary counted cause', 'zero confirmed failed executions',
+  'zero confirmed stale work', 'at most ten examples per section', 'Zero-effect budget',
+  'triage snapshot never authorizes', 'Never perform an N+1 sweep, poll, open a watcher, or cache',
+];
+if (!requiredSkillText.every((token) => skill.includes(token))) process.exit(1);
+
+const fenced = [...skill.matchAll(/```(?:bash)?\n([\s\S]*?)```/g)].map((match) => match[1]).join('\n');
+if (/^\s*(?:forged\s+(?:run|epic)\s+(?:start|submit)|forged\s+attention\s+(?:acknowledge|resolve|reopen)|bd\s+(?:update|close)|git\s|gh\s)/m.test(fenced)) process.exit(1);
+
+if (fixture.schema !== 'forged.triage-fixtures/1' || fixture.purpose !== 'validation-only' ||
+    Object.keys(fixture).sort().join('\n') !== ['bounds', 'cases', 'purpose', 'schema', 'zeroEffectBudget'].join('\n')) process.exit(1);
+const expectedBounds = {
+  operationsOverview: {scope: 'operator', limit: 500, groupRecoveryReads: 1},
+  attentionList: {scope: 'operator', state: 'active', limit: 500, hasCursor: false},
+  workMap: {maxNodes: 500, use: 'dependency-evidence-only', repositoryRequestScope: 'repository', portfolioRequestScope: 'operator'},
+  beadShow: {readonly: true, maxIds: 100, source: 'fresh-snapshot-identities-only'},
+  workDetail: {maxRoots: 10, use: 'unexplained-durable-roots-only'},
+  polling: false, watcher: false, cache: false,
+};
+if (JSON.stringify(fixture.bounds) !== JSON.stringify(expectedBounds)) process.exit(1);
+const effectKeys = [
+  'attentionAcknowledgements', 'attentionResolutions', 'attentionReopens', 'beadWrites',
+  'claimReleases', 'reservationReleases', 'retries', 'restarts', 'reconciliations',
+  'runStarts', 'runSubmits', 'epicStarts', 'epicSubmits', 'providerCalls',
+  'serviceMutations', 'processSignals', 'configWrites', 'repositoryWrites',
+  'githubWrites', 'cacheWrites',
+].sort();
+if (Object.keys(fixture.zeroEffectBudget).sort().join('\n') !== effectKeys.join('\n') ||
+    !Object.values(fixture.zeroEffectBudget).every((value) => value === 0)) process.exit(1);
+
+const ids = [
+  'manual-gate-human', 'generic-plan-default-blocked', 'runtime-recovery-lead',
+  'durable-failed-human', 'stale-custody-confirmed', 'custody-mismatch-unconfirmed',
+  'hard-dependency-wait', 'capacity-backoff-wait', 'planning-hold-stub',
+  'planning-hold-open-question', 'status-stale-candidate', 'ready-not-started',
+  'unknown-degraded', 'plan-only-age-not-failed-or-stale', 'hard-blocks-fanout',
+  'ignore-closed-and-soft-edges', 'multi-root-tie', 'graph-cycle',
+  'descendants-not-double-counted', 'operations-truncated-conflict',
+  'attention-truncated-no-cursor', 'required-source-down', 'oversized-work-map',
+  'unknown-repository', 'missing-dependency-status', 'bead-revision-drift',
+  'repository-safe-acquisition', 'duplicate-titles-preserve-identity',
+  'group-recovery-dedup', 'inspect-batch-refreshes', 'repair-batch-has-no-authority',
+];
+if (!Array.isArray(fixture.cases) || fixture.cases.length !== ids.length ||
+    fixture.cases.map((entry) => entry.id).join('\n') !== ids.join('\n')) process.exit(1);
+const byId = new Map();
+for (const entry of fixture.cases) {
+  if (!entry || Object.keys(entry).sort().join('\n') !== ['expected', 'id', 'input', 'kind'].join('\n') ||
+      byId.has(entry.id) || !entry.input || !entry.expected) process.exit(1);
+  byId.set(entry.id, entry);
+}
+const causes = new Set([
+  'human-decision-or-gate', 'durable-execution-failed', 'runtime-recovery',
+  'stale-execution-custody', 'dependency-wait', 'capacity-or-backoff-wait',
+  'intentional-planning-hold', 'status-only-stale-candidate', 'ready-not-started',
+  'unknown-or-degraded',
+]);
+const owners = new Set(['needs-you', 'agent-can-recover', 'waiting-normally', 'parked-by-design', 'ready-to-dispatch', 'unknown']);
+const classification = fixture.cases.filter((entry) => entry.kind === 'classification');
+if (classification.length !== 14 || !classification.every((entry) =>
+  causes.has(entry.expected.cause) && owners.has(entry.expected.owner) &&
+  ['confirmed', 'inferred', 'unknown'].includes(entry.expected.confidence))) process.exit(1);
+if (new Set(classification.map((entry) => entry.expected.cause)).size !== causes.size ||
+    new Set(classification.map((entry) => entry.expected.owner)).size !== owners.size) process.exit(1);
+if (byId.get('generic-plan-default-blocked').expected.owner !== 'unknown' ||
+    byId.get('durable-failed-human').expected.countedOnce !== true ||
+    byId.get('stale-custody-confirmed').expected.stale !== true ||
+    byId.get('custody-mismatch-unconfirmed').expected.stale !== false ||
+    byId.get('status-stale-candidate').expected.label !== 'stale candidate' ||
+    byId.get('status-stale-candidate').expected.autoOpen !== false ||
+    byId.get('ready-not-started').expected.dispatch !== false ||
+    byId.get('plan-only-age-not-failed-or-stale').expected.failed !== false ||
+    byId.get('plan-only-age-not-failed-or-stale').expected.stale !== false) process.exit(1);
+if (byId.get('hard-blocks-fanout').expected.countedRoots !== 1 ||
+    byId.get('ignore-closed-and-soft-edges').expected.traversed.length !== 0 ||
+    byId.get('multi-root-tie').expected.primary !== 'repo-a/root-a' ||
+    byId.get('multi-root-tie').expected.secondary[0] !== 'repo-a/root-b' ||
+    byId.get('graph-cycle').expected.classification !== 'unknown/recheck' ||
+    byId.get('descendants-not-double-counted').expected.countedDescendants !== 0) process.exit(1);
+for (const entry of fixture.cases.filter((item) => item.kind === 'degraded')) {
+  if (entry.expected.definitiveStale !== false || entry.expected.definitiveHealthy !== false) process.exit(1);
+}
+if (byId.get('repository-safe-acquisition').expected.workMapScope !== 'repository' ||
+    byId.get('duplicate-titles-preserve-identity').expected.merged !== false ||
+    byId.get('group-recovery-dedup').expected.rows.length !== 2 ||
+    byId.get('inspect-batch-refreshes').expected.maxExactDetails !== 10 ||
+    byId.get('inspect-batch-refreshes').expected.mutation !== false ||
+    byId.get('repair-batch-has-no-authority').expected.route !== 'manage-work' ||
+    byId.get('repair-batch-has-no-authority').expected.useSnapshotAsAuthority !== false ||
+    byId.get('repair-batch-has-no-authority').expected.mutation !== false) process.exit(1);
+NODE
+}
+
 check_manage_work_host_parity_contract() {
   node - "$1" <<'NODE'
 'use strict';
@@ -393,6 +504,7 @@ function inventorySkills(skillsRoot) {
     'plan/SKILL.md',
     'run-epic/SKILL.md',
     'setup/SKILL.md',
+    'triage/SKILL.md',
   ];
   invariant(stableJson(entrypoints) === stableJson(expectedEntrypoints), 'shared skill entrypoint inventory moved');
   return {files, digest: sha256(Buffer.from(stableJson(files)))};
@@ -669,7 +781,7 @@ function validateParityFixture(registration) {
   invariant(fixture.tools.length === 45 && new Set(fixture.tools).size === 45, 'tool declaration must contain 45 unique tools');
   invariant(stableJson(fixture.surfaces) === stableJson(expectedSurfaces), 'exact five-surface declaration moved');
   invariant(fixture.surfaces.length === 5, 'surface declaration must contain five resources');
-  exactKeys(fixture.contracts, ['intent', 'portfolioControl'], 'host parity contracts');
+  exactKeys(fixture.contracts, ['intent', 'portfolioControl', 'triage'], 'host parity contracts');
   const manageWorkRoot = resolveInside(registration.skillsRoot, 'manage-work', 'directory', `${registration.host} manage-work root`);
   return {
     intent: validateContractSource(
@@ -680,7 +792,7 @@ function validateParityFixture(registration) {
       {
         path: 'intent-fixtures.json',
         schema: 'forged.manage-work-intent-fixtures/1',
-        caseCount: 14,
+        caseCount: 15,
         comparisonFields: ['decision', 'delegate', 'result', 'routerMutationBudget'],
       },
     ),
@@ -694,6 +806,18 @@ function validateParityFixture(registration) {
         schema: 'forged.manage-work-portfolio-control-fixtures/1',
         caseCount: 33,
         comparisonFields: ['route', 'confirmation', 'postcondition', 'effectBudget'],
+      },
+    ),
+    triage: validateContractSource(
+      registration.host,
+      registration.skillsRoot,
+      'triage',
+      fixture.contracts.triage,
+      {
+        path: 'triage/triage-fixtures.json',
+        schema: 'forged.triage-fixtures/1',
+        caseCount: 31,
+        comparisonFields: ['kind', 'input', 'expected'],
       },
     ),
   };
@@ -719,8 +843,8 @@ try {
 
   console.log(
     `HOST PARITY: claudeRoot=${claude.pluginRoot} codexRoot=${codex.pluginRoot} ` +
-      `version=${claude.manifest.version} skills=8 inventorySha256=${claude.inventory.digest} ` +
-      `cases=14+31 tools=45 surfaces=5 evidence=declarative-contract-only`,
+      `version=${claude.manifest.version} skills=9 inventorySha256=${claude.inventory.digest} ` +
+      `cases=15+33+31 tools=45 surfaces=5 evidence=declarative-contract-only`,
   );
 } catch (error) {
   console.error(`host parity validation failed: ${error.message}`);
@@ -810,6 +934,7 @@ required=(
   "$plugin/skills/manage-work/intent-fixtures.json"
   "$plugin/skills/manage-work/portfolio-control-fixtures.json"
   "$plugin/skills/manage-work/host-parity-fixtures.json"
+  "$plugin/skills/triage/triage-fixtures.json"
 )
 for path in "${required[@]}"; do
   [[ -f "$path" ]] && pass "required companion $path" || fail "required companion $path"
@@ -833,13 +958,18 @@ check "manage-work portfolio/control fixture JSON" check_json \
 check "manage-work portfolio/control contract" check_manage_work_portfolio_contract \
   "$plugin/skills/manage-work/SKILL.md" \
   "$plugin/skills/manage-work/portfolio-control-fixtures.json"
+check "triage fixture JSON" check_json \
+  "$plugin/skills/triage/triage-fixtures.json"
+check "triage bounded read-only contract" check_triage_contract \
+  "$plugin/skills/triage/SKILL.md" \
+  "$plugin/skills/triage/triage-fixtures.json"
 check "manage-work host-parity fixture JSON" check_json \
   "$plugin/skills/manage-work/host-parity-fixtures.json"
 check "manage-work dual-host registration and contract parity" check_manage_work_host_parity_contract \
   "$plugin/skills/manage-work/host-parity-fixtures.json"
 
 skill_files=("$plugin"/skills/*/SKILL.md)
-[[ ${#skill_files[@]} -eq 8 ]] && pass "exactly eight skills" || fail "exactly eight skills"
+[[ ${#skill_files[@]} -eq 9 ]] && pass "exactly nine skills" || fail "exactly nine skills"
 for path in "${skill_files[@]}"; do check "frontmatter $path" check_frontmatter "$path"; done
 check "critic frontmatter" check_frontmatter "$plugin/agents/critic.md"
 
