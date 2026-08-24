@@ -99,9 +99,7 @@ fn advance_to_open_packet(env: &TestEnv, run: &str) {
     panic!("{run} never opened a packet");
 }
 
-fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
-    env.enable_dynamic_gh();
-    env.seed_epic(epic, children);
+fn start_seeded_epic(env: &TestEnv, epic: &str) {
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
     let spec = env.spec.to_string_lossy().into_owned();
@@ -118,6 +116,12 @@ fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
         "main",
     ]);
     assert_eq!(code, 0, "epic start {epic}: {started}");
+}
+
+fn start_epic(env: &TestEnv, epic: &str, children: &[(&str, &Path, bool)]) {
+    env.enable_dynamic_gh();
+    env.seed_epic(epic, children);
+    start_seeded_epic(env, epic);
 }
 
 fn park_direct_epic(env: &TestEnv, epic: &str) {
@@ -1115,8 +1119,8 @@ fn convergence_authorization_admission_and_fanout() {
     let fanout = TestEnv::new("convergence-fanout");
     set_admission(&fanout, 2, 2, 3);
     let fanout_spec = fanout.spec.clone();
-    start_epic(
-        &fanout,
+    fanout.enable_dynamic_gh();
+    fanout.seed_epic(
         "conv-fanout",
         &[
             ("conv-child-a", &fanout_spec, true),
@@ -1128,6 +1132,7 @@ fn convergence_authorization_admission_and_fanout() {
     fanout.set_bead_field("conv-child-a", "priority", "0");
     fanout.set_bead_field("conv-child-b", "priority", "1");
     fanout.set_bead_field("conv-child-c", "priority", "9");
+    start_seeded_epic(&fanout, "conv-fanout");
     park_direct_epic(&fanout, "conv-fanout");
     fanout.set_scenario("implement", "hang", 3);
     let driver = fanout
