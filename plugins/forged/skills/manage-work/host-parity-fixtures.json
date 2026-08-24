@@ -6,9 +6,10 @@
     "intent": {
       "path": "intent-fixtures.json",
       "schema": "forged.manage-work-intent-fixtures/1",
-      "caseCount": 14,
+      "caseCount": 15,
       "caseIds": [
         "observe",
+        "triage",
         "explore",
         "plan",
         "revise",
@@ -74,6 +75,49 @@
         "confirmation",
         "postcondition",
         "effectBudget"
+      ]
+    },
+    "triage": {
+      "path": "triage/triage-fixtures.json",
+      "schema": "forged.triage-fixtures/1",
+      "caseCount": 31,
+      "caseIds": [
+        "manual-gate-human",
+        "generic-plan-default-blocked",
+        "runtime-recovery-lead",
+        "durable-failed-human",
+        "stale-custody-confirmed",
+        "custody-mismatch-unconfirmed",
+        "hard-dependency-wait",
+        "capacity-backoff-wait",
+        "planning-hold-stub",
+        "planning-hold-open-question",
+        "status-stale-candidate",
+        "ready-not-started",
+        "unknown-degraded",
+        "plan-only-age-not-failed-or-stale",
+        "hard-blocks-fanout",
+        "ignore-closed-and-soft-edges",
+        "multi-root-tie",
+        "graph-cycle",
+        "descendants-not-double-counted",
+        "operations-truncated-conflict",
+        "attention-truncated-no-cursor",
+        "required-source-down",
+        "oversized-work-map",
+        "unknown-repository",
+        "missing-dependency-status",
+        "bead-revision-drift",
+        "repository-safe-acquisition",
+        "duplicate-titles-preserve-identity",
+        "group-recovery-dedup",
+        "inspect-batch-refreshes",
+        "repair-batch-has-no-authority"
+      ],
+      "comparisonFields": [
+        "kind",
+        "input",
+        "expected"
       ]
     }
   },

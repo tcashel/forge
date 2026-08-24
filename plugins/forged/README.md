@@ -3,11 +3,12 @@
 **Talk to one agent. Keep the specification in Beads. Manage durable work.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
-It gives Claude and Codex the same eight capabilities through one shared skill
+It gives Claude and Codex the same nine capabilities through one shared skill
 tree: automatic conversational routing, planning, proportional critique,
 adjudication, operator setup, slice dispatch, epic handoff, and a deliberate
-board launcher. The shared router also projects the bounded operator portfolio
-and invokes landed, target-scoped controls without adding another state store.
+board launcher, plus read-only causal portfolio triage. The shared router also
+projects the bounded operator portfolio and invokes landed, target-scoped
+controls without adding another state store.
 
 ## Ownership
 
@@ -71,7 +72,8 @@ registration; skills there use the CLI read path.
 After installation, run `/forged:setup`. Then talk normally: ask the lead agent
 to explore an idea, plan or revise work, critique or adjudicate a Bead, ask
 what needs attention, explain one run's blocker or spend, reprioritize a Bead,
-or safely pause, resume, or cancel exact existing work. It can also prepare one
+causally triage blocked or failed work across a repository or portfolio, or
+safely pause, resume, or cancel exact existing work. It can also prepare one
 ready subject for explicit execution approval. The shared `manage-work` skill
 routes that intent without requiring a command name or machine id.
 
@@ -85,9 +87,11 @@ Named skills remain available as explicit power-user and debugging surfaces:
 
 - `/forged:manage-work`
 - `/forged:board`
+- `/forged:triage`
 - `/forged:plan`
 - `/forged:critique`
 - `/forged:adjudicate`
+- `/forged:setup`
 - `/forged:dispatch`
 - `/forged:run-epic`
 

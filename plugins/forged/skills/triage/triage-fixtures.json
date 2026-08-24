@@ -1,0 +1,224 @@
+{
+  "schema": "forged.triage-fixtures/1",
+  "purpose": "validation-only",
+  "bounds": {
+    "operationsOverview": {"scope": "operator", "limit": 500, "groupRecoveryReads": 1},
+    "attentionList": {"scope": "operator", "state": "active", "limit": 500, "hasCursor": false},
+    "workMap": {"maxNodes": 500, "use": "dependency-evidence-only", "repositoryRequestScope": "repository", "portfolioRequestScope": "operator"},
+    "beadShow": {"readonly": true, "maxIds": 100, "source": "fresh-snapshot-identities-only"},
+    "workDetail": {"maxRoots": 10, "use": "unexplained-durable-roots-only"},
+    "polling": false,
+    "watcher": false,
+    "cache": false
+  },
+  "zeroEffectBudget": {
+    "attentionAcknowledgements": 0,
+    "attentionResolutions": 0,
+    "attentionReopens": 0,
+    "beadWrites": 0,
+    "claimReleases": 0,
+    "reservationReleases": 0,
+    "retries": 0,
+    "restarts": 0,
+    "reconciliations": 0,
+    "runStarts": 0,
+    "runSubmits": 0,
+    "epicStarts": 0,
+    "epicSubmits": 0,
+    "providerCalls": 0,
+    "serviceMutations": 0,
+    "processSignals": 0,
+    "configWrites": 0,
+    "repositoryWrites": 0,
+    "githubWrites": 0,
+    "cacheWrites": 0
+  },
+  "cases": [
+    {
+      "id": "manual-gate-human",
+      "kind": "classification",
+      "input": {"attention": "typed-human-manual-gate", "planLabel": "manual-gate"},
+      "expected": {"cause": "human-decision-or-gate", "owner": "needs-you", "confidence": "confirmed", "secondary": [], "section": "Human decision or gate"}
+    },
+    {
+      "id": "generic-plan-default-blocked",
+      "kind": "classification",
+      "input": {"planOnly": true, "attention": "condition=blocked owner=human action=resolve-blocker", "dependencyStatus": "missing"},
+      "expected": {"cause": "unknown-or-degraded", "owner": "unknown", "confidence": "unknown", "secondary": ["generic-human-default-ignored"], "section": "Unknown/degraded"}
+    },
+    {
+      "id": "runtime-recovery-lead",
+      "kind": "classification",
+      "input": {"durable": true, "attention": "typed-lead-agent-reconcile", "authorityExhausted": false},
+      "expected": {"cause": "runtime-recovery", "owner": "agent-can-recover", "confidence": "confirmed", "secondary": [], "section": "Runtime recovery"}
+    },
+    {
+      "id": "durable-failed-human",
+      "kind": "classification",
+      "input": {"durable": true, "runState": "failed", "attentionOwner": "human"},
+      "expected": {"cause": "durable-execution-failed", "owner": "needs-you", "confidence": "confirmed", "secondary": [], "section": "Failed execution", "countedOnce": true}
+    },
+    {
+      "id": "stale-custody-confirmed",
+      "kind": "classification",
+      "input": {"staleInProgress": true, "controller": "confirmed-dead", "liveAttempts": 0},
+      "expected": {"cause": "stale-execution-custody", "owner": "agent-can-recover", "confidence": "confirmed", "secondary": [], "section": "Stale custody or candidates", "stale": true}
+    },
+    {
+      "id": "custody-mismatch-unconfirmed",
+      "kind": "classification",
+      "input": {"staleInProgress": true, "holderMismatch": true, "independentLiveness": "missing"},
+      "expected": {"cause": "unknown-or-degraded", "owner": "unknown", "confidence": "unknown", "secondary": ["custody-mismatch/revalidate"], "section": "Unknown/degraded", "stale": false}
+    },
+    {
+      "id": "hard-dependency-wait",
+      "kind": "classification",
+      "input": {"dependencies": [{"type": "blocks", "status": "open"}]},
+      "expected": {"cause": "dependency-wait", "owner": "waiting-normally", "confidence": "confirmed", "secondary": [], "section": "Dependency or capacity wait"}
+    },
+    {
+      "id": "capacity-backoff-wait",
+      "kind": "classification",
+      "input": {"admission": "provider-backoff", "eligibleAt": "future"},
+      "expected": {"cause": "capacity-or-backoff-wait", "owner": "waiting-normally", "confidence": "confirmed", "secondary": [], "section": "Dependency or capacity wait"}
+    },
+    {
+      "id": "planning-hold-stub",
+      "kind": "classification",
+      "input": {"planLabel": "anvil-stub"},
+      "expected": {"cause": "intentional-planning-hold", "owner": "parked-by-design", "confidence": "inferred", "secondary": [], "section": "Parked by design"}
+    },
+    {
+      "id": "planning-hold-open-question",
+      "kind": "classification",
+      "input": {"canonicalSection": "Open Questions", "uncheckedItems": 1},
+      "expected": {"cause": "intentional-planning-hold", "owner": "needs-you", "confidence": "inferred", "secondary": [], "section": "Parked by design"}
+    },
+    {
+      "id": "status-stale-candidate",
+      "kind": "classification",
+      "input": {"status": "blocked", "hardDependencies": "all-closed", "durable": false, "explicitHold": false},
+      "expected": {"cause": "status-only-stale-candidate", "owner": "unknown", "confidence": "inferred", "secondary": [], "section": "Stale custody or candidates", "label": "stale candidate", "stale": false, "autoOpen": false}
+    },
+    {
+      "id": "ready-not-started",
+      "kind": "classification",
+      "input": {"readiness": "ready", "durableDesiredWork": false, "run": false},
+      "expected": {"cause": "ready-not-started", "owner": "ready-to-dispatch", "confidence": "confirmed", "secondary": [], "section": "Ready but not started", "dispatch": false}
+    },
+    {
+      "id": "unknown-degraded",
+      "kind": "classification",
+      "input": {"repository": null, "sourceHealth": "down"},
+      "expected": {"cause": "unknown-or-degraded", "owner": "unknown", "confidence": "unknown", "secondary": [], "section": "Unknown/degraded"}
+    },
+    {
+      "id": "plan-only-age-not-failed-or-stale",
+      "kind": "classification",
+      "input": {"planOnly": true, "ageDays": 120, "durable": false, "dependencyStatus": "missing"},
+      "expected": {"cause": "unknown-or-degraded", "owner": "unknown", "confidence": "unknown", "secondary": ["age-is-not-evidence"], "section": "Unknown/degraded", "failed": false, "stale": false}
+    },
+    {
+      "id": "hard-blocks-fanout",
+      "kind": "root-collapse",
+      "input": {"edges": ["child-1 blocks-on root-a:open", "child-2 blocks-on root-a:open"]},
+      "expected": {"roots": ["repo-a/root-a"], "assignments": ["child-1->root-a", "child-2->root-a"], "affected": {"root-a": 2}, "countedRoots": 1}
+    },
+    {
+      "id": "ignore-closed-and-soft-edges",
+      "kind": "root-collapse",
+      "input": {"edges": ["a blocks-on closed-b:closed", "a parent-child c:open", "a related d:open", "a discovered-from e:open", "a supersedes f:open"]},
+      "expected": {"traversed": [], "ignoredTypes": ["closed-blocks", "parent-child", "related", "discovered-from", "supersedes"], "roots": ["repo-a/a"]}
+    },
+    {
+      "id": "multi-root-tie",
+      "kind": "root-collapse",
+      "input": {"subject": "repo-a/child", "equalDistanceRoots": ["repo-a/root-b", "repo-a/root-a"]},
+      "expected": {"primary": "repo-a/root-a", "secondary": ["repo-a/root-b"], "tieBreak": "repository-plus-bead-id"}
+    },
+    {
+      "id": "graph-cycle",
+      "kind": "root-collapse",
+      "input": {"edges": ["a blocks-on b:open", "b blocks-on a:open"]},
+      "expected": {"roots": [], "classification": "unknown/recheck", "partial": true}
+    },
+    {
+      "id": "descendants-not-double-counted",
+      "kind": "root-collapse",
+      "input": {"root": "repo-a/root-a", "descendants": ["child-1", "child-2", "grandchild-1"]},
+      "expected": {"countedRoots": 1, "affectedDescendants": 3, "countedDescendants": 0, "decisionRows": 1}
+    },
+    {
+      "id": "operations-truncated-conflict",
+      "kind": "degraded",
+      "input": {"initialTruncated": true, "groupRecoveryReads": 1, "identityGroupsConflict": true},
+      "expected": {"report": "partial/recheck", "deduplicateBy": "canonical-work-identity", "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "attention-truncated-no-cursor",
+      "kind": "degraded",
+      "input": {"attentionTruncated": true, "cursor": null},
+      "expected": {"report": "partial", "moreReads": 0, "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "required-source-down",
+      "kind": "degraded",
+      "input": {"source": "operations", "health": "down", "fallback": "unavailable"},
+      "expected": {"report": "partial", "dependentClassification": "unknown", "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "oversized-work-map",
+      "kind": "degraded",
+      "input": {"workMap": "oversized", "directDependencies": "available"},
+      "expected": {"report": "partial", "retain": "direct-dependencies", "deeperRoots": "unknown", "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "unknown-repository",
+      "kind": "degraded",
+      "input": {"repository": null, "sameTitleElsewhere": true},
+      "expected": {"report": "unknown", "bucket": "unknown repository", "guessRepository": false, "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "missing-dependency-status",
+      "kind": "degraded",
+      "input": {"dependency": "repo-a/root-a", "status": null},
+      "expected": {"report": "partial", "root": "unknown", "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "bead-revision-drift",
+      "kind": "degraded",
+      "input": {"snapshotRevision": 8, "readRevision": 9},
+      "expected": {"report": "unknown/recheck", "mutation": false, "definitiveStale": false, "definitiveHealthy": false}
+    },
+    {
+      "id": "repository-safe-acquisition",
+      "kind": "scope",
+      "input": {"request": "repo-a", "operationsScope": "operator", "attentionScope": "operator"},
+      "expected": {"localFilter": "exact-canonical-repo-a", "workMapScope": "repository", "hideSettledFailure": false}
+    },
+    {
+      "id": "duplicate-titles-preserve-identity",
+      "kind": "scope",
+      "input": {"rows": ["repo-a/bead-1 Same title", "repo-b/bead-9 Same title"]},
+      "expected": {"groups": ["repo-a", "repo-b"], "merged": false, "identity": "repository-plus-canonical-id"}
+    },
+    {
+      "id": "group-recovery-dedup",
+      "kind": "scope",
+      "input": {"initial": ["run-1@revision-4"], "recovery": ["run-1@revision-4", "run-2@revision-2"]},
+      "expected": {"rows": ["run-1", "run-2"], "deduplicateBy": "canonical-work-identity", "partial": false}
+    },
+    {
+      "id": "inspect-batch-refreshes",
+      "kind": "follow-up",
+      "input": {"request": "Inspect batch A", "snapshotAge": "old"},
+      "expected": {"newSnapshot": true, "maxExactDetails": 10, "route": "triage", "mutation": false}
+    },
+    {
+      "id": "repair-batch-has-no-authority",
+      "kind": "follow-up",
+      "input": {"request": "Repair batch A", "snapshotContains": ["bead-revision", "attention-occurrence"]},
+      "expected": {"route": "manage-work", "refreshEveryTarget": true, "useSnapshotAsAuthority": false, "bulkFix": false, "mutation": false}
+    }
+  ]
+}
