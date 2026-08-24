@@ -1,0 +1,26 @@
+{
+  "name": "forged-pi",
+  "version": "0.3.1",
+  "description": "Native Pi tools and shared Forge lead-agent skills for the Forged execution control plane.",
+  "license": "SEE LICENSE IN LICENSE",
+  "keywords": [
+    "pi-package",
+    "forged",
+    "beads",
+    "agent-orchestration"
+  ],
+  "peerDependencies": {
+    "@earendil-works/pi-ai": "*",
+    "@earendil-works/pi-coding-agent": "*",
+    "@earendil-works/pi-tui": "*",
+    "typebox": "*"
+  },
+  "pi": {
+    "extensions": [
+      "./plugins/forged/extensions/index.ts"
+    ],
+    "skills": [
+      "./plugins/forged/skills"
+    ]
+  }
+}

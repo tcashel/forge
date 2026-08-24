@@ -13,7 +13,7 @@
 //! throughout this codebase; every failure here is logged and swallowed.
 
 use forged_ledger::NewUsage;
-use forged_provider::{ClaudeDriver, CodexDriver, ProviderDriver, UsageRow};
+use forged_provider::{ClaudeDriver, CodexDriver, PiDriver, ProviderDriver, UsageRow};
 
 use super::{on_ledger, Ctx};
 
@@ -34,6 +34,7 @@ pub async fn capture_attempt(
 ) -> u64 {
     let parsed = match provider {
         "codex" => CodexDriver.parse_usage(stdout, model),
+        "pi" => PiDriver.parse_usage(stdout, model),
         _ => ClaudeDriver.parse_usage(stdout, model),
     };
     let mut rows = match parsed {

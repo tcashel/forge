@@ -4,7 +4,9 @@ mod support;
 
 use std::path::PathBuf;
 
-use forged_provider::{ClaudeDriver, CodexDriver, PacketDirs, ProviderDriver, ProviderError};
+use forged_provider::{
+    ClaudeDriver, CodexDriver, PacketDirs, PiDriver, ProviderDriver, ProviderError,
+};
 use forged_types::{claude_session_id, Sandbox};
 
 /// The known claim token the exact-line tests pin.
@@ -87,6 +89,26 @@ fn codex_invocation_emits_the_documented_line() {
 }
 
 #[test]
+fn pi_invocation_is_ephemeral_but_keeps_project_cognition() {
+    let mut packet = support::sample_packet();
+    packet.provider_hints.provider = "pi".to_owned();
+    packet.provider_hints.model = "anthropic/claude-sonnet-4-5".to_owned();
+    let invocation = PiDriver
+        .invocation(&packet, &dirs(), CLAIM_TOKEN)
+        .expect("pi invocation builds");
+    assert!(invocation.shell_line.starts_with("pi --mode json -p"));
+    assert!(invocation
+        .shell_line
+        .contains("--no-session --no-extensions --approve"));
+    assert!(invocation
+        .shell_line
+        .contains("--model anthropic/claude-sonnet-4-5 --thinking high"));
+    assert!(!invocation.shell_line.contains("--no-skills"));
+    assert!(!invocation.shell_line.contains("--no-context-files"));
+    assert_eq!(invocation.session_hint, None);
+}
+
+#[test]
 fn codex_read_only_sandbox_maps_to_read_only() {
     let mut packet = support::sample_packet();
     packet.provider_hints.sandbox = Sandbox::ReadOnly;
@@ -138,7 +160,7 @@ fn codex_accepts_every_effort_in_the_closed_set() {
 }
 
 #[test]
-fn both_drivers_reject_unsafe_and_empty_models() {
+fn every_driver_rejects_unsafe_and_empty_models() {
     for model in ["x; rm -rf /", ""] {
         let mut packet = support::sample_packet();
         packet.provider_hints.model = model.to_owned();
@@ -152,21 +174,28 @@ fn both_drivers_reject_unsafe_and_empty_models() {
         if let ProviderError::UnsafeShellLine { value, .. } = &claude_err {
             assert_eq!(value, model, "the error names the offending value");
         }
-        let codex_err = CodexDriver
-            .invocation(&packet, &dirs(), CLAIM_TOKEN)
-            .expect_err("codex must refuse the model");
-        assert!(
-            matches!(codex_err, ProviderError::UnsafeShellLine { .. }),
-            "codex {model:?} gave {codex_err}"
-        );
+        for driver in [&CodexDriver as &dyn ProviderDriver, &PiDriver] {
+            let err = driver
+                .invocation(&packet, &dirs(), CLAIM_TOKEN)
+                .expect_err("driver must refuse the model");
+            assert!(
+                matches!(err, ProviderError::UnsafeShellLine { .. }),
+                "{} {model:?} gave {err}",
+                driver.name()
+            );
+        }
     }
 }
 
 #[test]
-fn both_drivers_reject_unsafe_packet_dirs() {
+fn every_driver_rejects_unsafe_packet_dirs() {
     let unsafe_dirs = PacketDirs::new("/tmp/run 1;/pkt", 7);
     let packet = support::sample_packet();
-    for driver in [&ClaudeDriver as &dyn ProviderDriver, &CodexDriver] {
+    for driver in [
+        &ClaudeDriver as &dyn ProviderDriver,
+        &CodexDriver,
+        &PiDriver,
+    ] {
         let err = driver
             .invocation(&packet, &unsafe_dirs, CLAIM_TOKEN)
             .expect_err("unsafe dir must be refused");
@@ -201,6 +230,12 @@ fn every_emitted_line_satisfies_the_host_rules() {
                     .expect("codex builds")
                     .shell_line,
             );
+            lines.push(
+                PiDriver
+                    .invocation(&packet, &dirs(), CLAIM_TOKEN)
+                    .expect("pi builds")
+                    .shell_line,
+            );
         }
     }
     for line in lines {
@@ -221,4 +256,5 @@ fn every_emitted_line_satisfies_the_host_rules() {
 fn driver_names_are_stable() {
     assert_eq!(ClaudeDriver.name(), "claude");
     assert_eq!(CodexDriver.name(), "codex");
+    assert_eq!(PiDriver.name(), "pi");
 }

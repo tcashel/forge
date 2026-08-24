@@ -747,6 +747,11 @@ check_version_parity() {
   node - <<'NODE'
 const fs = require('fs');
 const manifest = JSON.parse(fs.readFileSync('plugins/forged/.codex-plugin/plugin.json', 'utf8'));
+const piPackage = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (piPackage.version !== manifest.version) {
+  console.error(`package.json: expected ${manifest.version}, got ${piPackage.version}`);
+  process.exit(1);
+}
 const cargoFiles = fs.readdirSync('crates', {withFileTypes: true})
   .filter((entry) => entry.isDirectory())
   .map((entry) => `crates/${entry.name}/Cargo.toml`)
@@ -757,6 +762,48 @@ for (const path of cargoFiles) {
     console.error(`${path}: expected ${manifest.version}, got ${match?.[1] || 'missing'}`);
     process.exit(1);
   }
+}
+NODE
+}
+
+check_pi_package() {
+  node - <<'NODE'
+const fs = require('fs');
+const path = require('path');
+const pkg = JSON.parse(fs.readFileSync('package.json', 'utf8'));
+if (pkg.name !== 'forged-pi' || !pkg.keywords?.includes('pi-package')) process.exit(1);
+if (pkg.scripts && Object.keys(pkg.scripts).length) {
+  console.error('the Pi package must not install or build the Forged binary');
+  process.exit(1);
+}
+const expectedExtensions = ['./plugins/forged/extensions/index.ts'];
+const expectedSkills = ['./plugins/forged/skills'];
+if (JSON.stringify(pkg.pi?.extensions) !== JSON.stringify(expectedExtensions) ||
+    JSON.stringify(pkg.pi?.skills) !== JSON.stringify(expectedSkills)) process.exit(1);
+for (const resource of [...expectedExtensions, ...expectedSkills]) {
+  if (!fs.existsSync(path.resolve(resource))) process.exit(1);
+}
+const skills = fs.readdirSync('plugins/forged/skills', {withFileTypes: true})
+  .filter((entry) => entry.isDirectory() && fs.existsSync(path.join('plugins/forged/skills', entry.name, 'SKILL.md')))
+  .map((entry) => entry.name)
+  .sort();
+if (JSON.stringify(skills) !== JSON.stringify([
+  'adjudicate', 'board', 'critique', 'dispatch', 'manage-work', 'plan', 'run-epic', 'setup',
+])) process.exit(1);
+const extension = fs.readFileSync('plugins/forged/extensions/index.ts', 'utf8');
+for (const name of [
+  'forged_overview', 'forged_detail', 'forged_history', 'forged_sessions',
+  'forged_submit', 'forged_control', 'forged_attention', 'forged_critic',
+]) {
+  if (!extension.includes(`name: "${name}"`)) process.exit(1);
+}
+if (!extension.includes('registerCommand("forge"')) process.exit(1);
+for (const forbidden of ['forged mcp', 'postinstall', 'cargo install']) {
+  if (extension.includes(forbidden)) process.exit(1);
+}
+const piDriver = fs.readFileSync('crates/forged-provider/src/pi.rs', 'utf8');
+for (const required of ['--no-extensions', '--approve', 'provider: "pi"']) {
+  if (!piDriver.includes(required)) process.exit(1);
 }
 NODE
 }
@@ -822,7 +869,8 @@ check "Claude plugin JSON" check_json "$plugin/.claude-plugin/plugin.json"
 check "Codex interface" check_codex_interface "$plugin/.codex-plugin/plugin.json"
 check "dual-host manifest contract" check_manifest_contract
 check "marketplace source contract" check_marketplaces
-check "manifest/workspace version parity" check_version_parity
+check "Pi package resources and direct-tool contract" check_pi_package
+check "manifest/workspace/Pi package version parity" check_version_parity
 check "manage-work intent fixture JSON" check_json \
   "$plugin/skills/manage-work/intent-fixtures.json"
 check "manage-work authority and mutation contract" check_manage_work_contract \
