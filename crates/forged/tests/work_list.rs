@@ -666,11 +666,26 @@ fn an_epic_reports_the_state_its_events_describe() {
         started_epic("forged-work-list-epic-state", "epic-state", "child-state");
     env.enable_dynamic_gh();
 
-    // One event so far: active, no reason, and updatedAt IS the start.
+    // The atomic start bundle is active with no reason. Its retained approval
+    // is appended after the canonical start event, so createdAt is the start
+    // while updatedAt is the newest durable event in that bundle.
+    let ledger = env.ledger();
+    let events = ledger
+        .list_events(Some("epic-state"), 0, 100)
+        .expect("epic start events");
+    ledger.close().expect("close ledger");
+    let started_at = events
+        .iter()
+        .find(|event| event.kind == "forged.epic.started")
+        .expect("epic started event")
+        .ts
+        .clone();
+    let updated_at = events.last().expect("epic start bundle event").ts.clone();
     let epic = epic_entry(&env, "epic-state");
     assert_eq!(epic["state"], json!("active"));
     assert_eq!(epic["stopReason"], Value::Null);
-    assert_eq!(epic["updatedAt"], epic["createdAt"]);
+    assert_eq!(epic["createdAt"], json!(started_at));
+    assert_eq!(epic["updatedAt"], json!(updated_at));
     let created_at = epic["createdAt"].clone();
 
     let (code, paused) = env.forged(&[
