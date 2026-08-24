@@ -461,3 +461,31 @@ pub(crate) const HISTORY_INDEXES: &[&str] = &[
     "usage_facts_session",
     "attempt_links_value",
 ];
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::rebuild::SEARCH_FTS_DDL;
+
+    #[test]
+    fn the_schema_and_the_rebuild_declare_the_same_index() {
+        // A migration is frozen text and a rebuild recreates the table from
+        // live code. If those two drift, a rebuilt index silently stops being
+        // the index the schema promised.
+        assert!(
+            MIGRATION_001.contains(SEARCH_FTS_DDL),
+            "migration 001 must declare exactly {SEARCH_FTS_DDL}"
+        );
+    }
+
+    #[test]
+    fn the_schema_version_counts_the_embedded_migrations() {
+        assert_eq!(SCHEMA_VERSION, MIGRATIONS.len() as i64);
+        assert_eq!(SCHEMA_VERSION, 2);
+    }
+
+    #[test]
+    fn the_busy_timeout_matches_the_contract() {
+        assert_eq!(BUSY_TIMEOUT_MS, 5000);
+    }
+}

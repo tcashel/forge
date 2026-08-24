@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use forged_history::{
-    EventMetadata, History, Lineage, PreparedEventHeader, SessionFacts, SourceFamily,
+    EventMetadata, EventRole, History, Lineage, PreparedEventHeader, SessionFacts, SourceFamily,
     SourceLocation,
 };
 
@@ -86,4 +86,26 @@ pub fn raw(db: &Path) -> rusqlite::Connection {
 /// Count rows in a table through a raw connection.
 pub fn count(conn: &rusqlite::Connection, sql: &str) -> i64 {
     conn.query_row(sql, [], |row| row.get(0)).expect("count")
+}
+
+/// The same header with a speaker role and model attached.
+pub fn header_with(
+    session: &str,
+    relative: &str,
+    index: u64,
+    cwd: Option<&str>,
+    role: EventRole,
+    model: &str,
+) -> PreparedEventHeader {
+    let mut header = header(session, relative, index, cwd);
+    header.metadata.role = Some(role);
+    header.metadata.model = Some(model.to_owned());
+    header
+}
+
+/// A header whose identity falls back to the derived key.
+pub fn header_derived(session: &str, relative: &str, index: u64) -> PreparedEventHeader {
+    let mut header = header(session, relative, index, Some("/repos/forge"));
+    header.native_event_key = None;
+    header
 }

@@ -177,6 +177,10 @@ impl History {
     }
 
     /// Link a session to an orchestrator identity, idempotently.
+    ///
+    /// `true` means the link is NEW. Re-linking the same identity updates its
+    /// confidence in place and answers `false` — a caller replaying its own
+    /// work must be able to tell the two apart.
     pub fn link_session(
         &self,
         session_id: i64,
@@ -189,7 +193,16 @@ impl History {
         }
         let link_value = link_value.to_owned();
         self.submit(move |conn| {
-            let inserted = conn.execute(
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            // An upsert reports one changed row either way, so novelty is
+            // decided by reading before writing, inside the same transaction.
+            let existed: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM attempt_links
+                                WHERE session_id = ?1 AND link_kind = ?2 AND link_value = ?3)",
+                params![session_id, link_kind, link_value],
+                |row| row.get(0),
+            )?;
+            tx.execute(
                 "INSERT INTO attempt_links
                    (session_id, link_kind, link_value, confidence, created_at)
                  VALUES (?1, ?2, ?3, ?4, ?5)
@@ -197,7 +210,8 @@ impl History {
                    DO UPDATE SET confidence = ?4",
                 params![session_id, link_kind, link_value, confidence, now_iso()],
             )?;
-            Ok(inserted == 1)
+            tx.commit()?;
+            Ok(!existed)
         })
     }
 

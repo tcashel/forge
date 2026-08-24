@@ -20,4 +20,4 @@ zstd.workspace = true
 libc.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
+zstd.workspace = true

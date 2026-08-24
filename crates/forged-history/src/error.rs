@@ -118,3 +118,45 @@ pub(crate) fn column_decode_error(idx: usize, what: &str, value: &str) -> rusqli
         format!("unknown {what} in history database: {value:?}").into(),
     )
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn sqlite_failure(code: rusqlite::ErrorCode) -> rusqlite::Error {
+        rusqlite::Error::SqliteFailure(
+            rusqlite::ffi::Error {
+                code,
+                extended_code: 0,
+            },
+            Some("probe".to_owned()),
+        )
+    }
+
+    #[test]
+    fn lock_contention_maps_to_a_retryable_refusal() {
+        for code in [
+            rusqlite::ErrorCode::DatabaseBusy,
+            rusqlite::ErrorCode::DatabaseLocked,
+        ] {
+            let err = HistoryError::from(sqlite_failure(code));
+            assert!(
+                err.is_busy(),
+                "{code:?} is contention, never a data verdict: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_other_sqlite_failure_stays_internal() {
+        let err = HistoryError::from(sqlite_failure(rusqlite::ErrorCode::ConstraintViolation));
+        assert!(!err.is_busy());
+        assert!(matches!(err, HistoryError::Internal { .. }));
+    }
+
+    #[test]
+    fn an_unknown_stored_value_is_named_in_the_refusal() {
+        let err = column_decode_error(3, "source family", "matrix");
+        assert!(format!("{err}").contains("matrix"), "{err}");
+    }
+}
