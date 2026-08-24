@@ -788,20 +788,21 @@ fn validate_epic_child_snapshot(
         }
         (Some(_), Some(_)) => {}
     }
-    let expected_revision = child_revision.expect("matched above");
     let expected_spec_sha256 = child_spec_sha256.expect("matched above");
     let actual_spec_sha256 = match &prepared.source {
         super::spec::SpecSource::Bead(_) => super::spec::resolve_issue(&prepared.issue)?.sha256,
         super::spec::SpecSource::FrozenBead(frozen) => super::spec::resolve_frozen(frozen)?.sha256,
         super::spec::SpecSource::File(path) => super::spec::resolve_file(path)?.sha256,
     };
-    if prepared.issue.revision.as_deref() != Some(expected_revision)
-        || actual_spec_sha256 != expected_spec_sha256
-    {
+    // The frozen revision remains custody/evidence, but Beads legitimately
+    // changes it for priority, status, lease, and resolution writes that do
+    // not alter the provider-facing contract. Execution authority binds the
+    // canonical rendered spec bytes, so only that digest fences launch.
+    if actual_spec_sha256 != expected_spec_sha256 {
         return Err(Failure::refused(
             ErrorCode::ExecutionApprovalMismatch,
             format!(
-                "epic child {} differs from its approved revision/spec digest",
+                "epic child {} differs from its approved spec digest",
                 prepared.issue.id
             ),
         ));

@@ -54,6 +54,68 @@ fn fresh_epic_start_requires_the_revision_and_content_bound_approval() {
 }
 
 #[test]
+fn definition_validate_hydrates_revisionless_child_summaries_with_exact_long_show() {
+    let env = TestEnv::new("forged-epic-revision-hydration");
+    let epic = "revision-hydration-epic";
+    let child = "revision-hydration-child";
+    env.seed_epic(epic, &[(child, &env.spec, true)]);
+    env.set_bd_children_revisionless(true);
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    let (code, validated) = env.forged(&[
+        "definition",
+        "validate",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--epic",
+        epic,
+    ]);
+    assert_eq!(code, 0, "definition validation: {validated}");
+    assert_eq!(validated["result"]["valid"], json!(true));
+    assert_eq!(
+        validated["result"]["inventorySha256"]
+            .as_str()
+            .map(str::len),
+        Some(64)
+    );
+    let calls = env.bd_calls();
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &format!("children {epic} --json")),
+        "membership comes from native children: {calls:?}"
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|call| call == &format!("show {child} --long --json")),
+        "the candidate is hydrated by exact long show: {calls:?}"
+    );
+
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        epic,
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "approved epic start: {started}");
+    assert_eq!(
+        started["result"]["children"][0]["revision"]
+            .as_str()
+            .map(str::len),
+        Some(20),
+        "the frozen child uses the exact-show revision"
+    );
+}
+
+#[test]
 fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval() {
     let env = TestEnv::new("forged-epic-execution-approval");
     assert_eq!(env.forged(&["init"]).0, 0);

@@ -755,8 +755,8 @@ issue_json() {
   parent=$(cat "$state/$id.parent" 2>/dev/null || true)
   if [ -n "$parent" ]; then parent_json="\"$parent\""; else parent_json=null; fi
   dependencies=$(cat "$state/$id.dependencies" 2>/dev/null || echo '[]')
-  # bd emits `revision` on show/children only, as a signed 64-bit integer
-  # that changes on every write.
+  # bd emits `revision` on exact show as a signed 64-bit integer that changes
+  # on every write. Its children summary may omit the field entirely.
   revision=$(cat "$state/$id.revision" 2>/dev/null || echo -6192208415116251521)
   if [ "$shape" = brief ]; then revision_json=""; else revision_json=",\"revision\":$revision"; fi
   printf '{"id":"%s","title":"%s","description":"%s","status":"%s","priority":%s,"issue_type":"%s","assignee":"%s","acceptance_criteria":"%s","design":"%s","notes":"%s","metadata":%s%s,"updated_at":"2026-08-14T00:00:00Z","parent":%s,"dependencies":%s}' "$id" "$title" "$description" "$status" "$priority" "$type" "$assignee" "$acceptance" "$design" "$notes" "$metadata" "$revision_json" "$parent_json" "$dependencies"
@@ -982,7 +982,12 @@ case "$cmd" in
     printf '{"schema_version":1,"data":['
     while IFS= read -r id; do
       [ -n "$id" ] || continue
-      [ "$first" = 1 ] || printf ','; first=0; issue_json "$id"
+      [ "$first" = 1 ] || printf ','; first=0
+      if [ -f "$state/children-revisionless" ]; then
+        issue_json "$id" brief
+      else
+        issue_json "$id"
+      fi
     done < "$state/$epic.children"
     printf ']}\n' ;;
   close)
@@ -1636,6 +1641,19 @@ impl TestEnv {
         let marker = state.join("spec-show.unreachable");
         if unreachable {
             std::fs::write(marker, "1").expect("set bd spec-read outage");
+        } else {
+            let _ = std::fs::remove_file(marker);
+        }
+    }
+
+    /// Match pinned bd 1.2.1's native `children --json` summary, which omits
+    /// the guarded-write revision carried by an exact long `show`.
+    pub fn set_bd_children_revisionless(&self, revisionless: bool) {
+        let state = self.beads_dir.join("shim-state");
+        std::fs::create_dir_all(&state).expect("shim state");
+        let marker = state.join("children-revisionless");
+        if revisionless {
+            std::fs::write(marker, "1").expect("set revision-less children summary");
         } else {
             let _ = std::fs::remove_file(marker);
         }

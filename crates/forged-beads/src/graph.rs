@@ -1133,27 +1133,125 @@ pub async fn work_map_plan_inventory(
     })
 }
 
-/// Read an epic's inventory. Native parent/child links are preferred, with
-/// the Anvil-compatible epic-depends-on-children encoding unioned in.
-pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
+/// Discover an epic's child summaries. Native parent/child links are
+/// preferred, with the Anvil-compatible epic-depends-on-children encoding
+/// unioned in.
+async fn discover_epic_children(
+    cfg: &BdConfig,
+    epic: &str,
+) -> Result<BTreeMap<String, IssueSummary>, BdError> {
     let native = invoke::read(cfg, &["children", epic, "--json"]).await?;
     let shown = invoke::read(cfg, &["show", epic, "--json"]).await?;
-    let mut children: BTreeMap<String, IssueSummary> = list(&native)
-        .into_iter()
-        .map(|item| (item.id.clone(), item))
-        .collect();
-    if let Some(root) = envelope::first_obj(&shown) {
-        if let Some(dependencies) = root.get("dependencies").and_then(Value::as_array) {
+    let native = envelope::as_list(&native).ok_or_else(|| BdError::Envelope {
+        context: format!("bd children {epic}"),
+        detail: "response was not a list".to_owned(),
+    })?;
+    let mut children = BTreeMap::new();
+    for row in &native {
+        let item = issue(row).ok_or_else(|| BdError::Envelope {
+            context: format!("bd children {epic}"),
+            detail: "child summary has no string id".to_owned(),
+        })?;
+        if item.id == epic {
+            return Err(BdError::Envelope {
+                context: format!("bd children {epic}"),
+                detail: "epic was returned as its own child".to_owned(),
+            });
+        }
+        if children.insert(item.id.clone(), item).is_some() {
+            return Err(BdError::Envelope {
+                context: format!("bd children {epic}"),
+                detail: "response repeated a child id".to_owned(),
+            });
+        }
+    }
+    let root = envelope::first_obj(&shown).ok_or_else(|| BdError::Envelope {
+        context: format!("bd show {epic}"),
+        detail: "response contained no epic".to_owned(),
+    })?;
+    if root.get("id").and_then(Value::as_str) != Some(epic) {
+        return Err(BdError::Envelope {
+            context: format!("bd show {epic}"),
+            detail: "response returned a different epic id".to_owned(),
+        });
+    }
+    match root.get("dependencies") {
+        None | Some(Value::Null) => {}
+        Some(Value::Array(dependencies)) => {
             for dependency in dependencies {
-                if let Some(item) = issue(dependency) {
-                    if item.id != epic {
-                        children.entry(item.id.clone()).or_insert(item);
-                    }
+                let item = issue(dependency).ok_or_else(|| BdError::Envelope {
+                    context: format!("bd show {epic}"),
+                    detail: "dependency summary has no string id".to_owned(),
+                })?;
+                if item.id != epic {
+                    children.entry(item.id.clone()).or_insert(item);
                 }
             }
         }
+        Some(_) => {
+            return Err(BdError::Envelope {
+                context: format!("bd show {epic}"),
+                detail: "dependencies field was not a list".to_owned(),
+            })
+        }
     }
-    Ok(children.into_values().collect())
+    Ok(children)
+}
+
+/// Read an epic's live child summaries.
+pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
+    Ok(discover_epic_children(cfg, epic)
+        .await?
+        .into_values()
+        .collect())
+}
+
+/// Freeze-ready epic inventory rows hydrated through one exact long show.
+///
+/// Pinned bd 1.2.1 omits `revision` from `bd children --json`; that command
+/// is membership discovery, not execution authority. The exact long show is
+/// the authoritative row used for revision/spec binding. Missing, extra,
+/// duplicate, malformed, or revision-less rows fail closed.
+pub async fn epic_inventory_children(
+    cfg: &BdConfig,
+    epic: &str,
+) -> Result<Vec<IssueSummary>, BdError> {
+    let discovered = discover_epic_children(cfg, epic).await?;
+    let ids = discovered.keys().cloned().collect::<Vec<_>>();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    let mut args = Vec::with_capacity(ids.len() + 3);
+    args.push("show");
+    args.extend(ids.iter().map(String::as_str));
+    args.push("--long");
+    args.push("--json");
+    let data = invoke::read(cfg, &args).await?;
+    let children = exact_issue_rows(&data, &ids).map_err(|detail| BdError::Envelope {
+        context: format!("bd show exact epic children for {epic}"),
+        detail,
+    })?;
+    if children.len() != ids.len() {
+        let hydrated = children
+            .iter()
+            .map(|child| child.id.as_str())
+            .collect::<BTreeSet<_>>();
+        let missing = ids
+            .iter()
+            .filter(|id| !hydrated.contains(id.as_str()))
+            .collect::<Vec<_>>();
+        return Err(BdError::Envelope {
+            context: format!("bd show exact epic children for {epic}"),
+            detail: format!("hydrate omitted discovered child ids {missing:?}"),
+        });
+    }
+    if let Some(child) = children.iter().find(|child| child.revision.is_none()) {
+        return Err(BdError::Envelope {
+            context: format!("bd show exact epic children for {epic}"),
+            detail: format!("hydrated child {:?} has no revision", child.id),
+        });
+    }
+    Ok(children)
 }
 
 /// Read the current global ready frontier without claiming anything.

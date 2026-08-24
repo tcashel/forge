@@ -568,7 +568,7 @@ pub(super) fn canonical_inventory_sha256(value: &Value) -> Result<String, Failur
 }
 
 async fn freeze_inventory(ctx: &Ctx, epic: &str) -> Result<FrozenInventory, Failure> {
-    let inventory = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
+    let inventory = forged_beads::epic_inventory_children(&ctx.config.bd_config(), epic).await?;
     if inventory.is_empty() {
         return Err(Failure::invalid(format!(
             "epic {epic} has no Beads children"
