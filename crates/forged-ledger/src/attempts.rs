@@ -188,6 +188,7 @@ fn release_attempt_reservation_tx(
     attempt_id: i64,
     now: &str,
 ) -> Result<(), LedgerError> {
+    crate::admission::validate_reservation_owner_pairs_tx(conn)?;
     conn.execute(
         "UPDATE admission_reservations SET state = 'released', updated_at = ?1, \
          released_at = COALESCE(released_at, ?1), last_error = NULL \
@@ -209,7 +210,7 @@ fn validate_packet_admission_tx(
     let facts = conn
         .query_row(
             "SELECT ar.subject_id, ar.control_revision, ar.repository, ar.provider, ar.model, \
-                    ar.resource_class, ar.state, ar.owner_kind, r.repo \
+                    ar.resource_class, ar.state, ar.owner_kind, ar.owner_id, r.repo \
              FROM admission_reservations ar \
              JOIN packets p ON p.packet_id = ?1 \
              JOIN runs r ON r.run_id = p.run_id \
@@ -225,7 +226,8 @@ fn validate_packet_admission_tx(
                     row.get::<_, String>(5)?,
                     row.get::<_, String>(6)?,
                     row.get::<_, Option<String>>(7)?,
-                    row.get::<_, String>(8)?,
+                    row.get::<_, Option<String>>(8)?,
+                    row.get::<_, String>(9)?,
                 ))
             },
         )
@@ -255,15 +257,16 @@ fn validate_packet_admission_tx(
     };
     let packet_facts = crate::admission::packet_effective_facts_tx(conn, packet_id)?;
     let authorized = facts.0 == packet_id
-        && facts.2 == facts.8
+        && facts.2 == facts.9
         && packet_facts.provider == facts.3
         && packet_facts.model == facts.4
         && match packet_facts.resource_class {
             forged_types::AdmissionResourceClass::Read => "read",
             forged_types::AdmissionResourceClass::RepositoryWrite => "repository-write",
         } == facts.5
-        && matches!(facts.6.as_str(), "reserved" | "orphaned")
+        && facts.6 == "reserved"
         && facts.7.is_none()
+        && facts.8.is_none()
         && desired
             .as_ref()
             .is_some_and(|(state, revision, exhausted)| {
@@ -347,6 +350,9 @@ impl Ledger {
         let reservation_id = reservation_id.map(str::to_owned);
         self.submit(move |conn| {
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            if reservation_id.is_some() {
+                crate::admission::validate_reservation_owner_pairs_tx(&tx)?;
+            }
             let stored: Option<(String, Option<String>, String)> = tx
                 .query_row(
                     "SELECT p.spec_sha256, p.spec_revision, r.state \
@@ -465,9 +471,9 @@ impl Ledger {
                 let affected = tx.execute(
                     "UPDATE admission_reservations SET state = 'active', owner_kind = 'attempt', \
                      owner_id = ?1, last_error = NULL, updated_at = ?2 \
-                     WHERE reservation_id = ?3 AND state != 'released' \
+                     WHERE reservation_id = ?3 AND state = 'reserved' \
                        AND subject_kind = 'packet' AND subject_id = ?4 \
-                       AND (owner_kind IS NULL OR (owner_kind = 'attempt' AND owner_id = ?1))",
+                       AND owner_kind IS NULL AND owner_id IS NULL",
                     rusqlite::params![attempt_id.to_string(), now, reservation_id, packet_id],
                 )?;
                 if affected != 1 {

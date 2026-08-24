@@ -1314,6 +1314,7 @@ fn convergence_crash_matrix_is_effect_exact() {
         ledger.close().expect("close ledger");
         assert_eq!(!decisions.is_empty(), committed, "{site}: {decisions:?}");
         if committed {
+            assert_eq!(snapshot.capacity.total_active, 1, "{site}");
             let reservation = snapshot
                 .reservations
                 .iter()
@@ -1384,6 +1385,17 @@ fn convergence_crash_matrix_is_effect_exact() {
             .list_live_attempts(Some(&run))
             .expect("live attempts");
         assert_eq!(!live.is_empty(), transferred, "packet {site}: {live:?}");
+        let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+        assert_eq!(
+            snapshot.capacity.total_active,
+            u32::from(committed),
+            "packet {site}"
+        );
+        if transferred {
+            ledger
+                .assert_admitted_attempt_live(&live[0].claim_token)
+                .expect("transferred attempt remains admitted before reconciliation");
+        }
         ledger.close().expect("close ledger");
         if transferred {
             let (code, reconciled) = env.forged(&["reconcile", "--run", &run]);
