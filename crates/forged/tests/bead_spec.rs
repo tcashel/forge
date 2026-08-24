@@ -148,6 +148,132 @@ fn a_run_starts_from_a_bead_alone_and_every_seat_reads_the_rendered_body() {
 }
 
 #[test]
+fn run_start_binds_and_atomically_retains_exact_execution_approval() {
+    let env = TestEnv::new("forged-execution-approval");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    env.seed_bead_spec("approval-drift", DESCRIPTION, ACCEPTANCE);
+    let stale_path = env.root.join("stale-approval.json");
+    let stale = json!({
+        "schema": "forged-execution-approval/1",
+        "subjectKind": "slice",
+        "beadId": "approval-drift",
+        "observedRevision": "stale-revision",
+        "repository": repo,
+        "baseRef": "main",
+        "profile": {"name": "standard", "version": 1},
+        "roster": {"name": "default", "version": 1},
+        "action": "run-start-submit",
+        "approvedAt": "2026-08-24T12:00:00Z",
+        "actor": "operator",
+        "basis": "approved exact tuple"
+    });
+    std::fs::write(
+        &stale_path,
+        serde_json::to_vec(&stale).expect("approval json"),
+    )
+    .expect("write approval");
+    let (code, mismatch) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "approval-drift",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--expected-bead-revision",
+        "stale-revision",
+        "--approval",
+        stale_path.to_str().expect("approval path"),
+    ]);
+    assert_ne!(code, 0, "stale approval must refuse: {mismatch}");
+    assert_eq!(
+        mismatch["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+    let ledger = env.ledger();
+    assert!(ledger.get_run("approval-drift").is_err(), "no run effect");
+    assert!(
+        ledger
+            .find_operation("run_start", "op:run_start:approval-drift:-:-")
+            .expect("operation read")
+            .is_none(),
+        "approval mismatch precedes the operation fence"
+    );
+    ledger.close().expect("close");
+
+    env.seed_bead_spec("approval-bound", DESCRIPTION, ACCEPTANCE);
+    let revision = env.bead_revision("approval-bound");
+    let approval_path = env.root.join("approval.json");
+    let approval = json!({
+        "schema": "forged-execution-approval/1",
+        "subjectKind": "slice",
+        "beadId": "approval-bound",
+        "observedRevision": revision,
+        "repository": repo,
+        "baseRef": "main",
+        "profile": {"name": "standard", "version": 1},
+        "roster": {"name": "default", "version": 1},
+        "action": "run-start-submit",
+        "approvedAt": "2026-08-24T12:00:00Z",
+        "actor": "operator",
+        "basis": "approved exact tuple"
+    });
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval json"),
+    )
+    .expect("write approval");
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "approval-bound",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        approval_path.to_str().expect("approval path"),
+    ]);
+    assert_eq!(code, 0, "approved run start: {started}");
+    let (code, replayed) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "approval-bound",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        approval_path.to_str().expect("approval path"),
+    ]);
+    assert_eq!(code, 0, "approved run start replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
+
+    let ledger = env.ledger();
+    let approval_events = ledger
+        .list_events(Some("approval-bound"), 0, 100)
+        .expect("events")
+        .into_iter()
+        .filter(|event| event.kind == "forged.run.execution-approval")
+        .collect::<Vec<_>>();
+    assert_eq!(approval_events.len(), 1, "one durable approval event");
+    assert_eq!(
+        serde_json::from_str::<Value>(&approval_events[0].payload_json).expect("stored approval"),
+        approval
+    );
+    ledger.close().expect("close");
+}
+
+#[test]
 fn run_start_obeys_the_ready_frontier_and_routes_non_slice_beads_explicitly() {
     let env = TestEnv::new("forged-bead-ready-types");
     assert_eq!(env.forged(&["init"]).0, 0);
