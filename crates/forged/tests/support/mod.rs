@@ -13,7 +13,7 @@
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 use serde_json::{json, Value};
 
@@ -193,61 +193,149 @@ pub fn show_bead(bd: &Path, s: &Scratch, id: &str) -> Value {
     }
 }
 
-/// Resolve the sandboxed bd binary: `$FORGED_TEST_BD`, else
-/// `~/.anvil/tools/bd-1.2.1/bin/bd`, else `None` — never the PATH bd. The
-/// ported predicate is tightened to EXACT equality with 1.2.1; any other
-/// version is skipped with the same loud SKIP message.
-pub fn sandboxed_bd() -> Option<PathBuf> {
-    static BD: OnceLock<Option<PathBuf>> = OnceLock::new();
-    BD.get_or_init(|| {
-        let mut candidates = Vec::new();
-        if let Some(p) = std::env::var_os("FORGED_TEST_BD") {
-            candidates.push(PathBuf::from(p));
-        }
-        if let Some(h) = std::env::var_os("HOME") {
-            candidates.push(PathBuf::from(h).join(".anvil/tools/bd-1.2.1/bin/bd"));
-        }
-        candidates
-            .into_iter()
-            .find(|c| c.exists() && verify_bd_version(c))
-    })
-    .clone()
+/// Inputs to the bd test-binary policy. Resolution is independent from the
+/// process environment so its failure and fallback matrix is directly
+/// testable without order-dependent environment mutation.
+pub struct BdTestPolicy {
+    /// An explicitly selected compatibility candidate. When present, this is
+    /// authoritative even if it is unusable.
+    pub explicit: Option<PathBuf>,
+    /// The existing operator-scoped supported baseline, consulted only when
+    /// `explicit` is absent.
+    pub canonical: Option<PathBuf>,
+    /// Whether total absence is fatal.
+    pub required: bool,
+    /// An optional exact version requirement.
+    pub expected_version: Option<String>,
 }
 
-fn verify_bd_version(bd: &Path) -> bool {
-    let s = scratch("forged-bd-version-verify");
-    let out = raw_bd(bd, &s, &["version", "--json"]).output();
-    let ok = match out {
-        Ok(o) if o.status.success() => {
-            let stdout = String::from_utf8_lossy(&o.stdout).into_owned();
-            serde_json::from_str::<Value>(&stdout)
-                .ok()
-                .and_then(|v| {
-                    v.get("data")
-                        .and_then(|d| d.get("version"))
-                        .or_else(|| v.get("version"))
-                        .and_then(Value::as_str)
-                        .map(|ver| ver == "1.2.1")
-                })
-                .unwrap_or(false)
+fn current_bd_policy() -> BdTestPolicy {
+    let explicit = std::env::var_os("FORGED_TEST_BD").map(PathBuf::from);
+    let canonical = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .map(|home| home.join(".anvil/tools/bd-1.2.1/bin/bd"));
+    let expected_version = match std::env::var("FORGED_EXPECT_BD_VERSION") {
+        Ok(version) => Some(version),
+        Err(std::env::VarError::NotPresent) => None,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("FORGED_EXPECT_BD_VERSION must be valid UTF-8")
         }
-        _ => false,
+    };
+    BdTestPolicy {
+        explicit,
+        canonical,
+        required: std::env::var_os("FORGED_REQUIRE_BD").is_some_and(|value| value == "1"),
+        expected_version,
+    }
+}
+
+/// Resolve one sandboxed bd candidate. An explicit path is authoritative and
+/// never falls back to the canonical operator path. `Ok(None)` means exactly
+/// one thing: optional mode and total absence.
+pub fn resolve_bd(policy: &BdTestPolicy) -> Result<Option<PathBuf>, String> {
+    let (candidate, source) = if let Some(explicit) = &policy.explicit {
+        (explicit, "FORGED_TEST_BD")
+    } else if let Some(canonical) = policy.canonical.as_ref().filter(|path| path.exists()) {
+        (canonical, "canonical operator path")
+    } else if policy.required {
+        return Err(
+            "FORGED_REQUIRE_BD=1 but no sandboxed bd candidate exists; the bd contract was not checked"
+                .to_owned(),
+        );
+    } else {
+        return Ok(None);
+    };
+
+    if !candidate.is_absolute() {
+        return Err(format!(
+            "{source} candidate {} is not absolute; ambient PATH is never searched",
+            candidate.display()
+        ));
+    }
+    if !candidate.exists() {
+        return Err(format!(
+            "{source} candidate {} does not exist; explicit selection never falls back",
+            candidate.display()
+        ));
+    }
+    let version = inspect_bd_version(candidate)
+        .map_err(|reason| format!("{source} candidate {} {reason}", candidate.display()))?;
+    if let Some(expected) = &policy.expected_version {
+        if &version != expected {
+            return Err(format!(
+                "{source} candidate {} reports bd {version}, expected exactly {expected}",
+                candidate.display()
+            ));
+        }
+    }
+    eprintln!(
+        "sandboxed bd candidate {} reports version {version}",
+        candidate.display()
+    );
+    Ok(Some(candidate.clone()))
+}
+
+fn inspect_bd_version(bd: &Path) -> Result<String, String> {
+    static CHECK_ID: AtomicU64 = AtomicU64::new(0);
+    let check_id = CHECK_ID.fetch_add(1, Ordering::Relaxed);
+    let s = scratch(&format!("forged-bd-version-verify-{check_id}"));
+    let out = raw_bd(bd, &s, &["version", "--json"]).output();
+    let result = match out {
+        Ok(output) if output.status.success() => parse_bd_version(&output.stdout),
+        Ok(output) => Err(format!(
+            "version probe exited unsuccessfully with {}",
+            output.status
+        )),
+        Err(error) => Err(format!("version probe could not execute: {error}")),
     };
     let _ = std::fs::remove_dir_all(&s.root);
-    ok
+    result
+}
+
+fn parse_bd_version(stdout: &[u8]) -> Result<String, String> {
+    let value: Value = serde_json::from_slice(stdout)
+        .map_err(|error| format!("returned malformed version JSON: {error}"))?;
+    value
+        .get("data")
+        .and_then(|data| data.get("version"))
+        .or_else(|| value.get("version"))
+        .and_then(Value::as_str)
+        .filter(|version| well_formed_version(version))
+        .map(str::to_owned)
+        .ok_or_else(|| "returned malformed version evidence".to_owned())
+}
+
+fn well_formed_version(version: &str) -> bool {
+    let (core, suffix) = version
+        .split_once(['-', '+'])
+        .map_or((version, None), |(core, suffix)| (core, Some(suffix)));
+    let mut parts = core.split('.');
+    let valid_core = (0..3).all(|_| {
+        parts
+            .next()
+            .is_some_and(|part| !part.is_empty() && part.bytes().all(|byte| byte.is_ascii_digit()))
+    }) && parts.next().is_none();
+    let valid_suffix = suffix.is_none_or(|suffix| {
+        !suffix.is_empty()
+            && suffix
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'-' | b'+'))
+    });
+    valid_core && valid_suffix
 }
 
 /// Resolve the sandboxed bd or SKIP loudly.
 pub fn require_bd() -> Option<PathBuf> {
-    match sandboxed_bd() {
-        Some(bd) => Some(bd),
-        None => {
+    match resolve_bd(&current_bd_policy()) {
+        Ok(Some(bd)) => Some(bd),
+        Ok(None) => {
             eprintln!(
-                "SKIP: sandboxed bd 1.2.1 not found (set FORGED_TEST_BD or install \
+                "SKIP: no sandboxed bd candidate (set FORGED_TEST_BD or install \
                  ~/.anvil/tools/bd-1.2.1/bin/bd); bd-gated test not run"
             );
             None
         }
+        Err(message) => panic!("{message}"),
     }
 }
 

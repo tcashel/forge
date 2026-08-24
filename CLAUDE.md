@@ -19,12 +19,20 @@ cargo test  --workspace
 cargo test -p forged --features failpoints
 ```
 
-CI (`.github/workflows/rust.yml`) runs exactly these. The bd-gated tests
-require a sandboxed **bd 1.2.1** binary and SKIP loudly when the machine has
-none — but they FAIL, never skip, when a bd binary is present at an
-unaccepted version (an upgrade is exactly when the pinned JSON shape must be
-re-checked) or when `FORGED_REQUIRE_BD=1` declares a bd-less run a failed
-one. The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
+CI (`.github/workflows/rust.yml`) runs these with a checksum-verified,
+sandboxed **bd 1.2.1**, `FORGED_REQUIRE_BD=1`, and
+`FORGED_EXPECT_BD_VERSION=1.2.1`; that stable lane is the reproducible support
+baseline. Local compatibility probes may instead set `FORGED_TEST_BD` to an
+absolute explicit binary and omit `FORGED_EXPECT_BD_VERSION`; a well-formed
+reported version then runs as a compatibility candidate without changing the
+runtime support boundary. A separate advisory `.github/workflows/bd-compat.yml`
+lane runs the same fast real-bd contract against the checksum-verified latest
+official release on relevant pull requests and weekly schedules; its first
+manual dispatch is a post-merge, human-authorized rollout check. Explicit
+candidates are authoritative and never fall back, malformed or unsuccessful
+version evidence always fails, and only optional total absence skips loudly.
+
+The genuine lease-expiry case is `#[ignore]`d (5+ real minutes) — run it
 deliberately with `FORGED_SLOW_TESTS=1 cargo test -p forged --features
 failpoints -- --ignored --nocapture` when you touch lease code.
 
