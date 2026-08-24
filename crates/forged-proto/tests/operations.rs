@@ -14,7 +14,8 @@ mod support;
 use std::collections::HashMap;
 
 use forged_ledger::{
-    EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState, SpecFence,
+    AttemptState, EffectClass, Ledger, NewPacket, NewRun, OperationOutcome, OperationState,
+    RevokeScope, RunOutcome, SpecFence,
 };
 use forged_proto::{
     advance, project_run, reconcile, record, widen_rfc3339, GatePhase, MachineStage, NextAction,
@@ -27,6 +28,16 @@ const RUN: &str = "run-1";
 
 fn now_stamp() -> String {
     widen_rfc3339(&jiff::Timestamp::now().to_string())
+}
+
+fn seconds_after(anchor: &str, seconds: i64) -> String {
+    let timestamp = anchor.parse::<jiff::Timestamp>().expect("timestamp");
+    widen_rfc3339(
+        &timestamp
+            .checked_add(jiff::Span::new().seconds(seconds))
+            .expect("shift")
+            .to_string(),
+    )
 }
 
 fn config() -> ReconcileConfig {
@@ -647,6 +658,117 @@ async fn human_ambiguous_is_quarantined_and_left_in_progress() {
         .expect("row survives");
     assert_eq!(row.state, OperationState::InProgress);
     ledger.close().expect("close");
+}
+
+#[tokio::test]
+async fn stored_wall_clock_deadline_ignores_heartbeat_and_never_opens_a_successor() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let ledger = Ledger::open(&dir.path().join("state.db")).expect("open");
+    seed_run(&ledger);
+    let body = serde_json::json!({
+        "schema": "forged.packet/1",
+        "beadId": "bead-1",
+        "worktree": "/tmp/worktree",
+        "branch": "feat/x",
+        "baseRef": "main",
+        "contract": {
+            "instructions": "implement",
+            "gateCommands": [],
+            "deliverable": "commitsInWorktree",
+            "budgetS": 1800
+        },
+        "resultSchema": "forged.result/1",
+        "providerHints": {
+            "provider": "claude",
+            "model": "test",
+            "sandbox": "workspaceWrite"
+        },
+        "fieldNotes": []
+    })
+    .to_string();
+    let packet_id = ledger
+        .open_packet(NewPacket {
+            run_id: RUN.to_owned(),
+            stage: Stage::Implement,
+            seq: 1,
+            spec_path: "spec.md".to_owned(),
+            spec_sha256: "cafe".to_owned(),
+            spec_revision: None,
+            body_json: body,
+        })
+        .expect("open packet");
+    let claim = ledger
+        .claim_packet(
+            &packet_id,
+            "claude:deadline:1",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .expect("claim");
+    let started_at = ledger
+        .get_attempt(claim.attempt_id)
+        .expect("attempt")
+        .started_at;
+
+    let ports = FakePorts::new();
+    ports
+        .liveness_script
+        .lock()
+        .expect("lock")
+        .push_back(SessionLiveness::Running);
+    let mut legacy_config = config();
+    legacy_config.stage_budget_s.insert(Stage::Implement, 3600);
+    let before = reconcile(
+        &ledger,
+        RUN,
+        &ports,
+        &legacy_config,
+        &seconds_after(&started_at, 1799),
+    )
+    .await
+    .expect("before deadline");
+    assert_eq!(before.left_running, vec![claim.attempt_id]);
+
+    ledger
+        .heartbeat_attempt(&claim.claim_token)
+        .expect("fresh heartbeat");
+    let at_deadline = reconcile(
+        &ledger,
+        RUN,
+        &ports,
+        &legacy_config,
+        &seconds_after(&started_at, 1800),
+    )
+    .await
+    .expect("at deadline");
+    assert_eq!(at_deadline.deadline_exceeded, vec![claim.attempt_id]);
+    assert!(at_deadline.reclaimed.is_empty());
+    assert!(at_deadline.stopped.is_empty());
+    let marker = ledger.get_attempt(claim.attempt_id).expect("marker");
+    assert_eq!(marker.state, AttemptState::Revoking);
+    assert_eq!(marker.revoke_scope, Some(RevokeScope::Deadline));
+    assert!(ledger
+        .claim_packet(
+            &packet_id,
+            "claude:successor:2",
+            &SpecFence::Sha256("cafe".to_owned()),
+        )
+        .is_err());
+    assert!(ledger.mark_stopped(claim.attempt_id).is_err());
+    assert!(ledger.mark_reclaimed(claim.attempt_id).is_err());
+
+    ledger
+        .settle_run(
+            RUN,
+            RunOutcome::Blocked,
+            "stage deadline exceeded".to_owned(),
+            None,
+            None,
+            None,
+        )
+        .expect("terminalize run");
+    ledger
+        .mark_stopped(claim.attempt_id)
+        .expect("deadline attempt stops only after run");
 }
 
 #[tokio::test]

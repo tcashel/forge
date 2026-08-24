@@ -28,7 +28,7 @@ use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::time::now_iso;
-use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, SpecFence};
+use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, RunState, SpecFence};
 
 pub(crate) const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, revoke_scope, \
@@ -59,6 +59,7 @@ fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, ru
         None => Ok(None),
         Some("bead") => Ok(Some(RevokeScope::Bead)),
         Some("attempt") => Ok(Some(RevokeScope::Attempt)),
+        Some("deadline") => Ok(Some(RevokeScope::Deadline)),
         Some(other) => Err(column_decode_error(idx, "revoke scope", other)),
     }
 }
@@ -723,6 +724,12 @@ impl Ledger {
                     ),
                 ));
             }
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("deadline attempt {attempt_id} cannot reclaim a Bead lease"),
+                ));
+            }
             let now = now_iso();
             tx.execute(
                 "UPDATE attempts SET state = 'reclaimed', updated_at = ?1, ended_at = ?1 \
@@ -765,6 +772,22 @@ impl Ledger {
                         attempt.state.as_str()
                     ),
                 ));
+            }
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                let run_state: String = tx.query_row(
+                    "SELECT r.state FROM packets p JOIN runs r ON r.run_id = p.run_id \
+                     WHERE p.packet_id = ?1",
+                    rusqlite::params![attempt.packet_id],
+                    |row| row.get(0),
+                )?;
+                if run_state == RunState::Active.as_str() {
+                    return Err(refused(
+                        ErrorCode::InvalidRequest,
+                        format!(
+                            "deadline attempt {attempt_id} cannot stop while its run is active"
+                        ),
+                    ));
+                }
             }
             let now = now_iso();
             tx.execute(

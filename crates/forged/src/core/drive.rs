@@ -9,7 +9,7 @@ use std::time::Duration;
 
 use forged_gate::GateRequest;
 use forged_git::GhClient;
-use forged_ledger::{EffectClass, OperationState, RunRow, RunState};
+use forged_ledger::{EffectClass, OperationState, RunOutcome, RunRow, RunState};
 use forged_proto::{
     machine_idempotency_key, MachineStage, NextAction, PacketIntent, ProtoEvent, RunView, Terminal,
 };
@@ -701,11 +701,53 @@ async fn honor_await(
                     &attempt.claim_token,
                 )
                 .await?;
-                after_outcome(outcome);
+                after_outcome(ctx, &run_id, outcome).await?;
                 Ok(Honored::Progressed)
             }
             Some(pid) if pid_alive(pid) => {
-                // Someone else's provider is genuinely running.
+                // Someone else's provider is genuinely running. Heartbeats
+                // prove liveness, not more execution time: once the stored
+                // packet budget expires, route it through the same
+                // reconciler containment as a recovered corpse.
+                let packet = stored_packet_for_attempt(view, packet_id)?;
+                let started = attempt
+                    .started_at
+                    .parse::<jiff::Timestamp>()
+                    .map_err(|error| {
+                        Failure::internal(format!(
+                            "invalid attempt start timestamp {:?}: {error}",
+                            attempt.started_at
+                        ))
+                    })?;
+                let deadline = jiff::Timestamp::from_nanosecond(
+                    started.as_nanosecond().saturating_add(
+                        i128::from(packet.contract.budget_s).saturating_mul(1_000_000_000),
+                    ),
+                )
+                .map_err(|error| Failure::internal(format!("stage deadline overflow: {error}")))?;
+                if jiff::Timestamp::now() >= deadline {
+                    let config = forged_proto::ReconcileConfig {
+                        stage_budget_s: view
+                            .policy
+                            .stage_budget_s
+                            .iter()
+                            .map(|(stage, budget)| (*stage, *budget))
+                            .collect(),
+                        gate_commands: view.policy.gate_commands.clone(),
+                    };
+                    let now = now_iso();
+                    let report = forged_proto::reconcile(
+                        &ctx.ledger,
+                        &view.run.run_id,
+                        ports,
+                        &config,
+                        &now,
+                    )
+                    .await?;
+                    settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded)
+                        .await?;
+                    return Ok(Honored::Progressed);
+                }
                 if wait_allowed {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                     Ok(Honored::Progressed)
@@ -725,8 +767,10 @@ async fn honor_await(
                     gate_commands: view.policy.gate_commands.clone(),
                 };
                 let now = now_iso();
-                forged_proto::reconcile(&ctx.ledger, &view.run.run_id, ports, &config, &now)
-                    .await?;
+                let report =
+                    forged_proto::reconcile(&ctx.ledger, &view.run.run_id, ports, &config, &now)
+                        .await?;
+                settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded).await?;
                 Ok(Honored::Progressed)
             }
         }
@@ -749,12 +793,12 @@ async fn honor_await(
         // refuse `SpecDrift` on every retry, forever) and charges a
         // pre-claim bd outage to the packet's bounded retry budget.
         let outcome = execute_packet(ctx, ports, &exec, &packet).await?;
-        after_outcome(outcome);
+        after_outcome(ctx, &view.run.run_id, outcome).await?;
         Ok(Honored::Progressed)
     }
 }
 
-fn after_outcome(outcome: PacketOutcome) {
+async fn after_outcome(ctx: &Ctx, run_id: &str, outcome: PacketOutcome) -> Result<(), Failure> {
     match outcome {
         PacketOutcome::Landed(_) => tracing::info!("packet landed"),
         PacketOutcome::Quarantined => tracing::warn!("packet result quarantined"),
@@ -764,7 +808,54 @@ fn after_outcome(outcome: PacketOutcome) {
         }
         PacketOutcome::Semantic(note) => tracing::warn!(note, "semantic failure recorded"),
         PacketOutcome::Revoked => tracing::warn!("attempt revoked mid-flight"),
+        PacketOutcome::Deadline { attempt_id, reason } => {
+            tracing::warn!(attempt_id, reason, "stage deadline exceeded");
+            settle_stage_deadlines(ctx, run_id, &[attempt_id]).await?;
+        }
     }
+    Ok(())
+}
+
+/// Convert contained deadline attempts into one whole-run blocked outcome.
+/// The attempt remains `revoking` until `settle` atomically stops the run;
+/// settlement aftermath then kill-confirms and marks every live attempt
+/// stopped without touching a shared Bead lease on one seat's behalf.
+pub(crate) async fn settle_stage_deadlines(
+    ctx: &Ctx,
+    run_id: &str,
+    attempt_ids: &[i64],
+) -> Result<bool, Failure> {
+    let Some(attempt_id) = attempt_ids.iter().copied().min() else {
+        return Ok(false);
+    };
+    let current_run = {
+        let run_id = run_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
+    };
+    if current_run.state == RunState::Stopped {
+        return Ok(true);
+    }
+    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    let reason = attempt
+        .revoke_reason
+        .unwrap_or_else(|| format!("stage deadline exceeded for attempt {attempt_id}"));
+    let settlement = super::settlement::Settlement {
+        outcome: RunOutcome::Blocked,
+        reason,
+        delivery_pr: None,
+        delivery_sha: None,
+        superseded_by: None,
+    };
+    if let Err(error) = super::settlement::settle(ctx, run_id, settlement).await {
+        let latest = {
+            let run_id = run_id.to_owned();
+            on_ledger(&ctx.ledger, move |ledger| ledger.get_run(&run_id)).await?
+        };
+        if latest.state != RunState::Stopped {
+            return Err(error);
+        }
+    }
+    Ok(true)
 }
 
 fn pid_alive(pid: i32) -> bool {

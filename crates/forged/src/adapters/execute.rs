@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forged_host::{ProcessHost, SessionHost};
-use forged_ledger::{EffectClass, RunRow};
+use forged_ledger::{AttemptRow, EffectClass, RevokeScope, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
@@ -65,6 +65,56 @@ pub enum PacketOutcome {
     Semantic(String),
     /// Our own attempt was revoked mid-flight; the provider was stopped.
     Revoked,
+    /// The immutable stage wall-clock deadline expired. The attempt remains
+    /// revoking until the core terminalizes the owning run, so no automatic
+    /// successor can open after a crash.
+    Deadline { attempt_id: i64, reason: String },
+}
+
+fn stage_deadline(started_at: &str, budget_s: u32) -> Result<String, Failure> {
+    let started = started_at.parse::<jiff::Timestamp>().map_err(|error| {
+        Failure::internal(format!(
+            "invalid attempt start timestamp {started_at:?}: {error}"
+        ))
+    })?;
+    let deadline = jiff::Timestamp::from_nanosecond(
+        started
+            .as_nanosecond()
+            .saturating_add(i128::from(budget_s).saturating_mul(1_000_000_000)),
+    )
+    .map_err(|error| Failure::internal(format!("stage deadline out of range: {error}")))?;
+    Ok(forged_proto::widen_rfc3339(&deadline.to_string()))
+}
+
+async fn deadline_reason(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+) -> Result<Option<(AttemptRow, String)>, Failure> {
+    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    let deadline = stage_deadline(&attempt.started_at, packet.contract.budget_s)?;
+    let as_of = now_iso();
+    if as_of < deadline {
+        return Ok(None);
+    }
+    let reason = format!(
+        "stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
+        stage_str(packet.stage),
+        attempt.started_at,
+        packet.contract.budget_s,
+        deadline,
+    );
+    Ok(Some((attempt, reason)))
+}
+
+async fn revoke_deadline(ctx: &Ctx, attempt_id: i64, reason: &str) -> Result<bool, Failure> {
+    let reason = reason.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Deadline)
+    })
+    .await?;
+    let current = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    Ok(current.revoke_scope == Some(RevokeScope::Deadline))
 }
 
 /// SHA-256 hex over a file's bytes.
@@ -149,6 +199,9 @@ pub fn build_packet(
         }
         Stage::Fix => "address the merged review findings and push the fixes",
     };
+    let budget_s = u32::try_from(budget_s).map_err(|_| {
+        Failure::invalid("stage budget exceeds the packet contract's 32-bit seconds field")
+    })?;
     let mut packet = WorkPacket {
         schema: "forged.packet/1".to_owned(),
         packet_id,
@@ -169,7 +222,7 @@ pub fn build_packet(
             instructions: instructions.to_owned(),
             gate_commands: gate_commands.to_vec(),
             deliverable,
-            budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
+            budget_s,
         },
         result_schema: PromptStage::for_stage(stage).result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
@@ -840,6 +893,16 @@ async fn run_attempt(
     let claim_token = claim_token.to_owned();
     let run_root = ctx.config.run_dir(&run_id);
 
+    // Recovered claims can already be over budget before a provider is
+    // spawned. Fence them from the same immutable start + stored packet
+    // contract used by the live loop.
+    if let Some((_attempt, reason)) = deadline_reason(ctx, packet, attempt_id).await? {
+        if revoke_deadline(ctx, attempt_id, &reason).await? {
+            return Ok(PacketOutcome::Deadline { attempt_id, reason });
+        }
+        return Ok(PacketOutcome::Revoked);
+    }
+
     // 1. Everything between the claim and the spawn. The attempt is already
     // `running` with no process behind it, so NOTHING in here may propagate
     // on its own: every exit settles the row under its own claim token
@@ -1476,6 +1539,49 @@ async fn run_attempt(
     let liveness = loop {
         match host.alive(&session).await {
             Ok(forged_host::Liveness::Running) => {
+                if let Some((_attempt, reason)) = deadline_reason(ctx, &packet, attempt_id).await? {
+                    if !revoke_deadline(ctx, attempt_id, &reason).await? {
+                        let _ = host.kill_confirmed(&session).await;
+                        if let Some(handle) = guardian.take() {
+                            handle.abort();
+                        }
+                        return Ok(PacketOutcome::Revoked);
+                    }
+                    host.kill_confirmed(&session)
+                        .await
+                        .map_err(|error| Failure {
+                            code: ErrorCode::HostUnavailable,
+                            message: format!(
+                            "stage deadline expired but provider death was not confirmed: {error}"
+                        ),
+                            recoverable: true,
+                        })?;
+                    if let Some(handle) = guardian.take() {
+                        handle.abort();
+                    }
+                    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+                    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
+                    crate::core::usage::capture_attempt(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        Some(attempt_id),
+                        &packet.provider_hints.provider,
+                        &packet.provider_hints.model,
+                        &out,
+                    )
+                    .await;
+                    crate::core::artifacts::materialize_and_join(
+                        ctx,
+                        &packet,
+                        attempt_id,
+                        "deadline",
+                        &json!({"reason": &reason}),
+                        &session_evidence,
+                    )
+                    .await?;
+                    return Ok(PacketOutcome::Deadline { attempt_id, reason });
+                }
                 beats += 1;
                 if beats.is_multiple_of(25) {
                     // Keep the ledger's budget anchor honest while we wait.

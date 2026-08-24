@@ -396,6 +396,10 @@ impl ExecutionPolicyV1 {
                     format!("$.policy.stageBudgetS.{stage:?}"),
                     "stage budget must be greater than zero",
                 )),
+                Some(value) if *value > u64::from(u32::MAX) => errors.push(DefinitionError::at(
+                    format!("$.policy.stageBudgetS.{stage:?}"),
+                    "stage budget must fit the packet contract's 32-bit seconds field",
+                )),
                 Some(_) => {}
                 None => errors.push(DefinitionError::at(
                     format!("$.policy.stageBudgetS.{stage:?}"),

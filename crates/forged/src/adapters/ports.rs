@@ -811,6 +811,7 @@ pub fn report_json(report: &forged_proto::ReconcileReport) -> Value {
         "quarantined": report.quarantined,
         "harvestMismatches": report.harvest_mismatches,
         "deferred": report.deferred,
+        "deadlineExceeded": report.deadline_exceeded,
     })
 }
 

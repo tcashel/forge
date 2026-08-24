@@ -609,8 +609,17 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
                 })
                 .await?;
+                let marker =
+                    on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-                let state = forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
+                let state = if marker.revoke_scope == Some(RevokeScope::Deadline) {
+                    super::drive::settle_stage_deadlines(ctx, &run_id, &[attempt_id]).await?;
+                    on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
+                        .await?
+                        .state
+                } else {
+                    forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?
+                };
                 let view = crate::core::drive::project(ctx, &run_id).await?;
                 let config = forged_proto::ReconcileConfig {
                     stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
