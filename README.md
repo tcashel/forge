@@ -42,7 +42,7 @@ workers never write bd.
 | `forged-git` | Worktrees, gh wrapper with effect probes, merge guard |
 | `forged-gate` | Quality-gate runner |
 | `forged-beads` | bd lease wrapper: claim/heartbeat/scoped reclaim, TTL/3 guardian, contention classifier |
-| `forged-provider` | Claude + Codex drivers; usage parsers golden-tested against real captures |
+| `forged-provider` | Claude, Codex, and opt-in Pi drivers; usage parsers golden-tested against captures |
 | `forged-proto` | The slice/v1 advance engine and the kill-confirmed reclaim saga |
 | `forged` (bin) | clap CLI + rmcp MCP/App server over one shared core; detached slice/epic submission, reconnect overview, and session controls |
 
@@ -74,7 +74,7 @@ real 5-minute TTL) is `#[ignore]`d and run deliberately:
 ## Status
 
 The Rust product now owns adaptive execution packages, YAML profiles/rosters,
-Claude and Codex provider adapters, Herdr supervision, durable epic waves,
+Claude, Codex, and opt-in Pi provider adapters, Herdr supervision, durable epic waves,
 detached handoff, and one CLI/MCP/MCP-App control plane.
 
 **2026-08-14 ownership clarification:** the current Forge tree also owns the
@@ -109,12 +109,25 @@ codex plugin marketplace add /absolute/path/to/forge
 codex plugin add forged@forge
 ```
 
-Then invoke `/forged:setup` in the host. It preserves explicit `ANVIL_HOME`
-and `BEADS_DIR` values and proves that setup added nothing to the target
-repository. The manifest remains version-aligned with the current 0.3.1
-workspace; availability begins with the next release that contains this tree.
-These commands are installation instructions only; repository validation and
-CI do not install the plugin.
+Pi installs this repository as one Pi package. Install the `forged` binary
+separately first; the Pi package never downloads, builds, or copies it:
+
+```sh
+pi install git:github.com/tcashel/forge@<release-tag>
+```
+
+The root package manifest loads only the shared skills and
+`plugins/forged/extensions`. In Pi, `/forge` opens the native terminal cockpit;
+the same shared workflows are available as `/skill:plan`, `/skill:critique`,
+`/skill:adjudicate`, `/skill:dispatch`, and `/skill:run-epic`. For checkout
+development use `pi -e /absolute/path/to/forge` without installing it.
+
+Then invoke `/forged:setup` in Claude/Codex or `/skill:setup` in Pi. Setup
+preserves explicit `ANVIL_HOME` and `BEADS_DIR` values and proves that setup
+added nothing to the target repository. The manifests remain version-aligned
+with the current 0.3.1 workspace; availability begins with the next release
+that contains this tree. These commands install agent resources only;
+repository validation and CI do not install plugins or the Forged binary.
 
 History and rationale live in [`docs/adr/`](docs/adr/) — start at
 [ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md) and

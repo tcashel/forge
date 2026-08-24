@@ -11,15 +11,17 @@ The skill is read-only — it never mutates, never dispatches, and never turns
 visible App state into a mutation selector. Apps are views; for any control,
 follow `../manage-work/SKILL.md`.
 
-## With forged server tools in the session
+## With native Forge tools in the session
 
-Call the `operations_overview` tool once, unscoped unless the operator named
-a repository or group. The authoritative response schema is
+Call `operations_overview` in an MCP host or Pi's direct `forged_overview`
+tool once, unscoped unless the operator named a repository or group. The
+authoritative response schema is
 `forged.operations-overview/1` and its App resource is
 `ui://forged/operations-overview.html`. In an App-capable host, render that
-view: opening the board is the point of this skill, not a side effect of a
-tool call. The view stays an optional projection over the same data — the
-structured response, not the rendered App, is what the answer reads.
+view. In Pi, `/forge` opens the native terminal cockpit over the same
+Operations, history, and provider-session projections. Views stay optional
+projections over the same data — the structured response, not rendered UI, is
+what the answer reads.
 
 Answer with one line summarizing portfolio state: the Needs me, Ready to
 merge, Running, Stalled or recoverable, and Planned group counts plus

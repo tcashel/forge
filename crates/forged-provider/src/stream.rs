@@ -16,6 +16,7 @@ use serde_json::Value;
 
 use crate::codex::EFFORTS;
 use crate::invocation::{validate_embedded_path, validate_model, Invocation, PacketDirs};
+use crate::pi::PI_EFFORTS;
 use crate::ProviderError;
 
 /// Raw argv sentinel for the private provider-stream runner. It is deliberately
@@ -45,6 +46,7 @@ const RUNNER_TRANSPORT_EXIT: i32 = 125;
 enum ProviderKindV1 {
     Claude,
     Codex,
+    Pi,
 }
 
 impl ProviderKindV1 {
@@ -52,6 +54,7 @@ impl ProviderKindV1 {
         match name {
             "claude" => Ok(Self::Claude),
             "codex" => Ok(Self::Codex),
+            "pi" => Ok(Self::Pi),
             _ => Err(ProviderError::Malformed {
                 message: "provider-stream request has an unsupported provider".to_owned(),
             }),
@@ -62,6 +65,7 @@ impl ProviderKindV1 {
         match self {
             Self::Claude => "claude",
             Self::Codex => "codex",
+            Self::Pi => "pi",
         }
     }
 }
@@ -171,10 +175,10 @@ impl ProviderStreamRequestV1 {
         let provider = ProviderKindV1::from_name(&packet.provider_hints.provider)?;
         let effort = match provider {
             ProviderKindV1::Claude => None,
-            ProviderKindV1::Codex => packet.provider_hints.effort.clone(),
+            ProviderKindV1::Codex | ProviderKindV1::Pi => packet.provider_hints.effort.clone(),
         };
         let last_message_path = match provider {
-            ProviderKindV1::Claude => None,
+            ProviderKindV1::Claude | ProviderKindV1::Pi => None,
             ProviderKindV1::Codex => Some(dirs.last_message_working()),
         };
         let artifact_dir = dirs
@@ -238,18 +242,33 @@ impl ProviderStreamRequestV1 {
         validate_context(&self.run_id)?;
         validate_context(&self.packet_id)?;
         validate_artifact_dir(&self.artifact_dir, self.attempt_id)?;
-        if self.provider == ProviderKindV1::Codex {
-            if let Some(effort) = self.effort.as_deref() {
-                if !EFFORTS.contains(&effort) {
-                    return Err(ProviderError::UnsupportedEffort {
-                        effort: effort.to_owned(),
+        match self.provider {
+            ProviderKindV1::Codex => {
+                if let Some(effort) = self.effort.as_deref() {
+                    if !EFFORTS.contains(&effort) {
+                        return Err(ProviderError::UnsupportedEffort {
+                            effort: effort.to_owned(),
+                        });
+                    }
+                }
+            }
+            ProviderKindV1::Pi => {
+                if self
+                    .effort
+                    .as_deref()
+                    .is_some_and(|effort| !PI_EFFORTS.contains(&effort))
+                {
+                    return Err(ProviderError::Malformed {
+                        message: "pi provider-stream request carries unsupported effort".to_owned(),
                     });
                 }
             }
-        } else if self.effort.is_some() {
-            return Err(ProviderError::Malformed {
-                message: "claude provider-stream request carries codex effort".to_owned(),
-            });
+            ProviderKindV1::Claude if self.effort.is_some() => {
+                return Err(ProviderError::Malformed {
+                    message: "claude provider-stream request carries provider effort".to_owned(),
+                });
+            }
+            ProviderKindV1::Claude => {}
         }
 
         let Some(attempt_dir) = request_path.parent() else {
@@ -304,6 +323,11 @@ impl ProviderStreamRequestV1 {
             {
                 return Err(ProviderError::Malformed {
                     message: "codex provider-stream request has invalid provider fields".to_owned(),
+                });
+            }
+            ProviderKindV1::Pi if self.last_message_path.is_some() || self.session_id.is_some() => {
+                return Err(ProviderError::Malformed {
+                    message: "pi provider-stream request has invalid provider fields".to_owned(),
                 });
             }
             _ => {}
@@ -693,6 +717,27 @@ fn provider_command(request: &ProviderStreamRequestV1, override_path: Option<&Pa
                         .expect("validated codex request has final-message path"),
                 )
                 .arg("-");
+        }
+        ProviderKindV1::Pi => {
+            command.args([
+                "--mode",
+                "json",
+                "-p",
+                "--no-session",
+                "--no-extensions",
+                "--approve",
+                "--model",
+                &request.model,
+                "--append-system-prompt",
+                "You are a Forged packet worker. Follow the frozen packet and repository skills. Do not invoke Forge lead planning, dispatch, or lifecycle-control skills.",
+            ]);
+            if let Some(effort) = request.effort.as_deref() {
+                command.args(["--thinking", effort]);
+            }
+            if request.sandbox == Sandbox::ReadOnly {
+                command.args(["--tools", "read,bash,grep,find,ls"]);
+            }
+            command.env("FORGED_PI_WORKER", "1");
         }
     }
     command
@@ -1290,6 +1335,7 @@ fn normalize(provider: ProviderKindV1, value: &Value) -> Option<ProgressEvent> {
     match provider {
         ProviderKindV1::Claude => normalize_claude(value),
         ProviderKindV1::Codex => normalize_codex(value),
+        ProviderKindV1::Pi => normalize_pi(value),
     }
 }
 
@@ -1346,11 +1392,40 @@ fn normalize_codex(value: &Value) -> Option<ProgressEvent> {
     }
 }
 
+fn normalize_pi(value: &Value) -> Option<ProgressEvent> {
+    match value.get("type").and_then(Value::as_str) {
+        Some("agent_start" | "turn_start") => Some(ProgressEvent::Working),
+        Some("tool_execution_start") => Some(ProgressEvent::ToolStarted(tool_category(
+            value.get("toolName").and_then(Value::as_str),
+        ))),
+        Some("tool_execution_end") => Some(ProgressEvent::ToolCompleted(tool_category(
+            value.get("toolName").and_then(Value::as_str),
+        ))),
+        Some("message_end")
+            if value.pointer("/message/role").and_then(Value::as_str) == Some("assistant")
+                && matches!(
+                    value.pointer("/message/stopReason").and_then(Value::as_str),
+                    Some("error" | "aborted")
+                ) =>
+        {
+            Some(ProgressEvent::Warning(classify_warning(
+                value
+                    .pointer("/message/errorMessage")
+                    .and_then(Value::as_str),
+            )))
+        }
+        Some("agent_settled") => Some(ProgressEvent::Completed),
+        _ => None,
+    }
+}
+
 fn tool_category(name: Option<&str>) -> &'static str {
     match name {
-        Some("Bash" | "Shell" | "terminal" | "command_execution") => "command",
-        Some("Read" | "Glob" | "Grep" | "search" | "web_search") => "search",
-        Some("Edit" | "Write" | "NotebookEdit" | "apply_patch") => "file change",
+        Some("Bash" | "Shell" | "bash" | "terminal" | "command_execution") => "command",
+        Some(
+            "Read" | "Glob" | "Grep" | "read" | "grep" | "find" | "ls" | "search" | "web_search",
+        ) => "search",
+        Some("Edit" | "Write" | "edit" | "write" | "NotebookEdit" | "apply_patch") => "file change",
         Some("Task" | "Agent") => "delegation",
         _ => "tool activity",
     }
@@ -1390,7 +1465,7 @@ fn classify_warning(message: Option<&str>) -> WarningClass {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ClaudeDriver, CodexDriver, ProviderDriver};
+    use crate::{ClaudeDriver, CodexDriver, PiDriver, ProviderDriver};
     use forged_types::{Deliverable, ProviderHints, SpecRef, StageContract};
     use std::os::unix::fs::PermissionsExt;
     use tempfile::tempdir;
@@ -1422,7 +1497,7 @@ mod tests {
             provider_hints: ProviderHints {
                 provider: provider.to_owned(),
                 model: "model-1".to_owned(),
-                effort: (provider == "codex").then(|| "high".to_owned()),
+                effort: matches!(provider, "codex" | "pi").then(|| "high".to_owned()),
                 sandbox: Sandbox::WorkspaceWrite,
             },
             field_notes: Vec::new(),
@@ -1436,10 +1511,11 @@ mod tests {
         std::fs::create_dir_all(dirs.path()).expect("attempt dir");
         std::fs::write(dirs.prompt(), "prompt").expect("prompt");
         let packet = packet(provider, root.path());
-        let driver: &dyn ProviderDriver = if provider == "claude" {
-            &ClaudeDriver
-        } else {
-            &CodexDriver
+        let driver: &dyn ProviderDriver = match provider {
+            "claude" => &ClaudeDriver,
+            "codex" => &CodexDriver,
+            "pi" => &PiDriver,
+            other => panic!("unsupported fixture provider {other}"),
         };
         let invocation = driver
             .invocation(&packet, &dirs, "claim-token")
@@ -1606,6 +1682,24 @@ mod tests {
             load_provider_stream_status(&request, 0),
             Err(ProviderStreamStatusFailure::Malformed)
         );
+    }
+
+    #[test]
+    fn pi_runner_preserves_skills_and_context_but_disables_extensions() {
+        let (_root, request, _path) = request_fixture("pi");
+        let command = provider_command(&request, None);
+        let args = command
+            .get_args()
+            .map(|value| value.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        assert!(args.iter().any(|arg| arg == "--no-extensions"));
+        assert!(args.iter().any(|arg| arg == "--approve"));
+        assert!(args.windows(2).any(|pair| pair == ["--thinking", "high"]));
+        assert!(!args.iter().any(|arg| arg == "--no-skills"));
+        assert!(!args.iter().any(|arg| arg == "--no-context-files"));
+        assert!(command.get_envs().any(|(key, value)| {
+            key == "FORGED_PI_WORKER" && value.is_some_and(|value| value == "1")
+        }));
     }
 
     #[test]

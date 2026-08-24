@@ -12,7 +12,7 @@ use forged_host::{ProcessHost, SessionHost};
 use forged_ledger::{EffectClass, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
-    ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
+    ClaudeDriver, CodexDriver, PacketDirs, PiDriver, PromptStage, PromptTemplates, ProviderDriver,
     ProviderStreamRenderModeV1, ProviderStreamRequestV1,
 };
 use forged_types::{
@@ -21,7 +21,7 @@ use forged_types::{
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
-use crate::adapters::extract::{harvest_claude, harvest_codex, Harvest};
+use crate::adapters::extract::{harvest_claude, harvest_codex, harvest_pi, Harvest};
 use crate::adapters::ports::ForgedPorts;
 use crate::config::{now_iso, stage_str, HostPolicy};
 use crate::core::spec::{ResolvedSpec, SpecSource};
@@ -384,6 +384,7 @@ fn driver_for(provider: &str) -> Result<Box<dyn ProviderDriver>, Failure> {
     match provider {
         "claude" => Ok(Box::new(ClaudeDriver)),
         "codex" => Ok(Box::new(CodexDriver)),
+        "pi" => Ok(Box::new(PiDriver)),
         other => Err(Failure::invalid(format!(
             "unknown provider {other:?} in packet hints"
         ))),
@@ -1625,6 +1626,7 @@ async fn run_attempt(
                     let last = crate::core::artifacts::read_final_message_text(&run_root, &dirs)?;
                     harvest_codex(&out, last.as_deref(), &packet.result_schema, &packet_id)
                 }
+                "pi" => harvest_pi(&out, &packet.result_schema, &packet_id),
                 _ => harvest_claude(&out, &packet.result_schema, &packet_id),
             },
             forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),

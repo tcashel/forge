@@ -22,8 +22,8 @@ pub struct UsageCapture {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct UsageRow {
-    /// The driver that produced the row: `"claude"` or `"codex"` — never
-    /// the model, and never a provider field read out of the capture.
+    /// The driver that produced the row: `"claude"`, `"codex"`, or `"pi"`
+    /// — never the model, and never a provider field read out of the capture.
     pub provider: String,
     /// The model the row is attributed to. The caller's argument
     /// everywhere except the claude `modelUsage` branch, whose keys name
