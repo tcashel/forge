@@ -4,21 +4,36 @@
 //! Beads, filesystem, or process boundary.
 
 use std::collections::BTreeMap;
+use std::fmt::Write as _;
 
 use forged_types::{
-    normalize_repository_path, repository_label, work_display_title, ErrorCode,
-    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
-    WorkIdentityBeadV1, WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource,
-    WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V1,
-    WORK_IDENTITY_SCHEMA_V1,
+    canonical_json_bytes, normalize_repository_path, repository_label, work_display_title,
+    ErrorCode, ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV2,
+    ExecutionPackageV1, WorkIdentityBeadV1, WorkIdentityContextV1, WorkIdentityRepositoryV1,
+    WorkIdentitySource, WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1,
+    EXECUTION_APPROVAL_SCHEMA_V2, WORK_IDENTITY_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
+use serde::Serialize;
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 
 use crate::error::{column_decode_error, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
 use crate::types::NewRun;
+
+fn canonical_sha256<T: Serialize>(value: &T) -> Result<String, LedgerError> {
+    let value = serde_json::to_value(value)?;
+    let bytes = canonical_json_bytes(&value)
+        .map_err(|error| crate::error::internal(format!("canonical JSON: {error}")))?;
+    let mut hex = String::with_capacity(64);
+    for byte in Sha256::digest(bytes) {
+        write!(&mut hex, "{byte:02x}")
+            .map_err(|_| crate::error::internal("digest formatting failed"))?;
+    }
+    Ok(hex)
+}
 
 pub(crate) const IDENTITY_COLUMNS: &str = "schema, subject_kind, subject_id, bead_id, bead_title, \
     bead_revision, repository_path, repository_label, project_id, project_title, \
@@ -579,7 +594,7 @@ impl Ledger {
         epic_id: &str,
         event: Value,
         identity: WorkIdentityV1,
-        approval: Option<ExecutionApprovalV1>,
+        approval: Option<ExecutionApprovalV2>,
     ) -> Result<bool, LedgerError> {
         let epic_id = epic_id.to_owned();
         self.submit(move |conn| {
@@ -630,7 +645,7 @@ impl Ledger {
             if let Some(approval) = approval.as_ref() {
                 let mismatch =
                     |message: String| refused(ErrorCode::ExecutionApprovalMismatch, message);
-                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1 {
+                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V2 {
                     return Err(mismatch(format!(
                         "unsupported execution approval schema {:?}",
                         approval.schema
@@ -651,14 +666,28 @@ impl Ledger {
                         .ok_or_else(|| mismatch("epic start event has no package".to_owned()))?,
                 )
                 .map_err(|error| mismatch(format!("epic start package is invalid: {error}")))?;
+                let profile_sha256 = canonical_sha256(&package.profile)?;
+                let roster_sha256 = canonical_sha256(&package.roster)?;
+                let package_sha256 = canonical_sha256(&package)?;
+                let event_package_sha256 = text(event.get("packageSha256"));
                 let event_base = text(event.get("baseRef"));
+                let event_base_sha = text(event.get("baseSha"));
                 if approval.bead_id != epic_id
                     || Some(approval.observed_revision.as_str())
                         != identity.bead.revision.as_deref()
                     || approval.repository != event_repository.clone().unwrap_or_default()
                     || Some(approval.base_ref.as_str()) != event_base.as_deref()
+                    || Some(approval.base_sha.as_str()) != event_base_sha.as_deref()
                     || approval.profile != package.profile_ref
                     || approval.roster != package.roster_ref
+                    || approval.profile_sha256 != profile_sha256
+                    || approval.roster_sha256 != roster_sha256
+                    || approval.package_sha256 != package_sha256
+                    || package.profile_sha256 != profile_sha256
+                    || package.roster_sha256 != roster_sha256
+                    || event_package_sha256.as_deref() != Some(package_sha256.as_str())
+                    || text(event.get("executionApprovalSchema")).as_deref()
+                        != Some(EXECUTION_APPROVAL_SCHEMA_V2)
                 {
                     return Err(mismatch(
                         "execution approval does not match the frozen epic tuple".to_owned(),

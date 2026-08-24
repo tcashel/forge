@@ -13,9 +13,9 @@ use forged_ledger::{
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
     AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode,
-    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV2, ExecutionPackageV1,
     OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
-    WorkIdentityContextV1, WorkIdentitySubjectKind, EXECUTION_APPROVAL_SCHEMA_V1,
+    WorkIdentityContextV1, WorkIdentitySubjectKind, EXECUTION_APPROVAL_SCHEMA_V2,
 };
 use serde_json::{json, Map, Value};
 
@@ -66,6 +66,7 @@ struct EpicConfig {
     /// Deprecated external epic-map path retained for old start events.
     spec_path: Option<String>,
     base_ref: String,
+    base_sha: Option<String>,
     integration_branch: String,
     /// Frozen per-epic window. Events written before fan-out existed replay
     /// sequentially instead of silently inheriting a wider current config.
@@ -103,6 +104,7 @@ struct PreparedEpicStart {
     epic_spec_sha256: String,
     children: Vec<Value>,
     base_ref: String,
+    base_sha: String,
 }
 
 fn payload(row: &forged_ledger::EventRow) -> Result<Value, Failure> {
@@ -154,6 +156,10 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             .and_then(Value::as_str)
             .map(str::to_owned),
         base_ref: string(value, "baseRef")?,
+        base_sha: value
+            .get("baseSha")
+            .and_then(Value::as_str)
+            .map(str::to_owned),
         integration_branch: string(value, "integrationBranch")?,
         max_active_children: value
             .get("maxActiveChildren")
@@ -601,6 +607,7 @@ async fn prepare_epic_start(
         Some(value) => value.to_owned(),
         None => super::ops::default_branch_of(&repo).await,
     };
+    let base_sha = forged_git::resolve_remote_base_sha(Path::new(&repo), &base_ref).await?;
     Ok(PreparedEpicStart {
         repo,
         legacy_spec,
@@ -609,6 +616,7 @@ async fn prepare_epic_start(
         epic_spec_sha256: epic_spec.sha256,
         children,
         base_ref,
+        base_sha,
     })
 }
 
@@ -616,34 +624,38 @@ fn validate_epic_start_approval(
     params: &Map<String, Value>,
     prepared: &PreparedEpicStart,
     epic: &str,
-) -> Result<Option<ExecutionApprovalV1>, Failure> {
+) -> Result<ExecutionApprovalV2, Failure> {
     let mismatch =
         |message: String| Failure::refused(ErrorCode::ExecutionApprovalMismatch, message);
     let expected = match params.get("expectedBeadRevision") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(Value::String(value)) if !value.is_empty() => value.as_str(),
+        None | Some(Value::Null) => {
+            return Err(mismatch(
+                "new epic starts require expectedBeadRevision and forged-execution-approval/2"
+                    .to_owned(),
+            ))
+        }
         Some(_) => {
             return Err(mismatch(
                 "expectedBeadRevision must be a non-empty string".to_owned(),
             ))
         }
     };
-    if let Some(expected) = expected {
-        if prepared.issue.revision.as_deref() != Some(expected) {
-            return Err(mismatch(format!(
-                "bead {epic} revision does not match expectedBeadRevision"
-            )));
-        }
+    if prepared.issue.revision.as_deref() != Some(expected) {
+        return Err(mismatch(format!(
+            "bead {epic} revision does not match expectedBeadRevision"
+        )));
     }
 
     let Some(value) = params.get("approval").filter(|value| !value.is_null()) else {
-        return Ok(None);
+        return Err(mismatch(
+            "new epic starts require expectedBeadRevision and forged-execution-approval/2"
+                .to_owned(),
+        ));
     };
-    let expected =
-        expected.ok_or_else(|| mismatch("approval requires expectedBeadRevision".to_owned()))?;
-    let approval: ExecutionApprovalV1 = serde_json::from_value(value.clone()).map_err(|error| {
+    let approval: ExecutionApprovalV2 = serde_json::from_value(value.clone()).map_err(|error| {
         mismatch(format!(
-            "approval is not forged-execution-approval/1: {error}"
+            "approval is not forged-execution-approval/2: {error}"
         ))
     })?;
     let bead_repository = prepared
@@ -653,7 +665,7 @@ fn validate_epic_start_approval(
         .ok_or_else(|| mismatch("bead metadata.repository is missing".to_owned()))?;
     let bead_repository = super::work_identity::canonical_repository(bead_repository)
         .map_err(|error| mismatch(format!("bead metadata.repository is invalid: {error}")))?;
-    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1
+    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V2
         || approval.subject_kind != ExecutionApprovalSubjectKind::Epic
         || approval.action != ExecutionApprovalAction::EpicStartSubmit
         || approval.bead_id != epic
@@ -661,11 +673,15 @@ fn validate_epic_start_approval(
         || bead_repository != prepared.repo
         || approval.repository != prepared.repo
         || approval.base_ref != prepared.base_ref
+        || approval.base_sha != prepared.base_sha
         || approval.profile != prepared.compiled.package.profile_ref
         || approval.roster != prepared.compiled.package.roster_ref
+        || approval.profile_sha256 != prepared.compiled.package.profile_sha256
+        || approval.roster_sha256 != prepared.compiled.package.roster_sha256
+        || approval.package_sha256 != prepared.compiled.package_sha256
     {
         return Err(mismatch(
-            "execution approval does not match bead, repository, base, profile, roster, or action"
+            "execution approval does not match bead, repository, base ref/SHA, profile, roster, package, or action"
                 .to_owned(),
         ));
     }
@@ -677,7 +693,7 @@ fn validate_epic_start_approval(
             "execution approval requires actor, basis, and an RFC 3339 approvedAt".to_owned(),
         ));
     }
-    Ok(Some(approval))
+    Ok(approval)
 }
 
 fn response(resp: OperationResponse) -> Result<Value, Failure> {
@@ -974,10 +990,6 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
     if req.run_id.is_none() {
         req.run_id = Some(epic.clone());
     }
-    let _guard = match acquire_driver(ctx, &epic).await {
-        Ok(guard) => guard,
-        Err(error) => return err_response(&req.idempotency_key, &error),
-    };
     let params = req.params.clone();
     let key = req.idempotency_key.clone();
     match recover_applied_epic_start(ctx, &key, &epic, &params).await {
@@ -985,49 +997,45 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Ok(None) => {}
         Err(error) => return err_response(&key, &error),
     }
-    let approval_guarded = super::ops::approval_param_present(&params);
-    if approval_guarded {
-        let name = "epic_start".to_owned();
-        let key_for_lookup = key.clone();
-        let standing = on_ledger(&ctx.ledger, move |ledger| {
-            ledger.find_operation(&name, &key_for_lookup)
-        })
-        .await;
-        match standing {
-            Ok(Some(row)) if row.state == OperationState::Terminal => {
-                return fenced(
-                    ctx,
-                    "epic_start",
-                    EffectClass::SafeRetry,
-                    req,
-                    None,
-                    |_operation| async {
-                        Err(Failure::internal(
-                            "terminal epic_start replay unexpectedly executed",
-                        ))
-                    },
-                )
-                .await;
-            }
-            Ok(_) => {}
-            Err(error) => return err_response(&key, &error),
+    let name = "epic_start".to_owned();
+    let key_for_lookup = key.clone();
+    let standing = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key_for_lookup)
+    })
+    .await;
+    match standing {
+        Ok(Some(row)) if row.state == OperationState::Terminal => {
+            return fenced(
+                ctx,
+                "epic_start",
+                EffectClass::SafeRetry,
+                req,
+                None,
+                |_operation| async {
+                    Err(Failure::internal(
+                        "terminal epic_start replay unexpectedly executed",
+                    ))
+                },
+            )
+            .await;
         }
+        Ok(_) => {}
+        Err(error) => return err_response(&key, &error),
     }
-    // Guarded launches validate against one Beads snapshot before the
-    // operation fence records anything. That exact snapshot and approval are
-    // then moved into the atomic epic-start bundle.
-    let (prepared, approval) = if approval_guarded {
-        let prepared = match prepare_epic_start(ctx, &params, &epic).await {
-            Ok(prepared) => prepared,
-            Err(error) => return err_response(&key, &error),
-        };
-        let approval = match validate_epic_start_approval(&params, &prepared, &epic) {
-            Ok(approval) => approval,
-            Err(error) => return err_response(&key, &error),
-        };
-        (Some(prepared), approval)
-    } else {
-        (None, None)
+
+    // A fresh start validates the exact Bead snapshot and compiled package
+    // before acquiring the epic driver slot or recording an operation.
+    let prepared = match prepare_epic_start(ctx, &params, &epic).await {
+        Ok(prepared) => prepared,
+        Err(error) => return err_response(&key, &error),
+    };
+    let approval = match validate_epic_start_approval(&params, &prepared, &epic) {
+        Ok(approval) => approval,
+        Err(error) => return err_response(&key, &error),
+    };
+    let _guard = match acquire_driver(ctx, &epic).await {
+        Ok(guard) => guard,
+        Err(error) => return err_response(&req.idempotency_key, &error),
     };
     let result = safe_effect(
         ctx,
@@ -1050,13 +1058,10 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         // or unavailable Bead.
                         return Ok(landed);
                     }
-                    if approval.is_some() {
-                        return Err(Failure::refused(
-                            ErrorCode::ExecutionApprovalMismatch,
-                            format!("epic {epic} was already started by a different operation"),
-                        ));
-                    }
-                    return status_json(ctx, project(ctx, &epic).await?).await;
+                    return Err(Failure::refused(
+                        ErrorCode::ExecutionApprovalMismatch,
+                        format!("epic {epic} was already started by a different operation"),
+                    ));
                 }
                 let PreparedEpicStart {
                     repo,
@@ -1066,10 +1071,8 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     epic_spec_sha256,
                     children,
                     base_ref,
-                } = match prepared {
-                    Some(prepared) => prepared,
-                    None => prepare_epic_start(ctx, &params, &epic).await?,
-                };
+                    base_sha,
+                } = prepared;
                 let integration_branch = format!("forged/epic-{epic}");
                 let identity = super::work_identity::durable_identity(
                     WorkIdentitySubjectKind::Epic,
@@ -1093,11 +1096,13 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "specPath": legacy_spec,
                     "deprecatedSpecPath": legacy_spec,
                     "baseRef": base_ref,
+                    "baseSha": base_sha,
                     "integrationBranch": integration_branch,
                     "maxActiveChildren": ctx.config.admission.epic_fanout,
                     "profile": compiled.package.profile_ref.name,
                     "roster": compiled.package.roster_ref.name,
                     "packageSha256": compiled.package_sha256,
+                    "executionApprovalSchema": EXECUTION_APPROVAL_SCHEMA_V2,
                     "executionPackage": compiled.package,
                     "children": children,
                 });
@@ -1108,7 +1113,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         &epic_for_store,
                         event_for_store,
                         identity,
-                        approval,
+                        Some(approval),
                     )
                 })
                 .await?;
@@ -1702,6 +1707,7 @@ async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Fai
     let repo = config.repo.clone();
     let branch = config.integration_branch.clone();
     let base = config.base_ref.clone();
+    let base_sha = config.base_sha.clone();
     let epic = config.epic_id.clone();
     let event_epic = epic.clone();
     safe_effect(
@@ -1711,8 +1717,13 @@ async fn ensure_integration(ctx: &Ctx, config: &EpicConfig) -> Result<Value, Fai
         &epic,
         json!({"repo": repo, "integrationBranch": branch, "baseRef": base}),
         move |_operation| async move {
-            let sha =
-                forged_git::ensure_integration_branch(Path::new(&repo), &branch, &base).await?;
+            let sha = forged_git::ensure_integration_branch(
+                Path::new(&repo),
+                &branch,
+                &base,
+                base_sha.as_deref(),
+            )
+            .await?;
             let event = json!({"branch": branch, "baseRef": base, "cutSha": sha});
             append(ctx, &event_epic, INTEGRATION_READY, event.clone()).await?;
             Ok(event)
@@ -1751,8 +1762,10 @@ async fn start_child(
             _ => Map::new(),
         },
     };
-    let started =
-        response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)?;
+    let started = response(
+        super::ops::run_start_from_approved_epic(ctx, &mut request, compiled, &config.epic_id)
+            .await,
+    )?;
     let event = json!({
         "childId": child.id,
         "runId": run_id,

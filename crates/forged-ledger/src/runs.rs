@@ -4,9 +4,9 @@ use std::fmt::Write as _;
 
 use forged_types::{
     canonical_json_bytes, normalize_repository_path, AcceptedRisk, ErrorCode,
-    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV2, ExecutionPackageV1,
     ExecutionPolicyV1, ResolvedRosterV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V1, EXECUTION_PACKAGE_SCHEMA_V1,
+    WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V2, EXECUTION_PACKAGE_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde::Serialize;
@@ -559,7 +559,7 @@ impl Ledger {
         definition: NewRunDefinition,
         spec_event: serde_json::Value,
         identity: WorkIdentityV1,
-        approval: Option<ExecutionApprovalV1>,
+        approval: Option<ExecutionApprovalV2>,
     ) -> Result<RunRow, LedgerError> {
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
@@ -635,10 +635,13 @@ impl Ledger {
                     "execution package roster ref does not match resolved roster",
                 ));
             }
+            let (profile_json, profile_sha256) = canonical(&package.profile)?;
+            let (roster_json, roster_sha256) = canonical(&package.roster)?;
+            let (package_json, package_sha256) = canonical(package)?;
             if let Some(approval) = approval.as_ref() {
                 let mismatch =
                     |message: String| refused(ErrorCode::ExecutionApprovalMismatch, message);
-                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1 {
+                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V2 {
                     return Err(mismatch(format!(
                         "unsupported execution approval schema {:?}",
                         approval.schema
@@ -656,8 +659,14 @@ impl Ledger {
                         != identity.bead.revision.as_deref()
                     || approval.repository != normalized_repo
                     || approval.base_ref != new_run.base_ref
+                    || spec_event.get("baseSha").and_then(Value::as_str)
+                        != Some(approval.base_sha.as_str())
                     || approval.profile != package.profile_ref
                     || approval.roster != package.roster_ref
+                    || approval.profile_sha256 != profile_sha256
+                    || approval.roster_sha256 != roster_sha256
+                    || approval.package_sha256 != package_sha256
+                    || approval.package_sha256 != definition.package_sha256
                 {
                     return Err(mismatch(
                         "execution approval does not match the frozen run tuple".to_owned(),
@@ -674,9 +683,6 @@ impl Ledger {
                 }
             }
             let approval_payload = approval.as_ref().map(serde_json::to_value).transpose()?;
-            let (profile_json, profile_sha256) = canonical(&package.profile)?;
-            let (roster_json, roster_sha256) = canonical(&package.roster)?;
-            let (package_json, package_sha256) = canonical(package)?;
             if profile_sha256 != package.profile_sha256 {
                 return Err(refused(
                     ErrorCode::InvalidRequest,

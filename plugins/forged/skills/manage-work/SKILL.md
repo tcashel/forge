@@ -146,15 +146,18 @@ tracker and never stores its credentials.
 Approval of a plan, critique resolution, implementation direction, prior work,
 or a portfolio control is not execution approval.
 
-Before asking, resolve the base branch and use `forged definition validate`
-with the intended profile and roster to obtain their exact references. Present
-one bounded confirmation tuple:
+Before asking, resolve the base branch and use `forged definition validate
+--repo "$TARGET_REPO" --base-ref "$BASE_REF"` with the intended profile and
+roster. Retain the returned `baseSha`, `packageSha256`, `profileSha256`, and
+`rosterSha256`; names alone are mutable authoring references. Present one
+bounded confirmation tuple:
 
 - slice or epic;
 - Bead id, title, and observed revision;
 - canonical `metadata.repository`;
-- base branch;
-- resolved profile and roster;
+- base branch and exact remote base SHA;
+- resolved profile and roster references plus their exact SHA-256 values;
+- complete execution-package SHA-256;
 - the exact start-then-submit action being authorized.
 
 A short reply such as “yes” or “do it” is valid only when it immediately and
@@ -166,14 +169,18 @@ outside the repository:
 
 ```forged-execution-approval
 {
-  "schema": "forged-execution-approval/1",
+  "schema": "forged-execution-approval/2",
   "subjectKind": "<slice|epic>",
   "beadId": "<exact id>",
   "observedRevision": "<revision shown in the tuple>",
   "repository": "<canonical absolute root>",
   "baseRef": "<base>",
+  "baseSha": "<exact remote base SHA>",
   "profile": {"name": "<profile name>", "version": <profile version>},
+  "profileSha256": "<exact profile SHA-256>",
   "roster": {"name": "<roster name>", "version": <roster version>},
+  "rosterSha256": "<exact roster SHA-256>",
+  "packageSha256": "<exact execution-package SHA-256>",
   "action": "<run-start-submit|epic-start-submit>",
   "approvedAt": "<ISO-8601 UTC>",
   "actor": "<operator identity>",
@@ -183,10 +190,12 @@ outside the repository:
 
 Do not write this record to the Bead. Immediately before start, perform one
 target-only exact Bead read and confirm its revision still equals
-`observedRevision`. Do not mix a portfolio or ready-frontier listing into this
+`observedRevision`. Do not re-resolve or substitute definition or base values
+after approval: start independently resolves them and refuses any drift before
+an effect. Do not mix a portfolio or ready-frontier listing into this
 preflight. Pass the revision and scratch approval file to the typed start; the
 ledger validates the complete tuple and retains the approval atomically with
-the run or epic-start bundle. `EXECUTION_APPROVAL_MISMATCH` means no run,
+the run or epic-start bundle. `EXECUTION_APPROVAL_MISMATCH` means no new run,
 epic, or external effect was created and requires a fresh tuple. Both slice
 and epic dispatch pass the exact pair as `--expected-bead-revision` and
 `--approval`; never downgrade to an unguarded start or write an approval

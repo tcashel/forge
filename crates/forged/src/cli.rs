@@ -377,8 +377,8 @@ pub struct EpicStartArgs {
     /// Exact opaque Beads revision expected at launch.
     #[arg(long, allow_hyphen_values = true)]
     pub expected_bead_revision: Option<String>,
-    /// JSON file containing a forged-execution-approval/1 record. Requires
-    /// --expected-bead-revision.
+    /// JSON file containing a content-bound forged-execution-approval/2
+    /// record. Required for every fresh launch with --expected-bead-revision.
     #[arg(long)]
     pub approval: Option<String>,
     /// Override the derived idempotency key.
@@ -495,6 +495,12 @@ pub struct DefinitionValidateArgs {
     /// Named model roster; defaults from config.
     #[arg(long)]
     pub roster: Option<String>,
+    /// Absolute target checkout whose remote base should be resolved.
+    #[arg(long, requires = "base_ref")]
+    pub repo: Option<String>,
+    /// Base ref whose exact remote object id should be returned.
+    #[arg(long, requires = "repo")]
+    pub base_ref: Option<String>,
     /// Override the read-only idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -525,8 +531,8 @@ pub struct RunStartArgs {
     /// Exact opaque Beads revision expected at launch.
     #[arg(long, allow_hyphen_values = true)]
     pub expected_bead_revision: Option<String>,
-    /// JSON file containing a forged-execution-approval/1 record. Requires
-    /// --expected-bead-revision.
+    /// JSON file containing a content-bound forged-execution-approval/2
+    /// record. Required for every fresh launch with --expected-bead-revision.
     #[arg(long)]
     pub approval: Option<String>,
     /// Override the derived idempotency key.
@@ -1454,7 +1460,12 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
                 request(
                     a.idempotency_key,
                     None,
-                    json!({"profile": a.profile, "roster": a.roster}),
+                    json!({
+                        "profile": a.profile,
+                        "roster": a.roster,
+                        "repo": a.repo,
+                        "baseRef": a.base_ref,
+                    }),
                 ),
             ),
         },

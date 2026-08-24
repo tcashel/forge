@@ -1290,6 +1290,19 @@ impl TestEnv {
 
     /// Run forged to completion; return (exit code, parsed envelope).
     pub fn forged(&self, args: &[&str]) -> (i32, Value) {
+        let approved = self.test_approved_start_args(args);
+        match approved {
+            Some(args) => {
+                let refs = args.iter().map(String::as_str).collect::<Vec<_>>();
+                self.forged_without_test_approval(&refs)
+            }
+            None => self.forged_without_test_approval(args),
+        }
+    }
+
+    /// Run the exact argv without the integration harness's routine launch
+    /// approval. Tests of the fail-closed public boundary use this directly.
+    pub fn forged_without_test_approval(&self, args: &[&str]) -> (i32, Value) {
         let out = self
             .forged_cmd(args)
             .output()
@@ -1303,6 +1316,111 @@ impl TestEnv {
             )
         });
         (out.status.code().unwrap_or(-1), envelope)
+    }
+
+    /// Build the exact content-bound approval used by launch tests.
+    pub fn execution_approval(
+        &self,
+        subject_kind: &str,
+        bead: &str,
+        repository: &str,
+        base_ref: &str,
+        profile: Option<&str>,
+        roster: Option<&str>,
+        observed_revision: &str,
+    ) -> Value {
+        let mut args = vec![
+            "definition",
+            "validate",
+            "--repo",
+            repository,
+            "--base-ref",
+            base_ref,
+        ];
+        if let Some(profile) = profile {
+            args.extend(["--profile", profile]);
+        }
+        if let Some(roster) = roster {
+            args.extend(["--roster", roster]);
+        }
+        let (code, definition) = self.forged_without_test_approval(&args);
+        assert_eq!(code, 0, "definition validation: {definition}");
+        assert_eq!(definition["result"]["valid"], json!(true));
+        json!({
+            "schema": "forged-execution-approval/2",
+            "subjectKind": subject_kind,
+            "beadId": bead,
+            "observedRevision": observed_revision,
+            "repository": repository,
+            "baseRef": base_ref,
+            "baseSha": definition["result"]["baseSha"],
+            "profile": definition["result"]["profileRef"],
+            "profileSha256": definition["result"]["profileSha256"],
+            "roster": definition["result"]["rosterRef"],
+            "rosterSha256": definition["result"]["rosterSha256"],
+            "packageSha256": definition["result"]["packageSha256"],
+            "action": if subject_kind == "epic" {
+                "epic-start-submit"
+            } else {
+                "run-start-submit"
+            },
+            "approvedAt": "2026-08-24T12:00:00Z",
+            "actor": "test-operator",
+            "basis": "integration test exact tuple",
+        })
+    }
+
+    fn test_approved_start_args(&self, args: &[&str]) -> Option<Vec<String>> {
+        if args.len() < 2
+            || args[1] != "start"
+            || !matches!(args[0], "run" | "epic")
+            || args
+                .iter()
+                .any(|arg| matches!(*arg, "--approval" | "--expected-bead-revision"))
+        {
+            return None;
+        }
+        let flag = |name: &str| {
+            args.windows(2)
+                .find(|pair| pair[0] == name)
+                .map(|pair| pair[1])
+        };
+        let bead = flag(if args[0] == "epic" {
+            "--epic"
+        } else {
+            "--bead"
+        })?;
+        let repository = flag("--repo")?;
+        if !Path::new(repository).is_absolute() {
+            return None;
+        }
+        let base_ref = flag("--base-ref").unwrap_or("main");
+        let revision = self.bead_revision(bead);
+        let approval = self.execution_approval(
+            if args[0] == "epic" { "epic" } else { "slice" },
+            bead,
+            repository,
+            base_ref,
+            flag("--profile"),
+            flag("--roster"),
+            &revision,
+        );
+        let approval_path = self
+            .root
+            .join(format!("test-execution-approval-{bead}.json"));
+        std::fs::write(
+            &approval_path,
+            serde_json::to_vec(&approval).expect("test approval JSON"),
+        )
+        .expect("write test approval");
+        let mut approved = args.iter().map(|arg| (*arg).to_owned()).collect::<Vec<_>>();
+        approved.extend([
+            "--expected-bead-revision".to_owned(),
+            revision,
+            "--approval".to_owned(),
+            approval_path.to_string_lossy().into_owned(),
+        ]);
+        Some(approved)
     }
 
     /// Arm a per-stage provider scenario for the next `count` invocations.

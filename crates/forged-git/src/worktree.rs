@@ -42,6 +42,47 @@ pub struct PreparedWorktree {
     pub base_sha: String,
 }
 
+/// Resolve one remote branch to the exact object id currently advertised by
+/// `origin`, without updating local refs or creating a worktree.
+pub async fn resolve_remote_base_sha(repo: &Path, base: &str) -> Result<String, GitError> {
+    validate_abs_path(repo, "repo")?;
+    validate_ref_name(base, "base")?;
+    let head = format!("refs/heads/{base}");
+    let output = git_output(
+        repo,
+        [
+            "ls-remote",
+            "--exit-code",
+            "--heads",
+            "origin",
+            head.as_str(),
+        ],
+    )
+    .await?;
+    if output.status.code() == Some(2) {
+        return Err(GitError::BaseNotFound {
+            base: base.to_owned(),
+            detail: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    if !output.status.success() {
+        return Err(GitError::Exec {
+            command: "git ls-remote remote base".to_owned(),
+            stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+        });
+    }
+    let sha = String::from_utf8_lossy(&output.stdout)
+        .split_whitespace()
+        .next()
+        .map(str::to_owned)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| GitError::BaseNotFound {
+            base: base.to_owned(),
+            detail: "git ls-remote returned no object id".to_owned(),
+        })?;
+    Ok(sha)
+}
+
 /// How to retire: force requires the caller's explicit attestation that the
 /// run is terminal in the ledger — this crate cannot read the ledger.
 #[derive(Debug, Clone, PartialEq)]

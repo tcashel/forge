@@ -6,7 +6,7 @@
 mod support;
 
 use serde_json::{json, Value};
-use support::TestEnv;
+use support::{git, McpClient, TestEnv};
 
 const DESCRIPTION: &str = "## Context\\n\\nthe bead is the spec.";
 const ACCEPTANCE: &str = "- the seat reads the bead, not a file";
@@ -155,20 +155,16 @@ fn run_start_binds_and_atomically_retains_exact_execution_approval() {
 
     env.seed_bead_spec("approval-drift", DESCRIPTION, ACCEPTANCE);
     let stale_path = env.root.join("stale-approval.json");
-    let stale = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "slice",
-        "beadId": "approval-drift",
-        "observedRevision": "stale-revision",
-        "repository": repo,
-        "baseRef": "main",
-        "profile": {"name": "standard", "version": 1},
-        "roster": {"name": "default", "version": 1},
-        "action": "run-start-submit",
-        "approvedAt": "2026-08-24T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved exact tuple"
-    });
+    let mut stale = env.execution_approval(
+        "slice",
+        "approval-drift",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &env.bead_revision("approval-drift"),
+    );
+    stale["observedRevision"] = json!("stale-revision");
     std::fs::write(
         &stale_path,
         serde_json::to_vec(&stale).expect("approval json"),
@@ -207,20 +203,15 @@ fn run_start_binds_and_atomically_retains_exact_execution_approval() {
     env.seed_bead_spec("approval-bound", DESCRIPTION, ACCEPTANCE);
     let revision = env.bead_revision("approval-bound");
     let approval_path = env.root.join("approval.json");
-    let approval = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "slice",
-        "beadId": "approval-bound",
-        "observedRevision": revision,
-        "repository": repo,
-        "baseRef": "main",
-        "profile": {"name": "standard", "version": 1},
-        "roster": {"name": "default", "version": 1},
-        "action": "run-start-submit",
-        "approvedAt": "2026-08-24T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved exact tuple"
-    });
+    let approval = env.execution_approval(
+        "slice",
+        "approval-bound",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
     std::fs::write(
         &approval_path,
         serde_json::to_vec(&approval).expect("approval json"),
@@ -241,6 +232,17 @@ fn run_start_binds_and_atomically_retains_exact_execution_approval() {
         approval_path.to_str().expect("approval path"),
     ]);
     assert_eq!(code, 0, "approved run start: {started}");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read config for replay drift"),
+    )
+    .expect("config JSON");
+    config["gate_commands"] = json!(["true", "git diff --check"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("drifted config JSON"),
+    )
+    .expect("write replay drift");
     let (code, replayed) = env.forged(&[
         "run",
         "start",
@@ -255,7 +257,10 @@ fn run_start_binds_and_atomically_retains_exact_execution_approval() {
         "--approval",
         approval_path.to_str().expect("approval path"),
     ]);
-    assert_eq!(code, 0, "approved run start replay: {replayed}");
+    assert_eq!(
+        code, 0,
+        "terminal replay must not compile the drifted definition: {replayed}"
+    );
     assert_eq!(replayed["reused"], json!(true));
 
     let ledger = env.ledger();
@@ -271,6 +276,263 @@ fn run_start_binds_and_atomically_retains_exact_execution_approval() {
         approval
     );
     ledger.close().expect("close");
+}
+
+#[test]
+fn run_start_rejects_same_ref_definition_and_base_drift_before_any_effect() {
+    let env = TestEnv::new("forged-execution-approval-content-drift");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+
+    env.seed_bead_spec("approval-package-drift", DESCRIPTION, ACCEPTANCE);
+    let revision = env.bead_revision("approval-package-drift");
+    let approval = env.execution_approval(
+        "slice",
+        "approval-package-drift",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let approval_path = env.root.join("package-drift-approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval JSON"),
+    )
+    .expect("write approval");
+    let config_path = env.anvil.join("config.json");
+    let original_config = std::fs::read_to_string(&config_path).expect("read config");
+    let mut config: Value = serde_json::from_str(&original_config).expect("config JSON");
+    config["gate_commands"] = json!(["true", "git diff --check"]);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("config JSON"),
+    )
+    .expect("write drifted config");
+    let (code, mismatch) = env.forged_without_test_approval(&[
+        "run",
+        "start",
+        "--bead",
+        "approval-package-drift",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--profile",
+        "standard",
+        "--roster",
+        "default",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        approval_path.to_str().expect("approval path"),
+    ]);
+    assert_ne!(code, 0, "same-ref package drift must refuse: {mismatch}");
+    assert_eq!(
+        mismatch["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+
+    std::fs::write(&config_path, original_config).expect("restore config");
+    env.seed_bead_spec("approval-base-drift", DESCRIPTION, ACCEPTANCE);
+    let revision = env.bead_revision("approval-base-drift");
+    let approval = env.execution_approval(
+        "slice",
+        "approval-base-drift",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let approval_path = env.root.join("base-drift-approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval JSON"),
+    )
+    .expect("write approval");
+    std::fs::write(env.repos.origin.join("base-drift.txt"), "advanced\n")
+        .expect("advance base file");
+    git(&env.repos.origin, &["add", "base-drift.txt"]);
+    git(
+        &env.repos.origin,
+        &["commit", "-m", "advance approval base"],
+    );
+    let (code, mismatch) = env.forged_without_test_approval(&[
+        "run",
+        "start",
+        "--bead",
+        "approval-base-drift",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--profile",
+        "standard",
+        "--roster",
+        "default",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        approval_path.to_str().expect("approval path"),
+    ]);
+    assert_ne!(code, 0, "same-ref base drift must refuse: {mismatch}");
+    assert_eq!(
+        mismatch["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+
+    let ledger = env.ledger();
+    for run in ["approval-package-drift", "approval-base-drift"] {
+        assert!(ledger.get_run(run).is_err(), "{run} created no run");
+        assert!(
+            ledger
+                .find_operation("run_start", &format!("op:run_start:{run}:-:-"))
+                .expect("operation read")
+                .is_none(),
+            "{run} mismatch precedes its operation fence"
+        );
+    }
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn mcp_run_start_exposes_and_enforces_the_content_bound_guard() {
+    let env = TestEnv::new("forged-mcp-run-execution-approval");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    env.seed_bead_spec("mcp-approval-missing", DESCRIPTION, ACCEPTANCE);
+    env.seed_bead_spec("mcp-approval-bound", DESCRIPTION, ACCEPTANCE);
+    env.seed_bead_spec("mcp-cli-null-replay", DESCRIPTION, ACCEPTANCE);
+
+    let mut mcp = McpClient::new(&env);
+    let tool = mcp.tool("run_start");
+    let description = tool["description"].as_str().expect("run description");
+    for token in [
+        "forged-execution-approval/2",
+        "expectedBeadRevision",
+        "baseSha",
+        "packageSha256",
+        "before any effect",
+    ] {
+        assert!(
+            description.contains(token),
+            "missing {token}: {description}"
+        );
+    }
+    let schema = tool["inputSchema"].to_string();
+    for field in [
+        "expectedBeadRevision",
+        "approval",
+        "baseSha",
+        "profileSha256",
+        "rosterSha256",
+        "packageSha256",
+    ] {
+        assert!(schema.contains(field), "MCP schema omits {field}: {schema}");
+    }
+
+    let missing = mcp.call_tool(
+        "run_start",
+        json!({
+            "schemaVersion": 1,
+            "params": {
+                "bead": "mcp-approval-missing",
+                "repo": repo.clone(),
+                "baseRef": "main",
+                "profile": "standard",
+                "roster": "default"
+            }
+        }),
+    );
+    assert_eq!(missing["ok"], json!(false));
+    assert_eq!(
+        missing["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+
+    let revision = env.bead_revision("mcp-approval-bound");
+    let approval = env.execution_approval(
+        "slice",
+        "mcp-approval-bound",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let started = mcp.call_tool(
+        "run_start",
+        json!({
+            "schemaVersion": 1,
+            "params": {
+                "bead": "mcp-approval-bound",
+                "repo": repo.clone(),
+                "baseRef": "main",
+                "profile": "standard",
+                "roster": "default",
+                "expectedBeadRevision": revision,
+                "approval": approval
+            }
+        }),
+    );
+    assert_eq!(started["ok"], json!(true), "approved MCP start: {started}");
+    assert_eq!(started["result"]["run_id"], json!("mcp-approval-bound"));
+
+    let revision = env.bead_revision("mcp-cli-null-replay");
+    let approval = env.execution_approval(
+        "slice",
+        "mcp-cli-null-replay",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let approval_path = env.root.join("mcp-cli-null-replay.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval JSON"),
+    )
+    .expect("write approval");
+    let (code, cli_started) = env.forged_without_test_approval(&[
+        "run",
+        "start",
+        "--bead",
+        "mcp-cli-null-replay",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--profile",
+        "standard",
+        "--roster",
+        "default",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        approval_path.to_str().expect("approval path"),
+    ]);
+    assert_eq!(code, 0, "CLI start for MCP replay: {cli_started}");
+    let replayed = mcp.call_tool(
+        "run_start",
+        json!({
+            "schemaVersion": 1,
+            "params": {
+                "bead": "mcp-cli-null-replay",
+                "repo": repo,
+                "spec": null,
+                "baseRef": "main",
+                "profile": "standard",
+                "roster": "default",
+                "expectedBeadRevision": revision,
+                "approval": approval
+            }
+        }),
+    );
+    assert_eq!(replayed["ok"], json!(true), "MCP exact replay: {replayed}");
+    assert_eq!(replayed["reused"], json!(true));
 }
 
 #[test]

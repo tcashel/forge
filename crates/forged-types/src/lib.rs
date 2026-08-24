@@ -48,7 +48,7 @@ pub use envelope::{OpError, OperationRequest, OperationResponse};
 pub use error::ErrorCode;
 pub use execution_approval::{
     ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1,
-    EXECUTION_APPROVAL_SCHEMA_V1,
+    ExecutionApprovalV2, EXECUTION_APPROVAL_SCHEMA_V1, EXECUTION_APPROVAL_SCHEMA_V2,
 };
 pub use herdr_layout::{
     HerdrLayoutSubjectKind, HerdrLayoutSubjectV1, HerdrLayoutV1, HerdrLayoutValidationError,

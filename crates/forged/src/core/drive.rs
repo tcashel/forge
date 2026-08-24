@@ -120,6 +120,29 @@ pub async fn spec_source_of(ctx: &Ctx, run_id: &str) -> Result<SpecSource, Failu
     )))
 }
 
+async fn base_sha_of(ctx: &Ctx, run_id: &str) -> Result<Option<String>, Failure> {
+    let run_id_owned = run_id.to_owned();
+    let events = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_events(Some(&run_id_owned), 0, 4096)
+    })
+    .await?;
+    for row in &events {
+        if row.kind != "forged.run.spec" {
+            continue;
+        }
+        let payload: Value = serde_json::from_str(&row.payload_json).map_err(|error| {
+            Failure::internal(format!("run {run_id} has malformed spec event: {error}"))
+        })?;
+        return Ok(payload
+            .get("baseSha")
+            .and_then(Value::as_str)
+            .map(str::to_owned));
+    }
+    Err(Failure::internal(format!(
+        "run {run_id} has no recorded spec source"
+    )))
+}
+
 /// The draft PR number, from the settled `draftpr` machine operation.
 pub(crate) fn pr_number_of(view: &RunView) -> Option<u64> {
     let key = machine_idempotency_key(&view.run.run_id, MachineStage::DraftPr, 0);
@@ -1124,13 +1147,14 @@ async fn machine_effect(
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
+            let expected_base_sha = base_sha_of(ctx, &run.run_id).await?;
             let spec = forged_git::WorktreeSpec {
                 repo: PathBuf::from(&run.repo),
                 runs_root: ctx.config.runs_root.clone(),
                 run_id: run.run_id.clone(),
                 branch: run.branch.clone(),
                 base: run.base_ref.clone(),
-                expected_base_sha: None,
+                expected_base_sha,
             };
             let prepared = match forged_git::prepare_worktree(&spec).await {
                 Ok(prepared) => Some(prepared),

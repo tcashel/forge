@@ -41,6 +41,7 @@ pub async fn ensure_integration_branch(
     repo: &Path,
     integration: &str,
     base: &str,
+    expected_base_sha: Option<&str>,
 ) -> Result<String, GitError> {
     validate_branch(repo, integration).await?;
     validate_branch(repo, base).await?;
@@ -58,14 +59,23 @@ pub async fn ensure_integration_branch(
     .await?;
     if probe.status.success() {
         let line = String::from_utf8_lossy(&probe.stdout);
-        return line
+        let sha = line
             .split_whitespace()
             .next()
             .map(str::to_owned)
             .ok_or_else(|| GitError::Exec {
                 command: "git ls-remote integration branch".to_owned(),
                 stderr: "successful probe returned no sha".to_owned(),
-            });
+            })?;
+        if let Some(expected) = expected_base_sha {
+            if sha != expected {
+                return Err(GitError::BaseShaMismatch {
+                    expected: expected.to_owned(),
+                    actual: sha,
+                });
+            }
+        }
+        return Ok(sha);
     }
     // `ls-remote --exit-code` uses 2 for a clean miss. Any other failure is
     // transport/auth and must not be treated as an absent branch.
@@ -78,6 +88,14 @@ pub async fn ensure_integration_branch(
     let remote_base = format!("refs/remotes/origin/{base}");
     let resolved = git(repo, &["rev-parse", &remote_base]).await?;
     let sha = stdout(&resolved, "git rev-parse integration base")?;
+    if let Some(expected) = expected_base_sha {
+        if sha != expected {
+            return Err(GitError::BaseShaMismatch {
+                expected: expected.to_owned(),
+                actual: sha,
+            });
+        }
+    }
     let refspec = format!("{sha}:{integration_ref}");
     let pushed = git(repo, &["push", "origin", &refspec]).await?;
     stdout(&pushed, "git push integration branch")?;

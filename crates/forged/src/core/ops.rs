@@ -14,9 +14,9 @@ use forged_provider::{CodexDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
     AttentionState, ErrorCode, ExecutionApprovalAction, ExecutionApprovalSubjectKind,
-    ExecutionApprovalV1, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
+    ExecutionApprovalV2, ExecutionPackageV1, OperationRequest, OperationResponse, RunId,
     WorkIdentityContextV1, WorkIdentitySubjectKind, WorkPacket, WorkRefKind, WorkRefV1,
-    EXECUTION_APPROVAL_SCHEMA_V1,
+    EXECUTION_APPROVAL_SCHEMA_V2,
 };
 use serde_json::{json, Value};
 
@@ -272,6 +272,7 @@ struct PreparedRunStart {
     issue: forged_beads::IssueSummary,
     source: super::spec::SpecSource,
     base_ref: String,
+    base_sha: String,
 }
 
 async fn prepare_run_start(
@@ -303,54 +304,53 @@ async fn prepare_run_start(
         Some(base) => base.to_owned(),
         None => default_branch_of(&repo).await,
     };
+    let base_sha = forged_git::resolve_remote_base_sha(Path::new(&repo), &base_ref).await?;
     Ok(PreparedRunStart {
         repo,
         issue,
         source,
         base_ref,
+        base_sha,
     })
-}
-
-pub(super) fn approval_param_present(params: &serde_json::Map<String, Value>) -> bool {
-    params
-        .get("expectedBeadRevision")
-        .is_some_and(|value| !value.is_null())
-        || params.get("approval").is_some_and(|value| !value.is_null())
 }
 
 fn validate_run_start_approval(
     params: &serde_json::Map<String, Value>,
     prepared: &PreparedRunStart,
     bead: &str,
-    package: &ExecutionPackageV1,
-) -> Result<Option<ExecutionApprovalV1>, Failure> {
+    definition: &crate::config::CompiledDefinition,
+) -> Result<ExecutionApprovalV2, Failure> {
     let mismatch =
         |message: String| Failure::refused(ErrorCode::ExecutionApprovalMismatch, message);
     let expected = match params.get("expectedBeadRevision") {
-        None | Some(Value::Null) => None,
-        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(Value::String(value)) if !value.is_empty() => value.as_str(),
+        None | Some(Value::Null) => {
+            return Err(mismatch(
+                "new run starts require expectedBeadRevision and forged-execution-approval/2"
+                    .to_owned(),
+            ))
+        }
         Some(_) => {
             return Err(mismatch(
                 "expectedBeadRevision must be a non-empty string".to_owned(),
             ))
         }
     };
-    if let Some(expected) = expected {
-        if prepared.issue.revision.as_deref() != Some(expected) {
-            return Err(mismatch(format!(
-                "bead {bead} revision does not match expectedBeadRevision"
-            )));
-        }
+    if prepared.issue.revision.as_deref() != Some(expected) {
+        return Err(mismatch(format!(
+            "bead {bead} revision does not match expectedBeadRevision"
+        )));
     }
 
     let Some(value) = params.get("approval").filter(|value| !value.is_null()) else {
-        return Ok(None);
+        return Err(mismatch(
+            "new run starts require expectedBeadRevision and forged-execution-approval/2"
+                .to_owned(),
+        ));
     };
-    let expected =
-        expected.ok_or_else(|| mismatch("approval requires expectedBeadRevision".to_owned()))?;
-    let approval: ExecutionApprovalV1 = serde_json::from_value(value.clone()).map_err(|error| {
+    let approval: ExecutionApprovalV2 = serde_json::from_value(value.clone()).map_err(|error| {
         mismatch(format!(
-            "approval is not forged-execution-approval/1: {error}"
+            "approval is not forged-execution-approval/2: {error}"
         ))
     })?;
     let bead_repository = prepared
@@ -360,7 +360,8 @@ fn validate_run_start_approval(
         .ok_or_else(|| mismatch("bead metadata.repository is missing".to_owned()))?;
     let bead_repository = super::work_identity::canonical_repository(bead_repository)
         .map_err(|error| mismatch(format!("bead metadata.repository is invalid: {error}")))?;
-    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1
+    let package = &definition.package;
+    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V2
         || approval.subject_kind != ExecutionApprovalSubjectKind::Slice
         || approval.action != ExecutionApprovalAction::RunStartSubmit
         || approval.bead_id != bead
@@ -368,11 +369,15 @@ fn validate_run_start_approval(
         || bead_repository != prepared.repo
         || approval.repository != prepared.repo
         || approval.base_ref != prepared.base_ref
+        || approval.base_sha != prepared.base_sha
         || approval.profile != package.profile_ref
         || approval.roster != package.roster_ref
+        || approval.profile_sha256 != package.profile_sha256
+        || approval.roster_sha256 != package.roster_sha256
+        || approval.package_sha256 != definition.package_sha256
     {
         return Err(mismatch(
-            "execution approval does not match bead, repository, base, profile, roster, or action"
+            "execution approval does not match bead, repository, base ref/SHA, profile, roster, package, or action"
                 .to_owned(),
         ));
     }
@@ -384,7 +389,104 @@ fn validate_run_start_approval(
             "execution approval requires actor, basis, and an RFC 3339 approvedAt".to_owned(),
         ));
     }
-    Ok(Some(approval))
+    Ok(approval)
+}
+
+async fn validate_retained_epic_approval(
+    ctx: &Ctx,
+    epic: &str,
+    definition: &crate::config::CompiledDefinition,
+) -> Result<(), Failure> {
+    let epic_id = epic.to_owned();
+    let events = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.list_events(Some(&epic_id), 0, 65_536)
+    })
+    .await?;
+    let started = events
+        .iter()
+        .filter(|event| event.kind == "forged.epic.started")
+        .collect::<Vec<_>>();
+    let approvals = events
+        .iter()
+        .filter(|event| event.kind == "forged.epic.execution-approval")
+        .collect::<Vec<_>>();
+    let [started] = started.as_slice() else {
+        return Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("epic {epic} has no singular retained start bundle"),
+        ));
+    };
+    let started: Value = serde_json::from_str(&started.payload_json)
+        .map_err(|error| Failure::internal(format!("malformed epic start bundle: {error}")))?;
+    let frozen: ExecutionPackageV1 = serde_json::from_value(
+        started
+            .get("executionPackage")
+            .cloned()
+            .ok_or_else(|| Failure::internal("epic start bundle has no execution package"))?,
+    )
+    .map_err(|error| Failure::internal(format!("malformed epic execution package: {error}")))?;
+    if frozen != definition.package
+        || started.get("packageSha256").and_then(Value::as_str)
+            != Some(definition.package_sha256.as_str())
+    {
+        return Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("epic {epic} child definition differs from its frozen parent package"),
+        ));
+    }
+
+    match started
+        .get("executionApprovalSchema")
+        .and_then(Value::as_str)
+    {
+        // Epics durably started before content-bound approvals existed remain
+        // driveable. New starts always carry the v2 marker atomically, so
+        // this compatibility branch cannot be selected by request JSON.
+        None if approvals.len() <= 1 => Ok(()),
+        None => Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("epic {epic} has conflicting legacy execution approvals"),
+        )),
+        Some(EXECUTION_APPROVAL_SCHEMA_V2) => {
+            let [approval] = approvals.as_slice() else {
+                return Err(Failure::refused(
+                    ErrorCode::ExecutionApprovalMismatch,
+                    format!("epic {epic} has no singular retained execution approval"),
+                ));
+            };
+            let approval: ExecutionApprovalV2 = serde_json::from_str(&approval.payload_json)
+                .map_err(|error| {
+                    Failure::refused(
+                        ErrorCode::ExecutionApprovalMismatch,
+                        format!("epic {epic} retained approval is malformed: {error}"),
+                    )
+                })?;
+            if approval.schema != EXECUTION_APPROVAL_SCHEMA_V2
+                || approval.subject_kind != ExecutionApprovalSubjectKind::Epic
+                || approval.action != ExecutionApprovalAction::EpicStartSubmit
+                || approval.bead_id != epic
+                || started.get("baseRef").and_then(Value::as_str)
+                    != Some(approval.base_ref.as_str())
+                || started.get("baseSha").and_then(Value::as_str)
+                    != Some(approval.base_sha.as_str())
+                || approval.profile != definition.package.profile_ref
+                || approval.roster != definition.package.roster_ref
+                || approval.profile_sha256 != definition.package.profile_sha256
+                || approval.roster_sha256 != definition.package.roster_sha256
+                || approval.package_sha256 != definition.package_sha256
+            {
+                return Err(Failure::refused(
+                    ErrorCode::ExecutionApprovalMismatch,
+                    format!("epic {epic} retained approval does not match its frozen package"),
+                ));
+            }
+            Ok(())
+        }
+        Some(other) => Err(Failure::refused(
+            ErrorCode::ExecutionApprovalMismatch,
+            format!("epic {epic} has unsupported retained approval schema {other:?}"),
+        )),
+    }
 }
 
 /// `run start` — mint the RunId from the bead id (or the epic scheduler's
@@ -392,6 +494,32 @@ fn validate_run_start_approval(
 /// `--repo` and `--base-ref` arguments. The spec comes from the bead;
 /// `--spec <path>` is the deprecated file route, honored for one release.
 pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationResponse {
+    let bead = match param_str(&req.params, "bead") {
+        Ok(value) => value.to_owned(),
+        Err(error) => return err_response(&derive_key("run_start", None, None, None), &error),
+    };
+    let run_id = match RunId::new(bead.clone()) {
+        Ok(run_id) => run_id,
+        Err(error) => {
+            return err_response(
+                &derive_key("run_start", None, None, None),
+                &Failure::invalid(format!("bead id does not mint a valid run id: {error}")),
+            )
+        }
+    };
+    default_key(
+        req,
+        derive_key("run_start", Some(run_id.as_str()), None, None),
+    );
+    if req.run_id.is_none() {
+        req.run_id = Some(run_id.as_str().to_owned());
+    }
+    match replay_terminal_run_start_before_compile(ctx, req, &run_id).await {
+        Ok(Some(response)) => return response,
+        Ok(None) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
+    }
+
     let compiled = match ctx.config.compile_definition(
         param_opt_str(&req.params, "profile"),
         param_opt_str(&req.params, "roster"),
@@ -408,16 +536,112 @@ pub async fn run_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             )
         }
     };
-    run_start_with_definition(ctx, req, compiled).await
+    run_start_with_definition(ctx, req, compiled, RunStartAuthority::Direct).await
 }
 
-/// Start a run from an owned, already-compiled definition. This is the
-/// epic scheduler boundary: child creation never resolves mutable authoring
-/// names again.
-pub(crate) async fn run_start_with_definition(
+/// Replay a terminal direct start without consulting mutable definition refs.
+///
+/// Older operations were fenced either before `packageSha256` joined the
+/// request or after it was injected by the core. The frozen run definition (or
+/// the v2 approval itself) supplies that historical hash, so definition drift
+/// and deleted authoring refs cannot turn an exact replay into a new request.
+async fn replay_terminal_run_start_before_compile(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    run_id: &RunId,
+) -> Result<Option<OperationResponse>, Failure> {
+    let name = "run_start".to_owned();
+    let key = req.idempotency_key.clone();
+    let row = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation(&name, &key)
+    })
+    .await?;
+    let Some(row) = row.filter(|row| row.state == OperationState::Terminal) else {
+        return Ok(None);
+    };
+
+    let mut candidates = vec![req.clone()];
+    if let Some(package_sha256) = req
+        .params
+        .get("approval")
+        .and_then(|approval| approval.get("packageSha256"))
+        .and_then(Value::as_str)
+    {
+        let mut candidate = req.clone();
+        candidate.params.insert(
+            "packageSha256".to_owned(),
+            Value::String(package_sha256.to_owned()),
+        );
+        candidates.push(candidate);
+    }
+    let frozen_sha256 = {
+        let run_id = run_id.as_str().to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            Ok(ledger
+                .get_run_definition(&run_id)?
+                .map(|definition| definition.package_sha256))
+        })
+        .await?
+    };
+    if let Some(package_sha256) = frozen_sha256 {
+        let mut candidate = req.clone();
+        candidate
+            .params
+            .insert("packageSha256".to_owned(), Value::String(package_sha256));
+        candidates.push(candidate);
+    }
+
+    if let Some(candidate) = candidates
+        .into_iter()
+        .find(|candidate| request_sha256(candidate).is_ok_and(|hash| hash == row.request_sha256))
+    {
+        *req = candidate;
+    }
+    Ok(Some(
+        fenced(
+            ctx,
+            "run_start",
+            EffectClass::SafeRetry,
+            req,
+            None,
+            |_operation| async {
+                Err(Failure::internal(
+                    "terminal run_start replay unexpectedly executed",
+                ))
+            },
+        )
+        .await,
+    ))
+}
+
+enum RunStartAuthority {
+    Direct,
+    ApprovedEpic(String),
+}
+
+/// Start a child run from the exact package retained by its parent epic.
+/// This crate-private entry point accepts no JSON authority flag: the durable
+/// parent bundle is revalidated before the child launch can reach a fence.
+pub(crate) async fn run_start_from_approved_epic(
     ctx: &Ctx,
     req: &mut OperationRequest,
     compiled: crate::config::CompiledDefinition,
+    parent_epic: &str,
+) -> OperationResponse {
+    run_start_with_definition(
+        ctx,
+        req,
+        compiled,
+        RunStartAuthority::ApprovedEpic(parent_epic.to_owned()),
+    )
+    .await
+}
+
+async fn run_start_with_definition(
+    ctx: &Ctx,
+    req: &mut OperationRequest,
+    compiled: crate::config::CompiledDefinition,
+    authority: RunStartAuthority,
 ) -> OperationResponse {
     let bead = match param_str(&req.params, "bead") {
         Ok(v) => v.to_owned(),
@@ -491,49 +715,61 @@ pub(crate) async fn run_start_with_definition(
         Err(error) => return err_response(&req.idempotency_key, &error),
     }
     let params = req.params.clone();
-    let approval_guarded = approval_param_present(&params);
-    if approval_guarded {
-        let key = req.idempotency_key.clone();
-        let standing = on_ledger(&ctx.ledger, move |ledger| {
-            ledger.find_operation("run_start", &key)
-        })
-        .await;
-        match standing {
-            Ok(Some(row)) if row.state == OperationState::Terminal => {
-                return fenced(
-                    ctx,
-                    "run_start",
-                    EffectClass::SafeRetry,
-                    req,
-                    None,
-                    |_operation| async {
-                        Err(Failure::internal(
-                            "terminal run_start replay unexpectedly executed",
-                        ))
-                    },
-                )
-                .await;
-            }
-            Ok(_) => {}
-            Err(error) => return err_response(&req.idempotency_key, &error),
+    let key = req.idempotency_key.clone();
+    let standing = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.find_operation("run_start", &key)
+    })
+    .await;
+    match standing {
+        Ok(Some(row)) if row.state == OperationState::Terminal => {
+            return fenced(
+                ctx,
+                "run_start",
+                EffectClass::SafeRetry,
+                req,
+                None,
+                |_operation| async {
+                    Err(Failure::internal(
+                        "terminal run_start replay unexpectedly executed",
+                    ))
+                },
+            )
+            .await;
         }
+        Ok(_) => {}
+        Err(error) => return err_response(&req.idempotency_key, &error),
     }
-    // Guarded launches validate against one Beads snapshot before the
-    // operation fence records anything. That exact snapshot and approval are
-    // then moved into the atomic launch bundle.
-    let (prepared, approval) = if approval_guarded {
-        let prepared = match prepare_run_start(ctx, &params, &bead).await {
-            Ok(prepared) => prepared,
-            Err(error) => return err_response(&req.idempotency_key, &error),
-        };
-        let approval =
-            match validate_run_start_approval(&params, &prepared, &bead, &compiled.package) {
+
+    // A fresh direct launch is always guarded. The only unguarded-looking
+    // path is crate-private child creation, and it proves the retained parent
+    // approval rather than trusting a caller-supplied JSON escape hatch.
+    let (prepared, approval) = match &authority {
+        RunStartAuthority::Direct => {
+            if params.get("run").is_some_and(|value| !value.is_null()) {
+                return err_response(
+                    &req.idempotency_key,
+                    &Failure::refused(
+                        ErrorCode::ExecutionApprovalMismatch,
+                        "direct run_start cannot override the bead-derived run id",
+                    ),
+                );
+            }
+            let prepared = match prepare_run_start(ctx, &params, &bead).await {
+                Ok(prepared) => prepared,
+                Err(error) => return err_response(&req.idempotency_key, &error),
+            };
+            let approval = match validate_run_start_approval(&params, &prepared, &bead, &compiled) {
                 Ok(approval) => approval,
                 Err(error) => return err_response(&req.idempotency_key, &error),
             };
-        (Some(prepared), approval)
-    } else {
-        (None, None)
+            (Some(prepared), Some(approval))
+        }
+        RunStartAuthority::ApprovedEpic(parent_epic) => {
+            if let Err(error) = validate_retained_epic_approval(ctx, parent_epic, &compiled).await {
+                return err_response(&req.idempotency_key, &error);
+            }
+            (None, None)
+        }
     };
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
@@ -542,6 +778,7 @@ pub(crate) async fn run_start_with_definition(
                 issue,
                 source,
                 base_ref,
+                base_sha,
             } = match prepared {
                 Some(prepared) => prepared,
                 None => prepare_run_start(ctx, &params, &bead).await?,
@@ -587,6 +824,7 @@ pub(crate) async fn run_start_with_definition(
                     "beadTitle": identity.bead.title.clone(),
                     "beadRevision": issue.revision,
                     "repo": repo,
+                    "baseSha": base_sha,
                     "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
@@ -600,6 +838,7 @@ pub(crate) async fn run_start_with_definition(
                     "beadTitle": identity.bead.title.clone(),
                     "beadRevision": issue.revision,
                     "repo": repo,
+                    "baseSha": base_sha,
                     "operationId": operation_id,
                     "issueType": issue.issue_type,
                     "metadata": issue.metadata,
@@ -619,6 +858,7 @@ pub(crate) async fn run_start_with_definition(
                 "bead_id": row.bead_id,
                 "branch": branch,
                 "base_ref": base_ref,
+                "base_sha": base_sha,
                 "protocol_ref": package.protocol_ref,
                 "profile_ref": package.profile_ref,
                 "roster_ref": package.roster_ref,
@@ -1033,6 +1273,26 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
         let roster = param_opt_str(&req.params, "roster");
         match ctx.config.compile_definition(profile, roster) {
             Ok(compiled) => {
+                let base = match (
+                    param_opt_str(&req.params, "repo"),
+                    param_opt_str(&req.params, "baseRef"),
+                ) {
+                    (None, None) => None,
+                    (Some(repo), Some(base_ref)) => {
+                        let repo = super::work_identity::canonical_repository(repo)?;
+                        let base_sha = forged_git::resolve_remote_base_sha(
+                            Path::new(&repo),
+                            base_ref,
+                        )
+                        .await?;
+                        Some((base_ref.to_owned(), base_sha))
+                    }
+                    _ => {
+                        return Err(Failure::invalid(
+                            "definition validation requires repo and baseRef together",
+                        ))
+                    }
+                };
                 let package = compiled.package;
                 Ok(json!({
                     "valid": true,
@@ -1043,6 +1303,8 @@ pub async fn definition_validate(ctx: &Ctx, req: &OperationRequest) -> Operation
                     "packageSha256": compiled.package_sha256,
                     "profileSha256": package.profile_sha256,
                     "rosterSha256": package.roster_sha256,
+                    "baseRef": base.as_ref().map(|(base_ref, _)| base_ref),
+                    "baseSha": base.as_ref().map(|(_, base_sha)| base_sha),
                     "roles": package.roster.roles.keys().map(|role| role.as_str()).collect::<Vec<_>>(),
                     "seats": package.profile.seats,
                     "policy": package.policy,

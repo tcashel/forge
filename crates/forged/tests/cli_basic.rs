@@ -84,7 +84,13 @@ fn help_lists_every_command_and_subcommand_flags() {
         );
     }
     let definition = help_text(&env, &["definition", "validate", "--help"]);
-    for flag in ["--profile", "--roster", "--idempotency-key"] {
+    for flag in [
+        "--profile",
+        "--roster",
+        "--repo",
+        "--base-ref",
+        "--idempotency-key",
+    ] {
         assert!(
             definition.contains(flag),
             "definition validate --help must document {flag}"

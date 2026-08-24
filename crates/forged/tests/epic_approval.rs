@@ -7,6 +7,50 @@ use serde_json::{json, Value};
 use support::{McpClient, TestEnv};
 
 #[test]
+fn fresh_epic_start_requires_the_revision_and_content_bound_approval() {
+    let env = TestEnv::new("forged-epic-approval-required");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    env.seed_epic(
+        "approval-required-epic",
+        &[("approval-child", &env.spec, true)],
+    );
+
+    let (code, refused) = env.forged_without_test_approval(&[
+        "epic",
+        "start",
+        "--epic",
+        "approval-required-epic",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+    ]);
+    assert_ne!(code, 0, "unguarded epic start must refuse: {refused}");
+    assert_eq!(
+        refused["error"]["code"],
+        json!("EXECUTION_APPROVAL_MISMATCH")
+    );
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .find_operation("epic_start", "op:epic_start:approval-required-epic:-:-")
+            .expect("operation read")
+            .is_none(),
+        "refusal precedes the operation fence"
+    );
+    assert!(
+        ledger
+            .list_events(Some("approval-required-epic"), 0, 100)
+            .expect("events")
+            .into_iter()
+            .all(|event| event.kind != "forged.epic.started"),
+        "refusal creates no epic bundle"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
 fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval() {
     let env = TestEnv::new("forged-epic-execution-approval");
     assert_eq!(env.forged(&["init"]).0, 0);
@@ -17,20 +61,16 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
         &[("approval-drift-child", &env.spec, true)],
     );
     env.set_bead_repository("approval-drift-epic", &repo);
-    let stale = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "epic",
-        "beadId": "approval-drift-epic",
-        "observedRevision": "stale-revision",
-        "repository": repo,
-        "baseRef": "main",
-        "profile": {"name": "standard", "version": 1},
-        "roster": {"name": "default", "version": 1},
-        "action": "epic-start-submit",
-        "approvedAt": "2026-08-24T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved exact epic tuple"
-    });
+    let mut stale = env.execution_approval(
+        "epic",
+        "approval-drift-epic",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &env.bead_revision("approval-drift-epic"),
+    );
+    stale["observedRevision"] = json!("stale-revision");
     let mismatch = {
         let mut mcp = McpClient::new(&env);
         let tool = mcp.tool("epic_start");
@@ -40,8 +80,10 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
         for token in [
             "params.expectedBeadRevision",
             "params.approval",
-            "forged-execution-approval/1",
-            "before effects",
+            "forged-execution-approval/2",
+            "baseSha",
+            "packageSha256",
+            "before any effect",
         ] {
             assert!(
                 description.contains(token),
@@ -105,20 +147,15 @@ fn epic_start_rejects_drift_then_atomically_retains_and_replays_exact_approval()
     env.set_bead_repository("approval-bound-epic", &repo);
     let revision = env.bead_revision("approval-bound-epic");
     let approval_path = env.root.join("epic-approval.json");
-    let approval = json!({
-        "schema": "forged-execution-approval/1",
-        "subjectKind": "epic",
-        "beadId": "approval-bound-epic",
-        "observedRevision": revision,
-        "repository": repo,
-        "baseRef": "main",
-        "profile": {"name": "standard", "version": 1},
-        "roster": {"name": "default", "version": 1},
-        "action": "epic-start-submit",
-        "approvedAt": "2026-08-24T12:00:00Z",
-        "actor": "operator",
-        "basis": "approved exact epic tuple"
-    });
+    let approval = env.execution_approval(
+        "epic",
+        "approval-bound-epic",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
     std::fs::write(
         &approval_path,
         serde_json::to_vec(&approval).expect("approval JSON"),

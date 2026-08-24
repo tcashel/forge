@@ -124,6 +124,158 @@ impl EnvelopeArgs {
     }
 }
 
+/// A named immutable definition coordinate shown inside an approval tuple.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionApprovalRefArgs {
+    pub name: String,
+    pub version: u32,
+}
+
+/// Model-facing shape of a content-bound execution approval.
+///
+/// Digest fields remain optional at deserialization only so an exact terminal
+/// replay written by the short-lived v1 implementation can still reach the
+/// core replay fence. Every fresh launch requires all three and schema v2.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct ExecutionApprovalArgs {
+    pub schema: String,
+    pub subject_kind: String,
+    pub bead_id: String,
+    pub observed_revision: String,
+    pub repository: String,
+    pub base_ref: String,
+    /// Required for every fresh launch: exact remote object id of baseRef.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_sha: Option<String>,
+    pub profile: ExecutionApprovalRefArgs,
+    /// Required for every fresh launch: SHA-256 returned by definition_validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile_sha256: Option<String>,
+    pub roster: ExecutionApprovalRefArgs,
+    /// Required for every fresh launch: SHA-256 returned by definition_validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster_sha256: Option<String>,
+    /// Required for every fresh launch: SHA-256 returned by definition_validate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub package_sha256: Option<String>,
+    pub action: String,
+    pub approved_at: String,
+    pub actor: String,
+    pub basis: String,
+}
+
+/// Typed MCP parameters for a direct slice launch.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase")]
+pub struct RunStartParams {
+    pub bead: String,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster: Option<String>,
+    /// Required for a fresh launch; optional on wire only for exact legacy replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_bead_revision: Option<String>,
+    /// Required forged-execution-approval/2 for a fresh launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ExecutionApprovalArgs>,
+    /// Display-only context retained for compatible callers.
+    #[serde(flatten)]
+    pub context: serde_json::Map<String, Value>,
+}
+
+/// Typed MCP envelope for a direct slice launch.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct RunStartArgs {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Raw values are retained for exact request-hash replay; `with` keeps the
+    /// model-facing schema strongly typed without deserialize/reserialize loss.
+    #[schemars(with = "RunStartParams")]
+    pub params: serde_json::Map<String, Value>,
+}
+
+impl RunStartArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params: self.params,
+        }
+    }
+}
+
+/// Typed MCP parameters for an epic launch.
+#[derive(Debug, Deserialize, Serialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars", inline)]
+#[serde(rename_all = "camelCase")]
+pub struct EpicStartParams {
+    pub epic: String,
+    pub repo: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub spec: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_ref: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub roster: Option<String>,
+    /// Required for a fresh launch; optional on wire only for exact legacy replay.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub expected_bead_revision: Option<String>,
+    /// Required forged-execution-approval/2 for a fresh launch.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub approval: Option<ExecutionApprovalArgs>,
+    /// Display-only context retained for compatible callers.
+    #[serde(flatten)]
+    pub context: serde_json::Map<String, Value>,
+}
+
+/// Typed MCP envelope for an epic launch.
+#[derive(Debug, Deserialize, JsonSchema)]
+#[schemars(crate = "rmcp::schemars")]
+#[serde(rename_all = "camelCase")]
+pub struct EpicStartArgs {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
+    #[serde(default)]
+    pub idempotency_key: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Raw values are retained for exact request-hash replay; `with` keeps the
+    /// model-facing schema strongly typed without deserialize/reserialize loss.
+    #[schemars(with = "EpicStartParams")]
+    pub params: serde_json::Map<String, Value>,
+}
+
+impl EpicStartArgs {
+    fn into_envelope(self) -> EnvelopeArgs {
+        EnvelopeArgs {
+            schema_version: self.schema_version,
+            idempotency_key: self.idempotency_key,
+            run_id: self.run_id,
+            params: self.params,
+        }
+    }
+}
+
 /// The `overview` envelope: the shared envelope shape with a TYPED
 /// `params`, so the one tool a host renders advertises the scopes it
 /// accepts instead of a free-form map. [`EnvelopeArgs`] itself is
@@ -978,16 +1130,19 @@ impl ForgedServer {
     /// Resolve and validate a profile/roster selection.
     #[tool(
         name = "definition_validate",
-        description = "Resolve and validate an execution definition."
+        description = "Resolve and validate an execution definition. Returns exact packageSha256, profileSha256, and rosterSha256 for approval. Pass params.repo and params.baseRef together to also resolve the exact remote baseSha required by forged-execution-approval/2."
     )]
     pub async fn definition_validate(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("definition_validate", args.0).await
     }
 
     /// Start a run for a bead.
-    #[tool(name = "run_start", description = "Create a run for a bead.")]
-    pub async fn run_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("run_start", args.0).await
+    #[tool(
+        name = "run_start",
+        description = "Start one durable slice run. Every fresh launch requires params.expectedBeadRevision and a forged-execution-approval/2 object in params.approval containing exact baseSha, packageSha256, profileSha256, and rosterSha256 values returned by definition_validate. Forged validates the bead/revision/repository/base ref/base SHA/profile/roster/content/action tuple before any effect and retains approval atomically. Omission is accepted only for byte-identical replay of a terminal legacy operation."
+    )]
+    pub async fn run_start(&self, args: Parameters<RunStartArgs>) -> CallToolResult {
+        self.call("run_start", args.0.into_envelope()).await
     }
 
     /// One project → advance → honor iteration.
@@ -1053,10 +1208,10 @@ impl ForgedServer {
     /// Freeze an epic inventory and child execution defaults.
     #[tool(
         name = "epic_start",
-        description = "Start a durable Beads epic. Approved execution passes params.expectedBeadRevision plus a strict forged-execution-approval/1 object in params.approval; Forged validates the exact epic/repository/base/profile/roster/action tuple before effects and retains it atomically with the frozen epic."
+        description = "Start one durable Beads epic. Every fresh launch requires params.expectedBeadRevision and a forged-execution-approval/2 object in params.approval containing exact baseSha, packageSha256, profileSha256, and rosterSha256 values returned by definition_validate. Forged validates the epic/revision/repository/base ref/base SHA/profile/roster/content/action tuple before any effect and retains approval atomically with the frozen epic. Omission is accepted only for byte-identical replay of a terminal legacy operation."
     )]
-    pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
-        self.call("epic_start", args.0).await
+    pub async fn epic_start(&self, args: Parameters<EpicStartArgs>) -> CallToolResult {
+        self.call("epic_start", args.0.into_envelope()).await
     }
 
     /// Perform one epic scheduler action.

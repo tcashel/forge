@@ -78,12 +78,13 @@ forged run submit --run "$RUN_ID"
 ```
 
 `OBSERVED_REVISION` is the opaque revision in the approved tuple and
-`APPROVAL_FILE` is its strict `forged-execution-approval/1` JSON. Start checks
-the latest Bead revision and complete tuple before any effect, then retains the
-approval in the same ledger transaction as the run. Capture the immutable run
-id returned by `start`; submit that exact id. Do not modify the Bead or
-repository between preflight, freeze, and submit. A successful submit is
-detached: do not poll in this turn.
+`APPROVAL_FILE` is its strict `forged-execution-approval/2` JSON, including
+the exact approved base SHA and definition digests. Start checks the latest
+Bead revision, remote base SHA, and complete content-bound tuple before any
+effect, then retains the approval in the same ledger transaction as the run.
+Capture the immutable run id returned by `start`; submit that exact id. Do not
+modify the Bead or repository between preflight, freeze, and submit. A
+successful submit is detached: do not poll in this turn.
 
 ## Return to the operator
 

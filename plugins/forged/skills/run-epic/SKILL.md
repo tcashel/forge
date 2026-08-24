@@ -48,9 +48,9 @@ warrants more. The profile's loop budget is the stopping rule.
 ## Revision-bound typed handoff
 
 Consume the exact observed epic revision and strict
-`forged-execution-approval/1` scratch file supplied by the execution gate. Do
-not write approval to a Bead comment. The ordered handoff contains no spec-file
-argument:
+`forged-execution-approval/2` scratch file supplied by the execution gate,
+including the exact approved base SHA and definition digests. Do not write
+approval to a Bead comment. The ordered handoff contains no spec-file argument:
 
 ```bash
 PROFILE="${PROFILE:-standard}"
@@ -64,13 +64,14 @@ forged epic start --epic "$EPIC_ID" --repo "$TARGET_REPO" \
 forged epic submit --epic "$EPIC_ID"
 ```
 
-The start atomically checks the epic id, revision, repository, base, profile,
-roster, and `epic-start-submit` action, then retains that approval with the
-frozen epic. `EXECUTION_APPROVAL_MISMATCH` creates no epic or external effect:
-stop for a fresh tuple and never retry unguarded. Use output from `start` to
-verify the frozen inventory and branches before submitting. Submit the exact
-epic id and return immediately; do not build a second watcher loop around the
-durable controller.
+The start atomically checks the epic id, revision, repository, base ref and
+remote SHA, exact profile/roster/package content, and `epic-start-submit`
+action, then retains that approval with the frozen epic.
+`EXECUTION_APPROVAL_MISMATCH` creates no new epic or external effect: stop for
+a fresh tuple and never retry unguarded. Use output from `start` to verify the
+frozen inventory and branches before submitting. Submit the exact epic id and
+return immediately; do not build a second watcher loop around the durable
+controller.
 
 ## Execution and terminal boundary
 

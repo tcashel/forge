@@ -76,7 +76,11 @@ const requiredSkillText = [
   '../dispatch/SKILL.md',
   '../run-epic/SKILL.md',
   '../triage/SKILL.md',
-  'forged-execution-approval/1',
+  'forged-execution-approval/2',
+  'baseSha',
+  'packageSha256',
+  'profileSha256',
+  'rosterSha256',
   'forged definition validate',
   'forged doctor',
   'forged service status',
@@ -906,7 +910,7 @@ check_epic_approval_handoff() {
   local skill=$1
   local token
   for token in \
-    'forged-execution-approval/1' \
+    'forged-execution-approval/2' \
     '--expected-bead-revision "$OBSERVED_REVISION"' \
     '--approval "$APPROVAL_FILE"' \
     'EXECUTION_APPROVAL_MISMATCH' \
