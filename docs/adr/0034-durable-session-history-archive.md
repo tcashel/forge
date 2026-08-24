@@ -116,11 +116,12 @@ log would silently lose exactly the history the archive exists to keep.
 
 **Staged bounded publication.** An event of any size is written through
 bounded staging transactions and made visible by one final publication
-transaction that is metadata-only — it compresses nothing and rewrites no
-blob, so its cost is independent of the bytes the event carried and of the
-archive's size. Every committed read, FTS match, usage aggregation, and
-cursor join excludes staging, and a source cursor advances only inside a
-publication. Compression, hashing, and segmentation happen outside every
+transaction. That transaction is metadata-only: it compresses nothing,
+hashes nothing, and rewrites no blob, and it touches only this event's own
+index rows — so it never scans the archive and never repeats the work
+staging already did. Every committed read, FTS match, usage aggregation,
+and cursor join excludes staging, and a source cursor advances only inside
+a publication. Compression, hashing, and segmentation happen outside every
 transaction.
 
 **Retention and purge.** Missing sources and stale index generations are

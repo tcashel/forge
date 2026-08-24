@@ -451,7 +451,6 @@ dependencies = [
  "libc",
  "rusqlite",
  "sha2",
- "tempfile",
  "thiserror",
  "uuid",
  "zstd",

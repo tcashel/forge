@@ -381,9 +381,10 @@ impl EventIngest<'_> {
     /// Publish the event and advance its source cursor, atomically.
     ///
     /// This is the ONLY transaction that makes anything visible, and the only
-    /// one that moves a cursor. It is metadata-only — it compresses nothing,
-    /// hashes nothing, and rewrites no blob — so its cost is independent of
-    /// how many bytes the event carried and of how large the archive is.
+    /// one that moves a cursor. It is metadata-only: it compresses nothing,
+    /// hashes nothing, and rewrites no blob, and it touches only this event's
+    /// own index rows — so it never scans the archive and never repeats the
+    /// work the staging transactions already did.
     ///
     /// Three outcomes, decided by what is already committed under this
     /// identity: a new event, an exact replay (every staged row is reclaimed
