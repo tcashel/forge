@@ -1,0 +1,69 @@
+name: bd compatibility
+
+on:
+  pull_request:
+    paths:
+      - .github/workflows/bd-compat.yml
+      - .github/workflows/rust.yml
+      - scripts/ci/**
+      - crates/forged-beads/tests/**
+      - crates/forged/tests/support/mod.rs
+      - crates/forged/tests/kill_matrix.rs
+  schedule:
+    - cron: '17 9 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  latest-release:
+    name: latest-release compatibility
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: actions-rust-lang/setup-rust-toolchain@v1
+
+      - name: resolve latest official Linux amd64 release
+        id: release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          release=$(gh api repos/gastownhall/beads/releases/latest)
+          asset=$(jq -cer '
+            [.assets[] | select(.name | test("^beads_[^/]+_linux_amd64\\.tar\\.gz$"))]
+            | if length == 1 then .[0] else error("expected exactly one Linux amd64 archive") end
+          ' <<<"$release")
+          digest=$(jq -er '.digest | select(type == "string")' <<<"$asset")
+          if [[ ! $digest =~ ^sha256:[[:xdigit:]]{64}$ ]]; then
+            echo "latest Linux amd64 asset has no valid SHA-256 digest" >&2
+            exit 1
+          fi
+          echo "release=$(jq -r '.tag_name' <<<"$release")"
+          echo "asset=$(jq -r '.name' <<<"$asset")"
+          echo "url=$(jq -r '.browser_download_url' <<<"$asset")" >> "$GITHUB_OUTPUT"
+          echo "sha256=${digest#sha256:}" >> "$GITHUB_OUTPUT"
+
+      - name: verify and provision latest bd
+        id: latest_bd
+        env:
+          BD_ARCHIVE_URL: ${{ steps.release.outputs.url }}
+          BD_ARCHIVE_SHA256: ${{ steps.release.outputs.sha256 }}
+        run: |
+          bash scripts/ci/provision-bd.sh \
+            "$BD_ARCHIVE_URL" \
+            "$BD_ARCHIVE_SHA256" \
+            "$RUNNER_TEMP/forged-bd-latest"
+
+      - name: require latest bd compatibility candidate
+        run: |
+          echo "FORGED_TEST_BD=${{ steps.latest_bd.outputs.path }}" >> "$GITHUB_ENV"
+          echo "FORGED_REQUIRE_BD=1" >> "$GITHUB_ENV"
+
+      - name: latest real-bd compatibility contract
+        run: |
+          unset FORGED_EXPECT_BD_VERSION
+          cargo test -p forged-beads -- --nocapture
+          cargo test -p forged --features failpoints \
+            real_bd_lease_cycle_against_a_temp_beads_dir -- --exact --nocapture

@@ -160,9 +160,7 @@ impl BdError {
         let haystack = self.haystack();
         let start = haystack.find(CLAIM_REFUSAL_PREFIX)?;
         let fragment = &haystack[start..];
-        let end = fragment
-            .find(['\n', '"'])
-            .unwrap_or(fragment.len());
+        let end = fragment.find(['\n', '"']).unwrap_or(fragment.len());
         Some(fragment[..end].trim_end().to_owned())
     }
 

@@ -16,6 +16,21 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: provision pinned bd 1.2.1
+        id: stable_bd
+        run: |
+          bash scripts/ci/provision-bd.sh \
+            https://github.com/gastownhall/beads/releases/download/v1.2.1/beads_1.2.1_linux_amd64.tar.gz \
+            48aecf42ffdefa6470298d8022deeb762e30c8729dc0a4bdda93888c0b0354e2 \
+            "$RUNNER_TEMP/forged-bd-1.2.1" \
+            1.2.1
+
+      - name: require pinned bd 1.2.1
+        run: |
+          echo "FORGED_TEST_BD=${{ steps.stable_bd.outputs.path }}" >> "$GITHUB_ENV"
+          echo "FORGED_REQUIRE_BD=1" >> "$GITHUB_ENV"
+          echo "FORGED_EXPECT_BD_VERSION=1.2.1" >> "$GITHUB_ENV"
+
       - name: fmt
         run: cargo fmt --all -- --check
 
@@ -28,8 +43,13 @@ jobs:
       - name: test
         run: cargo test --workspace
 
-      # The failpoint kill-matrix — the bd-gated cases SKIP loudly when no
-      # sandboxed bd 1.2.1 binary is present, and the genuine-expiry variant
-      # stays #[ignore]d (run deliberately with FORGED_SLOW_TESTS=1).
+      # The genuine-expiry variant stays #[ignore]d and is run deliberately
+      # with FORGED_SLOW_TESTS=1 rather than on every pull request.
       - name: failpoints
         run: cargo test -p forged --features failpoints
+
+      - name: stable real-bd qualification
+        run: |
+          cargo test -p forged-beads -- --nocapture
+          cargo test -p forged --features failpoints \
+            real_bd_lease_cycle_against_a_temp_beads_dir -- --exact --nocapture
