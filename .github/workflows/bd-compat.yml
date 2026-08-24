@@ -62,8 +62,22 @@ jobs:
           echo "FORGED_REQUIRE_BD=1" >> "$GITHUB_ENV"
 
       - name: latest real-bd compatibility contract
+        id: compatibility
+        continue-on-error: ${{ github.event_name == 'pull_request' }}
         run: |
           unset FORGED_EXPECT_BD_VERSION
           cargo test -p forged-beads -- --nocapture
           cargo test -p forged --features failpoints \
             real_bd_lease_cycle_against_a_temp_beads_dir -- --exact --nocapture
+
+      - name: report latest-release drift
+        if: always() && steps.compatibility.outcome == 'failure'
+        run: |
+          echo "::warning title=Latest bd compatibility drift::The pinned qualification lane remains authoritative; the latest release is incompatible and needs follow-up."
+          cat >> "$GITHUB_STEP_SUMMARY" <<'EOF'
+          ## Latest bd compatibility drift
+
+          The latest upstream `bd` release does not satisfy Forge's real-binary contract.
+          Pull requests stay mergeable against the pinned qualified version; scheduled and
+          manually dispatched canaries still fail until compatibility is restored.
+          EOF
