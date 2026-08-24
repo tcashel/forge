@@ -1051,7 +1051,10 @@ impl ForgedServer {
     }
 
     /// Freeze an epic inventory and child execution defaults.
-    #[tool(name = "epic_start", description = "Start a durable Beads epic run.")]
+    #[tool(
+        name = "epic_start",
+        description = "Start a durable Beads epic. Approved execution passes params.expectedBeadRevision plus a strict forged-execution-approval/1 object in params.approval; Forged validates the exact epic/repository/base/profile/roster/action tuple before effects and retains it atomically with the frozen epic."
+    )]
     pub async fn epic_start(&self, args: Parameters<EnvelopeArgs>) -> CallToolResult {
         self.call("epic_start", args.0).await
     }

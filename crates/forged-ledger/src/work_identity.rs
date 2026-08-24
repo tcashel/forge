@@ -6,9 +6,11 @@
 use std::collections::BTreeMap;
 
 use forged_types::{
-    normalize_repository_path, repository_label, work_display_title, ErrorCode, WorkIdentityBeadV1,
-    WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource, WorkIdentitySubjectKind,
-    WorkIdentitySubjectV1, WorkIdentityV1, WORK_IDENTITY_SCHEMA_V1,
+    normalize_repository_path, repository_label, work_display_title, ErrorCode,
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
+    WorkIdentityBeadV1, WorkIdentityContextV1, WorkIdentityRepositoryV1, WorkIdentitySource,
+    WorkIdentitySubjectKind, WorkIdentitySubjectV1, WorkIdentityV1, EXECUTION_APPROVAL_SCHEMA_V1,
+    WORK_IDENTITY_SCHEMA_V1,
 };
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::Value;
@@ -566,6 +568,19 @@ impl Ledger {
         event: Value,
         identity: WorkIdentityV1,
     ) -> Result<bool, LedgerError> {
+        self.append_epic_started_with_identity_and_approval(epic_id, event, identity, None)
+    }
+
+    /// Append the canonical epic-start event, optional exact execution
+    /// approval, and frozen display identity in one transaction. An exact
+    /// retry returns `false`; a partial or conflicting bundle fails closed.
+    pub fn append_epic_started_with_identity_and_approval(
+        &self,
+        epic_id: &str,
+        event: Value,
+        identity: WorkIdentityV1,
+        approval: Option<ExecutionApprovalV1>,
+    ) -> Result<bool, LedgerError> {
         let epic_id = epic_id.to_owned();
         self.submit(move |conn| {
             identity.validate_for_storage().map_err(|error| {
@@ -612,6 +627,54 @@ impl Ledger {
                     "epic start event repository does not match its identity",
                 ));
             }
+            if let Some(approval) = approval.as_ref() {
+                let mismatch =
+                    |message: String| refused(ErrorCode::ExecutionApprovalMismatch, message);
+                if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1 {
+                    return Err(mismatch(format!(
+                        "unsupported execution approval schema {:?}",
+                        approval.schema
+                    )));
+                }
+                if approval.subject_kind != ExecutionApprovalSubjectKind::Epic
+                    || approval.action != ExecutionApprovalAction::EpicStartSubmit
+                {
+                    return Err(mismatch(
+                        "epic launch approval must authorize an epic-start-submit action"
+                            .to_owned(),
+                    ));
+                }
+                let package: ExecutionPackageV1 = serde_json::from_value(
+                    event
+                        .get("executionPackage")
+                        .cloned()
+                        .ok_or_else(|| mismatch("epic start event has no package".to_owned()))?,
+                )
+                .map_err(|error| mismatch(format!("epic start package is invalid: {error}")))?;
+                let event_base = text(event.get("baseRef"));
+                if approval.bead_id != epic_id
+                    || Some(approval.observed_revision.as_str())
+                        != identity.bead.revision.as_deref()
+                    || approval.repository != event_repository.clone().unwrap_or_default()
+                    || Some(approval.base_ref.as_str()) != event_base.as_deref()
+                    || approval.profile != package.profile_ref
+                    || approval.roster != package.roster_ref
+                {
+                    return Err(mismatch(
+                        "execution approval does not match the frozen epic tuple".to_owned(),
+                    ));
+                }
+                if approval.actor.trim().is_empty()
+                    || approval.basis.trim().is_empty()
+                    || approval.approved_at.parse::<jiff::Timestamp>().is_err()
+                {
+                    return Err(mismatch(
+                        "execution approval requires actor, basis, and an RFC 3339 approvedAt"
+                            .to_owned(),
+                    ));
+                }
+            }
+            let approval_payload = approval.as_ref().map(serde_json::to_value).transpose()?;
 
             let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
             let standing_events = {
@@ -624,16 +687,42 @@ impl Ledger {
             };
             let standing_identity =
                 get_work_identity_tx(&tx, WorkIdentitySubjectKind::Epic, &epic_id)?;
+            let standing_approvals = {
+                let mut statement = tx.prepare(
+                    "SELECT payload_json FROM events WHERE run_id = ?1 \
+                     AND kind = 'forged.epic.execution-approval' ORDER BY event_id",
+                )?;
+                let rows = statement.query_map([&epic_id], |row| row.get::<_, String>(0))?;
+                rows.collect::<Result<Vec<_>, _>>()?
+            };
+            let approval_matches = match (&approval_payload, standing_approvals.as_slice()) {
+                (None, []) => true,
+                (Some(expected), [payload]) => {
+                    serde_json::from_str::<Value>(payload).is_ok_and(|stored| stored == *expected)
+                }
+                _ => false,
+            };
             match (standing_events.as_slice(), standing_identity) {
-                ([], None) => {
+                ([], None) if standing_approvals.is_empty() => {
                     append_event_tx(&tx, Some(&epic_id), "forged.epic.started", &event)?;
+                    if let Some(approval) = approval_payload.as_ref() {
+                        append_event_tx(
+                            &tx,
+                            Some(&epic_id),
+                            "forged.epic.execution-approval",
+                            approval,
+                        )?;
+                    }
                     insert_work_identity_tx(&tx, &identity)?;
                     tx.commit()?;
                     Ok(true)
                 }
                 ([payload], Some(standing)) => {
                     let stored: Value = serde_json::from_str(payload)?;
-                    if stored != event || !identity_replay_matches(&standing, &identity) {
+                    if stored != event
+                        || !approval_matches
+                        || !identity_replay_matches(&standing, &identity)
+                    {
                         return Err(refused(
                             ErrorCode::InvalidRequest,
                             format!("epic {epic_id:?} start replay conflicts with durable bundle"),
