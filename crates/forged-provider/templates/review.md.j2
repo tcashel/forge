@@ -6,7 +6,7 @@ them, and make no GitHub writes. Working directory: {{ worktree }}
 Gather first, each once: `gh pr view {{ pr_number }} --json
 number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url`;
 `gh pr diff {{ pr_number }}` (cap ~60k chars; say so if you cut it);
-`gh pr checks {{ pr_number }} --watch --fail-fast`; and the spec at
+`sh -c 'checks=0; registration_ticks=0; while [ "$registration_ticks" -lt 12 ]; do checks=$(gh pr view "$1" --json statusCheckRollup --jq ".statusCheckRollup | length") || exit; [ "$checks" -gt 0 ] && break; registration_ticks=$((registration_ticks + 1)); sleep 5; done; if [ "$checks" -eq 0 ]; then echo "no GitHub checks registered for PR #$1 within 60s" >&2; exit 1; fi; gh pr checks "$1" --watch --fail-fast --interval 10 & watcher=$!; watch_ticks=0; while kill -0 "$watcher" 2>/dev/null && [ "$watch_ticks" -lt 132 ]; do sleep 5; watch_ticks=$((watch_ticks + 1)); done; if kill -0 "$watcher" 2>/dev/null; then kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :; echo "GitHub checks for PR #$1 did not reach a terminal state within 660s" >&2; exit 124; fi; wait "$watcher"' -- {{ pr_number }}`; and the spec at
 {{ spec_path }}. The
 implementing agent saw ONLY that spec — it is the sole contract you grade
 against.

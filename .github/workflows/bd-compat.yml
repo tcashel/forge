@@ -6,7 +6,9 @@ on:
       - .github/workflows/bd-compat.yml
       - .github/workflows/rust.yml
       - scripts/ci/**
+      - crates/forged-beads/src/**
       - crates/forged-beads/tests/**
+      - crates/forged/tests/bd_helper_contract.rs
       - crates/forged/tests/support/mod.rs
       - crates/forged/tests/kill_matrix.rs
   schedule:

@@ -92,9 +92,10 @@ fn render_succeeds_for_all_three_stages() {
         .expect("review renders");
     assert!(review.contains("#41"));
     assert!(review.contains("specs/bead-1.md"));
+    let expected_checks_command = r#"`sh -c 'checks=0; registration_ticks=0; while [ "$registration_ticks" -lt 12 ]; do checks=$(gh pr view "$1" --json statusCheckRollup --jq ".statusCheckRollup | length") || exit; [ "$checks" -gt 0 ] && break; registration_ticks=$((registration_ticks + 1)); sleep 5; done; if [ "$checks" -eq 0 ]; then echo "no GitHub checks registered for PR #$1 within 60s" >&2; exit 1; fi; gh pr checks "$1" --watch --fail-fast --interval 10 & watcher=$!; watch_ticks=0; while kill -0 "$watcher" 2>/dev/null && [ "$watch_ticks" -lt 132 ]; do sleep 5; watch_ticks=$((watch_ticks + 1)); done; if kill -0 "$watcher" 2>/dev/null; then kill "$watcher" 2>/dev/null || :; wait "$watcher" 2>/dev/null || :; echo "GitHub checks for PR #$1 did not reach a terminal state within 660s" >&2; exit 124; fi; wait "$watcher"' -- 41`"#;
     assert!(
-        review.contains("gh pr checks 41 --watch --fail-fast"),
-        "review waits for a terminal CI result instead of sampling pending checks"
+        review.contains(expected_checks_command),
+        "review waits for checks to register and then watches them to a bounded terminal result"
     );
 
     let findings = vec![
