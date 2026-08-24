@@ -1071,6 +1071,7 @@ pub(super) async fn recover_abandoned(
                 crate::adapters::ports::ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
             let report =
                 forged_proto::reconcile(&ctx.ledger, id, &ports, &config, &now_iso()).await?;
+            super::drive::settle_stage_deadlines(ctx, id, &report.deadline_exceeded).await?;
             crate::adapters::ports::report_json(&report)
         }
         Scope::Epic => {

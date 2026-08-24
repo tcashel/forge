@@ -1644,6 +1644,7 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             let now = now_iso();
             let report =
                 forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now).await?;
+            super::drive::settle_stage_deadlines(ctx, &run_id, &report.deadline_exceeded).await?;
             Ok(json!({"report": report_json(&report)}))
         }
     })

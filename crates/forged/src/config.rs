@@ -340,10 +340,10 @@ fn default_gate_commands() -> Vec<String> {
 
 fn default_stage_budget_s() -> HashMap<Stage, u64> {
     HashMap::from([
-        (Stage::Implement, 1800),
+        (Stage::Implement, 5400),
         (Stage::ReviewClaude, 1800),
         (Stage::ReviewCodex, 1800),
-        (Stage::Fix, 1800),
+        (Stage::Fix, 3600),
     ])
 }
 
@@ -1283,8 +1283,8 @@ mod tests {
     fn partial_stage_budgets_overlay_the_legacy_defaults() {
         let budgets = resolve_stage_budget_s(Some(HashMap::from([(Stage::Implement, 42)])));
         assert_eq!(budgets[&Stage::Implement], 42);
-        for stage in [Stage::ReviewClaude, Stage::ReviewCodex, Stage::Fix] {
-            assert_eq!(budgets[&stage], 1800, "missing {stage:?} keeps its default");
-        }
+        assert_eq!(budgets[&Stage::ReviewClaude], 1800);
+        assert_eq!(budgets[&Stage::ReviewCodex], 1800);
+        assert_eq!(budgets[&Stage::Fix], 3600);
     }
 }

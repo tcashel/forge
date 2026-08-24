@@ -53,9 +53,9 @@ fn reclaim_older_than(stage_budget_s: u64) -> u64 {
 /// variables — budgets and gate commands arrive here explicitly.
 #[derive(Debug, Clone)]
 pub struct ReconcileConfig {
-    /// Per-stage wall-clock budget, seconds; drives the ladder's budget rung
-    /// and `reclaim_older_than(stage_budget_s)`. No default — callers supply
-    /// it (tests use 1800).
+    /// Legacy per-stage wall-clock budget, seconds. Current packets carry
+    /// their immutable budget in `WorkPacket.contract`; this map remains the
+    /// recovery source only for definition-less rows with a legacy body.
     ///
     /// AMENDED (operator-adjudicated 2026-08-12): `HashMap` for the same
     /// reason as [`crate::RunView::roster`] — the merged
@@ -99,6 +99,10 @@ pub struct ReconcileReport {
     /// Attempts left `revoking` after a reclaim refusal shape; resumed next
     /// pass.
     pub deferred: Vec<i64>,
+    /// Deadline-scoped attempts whose providers are confirmed dead. They
+    /// intentionally remain `revoking` until the owning run is terminal so
+    /// a recovery pass can never open an automatic successor.
+    pub deadline_exceeded: Vec<i64>,
 }
 
 /// What [`land_packet_result`] did with a result.
@@ -218,17 +222,26 @@ pub async fn reconcile(
     };
 
     for attempt in live {
-        let stage = {
+        let packet = {
             let packet_id = attempt.packet_id.clone();
             on_ledger(ledger, move |l| {
                 l.get_packet(&packet_id).map_err(ProtoError::Ledger)
             })
             .await?
-            .stage
         };
-        let budget = *config.stage_budget_s.get(&stage).ok_or_else(|| {
-            ProtoError::Projection(format!("no stage budget for stage {stage:?}"))
-        })?;
+        // Current packets carry the immutable budget in their stored stage
+        // contract. Definition-less legacy rows predate that body shape;
+        // preserve their existing config-backed recovery rather than making
+        // an upgrade strand them forever.
+        let budget = match crate::stored_packet(&packet) {
+            Ok(stored) => u64::from(stored.contract.budget_s),
+            Err(_) => *config.stage_budget_s.get(&packet.stage).ok_or_else(|| {
+                ProtoError::Projection(format!(
+                    "packet {:?} has neither a stored nor legacy {:?} stage budget",
+                    packet.packet_id, packet.stage
+                ))
+            })?,
+        };
 
         match attempt.state {
             // A revoking row skips the liveness ladder entirely: the durable
@@ -236,6 +249,19 @@ pub async fn reconcile(
             // of WHICHEVER order placed the marker, which is what the
             // marker's scope records.
             AttemptState::Revoking => match attempt.revoke_scope {
+                // A deadline is a whole-run terminal decision. Confirm the
+                // provider dead, but keep the attempt revoking until the
+                // core has stopped the run; `stopped` on an active run would
+                // make this packet successor-ready.
+                Some(RevokeScope::Deadline) => {
+                    ports
+                        .kill_confirmed(&attempt.claimant)
+                        .await
+                        .map_err(|source| {
+                            port_failure(attempt.attempt_id, "kill_confirmed", source)
+                        })?;
+                    report.deadline_exceeded.push(attempt.attempt_id);
+                }
                 // An operator's stop that could not confirm death. Finishing
                 // it through the bead-scoped order instead would reclaim the
                 // shared lease on an attempt-local operation's behalf: the
@@ -252,28 +278,35 @@ pub async fn reconcile(
                 }
             },
             AttemptState::Running => {
-                let liveness = ports
-                    .liveness(&attempt.claimant)
-                    .await
-                    .map_err(|source| port_failure(attempt.attempt_id, "liveness", source))?;
-                let (dead, reason) = match liveness {
-                    SessionLiveness::Running => {
-                        // Budget override: a live session past its stage
-                        // budget is hung.
-                        let anchor = attempt
-                            .last_heartbeat_at
-                            .as_deref()
-                            .unwrap_or(&attempt.started_at);
-                        let anchor_ts = parse_stamp(anchor)?;
-                        let over = now_ts.as_second().saturating_sub(anchor_ts.as_second())
-                            > i64::try_from(budget).unwrap_or(i64::MAX);
-                        (over, "stage budget exceeded".to_owned())
-                    }
-                    SessionLiveness::Exited(code) => (
+                let started = parse_stamp(&attempt.started_at)?;
+                let budget_i64 = i64::try_from(budget).unwrap_or(i64::MAX);
+                let deadline_reached =
+                    now_ts.as_second().saturating_sub(started.as_second()) >= budget_i64;
+                let (dead, reason, scope) = if deadline_reached {
+                    (
                         true,
-                        format!("session exited ({code}) without landing a result"),
-                    ),
-                    SessionLiveness::Vanished => (true, "session vanished".to_owned()),
+                        format!(
+                            "stage deadline exceeded: startedAt={} budgetS={} asOf={now}",
+                            attempt.started_at, budget
+                        ),
+                        RevokeScope::Deadline,
+                    )
+                } else {
+                    let liveness = ports
+                        .liveness(&attempt.claimant)
+                        .await
+                        .map_err(|source| port_failure(attempt.attempt_id, "liveness", source))?;
+                    match liveness {
+                        SessionLiveness::Running => (false, String::new(), RevokeScope::Bead),
+                        SessionLiveness::Exited(code) => (
+                            true,
+                            format!("session exited ({code}) without landing a result"),
+                            RevokeScope::Bead,
+                        ),
+                        SessionLiveness::Vanished => {
+                            (true, "session vanished".to_owned(), RevokeScope::Bead)
+                        }
+                    }
                 };
                 if !dead {
                     report.left_running.push(attempt.attempt_id);
@@ -284,11 +317,32 @@ pub async fn reconcile(
                 // terminal-state refusal means we raced someone.
                 let revoked: Result<(), LedgerError> = {
                     let attempt_id = attempt.attempt_id;
-                    on_ledger(ledger, move |l| Ok(l.revoke_attempt(attempt_id, &reason))).await?
+                    on_ledger(ledger, move |l| {
+                        Ok(l.revoke_attempt_scoped(attempt_id, &reason, scope))
+                    })
+                    .await?
                 };
                 match revoked {
                     Ok(()) => {
-                        revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
+                        let current = get_attempt(ledger, attempt.attempt_id).await?;
+                        match current.revoke_scope {
+                            Some(RevokeScope::Deadline) => {
+                                ports.kill_confirmed(&current.claimant).await.map_err(
+                                    |source| {
+                                        port_failure(current.attempt_id, "kill_confirmed", source)
+                                    },
+                                )?;
+                                report.deadline_exceeded.push(current.attempt_id);
+                            }
+                            Some(RevokeScope::Attempt) => {
+                                let settled = stop_order(ledger, ports, &current).await?;
+                                note_terminal(settled, current.attempt_id, &mut report);
+                            }
+                            Some(RevokeScope::Bead) | None => {
+                                revoke_order(ledger, ports, &run, &current, budget, &mut report)
+                                    .await?;
+                            }
+                        }
                     }
                     Err(err) if err.code() == ErrorCode::InvalidRequest => {
                         // A racing reconciler finished the saga, or a racing
