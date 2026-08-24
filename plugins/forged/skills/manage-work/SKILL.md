@@ -186,10 +186,11 @@ target-only exact Bead read and confirm its revision still equals
 `observedRevision`. Do not mix a portfolio or ready-frontier listing into this
 preflight. Pass the revision and scratch approval file to the typed start; the
 ledger validates the complete tuple and retains the approval atomically with
-the run. `EXECUTION_APPROVAL_MISMATCH` means no run or external effect was
-created and requires a fresh tuple. Slice dispatch passes the exact pair as
-`--expected-bead-revision` and `--approval`; never downgrade to an unguarded
-start after a mismatch.
+the run or epic-start bundle. `EXECUTION_APPROVAL_MISMATCH` means no run,
+epic, or external effect was created and requires a fresh tuple. Both slice
+and epic dispatch pass the exact pair as `--expected-bead-revision` and
+`--approval`; never downgrade to an unguarded start or write an approval
+comment after a mismatch.
 
 Before promising unattended continuation, run only the installed CLI's
 read-only `forged doctor` and `forged service status`. Do not install, start,
@@ -198,9 +199,10 @@ restart, or repair the service here.
 For a slice, follow `../dispatch/SKILL.md` and invoke exactly one
 revision-bound typed start and one submit using the returned run id. After
 approval, the only allowed sequence is target preflight, start, submit: no
-portfolio query, critique, comment, or unrelated work may intervene. For an epic, follow
-`../run-epic/SKILL.md`, verify the frozen inventory, and invoke exactly one
-typed start and submit. Perform no Bead or repository mutation between them.
+portfolio query, critique, comment, or unrelated work may intervene. For an
+epic, follow `../run-epic/SKILL.md` and invoke exactly one revision-bound typed
+start and one submit. The start response itself is the frozen-inventory
+readback; perform no Bead or repository mutation between them.
 Return the sibling skill's durable identifiers and reconnect commands, then
 stop without polling, watching, or resubmitting.
 

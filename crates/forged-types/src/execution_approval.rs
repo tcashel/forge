@@ -27,8 +27,9 @@ pub enum ExecutionApprovalAction {
     EpicStartSubmit,
 }
 
-/// One immutable operator approval. The run-start boundary checks every
-/// execution coordinate before retaining this record with the run bundle.
+/// One immutable operator approval. The run- and epic-start boundaries check
+/// every execution coordinate before retaining this record with the launch
+/// bundle.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ExecutionApprovalV1 {

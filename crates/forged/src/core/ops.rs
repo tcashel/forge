@@ -311,7 +311,7 @@ async fn prepare_run_start(
     })
 }
 
-fn approval_param_present(params: &serde_json::Map<String, Value>) -> bool {
+pub(super) fn approval_param_present(params: &serde_json::Map<String, Value>) -> bool {
     params
         .get("expectedBeadRevision")
         .is_some_and(|value| !value.is_null())
