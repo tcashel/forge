@@ -13,7 +13,7 @@ pub(crate) fn now_iso() -> String {
 
 /// Normalize an RFC-3339 UTC string (as jiff displays it) to exactly nine
 /// fractional digits before the trailing `Z`.
-fn widen_fraction(s: &str) -> String {
+pub(crate) fn widen_fraction(s: &str) -> String {
     let body = s.strip_suffix('Z').unwrap_or(s);
     let mut out = String::with_capacity(30);
     match body.find('.') {

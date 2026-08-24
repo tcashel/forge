@@ -20,19 +20,48 @@
 //! next reconcile pass resumes it through the bead-scoped reclaim the stop
 //! exists to avoid.
 
-use forged_types::{new_claim_token, ErrorCode, PacketResult};
+use forged_types::{
+    new_claim_token, ErrorCode, PacketColumns, PacketResult, SpecRef, Stage, WorkPacket,
+};
 use rusqlite::{Connection, OptionalExtension, TransactionBehavior};
 use serde_json::json;
 
-use crate::error::{column_decode_error, refused, LedgerError};
+use crate::error::{column_decode_error, internal, refused, LedgerError};
 use crate::events::append_event_tx;
 use crate::ledger::Ledger;
-use crate::time::now_iso;
-use crate::types::{AttemptRow, AttemptState, ClaimedAttempt, RevokeScope, RunState, SpecFence};
+use crate::time::{now_iso, widen_fraction};
+use crate::types::{
+    AttemptRow, AttemptState, ClaimedAttempt, CompletePacketOutcome, RevokeScope, RunState,
+    SpecFence,
+};
 
 pub(crate) const ATTEMPT_COLUMNS: &str =
     "attempt_id, packet_id, claim_token, claimant, state, revoke_reason, revoke_scope, \
      fail_note, result_json, started_at, updated_at, last_heartbeat_at, ended_at";
+
+fn stage_name(stage: Stage) -> &'static str {
+    match stage {
+        Stage::Implement => "implement",
+        Stage::ReviewClaude => "reviewclaude",
+        Stage::ReviewCodex => "reviewcodex",
+        Stage::Fix => "fix",
+    }
+}
+
+fn stage_deadline(started_at: &str, budget_s: u32) -> Result<String, LedgerError> {
+    let started = started_at.parse::<jiff::Timestamp>().map_err(|error| {
+        internal(format!(
+            "invalid attempt start timestamp {started_at:?}: {error}"
+        ))
+    })?;
+    let deadline = jiff::Timestamp::from_nanosecond(
+        started
+            .as_nanosecond()
+            .saturating_add(i128::from(budget_s).saturating_mul(1_000_000_000)),
+    )
+    .map_err(|error| internal(format!("stage deadline out of range: {error}")))?;
+    Ok(widen_fraction(&deadline.to_string()))
+}
 
 /// Decode a stored `attempts.state`, failing CLOSED: only the six DDL CHECK
 /// strings are accepted, and `running` in particular must be stored
@@ -533,6 +562,88 @@ impl Ledger {
             )?;
             tx.commit()?;
             Ok(())
+        })
+    }
+
+    /// Atomically land a result only while the exact attempt remains before
+    /// the immutable deadline stored in its packet body. The trusted `asOf`
+    /// is minted inside the same immediate transaction as either transition:
+    /// `running -> completed` before the deadline, or `running -> revoking`
+    /// with deadline scope at/after it. No caller-supplied clock or mutable
+    /// process config participates in the decision.
+    pub fn complete_packet_before_deadline(
+        &self,
+        packet_id: &str,
+        claim_token: &str,
+        result: &PacketResult,
+    ) -> Result<CompletePacketOutcome, LedgerError> {
+        let packet_id = packet_id.to_owned();
+        let claim_token = claim_token.to_owned();
+        let result_json = serde_json::to_string(result);
+        self.submit(move |conn| {
+            let result_json = result_json?;
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let attempt = running_attempt_for(&tx, &packet_id, &claim_token)?;
+            let row = crate::packets::get_packet_tx(&tx, &packet_id)?;
+            let packet = WorkPacket::from_stored_body(
+                &row.body_json,
+                PacketColumns {
+                    packet_id: row.packet_id,
+                    run_id: row.run_id,
+                    stage: row.stage,
+                    seq: row.seq,
+                    spec: SpecRef {
+                        path: row.spec_path,
+                        sha256: row.spec_sha256,
+                        revision: row.spec_revision,
+                    },
+                },
+            )?;
+            let now = now_iso();
+            let deadline = stage_deadline(&attempt.started_at, packet.contract.budget_s)?;
+            if now >= deadline {
+                let reason = format!(
+                    "stage deadline exceeded: attemptId={} stage={} startedAt={} budgetS={} deadlineAt={} asOf={now}",
+                    attempt.attempt_id,
+                    stage_name(packet.stage),
+                    attempt.started_at,
+                    packet.contract.budget_s,
+                    deadline,
+                );
+                tx.execute(
+                    "UPDATE attempts SET state = 'revoking', revoke_reason = ?1, \
+                     revoke_scope = 'deadline', updated_at = ?2 WHERE attempt_id = ?3",
+                    rusqlite::params![reason, now, attempt.attempt_id],
+                )?;
+                attempt_event(
+                    &tx,
+                    attempt.attempt_id,
+                    &packet_id,
+                    Some(AttemptState::Running),
+                    AttemptState::Revoking,
+                    Some(&reason),
+                )?;
+                tx.commit()?;
+                return Ok(CompletePacketOutcome::Deadline { reason });
+            }
+
+            tx.execute(
+                "UPDATE attempts SET state = 'completed', result_json = ?1, \
+                 updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
+                rusqlite::params![result_json, now, attempt.attempt_id],
+            )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt.attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt.attempt_id, &now)?;
+            attempt_event(
+                &tx,
+                attempt.attempt_id,
+                &packet_id,
+                Some(AttemptState::Running),
+                AttemptState::Completed,
+                None,
+            )?;
+            tx.commit()?;
+            Ok(CompletePacketOutcome::Completed)
         })
     }
 

@@ -1474,6 +1474,15 @@ pub struct AttemptRow {
     pub ended_at: Option<String>,
 }
 
+/// The atomic result of completing a packet under its stored stage deadline.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum CompletePacketOutcome {
+    /// The result committed before the immutable deadline.
+    Completed,
+    /// The same transaction marked the attempt deadline-revoking instead.
+    Deadline { reason: String },
+}
+
 /// Immutable filesystem evidence joined one-to-one with an attempt.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AttemptArtifactRow {

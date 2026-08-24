@@ -1637,7 +1637,7 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     .ok_or_else(|| Failure::invalid("missing required param \"attempt\""))?;
                 let claim_token = param_str(&params, "claimToken")?.to_owned();
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-                let outcome = forged_proto::land_packet_result(
+                let outcome = forged_proto::land_packet_result_before_deadline(
                     &ctx.ledger,
                     &ports,
                     &run_id,
@@ -1650,6 +1650,9 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                 Ok(match outcome {
                     forged_proto::LandOutcome::Completed => json!({"outcome": "Landed"}),
                     forged_proto::LandOutcome::Quarantined => json!({"outcome": "Quarantined"}),
+                    forged_proto::LandOutcome::Deadline { reason } => {
+                        json!({"outcome": "Deadline", "reason": reason})
+                    }
                 })
             }
         },
@@ -1789,9 +1792,7 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                 gate_commands: view.policy.gate_commands,
             };
-            let now = now_iso();
-            let report =
-                forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now).await?;
+            let report = super::drive::reconcile_guarded(ctx, &run_id, &ports, &config).await?;
             super::drive::settle_stage_deadlines(ctx, &run_id, &report.deadline_exceeded).await?;
             Ok(json!({"report": report_json(&report)}))
         }

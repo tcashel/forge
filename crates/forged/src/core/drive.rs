@@ -735,15 +735,7 @@ async fn honor_await(
                             .collect(),
                         gate_commands: view.policy.gate_commands.clone(),
                     };
-                    let now = now_iso();
-                    let report = forged_proto::reconcile(
-                        &ctx.ledger,
-                        &view.run.run_id,
-                        ports,
-                        &config,
-                        &now,
-                    )
-                    .await?;
+                    let report = reconcile_guarded(ctx, &view.run.run_id, ports, &config).await?;
                     settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded)
                         .await?;
                     return Ok(Honored::Progressed);
@@ -766,10 +758,7 @@ async fn honor_await(
                         .collect(),
                     gate_commands: view.policy.gate_commands.clone(),
                 };
-                let now = now_iso();
-                let report =
-                    forged_proto::reconcile(&ctx.ledger, &view.run.run_id, ports, &config, &now)
-                        .await?;
+                let report = reconcile_guarded(ctx, &view.run.run_id, ports, &config).await?;
                 settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded).await?;
                 Ok(Honored::Progressed)
             }
@@ -888,6 +877,22 @@ async fn settle_stage_deadlines_inner(
         None => super::settlement::settle(ctx, run_id, settlement).await?,
     };
     Ok(true)
+}
+
+/// Serialize every reconciler revocation against the packet start fence.
+/// `run_attempt` holds the same run slot from its final authorization read
+/// through durable provider identity, so reconcile either revokes first (and
+/// the start read refuses) or observes only after the start effect is owned.
+pub(crate) async fn reconcile_guarded(
+    ctx: &Ctx,
+    run_id: &str,
+    ports: &ForgedPorts,
+    config: &forged_proto::ReconcileConfig,
+) -> Result<forged_proto::ReconcileReport, Failure> {
+    let _submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
+    forged_proto::reconcile(&ctx.ledger, run_id, ports, config, &now_iso())
+        .await
+        .map_err(Into::into)
 }
 
 fn pid_alive(pid: i32) -> bool {

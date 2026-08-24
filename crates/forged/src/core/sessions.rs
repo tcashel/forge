@@ -602,6 +602,11 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
         None,
         {
             move |_operation_id| async move {
+                // Linearize an operator revocation against the provider's
+                // final read/start critical section. Whichever owns the run
+                // slot first is authoritative; there is no read/start gap in
+                // which this marker can land unseen.
+                let submit_guard = super::handoff::acquire_run_submit(ctx, &run_id).await?;
                 let reason = param_str(&params, "reason")?.to_owned();
                 // Step 1: the durable marker commits BEFORE the kill, and
                 // carries the scope that decides who may resume it.
@@ -613,7 +618,16 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
                 let state = if marker.revoke_scope == Some(RevokeScope::Deadline) {
-                    super::drive::settle_stage_deadlines(ctx, &run_id, &[attempt_id]).await?;
+                    // Recovery's held-lock settlement seam preserves this
+                    // exact revocation/start fence without recursively
+                    // acquiring the non-reentrant run slot.
+                    super::drive::settle_stage_deadlines_held(
+                        ctx,
+                        &run_id,
+                        &[attempt_id],
+                        &submit_guard,
+                    )
+                    .await?;
                     on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
                         .await?
                         .state

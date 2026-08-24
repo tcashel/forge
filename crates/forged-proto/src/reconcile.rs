@@ -27,7 +27,8 @@
 use std::collections::HashMap;
 
 use forged_ledger::{
-    AttemptRow, AttemptState, EffectClass, Ledger, LedgerError, OperationRow, RevokeScope, RunRow,
+    AttemptRow, AttemptState, CompletePacketOutcome, EffectClass, Ledger, LedgerError,
+    OperationRow, RevokeScope, RunRow,
 };
 use forged_types::{ErrorCode, OperationRequest, OperationResponse, Outcome, PacketResult, Stage};
 use serde_json::{json, Value};
@@ -106,12 +107,18 @@ pub struct ReconcileReport {
 }
 
 /// What [`land_packet_result`] did with a result.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum LandOutcome {
     /// The ledger accepted the completion.
     Completed,
     /// The fence refused the stale token; the bytes went to quarantine.
     Quarantined,
+    /// The atomic completion transaction found the stored deadline reached;
+    /// it marked the attempt deadline-revoking and quarantined the late bytes.
+    Deadline {
+        /// Canonical reason committed with the deadline revocation marker.
+        reason: String,
+    },
 }
 
 /// Run one blocking closure against the ledger without holding anything
@@ -138,6 +145,33 @@ fn port_failure(attempt_id: i64, step: &str, source: PortError) -> ProtoError {
 fn parse_stamp(s: &str) -> Result<jiff::Timestamp, ProtoError> {
     s.parse()
         .map_err(|err| ProtoError::Projection(format!("cannot parse timestamp {s:?}: {err}")))
+}
+
+async fn quarantine_result(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    result: &PacketResult,
+    reason: String,
+) -> Result<(), ProtoError> {
+    let body = serde_json::to_vec(result)
+        .map_err(|err| ProtoError::Projection(format!("cannot serialize refused result: {err}")))?;
+    ports
+        .quarantine(run_id, attempt_id, "result.json", &body)
+        .await
+        .map_err(|source| port_failure(attempt_id, "quarantine", source))?;
+    let event = ProtoEvent::Quarantine {
+        packet_id: packet_id.to_owned(),
+        attempt_id,
+        reason,
+        name: Some("result.json".to_owned()),
+        result: Some(result.clone()),
+    };
+    let run_id = run_id.to_owned();
+    on_ledger(ledger, move |l| record(l, &run_id, event)).await?;
+    Ok(())
 }
 
 /// The public result-landing seam every caller lands a packet result
@@ -169,23 +203,70 @@ pub async fn land_packet_result(
     match landed {
         Ok(()) => Ok(LandOutcome::Completed),
         Err(err) if err.code() == ErrorCode::StaleClaimToken => {
-            let body = serde_json::to_vec(result).map_err(|err| {
-                ProtoError::Projection(format!("cannot serialize refused result: {err}"))
-            })?;
-            ports
-                .quarantine(run_id, attempt_id, "result.json", &body)
-                .await
-                .map_err(|source| port_failure(attempt_id, "quarantine", source))?;
-            let event = ProtoEvent::Quarantine {
-                packet_id: packet_id.to_owned(),
+            quarantine_result(
+                ledger,
+                ports,
+                run_id,
+                packet_id,
                 attempt_id,
-                // The required `reason` is the fence's refusal, verbatim.
-                reason: err.to_string(),
-                name: Some("result.json".to_owned()),
-                result: Some(result.clone()),
-            };
-            let run_id = run_id.to_owned();
-            on_ledger(ledger, move |l| record(l, &run_id, event)).await?;
+                result,
+                err.to_string(),
+            )
+            .await?;
+            Ok(LandOutcome::Quarantined)
+        }
+        Err(err) => Err(ProtoError::Ledger(err)),
+    }
+}
+
+/// Deadline-authoritative result landing. The ledger reads the exact attempt
+/// and the stored packet contract, mints `asOf`, and transitions in one
+/// transaction, so no awaited artifact or operation work can open a
+/// check-to-complete window. Late bytes are preserved in quarantine.
+pub async fn land_packet_result_before_deadline(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    claim_token: &str,
+    result: &PacketResult,
+) -> Result<LandOutcome, ProtoError> {
+    let landed: Result<CompletePacketOutcome, LedgerError> = {
+        let packet_id = packet_id.to_owned();
+        let claim_token = claim_token.to_owned();
+        let result = result.clone();
+        on_ledger(ledger, move |l| {
+            Ok(l.complete_packet_before_deadline(&packet_id, &claim_token, &result))
+        })
+        .await?
+    };
+    match landed {
+        Ok(CompletePacketOutcome::Completed) => Ok(LandOutcome::Completed),
+        Ok(CompletePacketOutcome::Deadline { reason }) => {
+            quarantine_result(
+                ledger,
+                ports,
+                run_id,
+                packet_id,
+                attempt_id,
+                result,
+                reason.clone(),
+            )
+            .await?;
+            Ok(LandOutcome::Deadline { reason })
+        }
+        Err(err) if err.code() == ErrorCode::StaleClaimToken => {
+            quarantine_result(
+                ledger,
+                ports,
+                run_id,
+                packet_id,
+                attempt_id,
+                result,
+                err.to_string(),
+            )
+            .await?;
             Ok(LandOutcome::Quarantined)
         }
         Err(err) => Err(ProtoError::Ledger(err)),

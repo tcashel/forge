@@ -8,8 +8,8 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::Duration;
 
-use forged_host::{ProcessHost, SessionHost};
-use forged_ledger::{AttemptRow, EffectClass, RevokeScope, RunRow};
+use forged_host::{PreparedSession, ProcessHost, SessionHost};
+use forged_ledger::{AttemptRow, AttemptState, EffectClass, RevokeScope, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PromptStage, PromptTemplates, ProviderDriver,
@@ -71,6 +71,13 @@ pub enum PacketOutcome {
     Deadline { attempt_id: i64, reason: String },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum AttemptEffectFence {
+    Authorized,
+    Revoked,
+    Deadline(String),
+}
+
 fn stage_deadline(started_at: &str, budget_s: u32) -> Result<String, Failure> {
     let started = started_at.parse::<jiff::Timestamp>().map_err(|error| {
         Failure::internal(format!(
@@ -86,24 +93,35 @@ fn stage_deadline(started_at: &str, budget_s: u32) -> Result<String, Failure> {
     Ok(forged_proto::widen_rfc3339(&deadline.to_string()))
 }
 
+fn deadline_reason_at(
+    packet: &WorkPacket,
+    attempt: &AttemptRow,
+    as_of: &str,
+) -> Result<Option<String>, Failure> {
+    let deadline = stage_deadline(&attempt.started_at, packet.contract.budget_s)?;
+    if as_of < deadline.as_str() {
+        return Ok(None);
+    }
+    let reason = format!(
+        "stage deadline exceeded: attemptId={} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
+        attempt.attempt_id,
+        stage_str(packet.stage),
+        attempt.started_at,
+        packet.contract.budget_s,
+        deadline,
+    );
+    Ok(Some(reason))
+}
+
 async fn deadline_reason(
     ctx: &Ctx,
     packet: &WorkPacket,
     attempt_id: i64,
 ) -> Result<Option<(AttemptRow, String)>, Failure> {
     let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
-    let deadline = stage_deadline(&attempt.started_at, packet.contract.budget_s)?;
-    let as_of = now_iso();
-    if as_of < deadline {
+    let Some(reason) = deadline_reason_at(packet, &attempt, &now_iso())? else {
         return Ok(None);
-    }
-    let reason = format!(
-        "stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
-        stage_str(packet.stage),
-        attempt.started_at,
-        packet.contract.budget_s,
-        deadline,
-    );
+    };
     Ok(Some((attempt, reason)))
 }
 
@@ -115,6 +133,88 @@ async fn revoke_deadline(ctx: &Ctx, attempt_id: i64, reason: &str) -> Result<boo
     .await?;
     let current = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
     Ok(current.revoke_scope == Some(RevokeScope::Deadline))
+}
+
+/// Re-read the exact attempt at an effect boundary. Admission is asserted
+/// first, then the immutable deadline is evaluated from a fresh local clock
+/// with no further await on the authorized path. A revocation, desired-control
+/// change, or deadline reached during preparation cannot authorize a provider
+/// start or result.
+async fn attempt_effect_fence(
+    ctx: &Ctx,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    claim_token: &str,
+) -> Result<AttemptEffectFence, Failure> {
+    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    if attempt.claim_token != claim_token || attempt.state != AttemptState::Running {
+        return Ok(if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+            AttemptEffectFence::Deadline(
+                attempt
+                    .revoke_reason
+                    .unwrap_or_else(|| format!("stage deadline exceeded for attempt {attempt_id}")),
+            )
+        } else {
+            AttemptEffectFence::Revoked
+        });
+    }
+    let token = claim_token.to_owned();
+    match on_ledger(&ctx.ledger, move |ledger| {
+        ledger.assert_admitted_attempt_live(&token)
+    })
+    .await
+    {
+        Ok(()) => {}
+        Err(error) if error.code == ErrorCode::StaleClaimToken => {
+            let current =
+                on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+            return Ok(if current.revoke_scope == Some(RevokeScope::Deadline) {
+                AttemptEffectFence::Deadline(
+                    current.revoke_reason.unwrap_or_else(|| {
+                        format!("stage deadline exceeded for attempt {attempt_id}")
+                    }),
+                )
+            } else {
+                AttemptEffectFence::Revoked
+            });
+        }
+        Err(error) => return Err(error),
+    }
+
+    if let Some(reason) = deadline_reason_at(packet, &attempt, &now_iso())? {
+        return Ok(if revoke_deadline(ctx, attempt_id, &reason).await? {
+            AttemptEffectFence::Deadline(reason)
+        } else {
+            AttemptEffectFence::Revoked
+        });
+    }
+
+    Ok(AttemptEffectFence::Authorized)
+}
+
+/// Roll back a reserved host session after the final effect fence refuses.
+/// Herdr ownership was already durable by this point, so mark that exact pane
+/// as command-not-started before asking the host to close it. The rollback is
+/// attempted even if the durable cleanup marker itself fails.
+async fn rollback_fenced_start(
+    ctx: &Ctx,
+    host: &Arc<dyn SessionHost>,
+    prepared: PreparedSession,
+    ownership_id: Option<&str>,
+) -> Result<(), Failure> {
+    let cleanup = if let Some(ownership_id) = ownership_id {
+        let ownership_id = ownership_id.to_owned();
+        on_ledger(&ctx.ledger, move |ledger| {
+            ledger
+                .request_abandoned_owned_herdr_cleanup(&ownership_id)
+                .map(|_| ())
+        })
+        .await
+    } else {
+        Ok(())
+    };
+    host.rollback_prepared(prepared).await;
+    cleanup
 }
 
 /// SHA-256 hex over a file's bytes.
@@ -893,14 +993,15 @@ async fn run_attempt(
     let claim_token = claim_token.to_owned();
     let run_root = ctx.config.run_dir(&run_id);
 
-    // Recovered claims can already be over budget before a provider is
-    // spawned. Fence them from the same immutable start + stored packet
-    // contract used by the live loop.
-    if let Some((_attempt, reason)) = deadline_reason(ctx, packet, attempt_id).await? {
-        if revoke_deadline(ctx, attempt_id, &reason).await? {
-            return Ok(PacketOutcome::Deadline { attempt_id, reason });
+    // Recovered claims can already be over budget or revoked before any
+    // provider-facing preparation. Fence them from the same immutable start
+    // and stored packet contract used at every later effect boundary.
+    match attempt_effect_fence(ctx, packet, attempt_id, &claim_token).await? {
+        AttemptEffectFence::Authorized => {}
+        AttemptEffectFence::Revoked => return Ok(PacketOutcome::Revoked),
+        AttemptEffectFence::Deadline(reason) => {
+            return Ok(PacketOutcome::Deadline { attempt_id, reason })
         }
-        return Ok(PacketOutcome::Revoked);
     }
 
     // 1. Everything between the claim and the spawn. The attempt is already
@@ -1347,6 +1448,44 @@ async fn run_attempt(
     crate::core::herdr_layout::finish_mutation(ctx, layout_mutation.take(), Some(&prepared), None)
         .await;
     failpoint::hit("provider.ownership.register.after");
+
+    // Preparation, host reservation, ownership registration, projection,
+    // and layout release all await after the attempt's first deadline read.
+    // Re-read the exact attempt only after that work and immediately before
+    // the non-idempotent start effect. The submit guard excludes desired
+    // control transitions across this final read/start boundary; the attempt
+    // state also catches a concurrent reconciler's durable revocation.
+    let start_fence = match attempt_effect_fence(ctx, &packet, attempt_id, &claim_token).await {
+        Ok(fence) => fence,
+        Err(error) => {
+            rollback_fenced_start(
+                ctx,
+                &host,
+                prepared,
+                ownership
+                    .as_ref()
+                    .map(|identity| identity.ownership_id.as_str()),
+            )
+            .await?;
+            return Err(error);
+        }
+    };
+    if start_fence != AttemptEffectFence::Authorized {
+        rollback_fenced_start(
+            ctx,
+            &host,
+            prepared,
+            ownership
+                .as_ref()
+                .map(|identity| identity.ownership_id.as_str()),
+        )
+        .await?;
+        return Ok(match start_fence {
+            AttemptEffectFence::Authorized => unreachable!("checked above"),
+            AttemptEffectFence::Revoked => PacketOutcome::Revoked,
+            AttemptEffectFence::Deadline(reason) => PacketOutcome::Deadline { attempt_id, reason },
+        });
+    }
     let spawned = host.start(prepared).await;
     failpoint::hit("provider.spawn.after");
     let session = match spawned {
@@ -1648,6 +1787,12 @@ async fn run_attempt(
         handle.abort();
     }
 
+    // `alive` may observe a terminal sentinel on its first poll. That path
+    // used to skip the running-loop deadline check and could land a result
+    // produced after the immutable deadline. Fence the terminal observation
+    // with the same exact timestamp comparison before interpreting output.
+    let terminal_fence = attempt_effect_fence(ctx, &packet, attempt_id, &claim_token).await?;
+
     // The shell sentinel is the runner exit. Its closed status proves the
     // provider termination/capture split without admitting renderer output
     // into execution truth. A missing or mismatched status is transport on
@@ -1718,6 +1863,34 @@ async fn run_attempt(
     )
     .await;
 
+    match terminal_fence {
+        AttemptEffectFence::Authorized => {}
+        AttemptEffectFence::Revoked => {
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "revoked",
+                &json!({"note": "attempt authorization was revoked before result settlement"}),
+                &session_evidence,
+            )
+            .await?;
+            return Ok(PacketOutcome::Revoked);
+        }
+        AttemptEffectFence::Deadline(reason) => {
+            crate::core::artifacts::materialize_and_join(
+                ctx,
+                &packet,
+                attempt_id,
+                "deadline",
+                &json!({"reason": &reason}),
+                &session_evidence,
+            )
+            .await?;
+            return Ok(PacketOutcome::Deadline { attempt_id, reason });
+        }
+    }
+
     // 6. Harvest per the extraction contract.
     let harvest = if let Some(note) = provider_stream_transport {
         Harvest::Transport(note)
@@ -1757,6 +1930,17 @@ async fn run_attempt(
     )
     .await?;
     failpoint::hit("provider.result.recorded.after");
+
+    // Harvesting and durable evidence publication also await. A result may
+    // land only while the exact attempt remains authorized and strictly
+    // before the same immutable deadline used at start and terminal exit.
+    match attempt_effect_fence(ctx, &packet, attempt_id, &claim_token).await? {
+        AttemptEffectFence::Authorized => {}
+        AttemptEffectFence::Revoked => return Ok(PacketOutcome::Revoked),
+        AttemptEffectFence::Deadline(reason) => {
+            return Ok(PacketOutcome::Deadline { attempt_id, reason })
+        }
+    }
 
     // 7. Settle. Every arm BINDS rather than returns, so the three settle
     // paths share one exit and none of them can skip the release below.
@@ -1851,7 +2035,7 @@ pub async fn land_result(
             let claim_token = claim_token.to_owned();
             let result = result.clone();
             move |_op_id| async move {
-                let outcome = forged_proto::land_packet_result(
+                let outcome = forged_proto::land_packet_result_before_deadline(
                     &ledger,
                     ports,
                     &run_id,
@@ -1864,19 +2048,21 @@ pub async fn land_result(
                 Ok(match outcome {
                     LandOutcome::Completed => json!({"outcome": "Landed"}),
                     LandOutcome::Quarantined => json!({"outcome": "Quarantined"}),
+                    LandOutcome::Deadline { reason } => {
+                        json!({"outcome": "Deadline", "reason": reason})
+                    }
                 })
             }
         },
     )
     .await;
     if resp.ok {
-        let landed = resp
+        let outcome = resp
             .result
             .as_ref()
             .and_then(|r| r.get("outcome"))
-            .and_then(Value::as_str)
-            == Some("Landed");
-        if landed {
+            .and_then(Value::as_str);
+        if outcome == Some("Landed") {
             if let Outcome::Review {
                 verdict,
                 findings,
@@ -1919,6 +2105,15 @@ pub async fn land_result(
                 .await?;
             }
             Ok(PacketOutcome::Landed(Box::new(result)))
+        } else if outcome == Some("Deadline") {
+            let reason = resp
+                .result
+                .as_ref()
+                .and_then(|value| value.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("stage deadline exceeded while landing result")
+                .to_owned();
+            Ok(PacketOutcome::Deadline { attempt_id, reason })
         } else {
             Ok(PacketOutcome::Quarantined)
         }
@@ -2049,6 +2244,7 @@ mod settle_tests {
 
     const RUN_ID: &str = "run-release";
     const PANE_ID: &str = "w1:p7";
+    const DEADLINE_CROSS_DELAY: Duration = Duration::from_millis(1_250);
 
     /// Every method the mock was asked for, in arrival order.
     type MethodLog = Arc<Mutex<Vec<String>>>;
@@ -2057,6 +2253,8 @@ mod settle_tests {
     enum MockBehavior {
         RefuseClose,
         LoseSendResponse,
+        DelayPreparePastDeadline,
+        DelayStartResponsePastDeadline,
     }
 
     /// A protocol-19 Herdr exercising either a refused cleanup or the
@@ -2084,6 +2282,13 @@ mod settle_tests {
                             // Drop the response after observing the request:
                             // the client cannot know whether Herdr accepted it.
                             return;
+                        }
+                        if (method == "pane.split"
+                            && matches!(behavior, MockBehavior::DelayPreparePastDeadline))
+                            || (method == "pane.send_input"
+                                && matches!(behavior, MockBehavior::DelayStartResponsePastDeadline))
+                        {
+                            tokio::time::sleep(DEADLINE_CROSS_DELAY).await;
                         }
                         let frame = match method.as_str() {
                             "ping" => json!({"id": id, "result": {"type": "pong",
@@ -2312,7 +2517,11 @@ mod settle_tests {
         packet_dir: PathBuf,
     }
 
-    async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
+    async fn claimed_fixture_with_budget(
+        root: &Path,
+        socket: &Path,
+        budget_s: u64,
+    ) -> ClaimedFixture {
         write_bd_stub(&root.join("bd"), root);
         std::fs::create_dir_all(root.join("beads")).expect("beads dir");
 
@@ -2366,7 +2575,7 @@ mod settle_tests {
             bead_context: Vec::new(),
         };
         let packet =
-            build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600).expect("packet");
+            build_packet(&ctx, &run, &intent, &source, &resolved, &[], budget_s).expect("packet");
         std::fs::create_dir_all(&packet.worktree).expect("worktree");
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {
@@ -2412,6 +2621,10 @@ mod settle_tests {
             claim_token: claimed.claim_token,
             packet_dir,
         }
+    }
+
+    async fn claimed_fixture(root: &Path, socket: &Path) -> ClaimedFixture {
+        claimed_fixture_with_budget(root, socket, 600).await
     }
 
     #[tokio::test]
@@ -2535,6 +2748,222 @@ mod settle_tests {
             "a settled attempt must advertise no attach command: {settled}"
         );
         assert_eq!(settled["layoutId"], layout_id);
+    }
+
+    #[tokio::test]
+    async fn preparation_that_crosses_the_deadline_never_starts_the_provider() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::DelayPreparePastDeadline);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
+
+        let outcome = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("expired preparation settles through the typed deadline path");
+
+        assert!(matches!(outcome, PacketOutcome::Deadline { .. }));
+        let methods = seen.lock().expect("method log").clone();
+        assert!(
+            !methods.iter().any(|method| method == "pane.send_input"),
+            "no provider effect may cross the final deadline fence: {methods:?}"
+        );
+        assert!(
+            methods.iter().any(|method| method == "pane.close"),
+            "the prepared pane must be rolled back: {methods:?}"
+        );
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt row");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Revoking);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert!(attempt.ended_at.is_none());
+        let owned = fixture
+            .ledger
+            .find_owned_herdr_attempt(fixture.attempt_id, &fixture.claim_token)
+            .expect("ownership lookup")
+            .expect("durable prepared pane");
+        assert_eq!(
+            owned.cleanup_reason,
+            Some(forged_ledger::OwnedHerdrCleanupReason::CommandNotStarted)
+        );
+        assert_eq!(
+            owned.cleanup_state,
+            forged_ledger::OwnedHerdrCleanupState::Pending
+        );
+    }
+
+    #[tokio::test]
+    async fn external_reconcile_cannot_revoke_between_final_read_and_start() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::DelayPreparePastDeadline);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 600).await;
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+
+        let drive = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        );
+        let reconcile = async {
+            wait_for(&seen, "pane.split").await;
+            let response = crate::core::dispatch(
+                &fixture.ctx,
+                "reconcile",
+                OperationRequest {
+                    schema_version: 1,
+                    idempotency_key: String::new(),
+                    run_id: None,
+                    params: json!({"run": RUN_ID}).as_object().cloned().expect("params"),
+                },
+            )
+            .await;
+            assert!(
+                seen.lock()
+                    .expect("method log")
+                    .iter()
+                    .any(|method| method == "pane.send_input"),
+                "reconcile returned before the guarded provider start: {response:?}"
+            );
+        };
+        let provider = async {
+            wait_for(&seen, "pane.send_input").await;
+            play_provider(
+                attempt_dirs.attempt_path(),
+                attempt_dirs.status(),
+                claude_capture(&fixture.packet_id),
+            )
+            .await;
+        };
+
+        let (drive, (), ()) = tokio::join!(drive, reconcile, provider);
+        assert!(
+            drive.is_ok(),
+            "the serialized race must remain a valid attempt outcome: {drive:?}"
+        );
+        assert_eq!(
+            seen.lock()
+                .expect("method log")
+                .iter()
+                .filter(|method| method.as_str() == "pane.send_input")
+                .count(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn terminal_result_observed_after_deadline_cannot_land() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let seen = start_mock_herdr(&socket, MockBehavior::DelayStartResponsePastDeadline);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 1).await;
+        let attempt_dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+
+        let drive = run_attempt(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            &fixture.resolved,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        );
+        let provider = async {
+            wait_for(&seen, "pane.send_input").await;
+            play_provider(
+                attempt_dirs.attempt_path(),
+                attempt_dirs.status(),
+                claude_capture(&fixture.packet_id),
+            )
+            .await;
+        };
+        let (outcome, ()) = tokio::join!(drive, provider);
+        let outcome = outcome.expect("late terminal result settles through deadline");
+
+        assert!(matches!(outcome, PacketOutcome::Deadline { .. }));
+        assert_eq!(
+            seen.lock()
+                .expect("method log")
+                .iter()
+                .filter(|method| method.as_str() == "pane.send_input")
+                .count(),
+            1,
+            "the provider starts once, then its late result is refused"
+        );
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt row");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Revoking);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert!(
+            attempt.result_json.is_none(),
+            "a result observed after the deadline must never complete the packet"
+        );
+    }
+
+    #[tokio::test]
+    async fn landing_transaction_marks_and_quarantines_a_late_result_atomically() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let _seen = start_mock_herdr(&socket, MockBehavior::RefuseClose);
+        let fixture = claimed_fixture_with_budget(root.path(), &socket, 0).await;
+        let result = forged_types::PacketResult {
+            schema: "forged.result.implement/1".to_owned(),
+            packet_id: fixture.packet_id.clone(),
+            outcome: Outcome::Implement {
+                implemented: true,
+                commits_ahead: 1,
+                summary: "too late".to_owned(),
+                gate_state: Some("pass".to_owned()),
+                note: None,
+            },
+        };
+
+        let outcome = land_result(
+            &fixture.ctx,
+            &fixture.ports,
+            RUN_ID,
+            &fixture.packet_id,
+            fixture.attempt_id,
+            &fixture.claim_token,
+            result,
+        )
+        .await
+        .expect("deadline-aware landing returns a typed outcome");
+
+        assert!(matches!(outcome, PacketOutcome::Deadline { .. }));
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt row");
+        assert_eq!(attempt.state, forged_ledger::AttemptState::Revoking);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert!(attempt.result_json.is_none());
+        assert!(
+            fixture
+                .ctx
+                .config
+                .run_dir(RUN_ID)
+                .join("quarantine")
+                .join(fixture.attempt_id.to_string())
+                .join("result.json")
+                .is_file(),
+            "late result bytes must be preserved in quarantine"
+        );
     }
 
     #[tokio::test]

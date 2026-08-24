@@ -39,5 +39,6 @@ pub use project::{
     packet_columns, packet_spec, project_run, project_run_with_policy, stored_packet,
 };
 pub use reconcile::{
-    land_packet_result, reconcile, stop_attempt, LandOutcome, ReconcileConfig, ReconcileReport,
+    land_packet_result, land_packet_result_before_deadline, reconcile, stop_attempt, LandOutcome,
+    ReconcileConfig, ReconcileReport,
 };
