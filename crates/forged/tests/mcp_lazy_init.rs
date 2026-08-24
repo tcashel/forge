@@ -82,8 +82,12 @@ fn uninitialized_tool_calls_refuse_with_setup_guidance_and_create_nothing() {
     let mut mcp = McpClient::from_command(bare.forged_cmd(&["mcp"]));
     // A read tool, a mutating tool, and doctor: every dispatch seam sits
     // behind the same gate.
-    for tool in ["work_list", "run_start", "doctor"] {
-        let response = mcp.call_tool(tool, json!({}));
+    for (tool, envelope) in [
+        ("work_list", json!({})),
+        ("run_start", json!({"params": {}})),
+        ("doctor", json!({})),
+    ] {
+        let response = mcp.call_tool(tool, envelope);
         assert_eq!(response["ok"], json!(false), "{tool}: {response}");
         assert_eq!(
             response["error"]["code"],
