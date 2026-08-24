@@ -374,6 +374,13 @@ pub struct EpicStartArgs {
     /// Model roster inherited by child slices.
     #[arg(long)]
     pub roster: Option<String>,
+    /// Exact opaque Beads revision expected at launch.
+    #[arg(long, allow_hyphen_values = true)]
+    pub expected_bead_revision: Option<String>,
+    /// JSON file containing a forged-execution-approval/1 record. Requires
+    /// --expected-bead-revision.
+    #[arg(long)]
+    pub approval: Option<String>,
     /// Override the derived idempotency key.
     #[arg(long)]
     pub idempotency_key: Option<String>,
@@ -1578,21 +1585,46 @@ pub fn to_request(command: Command) -> Result<(&'static str, OperationRequest), 
             ),
         },
         Command::Epic { command } => match command {
-            EpicCmd::Start(a) => (
-                "epic_start",
-                request(
-                    a.idempotency_key,
-                    Some(a.epic.clone()),
-                    json!({
-                        "epic": a.epic,
-                        "repo": a.repo,
-                        "spec": a.spec,
-                        "baseRef": a.base_ref,
-                        "profile": a.profile,
-                        "roster": a.roster,
-                    }),
-                ),
-            ),
+            EpicCmd::Start(a) => {
+                let approval = a
+                    .approval
+                    .as_ref()
+                    .map(|path| {
+                        let text = std::fs::read_to_string(path)
+                            .map_err(|e| format!("cannot read --approval {path}: {e}"))?;
+                        serde_json::from_str::<Value>(&text)
+                            .map_err(|e| format!("--approval {path} is not JSON: {e}"))
+                    })
+                    .transpose()?;
+                let mut params = json!({
+                    "epic": a.epic,
+                    "repo": a.repo,
+                    "spec": a.spec,
+                    "baseRef": a.base_ref,
+                    "profile": a.profile,
+                    "roster": a.roster,
+                })
+                .as_object()
+                .cloned()
+                .expect("epic start params are an object");
+                // Keep absent additions out of the request so existing CLI
+                // calls retain their historical idempotency hash.
+                if let Some(revision) = a.expected_bead_revision {
+                    params.insert("expectedBeadRevision".to_owned(), Value::String(revision));
+                }
+                if let Some(approval) = approval {
+                    params.insert("approval".to_owned(), approval);
+                }
+                (
+                    "epic_start",
+                    OperationRequest {
+                        schema_version: 1,
+                        idempotency_key: a.idempotency_key.unwrap_or_default(),
+                        run_id: Some(a.epic),
+                        params,
+                    },
+                )
+            }
             EpicCmd::Advance(a) => (
                 "epic_advance",
                 request(

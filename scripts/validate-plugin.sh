@@ -902,6 +902,19 @@ check_handoff_block() {
   ' "$1"
 }
 
+check_epic_approval_handoff() {
+  local skill=$1
+  local token
+  for token in \
+    'forged-execution-approval/1' \
+    '--expected-bead-revision "$OBSERVED_REVISION"' \
+    '--approval "$APPROVAL_FILE"' \
+    'EXECUTION_APPROVAL_MISMATCH' \
+    'approval to a Bead comment'; do
+    grep -Fq -- "$token" "$skill" || return 1
+  done
+}
+
 check_reconnect_surface() {
   local path=$1
   shift
@@ -1007,6 +1020,8 @@ check "slice handoff start then submit" check_handoff_block \
   "$plugin/skills/dispatch/SKILL.md" "forged run start" "forged run submit"
 check "epic handoff start then submit" check_handoff_block \
   "$plugin/skills/run-epic/SKILL.md" "forged epic start" "forged epic submit"
+check "epic handoff uses atomic execution approval" check_epic_approval_handoff \
+  "$plugin/skills/run-epic/SKILL.md"
 check "slice reconnect command surface" check_reconnect_surface \
   "$plugin/skills/dispatch/SKILL.md" \
   "forged overview --run" "forged run status --run" \

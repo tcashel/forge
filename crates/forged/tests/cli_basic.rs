@@ -67,6 +67,22 @@ fn help_lists_every_command_and_subcommand_flags() {
             "run start --help must document {flag}"
         );
     }
+    let epic_start = help_text(&env, &["epic", "start", "--help"]);
+    for flag in [
+        "--epic",
+        "--repo",
+        "--base-ref",
+        "--profile",
+        "--roster",
+        "--expected-bead-revision",
+        "--approval",
+        "--idempotency-key",
+    ] {
+        assert!(
+            epic_start.contains(flag),
+            "epic start --help must document {flag}"
+        );
+    }
     let definition = help_text(&env, &["definition", "validate", "--help"]);
     for flag in ["--profile", "--roster", "--idempotency-key"] {
         assert!(

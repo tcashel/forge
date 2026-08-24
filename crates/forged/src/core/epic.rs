@@ -12,9 +12,10 @@ use forged_ledger::{
 };
 use forged_proto::{NextAction, ProtoEvent, Terminal};
 use forged_types::{
-    AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
+    AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode,
+    ExecutionApprovalAction, ExecutionApprovalSubjectKind, ExecutionApprovalV1, ExecutionPackageV1,
     OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
-    WorkIdentityContextV1, WorkIdentitySubjectKind,
+    WorkIdentityContextV1, WorkIdentitySubjectKind, EXECUTION_APPROVAL_SCHEMA_V1,
 };
 use serde_json::{json, Map, Value};
 
@@ -30,6 +31,7 @@ use crate::core::{
 // epic's hold out of exactly those two; every other kind stays private to
 // the scheduler.
 pub(super) const STARTED: &str = "forged.epic.started";
+const EXECUTION_APPROVAL: &str = "forged.epic.execution-approval";
 const INTEGRATION_READY: &str = "forged.epic.integration.ready";
 const WAVE_STARTED: &str = "forged.epic.wave.started";
 const CHILD_STARTED: &str = "forged.epic.child.started";
@@ -91,6 +93,16 @@ struct EpicView {
     pr: Option<Value>,
     roster_revisions: Vec<RosterRevisionV1>,
     cursor: i64,
+}
+
+struct PreparedEpicStart {
+    repo: String,
+    legacy_spec: Option<String>,
+    compiled: crate::config::CompiledDefinition,
+    issue: forged_beads::IssueSummary,
+    epic_spec_sha256: String,
+    children: Vec<Value>,
+    base_ref: String,
 }
 
 fn payload(row: &forged_ledger::EventRow) -> Result<Value, Failure> {
@@ -513,6 +525,161 @@ fn is_no_diff(issue_type: &str) -> bool {
     matches!(issue_type, "chore" | "decision" | "milestone")
 }
 
+async fn prepare_epic_start(
+    ctx: &Ctx,
+    params: &Map<String, Value>,
+    epic: &str,
+) -> Result<PreparedEpicStart, Failure> {
+    let repo = super::work_identity::canonical_repository(param_str(params, "repo")?)?;
+    let legacy_spec = param_opt_str(params, "spec").map(str::to_owned);
+    if let Some(spec) = legacy_spec.as_deref() {
+        if !Path::new(spec).is_absolute() || !Path::new(spec).exists() {
+            return Err(Failure::invalid(format!(
+                "deprecated epic --spec {spec:?} is not an existing absolute path"
+            )));
+        }
+    }
+    let compiled = ctx
+        .config
+        .compile_definition(
+            param_opt_str(params, "profile"),
+            param_opt_str(params, "roster"),
+        )
+        .map_err(|errors| {
+            Failure::invalid(format!(
+                "epic child definition is invalid: {}",
+                serde_json::to_string(&errors).unwrap_or_default()
+            ))
+        })?;
+    let issue = forged_beads::show_issue(&ctx.config.bd_config(), epic).await?;
+    if issue.issue_type != "epic" {
+        return Err(Failure::invalid(format!(
+            "bead {epic} has issue type {:?}, not epic",
+            issue.issue_type
+        )));
+    }
+    let epic_spec = super::spec::resolve_issue(&issue)?;
+    let inventory = forged_beads::epic_children(&ctx.config.bd_config(), epic).await?;
+    if inventory.is_empty() {
+        return Err(Failure::invalid(format!(
+            "epic {epic} has no Beads children"
+        )));
+    }
+    let mut children = Vec::new();
+    for child in inventory {
+        // The bead's own fields win, but only when they are a WHOLE spec. A
+        // child missing either required section falls back to its `spec:`
+        // pointer rather than freezing a fragment as bead-sourced.
+        let no_diff = is_no_diff(&child.issue_type);
+        let child_spec = if no_diff || super::spec::carries_spec(&child) {
+            None
+        } else {
+            let missing = super::spec::missing_spec_fields(&child).join(", ");
+            let pointer = spec_pointer(&child.description).ok_or_else(|| {
+                Failure::invalid(format!(
+                    "epic child {} has no spec: {missing} empty and it carries no spec: pointer",
+                    child.id
+                ))
+            })?;
+            if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
+                return Err(Failure::invalid(format!(
+                    "epic child {} spec {:?} is not an existing absolute path",
+                    child.id, pointer
+                )));
+            }
+            Some(pointer)
+        };
+        children.push(json!({
+            "id": child.id,
+            "title": child.title,
+            "issueType": child.issue_type,
+            "specPath": child_spec,
+            "initiallyClosed": child.status == "closed",
+        }));
+    }
+    let base_ref = match param_opt_str(params, "baseRef") {
+        Some(value) => value.to_owned(),
+        None => super::ops::default_branch_of(&repo).await,
+    };
+    Ok(PreparedEpicStart {
+        repo,
+        legacy_spec,
+        compiled,
+        issue,
+        epic_spec_sha256: epic_spec.sha256,
+        children,
+        base_ref,
+    })
+}
+
+fn validate_epic_start_approval(
+    params: &Map<String, Value>,
+    prepared: &PreparedEpicStart,
+    epic: &str,
+) -> Result<Option<ExecutionApprovalV1>, Failure> {
+    let mismatch =
+        |message: String| Failure::refused(ErrorCode::ExecutionApprovalMismatch, message);
+    let expected = match params.get("expectedBeadRevision") {
+        None | Some(Value::Null) => None,
+        Some(Value::String(value)) if !value.is_empty() => Some(value.as_str()),
+        Some(_) => {
+            return Err(mismatch(
+                "expectedBeadRevision must be a non-empty string".to_owned(),
+            ))
+        }
+    };
+    if let Some(expected) = expected {
+        if prepared.issue.revision.as_deref() != Some(expected) {
+            return Err(mismatch(format!(
+                "bead {epic} revision does not match expectedBeadRevision"
+            )));
+        }
+    }
+
+    let Some(value) = params.get("approval").filter(|value| !value.is_null()) else {
+        return Ok(None);
+    };
+    let expected =
+        expected.ok_or_else(|| mismatch("approval requires expectedBeadRevision".to_owned()))?;
+    let approval: ExecutionApprovalV1 = serde_json::from_value(value.clone()).map_err(|error| {
+        mismatch(format!(
+            "approval is not forged-execution-approval/1: {error}"
+        ))
+    })?;
+    let bead_repository = prepared
+        .issue
+        .metadata
+        .get("repository")
+        .ok_or_else(|| mismatch("bead metadata.repository is missing".to_owned()))?;
+    let bead_repository = super::work_identity::canonical_repository(bead_repository)
+        .map_err(|error| mismatch(format!("bead metadata.repository is invalid: {error}")))?;
+    if approval.schema != EXECUTION_APPROVAL_SCHEMA_V1
+        || approval.subject_kind != ExecutionApprovalSubjectKind::Epic
+        || approval.action != ExecutionApprovalAction::EpicStartSubmit
+        || approval.bead_id != epic
+        || approval.observed_revision != expected
+        || bead_repository != prepared.repo
+        || approval.repository != prepared.repo
+        || approval.base_ref != prepared.base_ref
+        || approval.profile != prepared.compiled.package.profile_ref
+        || approval.roster != prepared.compiled.package.roster_ref
+    {
+        return Err(mismatch(
+            "execution approval does not match bead, repository, base, profile, roster, or action"
+                .to_owned(),
+        ));
+    }
+    if approval.actor.trim().is_empty()
+        || approval.basis.trim().is_empty()
+        || approval.approved_at.parse::<jiff::Timestamp>().is_err()
+    {
+        return Err(mismatch(
+            "execution approval requires actor, basis, and an RFC 3339 approvedAt".to_owned(),
+        ));
+    }
+    Ok(Some(approval))
+}
+
 fn response(resp: OperationResponse) -> Result<Value, Failure> {
     if resp.ok {
         return Ok(resp.result.unwrap_or(Value::Null));
@@ -766,6 +933,22 @@ async fn recover_applied_epic_start(
     else {
         return Ok(None);
     };
+    let expected_approval = params.get("approval").filter(|value| !value.is_null());
+    let approval_events = events
+        .iter()
+        .filter(|event| event.kind == EXECUTION_APPROVAL)
+        .map(payload)
+        .collect::<Result<Vec<_>, _>>()?;
+    let approval_matches = match (expected_approval, approval_events.as_slice()) {
+        (None, []) => true,
+        (Some(expected), [stored]) => stored == expected,
+        _ => false,
+    };
+    if !approval_matches {
+        return Err(Failure::internal(format!(
+            "epic {epic} has a partial or conflicting execution approval bundle"
+        )));
+    }
     // Absence is a torn/corrupt bundle. Never fall through to current Beads
     // and silently manufacture a different display identity.
     super::work_identity::load(ctx, WorkIdentitySubjectKind::Epic, epic).await?;
@@ -802,6 +985,50 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
         Ok(None) => {}
         Err(error) => return err_response(&key, &error),
     }
+    let approval_guarded = super::ops::approval_param_present(&params);
+    if approval_guarded {
+        let name = "epic_start".to_owned();
+        let key_for_lookup = key.clone();
+        let standing = on_ledger(&ctx.ledger, move |ledger| {
+            ledger.find_operation(&name, &key_for_lookup)
+        })
+        .await;
+        match standing {
+            Ok(Some(row)) if row.state == OperationState::Terminal => {
+                return fenced(
+                    ctx,
+                    "epic_start",
+                    EffectClass::SafeRetry,
+                    req,
+                    None,
+                    |_operation| async {
+                        Err(Failure::internal(
+                            "terminal epic_start replay unexpectedly executed",
+                        ))
+                    },
+                )
+                .await;
+            }
+            Ok(_) => {}
+            Err(error) => return err_response(&key, &error),
+        }
+    }
+    // Guarded launches validate against one Beads snapshot before the
+    // operation fence records anything. That exact snapshot and approval are
+    // then moved into the atomic epic-start bundle.
+    let (prepared, approval) = if approval_guarded {
+        let prepared = match prepare_epic_start(ctx, &params, &epic).await {
+            Ok(prepared) => prepared,
+            Err(error) => return err_response(&key, &error),
+        };
+        let approval = match validate_epic_start_approval(&params, &prepared, &epic) {
+            Ok(approval) => approval,
+            Err(error) => return err_response(&key, &error),
+        };
+        (Some(prepared), approval)
+    } else {
+        (None, None)
+    };
     let result = safe_effect(
         ctx,
         "epic_start",
@@ -823,81 +1050,25 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                         // or unavailable Bead.
                         return Ok(landed);
                     }
+                    if approval.is_some() {
+                        return Err(Failure::refused(
+                            ErrorCode::ExecutionApprovalMismatch,
+                            format!("epic {epic} was already started by a different operation"),
+                        ));
+                    }
                     return status_json(ctx, project(ctx, &epic).await?).await;
                 }
-                let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
-                let legacy_spec = param_opt_str(&params, "spec").map(str::to_owned);
-                if let Some(spec) = legacy_spec.as_deref() {
-                    if !Path::new(spec).is_absolute() || !Path::new(spec).exists() {
-                        return Err(Failure::invalid(format!(
-                            "deprecated epic --spec {spec:?} is not an existing absolute path"
-                        )));
-                    }
-                }
-                let compiled = ctx
-                    .config
-                    .compile_definition(
-                        param_opt_str(&params, "profile"),
-                        param_opt_str(&params, "roster"),
-                    )
-                    .map_err(|errors| {
-                        Failure::invalid(format!(
-                            "epic child definition is invalid: {}",
-                            serde_json::to_string(&errors).unwrap_or_default()
-                        ))
-                    })?;
-                let issue = forged_beads::show_issue(&ctx.config.bd_config(), &epic).await?;
-                if issue.issue_type != "epic" {
-                    return Err(Failure::invalid(format!(
-                        "bead {epic} has issue type {:?}, not epic",
-                        issue.issue_type
-                    )));
-                }
-                let epic_spec = super::spec::resolve_issue(&issue)?;
-                let inventory = forged_beads::epic_children(&ctx.config.bd_config(), &epic).await?;
-                if inventory.is_empty() {
-                    return Err(Failure::invalid(format!(
-                        "epic {epic} has no Beads children"
-                    )));
-                }
-                let mut children = Vec::new();
-                for child in inventory {
-                    // The bead's own fields win, but only when they are a
-                    // WHOLE spec. A child missing either required section
-                    // falls back to its `spec:` pointer — the route every
-                    // epic frozen before this used — rather than freezing
-                    // bead-sourced around a fragment.
-                    let no_diff = is_no_diff(&child.issue_type);
-                    let child_spec = if no_diff || super::spec::carries_spec(&child) {
-                        None
-                    } else {
-                        let missing = super::spec::missing_spec_fields(&child).join(", ");
-                        let pointer = spec_pointer(&child.description).ok_or_else(|| {
-                            Failure::invalid(format!(
-                                "epic child {} has no spec: {missing} empty and it carries no \
-                                 spec: pointer",
-                                child.id
-                            ))
-                        })?;
-                        if !Path::new(&pointer).is_absolute() || !Path::new(&pointer).exists() {
-                            return Err(Failure::invalid(format!(
-                                "epic child {} spec {:?} is not an existing absolute path",
-                                child.id, pointer
-                            )));
-                        }
-                        Some(pointer)
-                    };
-                    children.push(json!({
-                        "id": child.id,
-                        "title": child.title,
-                        "issueType": child.issue_type,
-                        "specPath": child_spec,
-                        "initiallyClosed": child.status == "closed",
-                    }));
-                }
-                let base_ref = match param_opt_str(&params, "baseRef") {
-                    Some(value) => value.to_owned(),
-                    None => super::ops::default_branch_of(&repo).await,
+                let PreparedEpicStart {
+                    repo,
+                    legacy_spec,
+                    compiled,
+                    issue,
+                    epic_spec_sha256,
+                    children,
+                    base_ref,
+                } = match prepared {
+                    Some(prepared) => prepared,
+                    None => prepare_epic_start(ctx, &params, &epic).await?,
                 };
                 let integration_branch = format!("forged/epic-{epic}");
                 let identity = super::work_identity::durable_identity(
@@ -918,7 +1089,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "operationId": operation_id,
                     "specSource": "bead",
                     "specRevision": issue.revision,
-                    "specSha256": epic_spec.sha256,
+                    "specSha256": epic_spec_sha256,
                     "specPath": legacy_spec,
                     "deprecatedSpecPath": legacy_spec,
                     "baseRef": base_ref,
@@ -933,10 +1104,11 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 let epic_for_store = epic.clone();
                 let event_for_store = event.clone();
                 on_ledger(&ctx.ledger, move |ledger| {
-                    ledger.append_epic_started_with_identity(
+                    ledger.append_epic_started_with_identity_and_approval(
                         &epic_for_store,
                         event_for_store,
                         identity,
+                        approval,
                     )
                 })
                 .await?;
