@@ -12,6 +12,14 @@
       "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
     },
     {
+      "id": "triage",
+      "request": "Across these projects, group blocked and failed work by root cause and tell me what needs me.",
+      "decision": "triage",
+      "delegate": "triage",
+      "result": "read-only-causal-report",
+      "routerMutationBudget": {"approvalComments": 0, "runStarts": 0, "runSubmits": 0, "epicStarts": 0, "epicSubmits": 0, "controlCalls": 0, "serviceMutations": 0, "providerCalls": 0, "githubWrites": 0}
+    },
+    {
       "id": "explore",
       "request": "Help me think through this idea without recording it yet.",
       "decision": "explore",

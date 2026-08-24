@@ -23,6 +23,7 @@ execution, or an existing-work control become a new submission.
 | Intent | Route | Authority |
 | --- | --- | --- |
 | Observe or explain the portfolio, queue, repository, or what needs attention | `forged operations overview` (deliberately opening the board view routes via `../board/SKILL.md`) | Read only |
+| Triage causes across multiple blocked, stale-looking, failed, or never-started items | Read and follow `../triage/SKILL.md` | Read only |
 | Explain one durable run or epic | Resolve one exact WorkIdentity, then `forged work detail` | Read only |
 | Explore | Discuss or research supplied context | Persist nothing |
 | Plan or revise | Read and follow `../plan/SKILL.md` | Native Bead writes only |
@@ -42,6 +43,12 @@ When a request mixes intents, complete the least-authorized part first. A
 request to “plan and run this” authorizes planning, not execution. A request
 to “resume this epic” can authorize only a landed resume of that already-started
 epic; it never authorizes `epic start` or `epic submit`.
+
+Route only multi-item causal portfolio questions to triage. A status or blocker
+question about one exact durable subject stays on the Operations-to-Work-Detail
+path above. A request to repair a triage batch returns here and refreshes every
+exact identity and authority tuple; the prior read-only snapshot grants no
+mutation authority.
 
 ## Resolve operator and repository scope
 
