@@ -47,6 +47,9 @@
 //! arrival boundary immediately before that operation's submit singleton: a
 //! rival paused there is provably at contention while the holder still owns
 //! the lock.
+//! `deadline.reconcile.settle.before` is after reconcile has durably marked
+//! and kill-confirmed expired attempts but before whole-run settlement. The
+//! run submit singleton must remain held across this exact seam.
 //! `run.start.bundle.after` and `epic.start.bundle.after` sit after the
 //! creation record, compatibility event, and WorkIdentityV1 commit in one
 //! transaction but before the operation response is settled; replay must use

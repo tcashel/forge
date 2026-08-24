@@ -1899,6 +1899,12 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     .ok_or_else(|| Failure::invalid("missing required param \"attempt\""))?;
                 let claim_token = param_str(&params, "claimToken")?.to_owned();
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
+                // The atomic ledger transition can discover that these bytes
+                // arrived after the immutable stage deadline. Hold the run
+                // singleton from that decision through whole-run settlement,
+                // so a public/external seat cannot leave a revoking attempt
+                // and its admission capacity stranded behind a start race.
+                let submit_guard = super::handoff::acquire_run_submit(ctx, &run_id).await?;
                 let outcome = forged_proto::land_packet_result_before_deadline(
                     &ctx.ledger,
                     &ports,
@@ -1909,6 +1915,30 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
                     &result,
                 )
                 .await?;
+                let deadline_attempt = match &outcome {
+                    forged_proto::LandOutcome::Deadline { .. } => Some(attempt_id),
+                    // Adopt a deadline marker that won immediately before
+                    // this guarded landing. Other stale-token causes remain
+                    // quarantines and never gain whole-run authority.
+                    forged_proto::LandOutcome::Quarantined => {
+                        let attempt =
+                            on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
+                                .await?;
+                        (attempt.state == forged_ledger::AttemptState::Revoking
+                            && attempt.revoke_scope == Some(forged_ledger::RevokeScope::Deadline))
+                        .then_some(attempt_id)
+                    }
+                    forged_proto::LandOutcome::Completed => None,
+                };
+                if let Some(deadline_attempt) = deadline_attempt {
+                    super::drive::settle_stage_deadlines_held(
+                        ctx,
+                        &run_id,
+                        &[deadline_attempt],
+                        &submit_guard,
+                    )
+                    .await?;
+                }
                 Ok(match outcome {
                     forged_proto::LandOutcome::Completed => json!({"outcome": "Landed"}),
                     forged_proto::LandOutcome::Quarantined => json!({"outcome": "Quarantined"}),
@@ -2054,8 +2084,10 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
                 stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                 gate_commands: view.policy.gate_commands,
             };
-            let report = super::drive::reconcile_guarded(ctx, &run_id, &ports, &config).await?;
-            super::drive::settle_stage_deadlines(ctx, &run_id, &report.deadline_exceeded).await?;
+            let report = super::drive::reconcile_and_settle_stage_deadlines_guarded(
+                ctx, &run_id, &ports, &config,
+            )
+            .await?;
             Ok(json!({"report": report_json(&report)}))
         }
     })

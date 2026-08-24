@@ -758,9 +758,13 @@ async fn honor_await(
                             .collect(),
                         gate_commands: view.policy.gate_commands.clone(),
                     };
-                    let report = reconcile_guarded(ctx, &view.run.run_id, ports, &config).await?;
-                    settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded)
-                        .await?;
+                    reconcile_and_settle_stage_deadlines_guarded(
+                        ctx,
+                        &view.run.run_id,
+                        ports,
+                        &config,
+                    )
+                    .await?;
                     return Ok(Honored::Progressed);
                 }
                 if wait_allowed {
@@ -781,8 +785,8 @@ async fn honor_await(
                         .collect(),
                     gate_commands: view.policy.gate_commands.clone(),
                 };
-                let report = reconcile_guarded(ctx, &view.run.run_id, ports, &config).await?;
-                settle_stage_deadlines(ctx, &view.run.run_id, &report.deadline_exceeded).await?;
+                reconcile_and_settle_stage_deadlines_guarded(ctx, &view.run.run_id, ports, &config)
+                    .await?;
                 Ok(Honored::Progressed)
             }
         }
@@ -902,20 +906,37 @@ async fn settle_stage_deadlines_inner(
     Ok(true)
 }
 
-/// Serialize every reconciler revocation against the packet start fence.
-/// `run_attempt` holds the same run slot from its final authorization read
-/// through durable provider identity, so reconcile either revokes first (and
-/// the start read refuses) or observes only after the start effect is owned.
-pub(crate) async fn reconcile_guarded(
+/// Reconcile and settle every discovered deadline under one run singleton.
+/// `run_attempt` holds the same slot from its final authorization read through
+/// durable provider identity, so this pass either revokes first and makes the
+/// start read refuse, or observes only after the start effect is owned. The
+/// guard remains held through whole-run terminalization and aftermath; there
+/// is no successor/controller admission window over a deadline-revoking row.
+pub(crate) async fn reconcile_and_settle_stage_deadlines_guarded(
     ctx: &Ctx,
     run_id: &str,
     ports: &ForgedPorts,
     config: &forged_proto::ReconcileConfig,
 ) -> Result<forged_proto::ReconcileReport, Failure> {
-    let _submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
-    forged_proto::reconcile(&ctx.ledger, run_id, ports, config, &now_iso())
-        .await
-        .map_err(Into::into)
+    let submit_guard = super::handoff::acquire_run_submit(ctx, run_id).await?;
+    reconcile_and_settle_stage_deadlines_held(ctx, run_id, ports, config, &submit_guard).await
+}
+
+/// The same atomic lifecycle seam for callers that already own the exact run
+/// singleton. Keeping this explicit prevents session/submit recovery from
+/// recursively contending on the non-reentrant slot.
+pub(crate) async fn reconcile_and_settle_stage_deadlines_held(
+    ctx: &Ctx,
+    run_id: &str,
+    ports: &ForgedPorts,
+    config: &forged_proto::ReconcileConfig,
+    submit_guard: &super::handoff::SubmitGuard,
+) -> Result<forged_proto::ReconcileReport, Failure> {
+    submit_guard.verify(super::handoff::Scope::Run, run_id)?;
+    let report = forged_proto::reconcile(&ctx.ledger, run_id, ports, config, &now_iso()).await?;
+    crate::failpoint::hit("deadline.reconcile.settle.before");
+    settle_stage_deadlines_held(ctx, run_id, &report.deadline_exceeded, submit_guard).await?;
+    Ok(report)
 }
 
 fn pid_alive(pid: i32) -> bool {

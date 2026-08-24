@@ -11,7 +11,6 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::adapters::ports::{report_json, ForgedPorts};
-use crate::config::now_iso;
 use crate::core::{
     default_key, derive_key, err_response, fenced, on_ledger, param_opt_str, param_str, read_only,
     Ctx, Failure,
@@ -639,9 +638,18 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                     gate_commands: view.policy.gate_commands,
                 };
-                let report =
-                    forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())
-                        .await?;
+                // The named stop and its sibling sweep share this exact run
+                // singleton. Any sibling whose immutable deadline is found
+                // owns a whole-run terminal decision and is settled before
+                // the guard can admit another start/controller transition.
+                let report = super::drive::reconcile_and_settle_stage_deadlines_held(
+                    ctx,
+                    &run_id,
+                    &ports,
+                    &config,
+                    &submit_guard,
+                )
+                .await?;
                 Ok(json!({
                     "attemptId": attempt_id,
                     "runId": run_id,
