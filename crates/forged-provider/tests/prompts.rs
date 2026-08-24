@@ -92,6 +92,10 @@ fn render_succeeds_for_all_three_stages() {
         .expect("review renders");
     assert!(review.contains("#41"));
     assert!(review.contains("specs/bead-1.md"));
+    assert!(
+        review.contains("gh pr checks 41 --watch --fail-fast"),
+        "review waits for a terminal CI result instead of sampling pending checks"
+    );
 
     let findings = vec![
         RenderedFinding {

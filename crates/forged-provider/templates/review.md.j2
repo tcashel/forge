@@ -6,7 +6,8 @@ them, and make no GitHub writes. Working directory: {{ worktree }}
 Gather first, each once: `gh pr view {{ pr_number }} --json
 number,title,body,headRefName,baseRefName,additions,deletions,changedFiles,url`;
 `gh pr diff {{ pr_number }}` (cap ~60k chars; say so if you cut it);
-`gh pr checks {{ pr_number }}`; and the spec at {{ spec_path }}. The
+`gh pr checks {{ pr_number }} --watch --fail-fast`; and the spec at
+{{ spec_path }}. The
 implementing agent saw ONLY that spec — it is the sole contract you grade
 against.
 
