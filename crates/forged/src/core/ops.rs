@@ -10,7 +10,7 @@ use forged_ledger::{
     EffectClass, InventorySnapshot, InventoryUsage, InventoryUsageSelection, NewRun,
     NewRunDefinition, OperationState, RunState,
 };
-use forged_provider::{CodexDriver, ProviderDriver};
+use forged_provider::{CodexDriver, PiDriver, ProviderDriver};
 use forged_types::{
     request_sha256, AttentionCondition, AttentionItemV1, AttentionResolutionDisposition,
     AttentionState, ErrorCode, ExecutionApprovalAction, ExecutionApprovalSubjectKind,
@@ -59,7 +59,17 @@ pub async fn doctor(ctx: &Ctx, req: &OperationRequest) -> OperationResponse {
                 Err(f) => f.message.clone(),
             },
         }));
-        for binary in ["claude", "codex"] {
+        let mut provider_binaries = vec!["claude", "codex"];
+        if ctx.config.rosters.values().any(|roster| {
+            roster
+                .roles
+                .values()
+                .flatten()
+                .any(|candidate| candidate.provider == "pi")
+        }) {
+            provider_binaries.push("pi");
+        }
+        for binary in provider_binaries {
             let found = on_path(binary);
             probes.push(json!({
                 "name": format!("provider-{binary}"),
@@ -2604,6 +2614,7 @@ async fn ingest_capture(
 ) -> Result<u64, Failure> {
     let capture = match provider {
         "codex" => CodexDriver.parse_usage(stdout, model)?,
+        "pi" => PiDriver.parse_usage(stdout, model)?,
         _ => forged_provider::ClaudeDriver.parse_usage(stdout, model)?,
     };
     let mut rows = capture.rows;

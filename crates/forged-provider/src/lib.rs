@@ -1,5 +1,5 @@
-//! forged-provider owns claude/codex invocation lines, packet prompts, and
-//! usage parsers.
+//! forged-provider owns Claude, Codex, and Pi invocation lines, packet
+//! prompts, and usage parsers.
 //!
 //! A driver turns one packet into one invocation contract and parses that
 //! run's captured output into usage rows. The hidden provider-stream runner
@@ -13,6 +13,7 @@ mod claude;
 mod codex;
 mod error;
 mod invocation;
+mod pi;
 mod prompts;
 mod rollout;
 mod session;
@@ -23,6 +24,7 @@ pub use claude::ClaudeDriver;
 pub use codex::CodexDriver;
 pub use error::ProviderError;
 pub use invocation::{Invocation, PacketDirs, ProviderDriver};
+pub use pi::PiDriver;
 pub use prompts::{normalize_findings, PromptStage, PromptTemplates, RenderedFinding};
 pub use rollout::recover_usage_from_rollout;
 pub use session::{ProviderSessionScanner, SessionEvidenceUpdate, SESSION_DISCOVERY_MAX_BYTES};

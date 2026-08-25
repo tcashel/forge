@@ -1,13 +1,15 @@
 ---
 name: setup
-description: "Establish and verify operator-scoped Beads and Forged state for the dual-host Forge plugin without imposing files, hooks, or settings on a target repository. Use for first-time configuration, environment diagnosis, or /forged:setup."
+description: "Establish and verify operator-scoped Beads and Forged state for the Claude, Codex, and Pi Forge package without imposing files, hooks, or settings on a target repository. Use for first-time configuration, environment diagnosis, /forged:setup, or Pi /skill:setup."
 ---
 
 # /forged:setup
 
 Configure the operator environment shared by lead agents and Forged. Setup is
 non-invasive: all durable state lives under `ANVIL_HOME` and `BEADS_DIR`, while
-target repositories are identified by native `metadata.repository`.
+target repositories are identified by native `metadata.repository`. Pi package
+installation provides only skills, extensions, and tools; it never installs the
+Forged binary.
 
 ## Boundaries
 
@@ -17,8 +19,9 @@ target repositories are identified by native `metadata.repository`.
 - Never initialize Beads from a target checkout or add `.beads`, hooks, agent
   files, settings, or workflow files there.
 - Never install or modify shell profiles without explicit operator consent.
-- Setup validates local tools and configuration only. It does not create work,
-  route work, start a run, or contact a separate issue tracker.
+- Setup validates local tools and configuration only. It does not install the
+  Forged binary, create work, route work, start a run, or contact a separate
+  issue tracker.
 
 ## Locate this plugin portably
 

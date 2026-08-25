@@ -198,6 +198,63 @@ pub fn harvest_codex(
     finish(text, expected_schema, packet_id)
 }
 
+/// Harvest a Pi JSON-mode run. A settled stream and its last finalized
+/// assistant message are authoritative; streaming deltas and catalogue cost
+/// never become result evidence.
+pub fn harvest_pi(out_jsonl: &str, expected_schema: &str, packet_id: &str) -> Harvest {
+    let mut settled = false;
+    let mut last_assistant: Option<Value> = None;
+    for line in out_jsonl.lines() {
+        let Ok(event) = serde_json::from_str::<Value>(line) else {
+            continue;
+        };
+        match event.get("type").and_then(Value::as_str) {
+            Some("agent_settled") => settled = true,
+            Some("message_end")
+                if event.pointer("/message/role").and_then(Value::as_str) == Some("assistant") =>
+            {
+                last_assistant = event.get("message").cloned();
+            }
+            _ => {}
+        }
+    }
+    if !settled {
+        return Harvest::Transport("transport: pi stream ended without agent_settled".to_owned());
+    }
+    let Some(message) = last_assistant else {
+        return Harvest::Semantic("pi settled without a final assistant message".to_owned());
+    };
+    let stop_reason = message
+        .get("stopReason")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    if matches!(stop_reason, "error" | "aborted") {
+        let detail = message
+            .get("errorMessage")
+            .and_then(Value::as_str)
+            .unwrap_or(stop_reason);
+        if is_transport_message(detail) || stop_reason == "aborted" {
+            return Harvest::Transport(format!("transport: pi {stop_reason}: {detail}"));
+        }
+        return Harvest::Semantic(format!("pi error: {detail}"));
+    }
+    if stop_reason != "stop" {
+        return Harvest::Semantic(format!(
+            "pi settled with non-final stop reason {stop_reason:?}"
+        ));
+    }
+    let text = message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("text"))
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<Vec<_>>()
+        .join("\n");
+    finish(&text, expected_schema, packet_id)
+}
+
 fn finish(text: &str, expected_schema: &str, packet_id: &str) -> Harvest {
     match extract_forged_result(text, expected_schema, packet_id) {
         Ok(result) => Harvest::Result(Box::new(result)),
@@ -429,6 +486,68 @@ mod tests {
             harvest_codex(stream, None, SCHEMA, PKT),
             Harvest::Semantic(note) if note == "no forged-result block"
         ));
+    }
+
+    #[test]
+    fn pi_requires_settlement_and_reads_the_last_final_assistant() {
+        let result = block(&implement_json(PKT, SCHEMA, 6));
+        let stream = [
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"draft"}],"stopReason":"toolUse"}}),
+            json!({"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":result}],"stopReason":"stop"}}),
+            json!({"type":"agent_settled"}),
+        ]
+        .into_iter()
+        .map(|value| value.to_string())
+        .collect::<Vec<_>>()
+        .join("\n");
+        assert!(matches!(
+            harvest_pi(&stream, SCHEMA, PKT),
+            Harvest::Result(_)
+        ));
+        assert!(matches!(
+            harvest_pi(
+                &stream.replace("{\"type\":\"agent_settled\"}", ""),
+                SCHEMA,
+                PKT
+            ),
+            Harvest::Transport(_)
+        ));
+    }
+
+    #[test]
+    fn pi_terminal_errors_use_the_closed_transport_markers() {
+        for (message, transport) in [("rate limit", true), ("policy refusal", false)] {
+            let stream = format!(
+                "{}\n{}",
+                json!({"type":"message_end","message":{"role":"assistant","content":[],"stopReason":"error","errorMessage":message}}),
+                json!({"type":"agent_settled"})
+            );
+            let harvested = harvest_pi(&stream, SCHEMA, PKT);
+            assert_eq!(matches!(harvested, Harvest::Transport(_)), transport);
+        }
+    }
+
+    #[test]
+    fn pi_refuses_non_final_stop_reasons_even_with_a_result_block() {
+        let result = block(&implement_json(PKT, SCHEMA, 6));
+        for stop_reason in [Some("toolUse"), Some("length"), None] {
+            let mut message = json!({
+                "role": "assistant",
+                "content": [{"type": "text", "text": result}],
+            });
+            if let Some(stop_reason) = stop_reason {
+                message["stopReason"] = json!(stop_reason);
+            }
+            let stream = format!(
+                "{}\n{}",
+                json!({"type": "message_end", "message": message}),
+                json!({"type": "agent_settled"})
+            );
+            assert!(matches!(
+                harvest_pi(&stream, SCHEMA, PKT),
+                Harvest::Semantic(note) if note.contains("non-final stop reason")
+            ));
+        }
     }
 
     #[test]

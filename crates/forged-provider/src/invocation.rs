@@ -17,7 +17,7 @@ use crate::usage::UsageCapture;
 /// wrong driver is a caller bug this crate does not detect and does not
 /// report.
 pub trait ProviderDriver: Send + Sync {
-    /// The driver's stable name: `"claude"` or `"codex"`. Every
+    /// The driver's stable name: `"claude"`, `"codex"`, or `"pi"`. Every
     /// [`crate::UsageRow`] the driver produces carries this as its
     /// `provider`.
     fn name(&self) -> &'static str;
@@ -163,8 +163,9 @@ pub struct Invocation {
     /// The session identifier the caller can correlate on before any
     /// output exists: [`crate::ClaudeDriver`] sets
     /// `Some(claude_session_id(claim_token))` — the same value it embeds
-    /// in `--session-id`; [`crate::CodexDriver`] sets `None` (codex mints
-    /// its thread id at runtime, first observable in `thread.started`).
+    /// in `--session-id`; [`crate::CodexDriver`] and [`crate::PiDriver`] set
+    /// `None` (Codex mints its thread id at runtime, while ephemeral Pi
+    /// packet sessions deliberately publish no native session identity).
     pub session_hint: Option<String>,
 }
 

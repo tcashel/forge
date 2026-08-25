@@ -37,7 +37,8 @@ pub struct ProviderSessionScanner {
 }
 
 impl ProviderSessionScanner {
-    /// Start a scanner for the closed `claude` or `codex` provider name.
+    /// Start a scanner. Claude and Codex can confirm native ids; ephemeral
+    /// Pi packet sessions intentionally settle as unsupported diagnostics.
     pub fn new(provider: impl Into<String>) -> Self {
         Self {
             provider: provider.into(),
@@ -63,6 +64,16 @@ impl ProviderSessionScanner {
     pub fn ingest(&mut self, chunk: &[u8], complete: bool) -> SessionEvidenceUpdate {
         if let Some(outcome) = &self.terminal {
             return outcome.clone();
+        }
+        if self.provider == "pi" {
+            if !complete {
+                return SessionEvidenceUpdate::Pending;
+            }
+            let outcome = SessionEvidenceUpdate::Diagnostic(
+                "Pi packet session is ephemeral; no provider-native session id exists".into(),
+            );
+            self.terminal = Some(outcome.clone());
+            return outcome;
         }
         if !matches!(self.provider.as_str(), "claude" | "codex") {
             let outcome = SessionEvidenceUpdate::Diagnostic(format!(
@@ -209,6 +220,21 @@ mod tests {
                 session_id: id,
                 source: HerdrSessionEvidenceSource::ClaudeOutput,
             }
+        );
+    }
+
+    #[test]
+    fn pi_is_pending_while_live_and_explicitly_ephemeral_at_completion() {
+        let mut scanner = ProviderSessionScanner::new("pi");
+        assert_eq!(
+            scanner.ingest(b"{\"type\":\"agent_start\"}\n", false),
+            SessionEvidenceUpdate::Pending
+        );
+        assert_eq!(
+            scanner.ingest(b"{\"type\":\"agent_settled\"}\n", true),
+            SessionEvidenceUpdate::Diagnostic(
+                "Pi packet session is ephemeral; no provider-native session id exists".into()
+            )
         );
     }
 

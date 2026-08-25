@@ -1,4 +1,6 @@
 target/
+node_modules/
+package-lock.json
 src/web/dist/
 *.log
 .DS_Store

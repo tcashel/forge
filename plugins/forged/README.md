@@ -3,12 +3,13 @@
 **Talk to one agent. Keep the specification in Beads. Manage durable work.**
 
 This Forge-owned plugin is the conversational adapter for the `forged` binary.
-It gives Claude and Codex the same nine capabilities through one shared skill
-tree: automatic conversational routing, planning, proportional critique,
+It gives Claude, Codex, and Pi the same nine capabilities through one shared
+skill tree: automatic conversational routing, planning, proportional critique,
 adjudication, operator setup, slice dispatch, epic handoff, and a deliberate
-board launcher, plus read-only causal portfolio triage. The shared router also
-projects the bounded operator portfolio and invokes landed, target-scoped
-controls without adding another state store.
+board launcher, plus read-only causal portfolio triage. The Pi package adds
+direct custom tools and a btop-inspired terminal cockpit without copying the
+skills or adding another state store. The shared router also projects the
+bounded operator portfolio and invokes landed, target-scoped controls.
 
 ## Ownership
 
@@ -56,6 +57,56 @@ codex plugin marketplace add /absolute/path/to/forge
 codex plugin add forged@forge
 ```
 
+Pi installs the whole Forge checkout as one package while loading only the
+resources named by the root manifest. The Forged binary remains a separate
+operator installation:
+
+```bash
+pi install git:github.com/tcashel/forge@<release-tag>
+# or, while developing a checkout
+pi install /absolute/path/to/forge
+```
+
+Use `/forge` for the native terminal cockpit. It presents work queues,
+attention, 30-day usage trends, and provider attempts directly from Forged's
+bounded JSON projections. Number keys switch views, arrows or vim keys move,
+Enter opens durable detail, and `r` refreshes. Use `/skill:setup`,
+`/skill:plan`, and the other shared skill commands when an explicit command is
+useful.
+
+To run detached packet seats through Pi as well, add an opt-in roster to
+`$ANVIL_HOME/config.yaml` using full Pi model coordinates. A standard-profile
+example is:
+
+```yaml
+rosters:
+  pi-standard:
+    schema: forged.roster/1
+    name: pi-standard
+    roles:
+      implementation:
+      - provider: pi
+        model: anthropic/claude-sonnet-4-5
+        effort: high
+        sandbox: workspaceWrite
+        capabilities: [repositoryRead, repositoryWrite, structuredOutput]
+      review.primary:
+      - provider: pi
+        model: openai-codex/gpt-5.4
+        effort: high
+        sandbox: readOnly
+        capabilities: [repositoryRead, structuredOutput]
+      remediation:
+      - provider: pi
+        model: anthropic/claude-sonnet-4-5
+        effort: high
+        sandbox: workspaceWrite
+        capabilities: [repositoryRead, repositoryWrite, structuredOutput]
+```
+
+Validate it with `forged definition validate --profile standard --roster
+pi-standard`. Pi packet workers keep repository skills and context enabled but
+disable extension code; direct Claude and Codex rosters remain available.
 The Claude manifest registers the `forged mcp` server over stdio, resolving
 the operator-installed `forged` binary from PATH (the host silently skips a
 missing binary; the plugin never installs software). Migration: operators
@@ -66,8 +117,10 @@ run `claude mcp remove forged` once. Until then two registrations spawn the
 same binary and tool-name precedence is host-defined. If the plugin mount
 does not appear, keep or re-add the user-scope entry
 (`claude mcp add forged -- <absolute path to forged> mcp`) and run
-`/forged:setup` to diagnose PATH. The Codex manifest carries no server
-registration; skills there use the CLI read path.
+`/forged:setup` to diagnose PATH. The Codex manifest carries no server registration; skills there use the CLI
+read path. Pi likewise has no MCP connector: its extension registers a small
+native tool set and executes the independently installed `forged` binary with
+argument arrays.
 
 After installation, run `/forged:setup`. Then talk normally: ask the lead agent
 to explore an idea, plan or revise work, critique or adjudicate a Bead, ask

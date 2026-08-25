@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 use forged_provider::{
-    load_provider_stream_status, ClaudeDriver, CodexDriver, PacketDirs, ProviderDriver,
+    load_provider_stream_status, ClaudeDriver, CodexDriver, PacketDirs, PiDriver, ProviderDriver,
     ProviderStreamRenderModeV1, ProviderStreamRequestV1, PROVIDER_STREAM_ARG,
 };
 use forged_types::{
@@ -43,7 +43,7 @@ fn packet(provider: &str, worktree: &Path) -> WorkPacket {
         provider_hints: ProviderHints {
             provider: provider.to_owned(),
             model: "model-1".to_owned(),
-            effort: (provider == "codex").then(|| "high".to_owned()),
+            effort: matches!(provider, "codex" | "pi").then(|| "high".to_owned()),
             sandbox: Sandbox::WorkspaceWrite,
         },
         field_notes: Vec::new(),
@@ -61,10 +61,11 @@ fn make_request(
     std::fs::create_dir_all(dirs.path()).expect("attempt dir");
     std::fs::write(dirs.prompt(), "private prompt").expect("prompt");
     let packet = packet(provider, worktree);
-    let driver: &dyn ProviderDriver = if provider == "claude" {
-        &ClaudeDriver
-    } else {
-        &CodexDriver
+    let driver: &dyn ProviderDriver = match provider {
+        "claude" => &ClaudeDriver,
+        "codex" => &CodexDriver,
+        "pi" => &PiDriver,
+        other => panic!("unsupported provider fixture {other}"),
     };
     let invocation = driver
         .invocation(&packet, &dirs, "claim-private")
@@ -215,6 +216,67 @@ printf '%s\n' '{"type":"thread.started","thread_id":"thread-private"}' '{"type":
     let raw = std::fs::read_to_string(dirs.stdout_working()).expect("raw");
     assert!(raw.contains("thread.started"));
     assert!(!raw.contains("final-message-only"));
+    assert_eq!(
+        load_provider_stream_status(&request, 0)
+            .expect("status")
+            .transport_failure(),
+        None
+    );
+}
+
+#[test]
+fn pi_runner_keeps_project_cognition_and_emits_canonical_json() {
+    let root = tempfile::tempdir().expect("root");
+    let worktree = root.path().join("worktree");
+    let bin_dir = root.path().join("bin");
+    std::fs::create_dir_all(&worktree).expect("worktree");
+    std::fs::create_dir_all(&bin_dir).expect("bin");
+    let (dirs, request) = make_request(
+        root.path(),
+        &worktree,
+        "pi",
+        13,
+        ProviderStreamRenderModeV1::Disabled,
+    );
+    let arguments = root.path().join("pi-arguments");
+    write_shim(
+        &bin_dir.join("pi"),
+        r#"#!/bin/sh
+printf '%s\n' "$@" > "$FORGED_TEST_ARGUMENTS"
+[ "$FORGED_PI_WORKER" = 1 ] || exit 92
+cat >/dev/null
+printf '%s\n' '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":"done"}],"usage":{"input":1,"output":1,"cacheRead":0,"cacheWrite":0},"stopReason":"stop"}}' '{"type":"agent_settled"}'
+"#,
+    );
+    let output = Command::new(binary())
+        .arg(PROVIDER_STREAM_ARG)
+        .arg(dirs.provider_stream_request())
+        .current_dir(&worktree)
+        .env("PATH", shim_path(&bin_dir))
+        .env("FORGED_TEST_ARGUMENTS", &arguments)
+        .output()
+        .expect("private Pi runner");
+    assert_eq!(output.status.code(), Some(0), "stderr={:?}", output.stderr);
+    let args = std::fs::read_to_string(arguments).expect("Pi arguments");
+    for required in [
+        "--mode",
+        "json",
+        "--no-session",
+        "--no-extensions",
+        "--approve",
+        "--thinking",
+        "high",
+    ] {
+        assert!(
+            args.lines().any(|line| line == required),
+            "missing {required}: {args}"
+        );
+    }
+    assert!(!args.lines().any(|line| line == "--no-skills"));
+    assert!(!args.lines().any(|line| line == "--no-context-files"));
+    let raw = std::fs::read_to_string(dirs.stdout_working()).expect("raw");
+    assert!(raw.contains("message_end"));
+    assert!(raw.contains("agent_settled"));
     assert_eq!(
         load_provider_stream_status(&request, 0)
             .expect("status")
