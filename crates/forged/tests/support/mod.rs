@@ -991,8 +991,18 @@ case "$cmd" in
     done < "$state/$epic.children"
     printf ']}\n' ;;
   close)
-    id=$2; printf 'closed' > "$state/$id.status"
-    rm -f "$state/$id.assignee"
+    id=$2
+    actor=$(val --actor "$@")
+    cur=$(cat "$state/$id.assignee" 2>/dev/null || true)
+    # Pinned bd protects an actively leased issue from a different close
+    # actor, and a successful close retains the historical assignee. Forged
+    # must use its guarded status+assignee update when it owns that lease and
+    # needs an atomic close-and-release transition.
+    if [ -n "$cur" ] && [ "$cur" != "$actor" ]; then
+      printf '{"schema_version":1,"data":{"error":"issue already claimed by %s"}}\n' "$cur"
+      exit 1
+    fi
+    printf 'closed' > "$state/$id.status"
     bump_revision "$id"
     printf '{"schema_version":1,"data":['; issue_json "$id"; printf ']}\n' ;;
   ready)

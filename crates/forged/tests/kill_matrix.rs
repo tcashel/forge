@@ -1193,6 +1193,21 @@ fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
         .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
         .count();
     assert_eq!(merges_before, 1, "GitHub received the child merge once");
+    assert_eq!(
+        env.assignee("child-crash").as_deref(),
+        Some("forged:child-crash:0"),
+        "clean settlement keeps the child run's lease until integration"
+    );
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_events(Some("epic-crash"), 0, 65_536)
+            .expect("epic events before recovery")
+            .iter()
+            .all(|event| event.kind != "forged.epic.child.merged"),
+        "the external merge is not yet a durable child transition"
+    );
+    ledger.close().expect("close ledger");
 
     // A different OS process reaps the dead controller slot, releases the
     // interrupted SafeRetry row, observes PR #7 as already merged, records
@@ -1206,6 +1221,28 @@ fn epic_merge_applied_then_controller_crashes_resumes_without_duplicate() {
         .filter(|args| args.starts_with(&["pr".to_owned(), "merge".to_owned(), "7".to_owned()]))
         .count();
     assert_eq!(merges_after, 1, "resume probes instead of re-merging");
+    assert_eq!(
+        env.assignee("child-crash"),
+        None,
+        "integration recovery atomically closes and releases the run lease"
+    );
+    assert_eq!(
+        std::fs::read_to_string(env.beads_dir.join("shim-state/child-crash.status"))
+            .expect("child status"),
+        "closed"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-crash"), 0, 65_536)
+            .expect("epic events after recovery")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.child.merged")
+            .count(),
+        1,
+        "recovery records one child transition"
+    );
+    ledger.close().expect("close ledger");
     let (code, projected) = env.forged(&["epic", "status", "--epic", "epic-crash"]);
     assert_eq!(code, 0, "epic status: {projected}");
     assert!(projected["result"]["children"][0]["merged"].is_object());

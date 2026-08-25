@@ -1976,7 +1976,7 @@ async fn merge_child(
         None,
     );
     let child_id = child.id.clone();
-    let epic_id = config.epic_id.clone();
+    let child_run_id = run.run.run_id.clone();
     safe_effect(
         ctx,
         "epic_child_close",
@@ -1984,13 +1984,16 @@ async fn merge_child(
         &config.epic_id,
         json!({"child": child.id, "pr": pr_number}),
         move |_operation| async move {
-            let issue = forged_beads::close_issue(
-                &ctx.config.bd_config(),
-                &child_id,
-                &format!("forged:{epic_id}"),
-                &format!("clean slice PR #{pr_number} merged into integration branch"),
-            )
-            .await?;
+            // Clean settlement deliberately preserves the child run's lease
+            // until its reviewed PR lands in the integration branch. The
+            // epic coordinates that delivery but never owns the child's
+            // Bead, so close under the exact forged custody identity already
+            // in force and release it in the same guarded write. On replay,
+            // closed+unassigned is success; a successor or foreign holder is
+            // still a mutation-free refusal.
+            let bd = ctx.config.bd_config();
+            let actor = super::lease_identity(&bd, &child_id, &child_run_id).await?;
+            let issue = forged_beads::close_held_issue(&bd, &child_id, &actor).await?;
             Ok(json!({"id": issue.id, "status": issue.status}))
         },
     )
