@@ -382,8 +382,46 @@ pub(crate) async fn run_start_with_definition(
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
             let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
-            let spec = param_opt_str(&params, "spec").map(str::to_owned);
-            let issue = ready_slice_bead(ctx, &bead).await?;
+            let planning = compiled.package.protocol_ref.name == "epic-plan"
+                && compiled.package.protocol_ref.version == 1;
+            let spec = if planning {
+                if params.get("spec").is_some_and(|value| !value.is_null()) {
+                    return Err(Failure::invalid(
+                        "epic-plan internal runs do not accept deprecated spec",
+                    ));
+                }
+                Some(
+                    param_str(&params, "internalSpec")
+                        .map(str::to_owned)
+                        .map_err(|_| {
+                            Failure::invalid("epic-plan internal run requires internalSpec")
+                        })?,
+                )
+            } else {
+                if params
+                    .get("internalSpec")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    return Err(Failure::invalid(
+                        "internalSpec is reserved for runtime-derived epic-plan runs",
+                    ));
+                }
+                param_opt_str(&params, "spec").map(str::to_owned)
+            };
+            let issue = if planning {
+                let issue = super::spec::read_bead(ctx, &bead).await?;
+                if param_opt_str(&params, "epicId") != Some(bead.as_str())
+                    || issue.issue_type != "epic"
+                    || !matches!(issue.status.as_str(), "open" | "in_progress")
+                {
+                    return Err(Failure::invalid(format!(
+                        "epic-plan run must bind to its open parent epic {bead}"
+                    )));
+                }
+                issue
+            } else {
+                ready_slice_bead(ctx, &bead).await?
+            };
             // The spec source is settled BEFORE the run row exists: a bead
             // with no spec, or a spec path that is not there, must never
             // reach a seat as an empty spec.
@@ -392,11 +430,13 @@ pub(crate) async fn run_start_with_definition(
                     if !Path::new(path).exists() {
                         return Err(Failure::invalid(format!("spec {path:?} does not exist")));
                     }
-                    tracing::warn!(
-                        bead = %bead,
-                        spec = %path,
-                        "--spec is deprecated: the bead's own fields are the spec"
-                    );
+                    if !planning {
+                        tracing::warn!(
+                            bead = %bead,
+                            spec = %path,
+                            "--spec is deprecated: the bead's own fields are the spec"
+                        );
+                    }
                     super::spec::SpecSource::File(path.clone())
                 }
                 None => {
@@ -1480,7 +1520,30 @@ pub async fn packet_complete(ctx: &Ctx, req: &mut OperationRequest) -> Operation
         Err(error) => return err_response(&req.idempotency_key, &error),
     };
     if existing.is_none() {
-        if let Err(message) = crate::adapters::extract::validate_implement_gate_state(&result) {
+        let view = match super::drive::project(ctx, &run_id).await {
+            Ok(view) => view,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        };
+        let packet = match view
+            .packets
+            .iter()
+            .find(|packet| packet.packet_id == packet_id)
+            .ok_or_else(|| Failure::invalid(format!("packet {packet_id:?} does not exist")))
+            .and_then(|row| {
+                forged_proto::stored_packet(row).map_err(|error| {
+                    Failure::internal(format!("stored packet body does not parse: {error}"))
+                })
+            }) {
+            Ok(packet) => packet,
+            Err(error) => return err_response(&req.idempotency_key, &error),
+        };
+        if let Err(message) = crate::adapters::extract::validate_result_for_packet(
+            &result,
+            view.execution_package
+                .as_ref()
+                .map(|package| &package.protocol_ref),
+            packet.execution.as_ref().map(|execution| execution.purpose),
+        ) {
             return err_response(&req.idempotency_key, &Failure::invalid(message));
         }
     }

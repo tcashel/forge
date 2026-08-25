@@ -326,13 +326,18 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
              INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, created_at, updated_at)
                VALUES ('fallback-run', 'fallback-bead', '/Users/tripp/repositories/forge', 'main',
                        'forged/fallback-run', 'active', 'fallback-time', 'fallback-time');
+             INSERT INTO runs (run_id, bead_id, repo, base_ref, branch, state, created_at, updated_at)
+               VALUES ('plan-run', 'epic-one', '/Users/tripp/repositories/forge', 'main',
+                       'forged/plan-run', 'active', 'plan-time', 'plan-time');
              INSERT INTO events (ts, run_id, kind, payload_json) VALUES
                ('epic-time', 'epic-one', 'forged.epic.started',
                 '{"epicId":"epic-one","title":"Epic One","repo":"/Users/tripp/repositories/forge","specRevision":-42}'),
                ('spec-time', 'child-run', 'forged.run.spec',
                 '{"runId":"child-run","source":"bead","beadId":"child-bead","beadTitle":"Child Work"}'),
                ('child-time', 'epic-one', 'forged.epic.child.started',
-                '{"childId":"child-bead","runId":"child-run","generation":1}');"#,
+                '{"childId":"child-bead","runId":"child-run","generation":1}'),
+               ('plan-time', 'epic-one', 'forged.epic.plan.started',
+                '{"childId":"stub-bead","runId":"plan-run","generation":1}');"#,
         )
         .expect("seed v14");
     }
@@ -361,6 +366,17 @@ fn migration_015_uses_only_durable_events_and_child_epic_context() {
         "/Users/tripp/repositories/forge"
     );
     assert_eq!(child.source, WorkIdentitySource::Durable);
+    let plan = ledger
+        .get_work_identity(WorkIdentitySubjectKind::Run, "plan-run")
+        .expect("read")
+        .expect("planning identity");
+    assert_eq!(
+        plan.epic,
+        Some(WorkIdentityContextV1 {
+            id: "epic-one".to_owned(),
+            title: Some("Epic One".to_owned()),
+        })
+    );
     let fallback = ledger
         .get_work_identity(WorkIdentitySubjectKind::Run, "fallback-run")
         .expect("read")

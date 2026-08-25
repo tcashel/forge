@@ -56,6 +56,20 @@ pub struct IssueSummary {
     pub updated_at: Option<String>,
 }
 
+/// The complete provider-authored native specification written at one
+/// rolling-planning boundary.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeSpecUpdate {
+    /// Context and exact outcome.
+    pub description: String,
+    /// Observable completion contract.
+    pub acceptance_criteria: String,
+    /// Necessary implementation constraints.
+    pub design: String,
+    /// Instructions and explicit non-goals for the executing agent.
+    pub notes: String,
+}
+
 /// One native Beads dependency coordinate carried by a hydrated plan row.
 ///
 /// This is deliberately only identity and current status. Forged does not
@@ -1160,6 +1174,73 @@ pub async fn epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummar
 pub async fn ready_issues(cfg: &BdConfig) -> Result<Vec<IssueSummary>, BdError> {
     let data = invoke::read(cfg, &["ready", "--json"]).await?;
     Ok(list(&data))
+}
+
+/// Read the complete ready frontier for exactly one frozen epic.
+pub async fn ready_epic_children(cfg: &BdConfig, epic: &str) -> Result<Vec<IssueSummary>, BdError> {
+    let data = invoke::read(cfg, &["ready", "--parent", epic, "--limit", "0", "--json"]).await?;
+    Ok(list(&data))
+}
+
+/// Persist one complete rolling-plan result and make the stub schedulable.
+/// The write is serialized by forged-beads and guarded on the exact workflow
+/// preconditions supported by pinned bd: blocked and unassigned. Callers
+/// additionally compare their four-field digest before entering this seam.
+pub async fn apply_native_spec_to_blocked_stub(
+    cfg: &BdConfig,
+    id: &str,
+    actor: &str,
+    spec: &NativeSpecUpdate,
+) -> Result<IssueSummary, BdError> {
+    let args = vec![
+        "update",
+        id,
+        "--description",
+        spec.description.as_str(),
+        "--acceptance",
+        spec.acceptance_criteria.as_str(),
+        "--design",
+        spec.design.as_str(),
+        "--notes",
+        spec.notes.as_str(),
+        "--status",
+        "open",
+        "--if-assignee",
+        "",
+        "--if-status",
+        "blocked",
+        "--actor",
+        actor,
+        "--json",
+    ];
+    invoke::write(
+        cfg,
+        invoke::WriteOp::Other {
+            bead: Some(id.to_owned()),
+            actor: Some(actor.to_owned()),
+        },
+        &args,
+    )
+    .await?;
+    let applied = show_issue(cfg, id).await?;
+    let exact = applied.description == spec.description
+        && applied.acceptance_criteria == spec.acceptance_criteria
+        && applied.design == spec.design
+        && applied.notes == spec.notes
+        && applied.status == "open"
+        && applied.assignee.is_none();
+    if exact {
+        Ok(applied)
+    } else {
+        Err(BdError::Beads {
+            context: format!("bd update {id} (rolling plan readback)"),
+            exit: None,
+            stdout: serde_json::to_string(&applied).unwrap_or_default(),
+            stderr:
+                "guarded rolling-plan write did not produce the exact native spec and open state"
+                    .to_owned(),
+        })
+    }
 }
 
 /// Idempotently close one merged child.

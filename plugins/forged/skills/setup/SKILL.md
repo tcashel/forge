@@ -22,6 +22,8 @@ Forged binary.
 - Setup validates local tools and configuration only. It does not install the
   Forged binary, create work, route work, start a run, or contact a separate
   issue tracker.
+- Rolling execution requires a dedicated read-only `assessment` roster role;
+  its selected provider/model must be independent of every critique candidate.
 
 ## Locate this plugin portably
 

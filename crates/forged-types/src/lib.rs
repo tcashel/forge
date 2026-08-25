@@ -62,9 +62,9 @@ pub use herdr_projection::{
 };
 pub use ids::{claude_session_id, new_claim_token, RunId, RunIdError};
 pub use packet::{
-    AcceptedRisk, Deliverable, Finding, GateRow, Outcome, PacketColumns, PacketResult,
-    ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef, Stage, StageContract, Verdict,
-    WorkPacket,
+    AcceptedRisk, Deliverable, Finding, GateRow, NativeBeadSpecV1, Outcome, PacketColumns,
+    PacketResult, PlanTraceabilityV1, ProviderHints, Sandbox, Severity, SpecAmendment, SpecRef,
+    Stage, StageContract, Verdict, WorkPacket,
 };
 pub use provider_session_inventory::{
     ProviderSessionActivity, ProviderSessionAttemptV1, ProviderSessionDesiredWorkV1,

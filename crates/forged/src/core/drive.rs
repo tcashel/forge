@@ -617,6 +617,9 @@ async fn honor(
                     &spec,
                     &view.policy.gate_commands,
                     budget,
+                    view.execution_package
+                        .as_ref()
+                        .map(|value| &value.protocol_ref),
                 )?;
                 open_packet_op(ctx, &packet).await?;
             }
@@ -954,9 +957,14 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
             .unwrap_or(&package.profile)
     });
     Ok(ExecutionContext {
+        protocol: view
+            .execution_package
+            .as_ref()
+            .map(|package| package.protocol_ref.clone()),
         pr_number: pr_number_of(view),
         findings: latest_review_findings(view),
         review_evidence: latest_review_evidence(view),
+        plan_candidate: latest_plan_candidate(view),
         risk_context: active_profile
             .map(|profile| profile.risk_context.clone())
             .unwrap_or_else(|| {
@@ -978,6 +986,52 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
     })
 }
 
+/// Latest complete plan candidate, preferring a bounded revision over the
+/// initial authoring result.
+pub(crate) fn latest_plan_candidate(
+    view: &RunView,
+) -> Option<crate::adapters::execute::PlanCandidate> {
+    view.packets
+        .iter()
+        .filter_map(|packet| {
+            let stored = forged_proto::stored_packet(packet).ok()?;
+            let execution = stored.execution?;
+            matches!(
+                execution.purpose,
+                forged_types::SeatPurpose::Implement | forged_types::SeatPurpose::Fix
+            )
+            .then_some((packet, execution.round, execution.purpose))
+        })
+        .filter_map(|(packet, round, purpose)| {
+            let outcome = view
+                .terminal_attempts
+                .get(&packet.packet_id)?
+                .iter()
+                .rev()
+                .find_map(|attempt| attempt.outcome.as_ref())?;
+            let forged_types::Outcome::Plan {
+                spec,
+                traceability,
+                cruxes,
+            } = outcome
+            else {
+                return None;
+            };
+            cruxes.is_empty().then_some((
+                round,
+                purpose,
+                crate::adapters::execute::PlanCandidate {
+                    spec: spec.clone(),
+                    traceability: traceability.clone(),
+                },
+            ))
+        })
+        .max_by_key(|(round, purpose, _)| {
+            (*round, matches!(purpose, forged_types::SeatPurpose::Fix))
+        })
+        .map(|(_, _, spec)| spec)
+}
+
 /// Run one machine step through the fence under its machine key.
 async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(), Failure> {
     let run = &view.run;
@@ -987,7 +1041,16 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         MachineStage::Resolve | MachineStage::Gate | MachineStage::ReGate => EffectClass::SafeRetry,
         MachineStage::Push | MachineStage::DraftPr => EffectClass::ObserveOnly,
     };
+    let planning = view.execution_package.as_ref().is_some_and(|package| {
+        package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1
+    });
     let params: Map<String, Value> = match step {
+        MachineStage::Resolve if planning => obj(json!({
+            "repo": run.repo,
+            "base": run.base_ref,
+            "branch": run.branch,
+            "planning": true,
+        })),
         MachineStage::Resolve => obj(json!({
             // The request descriptor names the DERIVED holder: params are
             // hashed for idempotency, so this must not vary with whatever
@@ -997,6 +1060,7 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
             "repo": run.repo,
             "base": run.base_ref,
             "branch": run.branch,
+            "planning": false,
         })),
         MachineStage::Push => {
             let sha = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
@@ -1012,8 +1076,7 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         params,
     };
     let run = run.clone();
-    let gate_commands = view.policy.gate_commands.clone();
-    let transport_retry_budget = view.policy.transport_retry_budget;
+    let policy = view.policy.clone();
     let controller_generation = super::handoff::controller_generation_for_run(run.run_id.as_str());
     let resp = fenced_machine(
         ctx,
@@ -1022,16 +1085,7 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         &req,
         controller_generation,
         move |op_id| async move {
-            machine_effect(
-                ctx,
-                &run,
-                step,
-                round,
-                &op_id,
-                &gate_commands,
-                transport_retry_budget,
-            )
-            .await
+            machine_effect(ctx, &run, step, round, &op_id, &policy, planning).await
         },
     )
     .await;
@@ -1084,8 +1138,8 @@ async fn machine_effect(
     step: MachineStage,
     round: u32,
     op_id: &str,
-    gate_commands: &[String],
-    transport_retry_budget: u32,
+    policy: &ExecutionPolicyV1,
+    planning: bool,
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
@@ -1111,16 +1165,24 @@ async fn machine_effect(
             // differing one: bd refuses a claim by any other actor outright
             // ("issue already claimed by …"), which is how a driver used to
             // wedge on BEAD_LEASE_HELD against its own frontier claim.
-            let bd = ctx.config.bd_config();
-            let holder = crate::core::lease_identity(&bd, &run.bead_id, &run.run_id).await?;
-            failpoint::hit("bd.claim.before");
-            forged_beads::claim_specific(&bd, &run.bead_id, &holder).await?;
-            failpoint::hit("bd.claim.after");
-            Ok(json!({
+            let holder = if planning {
+                None
+            } else {
+                let bd = ctx.config.bd_config();
+                let holder = crate::core::lease_identity(&bd, &run.bead_id, &run.run_id).await?;
+                failpoint::hit("bd.claim.before");
+                forged_beads::claim_specific(&bd, &run.bead_id, &holder).await?;
+                failpoint::hit("bd.claim.after");
+                Some(holder)
+            };
+            let mut result = obj(json!({
                 "worktree": ctx.config.worktree(&run.run_id).to_string_lossy(),
                 "baseSha": prepared.map(|p| p.base_sha),
-                "leaseHolder": holder,
-            }))
+            }));
+            if let Some(holder) = holder {
+                result.insert("leaseHolder".to_owned(), Value::String(holder));
+            }
+            Ok(Value::Object(result))
         }
         MachineStage::Gate | MachineStage::ReGate => {
             let artifacts = ctx
@@ -1129,7 +1191,7 @@ async fn machine_effect(
                 .join("artifacts")
                 .join(format!("{}-{op_id}", step.as_str()));
             let request = GateRequest::new(
-                gate_commands.to_vec(),
+                policy.gate_commands.clone(),
                 ctx.config.worktree(&run.run_id),
                 artifacts,
             );
@@ -1156,7 +1218,7 @@ async fn machine_effect(
             let worktree = ctx.config.worktree(&run.run_id);
             let expected = rev_parse_head(&worktree).await?;
             let refspec = format!("{0}:refs/heads/{0}", run.branch);
-            let max_attempts = transport_retry_budget.saturating_add(1);
+            let max_attempts = policy.transport_retry_budget.saturating_add(1);
             for attempt in 1..=max_attempts {
                 failpoint::hit("git.push.before");
                 let out = tokio::process::Command::new("git")

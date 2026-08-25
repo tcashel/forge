@@ -423,6 +423,8 @@ seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
 scenario_stage=$stage
 case "$stage" in
   implementation) scenario_stage=implement ;;
+  plan-author|plan-revision) scenario_stage=epic-plan ;;
+  plan-*) scenario_stage=epic-plan-review ;;
   review-1) scenario_stage=reviewclaude ;;
   review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
   remediation) scenario_stage=fix ;;
@@ -475,6 +477,18 @@ esac
 
 inner=""
 case "$stage" in
+  plan-author|plan-revision)
+    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"plan\": {\"spec\": {\"description\": \"planned context and outcome\", \"acceptanceCriteria\": \"planned observable acceptance\", \"design\": \"planned minimal design\", \"notes\": \"planned no scope expansion\"}, \"traceability\": {\"assumptions\": [], \"requirements\": [\"preserve the frozen epic outcome\"]}, \"cruxes\": []}}}"
+    ;;
+  plan-*)
+    if [ "$mode" = block ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"root authority must change\", \"evidence\": \"the frozen root excludes the required dependency mutation\", \"proposedChange\": \"authorize dependency mutation or remove the requirement\"}}}}"
+    elif [ "$seq" -eq 0 ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim plan review\", \"findings\": [{\"severity\": \"high\", \"file\": null, \"line\": null, \"message\": \"Requirement R1 needs an exact readback\"}], \"available\": true}}}"
+    else
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim plan review\", \"findings\": [], \"available\": true}}}"
+    fi
+    ;;
   implement|implementation)
     if [ "$mode" = spec-amendment ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
@@ -534,6 +548,8 @@ seq=$(printf '%s' "$pkt" | awk -F/ '{print $NF}')
 scenario_stage=$stage
 case "$stage" in
   implementation) scenario_stage=implement ;;
+  plan-author|plan-revision) scenario_stage=epic-plan ;;
+  plan-*) scenario_stage=epic-plan-review ;;
   review-1) scenario_stage=reviewclaude ;;
   review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
   remediation) scenario_stage=fix ;;
@@ -583,6 +599,18 @@ esac
 
 inner=""
 case "$stage" in
+  plan-author|plan-revision)
+    inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"plan\": {\"spec\": {\"description\": \"planned context and outcome\", \"acceptanceCriteria\": \"planned observable acceptance\", \"design\": \"planned minimal design\", \"notes\": \"planned no scope expansion\"}, \"traceability\": {\"assumptions\": [], \"requirements\": [\"preserve the frozen epic outcome\"]}, \"cruxes\": []}}}"
+    ;;
+  plan-*)
+    if [ "$mode" = block ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"root authority must change\", \"evidence\": \"the frozen root excludes the required dependency mutation\", \"proposedChange\": \"authorize dependency mutation or remove the requirement\"}}}}"
+    elif [ "$seq" -eq 0 ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim plan review\", \"findings\": [{\"severity\": \"high\", \"file\": null, \"line\": null, \"message\": \"Requirement R1 needs an exact readback\"}], \"available\": true}}}"
+    else
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim plan review\", \"findings\": [], \"available\": true}}}"
+    fi
+    ;;
   implement|implementation)
     if [ "$mode" = spec-amendment ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"contract conflicts with repository\", \"evidence\": \"the named API is absent\", \"proposedChange\": \"target the replacement API\"}}}}"
@@ -686,6 +714,10 @@ case "$cmd" in
     new_status=$(val --status "$@")
     [ -n "$new_status" ] || new_status=$(val -s "$@")
     new_assignee=$(val --assignee "$@")
+    new_description=$(val --description "$@")
+    new_acceptance=$(val --acceptance "$@")
+    new_design=$(val --design "$@")
+    new_notes=$(val --notes "$@")
     [ -n "$new_assignee" ] || new_assignee=$(val -a "$@")
     has_assignee=0; has_if_assignee=0; has_if_status=0; has_claim=0; expected_assignee=""; expected_status=""; prev=""
     for a in "$@"; do
@@ -728,6 +760,10 @@ case "$cmd" in
       exit 1
     fi
     if [ -n "$new_status" ]; then
+      [ -z "$new_description" ] || printf '%s' "$new_description" > "$state/$id.description"
+      [ -z "$new_acceptance" ] || printf '%s' "$new_acceptance" > "$state/$id.acceptance"
+      [ -z "$new_design" ] || printf '%s' "$new_design" > "$state/$id.design"
+      [ -z "$new_notes" ] || printf '%s' "$new_notes" > "$state/$id.notes"
       printf '%s' "$new_status" > "$state/$id.status"
       if [ "$has_assignee" = 1 ]; then
         if [ -n "$new_assignee" ]; then
@@ -1098,6 +1134,7 @@ impl TestEnv {
             let for_role = |role: &str, write: bool| match uniform {
                 Some((provider, model)) => candidate(provider, model, write),
                 None => match role {
+                    "assessment" => candidate("claude", "sonnet", write),
                     "review.secondary" | "synthesis" => candidate("codex", "gpt-5.6-sol", write),
                     _ => candidate("claude", "opus", write),
                 },
@@ -1107,6 +1144,7 @@ impl TestEnv {
                 "name": roster_name,
                 "roles": {
                     "implementation": [for_role("implementation", true)],
+                    "assessment": [for_role("assessment", false)],
                     "review.primary": [for_role("review.primary", false)],
                     "review.secondary": [for_role("review.secondary", false)],
                     "review.tertiary": [for_role("review.tertiary", false)],

@@ -178,6 +178,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
       profile: Type.Optional(Type.String({ default: "standard" })),
       roster: Type.Optional(Type.String({ default: "default" })),
       baseRef: Type.Optional(Type.String()),
+      rolling: Type.Optional(Type.Boolean({ default: false })),
     }),
     async execute(_id, params, signal) {
       const startArgs = params.kind === "slice"
@@ -186,6 +187,7 @@ export default function forgedPiExtension(pi: ExtensionAPI): void {
       addOptional(startArgs, "--profile", params.profile ?? "standard");
       addOptional(startArgs, "--roster", params.roster ?? "default");
       addOptional(startArgs, "--base-ref", params.baseRef);
+      if (params.kind === "epic" && params.rolling) startArgs.push("--rolling");
       const started = await callForged(pi, startArgs, signal, 60_000);
       const subjectId = params.kind === "slice" ? runIdFrom(started.result, params.id) : params.id;
       const submitArgs = params.kind === "slice"

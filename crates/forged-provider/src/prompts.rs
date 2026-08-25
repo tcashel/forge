@@ -15,6 +15,9 @@ const IMPLEMENT_SRC: &str = include_str!("../templates/implement.md.j2");
 const REVIEW_SRC: &str = include_str!("../templates/review.md.j2");
 /// The fix-stage template body.
 const FIX_SRC: &str = include_str!("../templates/fix.md.j2");
+const EPIC_PLAN_SRC: &str = include_str!("../templates/epic-plan.md.j2");
+const EPIC_PLAN_REVIEW_SRC: &str = include_str!("../templates/epic-plan-review.md.j2");
+const EPIC_PLAN_REVISION_SRC: &str = include_str!("../templates/epic-plan-revision.md.j2");
 
 /// Which prompt template a packet renders.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -25,6 +28,12 @@ pub enum PromptStage {
     Review,
     /// The auto-fix stage.
     Fix,
+    /// Author one complete native child spec.
+    EpicPlan,
+    /// Critique one exact native child spec candidate.
+    EpicPlanReview,
+    /// Revise one exact native child spec candidate from critique findings.
+    EpicPlanRevision,
 }
 
 impl PromptStage {
@@ -78,6 +87,30 @@ impl PromptStage {
                 "packet_id",
                 "result_schema",
             ],
+            PromptStage::EpicPlan => &[
+                "bead_id",
+                "spec_path",
+                "field_notes",
+                "packet_id",
+                "result_schema",
+            ],
+            PromptStage::EpicPlanReview => &[
+                "bead_id",
+                "spec_path",
+                "candidate_plan",
+                "review_evidence",
+                "risk_context",
+                "packet_id",
+                "result_schema",
+            ],
+            PromptStage::EpicPlanRevision => &[
+                "bead_id",
+                "spec_path",
+                "candidate_plan",
+                "findings",
+                "packet_id",
+                "result_schema",
+            ],
         }
     }
 
@@ -89,6 +122,8 @@ impl PromptStage {
             PromptStage::Implement => "forged.result.implement/1",
             PromptStage::Review => "forged.result.review/1",
             PromptStage::Fix => "forged.result.fix/1",
+            PromptStage::EpicPlan | PromptStage::EpicPlanRevision => "forged.result.epic-plan/1",
+            PromptStage::EpicPlanReview => "forged.result.review/1",
         }
     }
 
@@ -98,6 +133,9 @@ impl PromptStage {
             PromptStage::Implement => "implement",
             PromptStage::Review => "review",
             PromptStage::Fix => "fix",
+            PromptStage::EpicPlan => "epic-plan",
+            PromptStage::EpicPlanReview => "epic-plan-review",
+            PromptStage::EpicPlanRevision => "epic-plan-revision",
         }
     }
 
@@ -138,6 +176,30 @@ impl PromptStage {
                     {"severity": "HIGH", "location": "src/x.rs:42", "message": "sample"}
                 ],
                 "field_notes": [],
+                "packet_id": "pkt-1",
+                "result_schema": self.result_schema(),
+            }),
+            PromptStage::EpicPlan => json!({
+                "bead_id": "bead-1",
+                "spec_path": "planning-input.md",
+                "field_notes": [],
+                "packet_id": "pkt-1",
+                "result_schema": self.result_schema(),
+            }),
+            PromptStage::EpicPlanReview => json!({
+                "bead_id": "bead-1",
+                "spec_path": "planning-input.md",
+                "candidate_plan": "{}",
+                "review_evidence": [],
+                "risk_context": "Routine change.",
+                "packet_id": "pkt-1",
+                "result_schema": self.result_schema(),
+            }),
+            PromptStage::EpicPlanRevision => json!({
+                "bead_id": "bead-1",
+                "spec_path": "planning-input.md",
+                "candidate_plan": "{}",
+                "findings": [{"severity": "HIGH", "message": "gap"}],
                 "packet_id": "pkt-1",
                 "result_schema": self.result_schema(),
             }),
@@ -196,12 +258,15 @@ pub struct PromptTemplates {
 }
 
 impl PromptTemplates {
-    /// Load the three embedded template bodies.
+    /// Load the embedded template bodies.
     pub fn load() -> Result<Self, ProviderError> {
         Self::from_sources(&[
             (PromptStage::Implement, IMPLEMENT_SRC),
             (PromptStage::Review, REVIEW_SRC),
             (PromptStage::Fix, FIX_SRC),
+            (PromptStage::EpicPlan, EPIC_PLAN_SRC),
+            (PromptStage::EpicPlanReview, EPIC_PLAN_REVIEW_SRC),
+            (PromptStage::EpicPlanRevision, EPIC_PLAN_REVISION_SRC),
         ])
     }
 

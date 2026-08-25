@@ -38,6 +38,8 @@ pub enum Deliverable {
     CommitsInWorktree,
     ReviewBlock,
     FixCommitsPushed,
+    /// One complete native Beads specification; no repository write.
+    NativeBeadSpec,
 }
 
 /// The obligations a packet places on its stage.
@@ -204,6 +206,28 @@ pub struct SpecAmendment {
     pub proposed_change: String,
 }
 
+/// The four provider-authored native fields of one Beads specification.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct NativeBeadSpecV1 {
+    pub description: String,
+    pub acceptance_criteria: String,
+    pub design: String,
+    pub notes: String,
+}
+
+/// Provider-authored traceability that stays with a rolling-plan artifact
+/// but is never written into Beads' four native specification fields.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+pub struct PlanTraceabilityV1 {
+    /// Explicit assumptions the candidate relies on. Empty means none.
+    #[serde(default)]
+    pub assumptions: Vec<String>,
+    /// Frozen requirements the candidate demonstrably carries forward.
+    pub requirements: Vec<String>,
+}
+
 /// An operator's explicit decision to land with known review findings.
 ///
 /// This is terminal evidence, never a reviewer verdict: only the run control
@@ -243,6 +267,14 @@ pub enum Outcome {
     Fix {
         applied: bool,
         summary: String,
+    },
+    /// A complete rolling-plan candidate. Non-empty `cruxes` require human
+    /// adjudication and can never be persisted automatically.
+    Plan {
+        spec: NativeBeadSpecV1,
+        traceability: PlanTraceabilityV1,
+        #[serde(default)]
+        cruxes: Vec<SpecAmendment>,
     },
     /// Stop the current loop for operator adjudication without inventing a
     /// fix, successor run, or successor Bead.

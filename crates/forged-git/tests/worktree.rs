@@ -7,7 +7,8 @@ use std::path::{Path, PathBuf};
 
 use common::{commit_file, git, rev_parse, setup_repos};
 use forged_git::{
-    prepare_worktree, retire_worktree, GitError, PreparedWorktree, RetireOptions, WorktreeSpec,
+    prepare_worktree, retire_worktree, verify_worktree_clean, GitError, PreparedWorktree,
+    RetireOptions, WorktreeSpec,
 };
 use forged_types::ErrorCode;
 
@@ -259,6 +260,32 @@ async fn dirty_worktree_is_refused_with_bare_paths() {
     }
     assert_eq!(err.code(), ErrorCode::WorktreeDirty);
     assert!(prepared.worktree.exists(), "refusal must not delete");
+}
+
+#[tokio::test]
+async fn verify_clean_never_retires_the_worktree_or_artifacts() {
+    let repos = setup_repos(BASE);
+    let prepared = prepare(&repos, "run-1", "feat/run-1").await;
+
+    verify_worktree_clean(&repos.runs_root, "run-1")
+        .await
+        .expect("clean worktree verifies");
+    assert!(prepared.worktree.exists());
+    assert!(prepared.run_dir.exists());
+
+    std::fs::write(prepared.worktree.join("junk.txt"), "junk\n").unwrap();
+    let err = verify_worktree_clean(&repos.runs_root, "run-1")
+        .await
+        .expect_err("dirty worktree refuses");
+    assert!(matches!(err, GitError::WorktreeDirty { .. }), "got {err:?}");
+    assert!(
+        prepared.worktree.exists(),
+        "refusal must not delete worktree"
+    );
+    assert!(
+        prepared.run_dir.exists(),
+        "refusal must not delete artifacts"
+    );
 }
 
 #[tokio::test]

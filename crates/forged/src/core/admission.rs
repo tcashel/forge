@@ -660,8 +660,13 @@ async fn admit_packet_facts_once(
         .candidates
         .iter()
         .find(|candidate| {
-            (candidate.subject_kind == DesiredSubjectKind::Run && candidate.subject_id == run_id)
-                || candidate.delegated_run_id.as_deref() == Some(run_id.as_str())
+            candidate.subject_kind == DesiredSubjectKind::Run && candidate.subject_id == run_id
+        })
+        .or_else(|| {
+            snapshot
+                .candidates
+                .iter()
+                .find(|candidate| candidate.delegated_run_id.as_deref() == Some(run_id.as_str()))
         })
         .ok_or_else(|| Failure::internal("run vanished from admission snapshot"))?;
     let packet_facts = snapshot
@@ -811,6 +816,11 @@ async fn admit_packet_facts_once(
 mod tests {
     use super::*;
     use forged_types::{AdmissionCapacityV1, AdmissionRateLimitV1, AdmissionSpendV1};
+
+    #[test]
+    fn protocol_names_never_make_a_blocked_bead_runnable() {
+        assert!(!runnable("blocked"));
+    }
 
     fn candidate(id: &str, priority: i64, provider: &str) -> AdmissionCandidateV1 {
         AdmissionCandidateV1 {

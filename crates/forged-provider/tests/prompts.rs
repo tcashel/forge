@@ -52,6 +52,16 @@ fn fix_context(findings: &[RenderedFinding]) -> Value {
     })
 }
 
+fn epic_plan_context() -> Value {
+    json!({
+        "bead_id": "bead-1",
+        "spec_path": "/tmp/planning-input.md",
+        "field_notes": [],
+        "packet_id": PACKET_ID,
+        "result_schema": PromptStage::EpicPlan.result_schema(),
+    })
+}
+
 #[test]
 fn load_succeeds() {
     PromptTemplates::load().expect("the three embedded templates load");
@@ -112,6 +122,49 @@ fn render_succeeds_for_all_three_stages() {
     assert!(fix.contains("[HIGH] ? — unchecked exit"));
     let listed = fix.matches("  - [").count();
     assert_eq!(listed, 2, "fix lists exactly the findings it was given");
+}
+
+#[test]
+fn rolling_plan_templates_are_read_only_and_carry_exact_candidates() {
+    let templates = PromptTemplates::load().expect("loads");
+    let authored = templates
+        .render(PromptStage::EpicPlan, &epic_plan_context())
+        .expect("plan renders");
+    assert!(authored.contains("Do not edit the repository, Beads, GitHub"));
+    assert!(authored.contains("acceptanceCriteria"));
+
+    let candidate = r#"{"description":"d","acceptanceCriteria":"a","design":"x","notes":"n"}"#;
+    let reviewed = templates
+        .render(
+            PromptStage::EpicPlanReview,
+            &json!({
+                "bead_id": "bead-1",
+                "spec_path": "/tmp/planning-input.md",
+                "candidate_plan": candidate,
+                "review_evidence": [],
+                "risk_context": "routine",
+                "packet_id": PACKET_ID,
+                "result_schema": PromptStage::EpicPlanReview.result_schema(),
+            }),
+        )
+        .expect("review renders");
+    assert!(reviewed.contains(candidate));
+
+    let revised = templates
+        .render(
+            PromptStage::EpicPlanRevision,
+            &json!({
+                "bead_id": "bead-1",
+                "spec_path": "/tmp/planning-input.md",
+                "candidate_plan": candidate,
+                "findings": [{"severity": "HIGH", "message": "missing test"}],
+                "packet_id": PACKET_ID,
+                "result_schema": PromptStage::EpicPlanRevision.result_schema(),
+            }),
+        )
+        .expect("revision renders");
+    assert!(revised.contains("missing test"));
+    assert!(revised.contains(candidate));
 }
 
 #[test]

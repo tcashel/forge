@@ -37,6 +37,32 @@ pub fn is_transport_message(message: &str) -> bool {
 /// variants refuse instead of being silently rewritten, and the stored
 /// request payload and the recorded result stay byte-identical.
 pub(crate) fn validate_implement_gate_state(result: &PacketResult) -> Result<(), String> {
+    let shape_ok = match result.schema.as_str() {
+        "forged.result/1" => !matches!(result.outcome, forged_types::Outcome::Plan { .. }),
+        "forged.result.implement/1" => matches!(
+            result.outcome,
+            forged_types::Outcome::Implement { .. } | forged_types::Outcome::SpecAmendment { .. }
+        ),
+        "forged.result.review/1" => matches!(
+            result.outcome,
+            forged_types::Outcome::Review { .. } | forged_types::Outcome::SpecAmendment { .. }
+        ),
+        "forged.result.fix/1" => matches!(
+            result.outcome,
+            forged_types::Outcome::Fix { .. } | forged_types::Outcome::SpecAmendment { .. }
+        ),
+        "forged.result.epic-plan/1" => matches!(
+            result.outcome,
+            forged_types::Outcome::Plan { .. } | forged_types::Outcome::SpecAmendment { .. }
+        ),
+        _ => false,
+    };
+    if !shape_ok {
+        return Err(format!(
+            "forged-result outcome does not match schema {:?}",
+            result.schema
+        ));
+    }
     if let forged_types::Outcome::Implement {
         gate_state: Some(gate_state),
         ..
@@ -47,6 +73,105 @@ pub(crate) fn validate_implement_gate_state(result: &PacketResult) -> Result<(),
                 "implement result gateState must be exactly \"pass\" or \"fail\", got {gate_state:?}"
             ));
         }
+    }
+    if let forged_types::Outcome::Plan {
+        spec,
+        traceability,
+        cruxes,
+    } = &result.outcome
+    {
+        for (name, value) in [
+            ("description", &spec.description),
+            ("acceptanceCriteria", &spec.acceptance_criteria),
+            ("design", &spec.design),
+            ("notes", &spec.notes),
+        ] {
+            if value.trim().is_empty() {
+                return Err(format!("plan result {name} must not be empty"));
+            }
+        }
+        if cruxes.iter().any(|value| {
+            value.summary.trim().is_empty()
+                || value.evidence.trim().is_empty()
+                || value.proposed_change.trim().is_empty()
+        }) {
+            return Err(
+                "plan result cruxes require summary, evidence, and proposedChange".to_owned(),
+            );
+        }
+        if traceability.requirements.is_empty()
+            || traceability
+                .requirements
+                .iter()
+                .any(|value| value.trim().is_empty())
+        {
+            return Err("plan result traceability requires non-empty requirements".to_owned());
+        }
+        if traceability
+            .assumptions
+            .iter()
+            .any(|value| value.trim().is_empty())
+        {
+            return Err("plan result assumptions must not contain empty entries".to_owned());
+        }
+    }
+    Ok(())
+}
+
+/// Validate the result against the packet's immutable protocol and semantic
+/// purpose. Schema text alone is not authority for the runtime-only planning
+/// outcome.
+pub(crate) fn validate_result_for_packet(
+    result: &PacketResult,
+    protocol: Option<&forged_types::ProtocolRef>,
+    purpose: Option<forged_types::SeatPurpose>,
+) -> Result<(), String> {
+    validate_implement_gate_state(result)?;
+    let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
+    if matches!(result.outcome, forged_types::Outcome::Plan { .. })
+        && !(planning
+            && matches!(
+                purpose,
+                Some(forged_types::SeatPurpose::Implement | forged_types::SeatPurpose::Fix)
+            ))
+    {
+        return Err(
+            "plan outcomes require a frozen epic-plan/v1 author or revision packet".to_owned(),
+        );
+    }
+    if planning
+        && matches!(
+            purpose,
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis)
+        )
+        && matches!(
+            &result.outcome,
+            forged_types::Outcome::Review {
+                verdict: forged_types::Verdict::RequestChanges,
+                findings,
+                ..
+            } if findings.is_empty() || findings.iter().any(|finding| finding.message.trim().is_empty())
+        )
+    {
+        return Err("epic-plan requestChanges requires at least one actionable finding".to_owned());
+    }
+    if planning
+        && matches!(
+            purpose,
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis)
+        )
+        && matches!(
+            &result.outcome,
+            forged_types::Outcome::Review {
+                verdict: forged_types::Verdict::Block,
+                ..
+            }
+        )
+    {
+        return Err(
+            "epic-plan scope or authority blockers must return typed specAmendment evidence"
+                .to_owned(),
+        );
     }
     Ok(())
 }
@@ -260,6 +385,10 @@ fn finish(text: &str, expected_schema: &str, packet_id: &str) -> Harvest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use forged_types::{
+        Finding, NativeBeadSpecV1, Outcome, PlanTraceabilityV1, ProtocolRef, Severity,
+        SpecAmendment, Verdict,
+    };
     use serde_json::json;
 
     const SCHEMA: &str = "forged.result.implement/1";
@@ -291,6 +420,41 @@ mod tests {
             }},
         })
         .to_string()
+    }
+
+    fn packet_result(outcome: Outcome) -> PacketResult {
+        let schema = match &outcome {
+            Outcome::Review { .. } | Outcome::SpecAmendment { .. } => "forged.result.review/1",
+            _ => "forged.result.epic-plan/1",
+        };
+        PacketResult {
+            schema: schema.to_owned(),
+            packet_id: PKT.to_owned(),
+            outcome,
+        }
+    }
+
+    fn planning_protocol() -> ProtocolRef {
+        ProtocolRef {
+            name: "epic-plan".to_owned(),
+            version: 1,
+        }
+    }
+
+    fn plan_outcome() -> Outcome {
+        Outcome::Plan {
+            spec: NativeBeadSpecV1 {
+                description: "complete description".to_owned(),
+                acceptance_criteria: "observable acceptance".to_owned(),
+                design: "bounded design".to_owned(),
+                notes: "no scope expansion".to_owned(),
+            },
+            traceability: PlanTraceabilityV1 {
+                assumptions: vec!["the frozen inventory is authoritative".to_owned()],
+                requirements: vec!["carry the root outcome forward".to_owned()],
+            },
+            cruxes: Vec::new(),
+        }
     }
 
     #[test]
@@ -593,5 +757,96 @@ mod tests {
                 assert_eq!(gate_state.as_deref(), expected);
             }
         }
+    }
+
+    #[test]
+    fn plan_outcome_requires_frozen_epic_plan_authority_and_purpose() {
+        let result = packet_result(plan_outcome());
+        let protocol = planning_protocol();
+        assert!(validate_result_for_packet(
+            &result,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Implement)
+        )
+        .is_ok());
+        for (authority, purpose) in [
+            (None, Some(forged_types::SeatPurpose::Implement)),
+            (Some(&protocol), Some(forged_types::SeatPurpose::Review)),
+        ] {
+            assert!(validate_result_for_packet(&result, authority, purpose)
+                .expect_err("ordinary or critic packet must reject plan")
+                .contains("frozen epic-plan/v1"));
+        }
+    }
+
+    #[test]
+    fn planning_critique_requires_actionable_findings_or_typed_amendment() {
+        let protocol = planning_protocol();
+        let empty = packet_result(Outcome::Review {
+            verdict: Verdict::RequestChanges,
+            summary: "needs revision".to_owned(),
+            findings: Vec::new(),
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &empty,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Review)
+        )
+        .expect_err("empty requestChanges must fail")
+        .contains("actionable finding"));
+
+        let actionable = packet_result(Outcome::Review {
+            verdict: Verdict::RequestChanges,
+            summary: "needs revision".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::High,
+                file: None,
+                line: None,
+                message: "Requirement R1 has no acceptance observation; add the exact readback"
+                    .to_owned(),
+            }],
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &actionable,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Synthesis)
+        )
+        .is_ok());
+
+        let block = packet_result(Outcome::Review {
+            verdict: Verdict::Block,
+            summary: "root authority conflicts".to_owned(),
+            findings: vec![Finding {
+                severity: Severity::Blocker,
+                file: None,
+                line: None,
+                message: "The frozen root excludes the requested mutation".to_owned(),
+            }],
+            available: true,
+        });
+        assert!(validate_result_for_packet(
+            &block,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Review)
+        )
+        .expect_err("generic Block must fail")
+        .contains("typed specAmendment"));
+
+        let amendment = packet_result(Outcome::SpecAmendment {
+            amendment: SpecAmendment {
+                summary: "root authority conflicts".to_owned(),
+                evidence: "the frozen root excludes dependency mutation".to_owned(),
+                proposed_change: "authorize dependency mutation or remove the requirement"
+                    .to_owned(),
+            },
+        });
+        assert!(validate_result_for_packet(
+            &amendment,
+            Some(&protocol),
+            Some(forged_types::SeatPurpose::Review)
+        )
+        .is_ok());
     }
 }

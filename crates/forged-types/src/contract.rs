@@ -311,10 +311,12 @@ impl ProfileDefinitionV1 {
                 "invalid profile name",
             ));
         }
-        if self.protocol.name != "slice" || self.protocol.version != 1 {
+        if !matches!(self.protocol.name.as_str(), "slice" | "epic-plan")
+            || self.protocol.version != 1
+        {
             errors.push(DefinitionError::at(
                 "$.profile.protocol",
-                "only slice/v1 is supported",
+                "only slice/v1 and epic-plan/v1 are supported",
             ));
         }
         if self.seats.is_empty() || self.seats.len() > 8 {
@@ -361,28 +363,29 @@ impl ProfileDefinitionV1 {
             }
         }
         let count = |purpose| self.seats.iter().filter(|s| s.purpose == purpose).count();
+        let protocol = self.protocol.name.as_str();
         if count(SeatPurpose::Implement) != 1 {
             errors.push(DefinitionError::at(
                 "$.profile.seats",
-                "slice/v1 requires exactly one implement seat",
+                format!("{protocol}/v1 requires exactly one implement seat"),
             ));
         }
         if !(1..=4).contains(&count(SeatPurpose::Review)) {
             errors.push(DefinitionError::at(
                 "$.profile.seats",
-                "slice/v1 requires between one and four review seats",
+                format!("{protocol}/v1 requires between one and four review seats"),
             ));
         }
         if count(SeatPurpose::Synthesis) > 1 {
             errors.push(DefinitionError::at(
                 "$.profile.seats",
-                "slice/v1 permits at most one synthesis seat",
+                format!("{protocol}/v1 permits at most one synthesis seat"),
             ));
         }
         if count(SeatPurpose::Fix) != 1 {
             errors.push(DefinitionError::at(
                 "$.profile.seats",
-                "slice/v1 requires exactly one fix seat",
+                format!("{protocol}/v1 requires exactly one fix seat"),
             ));
         }
         let unique_triggers: BTreeSet<_> = self.escalate_on.iter().copied().collect();

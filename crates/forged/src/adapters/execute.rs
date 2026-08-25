@@ -28,14 +28,27 @@ use crate::core::spec::{ResolvedSpec, SpecSource};
 use crate::core::{on_ledger, session_claimant, Ctx, Failure};
 use crate::failpoint;
 
+/// One complete provider-authored planning artifact retained through critique
+/// and bounded revision. Only `spec` crosses the Beads write seam.
+#[derive(Debug, Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PlanCandidate {
+    pub spec: forged_types::NativeBeadSpecV1,
+    pub traceability: forged_types::PlanTraceabilityV1,
+}
+
 /// Everything packet execution needs beyond the packet itself.
 pub struct ExecutionContext {
+    /// Frozen protocol selected by the run's immutable execution package.
+    pub protocol: Option<forged_types::ProtocolRef>,
     /// The draft PR number, once one exists.
     pub pr_number: Option<u64>,
     /// The merged findings of the latest review fan-out (for Fix prompts).
     pub findings: Vec<forged_types::Finding>,
     /// Standing review evidence supplied to an adaptive synthesis seat.
     pub review_evidence: Vec<String>,
+    /// Latest complete rolling-plan candidate, when this is `epic-plan/v1`.
+    pub plan_candidate: Option<PlanCandidate>,
     /// Frozen consequence context used to classify review severity.
     pub risk_context: String,
     /// Frozen maximum number of remediation attempts.
@@ -229,6 +242,7 @@ pub(crate) fn packet_keys(packet: &WorkPacket) -> Result<(String, i64), Failure>
 /// A bead-sourced packet reads its spec from the packet directory, where
 /// `run_attempt` materializes the rendered body; a file-sourced one keeps
 /// pointing at the operator's file.
+#[allow(clippy::too_many_arguments)]
 pub fn build_packet(
     ctx: &Ctx,
     run: &RunRow,
@@ -237,23 +251,50 @@ pub fn build_packet(
     spec: &ResolvedSpec,
     gate_commands: &[String],
     budget_s: u64,
+    protocol: Option<&forged_types::ProtocolRef>,
 ) -> Result<WorkPacket, Failure> {
     let stage = intent.stage;
+    let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
+    let prompt_stage = if planning {
+        match intent.execution.as_ref().map(|value| value.purpose) {
+            Some(forged_types::SeatPurpose::Implement) => PromptStage::EpicPlan,
+            Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
+                PromptStage::EpicPlanReview
+            }
+            Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicPlanRevision,
+            None => PromptStage::for_stage(stage),
+        }
+    } else {
+        PromptStage::for_stage(stage)
+    };
     let packet_id = intent
         .packet_id
         .clone()
         .unwrap_or_else(|| format!("{}/{}/{}", run.run_id, stage_str(stage), intent.seq));
-    let deliverable = match stage {
-        Stage::Implement => Deliverable::CommitsInWorktree,
-        Stage::ReviewClaude | Stage::ReviewCodex => Deliverable::ReviewBlock,
-        Stage::Fix => Deliverable::FixCommitsPushed,
-    };
-    let instructions = match stage {
-        Stage::Implement => "implement the spec in the worktree and report honestly",
-        Stage::ReviewClaude | Stage::ReviewCodex => {
-            "review the diff against the spec and report a verdict"
+    let deliverable = if planning && matches!(stage, Stage::Implement | Stage::Fix) {
+        Deliverable::NativeBeadSpec
+    } else {
+        match stage {
+            Stage::Implement => Deliverable::CommitsInWorktree,
+            Stage::ReviewClaude | Stage::ReviewCodex => Deliverable::ReviewBlock,
+            Stage::Fix => Deliverable::FixCommitsPushed,
         }
-        Stage::Fix => "address the merged review findings and push the fixes",
+    };
+    let instructions = if planning {
+        match prompt_stage {
+            PromptStage::EpicPlan => "author one complete native Beads specification",
+            PromptStage::EpicPlanReview => "critique the exact native specification candidate",
+            PromptStage::EpicPlanRevision => "revise the exact candidate from bounded critique",
+            _ => unreachable!("planning packet has a planning prompt"),
+        }
+    } else {
+        match stage {
+            Stage::Implement => "implement the spec in the worktree and report honestly",
+            Stage::ReviewClaude | Stage::ReviewCodex => {
+                "review the diff against the spec and report a verdict"
+            }
+            Stage::Fix => "address the merged review findings and push the fixes",
+        }
     };
     let mut packet = WorkPacket {
         schema: "forged.packet/1".to_owned(),
@@ -273,11 +314,15 @@ pub fn build_packet(
         base_ref: run.base_ref.clone(),
         contract: StageContract {
             instructions: instructions.to_owned(),
-            gate_commands: gate_commands.to_vec(),
+            gate_commands: if planning {
+                Vec::new()
+            } else {
+                gate_commands.to_vec()
+            },
             deliverable,
             budget_s: u32::try_from(budget_s).unwrap_or(u32::MAX),
         },
-        result_schema: PromptStage::for_stage(stage).result_schema().to_owned(),
+        result_schema: prompt_stage.result_schema().to_owned(),
         provider_hints: intent.hints.clone(),
         field_notes: spec.bead_context.clone(),
     };
@@ -426,13 +471,31 @@ fn apply_open(
 
 /// Build the render context for a stage — top-level keys exactly
 /// `PromptStage::variables()`.
+fn prompt_stage_of(
+    packet: &WorkPacket,
+    protocol: Option<&forged_types::ProtocolRef>,
+) -> PromptStage {
+    let planning = protocol.is_some_and(|value| value.name == "epic-plan" && value.version == 1);
+    if !planning {
+        return PromptStage::for_stage(packet.stage);
+    }
+    match packet.execution.as_ref().map(|value| value.purpose) {
+        Some(forged_types::SeatPurpose::Implement) => PromptStage::EpicPlan,
+        Some(forged_types::SeatPurpose::Review | forged_types::SeatPurpose::Synthesis) => {
+            PromptStage::EpicPlanReview
+        }
+        Some(forged_types::SeatPurpose::Fix) => PromptStage::EpicPlanRevision,
+        None => PromptStage::for_stage(packet.stage),
+    }
+}
+
 fn render_context(
     exec: &ExecutionContext,
     packet: &WorkPacket,
     fix_round: i64,
 ) -> Result<Value, Failure> {
     let worktree = packet.worktree.to_string_lossy().into_owned();
-    let stage = PromptStage::for_stage(packet.stage);
+    let stage = prompt_stage_of(packet, exec.protocol.as_ref());
     let value = match stage {
         PromptStage::Implement => json!({
             "bead_id": packet.bead_id,
@@ -479,6 +542,30 @@ fn render_context(
             "push_url": exec.push_url,
             "findings": forged_provider::normalize_findings(&exec.findings),
             "field_notes": packet.field_notes,
+            "packet_id": packet.packet_id,
+            "result_schema": packet.result_schema,
+        }),
+        PromptStage::EpicPlan => json!({
+            "bead_id": packet.bead_id,
+            "spec_path": packet.spec.path,
+            "field_notes": packet.field_notes,
+            "packet_id": packet.packet_id,
+            "result_schema": packet.result_schema,
+        }),
+        PromptStage::EpicPlanReview => json!({
+            "bead_id": packet.bead_id,
+            "spec_path": packet.spec.path,
+            "candidate_plan": serde_json::to_string(&exec.plan_candidate).unwrap_or_default(),
+            "review_evidence": exec.review_evidence,
+            "risk_context": exec.risk_context,
+            "packet_id": packet.packet_id,
+            "result_schema": packet.result_schema,
+        }),
+        PromptStage::EpicPlanRevision => json!({
+            "bead_id": packet.bead_id,
+            "spec_path": packet.spec.path,
+            "candidate_plan": serde_json::to_string(&exec.plan_candidate).unwrap_or_default(),
+            "findings": forged_provider::normalize_findings(&exec.findings),
             "packet_id": packet.packet_id,
             "result_schema": packet.result_schema,
         }),
@@ -1001,7 +1088,8 @@ async fn run_attempt(
         crate::core::spec::materialize(spec, Path::new(&packet.spec.path))?;
         let templates = PromptTemplates::load()?;
         let context = render_context(exec, &packet, seq)?;
-        let prompt = templates.render(PromptStage::for_stage(packet.stage), &context)?;
+        let prompt_stage = prompt_stage_of(&packet, exec.protocol.as_ref());
+        let prompt = templates.render(prompt_stage, &context)?;
         crate::core::artifacts::materialize_prompt(&run_root, &dirs, prompt.as_bytes())?;
         Ok::<_, Failure>((packet, interventions, holder, packet_dir))
     }
@@ -1823,6 +1911,17 @@ async fn run_attempt(
             forged_host::Liveness::Running => unreachable!("loop breaks only on terminal liveness"),
         }
     };
+    let harvest = match harvest {
+        Harvest::Result(result) => match crate::adapters::extract::validate_result_for_packet(
+            &result,
+            exec.protocol.as_ref(),
+            packet.execution.as_ref().map(|value| value.purpose),
+        ) {
+            Ok(()) => Harvest::Result(result),
+            Err(note) => Harvest::Semantic(note),
+        },
+        other => other,
+    };
 
     let (artifact_outcome, artifact_detail) = match &harvest {
         Harvest::Result(result) => (
@@ -2424,9 +2523,11 @@ mod settle_tests {
         };
         let ports = ForgedPorts::new(ledger.clone(), ctx.config.clone());
         let exec = ExecutionContext {
+            protocol: None,
             pr_number: None,
             findings: Vec::new(),
             review_evidence: Vec::new(),
+            plan_candidate: None,
             risk_context: "routine".to_owned(),
             fix_round_budget: 1,
             push_url: String::new(),
@@ -2455,7 +2556,7 @@ mod settle_tests {
             bead_context: Vec::new(),
         };
         let packet =
-            build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600).expect("packet");
+            build_packet(&ctx, &run, &intent, &source, &resolved, &[], 600, None).expect("packet");
         std::fs::create_dir_all(&packet.worktree).expect("worktree");
         let packet_id = ledger
             .open_packet(forged_ledger::NewPacket {

@@ -948,8 +948,6 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
             "t",
             "--result",
             result_file.to_str().expect("utf8"),
-            "--idempotency-key",
-            "op:packet_complete:par-cli",
         ])
         .1;
     let result_json: Value =
@@ -959,7 +957,6 @@ fn all_forty_five_tools_match_their_cli_counterparts() {
         "packet_complete",
         json!({
             "schemaVersion": 1,
-            "idempotencyKey": "op:packet_complete:par-mcp",
             "params": {
                 "packet": "absent/implement/1",
                 "attempt": 1,

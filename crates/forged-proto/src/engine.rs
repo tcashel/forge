@@ -383,6 +383,9 @@ pub fn advance(view: &RunView) -> NextAction {
         }
     }
     if let Some(package) = &view.execution_package {
+        if package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1 {
+            return advance_epic_plan(view, package);
+        }
         return advance_adaptive(view, package);
     }
     if view.run.state == RunState::Stopped {
@@ -666,6 +669,144 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
     })
 }
 
+/// Closed `epic-plan/v1`: resolve one disposable worktree, author one native
+/// spec, critique it through the frozen review topology, and optionally run
+/// one bounded revision plus re-review. It intentionally has no gate, push,
+/// PR, or repository-writing machine step.
+fn advance_epic_plan(view: &RunView, package: &ExecutionPackageV1) -> NextAction {
+    if view.run.state == RunState::Stopped {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: view.run.stop_reason.clone().unwrap_or_default(),
+        });
+    }
+    let Some(profile) = active_profile(view, package) else {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "stored epic-plan profile is missing".to_owned(),
+        });
+    };
+    if !op_settled(view, MachineStage::Resolve, 0) {
+        return NextAction::RunMachine(MachineStage::Resolve);
+    }
+
+    let author = seats_for(profile, SeatPurpose::Implement);
+    match adaptive_group(view, package, &author, 0) {
+        AdaptiveGroup::Action(action) => return action,
+        AdaptiveGroup::Done(done) if done.amendment.is_some() => {
+            return amendment_stop(done.amendment.expect("checked"));
+        }
+        AdaptiveGroup::Done(done) if done.semantic_failure => {
+            return NextAction::Stop(Terminal::SemanticProviderUnavailable {
+                stage_id: "plan-author".to_owned(),
+                attempts: done.failed_without_result,
+            });
+        }
+        AdaptiveGroup::Done { .. } => {}
+    }
+    if let Some((stage_id, crux)) = plan_crux(view) {
+        return NextAction::Stop(Terminal::SpecAmendmentProposed {
+            stage_id,
+            amendment: crux,
+        });
+    }
+
+    let reviews = seats_for(profile, SeatPurpose::Review);
+    let fixes = seats_for(profile, SeatPurpose::Fix);
+    for round in 0..=profile.fix_round_budget {
+        let reviewed = match adaptive_group(view, package, &reviews, round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = reviewed.amendment {
+            return amendment_stop(amendment);
+        }
+        let reviewed = match synthesis_verdict(view, package, profile, round, reviewed) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if reviewed.control == Verdict::Block {
+            let (stage_id, evidence) = reviewed.block.unwrap_or_else(|| {
+                (
+                    "plan-review".to_owned(),
+                    "planning critique returned a blocking verdict".to_owned(),
+                )
+            });
+            return NextAction::Stop(Terminal::SpecAmendmentProposed {
+                stage_id,
+                amendment: SpecAmendment {
+                    summary: "rolling plan requires operator adjudication".to_owned(),
+                    evidence,
+                    proposed_change:
+                        "resolve the blocking scope or authority decision for this frozen child"
+                            .to_owned(),
+                },
+            });
+        }
+        if reviewed.control == Verdict::Approve {
+            return NextAction::Stop(Terminal::Done {
+                review_rounds: round.saturating_add(1),
+                final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
+            });
+        }
+        if round == profile.fix_round_budget {
+            return NextAction::Stop(Terminal::ReviewBudgetExhausted {
+                review_rounds: round.saturating_add(1),
+                final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
+            });
+        }
+        match adaptive_group(view, package, &fixes, round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) if done.amendment.is_some() => {
+                return amendment_stop(done.amendment.expect("checked"));
+            }
+            AdaptiveGroup::Done(done) if done.semantic_failure => {
+                return NextAction::Stop(Terminal::RemediationFailed {
+                    round: round.saturating_add(1),
+                    final_verdict: reviewed.produced,
+                    final_verdict_is_durable: reviewed.produced_is_durable,
+                    failed_review_seats: reviewed.failed_without_result,
+                });
+            }
+            AdaptiveGroup::Done { .. } => {}
+        }
+        if let Some((stage_id, crux)) = plan_crux(view) {
+            return NextAction::Stop(Terminal::SpecAmendmentProposed {
+                stage_id,
+                amendment: crux,
+            });
+        }
+    }
+    NextAction::Stop(Terminal::ExternallyStopped {
+        reason: "epic-plan review loop exceeded its frozen bound".to_owned(),
+    })
+}
+
+fn plan_crux(view: &RunView) -> Option<(String, SpecAmendment)> {
+    view.packets.iter().find_map(|row| {
+        let packet = crate::project::stored_packet(row).ok()?;
+        let execution = packet.execution?;
+        if !matches!(execution.purpose, SeatPurpose::Implement | SeatPurpose::Fix) {
+            return None;
+        }
+        let outcome = view
+            .terminal_attempts
+            .get(&row.packet_id)?
+            .iter()
+            .rev()
+            .find_map(|attempt| attempt.outcome.as_ref())?;
+        let Outcome::Plan { cruxes, .. } = outcome else {
+            return None;
+        };
+        cruxes
+            .first()
+            .cloned()
+            .map(|crux| (execution.stage_id, crux))
+    })
+}
+
 fn amendment_stop((stage_id, amendment): (String, SpecAmendment)) -> NextAction {
     NextAction::Stop(Terminal::SpecAmendmentProposed {
         stage_id,
@@ -741,6 +882,7 @@ struct AdaptiveDone {
     failed_without_result: u32,
     semantic_failure: bool,
     amendment: Option<(String, SpecAmendment)>,
+    block: Option<(String, String)>,
 }
 
 enum AdaptiveGroup {
@@ -769,6 +911,7 @@ fn adaptive_group(
     let mut failed_without_result = 0u32;
     let mut semantic_failure = false;
     let mut amendment = None;
+    let mut block = None;
     for seat in seats {
         let Some(packet) = adaptive_packet(view, seat, round) else {
             return AdaptiveGroup::Action(NextAction::Stop(Terminal::ExternallyStopped {
@@ -796,16 +939,23 @@ fn adaptive_group(
             LegState::Completed { outcome } => match outcome {
                 Some(Outcome::Review {
                     verdict,
+                    summary,
                     available: true,
                     ..
-                }) => verdicts.push((*verdict, true)),
+                }) => {
+                    if *verdict == Verdict::Block && block.is_none() {
+                        block = Some((seat.id.as_str().to_owned(), summary.clone()));
+                    }
+                    verdicts.push((*verdict, true));
+                }
                 Some(Outcome::Review {
                     available: false, ..
                 }) => {}
                 Some(Outcome::Implement {
                     implemented: true, ..
                 })
-                | Some(Outcome::Fix { applied: true, .. }) => {}
+                | Some(Outcome::Fix { applied: true, .. })
+                | Some(Outcome::Plan { .. }) => {}
                 Some(Outcome::SpecAmendment { amendment: value }) => {
                     if amendment.is_none() {
                         amendment = Some((seat.id.as_str().to_owned(), value.clone()));
@@ -842,6 +992,7 @@ fn adaptive_group(
         failed_without_result,
         semantic_failure,
         amendment,
+        block,
     })
 }
 

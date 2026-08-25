@@ -798,6 +798,16 @@ fn result_json(result: &PacketResult) -> Value {
             "applied": applied,
             "summary": summary,
         }),
+        Outcome::Plan {
+            spec,
+            traceability,
+            cruxes,
+        } => json!({
+            "kind": "plan",
+            "spec": spec,
+            "traceability": traceability,
+            "cruxes": cruxes,
+        }),
         Outcome::SpecAmendment { amendment } => json!({
             "kind": "spec-amendment",
             "amendment": amendment,
@@ -1219,6 +1229,7 @@ fn child_rows(snapshot: &WorkObservationSnapshot) -> Vec<Value> {
                 "eventId": child.event_id,
                 "childId": child.child_id,
                 "runId": child.run_id,
+                "phase": if child.planning { "planning" } else { "implementation" },
                 "identity": identity,
                 "status": run_status(run),
                 "delivery": run_delivery(run),

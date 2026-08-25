@@ -48,7 +48,7 @@ impl ProviderDriver for PiDriver {
             }
         };
         let tools = match packet.provider_hints.sandbox {
-            Sandbox::ReadOnly => " --tools read,bash,grep,find,ls",
+            Sandbox::ReadOnly => " --tools read,grep,find,ls",
             Sandbox::WorkspaceWrite => "",
         };
         // Skills and context files deliberately remain enabled. Extension
@@ -184,9 +184,8 @@ mod tests {
         let read_only = PiDriver
             .invocation(&packet(Sandbox::ReadOnly, None), &dirs, "token")
             .expect("read-only invocation");
-        assert!(read_only
-            .shell_line
-            .contains("--tools read,bash,grep,find,ls"));
+        assert!(read_only.shell_line.contains("--tools read,grep,find,ls"));
+        assert!(!read_only.shell_line.contains("bash"));
     }
 
     #[test]

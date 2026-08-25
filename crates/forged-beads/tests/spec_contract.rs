@@ -17,7 +17,8 @@ mod support;
 use std::path::Path;
 
 use forged_beads::{
-    assign_unassigned_issue, plan_inventory, show_issue, PlanDependencyStatus, PlanDependencyType,
+    apply_native_spec_to_blocked_stub, assign_unassigned_issue, plan_inventory,
+    ready_epic_children, show_issue, NativeSpecUpdate, PlanDependencyStatus, PlanDependencyType,
     PlanReadiness, BLOCKED_CLAIM_REFUSAL,
 };
 use serde_json::{json, Value};
@@ -45,6 +46,101 @@ fn brief_deps(bd: &Path, s: &support::Scratch, id: &str) -> Value {
         Value::Array(items) => items.into_iter().next().expect("bd show returned no issue"),
         other => other,
     }
+}
+
+fn create_epic(bd: &Path, s: &support::Scratch, title: &str) -> String {
+    let out = support::raw_bd(bd, s, &["create", title, "--type", "epic", "--json"])
+        .output()
+        .expect("creating epic");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let value: Value = serde_json::from_slice(&out.stdout).expect("create envelope");
+    value["data"]["id"].as_str().expect("epic id").to_owned()
+}
+
+#[tokio::test]
+async fn epic_ready_frontier_is_parent_scoped_and_uncapped() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("ready-epic-uncapped");
+    support::init_store(&bd, &s);
+    let epic = create_epic(&bd, &s, "large rolling epic");
+    for index in 0..105 {
+        let out = support::raw_bd(
+            &bd,
+            &s,
+            &[
+                "create",
+                &format!("child {index:03}"),
+                "--parent",
+                &epic,
+                "--json",
+            ],
+        )
+        .output()
+        .expect("creating child");
+        assert!(
+            out.status.success(),
+            "{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+    let ready = ready_epic_children(&support::cfg_for(&bd, &s), &epic)
+        .await
+        .expect("parent frontier");
+    assert_eq!(
+        ready.len(),
+        105,
+        "the bd default page must not hide children"
+    );
+}
+
+#[tokio::test]
+async fn rolling_plan_apply_is_guarded_and_exact() {
+    let _guard = support::HomeBeadsGuard::new();
+    let Some(bd) = support::require_bd() else {
+        return;
+    };
+    let s = support::scratch("rolling-plan-apply");
+    support::init_store(&bd, &s);
+    let id = create_status_bead(&bd, &s, "planning stub", "blocked");
+    let spec = NativeSpecUpdate {
+        description: "context and outcome".to_owned(),
+        acceptance_criteria: "observable acceptance".to_owned(),
+        design: "minimal design".to_owned(),
+        notes: "no scope expansion".to_owned(),
+    };
+    let applied = apply_native_spec_to_blocked_stub(
+        &support::cfg_for(&bd, &s),
+        &id,
+        "forged:test-epic",
+        &spec,
+    )
+    .await
+    .expect("guarded apply");
+    assert_eq!(applied.status, "open");
+    assert_eq!(applied.assignee, None);
+    assert_eq!(applied.description, spec.description);
+    assert_eq!(applied.acceptance_criteria, spec.acceptance_criteria);
+    assert_eq!(applied.design, spec.design);
+    assert_eq!(applied.notes, spec.notes);
+
+    let refused = apply_native_spec_to_blocked_stub(
+        &support::cfg_for(&bd, &s),
+        &id,
+        "forged:test-epic",
+        &spec,
+    )
+    .await;
+    assert!(
+        refused.is_err(),
+        "an open post-image is not a fresh guarded write"
+    );
 }
 
 /// Create a bead carrying every spec field, returning its id.

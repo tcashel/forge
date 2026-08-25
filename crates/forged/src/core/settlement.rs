@@ -443,8 +443,16 @@ pub(crate) async fn settle(
         });
     }
 
-    let (stopped_attempts, bead, retired, cleanup_error) =
-        settle_aftermath(ctx, run_id, &settlement, &run, false).await?;
+    let internal = is_internal_epic_plan(ctx, run_id).await?;
+    let (stopped_attempts, bead, retired, cleanup_error) = if internal {
+        let stopped = stop_live_attempts(ctx, run_id, &settlement.reason).await?;
+        // Preserve planning artifacts through typed stops. The epic apply
+        // seam performs the required clean retirement immediately before the
+        // guarded Beads write.
+        (stopped, Value::Null, false, None)
+    } else {
+        settle_aftermath(ctx, run_id, &settlement, &run, false).await?
+    };
 
     Ok(json!({
         "runId": run_id,
@@ -462,6 +470,15 @@ pub(crate) async fn settle(
         "worktreeRetired": retired,
         "worktreeCleanupError": cleanup_error,
     }))
+}
+
+async fn is_internal_epic_plan(ctx: &Ctx, run_id: &str) -> Result<bool, Failure> {
+    Ok(super::drive::project(ctx, run_id)
+        .await?
+        .execution_package
+        .is_some_and(|package| {
+            package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1
+        }))
 }
 
 /// `run stop` — the explicit whole-run terminal operation.
@@ -803,7 +820,16 @@ async fn adjudicate_locked(
         })?
     };
     let (stopped_attempts, bead, retired, cleanup_error) =
-        settle_aftermath(ctx, run_id, &settlement, &run, true).await?;
+        if is_internal_epic_plan(ctx, run_id).await? {
+            (
+                stop_live_attempts(ctx, run_id, &settlement.reason).await?,
+                Value::Null,
+                false,
+                None,
+            )
+        } else {
+            settle_aftermath(ctx, run_id, &settlement, &run, true).await?
+        };
     Ok(json!({
         "runId": run_id,
         "outcome": settlement.outcome.as_str(),

@@ -3,9 +3,9 @@
 //!
 //! This is the storage seam behind exact Work Detail projections. It never
 //! reads Beads, controller files, processes, Herdr, or providers. An epic's
-//! child runs are discovered from its durable `forged.epic.child.started`
-//! events and every child table is then read in a bounded number of bulk
-//! queries inside the same SQLite read transaction.
+//! child and internal planning runs are discovered from their durable epic
+//! start-link events and every run table is then read in a bounded number of
+//! bulk queries inside the same SQLite read transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -39,6 +39,7 @@ use crate::work_identity::{get_work_identity_tx, identity_row, IDENTITY_COLUMNS}
 
 const EPIC_STARTED: &str = "forged.epic.started";
 const EPIC_CHILD_STARTED: &str = "forged.epic.child.started";
+const EPIC_PLAN_STARTED: &str = "forged.epic.plan.started";
 
 /// Hard ceiling for the event page carried by one observation snapshot.
 pub const WORK_OBSERVATION_MAX_EVENT_LIMIT: u32 = 1_000;
@@ -49,6 +50,8 @@ pub struct EpicChildRunLink {
     pub event_id: i64,
     pub child_id: String,
     pub run_id: String,
+    /// True when this edge names the epic's internal read-only planning run.
+    pub planning: bool,
 }
 
 /// The bounded event page for the exact requested subject.
@@ -152,16 +155,23 @@ fn epic_children_tx(
     epic_id: &str,
 ) -> Result<Vec<EpicChildRunLink>, LedgerError> {
     let mut statement = conn.prepare(
-        "SELECT event_id, payload_json FROM events \
-         WHERE run_id = ?1 AND kind = ?2 ORDER BY event_id",
+        "SELECT event_id, kind, payload_json FROM events \
+         WHERE run_id = ?1 AND kind IN (?2, ?3) ORDER BY event_id",
     )?;
-    let rows = statement.query_map(rusqlite::params![epic_id, EPIC_CHILD_STARTED], |row| {
-        Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-    })?;
+    let rows = statement.query_map(
+        rusqlite::params![epic_id, EPIC_CHILD_STARTED, EPIC_PLAN_STARTED],
+        |row| {
+            Ok((
+                row.get::<_, i64>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        },
+    )?;
     let mut links = Vec::new();
     let mut owners = BTreeMap::<String, String>::new();
     for row in rows {
-        let (event_id, raw) = row?;
+        let (event_id, kind, raw) = row?;
         let child: StoredEpicChildStarted = serde_json::from_str(&raw).map_err(|error| {
             internal(format!(
                 "epic child-start event {event_id} has invalid payload: {error}"
@@ -184,6 +194,7 @@ fn epic_children_tx(
             event_id,
             child_id: child.child_id,
             run_id: child.run_id,
+            planning: kind == EPIC_PLAN_STARTED,
         });
     }
     Ok(links)
@@ -1109,8 +1120,10 @@ mod tests {
 
         seed_run(&ledger, "child-a", Some(epic_id));
         seed_run(&ledger, "child-b", Some(epic_id));
+        seed_run(&ledger, "plan-a", Some(epic_id));
         seed_run(&ledger, "outsider", None);
         let child_packet = seed_packet(&ledger, "child-a", 1);
+        let plan_packet = seed_packet(&ledger, "plan-a", 1);
         let _outsider_packet = seed_packet(&ledger, "outsider", 1);
         ledger
             .append_event(Some("child-a"), "child.local", json!({"n": 1}))
@@ -1140,6 +1153,18 @@ mod tests {
             )
             .expect("child b start");
         ledger
+            .append_event(
+                Some(epic_id),
+                EPIC_PLAN_STARTED,
+                json!({
+                    "childId": "bead-stub",
+                    "runId": "plan-a",
+                    "generation": 1,
+                    "preDigest": "digest",
+                }),
+            )
+            .expect("plan start");
+        ledger
             .append_event(Some(epic_id), "epic.note", json!({"n": 2}))
             .expect("epic note");
 
@@ -1150,27 +1175,41 @@ mod tests {
         let snapshot = ledger
             .work_observation_snapshot(WorkIdentitySubjectKind::Epic, epic_id, after, 2)
             .expect("epic snapshot");
-        assert_eq!(snapshot.epic_children.len(), 2);
+        assert_eq!(snapshot.epic_children.len(), 3);
         assert_eq!(
             snapshot
                 .epic_children
                 .iter()
                 .map(|link| link.run_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["child-a", "child-b"]
+            vec!["child-a", "child-b", "plan-a"]
         );
-        assert_eq!(snapshot.child_identities.len(), 2);
+        assert_eq!(
+            snapshot
+                .epic_children
+                .iter()
+                .map(|link| link.planning)
+                .collect::<Vec<_>>(),
+            vec![false, false, true]
+        );
+        assert_eq!(snapshot.child_identities.len(), 3);
         assert_eq!(
             snapshot
                 .runs
                 .iter()
                 .map(|run| run.run_id.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["child-a", "child-b"])
+            BTreeSet::from(["child-a", "child-b", "plan-a"])
         );
-        assert_eq!(snapshot.packets.len(), 1);
-        assert_eq!(snapshot.packets[0].packet_id, child_packet);
-        assert_eq!(snapshot.usage_totals.len(), 2);
+        assert_eq!(
+            snapshot
+                .packets
+                .iter()
+                .map(|packet| packet.packet_id.as_str())
+                .collect::<BTreeSet<_>>(),
+            BTreeSet::from([child_packet.as_str(), plan_packet.as_str()])
+        );
+        assert_eq!(snapshot.usage_totals.len(), 3);
         assert!(snapshot
             .usage_totals
             .values()
@@ -1215,7 +1254,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!remainder.events.has_more);
-        assert_eq!(remainder.epic_children.len(), 2);
+        assert_eq!(remainder.epic_children.len(), 3);
     }
 
     #[test]

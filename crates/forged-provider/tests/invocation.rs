@@ -50,17 +50,19 @@ fn claude_invocation_emits_the_documented_line() {
 }
 
 #[test]
-fn claude_ignores_sandbox_and_effort_even_when_bogus() {
-    let baseline = ClaudeDriver
-        .invocation(&support::sample_packet(), &dirs(), CLAIM_TOKEN)
-        .expect("baseline builds");
+fn claude_read_only_removes_bypass_and_write_capable_tools() {
     let mut packet = support::sample_packet();
     packet.provider_hints.effort = Some("bogus".to_owned());
     packet.provider_hints.sandbox = Sandbox::ReadOnly;
     let invocation = ClaudeDriver
         .invocation(&packet, &dirs(), CLAIM_TOKEN)
         .expect("claude never returns UnsupportedEffort");
-    assert_eq!(invocation.shell_line, baseline.shell_line);
+    assert!(invocation.shell_line.contains("--permission-mode plan"));
+    assert!(invocation.shell_line.contains("--tools Read,Grep,Glob"));
+    assert!(!invocation
+        .shell_line
+        .contains("--dangerously-skip-permissions"));
+    assert!(!invocation.shell_line.contains("Bash"));
 }
 
 #[test]

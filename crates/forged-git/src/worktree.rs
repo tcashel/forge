@@ -194,6 +194,19 @@ pub async fn retire_worktree(
     Ok(())
 }
 
+/// Verify that one validated run worktree is resolved and clean without
+/// pruning metadata or removing either the worktree or its artifact dir.
+/// An absent worktree is already clean for crash recovery.
+pub async fn verify_worktree_clean(runs_root: &Path, run_id: &str) -> Result<(), GitError> {
+    validate_abs_path(runs_root, "runs_root")?;
+    let run_id = RunId::new(run_id.to_owned())?;
+    let worktree = runs_root.join(run_id.as_str()).join("worktree");
+    if worktree.exists() {
+        check_clean(&worktree).await?;
+    }
+    Ok(())
+}
+
 /// Refuse a retire when the worktree carries unresolved merge state or any
 /// staged, modified, or untracked change.
 async fn check_clean(worktree: &Path) -> Result<(), GitError> {

@@ -31,6 +31,9 @@
 //! `epic.child.merge.after` is the scheduler's applied-but-response-lost
 //! boundary: GitHub accepted the integration merge, but the operation and
 //! epic journal have not yet been completed.
+//! `epic.plan.apply.after-beads` is the rolling planner's corresponding
+//! boundary: the guarded four-field Beads write and exact readback succeeded,
+//! but the SafeRetry operation and epic plan-applied event are not yet sealed.
 //! `controller.record.after` is the handoff equivalent: the detached
 //! controller identity is on disk, but its event and operation response are
 //! not yet durable in the ledger.
