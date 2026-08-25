@@ -359,6 +359,137 @@ fn once_adopts_live_work_and_concurrent_ticks_restart_once() {
     });
 }
 
+#[cfg(feature = "failpoints")]
+#[test]
+fn restart_recovers_a_preparing_admission_after_spawn_crash() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-recover-preparing-admission");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read restart admission config"),
+    )
+    .expect("config JSON");
+    config["admission"] = json!({
+        "totalActive": 8,
+        "providerActive": 4,
+        "repositoryWriteActive": 2,
+        "deferSeconds": 60,
+    });
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize restart admission config"),
+    )
+    .expect("write restart admission config");
+
+    let run = "run-recover-preparing-admission";
+    start_run(&env, run);
+    env.set_scenario("implement", "hang", 2);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", run]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    let first_pid = controller_pid(&submitted);
+    wait_until("first controller provider start", || {
+        implementation_starts(&env, run) == 1
+    });
+    killpg(Pid::from_raw(first_pid), Signal::SIGKILL).expect("kill first controller group");
+    wait_until("first controller group death", || {
+        !process_group_alive(first_pid)
+    });
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make killed controller immediately due");
+    ledger.close().expect("close");
+
+    let status = env
+        .forged_cmd(&["supervise", "--once"])
+        .env("FORGED_FAILPOINT", "controller.spawn.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("crashing supervisor tick");
+    assert!(!status.success(), "spawn failpoint must crash");
+
+    let controller_dir = env.anvil.join(format!("runs/{run}/controller"));
+    let admission_path = controller_dir.join("runtime-admission.json");
+    wait_until("generation two process identity", || {
+        controller_dir.join("controller-2.pid").exists()
+            && controller_dir.join("controller-2.lstart").exists()
+    });
+    let admission: Value = serde_json::from_slice(
+        &std::fs::read(&admission_path).expect("preserved runtime admission"),
+    )
+    .expect("admission JSON");
+    assert_eq!(admission["generation"], json!(2));
+    assert_eq!(admission["state"], json!("preparing"));
+    let predecessor: Value = serde_json::from_slice(
+        &std::fs::read(controller_dir.join("controller.json")).expect("predecessor record"),
+    )
+    .expect("controller JSON");
+    assert_eq!(predecessor["generation"], json!(1));
+    let ledger = env.ledger();
+    ledger
+        .record_desired_outcome(
+            DesiredSubjectKind::Run,
+            run,
+            DesiredState::Running,
+            DesiredReconcileOutcome::Authorized,
+            Some("2000-01-01T00:00:00.000000000Z".to_owned()),
+            None,
+        )
+        .expect("make spawn-crash recovery immediately due");
+    ledger.close().expect("close");
+
+    let (code, recovered) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "recovery tick: {recovered}");
+    assert_eq!(
+        recovered["result"]["subjects"][0]["action"],
+        json!("adopted"),
+        "{recovered}"
+    );
+    let record: Value = serde_json::from_slice(
+        &std::fs::read(controller_dir.join("controller.json")).expect("recovered record"),
+    )
+    .expect("controller JSON");
+    assert_eq!(record["generation"], json!(2));
+    assert_eq!(record["recoveredAfterSpawnCrash"], json!(true));
+    assert!(
+        !admission_path.exists(),
+        "matching recovered identity must clear the runtime fence"
+    );
+    let ledger = env.ledger();
+    let snapshot = ledger.admission_snapshot(None).expect("admission snapshot");
+    assert!(snapshot.reservations.iter().all(|reservation| {
+        reservation.subject_kind != forged_types::AdmissionSubjectKind::Run
+            || reservation.subject_id != run
+    }));
+    ledger.close().expect("close");
+    assert_eq!(
+        implementation_starts(&env, run),
+        1,
+        "controller recovery must not duplicate the provider effect"
+    );
+
+    let (code, cleanup) = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        run,
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "preparing-admission recovery test cleanup",
+    ]);
+    assert_eq!(code, 0, "stop recovery fixture: {cleanup}");
+}
+
 #[test]
 fn live_controller_adoption_bypasses_full_repository_capacity() {
     let _serial = serialize_process_fixture();
