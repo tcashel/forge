@@ -586,7 +586,7 @@ fn sync_parent(path: &Path) -> Result<(), Failure> {
         .map_err(|error| Failure::internal(format!("syncing {}: {error}", parent.display())))
 }
 
-fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
+pub(crate) fn atomic_write(path: &Path, bytes: &[u8], mode: u32) -> Result<(), Failure> {
     reject_symlink_chain(path)?;
     let parent = path
         .parent()

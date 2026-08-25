@@ -452,7 +452,7 @@ fn incomplete_blocked_stub_does_not_opt_into_rolling_planning() {
         .all(|event| event.kind != "forged.epic.started"));
 }
 
-fn start_rolling_plan(env: &TestEnv) -> usize {
+fn reach_rolling_planning_boundary(env: &TestEnv) -> usize {
     env.enable_dynamic_gh();
     env.seed_epic(
         "epic-rolling",
@@ -507,6 +507,11 @@ fn start_rolling_plan(env: &TestEnv) -> usize {
     let (code, merged) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "initial merge: {merged}");
     assert_eq!(merged["result"]["progress"]["childId"], json!("child-wave"));
+    env.gh_calls().len()
+}
+
+fn start_rolling_plan(env: &TestEnv) -> usize {
+    let gh_before_plan = reach_rolling_planning_boundary(env);
     env.seed_frontier("child-next");
     let (code, planning) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
     assert_eq!(code, 0, "planning dispatch: {planning}");
@@ -532,7 +537,7 @@ fn start_rolling_plan(env: &TestEnv) -> usize {
     assert_eq!(stub["phase"], json!("planning"));
     assert_eq!(status["result"]["counts"]["active"], json!(1));
     assert_eq!(status["result"]["counts"]["queuedDeferred"], json!(0));
-    env.gh_calls().len()
+    gh_before_plan
 }
 
 fn prepare_reviewed_rolling_plan(env: &TestEnv) -> usize {
@@ -550,6 +555,93 @@ fn prepare_reviewed_rolling_plan(env: &TestEnv) -> usize {
         "the complete planning protocol has zero GitHub effects"
     );
     gh_before_plan
+}
+
+#[test]
+fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
+    let env = TestEnv::new("forged-rolling-pre-cycle-resolve");
+    reach_rolling_planning_boundary(&env);
+    env.set_bead_field(
+        "child-stub",
+        "dependencies",
+        r#"[{"id":"late-blocker","dependency_type":"blocks","status":"closed"}]"#,
+    );
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "pre-cycle drift becomes typed input: {held}");
+    assert_eq!(
+        held["result"]["stopped"]["code"],
+        json!("planning-graph-drift")
+    );
+    assert!(env
+        .ledger()
+        .list_events(Some("epic-rolling"), 0, 65_536)
+        .expect("epic events")
+        .iter()
+        .all(|event| event.kind != "forged.epic.plan.started"));
+
+    env.set_bead_field("child-stub", "dependencies", "[]");
+    let updates_before = env
+        .bd_calls()
+        .into_iter()
+        .filter(|call| call.starts_with("update child-stub "))
+        .count();
+    let (code, resolved) = env.forged(&[
+        "epic",
+        "resolve",
+        "--epic",
+        "epic-rolling",
+        "--child",
+        "child-stub",
+        "--note",
+        "the accidental dependency was removed; retry the planning boundary",
+    ]);
+    assert_eq!(code, 0, "resolve pre-cycle drift: {resolved}");
+    assert_eq!(
+        std::fs::read_to_string(env.beads_dir.join("shim-state/child-stub.status"))
+            .expect("stub status"),
+        "blocked",
+        "resolution must not materialize the placeholder"
+    );
+    assert_eq!(
+        env.bd_calls()
+            .iter()
+            .filter(|call| call.starts_with("update child-stub "))
+            .count(),
+        updates_before,
+        "pre-cycle resolution performs no Beads write"
+    );
+
+    let (code, restarted) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "planning retries after resolution: {restarted}");
+    assert_eq!(
+        restarted["result"]["progress"]["planning"]["childId"],
+        json!("child-stub")
+    );
+}
+
+#[test]
+fn durable_planning_input_mismatch_is_child_addressed_and_preserved() {
+    let env = TestEnv::new("forged-rolling-input-mismatch");
+    start_rolling_plan(&env);
+    let input = env
+        .anvil
+        .join("runs/child-stub-epic-plan/planning-input.md");
+    std::fs::write(&input, "partial planning input\n").expect("simulate surviving torn input");
+
+    let (code, held) = env.forged(&["epic", "advance", "--epic", "epic-rolling"]);
+    assert_eq!(code, 0, "input mismatch becomes typed epic input: {held}");
+    assert_eq!(
+        held["result"]["stopped"]["code"],
+        json!("planning-input-mismatch")
+    );
+    assert_eq!(held["result"]["stopped"]["childId"], json!("child-stub"));
+    assert!(held["result"]["stopped"]["evidence"]["expectedSha256"].is_string());
+    assert!(held["result"]["stopped"]["evidence"]["observedSha256"].is_string());
+    assert_eq!(
+        std::fs::read_to_string(&input).expect("preserved mismatch"),
+        "partial planning input\n",
+        "mismatched evidence is preserved for adjudication"
+    );
 }
 
 #[test]

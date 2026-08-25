@@ -732,12 +732,16 @@ fn fields_digest(fields: &NativeBeadSpecV1) -> Result<String, Failure> {
     let bytes = forged_types::canonical_json_bytes(&value).map_err(|error| {
         Failure::internal(format!("cannot canonicalize native spec fields: {error}"))
     })?;
+    Ok(bytes_digest(&bytes))
+}
+
+fn bytes_digest(bytes: &[u8]) -> String {
     let mut out = String::with_capacity(64);
     for byte in Sha256::digest(bytes) {
         use std::fmt::Write as _;
         let _ = write!(out, "{byte:02x}");
     }
-    Ok(out)
+    out
 }
 
 fn complete_native_fields(fields: &NativeBeadSpecV1) -> bool {
@@ -1978,11 +1982,17 @@ struct PlanningCheckpoint {
     target_snapshot: Value,
 }
 
+enum PlanningRunEnsure {
+    Started(Value),
+    Stop(Value),
+}
+
 async fn ensure_planning_run(
     ctx: &Ctx,
     config: &EpicConfig,
+    child: &FrozenChild,
     state: &PlanningState,
-) -> Result<Value, Failure> {
+) -> Result<PlanningRunEnsure, Failure> {
     let input = state.input_body.as_deref().ok_or_else(|| {
         Failure::internal(format!(
             "new planning cycle {:?} has no durable input body",
@@ -1998,16 +2008,29 @@ async fn ensure_planning_run(
     .map_err(|error| Failure::internal(format!("creating planning input directory: {error}")))?;
     match std::fs::read_to_string(&input_path) {
         Ok(existing) if existing == input => {}
-        Ok(_) => {
-            return Err(Failure::invalid(format!(
-                "planning input {} differs from its durable checkpoint",
-                input_path.display()
-            )))
+        Ok(observed) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "planning-input-mismatch",
+                Some(&child.id),
+                format!(
+                    "planning input {} differs from its durable checkpoint",
+                    input_path.display()
+                ),
+                Some(json!({
+                    "path": input_path,
+                    "expectedSha256": bytes_digest(input.as_bytes()),
+                    "observedSha256": bytes_digest(observed.as_bytes()),
+                    "expectedBytes": input.len(),
+                    "observedBytes": observed.len(),
+                })),
+            )
+            .await?;
+            return Ok(PlanningRunEnsure::Stop(stopped));
         }
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            std::fs::write(&input_path, input.as_bytes()).map_err(|error| {
-                Failure::internal(format!("writing frozen planning input: {error}"))
-            })?;
+            crate::runtime::atomic_write(&input_path, input.as_bytes(), 0o600)?;
         }
         Err(error) => {
             return Err(Failure::internal(format!(
@@ -2043,6 +2066,7 @@ async fn ensure_planning_run(
         },
     };
     response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)
+        .map(PlanningRunEnsure::Started)
 }
 
 fn issue_checkpoint(row: &forged_beads::PlanIssue, dependency_status: bool) -> Value {
@@ -2214,7 +2238,7 @@ async fn start_planning(
     child: &FrozenChild,
     generation: u32,
     guidance: Option<&str>,
-) -> Result<Value, Failure> {
+) -> Result<Step, Failure> {
     let config = &view.config;
     let frozen_fields = child.frozen_fields.as_ref().ok_or_else(|| {
         Failure::internal(format!("planning stub {:?} has no frozen fields", child.id))
@@ -2289,8 +2313,12 @@ async fn start_planning(
     });
     append(ctx, &config.epic_id, PLAN_STARTED, event.clone()).await?;
     let state = planning_state(&event, generation)?;
-    let started = ensure_planning_run(ctx, config, &state).await?;
-    Ok(json!({"planning": event, "started": started}))
+    match ensure_planning_run(ctx, config, child, &state).await? {
+        PlanningRunEnsure::Started(started) => Ok(Step::Progress(
+            json!({"planning": event, "started": started}),
+        )),
+        PlanningRunEnsure::Stop(stopped) => Ok(Step::Stop(stopped)),
+    }
 }
 
 fn target_structure(snapshot: &Value) -> Value {
@@ -2998,7 +3026,7 @@ async fn planning_after_completed_wave(
     let Some((_, child)) = eligible.first() else {
         return Ok(None);
     };
-    Ok(Some(Step::Progress(
+    Ok(Some(
         start_planning(
             ctx,
             view,
@@ -3011,7 +3039,7 @@ async fn planning_after_completed_wave(
             view.planning_guidance.get(&child.id).map(String::as_str),
         )
         .await?,
-    )))
+    ))
 }
 
 async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
@@ -3055,7 +3083,10 @@ async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
             continue;
         };
         if planning.integration_sha.is_some() {
-            ensure_planning_run(ctx, &view.config, planning).await?;
+            match ensure_planning_run(ctx, &view.config, child, planning).await? {
+                PlanningRunEnsure::Started(_) => {}
+                PlanningRunEnsure::Stop(stopped) => return Ok(Step::Stop(stopped)),
+            }
         }
         let run = super::drive::project(ctx, &planning.run_id).await?;
         if run.run.state == RunState::Stopped {
@@ -3831,11 +3862,9 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     "epic {epic:?} input requirement does not target child {child:?}"
                 )));
             }
-            let active_planning = view
-                .planning
-                .get(&child)
-                .is_some_and(|state| state.applied.is_none());
-            if frozen_child.planning_stub && active_planning {
+            let planning = view.planning.get(&child);
+            let planning_applied = planning.is_some_and(|state| state.applied.is_some());
+            if frozen_child.planning_stub && !planning_applied {
                 let issue = forged_beads::show_issue(&ctx.config.bd_config(), &child).await?;
                 let fields = native_fields(&issue);
                 let digest = fields_digest(&fields)?;
@@ -3843,11 +3872,7 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                     && issue.assignee.is_none()
                     && complete_native_fields(&fields)
                 {
-                    if let Some(planning) = view
-                        .planning
-                        .get(&child)
-                        .filter(|state| state.applied.is_none())
-                    {
+                    if let Some(planning) = planning.filter(|state| state.applied.is_none()) {
                         append(
                             ctx,
                             &epic,
@@ -3862,18 +3887,24 @@ pub async fn epic_resolve(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                             }),
                         )
                         .await?;
+                    } else {
+                        return Err(Failure::invalid(format!(
+                            "planning stub {child:?} cannot adopt an open spec without an active planning cycle"
+                        )));
                     }
                 } else if issue.status == "blocked" && issue.assignee.is_none() {
-                    if let Some(planning) = view
-                        .planning
-                        .get(&child)
-                        .filter(|state| state.applied.is_none())
-                    {
+                    if let Some(planning) = planning.filter(|state| state.applied.is_none()) {
                         if digest != planning.pre_digest {
                             return Err(Failure::invalid(format!(
                                 "planning stub {child:?} changed without becoming a complete open spec"
                             )));
                         }
+                    } else if frozen_child.frozen_fields_sha256.as_deref()
+                        != Some(digest.as_str())
+                    {
+                        return Err(Failure::invalid(format!(
+                            "unmaterialized planning stub {child:?} changed before retry"
+                        )));
                     }
                 } else {
                     return Err(Failure::invalid(format!(
