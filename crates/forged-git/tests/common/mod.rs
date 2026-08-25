@@ -134,6 +134,7 @@ case "$1" in
     esac ;;
   api)
     case "$*" in
+      *--method\ PATCH*/pulls/*) key=update_pr ;;
       *--method\ POST*/pulls*) key=create_pr ;;
       *--method\ POST*/comments*) key=post_comment ;;
       */comments*) key=list_comments ;;

@@ -10,11 +10,11 @@ use forged_ledger::{
     DesiredReconcileOutcome, DesiredState, DesiredSubjectKind, EffectClass,
     InventoryUsageSelection, Ledger, OperationState, RunOutcome, RunState, SlotOutcome,
 };
-use forged_proto::{NextAction, ProtoEvent, Terminal};
+use forged_proto::{machine_idempotency_key, MachineStage, NextAction, ProtoEvent, Terminal};
 use forged_types::{
     AdmissionDecisionV1, AdmissionOutcome, AdmissionSubjectKind, ErrorCode, ExecutionPackageV1,
-    NativeBeadSpecV1, OperationRequest, OperationResponse, RosterRevisionV1, Severity, Verdict,
-    WorkIdentityContextV1, WorkIdentitySubjectKind,
+    NativeBeadSpecV1, OperationRequest, OperationResponse, RosterRevisionV1, SeatPurpose, Severity,
+    Verdict, WorkIdentityContextV1, WorkIdentitySubjectKind,
 };
 use serde_json::{json, Map, Value};
 use sha2::{Digest, Sha256};
@@ -41,6 +41,8 @@ pub(super) const INPUT_RESOLVED: &str = "forged.epic.input.resolved";
 pub(super) const PAUSED: &str = "forged.epic.paused";
 pub(super) const RESUMED: &str = "forged.epic.resumed";
 pub(super) const EPIC_PR: &str = "forged.epic.pr";
+const ASSURANCE_STARTED: &str = "forged.epic.assurance.started";
+pub(super) const ASSURANCE_COMPLETED: &str = "forged.epic.assurance.completed";
 const ROSTER_REVISED: &str = "forged.epic.roster.revised";
 const PACKAGE_MIGRATED: &str = "forged.epic.execution-package.migrated";
 const PACKAGE_MIGRATION: &str = "forged.epic.execution-package/1";
@@ -82,6 +84,9 @@ struct EpicConfig {
     max_active_children: u32,
     execution_package: ExecutionPackageV1,
     planning_package: Option<ExecutionPackageV1>,
+    /// Present only on newly authorized rolling epics. Older start events
+    /// retain terminal-on-PR behavior rather than silently changing meaning.
+    assurance_package: Option<ExecutionPackageV1>,
     /// Explicit operator authorization. Missing on old start events and
     /// therefore false rather than inferred from an incomplete child.
     rolling_authorized: bool,
@@ -116,6 +121,14 @@ struct PlanningState {
     applied: Option<Value>,
 }
 
+#[derive(Debug, Clone)]
+struct AssuranceState {
+    run_id: String,
+    integration_sha: String,
+    pr: Value,
+    input_body: String,
+}
+
 struct EpicView {
     config: EpicConfig,
     integration: Option<Value>,
@@ -124,6 +137,8 @@ struct EpicView {
     planning: BTreeMap<String, PlanningState>,
     planning_generations: BTreeMap<String, u32>,
     planning_guidance: BTreeMap<String, String>,
+    assurance: Option<AssuranceState>,
+    assurance_completed: Option<Value>,
     child_generations: BTreeMap<String, u32>,
     input: Option<Value>,
     paused: Option<Value>,
@@ -280,6 +295,15 @@ fn parse_config(value: &Value, migration: Option<&Value>) -> Result<EpicConfig, 
             .transpose()
             .map_err(|error| {
                 Failure::internal(format!("epic planning package is invalid: {error}"))
+            })?,
+        assurance_package: value
+            .get("assurancePackage")
+            .filter(|value| !value.is_null())
+            .cloned()
+            .map(serde_json::from_value)
+            .transpose()
+            .map_err(|error| {
+                Failure::internal(format!("epic assurance package is invalid: {error}"))
             })?,
         rolling_authorized: rolling_authorized(value),
         legacy_membership_recorded,
@@ -466,6 +490,25 @@ pub(super) async fn planning_base_sha(ctx: &Ctx, run_id: &str) -> Result<Option<
     Ok(None)
 }
 
+/// Return the exact integration head frozen when a root assurance run began.
+/// This is the only revision from which its worktree may be prepared.
+pub(super) async fn assurance_base_sha(ctx: &Ctx, run_id: &str) -> Result<Option<String>, Failure> {
+    let rows = on_ledger(&ctx.ledger, |ledger| {
+        ledger.list_events_by_kind(ASSURANCE_STARTED)
+    })
+    .await?;
+    for row in rows.iter().rev() {
+        let event = payload(row)?;
+        if event.get("runId").and_then(Value::as_str) == Some(run_id) {
+            return Ok(event
+                .get("integrationSha")
+                .and_then(Value::as_str)
+                .map(str::to_owned));
+        }
+    }
+    Ok(None)
+}
+
 async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
     let events = epic_events(ctx, epic).await?;
     let started = events
@@ -486,6 +529,8 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
         planning: BTreeMap::new(),
         planning_generations: BTreeMap::new(),
         planning_guidance: BTreeMap::new(),
+        assurance: None,
+        assurance_completed: None,
         child_generations: BTreeMap::new(),
         input: None,
         paused: None,
@@ -580,6 +625,19 @@ async fn project(ctx: &Ctx, epic: &str) -> Result<EpicView, Failure> {
             PAUSED => view.paused = Some(payload(&row)?),
             RESUMED => view.paused = None,
             EPIC_PR => view.pr = Some(payload(&row)?),
+            ASSURANCE_STARTED => {
+                let event = payload(&row)?;
+                view.assurance = Some(AssuranceState {
+                    run_id: string(&event, "runId")?,
+                    integration_sha: string(&event, "integrationSha")?,
+                    pr: event
+                        .get("pr")
+                        .cloned()
+                        .ok_or_else(|| Failure::internal("assurance start event has no PR"))?,
+                    input_body: string(&event, "assuranceInputBody")?,
+                });
+            }
+            ASSURANCE_COMPLETED => view.assurance_completed = Some(payload(&row)?),
             ROSTER_REVISED => {
                 let revision = serde_json::from_value(payload(&row)?).map_err(|error| {
                     Failure::internal(format!("epic roster revision is invalid: {error}"))
@@ -607,8 +665,10 @@ pub(super) async fn epic_host_policy(
 
 pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option<Value>, Failure> {
     let view = project(ctx, epic).await?;
-    Ok(if let Some(pr) = view.pr {
-        Some(json!({"finalPr": pr}))
+    Ok(if let Some(completed) = view.assurance_completed {
+        Some(json!({"finalPr": view.pr, "assurance": completed}))
+    } else if view.config.assurance_package.is_none() {
+        view.pr.map(|pr| json!({"finalPr": pr}))
     } else if let Some(paused) = view.paused {
         Some(json!({"paused": paused}))
     } else {
@@ -1203,6 +1263,20 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                 } else {
                     None
                 };
+                let assurance_package = if rolling_authorized {
+                    Some(
+                        crate::config::compile_epic_assurance_package(&compiled.package)
+                            .map_err(|errors| {
+                                Failure::invalid(format!(
+                                    "epic assurance definition is invalid: {}",
+                                    serde_json::to_string(&errors).unwrap_or_default()
+                                ))
+                            })?
+                            .package,
+                    )
+                } else {
+                    None
+                };
                 let base_ref = match param_opt_str(&params, "baseRef") {
                     Some(value) => value.to_owned(),
                     None => super::ops::default_branch_of(&repo).await,
@@ -1237,6 +1311,7 @@ pub async fn epic_start(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespo
                     "packageSha256": compiled.package_sha256,
                     "executionPackage": compiled.package,
                     "planningPackage": planning_package,
+                    "assurancePackage": assurance_package,
                     "rollingAuthorized": rolling_authorized,
                     "rootFields": root_fields,
                     "children": children,
@@ -1580,6 +1655,29 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         ));
     }
     next_wakes.sort();
+    let draft_pr = view.pr.clone();
+    let final_pr = if view.config.assurance_package.is_none() || view.assurance_completed.is_some()
+    {
+        view.pr.clone()
+    } else {
+        None
+    };
+    let assurance = view.assurance.as_ref().map(|state| {
+        let run = runs.get(state.run_id.as_str()).copied();
+        json!({
+            "runId": state.run_id,
+            "integrationSha": state.integration_sha,
+            "pr": state.pr,
+            "runState": run.map(|run| run.state.as_str()),
+            "terminalOutcome": run.and_then(|run| run.terminal_outcome.map(RunOutcome::as_str)),
+            "completed": view.assurance_completed.clone(),
+            "blocker": view.input.as_ref().filter(|input| {
+                input.get("code")
+                    .and_then(Value::as_str)
+                    .is_some_and(|code| code.starts_with("assurance-"))
+            }),
+        })
+    });
     Ok(json!({
         "schema": "forged.epic.status/1",
         "epicId": view.config.epic_id,
@@ -1617,7 +1715,9 @@ async fn status_json(ctx: &Ctx, view: EpicView) -> Result<Value, Failure> {
         "children": children,
         "inputRequired": view.input,
         "paused": view.paused,
-        "finalPr": view.pr,
+        "draftPr": draft_pr,
+        "finalPr": final_pr,
+        "assurance": assurance,
         "controller": controller,
         "beadsInventory": {
             "available": live_error.is_none(),
@@ -2840,6 +2940,9 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
         .map_err(|error| Failure::internal(error.to_string()))?;
     let key = derive_key("epic_pr", Some(&view.config.epic_id), None, None);
     let config = view.config.clone();
+    let assurance_enabled = config.assurance_package.is_some();
+    let integration_sha =
+        forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch).await?;
     let operation_epic = config.epic_id.clone();
     let journal = view
         .children
@@ -2884,12 +2987,506 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
                 "isDraft": pr.is_draft,
                 "head": pr.head_ref_name,
                 "base": pr.base_ref_name,
+                "headSha": integration_sha,
+                "terminal": !assurance_enabled,
                 "transitionId": operation,
+            });
+            if assurance_enabled {
+                append(ctx, &config.epic_id, EPIC_PR, event.clone()).await?;
+            } else {
+                append_stop_event(
+                    ctx,
+                    &config.epic_id,
+                    EPIC_PR,
+                    event.clone(),
+                    EpicStopTransition {
+                        state: DesiredState::Stopped,
+                        outcome: DesiredReconcileOutcome::Terminal,
+                        error: None,
+                        identity_field: Some("transitionId"),
+                    },
+                )
+                .await?;
+            }
+            Ok(event)
+        },
+    )
+    .await?;
+    if view.config.assurance_package.is_some() {
+        Ok(Step::Progress(json!({"draftPr": value, "terminal": false})))
+    } else {
+        Ok(Step::Stop(json!({"finalPr": value})))
+    }
+}
+
+fn assurance_run_id(epic: &str) -> String {
+    format!("{epic}-epic-assurance")
+}
+
+fn final_pr_number(pr: &Value) -> Result<u64, Failure> {
+    pr.get("number")
+        .and_then(Value::as_u64)
+        .filter(|number| *number > 0)
+        .ok_or_else(|| Failure::internal("epic draft PR event has no valid number"))
+}
+
+async fn git_head(path: &Path) -> Result<String, Failure> {
+    let output = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(path)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| Failure::internal(format!("git rev-parse HEAD: {error}")))?;
+    if !output.status.success() {
+        return Err(Failure::internal(format!(
+            "git rev-parse HEAD failed: {}",
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).trim().to_owned())
+}
+
+async fn ensure_assurance_run(
+    ctx: &Ctx,
+    config: &EpicConfig,
+    state: &AssuranceState,
+) -> Result<Value, Failure> {
+    let input_path = ctx.config.run_dir(&state.run_id).join("assurance-input.md");
+    std::fs::create_dir_all(
+        input_path
+            .parent()
+            .ok_or_else(|| Failure::internal("assurance input has no parent"))?,
+    )
+    .map_err(|error| Failure::internal(format!("creating assurance input directory: {error}")))?;
+    match std::fs::read_to_string(&input_path) {
+        Ok(existing) if existing == state.input_body => {}
+        Ok(existing) => {
+            return Err(Failure::invalid(format!(
+                "assurance input {} differs from durable bytes: expected {}, observed {}",
+                input_path.display(),
+                bytes_digest(state.input_body.as_bytes()),
+                bytes_digest(existing.as_bytes()),
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::runtime::atomic_write(&input_path, state.input_body.as_bytes(), 0o600)?;
+        }
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "reading frozen assurance input: {error}"
+            )))
+        }
+    }
+    let package = config
+        .assurance_package
+        .clone()
+        .ok_or_else(|| Failure::internal("epic has no frozen assurance package"))?;
+    let compiled = crate::config::compile_frozen_package(package).map_err(|errors| {
+        Failure::internal(format!(
+            "frozen epic assurance package is invalid: {}",
+            serde_json::to_string(&errors).unwrap_or_default()
+        ))
+    })?;
+    let mut request = OperationRequest {
+        schema_version: 1,
+        idempotency_key: derive_key("run_start", Some(&state.run_id), None, None),
+        run_id: Some(state.run_id.clone()),
+        params: match json!({
+            "bead": config.epic_id,
+            "run": state.run_id,
+            "repo": config.repo,
+            "internalSpec": input_path.to_string_lossy(),
+            "internalBranch": config.integration_branch,
+            "baseRef": config.base_ref,
+            "epicId": config.epic_id,
+            "epicTitle": config.title,
+        }) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        },
+    };
+    let started =
+        response(super::ops::run_start_with_definition(ctx, &mut request, compiled).await)?;
+    let run = super::drive::project(ctx, &state.run_id).await?;
+    if !run
+        .proto_events
+        .iter()
+        .any(|event| matches!(event, ProtoEvent::Pr { .. }))
+    {
+        let number = final_pr_number(&state.pr)?;
+        let is_draft = state
+            .pr
+            .get("isDraft")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        let base_ref_name = state
+            .pr
+            .get("base")
+            .and_then(Value::as_str)
+            .map(str::to_owned);
+        let url = state
+            .pr
+            .get("url")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned();
+        let run_id = state.run_id.clone();
+        let ledger = ctx.ledger.clone();
+        tokio::task::spawn_blocking(move || {
+            forged_proto::record(
+                &ledger,
+                &run_id,
+                ProtoEvent::Pr {
+                    number,
+                    is_draft,
+                    base_ref_name,
+                    url,
+                },
+            )
+        })
+        .await
+        .map_err(|error| Failure::internal(format!("record assurance PR join: {error}")))?
+        .map_err(Failure::from)?;
+    }
+    Ok(started)
+}
+
+async fn start_assurance(ctx: &Ctx, view: &EpicView, pr: &Value) -> Result<Step, Failure> {
+    let config = &view.config;
+    let integration_sha =
+        forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch).await?;
+    let pr_sha = pr
+        .get("headSha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("new assurance draft PR has no frozen head SHA"))?;
+    if pr_sha != integration_sha {
+        let stopped = require_input_with_evidence(
+            ctx,
+            &config.epic_id,
+            "assurance-pr-head-drift",
+            None,
+            "integration branch changed after draft PR creation",
+            Some(json!({"draftPrSha": pr_sha, "remoteSha": integration_sha, "pr": pr})),
+        )
+        .await?;
+        return Ok(Step::Stop(stopped));
+    }
+    let run_id = assurance_run_id(&config.epic_id);
+    let input_body = format!(
+        "# Frozen epic root contract\n\n```json\n{}\n```\n\n# Integrated outcome\n\n```json\n{}\n```\n",
+        serde_json::to_string_pretty(&config.root_fields)
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        serde_json::to_string_pretty(&json!({
+            "epicId": config.epic_id,
+            "repository": config.repo,
+            "baseRef": config.base_ref,
+            "integrationBranch": config.integration_branch,
+            "integrationSha": integration_sha,
+            "draftPr": pr,
+            "waves": view.waves,
+            "planningCycles": view.planning.iter().map(|(child, state)| json!({
+                "childId": child,
+                "runId": state.run_id,
+                "generation": state.generation,
+                "integrationSha": state.integration_sha,
+                "applied": state.applied,
+            })).collect::<Vec<_>>(),
+            "children": view.children.iter().map(|(child, state)| json!({
+                "childId": child,
+                "runId": state.run_id,
+                "wave": state.wave,
+                "generation": state.generation,
+                "merged": state.merged,
+            })).collect::<Vec<_>>(),
+        }))
+        .map_err(|error| Failure::internal(error.to_string()))?,
+    );
+    let event = json!({
+        "runId": run_id,
+        "childId": config.epic_id,
+        "integrationSha": integration_sha,
+        "pr": pr,
+        "assuranceInputBody": input_body,
+    });
+    append(ctx, &config.epic_id, ASSURANCE_STARTED, event.clone()).await?;
+    crate::failpoint::hit("epic.assurance.start.after");
+    let state = AssuranceState {
+        run_id,
+        integration_sha,
+        pr: pr.clone(),
+        input_body,
+    };
+    let started = ensure_assurance_run(ctx, config, &state).await?;
+    Ok(Step::Progress(
+        json!({"assurance": event, "started": started}),
+    ))
+}
+
+fn latest_gate_evidence(view: &forged_proto::RunView) -> Result<Value, Failure> {
+    let (phase, seq, passed, rows) = view
+        .proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Gate {
+                phase,
+                seq,
+                passed,
+                rows,
+            } => Some((*phase, *seq, *passed, rows.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| Failure::internal("clean assurance run has no gate evidence"))?;
+    let step = match phase {
+        forged_proto::GatePhase::Gate => MachineStage::Gate,
+        forged_proto::GatePhase::Regate => MachineStage::ReGate,
+    };
+    let round =
+        u32::try_from(seq).map_err(|_| Failure::internal("assurance gate sequence is invalid"))?;
+    let key = machine_idempotency_key(&view.run.run_id, step, round);
+    let operation = view
+        .settled_operations
+        .iter()
+        .find(|operation| {
+            operation.name == step.as_str()
+                && operation.idempotency_key == key
+                && operation.state == OperationState::Terminal
+        })
+        .ok_or_else(|| Failure::internal("assurance gate has no settled operation"))?;
+    let response: OperationResponse = serde_json::from_str(
+        operation
+            .response_json
+            .as_deref()
+            .ok_or_else(|| Failure::internal("assurance gate operation has no response"))?,
+    )
+    .map_err(|error| Failure::internal(format!("invalid assurance gate response: {error}")))?;
+    let result = response
+        .result
+        .ok_or_else(|| Failure::internal("assurance gate response has no result"))?;
+    let head_sha = result
+        .get("headSha")
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("assurance gate result has no head SHA"))?;
+    Ok(json!({
+        "operationId": operation.operation_id,
+        "phase": phase.as_str(),
+        "round": round,
+        "passed": passed,
+        "rows": rows,
+        "headSha": head_sha,
+    }))
+}
+
+async fn complete_assurance(
+    ctx: &Ctx,
+    view: &EpicView,
+    state: &AssuranceState,
+    run: &forged_proto::RunView,
+) -> Result<Step, Failure> {
+    let config = &view.config;
+    let gate = latest_gate_evidence(run)?;
+    let findings = super::drive::latest_review_findings(run);
+    let severe = findings
+        .iter()
+        .any(|finding| matches!(finding.severity, Severity::Blocker | Severity::High));
+    let local_sha = git_head(&ctx.config.worktree(&state.run_id)).await?;
+    let remote_sha =
+        forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch).await?;
+    let slug = repo_slug(Path::new(&config.repo))
+        .await
+        .map_err(|error| Failure::internal(error.to_string()))?;
+    let number = final_pr_number(&state.pr)?;
+    let gh = forged_git::GhClient::new();
+    let pr = gh.pr_view(&slug, number).await?;
+    let pr_sha = gh.pr_head_sha(&slug, number).await?;
+    let gate_sha = gate
+        .get("headSha")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let exact = local_sha == remote_sha && remote_sha == pr_sha && pr_sha == gate_sha;
+    let pr_exact = pr.state == "OPEN"
+        && pr.is_draft
+        && pr.head_ref_name == config.integration_branch
+        && pr.base_ref_name == config.base_ref;
+    let fix_packets = run
+        .packets
+        .iter()
+        .filter_map(|packet| forged_proto::stored_packet(packet).ok())
+        .filter(|packet| {
+            packet
+                .execution
+                .as_ref()
+                .is_some_and(|execution| execution.purpose == SeatPurpose::Fix)
+        })
+        .count();
+    let fix_changed_sha = fix_packets == 0 || local_sha != state.integration_sha;
+    let gate_passed = gate.get("passed").and_then(Value::as_bool).unwrap_or(false);
+    if !exact || !pr_exact || !fix_changed_sha || !gate_passed || severe {
+        let stopped = require_input_with_evidence(
+            ctx,
+            &config.epic_id,
+            "assurance-final-evidence-mismatch",
+            None,
+            "integrated assurance did not bind one clean exact draft PR head",
+            Some(json!({
+                "runId": state.run_id,
+                "initialSha": state.integration_sha,
+                "localSha": local_sha,
+                "remoteSha": remote_sha,
+                "prSha": pr_sha,
+                "gate": gate,
+                "pr": {
+                    "number": pr.number,
+                    "state": pr.state,
+                    "isDraft": pr.is_draft,
+                    "head": pr.head_ref_name,
+                    "base": pr.base_ref_name,
+                    "url": pr.url,
+                },
+                "fixPackets": fix_packets,
+                "fixChangedSha": fix_changed_sha,
+                "findings": findings,
+            })),
+        )
+        .await?;
+        return Ok(Step::Stop(stopped));
+    }
+    let reviewers = run
+        .packets
+        .iter()
+        .filter_map(|packet| forged_proto::stored_packet(packet).ok())
+        .filter_map(|packet| {
+            let execution = packet.execution?;
+            matches!(
+                execution.purpose,
+                SeatPurpose::Review | SeatPurpose::Synthesis
+            )
+            .then(|| {
+                json!({
+                    "packetId": packet.packet_id,
+                    "stageId": execution.stage_id,
+                    "seatId": execution.seat_id,
+                    "roleId": execution.role_id,
+                    "purpose": execution.purpose,
+                    "round": execution.round,
+                })
+            })
+        })
+        .collect::<Vec<_>>();
+    let evidence = json!({
+        "schema": "forged.epic-assurance.result/1",
+        "epicId": config.epic_id,
+        "runId": state.run_id,
+        "rootContract": config.root_fields,
+        "waves": view.waves,
+        "planningCycles": view.planning.iter().map(|(child, planning)| json!({
+            "childId": child,
+            "runId": planning.run_id,
+            "generation": planning.generation,
+            "integrationSha": planning.integration_sha,
+            "result": planning.applied,
+        })).collect::<Vec<_>>(),
+        "children": view.children.iter().map(|(child, child_state)| json!({
+            "childId": child,
+            "runId": child_state.run_id,
+            "wave": child_state.wave,
+            "merged": child_state.merged,
+        })).collect::<Vec<_>>(),
+        "draftPr": {
+            "number": pr.number,
+            "url": pr.url,
+            "head": pr.head_ref_name,
+            "base": pr.base_ref_name,
+            "isDraft": pr.is_draft,
+        },
+        "gate": gate,
+        "reviewers": reviewers,
+        "findings": findings,
+        "disposition": "approved-clean",
+        "terminalSha": local_sha,
+    });
+    let body = format!(
+        "Epic {} executed and integrally assured by forged.\n\n## Exact terminal evidence\n\n```json\n{}\n```",
+        config.epic_id,
+        serde_json::to_string_pretty(&evidence)
+            .map_err(|error| Failure::internal(error.to_string()))?,
+    );
+    let key = derive_key(
+        "epic_pr_finalize",
+        Some(&config.epic_id),
+        Some(&local_sha),
+        Some(i64::try_from(number).unwrap_or(i64::MAX)),
+    );
+    let epic_id = config.epic_id.clone();
+    let slug_for_effect = slug.clone();
+    let evidence_for_event = evidence.clone();
+    let repo_for_effect = config.repo.clone();
+    let branch_for_effect = config.integration_branch.clone();
+    let base_for_effect = config.base_ref.clone();
+    let expected_sha = local_sha.clone();
+    let finalized = safe_effect(
+        ctx,
+        "epic_pr_finalize",
+        key,
+        &config.epic_id,
+        json!({"pr": number, "headSha": local_sha, "bodySha256": bytes_digest(body.as_bytes())}),
+        move |operation| async move {
+            let gh = forged_git::GhClient::new();
+            let updated = gh.update_pr_body(&slug_for_effect, number, &body).await?;
+            crate::failpoint::hit("epic.assurance.pr-body.after");
+            let final_remote_sha =
+                forged_git::remote_branch_sha(Path::new(&repo_for_effect), &branch_for_effect)
+                    .await?;
+            let final_pr = gh.pr_view(&slug_for_effect, number).await?;
+            let final_pr_sha = gh.pr_head_sha(&slug_for_effect, number).await?;
+            if final_remote_sha != expected_sha
+                || final_pr_sha != expected_sha
+                || final_pr.state != "OPEN"
+                || !final_pr.is_draft
+                || final_pr.head_ref_name != branch_for_effect
+                || final_pr.base_ref_name != base_for_effect
+            {
+                let stopped = require_input_with_evidence(
+                    ctx,
+                    &epic_id,
+                    "assurance-finalization-drift",
+                    None,
+                    "draft PR or integration branch moved during assurance finalization",
+                    Some(json!({
+                        "runId": evidence_for_event["runId"],
+                        "expectedSha": expected_sha,
+                        "remoteSha": final_remote_sha,
+                        "prSha": final_pr_sha,
+                        "pr": {
+                            "number": final_pr.number,
+                            "state": final_pr.state,
+                            "isDraft": final_pr.is_draft,
+                            "head": final_pr.head_ref_name,
+                            "base": final_pr.base_ref_name,
+                            "url": final_pr.url,
+                        },
+                    })),
+                )
+                .await?;
+                return Ok(json!({"inputRequired": stopped}));
+            }
+            let event = json!({
+                "transitionId": operation,
+                "pr": {
+                    "number": updated.number,
+                    "url": updated.url,
+                    "head": updated.head_ref_name,
+                    "base": updated.base_ref_name,
+                    "isDraft": updated.is_draft,
+                },
+                "evidence": evidence_for_event,
             });
             append_stop_event(
                 ctx,
-                &config.epic_id,
-                EPIC_PR,
+                &epic_id,
+                ASSURANCE_COMPLETED,
                 event.clone(),
                 EpicStopTransition {
                     state: DesiredState::Stopped,
@@ -2902,8 +3499,116 @@ async fn final_pr(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
             Ok(event)
         },
     )
-    .await?;
-    Ok(Step::Stop(json!({"finalPr": value})))
+    .await;
+    let value = match finalized {
+        Ok(value) if value.get("inputRequired").is_some() => {
+            return Ok(Step::Stop(value));
+        }
+        Ok(value) => value,
+        Err(error) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "assurance-finalization-failed",
+                None,
+                error.message.clone(),
+                Some(json!({
+                    "runId": state.run_id,
+                    "expectedSha": local_sha,
+                    "pr": number,
+                    "errorCode": error.code,
+                    "recoverable": error.recoverable,
+                })),
+            )
+            .await?;
+            return Ok(Step::Stop(stopped));
+        }
+    };
+    Ok(Step::Stop(json!({"finalPr": state.pr, "assurance": value})))
+}
+
+async fn advance_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> {
+    let pr = view
+        .pr
+        .as_ref()
+        .ok_or_else(|| Failure::internal("assurance advance has no draft PR"))?;
+    let Some(state) = view.assurance.as_ref() else {
+        return start_assurance(ctx, view, pr).await;
+    };
+    let started = match ensure_assurance_run(ctx, &view.config, state).await {
+        Ok(started) => started,
+        Err(error) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &view.config.epic_id,
+                "assurance-recovery-unsafe",
+                None,
+                error.message,
+                Some(json!({"runId": state.run_id, "integrationSha": state.integration_sha})),
+            )
+            .await?;
+            return Ok(Step::Stop(stopped));
+        }
+    };
+    let run = super::drive::project(ctx, &state.run_id).await?;
+    if run.run.state == RunState::Stopped {
+        if run.run.terminal_outcome == Some(RunOutcome::Clean) {
+            return complete_assurance(ctx, view, state, &run).await;
+        }
+        let terminal = planning_protocol_terminal(ctx, &state.run_id).await?;
+        let stopped = require_input_with_evidence(
+            ctx,
+            &view.config.epic_id,
+            "assurance-run-stopped",
+            None,
+            format!(
+                "integrated assurance run {} stopped with outcome {:?}: {}",
+                state.run_id,
+                run.run.terminal_outcome,
+                run.run.stop_reason.as_deref().unwrap_or("no reason")
+            ),
+            Some(json!({
+                "runId": state.run_id,
+                "integrationSha": state.integration_sha,
+                "outcome": run.run.terminal_outcome.map(RunOutcome::as_str),
+                "protocolTerminal": terminal,
+                "draftPr": state.pr,
+            })),
+        )
+        .await?;
+        return Ok(Step::Stop(stopped));
+    }
+    let request = OperationRequest {
+        schema_version: 1,
+        idempotency_key: String::new(),
+        run_id: Some(state.run_id.clone()),
+        params: match json!({"run": state.run_id}) {
+            Value::Object(map) => map,
+            _ => Map::new(),
+        },
+    };
+    let advanced = super::drive::run_advance(ctx, &request).await;
+    if !advanced.ok {
+        let stopped = require_input_with_evidence(
+            ctx,
+            &view.config.epic_id,
+            "assurance-advance-failed",
+            None,
+            advanced
+                .error
+                .as_ref()
+                .map(|error| error.message.clone())
+                .unwrap_or_else(|| "assurance advance failed without typed detail".to_owned()),
+            Some(json!({"runId": state.run_id, "response": advanced})),
+        )
+        .await?;
+        return Ok(Step::Stop(stopped));
+    }
+    Ok(Step::Progress(json!({
+        "assuranceAdvanced": advanced,
+        "runId": state.run_id,
+        "started": started,
+    })))
 }
 
 fn child_accounted(view: &EpicView, statuses: &BTreeMap<&str, &str>, child: &FrozenChild) -> bool {
@@ -3044,17 +3749,28 @@ async fn planning_after_completed_wave(
 
 async fn advance_once(ctx: &Ctx, epic: &str) -> Result<Step, Failure> {
     let view = project(ctx, epic).await?;
-    if let Some(pr) = view.pr {
-        return Ok(Step::Stop(json!({"finalPr": pr})));
+    if let Some(completed) = view.assurance_completed.as_ref() {
+        return Ok(Step::Stop(json!({
+            "finalPr": view.pr,
+            "assurance": completed,
+        })));
     }
-    if let Some(paused) = view.paused {
+    if view.config.assurance_package.is_none() {
+        if let Some(pr) = view.pr.as_ref() {
+            return Ok(Step::Stop(json!({"finalPr": pr})));
+        }
+    }
+    if let Some(paused) = view.paused.as_ref() {
         return Ok(Step::Stop(json!({"paused": paused})));
     }
-    if let Some(input) = view.input {
+    if let Some(input) = view.input.as_ref() {
         return Ok(Step::Stop(json!({"inputRequired": input})));
     }
     if view.integration.is_none() {
         return Ok(Step::Progress(ensure_integration(ctx, &view.config).await?));
+    }
+    if view.pr.is_some() {
+        return advance_assurance(ctx, &view).await;
     }
 
     let (live, live_legacy_non_parent) =

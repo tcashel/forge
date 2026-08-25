@@ -54,7 +54,8 @@ pub(crate) fn release_subject_reservations_tx(
              (SELECT packet_id FROM packets WHERE run_id = ?4)) OR \
            (?3 = 'epic' AND subject_kind = 'packet' AND owner_kind IS NULL AND subject_id IN ( \
              SELECT p.packet_id FROM packets p JOIN events e \
-               ON e.kind = 'forged.epic.child.started' \
+               ON e.kind IN ('forged.epic.child.started','forged.epic.plan.started', \
+                             'forged.epic.assurance.started') \
               AND json_extract(e.payload_json, '$.runId') = p.run_id \
              WHERE e.run_id = ?4)) \
          )",
@@ -219,7 +220,7 @@ fn packet_resource(body: &str) -> Result<(String, String, AdmissionResourceClass
 
 /// Resolve the desired-work epoch that authorizes a packet. Ordinary runs
 /// own their own epoch; an epic child is delegated to the parent epic's
-/// epoch recorded by the durable child-start or rolling-plan-start event.
+/// epoch recorded by the durable child, rolling-plan, or assurance event.
 /// Direct run authority always wins if both exist.
 pub(crate) fn packet_authorization_subject_tx(
     conn: &Connection,
@@ -247,7 +248,8 @@ pub(crate) fn packet_authorization_subject_tx(
     let epic = conn
         .query_row(
             "SELECT e.run_id FROM events e \
-             WHERE e.kind IN ('forged.epic.child.started','forged.epic.plan.started') \
+             WHERE e.kind IN ('forged.epic.child.started','forged.epic.plan.started', \
+                              'forged.epic.assurance.started') \
                AND json_extract(e.payload_json, '$.runId') = ?1 \
              ORDER BY e.event_id DESC LIMIT 1",
             [&run_id],
@@ -615,7 +617,8 @@ fn durable_candidates(
                     conn.query_row(
                         "SELECT e.run_id FROM events e JOIN desired_work dw \
                          ON dw.subject_kind = 'epic' AND dw.subject_id = e.run_id \
-                         WHERE e.kind IN ('forged.epic.child.started','forged.epic.plan.started') \
+                         WHERE e.kind IN ('forged.epic.child.started','forged.epic.plan.started', \
+                                          'forged.epic.assurance.started') \
                            AND json_extract(e.payload_json, '$.runId') = ?1 \
                          ORDER BY e.event_id DESC LIMIT 1",
                         [id],
@@ -630,7 +633,7 @@ fn durable_candidates(
                     conn.query_row("SELECT repo FROM runs WHERE run_id = ?1", [id], |row| {
                         row.get::<_, String>(0)
                     })?;
-                // A just-created epic child or internal planning run has no
+                // A just-created epic child or internal planning/assurance run has no
                 // direct desired row. Project it as a RUN decision, but
                 // borrow the parent epic's exact control epoch for this
                 // admission cycle. This preserves run-addressed capacity
@@ -840,7 +843,8 @@ fn ledger_revision(conn: &Connection) -> Result<String, LedgerError> {
     let mut stmt = conn.prepare(
         "SELECT event_id, run_id, kind, payload_json FROM events \
          WHERE kind IN ('forged.epic.started','forged.epic.execution-package-migrated', \
-                        'forged.epic.child.started','forged.epic.plan.started') ORDER BY event_id",
+                        'forged.epic.child.started','forged.epic.plan.started', \
+                        'forged.epic.assurance.started') ORDER BY event_id",
     )?;
     for row in stmt.query_map([], |row| {
         Ok(json!([

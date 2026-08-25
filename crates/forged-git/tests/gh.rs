@@ -16,6 +16,57 @@ fn sv(args: &[&str]) -> Vec<String> {
 }
 
 #[tokio::test]
+async fn pr_head_sha_uses_exact_head_oid_field() {
+    enter_non_git_cwd();
+    let shim = Shim::new();
+    shim.set("pr_view", "stdout", r#"{"headRefOid":"abc123"}"#);
+
+    let sha = shim.client().pr_head_sha(REPO, 7).await.expect("head sha");
+    assert_eq!(sha, "abc123");
+    assert_eq!(
+        shim.calls(),
+        vec![sv(&[
+            "pr",
+            "view",
+            "7",
+            "--repo",
+            REPO,
+            "--json",
+            "headRefOid",
+        ])]
+    );
+}
+
+#[tokio::test]
+async fn update_pr_body_is_one_idempotent_patch() {
+    enter_non_git_cwd();
+    let shim = Shim::new();
+    shim.set(
+        "update_pr",
+        "stdout",
+        r#"{"number":7,"state":"open","draft":true,"base":{"ref":"main"},"head":{"ref":"forged/epic-x"},"html_url":"https://x/7"}"#,
+    );
+
+    let pr = shim
+        .client()
+        .update_pr_body(REPO, 7, "exact evidence")
+        .await
+        .expect("updated body");
+    assert_eq!(pr.number, 7);
+    assert_eq!(
+        shim.calls(),
+        vec![sv(&[
+            "api",
+            "--method",
+            "PATCH",
+            "repos/tcashel/forge/pulls/7",
+            "-f",
+            "body=exact evidence",
+        ])]
+    );
+}
+
+#[tokio::test]
 async fn pr_view_parses_meta_and_pins_argv() {
     enter_non_git_cwd();
     let shim = Shim::new();

@@ -352,6 +352,7 @@ case "$1" in
     esac ;;
   api)
     case "$*" in
+      *--method\ PATCH*/pulls/*) key=update_pr ;;
       *--method\ POST*/pulls*) key=create_pr ;;
       *--method\ POST*/comments*) key=post_comment ;;
       */comments*) key=list_comments ;;
@@ -379,7 +380,19 @@ if [ -f "$GH_SHIM_DIR/dynamic-prs" ]; then
     pr_view)
       num=$3; state=$(cat "$GH_SHIM_DIR/pr.$num.state"); draft=$(cat "$GH_SHIM_DIR/pr.$num.draft")
       base=$(cat "$GH_SHIM_DIR/pr.$num.base"); head=$(cat "$GH_SHIM_DIR/pr.$num.head")
+      case "$*" in
+        *headRefOid*)
+          oid=$(git -C "$FORGED_SHIM_REPO" ls-remote origin "refs/heads/$head" | awk 'NR==1 {print $1}')
+          printf '{"headRefOid":"%s"}\n' "$oid"; exit 0 ;;
+      esac
       printf '{"number":%s,"state":"%s","isDraft":%s,"baseRefName":"%s","headRefName":"%s","url":"https://example.invalid/pr/%s"}\n' "$num" "$state" "$draft" "$base" "$head" "$num"
+      exit 0 ;;
+    update_pr)
+      num=""
+      for a in "$@"; do case "$a" in repos/*/pulls/*) num=${a##*/} ;; body=*) printf '%s' "${a#body=}" > "$GH_SHIM_DIR/pr.$num.body" ;; esac; done
+      state=$(cat "$GH_SHIM_DIR/pr.$num.state"); draft=$(cat "$GH_SHIM_DIR/pr.$num.draft")
+      base=$(cat "$GH_SHIM_DIR/pr.$num.base"); head=$(cat "$GH_SHIM_DIR/pr.$num.head")
+      printf '{"number":%s,"state":"%s","draft":%s,"base":{"ref":"%s"},"head":{"ref":"%s"},"html_url":"https://example.invalid/pr/%s"}\n' "$num" "$(printf '%s' "$state" | tr '[:upper:]' '[:lower:]')" "$draft" "$base" "$head" "$num"
       exit 0 ;;
     pr_ready)
       num=$3; printf 'false' > "$GH_SHIM_DIR/pr.$num.draft"; exit 0 ;;
@@ -425,6 +438,9 @@ case "$stage" in
   implementation) scenario_stage=implement ;;
   plan-author|plan-revision) scenario_stage=epic-plan ;;
   plan-*) scenario_stage=epic-plan-review ;;
+  assurance-review-1) scenario_stage=reviewclaude ;;
+  assurance-review-*|assurance-synthesis-*) scenario_stage=reviewcodex ;;
+  assurance-fix) scenario_stage=fix ;;
   review-1) scenario_stage=reviewclaude ;;
   review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
   remediation) scenario_stage=fix ;;
@@ -500,8 +516,10 @@ case "$stage" in
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     fi
     ;;
-  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
-    if [ "$mode" = approve ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis|assurance-review-*|assurance-synthesis-*)
+    if [ "$mode" = block ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"root authority must change\", \"evidence\": \"the frozen root excludes the required dependency mutation\", \"proposedChange\": \"authorize dependency mutation or remove the requirement\"}}}}"
+    elif [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     elif [ "$mode" = request-changes ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
@@ -511,7 +529,7 @@ case "$stage" in
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix|remediation)
+  fix|remediation|assurance-fix)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -550,6 +568,9 @@ case "$stage" in
   implementation) scenario_stage=implement ;;
   plan-author|plan-revision) scenario_stage=epic-plan ;;
   plan-*) scenario_stage=epic-plan-review ;;
+  assurance-review-1) scenario_stage=reviewclaude ;;
+  assurance-review-*|assurance-synthesis-*) scenario_stage=reviewcodex ;;
+  assurance-fix) scenario_stage=fix ;;
   review-1) scenario_stage=reviewclaude ;;
   review-2|review-3|synthesis) scenario_stage=reviewcodex ;;
   remediation) scenario_stage=fix ;;
@@ -622,8 +643,10 @@ case "$stage" in
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"implement\": {\"implemented\": true, \"commitsAhead\": $commits, \"summary\": \"shim implement\", \"gateState\": \"pass\", \"note\": null}}}"
     fi
     ;;
-  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis)
-    if [ "$mode" = approve ]; then
+  reviewclaude|reviewcodex|review-1|review-2|review-3|synthesis|assurance-review-*|assurance-synthesis-*)
+    if [ "$mode" = block ]; then
+      inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"specAmendment\": {\"amendment\": {\"summary\": \"root authority must change\", \"evidence\": \"the frozen root excludes the required dependency mutation\", \"proposedChange\": \"authorize dependency mutation or remove the requirement\"}}}}"
+    elif [ "$mode" = approve ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     elif [ "$mode" = request-changes ]; then
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"requestChanges\", \"summary\": \"shim review\", \"findings\": [{\"severity\": \"high\", \"file\": \"impl-1.txt\", \"line\": 1, \"message\": \"needs a fix\"}], \"available\": true}}}"
@@ -633,7 +656,7 @@ case "$stage" in
       inner="{\"schema\": \"$schema\", \"packetId\": \"$pkt\", \"outcome\": {\"review\": {\"verdict\": \"approve\", \"summary\": \"shim review\", \"findings\": [], \"available\": true}}}"
     fi
     ;;
-  fix|remediation)
+  fix|remediation|assurance-fix)
     printf 'fix by shim\n' > "fix-$seq.txt"
     git add "fix-$seq.txt"
     git commit -q -m "fix(review): shim fix $seq"
@@ -1229,6 +1252,7 @@ impl TestEnv {
             .env("FORGED_SHIM_BASE", &self.repos.base)
             .env("GH_SHIM_LOG", &self.gh_log)
             .env("GH_SHIM_DIR", &self.gh_dir)
+            .env("FORGED_SHIM_REPO", &self.repos.repo)
             .env_remove("ANVIL_HOME")
             .env_remove("FORGED_CONFIG")
             .env_remove("FORGED_FAILPOINT")

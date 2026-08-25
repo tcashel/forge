@@ -18,6 +18,7 @@ use forged_types::{
     OperationResponse, Outcome, Stage, Verdict,
 };
 use serde_json::{json, Map, Value};
+use sha2::{Digest, Sha256};
 
 use crate::adapters::execute::{
     build_packet, execute_packet, open_packet_op, ExecutionContext, PacketOutcome,
@@ -30,6 +31,26 @@ use crate::core::{
     Failure,
 };
 use crate::failpoint;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InternalRunMode {
+    Ordinary,
+    Planning,
+    Assurance,
+}
+
+fn internal_run_mode(view: &RunView) -> InternalRunMode {
+    match view.execution_package.as_ref().map(|package| {
+        (
+            package.protocol_ref.name.as_str(),
+            package.protocol_ref.version,
+        )
+    }) {
+        Some(("epic-plan", 1)) => InternalRunMode::Planning,
+        Some(("epic-assurance", 1)) => InternalRunMode::Assurance,
+        _ => InternalRunMode::Ordinary,
+    }
+}
 
 /// Project one run into the engine's input. Definition-backed runs use their
 /// frozen compatibility roster; legacy runs fall back to the once-read config.
@@ -134,6 +155,15 @@ pub(crate) fn pr_number_of(view: &RunView) -> Option<u64> {
             v.get("pr")
                 .and_then(|p| p.get("number"))
                 .and_then(Value::as_u64)
+        })
+        .or_else(|| {
+            view.proto_events
+                .iter()
+                .rev()
+                .find_map(|event| match event {
+                    ProtoEvent::Pr { number, .. } => Some(*number),
+                    _ => None,
+                })
         })
 }
 
@@ -944,7 +974,189 @@ fn transport_fallback_index(
 }
 
 /// Assemble the execution context for provider packets.
-async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContext, Failure> {
+fn evidence_digest(bytes: &[u8]) -> String {
+    let digest = Sha256::digest(bytes);
+    let mut value = String::with_capacity(64);
+    for byte in digest {
+        use std::fmt::Write as _;
+        write!(&mut value, "{byte:02x}").expect("writing a String cannot fail");
+    }
+    value
+}
+
+async fn assurance_evidence(
+    ctx: &Ctx,
+    view: &RunView,
+) -> Result<Option<crate::adapters::execute::AssuranceEvidence>, Failure> {
+    if internal_run_mode(view) != InternalRunMode::Assurance {
+        return Ok(None);
+    }
+    let (phase, seq, passed, rows) = view
+        .proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Gate {
+                phase,
+                seq,
+                passed,
+                rows,
+            } => Some((*phase, *seq, *passed, rows.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| Failure::internal("assurance packet has no completed gate"))?;
+    let step = match phase {
+        forged_proto::GatePhase::Gate => MachineStage::Gate,
+        forged_proto::GatePhase::Regate => MachineStage::ReGate,
+    };
+    let round =
+        u32::try_from(seq).map_err(|_| Failure::internal("assurance gate sequence is invalid"))?;
+    let key = machine_idempotency_key(&view.run.run_id, step, round);
+    let operation = view
+        .settled_operations
+        .iter()
+        .find(|operation| operation.name == step.as_str() && operation.idempotency_key == key)
+        .ok_or_else(|| Failure::internal("assurance gate operation is not settled"))?;
+    let response: OperationResponse = serde_json::from_str(
+        operation
+            .response_json
+            .as_deref()
+            .ok_or_else(|| Failure::internal("assurance gate operation has no response"))?,
+    )
+    .map_err(|error| Failure::internal(format!("invalid assurance gate response: {error}")))?;
+    let gate_head = response
+        .result
+        .as_ref()
+        .and_then(|result| result.get("headSha"))
+        .and_then(Value::as_str)
+        .ok_or_else(|| Failure::internal("assurance gate response has no head SHA"))?
+        .to_owned();
+    let worktree = ctx.config.worktree(&view.run.run_id);
+    let live_head = rev_parse_head(&worktree).await?;
+    if live_head != gate_head {
+        return Err(Failure::invalid(format!(
+            "assurance worktree drifted after gate: gated {gate_head}, live {live_head}"
+        )));
+    }
+    let spec = match spec_source_of(ctx, &view.run.run_id).await? {
+        SpecSource::File(path) => std::fs::read_to_string(&path).map_err(|error| {
+            Failure::internal(format!("reading assurance root contract {path:?}: {error}"))
+        })?,
+        SpecSource::Bead(_) => {
+            return Err(Failure::internal(
+                "epic-assurance/v1 must use its frozen internal root contract",
+            ))
+        }
+    };
+    let diff = tokio::process::Command::new("git")
+        .arg("-C")
+        .arg(&worktree)
+        .args([
+            "diff",
+            "--binary",
+            "--no-ext-diff",
+            "--no-color",
+            &format!("origin/{}...HEAD", view.run.base_ref),
+        ])
+        .stdin(std::process::Stdio::null())
+        .output()
+        .await
+        .map_err(|error| Failure::internal(format!("materializing assurance diff: {error}")))?;
+    if !diff.status.success() {
+        return Err(Failure::internal(format!(
+            "materializing assurance diff failed: {}",
+            String::from_utf8_lossy(&diff.stderr).trim()
+        )));
+    }
+    let (pr_number, pr_draft, pr_base, pr_url) = view
+        .proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Pr {
+                number,
+                is_draft,
+                base_ref_name,
+                url,
+            } => Some((*number, *is_draft, base_ref_name.clone(), url.clone())),
+            _ => None,
+        })
+        .ok_or_else(|| Failure::internal("assurance packet has no frozen draft PR"))?;
+    let bundle = format!(
+        "# Exact integrated assurance evidence\n\nHead SHA: `{gate_head}`\nPR: #{pr_number} ({pr_url})\nPR base: `{}`\nPR head: `{}`\nDraft: `{pr_draft}`\nGate phase: `{}`\nGate round: `{round}`\nGate passed: `{passed}`\n\n## Frozen root contract and integrated journal\n\n{}\n\n## Gate rows\n\n```json\n{}\n```\n\n## Complete PR diff\n\n```diff\n{}\n```\n",
+        pr_base.as_deref().unwrap_or("unknown"),
+        view.run.branch,
+        phase.as_str(),
+        spec,
+        serde_json::to_string_pretty(&rows)
+            .map_err(|error| Failure::internal(error.to_string()))?,
+        String::from_utf8_lossy(&diff.stdout),
+    );
+    let bytes = bundle.as_bytes();
+    let sha256 = evidence_digest(bytes);
+    let path = ctx
+        .config
+        .run_dir(&view.run.run_id)
+        .join("artifacts")
+        .join(format!("assurance-evidence-{gate_head}.md"));
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            Failure::internal(format!("creating assurance evidence directory: {error}"))
+        })?;
+    }
+    match std::fs::read(&path) {
+        Ok(existing) if existing == bytes => {}
+        Ok(_) => {
+            return Err(Failure::invalid(format!(
+                "assurance evidence {} changed for frozen head {gate_head}",
+                path.display()
+            )))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            crate::runtime::atomic_write(&path, bytes, 0o600)?;
+        }
+        Err(error) => {
+            return Err(Failure::internal(format!(
+                "reading assurance evidence: {error}"
+            )))
+        }
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt as _;
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o400)).map_err(
+            |error| Failure::internal(format!("sealing assurance evidence read-only: {error}")),
+        )?;
+    }
+    let failed_gate_findings = if passed {
+        Vec::new()
+    } else {
+        rows.iter()
+            .filter(|row| row.timed_out || row.exit_code != Some(0))
+            .map(|row| forged_types::Finding {
+                severity: forged_types::Severity::High,
+                file: Some(format!("gate:{}", row.command)),
+                line: None,
+                message: format!(
+                    "gate command {:?} failed (exit {:?}, timedOut={}): {}{}",
+                    row.command,
+                    row.exit_code,
+                    row.timed_out,
+                    row.stdout_preview,
+                    row.stderr_preview,
+                ),
+            })
+            .collect()
+    };
+    Ok(Some(crate::adapters::execute::AssuranceEvidence {
+        path,
+        sha256,
+        head_sha: gate_head,
+        failed_gate_findings,
+    }))
+}
+
+async fn execution_context(ctx: &Ctx, view: &RunView) -> Result<ExecutionContext, Failure> {
     let active_profile = view.execution_package.as_ref().map(|package| {
         let name = view
             .profile_escalations
@@ -965,6 +1177,7 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
         findings: latest_review_findings(view),
         review_evidence: latest_review_evidence(view),
         plan_candidate: latest_plan_candidate(view),
+        assurance_evidence: assurance_evidence(ctx, view).await?,
         risk_context: active_profile
             .map(|profile| profile.risk_context.clone())
             .unwrap_or_else(|| {
@@ -1041,15 +1254,17 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         MachineStage::Resolve | MachineStage::Gate | MachineStage::ReGate => EffectClass::SafeRetry,
         MachineStage::Push | MachineStage::DraftPr => EffectClass::ObserveOnly,
     };
-    let planning = view.execution_package.as_ref().is_some_and(|package| {
-        package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1
-    });
+    let internal = internal_run_mode(view);
     let params: Map<String, Value> = match step {
-        MachineStage::Resolve if planning => obj(json!({
+        MachineStage::Resolve if internal != InternalRunMode::Ordinary => obj(json!({
             "repo": run.repo,
             "base": run.base_ref,
             "branch": run.branch,
-            "planning": true,
+            "internalMode": match internal {
+                InternalRunMode::Planning => "planning",
+                InternalRunMode::Assurance => "assurance",
+                InternalRunMode::Ordinary => unreachable!("guarded above"),
+            },
         })),
         MachineStage::Resolve => obj(json!({
             // The request descriptor names the DERIVED holder: params are
@@ -1060,13 +1275,17 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
             "repo": run.repo,
             "base": run.base_ref,
             "branch": run.branch,
-            "planning": false,
+            "internalMode": "ordinary",
         })),
         MachineStage::Push => {
             let sha = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
             obj(json!({"expectedSha": sha, "branch": run.branch}))
         }
         MachineStage::DraftPr => obj(json!({"head": run.branch, "base": run.base_ref})),
+        MachineStage::Gate | MachineStage::ReGate if internal == InternalRunMode::Assurance => {
+            let sha = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
+            obj(json!({"expectedSha": sha}))
+        }
         MachineStage::Gate | MachineStage::ReGate => obj(json!({})),
     };
     let req = OperationRequest {
@@ -1085,7 +1304,7 @@ async fn machine_op(ctx: &Ctx, view: &RunView, step: MachineStage) -> Result<(),
         &req,
         controller_generation,
         move |op_id| async move {
-            machine_effect(ctx, &run, step, round, &op_id, &policy, planning).await
+            machine_effect(ctx, &run, step, round, &op_id, &policy, internal).await
         },
     )
     .await;
@@ -1139,21 +1358,27 @@ async fn machine_effect(
     round: u32,
     op_id: &str,
     policy: &ExecutionPolicyV1,
-    planning: bool,
+    internal: InternalRunMode,
 ) -> Result<Value, Failure> {
     match step {
         MachineStage::Resolve => {
-            let expected_base_sha = if planning {
-                super::epic::planning_base_sha(ctx, &run.run_id).await?
-            } else {
-                None
+            let (base, expected_base_sha) = match internal {
+                InternalRunMode::Planning => (
+                    run.base_ref.clone(),
+                    super::epic::planning_base_sha(ctx, &run.run_id).await?,
+                ),
+                InternalRunMode::Assurance => (
+                    run.branch.clone(),
+                    super::epic::assurance_base_sha(ctx, &run.run_id).await?,
+                ),
+                InternalRunMode::Ordinary => (run.base_ref.clone(), None),
             };
             let spec = forged_git::WorktreeSpec {
                 repo: PathBuf::from(&run.repo),
                 runs_root: ctx.config.runs_root.clone(),
                 run_id: run.run_id.clone(),
                 branch: run.branch.clone(),
-                base: run.base_ref.clone(),
+                base,
                 expected_base_sha,
             };
             let prepared = match forged_git::prepare_worktree(&spec).await {
@@ -1170,7 +1395,7 @@ async fn machine_effect(
             // differing one: bd refuses a claim by any other actor outright
             // ("issue already claimed by …"), which is how a driver used to
             // wedge on BEAD_LEASE_HELD against its own frontier claim.
-            let holder = if planning {
+            let holder = if internal != InternalRunMode::Ordinary {
                 None
             } else {
                 let bd = ctx.config.bd_config();
@@ -1190,6 +1415,11 @@ async fn machine_effect(
             Ok(Value::Object(result))
         }
         MachineStage::Gate | MachineStage::ReGate => {
+            let head_before = if internal == InternalRunMode::Assurance {
+                Some(rev_parse_head(&ctx.config.worktree(&run.run_id)).await?)
+            } else {
+                None
+            };
             let artifacts = ctx
                 .config
                 .run_dir(&run.run_id)
@@ -1201,6 +1431,14 @@ async fn machine_effect(
                 artifacts,
             );
             let outcome = forged_gate::run_gates(&request).await?;
+            if let Some(expected) = head_before.as_deref() {
+                let observed = rev_parse_head(&ctx.config.worktree(&run.run_id)).await?;
+                if observed != expected {
+                    return Err(Failure::invalid(format!(
+                        "assurance gate mutated HEAD: expected {expected}, observed {observed}"
+                    )));
+                }
+            }
             let phase = if step == MachineStage::ReGate {
                 forged_proto::GatePhase::Regate
             } else {
@@ -1217,6 +1455,7 @@ async fn machine_effect(
                 "gates": serde_json::to_value(&outcome.rows)
                     .map_err(|e| Failure::internal(e.to_string()))?,
                 "passed": outcome.passed,
+                "headSha": head_before,
             }))
         }
         MachineStage::Push => {

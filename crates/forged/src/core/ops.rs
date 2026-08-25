@@ -382,19 +382,27 @@ pub(crate) async fn run_start_with_definition(
     fenced(ctx, "run_start", EffectClass::SafeRetry, req, None, {
         move |operation_id| async move {
             let repo = super::work_identity::canonical_repository(param_str(&params, "repo")?)?;
-            let planning = compiled.package.protocol_ref.name == "epic-plan"
-                && compiled.package.protocol_ref.version == 1;
-            let spec = if planning {
+            let internal_protocol = match (
+                compiled.package.protocol_ref.name.as_str(),
+                compiled.package.protocol_ref.version,
+            ) {
+                ("epic-plan", 1) => Some("epic-plan"),
+                ("epic-assurance", 1) => Some("epic-assurance"),
+                _ => None,
+            };
+            let spec = if let Some(protocol) = internal_protocol {
                 if params.get("spec").is_some_and(|value| !value.is_null()) {
-                    return Err(Failure::invalid(
-                        "epic-plan internal runs do not accept deprecated spec",
-                    ));
+                    return Err(Failure::invalid(format!(
+                        "{protocol}/v1 internal runs do not accept deprecated spec"
+                    )));
                 }
                 Some(
                     param_str(&params, "internalSpec")
                         .map(str::to_owned)
                         .map_err(|_| {
-                            Failure::invalid("epic-plan internal run requires internalSpec")
+                            Failure::invalid(format!(
+                                "{protocol}/v1 internal run requires internalSpec"
+                            ))
                         })?,
                 )
             } else {
@@ -403,19 +411,27 @@ pub(crate) async fn run_start_with_definition(
                     .is_some_and(|value| !value.is_null())
                 {
                     return Err(Failure::invalid(
-                        "internalSpec is reserved for runtime-derived epic-plan runs",
+                        "internalSpec is reserved for runtime-derived epic runs",
+                    ));
+                }
+                if params
+                    .get("internalBranch")
+                    .is_some_and(|value| !value.is_null())
+                {
+                    return Err(Failure::invalid(
+                        "internalBranch is reserved for runtime-derived epic runs",
                     ));
                 }
                 param_opt_str(&params, "spec").map(str::to_owned)
             };
-            let issue = if planning {
+            let issue = if let Some(protocol) = internal_protocol {
                 let issue = super::spec::read_bead(ctx, &bead).await?;
                 if param_opt_str(&params, "epicId") != Some(bead.as_str())
                     || issue.issue_type != "epic"
                     || !matches!(issue.status.as_str(), "open" | "in_progress")
                 {
                     return Err(Failure::invalid(format!(
-                        "epic-plan run must bind to its open parent epic {bead}"
+                        "{protocol}/v1 run must bind to its open parent epic {bead}"
                     )));
                 }
                 issue
@@ -430,7 +446,7 @@ pub(crate) async fn run_start_with_definition(
                     if !Path::new(path).exists() {
                         return Err(Failure::invalid(format!("spec {path:?} does not exist")));
                     }
-                    if !planning {
+                    if internal_protocol.is_none() {
                         tracing::warn!(
                             bead = %bead,
                             spec = %path,
@@ -450,7 +466,21 @@ pub(crate) async fn run_start_with_definition(
                 Some(base) => base.to_owned(),
                 None => default_branch_of(&repo).await,
             };
-            let branch = format!("forged/{run_id}");
+            let branch = match internal_protocol {
+                Some("epic-assurance") => param_str(&params, "internalBranch")?.to_owned(),
+                Some(_) => {
+                    if params
+                        .get("internalBranch")
+                        .is_some_and(|value| !value.is_null())
+                    {
+                        return Err(Failure::invalid(
+                            "internalBranch is supported only by epic-assurance/v1",
+                        ));
+                    }
+                    format!("forged/{run_id}")
+                }
+                None => format!("forged/{run_id}"),
+            };
             let new_run = NewRun {
                 run_id: run_id.clone(),
                 bead_id: bead.clone(),
@@ -2004,11 +2034,12 @@ async fn latest_attempt_per_packet(ctx: &Ctx, run_id: &str) -> BTreeMap<String, 
 const RUN_SETTLED: &str = "run.settled";
 const PROTO_PR: &str = "proto.pr";
 const CONTROLLER_STARTED: &str = "forged.controller.started";
-pub(super) const LIFECYCLE_KINDS: [&str; 7] = [
+pub(super) const LIFECYCLE_KINDS: [&str; 8] = [
     epic::STARTED,
     epic::PAUSED,
     epic::RESUMED,
     epic::EPIC_PR,
+    epic::ASSURANCE_COMPLETED,
     PROTO_PR,
     RUN_SETTLED,
     CONTROLLER_STARTED,
@@ -2076,6 +2107,25 @@ fn epic_lifecycles(snapshot: &InventorySnapshot) -> BTreeMap<String, EpicLifecyc
         .map(|(epic_id, (_, lifecycle))| (epic_id, lifecycle))
         .collect();
     for event in snapshot.events(epic::EPIC_PR) {
+        let Some(epic_id) = event.run_id.clone() else {
+            continue;
+        };
+        let nonterminal = serde_json::from_str::<Value>(&event.payload_json)
+            .ok()
+            .and_then(|payload| payload.get("terminal").and_then(Value::as_bool))
+            == Some(false);
+        if nonterminal {
+            continue;
+        }
+        lifecycles.insert(
+            epic_id,
+            EpicLifecycle {
+                state: "submitted",
+                stop_reason: Value::Null,
+            },
+        );
+    }
+    for event in snapshot.events(epic::ASSURANCE_COMPLETED) {
         let Some(epic_id) = event.run_id.clone() else {
             continue;
         };

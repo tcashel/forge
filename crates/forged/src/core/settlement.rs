@@ -443,7 +443,7 @@ pub(crate) async fn settle(
         });
     }
 
-    let internal = is_internal_epic_plan(ctx, run_id).await?;
+    let internal = is_internal_epic_run(ctx, run_id).await?;
     let (stopped_attempts, bead, retired, cleanup_error) = if internal {
         let stopped = stop_live_attempts(ctx, run_id, &settlement.reason).await?;
         // Preserve planning artifacts through typed stops. The epic apply
@@ -472,12 +472,18 @@ pub(crate) async fn settle(
     }))
 }
 
-async fn is_internal_epic_plan(ctx: &Ctx, run_id: &str) -> Result<bool, Failure> {
+async fn is_internal_epic_run(ctx: &Ctx, run_id: &str) -> Result<bool, Failure> {
     Ok(super::drive::project(ctx, run_id)
         .await?
         .execution_package
         .is_some_and(|package| {
-            package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1
+            matches!(
+                (
+                    package.protocol_ref.name.as_str(),
+                    package.protocol_ref.version
+                ),
+                ("epic-plan" | "epic-assurance", 1)
+            )
         }))
 }
 
@@ -820,7 +826,7 @@ async fn adjudicate_locked(
         })?
     };
     let (stopped_attempts, bead, retired, cleanup_error) =
-        if is_internal_epic_plan(ctx, run_id).await? {
+        if is_internal_epic_run(ctx, run_id).await? {
             (
                 stop_live_attempts(ctx, run_id, &settlement.reason).await?,
                 Value::Null,
