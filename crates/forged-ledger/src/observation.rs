@@ -3,9 +3,9 @@
 //!
 //! This is the storage seam behind exact Work Detail projections. It never
 //! reads Beads, controller files, processes, Herdr, or providers. An epic's
-//! child and internal planning runs are discovered from their durable epic
-//! start-link events and every run table is then read in a bounded number of
-//! bulk queries inside the same SQLite read transaction.
+//! child and internal planning/assurance runs are discovered from their
+//! durable epic start-link events and every run table is then read in a bounded
+//! number of bulk queries inside the same SQLite read transaction.
 
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -40,6 +40,7 @@ use crate::work_identity::{get_work_identity_tx, identity_row, IDENTITY_COLUMNS}
 const EPIC_STARTED: &str = "forged.epic.started";
 const EPIC_CHILD_STARTED: &str = "forged.epic.child.started";
 const EPIC_PLAN_STARTED: &str = "forged.epic.plan.started";
+const EPIC_ASSURANCE_STARTED: &str = "forged.epic.assurance.started";
 
 /// Hard ceiling for the event page carried by one observation snapshot.
 pub const WORK_OBSERVATION_MAX_EVENT_LIMIT: u32 = 1_000;
@@ -50,8 +51,25 @@ pub struct EpicChildRunLink {
     pub event_id: i64,
     pub child_id: String,
     pub run_id: String,
-    /// True when this edge names the epic's internal read-only planning run.
-    pub planning: bool,
+    pub phase: EpicLinkedRunPhase,
+}
+
+/// The closed role of a run linked from an epic's durable event stream.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EpicLinkedRunPhase {
+    Implementation,
+    Planning,
+    Assurance,
+}
+
+impl EpicLinkedRunPhase {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Implementation => "implementation",
+            Self::Planning => "planning",
+            Self::Assurance => "assurance",
+        }
+    }
 }
 
 /// The bounded event page for the exact requested subject.
@@ -156,10 +174,15 @@ fn epic_children_tx(
 ) -> Result<Vec<EpicChildRunLink>, LedgerError> {
     let mut statement = conn.prepare(
         "SELECT event_id, kind, payload_json FROM events \
-         WHERE run_id = ?1 AND kind IN (?2, ?3) ORDER BY event_id",
+         WHERE run_id = ?1 AND kind IN (?2, ?3, ?4) ORDER BY event_id",
     )?;
     let rows = statement.query_map(
-        rusqlite::params![epic_id, EPIC_CHILD_STARTED, EPIC_PLAN_STARTED],
+        rusqlite::params![
+            epic_id,
+            EPIC_CHILD_STARTED,
+            EPIC_PLAN_STARTED,
+            EPIC_ASSURANCE_STARTED
+        ],
         |row| {
             Ok((
                 row.get::<_, i64>(0)?,
@@ -194,7 +217,12 @@ fn epic_children_tx(
             event_id,
             child_id: child.child_id,
             run_id: child.run_id,
-            planning: kind == EPIC_PLAN_STARTED,
+            phase: match kind.as_str() {
+                EPIC_CHILD_STARTED => EpicLinkedRunPhase::Implementation,
+                EPIC_PLAN_STARTED => EpicLinkedRunPhase::Planning,
+                EPIC_ASSURANCE_STARTED => EpicLinkedRunPhase::Assurance,
+                _ => unreachable!("the query selects only closed epic run-link kinds"),
+            },
         });
     }
     Ok(links)
@@ -1121,9 +1149,11 @@ mod tests {
         seed_run(&ledger, "child-a", Some(epic_id));
         seed_run(&ledger, "child-b", Some(epic_id));
         seed_run(&ledger, "plan-a", Some(epic_id));
+        seed_run(&ledger, "assurance-a", Some(epic_id));
         seed_run(&ledger, "outsider", None);
         let child_packet = seed_packet(&ledger, "child-a", 1);
         let plan_packet = seed_packet(&ledger, "plan-a", 1);
+        let assurance_packet = seed_packet(&ledger, "assurance-a", 1);
         let _outsider_packet = seed_packet(&ledger, "outsider", 1);
         ledger
             .append_event(Some("child-a"), "child.local", json!({"n": 1}))
@@ -1165,6 +1195,56 @@ mod tests {
             )
             .expect("plan start");
         ledger
+            .append_event(
+                Some(epic_id),
+                EPIC_ASSURANCE_STARTED,
+                json!({
+                    "childId": epic_id,
+                    "runId": "assurance-a",
+                    "integrationSha": "a".repeat(40),
+                    "pr": {"number": 42},
+                }),
+            )
+            .expect("assurance start");
+        ledger
+            .submit({
+                let assurance_packet = assurance_packet.clone();
+                move |conn| {
+                    conn.execute(
+                        "INSERT INTO attempts (attempt_id, packet_id, claim_token, claimant, \
+                         state, started_at, updated_at) \
+                         VALUES (41, ?1, 'assurance-claim', 'test', 'completed', ?2, ?2)",
+                        rusqlite::params![assurance_packet, NOW],
+                    )?;
+                    conn.execute(
+                        "INSERT INTO attempt_artifacts (attempt_id, run_id, packet_id, \
+                         manifest_schema, manifest_path, manifest_sha256, retention_class, created_at) \
+                         VALUES (41, 'assurance-a', ?1, 'forged.attempt-artifacts/1', \
+                         'assurance-manifest.json', ?2, 'compactable-success', ?3)",
+                        rusqlite::params![assurance_packet, "d".repeat(64), NOW],
+                    )?;
+                    Ok(())
+                }
+            })
+            .expect("assurance evidence");
+        ledger
+            .record_usage(NewUsage {
+                run_id: "assurance-a".to_owned(),
+                packet_id: Some(assurance_packet.clone()),
+                attempt_id: Some(41),
+                provider: "provider".to_owned(),
+                model: "model".to_owned(),
+                input_tokens: 17,
+                output_tokens: 4,
+                cache_read_tokens: None,
+                cache_write_tokens: None,
+                cost_usd: Some(0.25),
+                pricing_basis: Some("billed".to_owned()),
+                rate_limit_used_percent: None,
+                web_search_requests: None,
+            })
+            .expect("assurance usage");
+        ledger
             .append_event(Some(epic_id), "epic.note", json!({"n": 2}))
             .expect("epic note");
 
@@ -1175,31 +1255,44 @@ mod tests {
         let snapshot = ledger
             .work_observation_snapshot(WorkIdentitySubjectKind::Epic, epic_id, after, 2)
             .expect("epic snapshot");
-        assert_eq!(snapshot.epic_children.len(), 3);
+        assert_eq!(snapshot.epic_children.len(), 4);
         assert_eq!(
             snapshot
                 .epic_children
                 .iter()
                 .map(|link| link.run_id.as_str())
                 .collect::<Vec<_>>(),
-            vec!["child-a", "child-b", "plan-a"]
+            vec!["child-a", "child-b", "plan-a", "assurance-a"]
         );
         assert_eq!(
             snapshot
                 .epic_children
                 .iter()
-                .map(|link| link.planning)
+                .map(|link| link.phase)
                 .collect::<Vec<_>>(),
-            vec![false, false, true]
+            vec![
+                EpicLinkedRunPhase::Implementation,
+                EpicLinkedRunPhase::Implementation,
+                EpicLinkedRunPhase::Planning,
+                EpicLinkedRunPhase::Assurance,
+            ]
         );
-        assert_eq!(snapshot.child_identities.len(), 3);
+        assert_eq!(
+            snapshot
+                .epic_children
+                .iter()
+                .map(|link| link.phase.as_str())
+                .collect::<Vec<_>>(),
+            vec!["implementation", "implementation", "planning", "assurance"]
+        );
+        assert_eq!(snapshot.child_identities.len(), 4);
         assert_eq!(
             snapshot
                 .runs
                 .iter()
                 .map(|run| run.run_id.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from(["child-a", "child-b", "plan-a"])
+            BTreeSet::from(["assurance-a", "child-a", "child-b", "plan-a"])
         );
         assert_eq!(
             snapshot
@@ -1207,13 +1300,21 @@ mod tests {
                 .iter()
                 .map(|packet| packet.packet_id.as_str())
                 .collect::<BTreeSet<_>>(),
-            BTreeSet::from([child_packet.as_str(), plan_packet.as_str()])
+            BTreeSet::from([
+                assurance_packet.as_str(),
+                child_packet.as_str(),
+                plan_packet.as_str(),
+            ])
         );
-        assert_eq!(snapshot.usage_totals.len(), 3);
-        assert!(snapshot
-            .usage_totals
-            .values()
-            .all(|totals| totals.input_tokens == 0));
+        assert_eq!(snapshot.attempts.len(), 1);
+        assert_eq!(snapshot.attempts[0].packet_id, assurance_packet);
+        assert_eq!(snapshot.attempt_artifacts.len(), 1);
+        assert_eq!(snapshot.attempt_artifacts[0].run_id, "assurance-a");
+        assert_eq!(snapshot.usage_rows.len(), 1);
+        assert_eq!(snapshot.usage_rows[0].run_id, "assurance-a");
+        assert_eq!(snapshot.usage_totals.len(), 4);
+        assert_eq!(snapshot.usage_totals["assurance-a"].input_tokens, 17);
+        assert_eq!(snapshot.usage_totals["assurance-a"].cost_usd_known, 0.25);
         assert_eq!(
             snapshot
                 .events
@@ -1254,7 +1355,7 @@ mod tests {
                 .collect::<Vec<_>>()
         );
         assert!(!remainder.events.has_more);
-        assert_eq!(remainder.epic_children.len(), 3);
+        assert_eq!(remainder.epic_children.len(), 4);
     }
 
     #[test]

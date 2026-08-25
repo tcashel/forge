@@ -1229,7 +1229,7 @@ fn child_rows(snapshot: &WorkObservationSnapshot) -> Vec<Value> {
                 "eventId": child.event_id,
                 "childId": child.child_id,
                 "runId": child.run_id,
-                "phase": if child.planning { "planning" } else { "implementation" },
+                "phase": child.phase.as_str(),
                 "identity": identity,
                 "status": run_status(run),
                 "delivery": run_delivery(run),

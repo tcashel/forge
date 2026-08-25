@@ -50,7 +50,7 @@ pub use history::{HistoryAttemptRow, HistorySnapshot, HISTORY_EVENT_KINDS};
 pub use inventory::{InventorySnapshot, InventoryUsage, InventoryUsageSelection};
 pub use ledger::{default_db_path, Ledger};
 pub use observation::{
-    EpicChildRunLink, WorkObservationEvents, WorkObservationSnapshot,
+    EpicChildRunLink, EpicLinkedRunPhase, WorkObservationEvents, WorkObservationSnapshot,
     WORK_OBSERVATION_MAX_EVENT_LIMIT,
 };
 pub use owned_herdr::OWNED_HERDR_CLEANUP_RETRY_BUDGET;
