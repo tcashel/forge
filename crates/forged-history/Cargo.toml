@@ -1,0 +1,21 @@
+[package]
+name = "forged-history"
+version = "0.3.1"
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+jiff.workspace = true
+libc.workspace = true
+rusqlite.workspace = true
+sha2.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+zstd.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

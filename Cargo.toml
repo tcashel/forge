@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/forged-types",
     "crates/forged-ledger",
+    "crates/forged-history",
     "crates/forged-host",
     "crates/forged-git",
     "crates/forged-gate",
@@ -26,6 +27,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 fs2 = "0.4"
 jiff = "0.2"
+libc = "0.2"
 minijinja = "2"
 nix = { version = "0.31", features = ["fs", "process", "signal"] }
 proptest = "1"
@@ -42,3 +44,4 @@ tokio = { version = "1", features = ["full"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json"] }
 uuid = { version = "1", features = ["v7", "v5"] }
+zstd = { version = "0.13", default-features = false }

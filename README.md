@@ -38,6 +38,7 @@ workers never write bd.
 | --- | --- |
 | `forged-types` | Frozen contracts: operation envelope (canonical JSON, 18-code closed error set), packet/result types |
 | `forged-ledger` | SQLite ledger (WAL, `BEGIN IMMEDIATE`): runs, packets, attempts, operations, merge slots, events, usage |
+| `forged-history` | Independent durable native-session archive: segmented Zstandard bytes, normalized metadata, usage, and rebuildable contentless FTS |
 | `forged-host` | `SessionHost` trait; process and Herdr backends |
 | `forged-git` | Worktrees, gh wrapper with effect probes, merge guard |
 | `forged-gate` | Quality-gate runner |
@@ -46,9 +47,10 @@ workers never write bd.
 | `forged-proto` | The slice/v1 advance engine and the kill-confirmed reclaim saga |
 | `forged` (bin) | clap CLI + rmcp MCP/App server over one shared core; detached slice/epic submission, reconnect overview, and session controls |
 
-All operator state lives out-of-repo under `~/.anvil/` (ledger at
-`~/.anvil/state.db`, run artifacts under `~/.anvil/runs/`). forged imposes
-nothing on the repositories it targets.
+All operator state lives out-of-repo under `~/.anvil/` (execution ledger at
+`~/.anvil/state.db`, independent history archive at
+`~/.anvil/history/history.db`, run artifacts under `~/.anvil/runs/`). forged
+imposes nothing on the repositories it targets.
 
 Beads may remain embedded or use one central Dolt SQL database for a team.
 The latter centralizes specs, dependencies, readiness, and leases only;
@@ -118,7 +120,9 @@ CI do not install the plugin.
 
 History and rationale live in [`docs/adr/`](docs/adr/) — start at
 [ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md) and
-[ADR-0033](docs/adr/0033-execution-package-ownership-boundary.md).
+[ADR-0033](docs/adr/0033-execution-package-ownership-boundary.md). Durable
+native-session retention is specified by
+[ADR-0034](docs/adr/0034-durable-native-session-history.md).
 
 ## License
 

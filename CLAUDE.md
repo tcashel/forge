@@ -2,7 +2,7 @@
 
 ## What this repo is
 
-**forged** — a provider-neutral Rust orchestrator (nine-crate Cargo
+**forged** — a provider-neutral Rust orchestrator (ten-crate Cargo
 workspace, binary `forged`). The TypeScript cockpit that used to live here
 was removed in the supersession recorded by
 [ADR-0032](docs/adr/0032-forged-provider-neutral-rust-orchestrator.md); it
@@ -52,16 +52,22 @@ story even if every test still passes:
 - **Canonical JSON** in the operation envelope: sorted keys, duplicate keys
   and non-integer numbers rejected at parse. No SQLite transaction held
   across an `.await` (the ledger sits behind a blocking actor).
+- **History is independent durable state.** `forged-history` owns
+  `~/.anvil/history/history.db`, never depends on `forged-ledger`, and keeps
+  exact native bytes behind its own synchronous blocking actor. Compressed
+  archive rows are durable; contentless FTS is a generation-fenced projection
+  that must be rebuildable from retained chunks alone.
 - **forged never uses `bd update --force`**, never bare-releases a merge
   slot (always `--holder`), and never auto-reaps a slot holder it did not
   record.
 
 ## Operator scope — nothing in-repo
 
-All runtime state is operator-scoped: ledger at `~/.anvil/state.db`, run
-artifacts under `~/.anvil/runs/`, beads in `$BEADS_DIR`. Never commit any of
-it. Tests write only under `CARGO_TARGET_TMPDIR` scratch dirs; bd-gated
-tests bind `HomeBeadsGuard` FIRST (a leaked machine-global `~/.beads` from a
+All runtime state is operator-scoped: execution ledger at `~/.anvil/state.db`,
+history at `~/.anvil/history/history.db`, run artifacts under
+`~/.anvil/runs/`, beads in `$BEADS_DIR`. Never commit any of it. Tests write
+only under `CARGO_TARGET_TMPDIR` scratch dirs; bd-gated tests bind
+`HomeBeadsGuard` FIRST (a leaked machine-global `~/.beads` from a
 scratch run is a test failure). Never run package managers (`brew`, `cargo
 install` into PATH, etc.) from an agent — the live bd binary is pinned by
 the operator.
