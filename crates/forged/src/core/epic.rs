@@ -3155,20 +3155,67 @@ async fn ensure_assurance_run(
 
 async fn start_assurance(ctx: &Ctx, view: &EpicView, pr: &Value) -> Result<Step, Failure> {
     let config = &view.config;
-    let integration_sha =
-        forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch).await?;
+    let inspected: Result<(String, forged_git::PrMeta, String), Failure> = async {
+        let integration_sha =
+            forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch)
+                .await?;
+        let slug = repo_slug(Path::new(&config.repo))
+            .await
+            .map_err(|error| Failure::internal(error.to_string()))?;
+        let number = final_pr_number(pr)?;
+        let gh = forged_git::GhClient::new();
+        let fresh_pr = gh.pr_view(&slug, number).await?;
+        let fresh_pr_sha = gh.pr_head_sha(&slug, number).await?;
+        Ok((integration_sha, fresh_pr, fresh_pr_sha))
+    }
+    .await;
+    let (integration_sha, fresh_pr, fresh_pr_sha) = match inspected {
+        Ok(inspected) => inspected,
+        Err(error) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "assurance-start-inspection-failed",
+                None,
+                error.message,
+                Some(json!({
+                    "integrationBranch": config.integration_branch,
+                    "draftPr": pr,
+                })),
+            )
+            .await?;
+            return Ok(Step::Stop(stopped));
+        }
+    };
     let pr_sha = pr
         .get("headSha")
         .and_then(Value::as_str)
         .ok_or_else(|| Failure::internal("new assurance draft PR has no frozen head SHA"))?;
-    if pr_sha != integration_sha {
+    let exact_pr = fresh_pr.state == "OPEN"
+        && fresh_pr.is_draft
+        && fresh_pr.head_ref_name == config.integration_branch
+        && fresh_pr.base_ref_name == config.base_ref;
+    if pr_sha != integration_sha || fresh_pr_sha != integration_sha || !exact_pr {
         let stopped = require_input_with_evidence(
             ctx,
             &config.epic_id,
             "assurance-pr-head-drift",
             None,
-            "integration branch changed after draft PR creation",
-            Some(json!({"draftPrSha": pr_sha, "remoteSha": integration_sha, "pr": pr})),
+            "draft PR or integration branch changed before assurance started",
+            Some(json!({
+                "draftPrSha": pr_sha,
+                "remoteSha": integration_sha,
+                "freshPrSha": fresh_pr_sha,
+                "draftPr": pr,
+                "freshPr": {
+                    "number": fresh_pr.number,
+                    "state": fresh_pr.state,
+                    "isDraft": fresh_pr.is_draft,
+                    "head": fresh_pr.head_ref_name,
+                    "base": fresh_pr.base_ref_name,
+                    "url": fresh_pr.url,
+                },
+            })),
         )
         .await?;
         return Ok(Step::Stop(stopped));
@@ -3589,6 +3636,17 @@ async fn advance_assurance(ctx: &Ctx, view: &EpicView) -> Result<Step, Failure> 
     };
     let advanced = super::drive::run_advance(ctx, &request).await;
     if !advanced.ok {
+        if advanced
+            .error
+            .as_ref()
+            .is_some_and(|error| error.recoverable && error.code == ErrorCode::OperationInProgress)
+        {
+            return Ok(Step::Wait(json!({
+                "assuranceDeferred": advanced,
+                "runId": state.run_id,
+                "started": started,
+            })));
+        }
         let stopped = require_input_with_evidence(
             ctx,
             &view.config.epic_id,
