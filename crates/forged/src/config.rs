@@ -506,11 +506,16 @@ impl ForgedConfig {
                 message: format!("unknown profile {profile_name:?}"),
             }]);
         };
-        if profile.protocol.name == "epic-plan" {
+        if matches!(
+            profile.protocol.name.as_str(),
+            "epic-plan" | "epic-assurance"
+        ) {
             return Err(vec![DefinitionError {
                 path: "$.profile.protocol".to_owned(),
-                message: "epic-plan/v1 is runtime-derived and cannot be selected directly"
-                    .to_owned(),
+                message: format!(
+                    "{}/v1 is runtime-derived and cannot be selected directly",
+                    profile.protocol.name
+                ),
             }]);
         }
         let Some(roster) = self.rosters.get(roster_name).cloned() else {
@@ -974,6 +979,55 @@ pub(crate) fn compile_epic_plan_package(
     compile_frozen_package(package)
 }
 
+/// Derive the internal `epic-assurance/v1` package from an already-frozen
+/// slice package. The existing review, synthesis, and remediation topology
+/// is retained verbatim; only implementation seats are omitted because the
+/// epic integration branch already contains the work under review.
+pub(crate) fn compile_epic_assurance_package(
+    base: &ExecutionPackageV1,
+) -> Result<CompiledDefinition, Vec<DefinitionError>> {
+    if base.protocol_ref.name != "slice" || base.protocol_ref.version != 1 {
+        return Err(vec![DefinitionError {
+            path: "$.protocolRef".to_owned(),
+            message: "epic assurance must derive from a frozen slice/v1 package".to_owned(),
+        }]);
+    }
+    let protocol = ProtocolRef {
+        name: "epic-assurance".to_owned(),
+        version: 1,
+    };
+    let derive_profile = |profile: &ProfileDefinitionV1| {
+        let mut profile = profile.clone();
+        profile.protocol = protocol.clone();
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
+        profile
+    };
+
+    let mut package = base.clone();
+    package.protocol_ref = protocol.clone();
+    package.profile = derive_profile(&base.profile);
+    package.profile_catalog = base
+        .profile_catalog
+        .iter()
+        .map(|(name, profile)| (name.clone(), derive_profile(profile)))
+        .collect();
+    package.profile_sha256 = digest_of(&package.profile).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.profile".to_owned(),
+            message,
+        }]
+    })?;
+    package.roster_sha256 = digest_of(&package.roster).map_err(|message| {
+        vec![DefinitionError {
+            path: "$.roster".to_owned(),
+            message,
+        }]
+    })?;
+    compile_frozen_package(package)
+}
+
 fn compatibility_projection(
     profile: &ProfileDefinitionV1,
     roster: &RosterDefinitionV1,
@@ -988,7 +1042,13 @@ fn compatibility_projection(
     let implement = seats(SeatPurpose::Implement);
     let reviews = seats(SeatPurpose::Review);
     let fixes = seats(SeatPurpose::Fix);
-    if implement.len() != 1 || reviews.is_empty() || fixes.len() != 1 {
+    let assurance = profile.protocol.name == "epic-assurance" && profile.protocol.version == 1;
+    let implement_valid = if assurance {
+        implement.is_empty()
+    } else {
+        implement.len() == 1
+    };
+    if !implement_valid || reviews.is_empty() || fixes.len() != 1 {
         return Err(DefinitionError {
             path: "$.profile.seats".to_owned(),
             message: "profile cannot supply the temporary slice/v1 storage lanes".to_owned(),
@@ -1010,8 +1070,9 @@ fn compatibility_projection(
                 message: "compatibility projection needs a first candidate".to_owned(),
             })
     };
+    let implement_lane = if assurance { fixes[0] } else { implement[0] };
     Ok(HashMap::from([
-        (Stage::Implement, candidate(implement[0])?),
+        (Stage::Implement, candidate(implement_lane)?),
         (Stage::ReviewClaude, candidate(reviews[0])?),
         (
             Stage::ReviewCodex,
@@ -1289,6 +1350,65 @@ mod tests {
     }
 
     #[test]
+    fn epic_assurance_omits_only_implement_and_preserves_frozen_inputs() {
+        let base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile");
+        let assurance = compile_epic_assurance_package(&base.package).expect("assurance package");
+
+        assert_eq!(assurance.package.protocol_ref.name, "epic-assurance");
+        assert_eq!(assurance.package.protocol_ref.version, 1);
+        assert_eq!(assurance.package.policy, base.package.policy);
+        assert_eq!(assurance.package.roster, base.package.roster);
+        assert_eq!(
+            assurance.package.profile.fix_round_budget,
+            base.package.profile.fix_round_budget
+        );
+        assert_eq!(
+            assurance.package.profile.escalate_on,
+            base.package.profile.escalate_on
+        );
+        assert_eq!(
+            assurance.package.profile.escalate_to,
+            base.package.profile.escalate_to
+        );
+        let retained = base
+            .package
+            .profile
+            .seats
+            .iter()
+            .filter(|seat| seat.purpose != SeatPurpose::Implement)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert_eq!(assurance.package.profile.seats, retained);
+        assert!(assurance
+            .package
+            .profile_catalog
+            .values()
+            .all(|profile| profile.protocol.name == "epic-assurance"
+                && profile
+                    .seats
+                    .iter()
+                    .all(|seat| seat.purpose != SeatPurpose::Implement)));
+        assert_eq!(
+            assurance.compatibility_roster[&Stage::Implement],
+            assurance.compatibility_roster[&Stage::Fix],
+            "the unused implementation storage lane projects from fix without adding a seat"
+        );
+    }
+
+    #[test]
+    fn epic_assurance_derivation_rejects_an_internal_base_protocol() {
+        let base = config().compile_definition(None, None).expect("compile");
+        let planning = compile_epic_plan_package(&base.package).expect("planning package");
+        let errors = compile_epic_assurance_package(&planning.package)
+            .expect_err("internal protocol cannot be composed");
+        assert!(errors
+            .iter()
+            .any(|error| { error.path == "$.protocolRef" && error.message.contains("slice/v1") }));
+    }
+
+    #[test]
     fn epic_plan_package_refuses_a_writable_critique_candidate() {
         let mut base = config()
             .compile_definition(None, None)
@@ -1358,6 +1478,22 @@ mod tests {
             .expect("standard profile")
             .protocol
             .name = "epic-plan".to_owned();
+        let errors = cfg
+            .compile_definition(Some("standard"), None)
+            .expect_err("runtime-only protocol cannot be selected");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.profile.protocol" && error.message.contains("runtime-derived")
+        }));
+    }
+
+    #[test]
+    fn operator_authored_epic_assurance_profile_is_rejected() {
+        let mut cfg = config();
+        let profile = cfg.profiles.get_mut("standard").expect("standard profile");
+        profile.protocol.name = "epic-assurance".to_owned();
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
         let errors = cfg
             .compile_definition(Some("standard"), None)
             .expect_err("runtime-only protocol cannot be selected");

@@ -152,7 +152,7 @@ pub enum EscalationTrigger {
     OversizedDiff,
 }
 
-/// A closed assurance/topology definition for `slice/v1`.
+/// A closed assurance/topology definition for one supported protocol.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
 pub struct ProfileDefinitionV1 {
@@ -296,7 +296,7 @@ pub struct RosterRevisionV1 {
 }
 
 impl ProfileDefinitionV1 {
-    /// Validate the closed `slice/v1` topology with stable error paths.
+    /// Validate a closed protocol topology with stable error paths.
     pub fn validate(&self) -> Vec<DefinitionError> {
         let mut errors = Vec::new();
         if self.schema != PROFILE_SCHEMA_V1 {
@@ -311,12 +311,14 @@ impl ProfileDefinitionV1 {
                 "invalid profile name",
             ));
         }
-        if !matches!(self.protocol.name.as_str(), "slice" | "epic-plan")
-            || self.protocol.version != 1
+        if !matches!(
+            self.protocol.name.as_str(),
+            "slice" | "epic-plan" | "epic-assurance"
+        ) || self.protocol.version != 1
         {
             errors.push(DefinitionError::at(
                 "$.profile.protocol",
-                "only slice/v1 and epic-plan/v1 are supported",
+                "only slice/v1, epic-plan/v1, and epic-assurance/v1 are supported",
             ));
         }
         if self.seats.is_empty() || self.seats.len() > 8 {
@@ -364,10 +366,15 @@ impl ProfileDefinitionV1 {
         }
         let count = |purpose| self.seats.iter().filter(|s| s.purpose == purpose).count();
         let protocol = self.protocol.name.as_str();
-        if count(SeatPurpose::Implement) != 1 {
+        let expected_implement = usize::from(protocol != "epic-assurance");
+        if count(SeatPurpose::Implement) != expected_implement {
             errors.push(DefinitionError::at(
                 "$.profile.seats",
-                format!("{protocol}/v1 requires exactly one implement seat"),
+                if expected_implement == 0 {
+                    format!("{protocol}/v1 permits no implement seats")
+                } else {
+                    format!("{protocol}/v1 requires exactly one implement seat")
+                },
             ));
         }
         if !(1..=4).contains(&count(SeatPurpose::Review)) {
@@ -613,6 +620,70 @@ mod tests {
         ] {
             assert!(errors.iter().any(|error| error.path == path), "{errors:?}");
         }
+    }
+
+    #[test]
+    fn epic_assurance_is_v1_only_and_has_no_implement_seat() {
+        let mut profile = standard_profile();
+        profile.protocol.name = "epic-assurance".to_owned();
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
+        assert!(profile.validate().is_empty());
+
+        profile.protocol.version = 2;
+        assert!(profile
+            .validate()
+            .iter()
+            .any(|error| error.path == "$.profile.protocol"));
+
+        profile.protocol.version = 1;
+        profile.seats.push(SeatDefinitionV1 {
+            id: SeatId::new("implementation").expect("id"),
+            role: RoleId::new("implementation").expect("role"),
+            purpose: SeatPurpose::Implement,
+        });
+        assert!(profile.validate().iter().any(|error| {
+            error.path == "$.profile.seats" && error.message.contains("no implement seats")
+        }));
+
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Implement);
+        profile
+            .seats
+            .retain(|seat| seat.purpose != SeatPurpose::Review);
+        assert!(profile.validate().iter().any(|error| {
+            error.path == "$.profile.seats" && error.message.contains("one and four review")
+        }));
+
+        profile.seats.push(SeatDefinitionV1 {
+            id: SeatId::new("review-1").expect("id"),
+            role: RoleId::new("review").expect("role"),
+            purpose: SeatPurpose::Review,
+        });
+        profile.seats.push(SeatDefinitionV1 {
+            id: SeatId::new("synthesis-1").expect("id"),
+            role: RoleId::new("synthesis").expect("role"),
+            purpose: SeatPurpose::Synthesis,
+        });
+        profile.seats.push(SeatDefinitionV1 {
+            id: SeatId::new("synthesis-2").expect("id"),
+            role: RoleId::new("synthesis").expect("role"),
+            purpose: SeatPurpose::Synthesis,
+        });
+        profile.seats.push(SeatDefinitionV1 {
+            id: SeatId::new("remediation-2").expect("id"),
+            role: RoleId::new("remediation").expect("role"),
+            purpose: SeatPurpose::Fix,
+        });
+        let errors = profile.validate();
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("at most one synthesis")));
+        assert!(errors
+            .iter()
+            .any(|error| error.message.contains("exactly one fix")));
     }
 
     #[test]

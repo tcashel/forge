@@ -16,7 +16,7 @@ use forged_ledger::{
 };
 use forged_types::{
     AcceptedRisk, EscalationTrigger, ExecutionPackageV1, ExecutionPolicyV1, Outcome,
-    ProfileDefinitionV1, ProviderHints, SeatDefinitionV1, SeatExecutionV1, SeatPurpose,
+    ProfileDefinitionV1, ProviderHints, SeatDefinitionV1, SeatExecutionV1, SeatPurpose, Severity,
     SpecAmendment, Stage, Verdict,
 };
 
@@ -383,6 +383,9 @@ pub fn advance(view: &RunView) -> NextAction {
         }
     }
     if let Some(package) = &view.execution_package {
+        if package.protocol_ref.name == "epic-assurance" && package.protocol_ref.version == 1 {
+            return advance_epic_assurance(view, package);
+        }
         if package.protocol_ref.name == "epic-plan" && package.protocol_ref.version == 1 {
             return advance_epic_plan(view, package);
         }
@@ -604,20 +607,9 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
         return NextAction::RunMachine(MachineStage::DraftPr);
     }
 
-    let reviews = seats_for(profile, SeatPurpose::Review);
     let fixes = seats_for(profile, SeatPurpose::Fix);
     for review_round in 0..=profile.fix_round_budget {
-        let reviewed = match adaptive_group(view, package, &reviews, review_round) {
-            AdaptiveGroup::Action(action) => return action,
-            AdaptiveGroup::Done(done) => done,
-        };
-        if let Some(amendment) = reviewed.amendment {
-            return amendment_stop(amendment);
-        }
-        // A configured panel's synthesis seat is its one adjudication. A
-        // disagreement never rewrites the run's topology or raises it into a
-        // more expensive profile.
-        let reviewed = match synthesis_verdict(view, package, profile, review_round, reviewed) {
+        let reviewed = match adaptive_review_round(view, package, profile, review_round) {
             AdaptiveGroup::Action(action) => return action,
             AdaptiveGroup::Done(done) => done,
         };
@@ -666,6 +658,95 @@ fn advance_adaptive(view: &RunView, package: &ExecutionPackageV1) -> NextAction 
     }
     NextAction::Stop(Terminal::ExternallyStopped {
         reason: "review loop exceeded its validated round bound".to_owned(),
+    })
+}
+
+/// Internal `epic-assurance/v1`: validate the already-integrated branch,
+/// review it through the frozen assurance topology, and remediate only when
+/// either the exact gate round or the controlling review is not clean.
+/// Publishing the final epic PR belongs to the enclosing epic controller.
+fn advance_epic_assurance(view: &RunView, package: &ExecutionPackageV1) -> NextAction {
+    if view.run.state == RunState::Stopped {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: view.run.stop_reason.clone().unwrap_or_default(),
+        });
+    }
+    let Some(profile) = active_profile(view, package) else {
+        return NextAction::Stop(Terminal::ExternallyStopped {
+            reason: "stored epic-assurance profile is missing".to_owned(),
+        });
+    };
+
+    if !op_settled(view, MachineStage::Resolve, 0) {
+        return NextAction::RunMachine(MachineStage::Resolve);
+    }
+    if !op_settled(view, MachineStage::Gate, 0) {
+        return NextAction::RunMachine(MachineStage::Gate);
+    }
+    if !gate_passed_for_round(view, 0) {
+        if let Some(action) = escalation_action(view, profile, EscalationTrigger::GateFailure) {
+            return action;
+        }
+    }
+
+    let fixes = seats_for(profile, SeatPurpose::Fix);
+    for review_round in 0..=profile.fix_round_budget {
+        let reviewed = match adaptive_review_round(view, package, profile, review_round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = reviewed.amendment {
+            return amendment_stop(amendment);
+        }
+        let gate_passed = gate_passed_for_round(view, review_round);
+        let severe = review_round_has_severe_findings(view, profile, review_round);
+        if gate_passed
+            && reviewed.control == Verdict::Approve
+            && reviewed.produced == Some(Verdict::Approve)
+            && reviewed.produced_is_durable
+            && !severe
+        {
+            return NextAction::Stop(Terminal::Done {
+                review_rounds: review_round.saturating_add(1),
+                final_verdict: reviewed.produced,
+                final_verdict_is_durable: true,
+                failed_review_seats: reviewed.failed_without_result,
+            });
+        }
+        if review_round == profile.fix_round_budget {
+            return NextAction::Stop(Terminal::ReviewBudgetExhausted {
+                review_rounds: review_round.saturating_add(1),
+                final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
+            });
+        }
+
+        let fixed = match adaptive_group(view, package, &fixes, review_round) {
+            AdaptiveGroup::Action(action) => return action,
+            AdaptiveGroup::Done(done) => done,
+        };
+        if let Some(amendment) = fixed.amendment {
+            return amendment_stop(amendment);
+        }
+        if fixed.semantic_failure {
+            return NextAction::Stop(Terminal::RemediationFailed {
+                round: review_round.saturating_add(1),
+                final_verdict: reviewed.produced,
+                final_verdict_is_durable: reviewed.produced_is_durable,
+                failed_review_seats: reviewed.failed_without_result,
+            });
+        }
+        let machine_round = u32::from(review_round) + 1;
+        if !op_settled(view, MachineStage::ReGate, machine_round) {
+            return NextAction::RunMachine(MachineStage::ReGate);
+        }
+        if !op_settled(view, MachineStage::Push, machine_round) {
+            return NextAction::RunMachine(MachineStage::Push);
+        }
+    }
+    NextAction::Stop(Terminal::ExternallyStopped {
+        reason: "epic-assurance review loop exceeded its validated round bound".to_owned(),
     })
 }
 
@@ -853,6 +934,27 @@ fn gate_failed(view: &RunView) -> bool {
         == Some(true)
 }
 
+fn gate_passed_for_round(view: &RunView, round: u8) -> bool {
+    let (phase, seq) = if round == 0 {
+        (crate::events::GatePhase::Gate, 0)
+    } else {
+        (crate::events::GatePhase::Regate, i64::from(round))
+    };
+    view.proto_events
+        .iter()
+        .rev()
+        .find_map(|event| match event {
+            ProtoEvent::Gate {
+                phase: event_phase,
+                seq: event_seq,
+                passed,
+                ..
+            } if *event_phase == phase && *event_seq == seq => Some(*passed),
+            _ => None,
+        })
+        == Some(true)
+}
+
 fn escalation_action(
     view: &RunView,
     profile: &ProfileDefinitionV1,
@@ -1008,6 +1110,45 @@ fn synthesis_verdict(
         return AdaptiveGroup::Done(reviews);
     }
     adaptive_group(view, package, &synthesis, round)
+}
+
+/// Run one frozen adaptive review round. A synthesis seat, when configured,
+/// remains the controlling adjudication exactly as it is for `slice/v1`.
+fn adaptive_review_round(
+    view: &RunView,
+    package: &ExecutionPackageV1,
+    profile: &ProfileDefinitionV1,
+    round: u8,
+) -> AdaptiveGroup {
+    let reviews = seats_for(profile, SeatPurpose::Review);
+    let reviewed = match adaptive_group(view, package, &reviews, round) {
+        AdaptiveGroup::Action(action) => return AdaptiveGroup::Action(action),
+        AdaptiveGroup::Done(done) => done,
+    };
+    if reviewed.amendment.is_some() {
+        return AdaptiveGroup::Done(reviewed);
+    }
+    synthesis_verdict(view, package, profile, round, reviewed)
+}
+
+fn review_round_has_severe_findings(
+    view: &RunView,
+    profile: &ProfileDefinitionV1,
+    round: u8,
+) -> bool {
+    profile
+        .seats
+        .iter()
+        .filter(|seat| matches!(seat.purpose, SeatPurpose::Review | SeatPurpose::Synthesis))
+        .filter_map(|seat| adaptive_packet(view, seat, round))
+        .filter_map(|packet| match packet_state(view, packet) {
+            LegState::Completed {
+                outcome: Some(Outcome::Review { findings, .. }),
+            } => Some(findings),
+            _ => None,
+        })
+        .flatten()
+        .any(|finding| matches!(finding.severity, Severity::Blocker | Severity::High))
 }
 
 fn adaptive_packet<'a>(
