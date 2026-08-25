@@ -667,8 +667,8 @@ pub(super) async fn epic_submission_stop(ctx: &Ctx, epic: &str) -> Result<Option
     let view = project(ctx, epic).await?;
     Ok(if let Some(completed) = view.assurance_completed {
         Some(json!({"finalPr": view.pr, "assurance": completed}))
-    } else if view.config.assurance_package.is_none() {
-        view.pr.map(|pr| json!({"finalPr": pr}))
+    } else if let Some(pr) = view.pr.filter(|_| view.config.assurance_package.is_none()) {
+        Some(json!({"finalPr": pr}))
     } else if let Some(paused) = view.paused {
         Some(json!({"paused": paused}))
     } else {
