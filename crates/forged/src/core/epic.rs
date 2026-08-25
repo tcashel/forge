@@ -129,6 +129,16 @@ struct AssuranceState {
     input_body: String,
 }
 
+struct AssuranceFinalInspection {
+    gate: Value,
+    local_sha: String,
+    remote_sha: String,
+    slug: String,
+    number: u64,
+    pr: forged_git::PrMeta,
+    pr_sha: String,
+}
+
 struct EpicView {
     config: EpicConfig,
     integration: Option<Value>,
@@ -3333,21 +3343,63 @@ async fn complete_assurance(
     run: &forged_proto::RunView,
 ) -> Result<Step, Failure> {
     let config = &view.config;
-    let gate = latest_gate_evidence(run)?;
+    let inspected: Result<AssuranceFinalInspection, Failure> = async {
+        let gate = latest_gate_evidence(run)?;
+        let local_sha = git_head(&ctx.config.worktree(&state.run_id)).await?;
+        let remote_sha =
+            forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch)
+                .await?;
+        let slug = repo_slug(Path::new(&config.repo))
+            .await
+            .map_err(|error| Failure::internal(error.to_string()))?;
+        let number = final_pr_number(&state.pr)?;
+        let gh = forged_git::GhClient::new();
+        let pr = gh.pr_view(&slug, number).await?;
+        let pr_sha = gh.pr_head_sha(&slug, number).await?;
+        Ok(AssuranceFinalInspection {
+            gate,
+            local_sha,
+            remote_sha,
+            slug,
+            number,
+            pr,
+            pr_sha,
+        })
+    }
+    .await;
+    let AssuranceFinalInspection {
+        gate,
+        local_sha,
+        remote_sha,
+        slug,
+        number,
+        pr,
+        pr_sha,
+    } = match inspected {
+        Ok(inspected) => inspected,
+        Err(error) => {
+            let stopped = require_input_with_evidence(
+                ctx,
+                &config.epic_id,
+                "assurance-final-inspection-failed",
+                None,
+                error.message.clone(),
+                Some(json!({
+                    "runId": state.run_id,
+                    "initialSha": state.integration_sha,
+                    "draftPr": state.pr,
+                    "errorCode": error.code,
+                    "recoverable": error.recoverable,
+                })),
+            )
+            .await?;
+            return Ok(Step::Stop(stopped));
+        }
+    };
     let findings = super::drive::latest_review_findings(run);
     let severe = findings
         .iter()
         .any(|finding| matches!(finding.severity, Severity::Blocker | Severity::High));
-    let local_sha = git_head(&ctx.config.worktree(&state.run_id)).await?;
-    let remote_sha =
-        forged_git::remote_branch_sha(Path::new(&config.repo), &config.integration_branch).await?;
-    let slug = repo_slug(Path::new(&config.repo))
-        .await
-        .map_err(|error| Failure::internal(error.to_string()))?;
-    let number = final_pr_number(&state.pr)?;
-    let gh = forged_git::GhClient::new();
-    let pr = gh.pr_view(&slug, number).await?;
-    let pr_sha = gh.pr_head_sha(&slug, number).await?;
     let gate_sha = gate
         .get("headSha")
         .and_then(Value::as_str)
@@ -3473,6 +3525,7 @@ async fn complete_assurance(
     let branch_for_effect = config.integration_branch.clone();
     let base_for_effect = config.base_ref.clone();
     let expected_sha = local_sha.clone();
+    let worktree_for_effect = ctx.config.worktree(&state.run_id);
     let finalized = safe_effect(
         ctx,
         "epic_pr_finalize",
@@ -3488,7 +3541,9 @@ async fn complete_assurance(
                     .await?;
             let final_pr = gh.pr_view(&slug_for_effect, number).await?;
             let final_pr_sha = gh.pr_head_sha(&slug_for_effect, number).await?;
-            if final_remote_sha != expected_sha
+            let final_local_sha = git_head(&worktree_for_effect).await?;
+            if final_local_sha != expected_sha
+                || final_remote_sha != expected_sha
                 || final_pr_sha != expected_sha
                 || final_pr.state != "OPEN"
                 || !final_pr.is_draft
@@ -3504,6 +3559,7 @@ async fn complete_assurance(
                     Some(json!({
                         "runId": evidence_for_event["runId"],
                         "expectedSha": expected_sha,
+                        "localSha": final_local_sha,
                         "remoteSha": final_remote_sha,
                         "prSha": final_pr_sha,
                         "pr": {

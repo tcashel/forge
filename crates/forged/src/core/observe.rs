@@ -1247,6 +1247,8 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
     let mut latest_pause: Option<(&str, &EventRow)> = None;
     let mut latest_input: Option<(&str, &EventRow)> = None;
     let mut latest_pr: Option<&EventRow> = None;
+    let mut latest_terminal_pr: Option<&EventRow> = None;
+    let mut latest_assurance_completion: Option<&EventRow> = None;
     if complete_events {
         for event in &snapshot.events.rows {
             match event.kind.as_str() {
@@ -1256,12 +1258,22 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
                 super::epic::INPUT_REQUIRED | super::epic::INPUT_RESOLVED => {
                     latest_input = Some((&event.kind, event));
                 }
-                super::epic::EPIC_PR => latest_pr = Some(event),
+                super::epic::EPIC_PR => {
+                    latest_pr = Some(event);
+                    let nonterminal = serde_json::from_str::<Value>(&event.payload_json)
+                        .ok()
+                        .and_then(|payload| payload.get("terminal").and_then(Value::as_bool))
+                        == Some(false);
+                    if !nonterminal {
+                        latest_terminal_pr = Some(event);
+                    }
+                }
+                super::epic::ASSURANCE_COMPLETED => latest_assurance_completion = Some(event),
                 _ => {}
             }
         }
     }
-    let state = if latest_pr.is_some() {
+    let state = if latest_terminal_pr.is_some() || latest_assurance_completion.is_some() {
         "submitted"
     } else if latest_input.is_some_and(|(kind, _)| kind == super::epic::INPUT_REQUIRED) {
         "input-required"
@@ -1295,7 +1307,7 @@ fn epic_status_delivery(snapshot: &WorkObservationSnapshot) -> Result<(Value, Va
             "source": "ledger-event",
             "known": true,
             "pr": payload.get("number"),
-            "sha": payload.get("sha"),
+            "sha": payload.get("headSha").or_else(|| payload.get("sha")),
             "base": payload.get("baseRefName").or_else(|| payload.get("base")),
             "eventId": event.event_id,
         })

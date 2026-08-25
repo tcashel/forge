@@ -835,6 +835,34 @@ pub fn compile_frozen_package(
     })
 }
 
+fn internal_role_is_read_only(roster: &ResolvedRosterV1, role: &forged_types::RoleId) -> bool {
+    roster.roles.get(role).is_some_and(|candidates| {
+        !candidates.is_empty()
+            && candidates.iter().all(|candidate| {
+                candidate.sandbox == Sandbox::ReadOnly
+                    && candidate.capabilities.contains(&Capability::RepositoryRead)
+                    && candidate
+                        .capabilities
+                        .contains(&Capability::StructuredOutput)
+                    && !candidate
+                        .capabilities
+                        .contains(&Capability::RepositoryWrite)
+            })
+    })
+}
+
+fn planning_role_uses_supported_provider(
+    roster: &ResolvedRosterV1,
+    role: &forged_types::RoleId,
+) -> bool {
+    roster.roles.get(role).is_some_and(|candidates| {
+        !candidates.is_empty()
+            && candidates
+                .iter()
+                .all(|candidate| matches!(candidate.provider.as_str(), "claude" | "codex" | "pi"))
+    })
+}
+
 /// Derive the closed `epic-plan/v1` package from one already-frozen epic
 /// package. Provider selection remains frozen; only the bounded protocol
 /// topology changes. Authoring and revision use a frozen read-only reviewer;
@@ -864,29 +892,18 @@ pub(crate) fn compile_epic_plan_package(
             message: "rolling epic planning requires at least one review seat".to_owned(),
         }]);
     }
-    let read_only = |role: &forged_types::RoleId| {
-        base.roster.roles.get(role).is_some_and(|candidates| {
-            !candidates.is_empty()
-                && candidates.iter().all(|candidate| {
-                    candidate.sandbox == Sandbox::ReadOnly
-                        && matches!(candidate.provider.as_str(), "claude" | "codex" | "pi")
-                        && candidate.capabilities.contains(&Capability::RepositoryRead)
-                        && candidate
-                            .capabilities
-                            .contains(&Capability::StructuredOutput)
-                        && !candidate
-                            .capabilities
-                            .contains(&Capability::RepositoryWrite)
-                })
-        })
-    };
-    if let Some(seat) = critique.iter().find(|seat| !read_only(&seat.role)) {
+    if let Some(seat) = critique.iter().find(|seat| {
+        !internal_role_is_read_only(&base.roster, &seat.role)
+            || !planning_role_uses_supported_provider(&base.roster, &seat.role)
+    }) {
         return Err(vec![DefinitionError {
             path: format!("$.roster.roles.{}", seat.role.as_str()),
             message: "rolling epic critique candidates must all be read-only".to_owned(),
         }]);
     }
-    if !read_only(&assessment_role) {
+    if !internal_role_is_read_only(&base.roster, &assessment_role)
+        || !planning_role_uses_supported_provider(&base.roster, &assessment_role)
+    {
         return Err(vec![DefinitionError {
             path: "$.roster.roles.assessment".to_owned(),
             message: "rolling epic assessment candidates must support enforced read-only execution"
@@ -990,6 +1007,18 @@ pub(crate) fn compile_epic_assurance_package(
         return Err(vec![DefinitionError {
             path: "$.protocolRef".to_owned(),
             message: "epic assurance must derive from a frozen slice/v1 package".to_owned(),
+        }]);
+    }
+    if let Some(seat) = std::iter::once(&base.profile)
+        .chain(base.profile_catalog.values())
+        .flat_map(|profile| profile.seats.iter())
+        .filter(|seat| matches!(seat.purpose, SeatPurpose::Review | SeatPurpose::Synthesis))
+        .find(|seat| !internal_role_is_read_only(&base.roster, &seat.role))
+    {
+        return Err(vec![DefinitionError {
+            path: format!("$.roster.roles.{}", seat.role.as_str()),
+            message: "epic assurance review and synthesis candidates must all be read-only"
+                .to_owned(),
         }]);
     }
     let protocol = ProtocolRef {
@@ -1406,6 +1435,52 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| { error.path == "$.protocolRef" && error.message.contains("slice/v1") }));
+    }
+
+    #[test]
+    fn epic_assurance_refuses_a_writable_review_candidate() {
+        let mut base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile")
+            .package;
+        let review = role("review.primary");
+        let candidate = &mut base.roster.roles.get_mut(&review).expect("review")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors =
+            compile_epic_assurance_package(&base).expect_err("writable assurance review refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.review.primary" && error.message.contains("read-only")
+        }));
+    }
+
+    #[test]
+    fn epic_assurance_refuses_a_writable_escalation_reviewer() {
+        let mut base = config()
+            .compile_definition(Some("lean"), None)
+            .expect("compile")
+            .package;
+        let secondary = role("review.secondary");
+        base.profile_catalog
+            .get_mut("standard")
+            .expect("reachable standard profile")
+            .seats
+            .iter_mut()
+            .find(|seat| seat.purpose == SeatPurpose::Review)
+            .expect("standard review")
+            .role = secondary.clone();
+        let candidate = &mut base
+            .roster
+            .roles
+            .get_mut(&secondary)
+            .expect("secondary review")[0];
+        candidate.sandbox = Sandbox::WorkspaceWrite;
+        candidate.capabilities.insert(Capability::RepositoryWrite);
+        let errors = compile_epic_assurance_package(&base)
+            .expect_err("writable escalation reviewer refused");
+        assert!(errors.iter().any(|error| {
+            error.path == "$.roster.roles.review.secondary" && error.message.contains("read-only")
+        }));
     }
 
     #[test]

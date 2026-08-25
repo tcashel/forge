@@ -594,6 +594,25 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
     let (_, in_progress) = env.forged(&["epic", "status", "--epic", "epic-assurance"]);
     assert!(in_progress["result"]["draftPr"].is_object());
     assert!(in_progress["result"]["finalPr"].is_null());
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "epic",
+        "--subject-id",
+        "epic-assurance",
+    ]);
+    assert_eq!(code, 0, "assurance Work Detail: {detail}");
+    assert_ne!(
+        detail["result"]["status"]["state"],
+        json!("submitted"),
+        "the nonterminal draft PR must not complete Work Detail: {detail}"
+    );
+    assert_eq!(detail["result"]["delivery"]["known"], json!(true));
+    assert_eq!(
+        detail["result"]["delivery"]["sha"],
+        draft["result"]["progress"]["draftPr"]["headSha"]
+    );
 
     let mut terminal = Value::Null;
     for _ in 0..64 {
@@ -634,6 +653,16 @@ fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
         completed["result"]["assurance"]["integrationSha"], evidence["terminalSha"],
         "the bounded Fix round must produce the head that ReGate approves"
     );
+    let (code, detail) = env.forged(&[
+        "work",
+        "detail",
+        "--subject-kind",
+        "epic",
+        "--subject-id",
+        "epic-assurance",
+    ]);
+    assert_eq!(code, 0, "completed assurance Work Detail: {detail}");
+    assert_eq!(detail["result"]["status"]["state"], json!("submitted"));
     let provider_log = env.provider_log();
     assert!(
         provider_log
@@ -946,6 +975,152 @@ fn assurance_start_crash_recovers_one_run_and_one_draft_pr() {
     assert!(gh_calls
         .iter()
         .all(|call| !call.iter().any(|arg| arg == "merge")));
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn assurance_pr_body_crash_replays_to_one_terminal_completion() {
+    let env = TestEnv::new("forged-rolling-assurance-finalize-crash");
+    env.enable_dynamic_gh();
+    env.seed_epic(
+        "epic-assurance-finalize-crash",
+        &[("child-assurance-finalize-crash", &env.spec, false)],
+    );
+    env.set_bead_field("child-assurance-finalize-crash", "status", "closed");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let default_sha = rev_parse(&env.repos.origin, "main");
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-assurance-finalize-crash",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--rolling",
+    ]);
+    assert_eq!(code, 0, "rolling start: {started}");
+    env.authorize_epic("epic-assurance-finalize-crash");
+    assert_eq!(
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"])
+            .0,
+        0
+    );
+    let (code, draft) = env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+    assert_eq!(code, 0, "draft PR: {draft}");
+    let draft_pr = draft["result"]["progress"]["draftPr"].clone();
+
+    let mut crashed = false;
+    for _ in 0..64 {
+        let status = env
+            .forged_cmd(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"])
+            .env("FORGED_FAILPOINT", "epic.assurance.pr-body.after")
+            .env("FORGED_FAILPOINT_MODE", "crash")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .status()
+            .expect("assurance finalization tick");
+        if !status.success() {
+            crashed = true;
+            break;
+        }
+    }
+    assert!(crashed, "finalization must reach the PR-body crash seam");
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.completed")
+            .count(),
+        0,
+        "a body update alone is not terminal"
+    );
+    let desired = ledger
+        .get_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-assurance-finalize-crash",
+        )
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.desired_state, forged_ledger::DesiredState::Running);
+    ledger.close().expect("close ledger");
+
+    let mut terminal = Value::Null;
+    for _ in 0..8 {
+        let (code, tick) =
+            env.forged(&["epic", "advance", "--epic", "epic-assurance-finalize-crash"]);
+        assert_eq!(code, 0, "assurance finalization recovery: {tick}");
+        terminal = tick;
+        if terminal["result"]["stopped"]["assurance"].is_object() {
+            break;
+        }
+    }
+    assert!(
+        terminal["result"]["stopped"]["assurance"].is_object(),
+        "replayed finalization did not complete: {terminal}"
+    );
+    assert_eq!(
+        terminal["result"]["stopped"]["assurance"]["pr"]["number"],
+        draft_pr["number"]
+    );
+    assert_eq!(
+        terminal["result"]["stopped"]["assurance"]["pr"]["url"],
+        draft_pr["url"]
+    );
+
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-finalize-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.completed")
+            .count(),
+        1,
+        "replay records one completion event"
+    );
+    let desired = ledger
+        .get_desired_work(
+            forged_ledger::DesiredSubjectKind::Epic,
+            "epic-assurance-finalize-crash",
+        )
+        .expect("desired query")
+        .expect("desired row");
+    assert_eq!(desired.desired_state, forged_ledger::DesiredState::Stopped);
+    assert_eq!(
+        desired.last_outcome,
+        Some(forged_ledger::DesiredReconcileOutcome::Terminal)
+    );
+    ledger.close().expect("close ledger");
+    assert_eq!(rev_parse(&env.repos.origin, "main"), default_sha);
+
+    let gh_calls = env.gh_calls();
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method POST")
+                && call.join(" ").contains("/pulls"))
+            .count(),
+        1,
+        "finalization recovery reuses the draft PR: {gh_calls:?}"
+    );
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method PATCH")
+                && call.join(" ").contains("/pulls/"))
+            .count(),
+        2,
+        "the idempotent body update is replayed once after the crash: {gh_calls:?}"
+    );
+    assert!(gh_calls.iter().all(|call| {
+        !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
+    }));
 }
 
 #[test]
