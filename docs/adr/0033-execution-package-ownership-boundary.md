@@ -70,6 +70,29 @@ in native Bead fields with native parent/dependency edges. The Forged binary
 still begins at the typed immutable execution-package handoff and does not
 author plans or absorb lead-agent cognition.
 
+### Rolling-epic clarification — 2026-08-25
+
+An approved epic may delegate **bounded just-in-time elaboration** of its
+predeclared, unstarted blocked children. At an explicit durable wave boundary,
+Forged may schedule a provider-neutral planning protocol through the same
+adapter, attempt, admission, artifact, and recovery machinery used by other
+cognitive stages. The provider authors the planning judgment; Forged owns only
+the closed protocol, fencing, evidence, and persistence of that exact typed
+result into the designated native Bead.
+
+This delegation cannot change the frozen root outcome, child inventory,
+dependencies, active or completed work, profile, roster, repository, branch
+strategy, or default-branch authority. A CRUX, structural plan change, scope or
+authority expansion, unsafe drift, or exhausted planning path stops for the
+operator. Routine successful elaboration continues the already-authorized epic
+without another lead session, child dispatch, resolution command, or submit.
+
+The distinction is authorship, not which process performs the fenced write:
+Forged does not invent, repair, or semantically adjudicate plan content, but it
+may persist a provider-authored complete structured result so a crash cannot
+leave plan truth and workflow truth ambiguously split. Conversational lead
+planners may continue to write Beads directly before handoff.
+
 ## Consequences
 
 - The default does not imply that every commit or bead receives the largest
@@ -90,7 +113,9 @@ author plans or absorb lead-agent cognition.
 
 ## Non-goals locked by this ADR
 
-- `forged` does not write plans or perform cognitive work itself.
+- `forged` does not author plans or perform cognitive work itself. At an
+  explicitly authorized rolling-epic boundary it may fence and persist the
+  provider-authored typed result described above.
 - Herdr does not decide readiness, topology, or run outcomes.
 - YAML is an authoring format, not durable runtime truth and not an executable
   workflow language.
