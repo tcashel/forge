@@ -2031,12 +2031,6 @@ fn complete_recovered_controller_admission_at(
             "controller recovery does not match the unresolved runtime admission",
         ));
     }
-    if admission.state != ControllerAdmissionState::Spawned {
-        return Err(Failure::refused(
-            ErrorCode::HostUnavailable,
-            "controller admission cannot complete before spawned process identity is durable",
-        ));
-    }
     let Some(record): Option<Value> = read_json(&controller_dir.join("controller.json"))? else {
         return Err(Failure::refused(
             ErrorCode::HostUnavailable,
@@ -2047,15 +2041,38 @@ fn complete_recovered_controller_admission_at(
     // Herdr ownership identity without changing the fenced driver identity
     // this runtime admission validates. Keep v1 recovery for already-running
     // controllers while accepting the closed current schema.
-    let record_matches = matches!(
+    let record_identity_matches = matches!(
         record.get("schemaVersion").and_then(Value::as_u64),
         Some(1 | 2)
     ) && record.get("id").and_then(Value::as_str) == Some(id)
-        && record.get("generation").and_then(Value::as_u64) == Some(u64::from(generation))
+        && record.get("generation").and_then(Value::as_u64) == Some(u64::from(generation));
+    let spawned_matches = admission.state == ControllerAdmissionState::Spawned
+        && record_identity_matches
         && record.pointer("/driver/pid").and_then(Value::as_i64) == admission.pid.map(i64::from)
         && record.pointer("/driver/lstart").and_then(Value::as_str)
             == admission.process_started_at.as_deref();
-    if !record_matches {
+    // A process-host spawn can publish its PID/lstart pair and then lose the
+    // atomic admission update to ENOSPC. `recover_reserved_record` writes this
+    // marker only after re-verifying that exact live process identity. The
+    // recovered record is therefore the durable identity that closes the
+    // still-preparing runtime fence; no unmarked preparing admission may pass.
+    let recovered_preparing_matches = admission.state == ControllerAdmissionState::Preparing
+        && admission.pid.is_none()
+        && admission.process_started_at.is_none()
+        && record_identity_matches
+        && record
+            .get("recoveredAfterSpawnCrash")
+            .and_then(Value::as_bool)
+            == Some(true)
+        && record
+            .pointer("/driver/pid")
+            .and_then(Value::as_i64)
+            .is_some_and(|pid| pid > 0 && i32::try_from(pid).is_ok())
+        && record
+            .pointer("/driver/lstart")
+            .and_then(Value::as_str)
+            .is_some_and(|lstart| !lstart.trim().is_empty());
+    if !spawned_matches && !recovered_preparing_matches {
         return Err(Failure::refused(
             ErrorCode::HostUnavailable,
             "durable controller identity does not match the unresolved admission",
@@ -4258,6 +4275,80 @@ mod tests {
                 .runtime_abi,
             CONTROLLER_RUNTIME_ABI
         );
+    }
+
+    #[test]
+    fn recovered_controller_identity_closes_only_its_preparing_admission() {
+        let (_root, config, paths) = setup();
+        let id = "run-recovered";
+        let generation = 2;
+        let mut admission = ControllerAdmission::acquire_at(&config, id, generation, &paths)
+            .expect("preparing admission");
+        admission.preserve_spawn_attempt();
+        drop(admission);
+
+        let controller_dir = config.run_dir(id).join("controller");
+        let admission_path = controller_dir.join("runtime-admission.json");
+        let record_path = controller_dir.join("controller.json");
+        let mut record = json!({
+            "schemaVersion": 1,
+            "id": id,
+            "generation": generation,
+            "driver": {"pid": 12_345, "lstart": "test-start"},
+        });
+        atomic_json(&record_path, &record).expect("ordinary controller record");
+        complete_recovered_controller_admission_at(&config, id, generation, &paths)
+            .expect_err("an unmarked record cannot close a preparing admission");
+        assert!(admission_path.exists());
+
+        record["recoveredAfterSpawnCrash"] = json!(true);
+        record["driver"]["pid"] = Value::Null;
+        atomic_json(&record_path, &record).expect("recovered record without PID");
+        complete_recovered_controller_admission_at(&config, id, generation, &paths)
+            .expect_err("a recovered identity without a PID cannot close the admission");
+        assert!(admission_path.exists());
+
+        record["driver"]["pid"] = json!(12_345);
+        record["driver"]["lstart"] = json!("");
+        atomic_json(&record_path, &record).expect("recovered record without lstart");
+        complete_recovered_controller_admission_at(&config, id, generation, &paths)
+            .expect_err("a recovered identity without lstart cannot close the admission");
+        assert!(admission_path.exists());
+
+        record["id"] = json!("run-other");
+        record["driver"]["lstart"] = json!("test-start");
+        atomic_json(&record_path, &record).expect("mismatched recovered record");
+        complete_recovered_controller_admission_at(&config, id, generation, &paths)
+            .expect_err("a mismatched recovered identity cannot close the admission");
+        assert!(admission_path.exists());
+
+        record["id"] = json!(id);
+        atomic_json(&record_path, &record).expect("verified recovered record");
+        complete_recovered_controller_admission_at(&config, id, generation, &paths)
+            .expect("matching recovered identity closes the admission");
+        assert!(!admission_path.exists());
+
+        let normal_id = "run-spawned";
+        let mut normal = ControllerAdmission::acquire_at(&config, normal_id, 1, &paths)
+            .expect("normal admission");
+        normal
+            .mark_spawned(54_321, "normal-start".to_owned())
+            .expect("spawned identity");
+        drop(normal);
+        let normal_dir = config.run_dir(normal_id).join("controller");
+        atomic_json(
+            &normal_dir.join("controller.json"),
+            &json!({
+                "schemaVersion": 2,
+                "id": normal_id,
+                "generation": 1,
+                "driver": {"pid": 54_321, "lstart": "normal-start"},
+            }),
+        )
+        .expect("normal controller record");
+        complete_recovered_controller_admission_at(&config, normal_id, 1, &paths)
+            .expect("normal spawned admission remains accepted");
+        assert!(!normal_dir.join("runtime-admission.json").exists());
     }
 
     #[tokio::test]

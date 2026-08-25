@@ -604,11 +604,18 @@ async fn reconcile_claimed(
 
     let mut record = handoff::latest_record(ctx, &row.subject_id).await?;
     if let Some(value) = record.as_ref() {
-        crate::runtime::complete_recovered_controller_admission(
-            &ctx.config,
-            &row.subject_id,
-            handoff::generation(value),
-        )?;
+        let generation = handoff::generation(value);
+        // A predecessor record may coexist with a newer unresolved spawn.
+        // Leave that admission intact for `recover_reserved_record`; trying
+        // to complete it against the stale generation would prevent the
+        // exact PID/lstart recovery path from ever running.
+        if generation == row.controller_generation {
+            crate::runtime::complete_recovered_controller_admission(
+                &ctx.config,
+                &row.subject_id,
+                generation,
+            )?;
+        }
     }
     let recorded_generation = record.as_ref().map(handoff::generation).unwrap_or(0);
     let recovery_target = recovery_generation.unwrap_or(row.controller_generation);
