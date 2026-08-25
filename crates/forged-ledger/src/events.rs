@@ -161,8 +161,9 @@ impl Ledger {
     /// being bounded.
     ///
     /// The dumb-durable-store boundary holds: the ledger hands `derive` the
-    /// rows it already stores and stores back whatever `derive` returns,
-    /// parsing neither.
+    /// rows it already stores and stores back whatever value it returns when
+    /// the paired boolean is true, parsing neither. A false boolean replays
+    /// an already-derived value without appending a duplicate physical row.
     pub fn append_event_derived<F>(
         &self,
         run_id: &str,
@@ -170,7 +171,7 @@ impl Ledger {
         derive: F,
     ) -> Result<serde_json::Value, LedgerError>
     where
-        F: FnOnce(&[EventRow]) -> Result<serde_json::Value, LedgerError> + Send + 'static,
+        F: FnOnce(&[EventRow]) -> Result<(serde_json::Value, bool), LedgerError> + Send + 'static,
     {
         let run_id = run_id.to_owned();
         let kind = kind.to_owned();
@@ -196,8 +197,10 @@ impl Ledger {
                 }
                 out
             };
-            let payload = derive(&standing)?;
-            append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            let (payload, append) = derive(&standing)?;
+            if append {
+                append_event_tx(&tx, Some(&run_id), &kind, &payload)?;
+            }
             tx.commit()?;
             Ok(payload)
         })

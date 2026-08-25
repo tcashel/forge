@@ -394,6 +394,7 @@ impl ForgedConfig {
                 .iter()
                 .map(|(stage, budget)| (*stage, *budget))
                 .collect(),
+            termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             transport_retry_budget: self.transport_retry_budget,
             host_policy: self.host_policy,
             herdr_socket: self.herdr_sock.clone(),

@@ -315,7 +315,11 @@ impl ForgedPorts {
     }
 
     /// Kill one attempt's session and verify death.
-    async fn attempt_kill(&self, attempt: &AttemptRow) -> Result<KillOutcome, PortError> {
+    async fn attempt_kill(
+        &self,
+        attempt: &AttemptRow,
+        termination_grace_s: u64,
+    ) -> Result<KillOutcome, PortError> {
         let owned = self.sessions.lock().await.get(&attempt.attempt_id).cloned();
         if let Some((host, session)) = owned {
             return match host.kill_confirmed(&session).await {
@@ -334,6 +338,11 @@ impl ForgedPorts {
             return Ok(KillOutcome::AlreadyDead);
         }
         let Some(pid) = read_pid(&dir) else {
+            if attempt.revoke_scope == Some(forged_ledger::RevokeScope::Deadline) {
+                return Err(PortError::Unavailable(format!(
+                    "deadline attempt {attempt_id} has no verifiable provider pid; retaining custody"
+                )));
+            }
             if self.identity_grace_elapsed(attempt) {
                 self.fail_unidentifiable(attempt).await;
             }
@@ -359,6 +368,11 @@ impl ForgedPorts {
         match pid_identity(&dir, pid).await {
             PidIdentity::Recycled => return Ok(KillOutcome::AlreadyDead),
             PidIdentity::Unverifiable => {
+                if attempt.revoke_scope == Some(forged_ledger::RevokeScope::Deadline) {
+                    return Err(PortError::Unavailable(format!(
+                        "deadline attempt {attempt_id}: pid {pid} identity is unverifiable; retaining custody"
+                    )));
+                }
                 if self.identity_grace_elapsed(attempt) {
                     self.fail_unidentifiable(attempt).await;
                     return Ok(KillOutcome::AlreadyDead);
@@ -375,21 +389,32 @@ impl ForgedPorts {
         // sentinel is re-consulted before the escalation.
         let pgid = Pid::from_raw(pid);
         let _ = killpg(pgid, Signal::SIGTERM);
-        for _ in 0..50 {
+        let grace = Duration::from_secs(termination_grace_s);
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
             if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
                 return Ok(KillOutcome::Killed);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
         }
         if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
             return Ok(KillOutcome::Killed);
         }
         let _ = killpg(pgid, Signal::SIGKILL);
-        for _ in 0..20 {
+        let deadline = tokio::time::Instant::now() + grace;
+        loop {
             if self.attempt_settled(&dir, attempt_id, pid, &sentinel).await {
                 return Ok(KillOutcome::Killed);
             }
-            tokio::time::sleep(Duration::from_millis(100)).await;
+            let now = tokio::time::Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(100).min(deadline - now)).await;
         }
         Err(PortError::Unavailable(format!(
             "kill sent to pgid {pid} but death was never verified"
@@ -418,11 +443,33 @@ impl ForgedPorts {
             config: self.config.clone(),
             ledger: self.ledger.clone(),
         };
+        let (run_id, _, _) = crate::core::split_packet_key(&packet.packet_id)
+            .map_err(|error| PortError::Internal(error.to_string()))?;
+        let run_root = ctx.config.run_dir(&run_id);
+        crate::core::artifacts::finalize_provider_files(&run_root, &dirs)
+            .map_err(|error| PortError::Internal(error.to_string()))?;
+        let output = crate::core::artifacts::read_output_text(&run_root, &dirs)
+            .map_err(|error| PortError::Internal(error.to_string()))?;
+        crate::core::usage::capture_attempt(
+            &ctx,
+            &run_id,
+            &packet.packet_id,
+            Some(attempt.attempt_id),
+            &packet.provider_hints.provider,
+            &packet.provider_hints.model,
+            &output,
+        )
+        .await;
+        let outcome = if attempt.revoke_scope == Some(forged_ledger::RevokeScope::Deadline) {
+            "deadline"
+        } else {
+            "revoked"
+        };
         crate::core::artifacts::materialize_and_join(
             &ctx,
             &packet,
             attempt.attempt_id,
-            "revoked",
+            outcome,
             &serde_json::json!({
                 "reason": attempt.revoke_reason,
                 "scope": attempt.revoke_scope.map(|scope| scope.as_str()),
@@ -625,10 +672,14 @@ impl ReconcilePorts for ForgedPorts {
         }
     }
 
-    async fn kill_confirmed(&self, session: &str) -> Result<KillOutcome, PortError> {
+    async fn kill_confirmed(
+        &self,
+        session: &str,
+        termination_grace_s: u64,
+    ) -> Result<KillOutcome, PortError> {
         match self.attempt_for(session).await? {
             Some(attempt) => {
-                let outcome = self.attempt_kill(&attempt).await?;
+                let outcome = self.attempt_kill(&attempt, termination_grace_s).await?;
                 self.preserve_after_kill(&attempt).await?;
                 Ok(outcome)
             }
@@ -811,6 +862,7 @@ pub fn report_json(report: &forged_proto::ReconcileReport) -> Value {
         "quarantined": report.quarantined,
         "harvestMismatches": report.harvest_mismatches,
         "deferred": report.deferred,
+        "timedOut": report.timed_out,
     })
 }
 
@@ -906,7 +958,7 @@ mod tests {
             !ports.identity_grace_elapsed(&attempt),
             "a fresh attempt is still inside its grace window"
         );
-        let deferred = rt.block_on(ports.attempt_kill(&attempt));
+        let deferred = rt.block_on(ports.attempt_kill(&attempt, 1));
         assert!(
             matches!(deferred, Err(PortError::Unavailable(_))),
             "inside the window the port defers: {deferred:?}"
@@ -922,7 +974,7 @@ mod tests {
 
         let old = backdated(&attempt);
         assert!(ports.identity_grace_elapsed(&old));
-        let settled = rt.block_on(ports.attempt_kill(&old));
+        let settled = rt.block_on(ports.attempt_kill(&old, 1));
         assert!(
             matches!(settled, Ok(KillOutcome::AlreadyDead)),
             "past the window the kill reports the only honest answer it has: {settled:?}"
@@ -939,6 +991,112 @@ mod tests {
         assert_eq!(
             rt.block_on(ports.attempt_liveness(&old)).expect("liveness"),
             SessionLiveness::Vanished
+        );
+        ledger.close().expect("close");
+    }
+
+    #[test]
+    fn a_deadline_never_signals_or_releases_an_unverifiable_live_pid() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, attempt) = one_running_attempt(tmp.path());
+        let dir = config.packet_dir_key("run-orphan", "implement", 1);
+        std::fs::create_dir_all(&dir).expect("packet dir");
+        let pid = i32::try_from(std::process::id()).expect("pid");
+        std::fs::write(dir.join("provider.pid"), pid.to_string()).expect("pid file");
+        let ports = ForgedPorts::new(ledger.clone(), config);
+        ledger
+            .revoke_attempt_scoped(
+                attempt.attempt_id,
+                "transport: stage deadline exceeded: test",
+                forged_ledger::RevokeScope::Deadline,
+            )
+            .expect("deadline marker");
+        let marked = ledger.get_attempt(attempt.attempt_id).expect("marked");
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+
+        let refused = rt.block_on(ports.attempt_kill(&marked, 1));
+        assert!(matches!(refused, Err(PortError::Unavailable(_))));
+        assert!(pid_alive(pid), "the unverifiable process was not signalled");
+        let retained = ledger.get_attempt(marked.attempt_id).expect("attempt");
+        assert_eq!(retained.state, forged_ledger::AttemptState::Revoking);
+        assert_eq!(
+            retained.revoke_scope,
+            Some(forged_ledger::RevokeScope::Deadline)
+        );
+        ledger.close().expect("close");
+    }
+
+    #[test]
+    fn a_deadline_kills_only_its_verified_process_group() {
+        use std::os::unix::process::CommandExt;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let (config, ledger, attempt) = one_running_attempt(tmp.path());
+        let dir = config.packet_dir_key("run-orphan", "implement", 1);
+        std::fs::create_dir_all(&dir).expect("packet dir");
+        let status = dir.join("verified-provider.status");
+        let mut child = std::process::Command::new("sh")
+            .args(["-c", r#"trap '' TERM; while :; do sleep 1; done"#])
+            .process_group(0)
+            .spawn()
+            .expect("isolated provider group");
+        let pid = i32::try_from(child.id()).expect("pid");
+        let ports = ForgedPorts::new(ledger.clone(), config);
+        let rt = tokio::runtime::Runtime::new().expect("runtime");
+        std::thread::sleep(Duration::from_millis(100));
+        let lstart = rt.block_on(lstart_of(pid)).unwrap_or_else(|| {
+            let _ = killpg(Pid::from_raw(pid), Signal::SIGKILL);
+            let _ = child.wait();
+            panic!("provider start identity");
+        });
+        std::fs::write(dir.join("provider.pid"), pid.to_string()).expect("pid file");
+        std::fs::write(dir.join("provider.lstart"), lstart).expect("lstart file");
+        ledger
+            .append_event_once(
+                "run-orphan",
+                "forged.session.started",
+                serde_json::json!({
+                    "schemaVersion": 2,
+                    "attemptId": attempt.attempt_id,
+                    "packetId": attempt.packet_id,
+                    "host": "process",
+                    "sessionId": "deadline-test",
+                    "socketPath": null,
+                    "statusPath": status,
+                    "controllerGeneration": null,
+                    "attachHint": null,
+                }),
+            )
+            .expect("session identity");
+        ledger
+            .revoke_attempt_scoped(
+                attempt.attempt_id,
+                "transport: stage deadline exceeded: test",
+                forged_ledger::RevokeScope::Deadline,
+            )
+            .expect("deadline marker");
+        let marked = ledger.get_attempt(attempt.attempt_id).expect("marked");
+        let reaper = std::thread::spawn(move || child.wait().expect("reap provider"));
+
+        let kill_started = std::time::Instant::now();
+        assert_eq!(
+            rt.block_on(ports.attempt_kill(&marked, 1))
+                .expect("verified kill"),
+            KillOutcome::Killed
+        );
+        let elapsed = kill_started.elapsed();
+        assert!(
+            elapsed >= Duration::from_millis(900) && elapsed < Duration::from_secs(3),
+            "recovered termination must consume the one-second frozen grace, took {elapsed:?}"
+        );
+        reaper.join().expect("provider reaper");
+        assert!(!pid_alive(pid), "the exact provider group is dead");
+        let retained = ledger.get_attempt(attempt.attempt_id).expect("attempt");
+        assert_eq!(retained.state, forged_ledger::AttemptState::Revoking);
+        assert_eq!(
+            retained.revoke_scope,
+            Some(forged_ledger::RevokeScope::Deadline),
+            "termination alone cannot settle or release custody"
         );
         ledger.close().expect("close");
     }

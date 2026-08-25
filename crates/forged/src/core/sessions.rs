@@ -610,15 +610,31 @@ pub async fn session_stop(ctx: &Ctx, req: &mut OperationRequest) -> OperationRes
                 })
                 .await?;
                 let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-                let state = forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
+                let marker =
+                    on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
                 let view = crate::core::drive::project(ctx, &run_id).await?;
                 let config = forged_proto::ReconcileConfig {
+                    termination_grace_s: view.policy.termination_grace_s,
                     stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                     gate_commands: view.policy.gate_commands,
                 };
-                let report =
+                let report = if marker.revoke_scope == Some(RevokeScope::Deadline) {
                     forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())
-                        .await?;
+                        .await?
+                } else {
+                    forged_proto::stop_attempt(
+                        &ctx.ledger,
+                        &ports,
+                        attempt_id,
+                        config.termination_grace_s,
+                    )
+                    .await?;
+                    forged_proto::reconcile(&ctx.ledger, &run_id, &ports, &config, &now_iso())
+                        .await?
+                };
+                let state = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
+                    .await?
+                    .state;
                 Ok(json!({
                     "attemptId": attempt_id,
                     "runId": run_id,

@@ -65,6 +65,7 @@ fn definition() -> NewRunDefinition {
         policy: ExecutionPolicyV1 {
             gate_commands: Vec::new(),
             stage_budget_s: BTreeMap::new(),
+            termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             transport_retry_budget: 1,
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,

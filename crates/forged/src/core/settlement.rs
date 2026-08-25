@@ -94,15 +94,27 @@ async fn stop_live_attempts(ctx: &Ctx, run_id: &str, reason: &str) -> Result<Vec
         if live.is_empty() {
             return Ok(stopped);
         }
+        let view = crate::core::drive::project(ctx, run_id).await?;
+        let config = forged_proto::ReconcileConfig {
+            termination_grace_s: view.policy.termination_grace_s,
+            stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
+            gate_commands: view.policy.gate_commands,
+        };
+        let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
         for attempt in live {
             let attempt_id = attempt.attempt_id;
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                forged_proto::reconcile(&ctx.ledger, run_id, &ports, &config, &now_iso()).await?;
+                stopped.push(attempt_id);
+                continue;
+            }
             let reason = reason.to_owned();
             on_ledger(&ctx.ledger, move |ledger| {
                 ledger.revoke_attempt_scoped(attempt_id, &reason, RevokeScope::Attempt)
             })
             .await?;
-            let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
-            forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id).await?;
+            forged_proto::stop_attempt(&ctx.ledger, &ports, attempt_id, config.termination_grace_s)
+                .await?;
             stopped.push(attempt_id);
         }
     }

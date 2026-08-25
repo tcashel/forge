@@ -43,6 +43,7 @@ pub async fn project(ctx: &Ctx, run_id: &str) -> Result<RunView, Failure> {
             .iter()
             .map(|(stage, budget)| (*stage, *budget))
             .collect(),
+        termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
         transport_retry_budget: ctx.config.transport_retry_budget,
         host_policy: ctx.config.host_policy,
         herdr_socket: ctx.config.herdr_sock.clone(),
@@ -705,9 +706,70 @@ async fn honor_await(
                 Ok(Honored::Progressed)
             }
             Some(pid) if pid_alive(pid) => {
-                // Someone else's provider is genuinely running.
+                // Someone else's provider is genuinely running. Its
+                // heartbeat proves liveness but cannot extend the frozen
+                // stage deadline anchored at the durable attempt start.
+                let stage = view
+                    .packets
+                    .iter()
+                    .find(|packet| packet.packet_id == *packet_id)
+                    .map(|packet| packet.stage)
+                    .ok_or_else(|| Failure::internal("live attempt has no stored packet"))?;
+                let budget_s = view
+                    .policy
+                    .stage_budget_s
+                    .get(&stage)
+                    .copied()
+                    .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+                let as_of = now_iso();
+                let deadline = forged_proto::stage_deadline_at(&attempt.started_at, budget_s)
+                    .map_err(|error| Failure::internal(error.to_string()))?;
+                if forged_proto::stage_deadline_reached(&attempt.started_at, budget_s, &as_of)
+                    .map_err(|error| Failure::internal(error.to_string()))?
+                {
+                    let config = forged_proto::ReconcileConfig {
+                        termination_grace_s: view.policy.termination_grace_s,
+                        stage_budget_s: view
+                            .policy
+                            .stage_budget_s
+                            .iter()
+                            .map(|(stage, budget)| (*stage, *budget))
+                            .collect(),
+                        gate_commands: view.policy.gate_commands.clone(),
+                    };
+                    forged_proto::reconcile(&ctx.ledger, &view.run.run_id, ports, &config, &as_of)
+                        .await?;
+                    return Ok(Honored::Progressed);
+                }
                 if wait_allowed {
-                    tokio::time::sleep(Duration::from_millis(500)).await;
+                    // Desired-work already persists the controller's
+                    // supervisor wake. Keep this live controller parked on
+                    // the immutable attempt deadline and inspect only the
+                    // exact process identity between wakes; do not re-project
+                    // the ledger every 500 ms. A controller crash is resumed
+                    // by that persisted desired-work wake and derives this
+                    // same deadline again from started_at + frozen policy.
+                    if wait_for_pid_or_deadline(pid, &deadline).await? {
+                        let as_of = now_iso();
+                        let config = forged_proto::ReconcileConfig {
+                            termination_grace_s: view.policy.termination_grace_s,
+                            stage_budget_s: view
+                                .policy
+                                .stage_budget_s
+                                .iter()
+                                .map(|(stage, budget)| (*stage, *budget))
+                                .collect(),
+                            gate_commands: view.policy.gate_commands.clone(),
+                        };
+                        forged_proto::reconcile(
+                            &ctx.ledger,
+                            &view.run.run_id,
+                            ports,
+                            &config,
+                            &as_of,
+                        )
+                        .await?;
+                    }
                     Ok(Honored::Progressed)
                 } else {
                     Ok(Honored::Waiting)
@@ -716,6 +778,7 @@ async fn honor_await(
             Some(_) => {
                 // A corpse: run one reconcile pass so the saga revokes it.
                 let config = forged_proto::ReconcileConfig {
+                    termination_grace_s: view.policy.termination_grace_s,
                     stage_budget_s: view
                         .policy
                         .stage_budget_s
@@ -772,6 +835,29 @@ fn pid_alive(pid: i32) -> bool {
         nix::sys::signal::kill(nix::unistd::Pid::from_raw(pid), None),
         Ok(()) | Err(nix::errno::Errno::EPERM)
     )
+}
+
+/// Wait for the recovered process to finish or for its one immutable stage
+/// deadline. The durable desired-work wake owns crash recovery; this local
+/// loop only accelerates observation of a process that exits before timeout.
+async fn wait_for_pid_or_deadline(pid: i32, deadline: &str) -> Result<bool, Failure> {
+    let deadline: jiff::Timestamp = deadline
+        .parse()
+        .map_err(|error| Failure::internal(format!("invalid stage deadline: {error}")))?;
+    loop {
+        if !pid_alive(pid) {
+            return Ok(false);
+        }
+        let now = jiff::Timestamp::now();
+        if now >= deadline {
+            return Ok(true);
+        }
+        let remaining_ns = deadline.as_nanosecond() - now.as_nanosecond();
+        let remaining_ns = u64::try_from(remaining_ns)
+            .map_err(|_| Failure::internal("stage deadline duration does not fit u64"))?;
+        tokio::time::sleep(Duration::from_nanos(remaining_ns).min(Duration::from_millis(500)))
+            .await;
+    }
 }
 
 /// Sleep until a widened RFC-3339 deadline (bounded polls, never a busy
@@ -882,6 +968,13 @@ async fn execution_context(_ctx: &Ctx, view: &RunView) -> Result<ExecutionContex
         push_url: push_url_of(&view.run.repo).await,
         host_policy: view.policy.host_policy,
         herdr_socket: view.policy.herdr_socket.clone(),
+        stage_budget_s: view
+            .policy
+            .stage_budget_s
+            .iter()
+            .map(|(k, v)| (*k, *v))
+            .collect(),
+        termination_grace_s: view.policy.termination_grace_s,
     })
 }
 

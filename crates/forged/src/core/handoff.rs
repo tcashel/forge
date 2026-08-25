@@ -1064,6 +1064,7 @@ pub(super) async fn recover_abandoned(
         Scope::Run => {
             let view = super::drive::project(ctx, id).await?;
             let config = forged_proto::ReconcileConfig {
+                termination_grace_s: view.policy.termination_grace_s,
                 stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                 gate_commands: view.policy.gate_commands,
             };

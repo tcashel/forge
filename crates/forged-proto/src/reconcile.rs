@@ -53,15 +53,16 @@ fn reclaim_older_than(stage_budget_s: u64) -> u64 {
 /// variables — budgets and gate commands arrive here explicitly.
 #[derive(Debug, Clone)]
 pub struct ReconcileConfig {
-    /// Per-stage wall-clock budget, seconds; drives the ladder's budget rung
-    /// and `reclaim_older_than(stage_budget_s)`. No default — callers supply
-    /// it (tests use 1800).
+    /// Per-stage limits projected from the run's frozen execution package.
+    /// Definition-less runs receive the explicit legacy policy projection.
     ///
     /// AMENDED (operator-adjudicated 2026-08-12): `HashMap` for the same
     /// reason as [`crate::RunView::roster`] — the merged
     /// `forged_types::Stage` derives `Hash + Eq` and not `Ord`, and reconcile
     /// looks budgets up by key rather than iterating them.
     pub stage_budget_s: HashMap<Stage, u64>,
+    /// Frozen bound for each TERM/close and KILL verification phase.
+    pub termination_grace_s: u64,
     /// Gate commands, in order, for `rerun_gates` during harvest-and-verify.
     pub gate_commands: Vec<String>,
 }
@@ -99,6 +100,9 @@ pub struct ReconcileReport {
     /// Attempts left `revoking` after a reclaim refusal shape; resumed next
     /// pass.
     pub deferred: Vec<i64>,
+    /// Kill-confirmed deadline attempts settled as retryable timeout
+    /// failures. Each one has exactly one attempt-addressed retry grant.
+    pub timed_out: Vec<i64>,
 }
 
 /// What [`land_packet_result`] did with a result.
@@ -134,6 +138,27 @@ fn port_failure(attempt_id: i64, step: &str, source: PortError) -> ProtoError {
 fn parse_stamp(s: &str) -> Result<jiff::Timestamp, ProtoError> {
     s.parse()
         .map_err(|err| ProtoError::Projection(format!("cannot parse timestamp {s:?}: {err}")))
+}
+
+/// The immutable wall-clock deadline derived from one durable attempt start.
+pub fn stage_deadline_at(started_at: &str, budget_s: u64) -> Result<String, ProtoError> {
+    let started = parse_stamp(started_at)?;
+    let deadline = jiff::Timestamp::from_nanosecond(
+        started
+            .as_nanosecond()
+            .saturating_add(i128::from(budget_s).saturating_mul(1_000_000_000)),
+    )
+    .map_err(|error| ProtoError::Projection(format!("stage deadline out of range: {error}")))?;
+    Ok(crate::widen_rfc3339(&deadline.to_string()))
+}
+
+/// Compare one captured clock value against the immutable stage deadline.
+pub fn stage_deadline_reached(
+    started_at: &str,
+    budget_s: u64,
+    as_of: &str,
+) -> Result<bool, ProtoError> {
+    Ok(parse_stamp(as_of)? >= parse_stamp(&stage_deadline_at(started_at, budget_s)?)?)
 }
 
 /// The public result-landing seam every caller lands a packet result
@@ -199,7 +224,7 @@ pub async fn reconcile(
     now: &str,
 ) -> Result<ReconcileReport, ProtoError> {
     let mut report = ReconcileReport::default();
-    let now_ts = parse_stamp(now)?;
+    parse_stamp(now)?;
     let run: RunRow = {
         let run_id = run_id.to_owned();
         on_ledger(ledger, move |l| {
@@ -226,8 +251,10 @@ pub async fn reconcile(
             .await?
             .stage
         };
+        // Core projects this map from the immutable execution package. Its
+        // explicit definition-less fallback is the sole legacy boundary.
         let budget = *config.stage_budget_s.get(&stage).ok_or_else(|| {
-            ProtoError::Projection(format!("no stage budget for stage {stage:?}"))
+            ProtoError::Projection(format!("no frozen stage budget for stage {stage:?}"))
         })?;
 
         match attempt.state {
@@ -236,44 +263,69 @@ pub async fn reconcile(
             // of WHICHEVER order placed the marker, which is what the
             // marker's scope records.
             AttemptState::Revoking => match attempt.revoke_scope {
+                Some(RevokeScope::Deadline) => {
+                    deadline_order(
+                        ledger,
+                        ports,
+                        &run,
+                        &attempt,
+                        &mut report,
+                        config.termination_grace_s,
+                    )
+                    .await?;
+                }
                 // An operator's stop that could not confirm death. Finishing
                 // it through the bead-scoped order instead would reclaim the
                 // shared lease on an attempt-local operation's behalf: the
                 // exact defect the split removes.
                 Some(RevokeScope::Attempt) => {
-                    let settled = stop_order(ledger, ports, &attempt).await?;
+                    let settled =
+                        stop_order(ledger, ports, &attempt, config.termination_grace_s).await?;
                     note_terminal(settled, attempt.attempt_id, &mut report);
                 }
                 // `bead`, and `None` for every row written before the scope
                 // was durable — all of those are saga revocations, because
                 // the attempt-local stop did not exist when they were made.
                 Some(RevokeScope::Bead) | None => {
-                    revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
+                    revoke_order(
+                        ledger,
+                        ports,
+                        &run,
+                        &attempt,
+                        budget,
+                        config.termination_grace_s,
+                        &mut report,
+                    )
+                    .await?;
                 }
             },
             AttemptState::Running => {
-                let liveness = ports
-                    .liveness(&attempt.claimant)
-                    .await
-                    .map_err(|source| port_failure(attempt.attempt_id, "liveness", source))?;
-                let (dead, reason) = match liveness {
-                    SessionLiveness::Running => {
-                        // Budget override: a live session past its stage
-                        // budget is hung.
-                        let anchor = attempt
-                            .last_heartbeat_at
-                            .as_deref()
-                            .unwrap_or(&attempt.started_at);
-                        let anchor_ts = parse_stamp(anchor)?;
-                        let over = now_ts.as_second().saturating_sub(anchor_ts.as_second())
-                            > i64::try_from(budget).unwrap_or(i64::MAX);
-                        (over, "stage budget exceeded".to_owned())
-                    }
-                    SessionLiveness::Exited(code) => (
+                let deadline_reached = stage_deadline_reached(&attempt.started_at, budget, now)?;
+                let (dead, reason, scope) = if deadline_reached {
+                    (
                         true,
-                        format!("session exited ({code}) without landing a result"),
-                    ),
-                    SessionLiveness::Vanished => (true, "session vanished".to_owned()),
+                        format!(
+                            "transport: stage deadline exceeded: attemptId={} startedAt={} budgetS={} asOf={now}",
+                            attempt.attempt_id, attempt.started_at, budget
+                        ),
+                        RevokeScope::Deadline,
+                    )
+                } else {
+                    let liveness = ports
+                        .liveness(&attempt.claimant)
+                        .await
+                        .map_err(|source| port_failure(attempt.attempt_id, "liveness", source))?;
+                    match liveness {
+                        SessionLiveness::Running => (false, String::new(), RevokeScope::Bead),
+                        SessionLiveness::Exited(code) => (
+                            true,
+                            format!("session exited ({code}) without landing a result"),
+                            RevokeScope::Bead,
+                        ),
+                        SessionLiveness::Vanished => {
+                            (true, "session vanished".to_owned(), RevokeScope::Bead)
+                        }
+                    }
                 };
                 if !dead {
                     report.left_running.push(attempt.attempt_id);
@@ -284,18 +336,58 @@ pub async fn reconcile(
                 // terminal-state refusal means we raced someone.
                 let revoked: Result<(), LedgerError> = {
                     let attempt_id = attempt.attempt_id;
-                    on_ledger(ledger, move |l| Ok(l.revoke_attempt(attempt_id, &reason))).await?
+                    on_ledger(ledger, move |l| {
+                        Ok(l.revoke_attempt_scoped(attempt_id, &reason, scope))
+                    })
+                    .await?
                 };
                 match revoked {
                     Ok(()) => {
-                        revoke_order(ledger, ports, &run, &attempt, budget, &mut report).await?;
+                        let current = get_attempt(ledger, attempt.attempt_id).await?;
+                        match current.revoke_scope {
+                            Some(RevokeScope::Deadline) => {
+                                deadline_order(
+                                    ledger,
+                                    ports,
+                                    &run,
+                                    &current,
+                                    &mut report,
+                                    config.termination_grace_s,
+                                )
+                                .await?;
+                            }
+                            Some(RevokeScope::Attempt) => {
+                                let settled =
+                                    stop_order(ledger, ports, &current, config.termination_grace_s)
+                                        .await?;
+                                note_terminal(settled, current.attempt_id, &mut report);
+                            }
+                            Some(RevokeScope::Bead) | None => {
+                                revoke_order(
+                                    ledger,
+                                    ports,
+                                    &run,
+                                    &current,
+                                    budget,
+                                    config.termination_grace_s,
+                                    &mut report,
+                                )
+                                .await?;
+                            }
+                        }
                     }
                     Err(err) if err.code() == ErrorCode::InvalidRequest => {
                         // A racing reconciler finished the saga, or a racing
                         // operator stop finished the attempt; either way the
                         // terminal row is the answer.
                         let current = get_attempt(ledger, attempt.attempt_id).await?;
-                        note_terminal(current.state, attempt.attempt_id, &mut report);
+                        if current.state == AttemptState::Failed
+                            && current.revoke_scope == Some(RevokeScope::Deadline)
+                        {
+                            report.timed_out.push(attempt.attempt_id);
+                        } else {
+                            note_terminal(current.state, attempt.attempt_id, &mut report);
+                        }
                         // Completed/failed on its own: nothing live remains.
                     }
                     Err(err) => return Err(ProtoError::Ledger(err)),
@@ -363,6 +455,49 @@ async fn get_attempt(ledger: &Ledger, attempt_id: i64) -> Result<AttemptRow, Pro
     .await
 }
 
+/// Resume the deadline containment after its durable marker: verified death,
+/// one attempt-addressed retry grant, then atomic timeout/capacity settlement.
+async fn deadline_order(
+    ledger: &Ledger,
+    ports: &dyn ReconcilePorts,
+    run: &RunRow,
+    attempt: &AttemptRow,
+    report: &mut ReconcileReport,
+    termination_grace_s: u64,
+) -> Result<(), ProtoError> {
+    let attempt_id = attempt.attempt_id;
+    ports
+        .kill_confirmed(&attempt.claimant, termination_grace_s)
+        .await
+        .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
+    let current = get_attempt(ledger, attempt_id).await?;
+    if current.state != AttemptState::Revoking
+        || current.revoke_scope != Some(RevokeScope::Deadline)
+    {
+        if current.state == AttemptState::Failed
+            && current.revoke_scope == Some(RevokeScope::Deadline)
+        {
+            report.timed_out.push(attempt_id);
+        } else {
+            note_terminal(current.state, attempt_id, report);
+        }
+        return Ok(());
+    }
+    let packet_id = current.packet_id.clone();
+    let since = current.updated_at.clone();
+    let run_id = run.run_id.clone();
+    on_ledger(ledger, move |l| {
+        crate::grant_retry_for_attempt(l, &run_id, &packet_id, attempt_id, &since)
+    })
+    .await?;
+    on_ledger(ledger, move |l| {
+        l.mark_timed_out(attempt_id).map_err(ProtoError::Ledger)
+    })
+    .await?;
+    report.timed_out.push(attempt_id);
+    Ok(())
+}
+
 /// Steps 2–5 of the revoke order, entered only after the durable `revoking`
 /// marker is committed.
 async fn revoke_order(
@@ -371,13 +506,14 @@ async fn revoke_order(
     run: &RunRow,
     attempt: &AttemptRow,
     stage_budget_s: u64,
+    termination_grace_s: u64,
     report: &mut ReconcileReport,
 ) -> Result<(), ProtoError> {
     let attempt_id = attempt.attempt_id;
 
     // Step 2: verified death, never signal-send.
     ports
-        .kill_confirmed(&attempt.claimant)
+        .kill_confirmed(&attempt.claimant, termination_grace_s)
         .await
         .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
 
@@ -468,9 +604,10 @@ pub async fn stop_attempt(
     ledger: &Ledger,
     ports: &dyn ReconcilePorts,
     attempt_id: i64,
+    termination_grace_s: u64,
 ) -> Result<AttemptState, ProtoError> {
     let attempt = get_attempt(ledger, attempt_id).await?;
-    stop_order(ledger, ports, &attempt).await
+    stop_order(ledger, ports, &attempt, termination_grace_s).await
 }
 
 /// The stop order over an attempt row already read — the form reconcile
@@ -479,8 +616,14 @@ async fn stop_order(
     ledger: &Ledger,
     ports: &dyn ReconcilePorts,
     attempt: &AttemptRow,
+    termination_grace_s: u64,
 ) -> Result<AttemptState, ProtoError> {
     let attempt_id = attempt.attempt_id;
+    if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+        return Err(ProtoError::Projection(format!(
+            "deadline attempt {attempt_id} must resume through timeout settlement"
+        )));
+    }
     if attempt.state != AttemptState::Revoking {
         // Not under the durable marker: the ledger's own transition speaks
         // the refusal (or converges on a terminal row), and nothing is
@@ -491,7 +634,7 @@ async fn stop_order(
     // Step 2 of the revoke order, unchanged: verified death, never
     // signal-send.
     ports
-        .kill_confirmed(&attempt.claimant)
+        .kill_confirmed(&attempt.claimant, termination_grace_s)
         .await
         .map_err(|source| port_failure(attempt_id, "kill_confirmed", source))?;
 

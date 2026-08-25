@@ -122,6 +122,33 @@ async fn round_trip_spawn_running_kill_verified() {
 }
 
 #[tokio::test]
+async fn kill_uses_the_supplied_termination_grace_before_escalation() {
+    let base = tempfile::tempdir().expect("tempdir");
+    let cwd = tempfile::tempdir().expect("tempdir");
+    let host = ProcessHost::new(base.path()).with_termination_grace_s(1);
+    let id = host
+        .spawn(
+            cwd.path(),
+            "trap '' TERM; while :; do sleep 1; done",
+            &no_env(),
+        )
+        .await
+        .expect("spawn");
+    tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    let started = std::time::Instant::now();
+    assert_eq!(
+        host.kill_confirmed(&id).await.expect("kill"),
+        Confirmed::Killed
+    );
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= std::time::Duration::from_millis(900)
+            && elapsed < std::time::Duration::from_secs(3),
+        "direct termination must consume the supplied grace, took {elapsed:?}"
+    );
+}
+
+#[tokio::test]
 async fn natural_exit_reports_code_zero_from_the_sentinel() {
     // Criterion 3: a short line exits on its own; the status file exists
     // and alive reports Exited with the correct code.

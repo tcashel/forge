@@ -2175,7 +2175,7 @@ mod tests {
 
     #[test]
     fn every_terminal_attempt_path_releases_capacity() {
-        for terminal in ["complete", "fail", "reclaim", "stop"] {
+        for terminal in ["complete", "fail", "reclaim", "stop", "timeout"] {
             let dir = tempfile::tempdir().expect("tempdir");
             let ledger = Ledger::open(&dir.path().join("state.db")).expect("ledger");
             let (_, packet_id) = seed_packet(&ledger, terminal);
@@ -2209,6 +2209,16 @@ mod tests {
                         .revoke_attempt_scoped(attempt.attempt_id, "stop", RevokeScope::Attempt)
                         .expect("revoke");
                     ledger.mark_stopped(attempt.attempt_id).expect("stop");
+                }
+                "timeout" => {
+                    ledger
+                        .revoke_attempt_scoped(
+                            attempt.attempt_id,
+                            "transport: stage deadline exceeded: test",
+                            RevokeScope::Deadline,
+                        )
+                        .expect("revoke");
+                    ledger.mark_timed_out(attempt.attempt_id).expect("timeout");
                 }
                 _ => unreachable!(),
             }

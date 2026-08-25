@@ -44,6 +44,67 @@ fn start_run(env: &TestEnv, run: &str) {
     assert_eq!(code, 0, "run start: {response}");
 }
 
+#[test]
+fn recovered_live_attempt_persists_a_wake_no_later_than_its_deadline() {
+    let _serial = serialize_process_fixture();
+    let env = TestEnv::new("supervise-provider-deadline-wake");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value = serde_json::from_str(
+        &std::fs::read_to_string(&config_path).expect("read stage-budget config"),
+    )
+    .expect("config JSON");
+    config["stage_budget_s"]["implement"] = json!(3);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("serialize stage-budget config"),
+    )
+    .expect("write stage-budget config");
+
+    start_run(&env, "run-deadline-wake");
+    env.set_scenario("implement", "hang", 1);
+    let (code, submitted) = env.forged(&["run", "submit", "--run", "run-deadline-wake"]);
+    assert_eq!(code, 0, "submit: {submitted}");
+    wait_until("provider attempt starts", || {
+        implementation_starts(&env, "run-deadline-wake") == 1
+    });
+
+    let (code, adopted) = env.forged(&["supervise", "--once"]);
+    assert_eq!(code, 0, "adopt tick: {adopted}");
+    assert_eq!(adopted["result"]["subjects"][0]["action"], json!("adopted"));
+    let ledger = env.ledger();
+    let desired = ledger
+        .get_desired_work(DesiredSubjectKind::Run, "run-deadline-wake")
+        .expect("desired query")
+        .expect("desired row");
+    let attempt = ledger
+        .list_live_attempts(Some("run-deadline-wake"))
+        .expect("live attempts")
+        .into_iter()
+        .next()
+        .expect("running provider attempt");
+    let deadline = forged_proto::stage_deadline_at(&attempt.started_at, 3).expect("deadline");
+    assert!(
+        desired
+            .next_wake_at
+            .as_deref()
+            .is_some_and(|wake| wake <= deadline.as_str()),
+        "durable supervisor wake {:?} must not follow provider deadline {deadline}",
+        desired.next_wake_at
+    );
+    ledger.close().expect("close");
+
+    let _ = env.forged(&[
+        "run",
+        "stop",
+        "--run",
+        "run-deadline-wake",
+        "--outcome",
+        "cancelled",
+        "--reason",
+        "test cleanup",
+    ]);
+}
+
 fn wait_until(what: &str, mut predicate: impl FnMut() -> bool) {
     let started = Instant::now();
     while !predicate() {

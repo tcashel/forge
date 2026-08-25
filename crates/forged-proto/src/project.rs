@@ -107,6 +107,7 @@ pub fn project_run(
             .into_iter()
             .map(|stage| (stage, 1_800))
             .collect(),
+            termination_grace_s: forged_types::DEFAULT_TERMINATION_GRACE_S,
             transport_retry_budget,
             host_policy: HostPolicyV1::Off,
             herdr_socket: None,
@@ -163,6 +164,12 @@ pub fn project_run_with_policy(
         .as_ref()
         .map(|package| package.policy.clone())
         .unwrap_or(legacy_policy);
+    if let Some(error) = policy.validate().into_iter().next() {
+        return Err(ProtoError::Projection(format!(
+            "projected execution policy is invalid at {}: {}",
+            error.path, error.message
+        )));
+    }
     Ok(RunView {
         run,
         packets,

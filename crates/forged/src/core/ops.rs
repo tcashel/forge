@@ -1648,6 +1648,7 @@ pub async fn reconcile(ctx: &Ctx, req: &mut OperationRequest) -> OperationRespon
             let ports = ForgedPorts::new(ctx.ledger.clone(), ctx.config.clone());
             let view = crate::core::drive::project(ctx, &run_id).await?;
             let config = forged_proto::ReconcileConfig {
+                termination_grace_s: view.policy.termination_grace_s,
                 stage_budget_s: view.policy.stage_budget_s.into_iter().collect(),
                 gate_commands: view.policy.gate_commands,
             };

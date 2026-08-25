@@ -20,6 +20,12 @@ pub const PROFILE_SCHEMA_V1: &str = "forged.profile/1";
 pub const ROSTER_SCHEMA_V1: &str = "forged.roster/1";
 /// The only resolved-roster schema understood by this binary.
 pub const RESOLVED_ROSTER_SCHEMA_V1: &str = "forged.resolved-roster/1";
+/// Longest wall-clock budget representable by the packet contract.
+pub const MAX_STAGE_BUDGET_S: u64 = u32::MAX as u64;
+/// Default bounded wait for each provider termination phase.
+pub const DEFAULT_TERMINATION_GRACE_S: u64 = 5;
+/// Longest accepted provider termination phase (five minutes).
+pub const MAX_TERMINATION_GRACE_S: u64 = 5 * 60;
 
 /// A validation failure with a stable JSON-path-like location.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -246,9 +252,18 @@ pub enum HostPolicyV1 {
 pub struct ExecutionPolicyV1 {
     pub gate_commands: Vec<String>,
     pub stage_budget_s: BTreeMap<Stage, u64>,
+    /// Frozen upper bound for graceful termination and subsequent hard-kill
+    /// verification. Older packages receive the historical five-second
+    /// compatibility value when deserialized.
+    #[serde(default = "default_termination_grace_s")]
+    pub termination_grace_s: u64,
     pub transport_retry_budget: u32,
     pub host_policy: HostPolicyV1,
     pub herdr_socket: Option<PathBuf>,
+}
+
+const fn default_termination_grace_s() -> u64 {
+    DEFAULT_TERMINATION_GRACE_S
 }
 
 /// Durable runtime truth for one run.
@@ -396,12 +411,26 @@ impl ExecutionPolicyV1 {
                     format!("$.policy.stageBudgetS.{stage:?}"),
                     "stage budget must be greater than zero",
                 )),
+                Some(value) if *value > MAX_STAGE_BUDGET_S => {
+                    errors.push(DefinitionError::at(
+                        format!("$.policy.stageBudgetS.{stage:?}"),
+                        "stage budget must fit the packet contract's 32-bit seconds field",
+                    ));
+                }
                 Some(_) => {}
                 None => errors.push(DefinitionError::at(
                     format!("$.policy.stageBudgetS.{stage:?}"),
                     "stage budget is missing",
                 )),
             }
+        }
+        if !(1..=MAX_TERMINATION_GRACE_S).contains(&self.termination_grace_s) {
+            errors.push(DefinitionError::at(
+                "$.policy.terminationGraceS",
+                format!(
+                    "termination grace must be between 1 and {MAX_TERMINATION_GRACE_S} seconds"
+                ),
+            ));
         }
         for (index, command) in self.gate_commands.iter().enumerate() {
             if command.trim().is_empty() {
@@ -619,5 +648,57 @@ mod tests {
         assert!(errors
             .iter()
             .any(|error| error.path.ends_with(".capabilities")));
+    }
+
+    fn execution_policy(stage_budget_s: u64, termination_grace_s: u64) -> ExecutionPolicyV1 {
+        ExecutionPolicyV1 {
+            gate_commands: Vec::new(),
+            stage_budget_s: [
+                Stage::Implement,
+                Stage::ReviewClaude,
+                Stage::ReviewCodex,
+                Stage::Fix,
+            ]
+            .into_iter()
+            .map(|stage| (stage, stage_budget_s))
+            .collect(),
+            termination_grace_s,
+            transport_retry_budget: 1,
+            host_policy: HostPolicyV1::Off,
+            herdr_socket: None,
+        }
+    }
+
+    #[test]
+    fn execution_policy_bounds_stage_budget_and_termination_grace() {
+        assert!(
+            execution_policy(MAX_STAGE_BUDGET_S, MAX_TERMINATION_GRACE_S)
+                .validate()
+                .is_empty()
+        );
+
+        let stage_errors = execution_policy(u64::MAX, DEFAULT_TERMINATION_GRACE_S).validate();
+        assert!(stage_errors.iter().any(|error| {
+            error.path == "$.policy.stageBudgetS.Implement"
+                && error.message.contains("32-bit seconds")
+        }));
+
+        for invalid in [0, MAX_TERMINATION_GRACE_S + 1, u64::MAX] {
+            let errors = execution_policy(1, invalid).validate();
+            assert!(errors
+                .iter()
+                .any(|error| error.path == "$.policy.terminationGraceS"));
+        }
+    }
+
+    #[test]
+    fn old_policy_json_receives_the_explicit_termination_grace_default() {
+        let mut value = serde_json::to_value(execution_policy(1, 17)).expect("policy JSON");
+        value
+            .as_object_mut()
+            .expect("policy object")
+            .remove("terminationGraceS");
+        let restored: ExecutionPolicyV1 = serde_json::from_value(value).expect("old policy");
+        assert_eq!(restored.termination_grace_s, DEFAULT_TERMINATION_GRACE_S);
     }
 }

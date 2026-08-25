@@ -88,6 +88,10 @@ pub enum ProtoEvent {
     Retry {
         /// The packet whose attempt transport-failed.
         packet_id: String,
+        /// The exact terminal attempt that earned this retry. Legacy and
+        /// pre-claim grants omit it because they have no durable attempt
+        /// identity.
+        attempt_id: Option<i64>,
         /// How many transport failures that packet has accumulated.
         transport_failures: u32,
         /// When the packet may be claimed again (30-byte RFC-3339 UTC).
@@ -225,14 +229,21 @@ impl ProtoEvent {
             }),
             ProtoEvent::Retry {
                 packet_id,
+                attempt_id,
                 transport_failures,
                 retry_after,
-            } => json!({
-                "schemaVersion": 1,
-                "packetId": packet_id,
-                "transportFailures": transport_failures,
-                "retryAfter": retry_after,
-            }),
+            } => {
+                let mut payload = json!({
+                    "schemaVersion": 1,
+                    "packetId": packet_id,
+                    "transportFailures": transport_failures,
+                    "retryAfter": retry_after,
+                });
+                if let (Some(map), Some(attempt_id)) = (payload.as_object_mut(), attempt_id) {
+                    map.insert("attemptId".to_owned(), Value::from(*attempt_id));
+                }
+                payload
+            }
             ProtoEvent::Review {
                 seq,
                 stage,
@@ -388,13 +399,67 @@ pub fn grant_retry(
         let standing = transport_failures_of(standing, &owned_packet).map_err(internal)?;
         let count = standing.saturating_add(1);
         let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
-        ProtoEvent::Retry {
+        let payload = ProtoEvent::Retry {
             packet_id: owned_packet.clone(),
+            attempt_id: None,
             transport_failures: count,
             retry_after,
         }
         .payload()
-        .map_err(internal)
+        .map_err(internal)?;
+        Ok((payload, true))
+    })?;
+    payload["transportFailures"]
+        .as_u64()
+        .and_then(|count| u32::try_from(count).ok())
+        .ok_or_else(|| ProtoError::Projection("granted retry carries no count".to_owned()))
+}
+
+/// Grant the one retry earned by a kill-confirmed timed-out attempt.
+///
+/// `attemptId` makes crash replay idempotent: if settlement resumes after
+/// the grant but before the attempt reaches `failed`, the derived append
+/// replays the same payload instead of advancing the packet's retry count.
+pub fn grant_retry_for_attempt(
+    ledger: &Ledger,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    since: &str,
+) -> Result<u32, ProtoError> {
+    let owned_packet = packet_id.to_owned();
+    let since = since.to_owned();
+    let payload = ledger.append_event_derived(run_id, RETRY_KIND, move |standing| {
+        let parsed = parse_proto_events(standing).map_err(internal)?;
+        if let Some(existing) = parsed.iter().find_map(|event| match event {
+            ProtoEvent::Retry {
+                attempt_id: Some(charged),
+                transport_failures,
+                retry_after,
+                packet_id,
+            } if *charged == attempt_id => Some(json!({
+                "schemaVersion": 1,
+                "packetId": packet_id,
+                "attemptId": attempt_id,
+                "transportFailures": transport_failures,
+                "retryAfter": retry_after,
+            })),
+            _ => None,
+        }) {
+            return Ok((existing, false));
+        }
+        let standing = transport_failures_of(standing, &owned_packet).map_err(internal)?;
+        let count = standing.saturating_add(1);
+        let retry_after = backoff_deadline(&since, count.saturating_sub(1)).map_err(internal)?;
+        let payload = ProtoEvent::Retry {
+            packet_id: owned_packet.clone(),
+            attempt_id: Some(attempt_id),
+            transport_failures: count,
+            retry_after,
+        }
+        .payload()
+        .map_err(internal)?;
+        Ok((payload, true))
     })?;
     payload["transportFailures"]
         .as_u64()
@@ -636,6 +701,15 @@ fn parse_retry(row: &EventRow, value: &Value) -> Result<ProtoEvent, ProtoError> 
         .map_err(|_| malformed(row, "transportFailures does not fit u32"))?;
     Ok(ProtoEvent::Retry {
         packet_id: require_str(row, value, "packetId")?,
+        attempt_id: value
+            .get("attemptId")
+            .filter(|value| !value.is_null())
+            .map(|value| {
+                value
+                    .as_i64()
+                    .ok_or_else(|| malformed(row, "attemptId is not an integer or null"))
+            })
+            .transpose()?,
         transport_failures,
         retry_after: require_str(row, value, "retryAfter")?,
     })

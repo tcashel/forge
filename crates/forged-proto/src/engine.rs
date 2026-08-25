@@ -1180,6 +1180,7 @@ fn latest_retry(view: &RunView, packet_id: &str) -> Option<(u32, String)> {
             packet_id: p,
             transport_failures,
             retry_after,
+            ..
         } if p == packet_id => Some((*transport_failures, retry_after.clone())),
         _ => None,
     })

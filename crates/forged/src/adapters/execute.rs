@@ -9,7 +9,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use forged_host::{ProcessHost, SessionHost};
-use forged_ledger::{EffectClass, RunRow};
+use forged_ledger::{AttemptRow, AttemptState, EffectClass, RevokeScope, RunRow};
 use forged_proto::{LandOutcome, PacketIntent};
 use forged_provider::{
     ClaudeDriver, CodexDriver, PacketDirs, PiDriver, PromptStage, PromptTemplates, ProviderDriver,
@@ -46,6 +46,10 @@ pub struct ExecutionContext {
     pub host_policy: HostPolicy,
     /// Frozen Herdr endpoint for this run.
     pub herdr_socket: Option<std::path::PathBuf>,
+    /// Per-stage wall-clock limits from the frozen execution package policy.
+    pub stage_budget_s: HashMap<Stage, u64>,
+    /// Frozen upper bound for each provider termination phase.
+    pub termination_grace_s: u64,
 }
 
 /// How one executed packet ended.
@@ -65,6 +69,108 @@ pub enum PacketOutcome {
     Semantic(String),
     /// Our own attempt was revoked mid-flight; the provider was stopped.
     Revoked,
+}
+
+fn deadline_reason(
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+    attempt_id: i64,
+    started_at: &str,
+    as_of: &str,
+) -> Result<Option<String>, Failure> {
+    let budget_s = exec
+        .stage_budget_s
+        .get(&packet.stage)
+        .copied()
+        .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+    let deadline = forged_proto::stage_deadline_at(started_at, budget_s)
+        .map_err(|error| Failure::internal(error.to_string()))?;
+    if !forged_proto::stage_deadline_reached(started_at, budget_s, as_of)
+        .map_err(|error| Failure::internal(error.to_string()))?
+    {
+        return Ok(None);
+    }
+    Ok(Some(format!(
+        "transport: stage deadline exceeded: attemptId={attempt_id} stage={} startedAt={} budgetS={} deadlineAt={} asOf={as_of}",
+        stage_str(packet.stage),
+        started_at,
+        budget_s,
+        deadline,
+    )))
+}
+
+async fn settle_deadline_retry(
+    ctx: &Ctx,
+    run_id: &str,
+    packet_id: &str,
+    attempt_id: i64,
+    note: String,
+) -> Result<PacketOutcome, Failure> {
+    let current = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    if current.state == AttemptState::Failed && current.revoke_scope == Some(RevokeScope::Deadline)
+    {
+        return Ok(PacketOutcome::Transport(note));
+    }
+    if current.state != AttemptState::Revoking
+        || current.revoke_scope != Some(RevokeScope::Deadline)
+    {
+        return Ok(PacketOutcome::Revoked);
+    }
+    let since = current.updated_at;
+    let run_id = run_id.to_owned();
+    let packet_id = packet_id.to_owned();
+    on_ledger(&ctx.ledger, move |ledger| {
+        forged_proto::grant_retry_for_attempt(ledger, &run_id, &packet_id, attempt_id, &since)
+            .map_err(|error| forged_ledger::LedgerError::Internal {
+                message: error.to_string(),
+            })
+    })
+    .await?;
+    on_ledger(&ctx.ledger, move |ledger| ledger.mark_timed_out(attempt_id)).await?;
+    Ok(PacketOutcome::Transport(note))
+}
+
+async fn deadline_marker(ctx: &Ctx, attempt_id: i64, note: &str) -> Result<AttemptRow, Failure> {
+    let marker_note = note.to_owned();
+    let marked = on_ledger(&ctx.ledger, move |ledger| {
+        ledger.revoke_attempt_scoped(attempt_id, &marker_note, RevokeScope::Deadline)
+    })
+    .await;
+    if let Err(error) = marked {
+        if error.code != ErrorCode::InvalidRequest {
+            return Err(error);
+        }
+    }
+    on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await
+}
+
+/// Settle the adoption crash window before it can create a provider effect.
+async fn settle_pre_spawn_deadline(
+    ctx: &Ctx,
+    exec: &ExecutionContext,
+    packet: &WorkPacket,
+    attempt_id: i64,
+) -> Result<Option<PacketOutcome>, Failure> {
+    let attempt = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id)).await?;
+    let as_of = now_iso();
+    let Some(note) = deadline_reason(exec, packet, attempt_id, &attempt.started_at, &as_of)? else {
+        return Ok(None);
+    };
+    let marker = deadline_marker(ctx, attempt_id, &note).await?;
+    if marker.state != AttemptState::Revoking || marker.revoke_scope != Some(RevokeScope::Deadline)
+    {
+        return if marker.state == AttemptState::Failed
+            && marker.revoke_scope == Some(RevokeScope::Deadline)
+        {
+            Ok(Some(PacketOutcome::Transport(note)))
+        } else {
+            Ok(Some(PacketOutcome::Revoked))
+        };
+    }
+    preserve_pre_spawn_failure(ctx, packet, attempt_id, &note, "deadline-before-spawn").await?;
+    settle_deadline_retry(ctx, &packet.run_id, &packet.packet_id, attempt_id, note)
+        .await
+        .map(Some)
 }
 
 /// SHA-256 hex over a file's bytes.
@@ -653,6 +759,11 @@ pub async fn execute_adopted(
     attempt_id: i64,
     claim_token: &str,
 ) -> Result<PacketOutcome, Failure> {
+    // Recovery must not create an effect for an attempt whose immutable
+    // started_at deadline passed while its prior controller was absent.
+    if let Some(outcome) = settle_pre_spawn_deadline(ctx, exec, packet, attempt_id).await? {
+        return Ok(outcome);
+    }
     let spec = match crate::core::spec::resolve_for_packet(ctx, &packet.spec, &packet.bead_id).await
     {
         Ok(spec) => spec,
@@ -840,6 +951,12 @@ async fn run_attempt(
     let packet_id = packet.packet_id.clone();
     let claim_token = claim_token.to_owned();
     let run_root = ctx.config.run_dir(&run_id);
+    // This field is immutable. Read it once for the owned attempt so the
+    // 200-ms liveness cadence never becomes a ledger polling loop and later
+    // heartbeats cannot move the deadline.
+    let attempt_started_at = on_ledger(&ctx.ledger, move |ledger| ledger.get_attempt(attempt_id))
+        .await?
+        .started_at;
 
     // 1. Everything between the claim and the spawn. The attempt is already
     // `running` with no process behind it, so NOTHING in here may propagate
@@ -995,7 +1112,9 @@ async fn run_attempt(
         Option<crate::core::herdr_layout::MutationLease>,
     ) = match exec.host_policy {
         HostPolicy::Off => (
-            Arc::new(ProcessHost::new(&status_base)),
+            Arc::new(
+                ProcessHost::new(&status_base).with_termination_grace_s(exec.termination_grace_s),
+            ),
             "process",
             None,
             None,
@@ -1026,7 +1145,10 @@ async fn run_attempt(
                         .await;
                 }
                 (
-                    Arc::new(ProcessHost::new(&status_base)),
+                    Arc::new(
+                        ProcessHost::new(&status_base)
+                            .with_termination_grace_s(exec.termination_grace_s),
+                    ),
                     "process",
                     None,
                     None,
@@ -1034,6 +1156,7 @@ async fn run_attempt(
             }
             Some(sock) => match forged_host::HerdrHost::connect(sock, &status_base).await {
                 Ok(herdr) => {
+                    let herdr = herdr.with_termination_grace_s(exec.termination_grace_s);
                     let (herdr, mutation) = match workspace_label(ctx, &run_id).await {
                         Some(label) => {
                             let herdr = herdr.with_workspace(label.clone());
@@ -1076,7 +1199,10 @@ async fn run_attempt(
                         .await;
                     }
                     (
-                        Arc::new(ProcessHost::new(&status_base)),
+                        Arc::new(
+                            ProcessHost::new(&status_base)
+                                .with_termination_grace_s(exec.termination_grace_s),
+                        ),
                         "process",
                         None,
                         None,
@@ -1477,9 +1603,74 @@ async fn run_attempt(
     let liveness = loop {
         match host.alive(&session).await {
             Ok(forged_host::Liveness::Running) => {
+                let as_of = now_iso();
+                if let Some(note) =
+                    deadline_reason(exec, &packet, attempt_id, &attempt_started_at, &as_of)?
+                {
+                    let marker = deadline_marker(ctx, attempt_id, &note).await?;
+                    if marker.state != AttemptState::Revoking {
+                        if let Some(handle) = guardian.take() {
+                            handle.abort();
+                        }
+                        return if marker.state == AttemptState::Failed
+                            && marker.revoke_scope == Some(RevokeScope::Deadline)
+                        {
+                            Ok(PacketOutcome::Transport(note))
+                        } else {
+                            Ok(PacketOutcome::Revoked)
+                        };
+                    }
+                    host.kill_confirmed(&session)
+                        .await
+                        .map_err(|error| Failure {
+                            code: ErrorCode::HostUnavailable,
+                            message: format!(
+                                "stage deadline expired but provider death was not confirmed: {error}"
+                            ),
+                            recoverable: true,
+                        })?;
+                    if let Some(handle) = guardian.take() {
+                        handle.abort();
+                    }
+                    crate::core::artifacts::finalize_provider_files(&run_root, &dirs)?;
+                    let out = crate::core::artifacts::read_output_text(&run_root, &dirs)?;
+                    crate::core::usage::capture_attempt(
+                        ctx,
+                        &run_id,
+                        &packet_id,
+                        Some(attempt_id),
+                        &packet.provider_hints.provider,
+                        &packet.provider_hints.model,
+                        &out,
+                    )
+                    .await;
+                    if marker.revoke_scope != Some(RevokeScope::Deadline) {
+                        crate::core::artifacts::materialize_and_join(
+                            ctx,
+                            &packet,
+                            attempt_id,
+                            "revoked",
+                            &json!({"note": "attempt was revoked while its deadline expired"}),
+                            &session_evidence,
+                        )
+                        .await?;
+                        return Ok(PacketOutcome::Revoked);
+                    }
+                    crate::core::artifacts::materialize_and_join(
+                        ctx,
+                        &packet,
+                        attempt_id,
+                        "deadline",
+                        &json!({"reason": &note}),
+                        &session_evidence,
+                    )
+                    .await?;
+                    return settle_deadline_retry(ctx, &run_id, &packet_id, attempt_id, note).await;
+                }
                 beats += 1;
                 if beats.is_multiple_of(25) {
-                    // Keep the ledger's budget anchor honest while we wait.
+                    // Heartbeats prove liveness but never renew the frozen
+                    // wall-clock deadline anchored at `started_at`.
                     let token = claim_token.clone();
                     let renewed =
                         on_ledger(&ctx.ledger, move |l| l.heartbeat_attempt(&token)).await;
@@ -2241,6 +2432,8 @@ mod settle_tests {
             push_url: String::new(),
             host_policy: HostPolicy::Required,
             herdr_socket: Some(socket.to_path_buf()),
+            stage_budget_s: HashMap::from([(Stage::Implement, 600)]),
+            termination_grace_s: 5,
         };
         let intent = PacketIntent {
             stage: Stage::Implement,
@@ -2308,6 +2501,148 @@ mod settle_tests {
             claim_token: claimed.claim_token,
             packet_dir,
         }
+    }
+
+    #[tokio::test]
+    async fn overdue_adoption_settles_before_any_provider_effect() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let mut fixture = claimed_fixture(root.path(), &socket).await;
+        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let outcome = execute_adopted(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("overdue adoption settles");
+        assert!(matches!(outcome, PacketOutcome::Transport(_)));
+        assert!(
+            fixture
+                .ledger
+                .list_events(Some(RUN_ID), 0, 1_000)
+                .expect("events")
+                .iter()
+                .all(|event| event.kind != "forged.session.started"),
+            "deadline settlement must occur before any provider session starts"
+        );
+
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Failed);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Deadline));
+        assert!(attempt
+            .fail_note
+            .as_deref()
+            .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+        let events = fixture
+            .ledger
+            .list_events(Some(RUN_ID), 0, 1_000)
+            .expect("events");
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.kind == "proto.retry")
+                .count(),
+            1,
+            "the overdue attempt earns exactly one attempt-addressed successor grant"
+        );
+        let attempt_owner = fixture.attempt_id.to_string();
+        assert!(fixture
+            .ledger
+            .admission_snapshot(None)
+            .expect("admission snapshot")
+            .reservations
+            .iter()
+            .filter(|reservation| {
+                reservation.owner_kind.as_deref() == Some("attempt")
+                    && reservation.owner_id.as_deref() == Some(attempt_owner.as_str())
+            })
+            .all(|reservation| reservation.released_at.is_some()));
+
+        let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        let result: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dirs.result()).expect("deadline result evidence"),
+        )
+        .expect("result JSON");
+        assert_eq!(result["detail"]["providerStarted"], false);
+        let session: serde_json::Value = serde_json::from_slice(
+            &std::fs::read(dirs.session()).expect("deadline session evidence"),
+        )
+        .expect("session JSON");
+        assert_eq!(session["metadata"]["phase"], "deadline-before-spawn");
+    }
+
+    #[tokio::test]
+    async fn an_operator_marker_winning_the_deadline_race_never_charges_retry() {
+        let root = tempfile::tempdir().expect("tempdir");
+        let socket = root.path().join("herdr.sock");
+        let mut fixture = claimed_fixture(root.path(), &socket).await;
+        fixture.exec.stage_budget_s.insert(Stage::Implement, 1);
+        fixture
+            .ledger
+            .revoke_attempt_scoped(
+                fixture.attempt_id,
+                "operator stop won",
+                RevokeScope::Attempt,
+            )
+            .expect("operator marker");
+        tokio::time::sleep(Duration::from_millis(1_100)).await;
+
+        let outcome = execute_adopted(
+            &fixture.ctx,
+            &fixture.ports,
+            &fixture.exec,
+            &fixture.packet,
+            fixture.attempt_id,
+            &fixture.claim_token,
+        )
+        .await
+        .expect("marker race converges");
+        assert_eq!(outcome, PacketOutcome::Revoked);
+
+        // A stale caller reaching the settlement helper after the marker
+        // race must be fenced there too, before it can append a retry.
+        let stale = settle_deadline_retry(
+            &fixture.ctx,
+            RUN_ID,
+            &fixture.packet_id,
+            fixture.attempt_id,
+            "transport: stale deadline settlement".to_owned(),
+        )
+        .await
+        .expect("stale settlement is fenced");
+        assert_eq!(stale, PacketOutcome::Revoked);
+
+        let attempt = fixture
+            .ledger
+            .get_attempt(fixture.attempt_id)
+            .expect("attempt");
+        assert_eq!(attempt.state, AttemptState::Revoking);
+        assert_eq!(attempt.revoke_scope, Some(RevokeScope::Attempt));
+        assert_eq!(
+            fixture
+                .ledger
+                .list_events(Some(RUN_ID), 0, 1_000)
+                .expect("events")
+                .iter()
+                .filter(|event| event.kind == "proto.retry")
+                .count(),
+            0,
+            "the non-deadline marker owns settlement and earns no retry"
+        );
+        let dirs = PacketDirs::new(&fixture.packet_dir, fixture.attempt_id);
+        assert!(
+            !dirs.result().exists(),
+            "deadline evidence must not be written for another revocation scope"
+        );
     }
 
     #[tokio::test]

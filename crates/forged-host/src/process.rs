@@ -9,6 +9,7 @@ use std::time::Duration;
 use nix::sys::signal::{killpg, Signal};
 use nix::unistd::Pid;
 use tokio::sync::Mutex;
+use tokio::time::Instant;
 
 use crate::identity::ProcessIdentity;
 use crate::{
@@ -20,8 +21,6 @@ use crate::{
 /// collide across hosts in one process. No randomness or clock needed.
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(0);
 
-const TERM_POLLS: u32 = 50; // 100 ms apart ≈ 5 s
-const KILL_POLLS: u32 = 20; // 100 ms apart ≈ 2 s
 const POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 struct ProcSession {
@@ -55,6 +54,7 @@ pub struct ProcessHost {
     instance: u64,
     prepared: Mutex<HashMap<HostSessionId, PreparedProcSession>>,
     sessions: Mutex<HashMap<HostSessionId, ProcSession>>,
+    termination_grace: Duration,
 }
 
 impl ProcessHost {
@@ -68,7 +68,14 @@ impl ProcessHost {
             instance: next_host_instance(),
             prepared: Mutex::new(HashMap::new()),
             sessions: Mutex::new(HashMap::new()),
+            termination_grace: Duration::from_secs(forged_types::DEFAULT_TERMINATION_GRACE_S),
         }
+    }
+
+    /// Freeze the provider termination phase bound for this host instance.
+    pub fn with_termination_grace_s(mut self, grace_s: u64) -> Self {
+        self.termination_grace = Duration::from_secs(grace_s);
+        self
     }
 
     fn remove_empty_status_dir(status_path: &Path) {
@@ -300,19 +307,29 @@ impl SessionHost for ProcessHost {
         // SIGTERM the group; ESRCH means it is already gone — the poll
         // below verifies either way. Never confirm on signal-send success.
         let _ = killpg(pgid, Signal::SIGTERM);
-        for _ in 0..TERM_POLLS {
+        let deadline = Instant::now() + self.termination_grace;
+        loop {
             if self.probe_dead(id).await? {
                 return Ok(Confirmed::Killed);
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
         }
 
         let _ = killpg(pgid, Signal::SIGKILL);
-        for _ in 0..KILL_POLLS {
+        let deadline = Instant::now() + self.termination_grace;
+        loop {
             if self.probe_dead(id).await? {
                 return Ok(Confirmed::Killed);
             }
-            tokio::time::sleep(POLL_INTERVAL).await;
+            let now = Instant::now();
+            if now >= deadline {
+                break;
+            }
+            tokio::time::sleep(POLL_INTERVAL.min(deadline - now)).await;
         }
         Err(HostError::KillVerifyTimeout)
     }

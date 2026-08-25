@@ -72,6 +72,29 @@ fn set_admission(env: &TestEnv, policy: Value) {
     .expect("write admission config");
 }
 
+fn expire_latest_retry(env: &TestEnv, run: &str) {
+    let connection =
+        rusqlite::Connection::open(env.anvil.join("state.db")).expect("open retry clock");
+    let (event_id, payload): (i64, String) = connection
+        .query_row(
+            "SELECT event_id, payload_json FROM events WHERE run_id = ?1 AND kind = 'proto.retry' ORDER BY event_id DESC LIMIT 1",
+            [run],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .expect("retry event");
+    let mut payload: Value = serde_json::from_str(&payload).expect("retry payload");
+    payload["retryAfter"] = json!("2000-01-01T00:00:00.000000000Z");
+    connection
+        .execute(
+            "UPDATE events SET payload_json = ?1 WHERE event_id = ?2",
+            rusqlite::params![
+                serde_json::to_string(&payload).expect("retry json"),
+                event_id
+            ],
+        )
+        .expect("advance retry clock");
+}
+
 #[test]
 fn push_transport_retries_are_bounded_then_stop_as_input_required() {
     let env = TestEnv::new("forged-push-retry");
@@ -1555,6 +1578,152 @@ fn transport_failure_advances_to_the_next_candidate_and_lands_once() {
 }
 
 #[test]
+fn real_provider_timeout_falls_back_to_the_next_candidate() {
+    let env = TestEnv::new("forged-timeout-fallback");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read timeout config"))
+            .expect("timeout config JSON");
+    config["stage_budget_s"]["implement"] = json!(1);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("timeout config JSON"),
+    )
+    .expect("write timeout config");
+    env.add_uniform_roster("timeout-fallback", "claude", "opus");
+    env.append_implementation_candidate("timeout-fallback", "codex", "gpt-5.6-sol");
+    env.set_scenario("implement", "hang", 1);
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-timeout-fallback",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+        "--roster",
+        "timeout-fallback",
+    ]);
+    assert_eq!(code, 0, "timeout fallback start: {started}");
+    env.authorize_run("bead-timeout-fallback");
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-timeout-fallback"]);
+        assert_eq!(code, 0, "timeout advance: {advanced}");
+    }
+    expire_latest_retry(&env, "bead-timeout-fallback");
+    let (code, driven) = env.forged(&["run", "drive", "--run", "bead-timeout-fallback"]);
+    assert_eq!(code, 0, "fallback drive: {driven}");
+
+    let ledger = env.ledger();
+    let first = ledger.get_attempt(1).expect("timed-out attempt");
+    let second = ledger.get_attempt(2).expect("fallback attempt");
+    assert!(first.claimant.starts_with("claude:"), "{first:?}");
+    assert_eq!(first.state, forged_ledger::AttemptState::Failed);
+    assert_eq!(
+        first.revoke_scope,
+        Some(forged_ledger::RevokeScope::Deadline)
+    );
+    assert!(first
+        .fail_note
+        .as_deref()
+        .is_some_and(|note| note.starts_with("transport: stage deadline exceeded")));
+    assert!(second.claimant.starts_with("codex:"), "{second:?}");
+    assert_eq!(second.state, forged_ledger::AttemptState::Completed);
+    assert_eq!(
+        ledger
+            .list_events(Some("bead-timeout-fallback"), 0, 1_000)
+            .expect("events")
+            .iter()
+            .filter(|event| event.kind == "proto.retry")
+            .count(),
+        1
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
+fn real_provider_timeouts_exhaust_the_frozen_retry_budget() {
+    let env = TestEnv::new("forged-timeout-exhaustion");
+    let config_path = env.anvil.join("config.json");
+    let mut config: Value =
+        serde_json::from_str(&std::fs::read_to_string(&config_path).expect("read timeout config"))
+            .expect("timeout config JSON");
+    config["stage_budget_s"]["implement"] = json!(1);
+    config["transport_retry_budget"] = json!(1);
+    std::fs::write(
+        &config_path,
+        serde_json::to_vec_pretty(&config).expect("timeout config JSON"),
+    )
+    .expect("write timeout config");
+    env.set_scenario("implement", "hang", 2);
+    env.forged(&["init"]);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "bead-timeout-exhaustion",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+        "--profile",
+        "lean",
+    ]);
+    assert_eq!(code, 0, "timeout exhaustion start: {started}");
+    env.authorize_run("bead-timeout-exhaustion");
+    for _ in 0..3 {
+        let (code, advanced) = env.forged(&["run", "advance", "--run", "bead-timeout-exhaustion"]);
+        assert_eq!(code, 0, "first timeout advance: {advanced}");
+    }
+    expire_latest_retry(&env, "bead-timeout-exhaustion");
+    let (code, second_timeout) =
+        env.forged(&["run", "advance", "--run", "bead-timeout-exhaustion"]);
+    assert_eq!(code, 0, "second timeout: {second_timeout}");
+    let (code, exhausted) = env.forged(&["run", "drive", "--run", "bead-timeout-exhaustion"]);
+    assert_eq!(code, 0, "exhaustion drive: {exhausted}");
+    assert_eq!(
+        exhausted["result"]["terminal"]["providerUnavailable"]["stage"],
+        json!("implementation")
+    );
+    assert_eq!(
+        exhausted["result"]["terminal"]["providerUnavailable"]["attempts"],
+        json!(2)
+    );
+
+    let ledger = env.ledger();
+    let attempts: Vec<_> = (1..=2)
+        .map(|attempt_id| ledger.get_attempt(attempt_id).expect("timeout attempt"))
+        .collect();
+    assert!(attempts.iter().all(|attempt| {
+        attempt.state == forged_ledger::AttemptState::Failed
+            && attempt.revoke_scope == Some(forged_ledger::RevokeScope::Deadline)
+    }));
+    assert_eq!(
+        ledger
+            .list_events(Some("bead-timeout-exhaustion"), 0, 1_000)
+            .expect("events")
+            .iter()
+            .filter(|event| event.kind == "proto.retry")
+            .count(),
+        2,
+        "each timed-out attempt is charged exactly once"
+    );
+    ledger.close().expect("close ledger");
+}
+
+#[test]
 fn roster_revision_resets_transport_fallback_to_its_first_candidate() {
     let env = TestEnv::new("forged-roster-revision-fallback");
     env.forged(&["init"]);
@@ -2230,6 +2399,78 @@ fn pre_policy_run_package_is_migrated_once_and_then_stays_frozen() {
         serde_json::from_str::<Value>(&original_json).expect("original JSON")["policy"].is_null(),
         "the original immutable definition row remains untouched"
     );
+}
+
+#[test]
+fn stored_old_policy_with_an_excessive_budget_fails_before_execution() {
+    let env = TestEnv::new("forged-old-package-budget-bound");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let spec = env.spec.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "run",
+        "start",
+        "--bead",
+        "old-package-budget-bound",
+        "--repo",
+        &repo,
+        "--spec",
+        &spec,
+        "--base-ref",
+        "main",
+    ]);
+    assert_eq!(code, 0, "start: {started}");
+
+    // Emulate a package frozen by the prior binary: the old shape has no
+    // terminationGraceS and accepted an unbounded u64 stage budget.
+    let db = env.anvil.join("state.db");
+    let connection = rusqlite::Connection::open(&db).expect("open old-package fixture");
+    let package_json: String = connection
+        .query_row(
+            "SELECT package_json FROM run_definitions WHERE run_id = ?1",
+            ["old-package-budget-bound"],
+            |row| row.get(0),
+        )
+        .expect("stored package");
+    let mut package: Value = serde_json::from_str(&package_json).expect("package JSON");
+    package["policy"]["stageBudgetS"]["implement"] = json!(u64::MAX);
+    package["policy"]
+        .as_object_mut()
+        .expect("policy object")
+        .remove("terminationGraceS");
+    let (package_json, package_sha256) = canonical_json_and_sha(&package);
+    connection
+        .execute(
+            "UPDATE run_definitions SET package_json = ?1, package_sha256 = ?2 WHERE run_id = ?3",
+            rusqlite::params![package_json, package_sha256, "old-package-budget-bound"],
+        )
+        .expect("install old package");
+    drop(connection);
+
+    let (code, rejected) = env.forged(&["run", "advance", "--run", "old-package-budget-bound"]);
+    assert_eq!(code, 1, "invalid stored policy must fail: {rejected}");
+    assert_eq!(rejected["error"]["code"], json!("INTERNAL"));
+    assert_eq!(
+        rejected["error"]["message"],
+        json!(concat!(
+            "projection: projected execution policy is invalid at ",
+            "$.policy.stageBudgetS.Implement: stage budget must fit the packet ",
+            "contract's 32-bit seconds field"
+        ))
+    );
+    assert!(
+        env.provider_log().is_empty(),
+        "no provider effect may start"
+    );
+    let ledger = env.ledger();
+    assert!(
+        ledger
+            .list_live_attempts(Some("old-package-budget-bound"))
+            .expect("attempts")
+            .is_empty(),
+        "invalid stored policy must fail before an attempt or reservation"
+    );
+    ledger.close().expect("close ledger");
 }
 
 #[test]

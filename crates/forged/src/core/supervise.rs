@@ -414,6 +414,40 @@ async fn subject_runtime(
     }
 }
 
+/// Persist the next supervisor observation no later than any provider
+/// deadline the run controller may be parking on. `desired_work.next_wake_at`
+/// remains the crash-recovery timer; the controller's local wait is only an
+/// accelerator while that exact process stays alive.
+async fn subject_observation_wake(ctx: &Ctx, row: &DesiredWorkRow) -> Result<String, Failure> {
+    let now = now_iso();
+    let mut wake = deadline_after(&now, POLL_SECONDS)?;
+    if row.subject_kind != DesiredSubjectKind::Run {
+        return Ok(wake);
+    }
+    let view = super::drive::project(ctx, &row.subject_id).await?;
+    if let Some(shortest_budget) = view.policy.stage_budget_s.values().copied().min() {
+        wake = wake.min(deadline_after(&now, shortest_budget)?);
+    }
+    for attempt in &view.live_attempts {
+        let stage = view
+            .packets
+            .iter()
+            .find(|packet| packet.packet_id == attempt.packet_id)
+            .map(|packet| packet.stage)
+            .ok_or_else(|| Failure::internal("live attempt has no stored packet"))?;
+        let budget_s = view
+            .policy
+            .stage_budget_s
+            .get(&stage)
+            .copied()
+            .ok_or_else(|| Failure::internal("frozen policy has no stage budget"))?;
+        let deadline = forged_proto::stage_deadline_at(&attempt.started_at, budget_s)
+            .map_err(|error| Failure::internal(error.to_string()))?;
+        wake = wake.min(deadline);
+    }
+    Ok(wake)
+}
+
 /// Adoption is observation, not a new capacity effect. Check an already-live
 /// exact controller before asking admission policy for a replacement slot;
 /// otherwise its own active provider attempt can fill repository capacity and
@@ -502,7 +536,7 @@ async fn reconcile_live_before_admission(
             outcome: DesiredReconcileOutcome::Adopted,
             controller_generation: Some(generation),
             predecessor_generation: row.predecessor_generation,
-            next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+            next_wake_at: Some(subject_observation_wake(ctx, &row).await?),
             last_progress_at: progress,
             last_error: None,
             attention_condition: None,
@@ -692,7 +726,7 @@ async fn reconcile_claimed(
                 outcome: DesiredReconcileOutcome::Adopted,
                 controller_generation: Some(generation),
                 predecessor_generation: row.predecessor_generation,
-                next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+                next_wake_at: Some(subject_observation_wake(ctx, &row).await?),
                 last_progress_at: progress,
                 last_error: None,
                 attention_condition: None,
@@ -842,7 +876,7 @@ async fn reconcile_claimed(
                     outcome: DesiredReconcileOutcome::Restarted,
                     controller_generation: Some(generation),
                     predecessor_generation: predecessor,
-                    next_wake_at: Some(deadline_after(&now_iso(), POLL_SECONDS)?),
+                    next_wake_at: Some(subject_observation_wake(ctx, &reserved).await?),
                     last_progress_at: last_progress(ctx, &reserved.subject_id).await?,
                     last_error: None,
                     attention_condition: None,

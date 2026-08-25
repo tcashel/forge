@@ -59,6 +59,7 @@ fn revoke_scope(idx: usize, s: Option<String>) -> Result<Option<RevokeScope>, ru
         None => Ok(None),
         Some("bead") => Ok(Some(RevokeScope::Bead)),
         Some("attempt") => Ok(Some(RevokeScope::Attempt)),
+        Some("deadline") => Ok(Some(RevokeScope::Deadline)),
         Some(other) => Err(column_decode_error(idx, "revoke scope", other)),
     }
 }
@@ -717,6 +718,12 @@ impl Ledger {
                     ),
                 ));
             }
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("deadline attempt {attempt_id} cannot reclaim a Bead lease"),
+                ));
+            }
             let now = now_iso();
             tx.execute(
                 "UPDATE attempts SET state = 'reclaimed', updated_at = ?1, ended_at = ?1 \
@@ -760,6 +767,12 @@ impl Ledger {
                     ),
                 ));
             }
+            if attempt.revoke_scope == Some(RevokeScope::Deadline) {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("deadline attempt {attempt_id} must settle as a timeout"),
+                ));
+            }
             let now = now_iso();
             tx.execute(
                 "UPDATE attempts SET state = 'stopped', updated_at = ?1, ended_at = ?1 \
@@ -775,6 +788,64 @@ impl Ledger {
                 Some(AttemptState::Revoking),
                 AttemptState::Stopped,
                 attempt.revoke_reason.as_deref(),
+            )?;
+            tx.commit()?;
+            Ok(())
+        })
+    }
+
+    /// Settle a kill-confirmed deadline marker as one retryable transport
+    /// failure. The marker's stored reason is the durable timeout evidence;
+    /// reservation release and the terminal event commit with the state.
+    pub fn mark_timed_out(&self, attempt_id: i64) -> Result<(), LedgerError> {
+        self.submit(move |conn| {
+            let tx = conn.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let attempt = get_attempt_tx(&tx, attempt_id)?;
+            if attempt.state == AttemptState::Failed
+                && attempt.revoke_scope == Some(RevokeScope::Deadline)
+                && attempt
+                    .fail_note
+                    .as_deref()
+                    .is_some_and(|note| note.starts_with("transport: stage deadline exceeded"))
+            {
+                tx.commit()?;
+                return Ok(());
+            }
+            if attempt.state != AttemptState::Revoking
+                || attempt.revoke_scope != Some(RevokeScope::Deadline)
+            {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("attempt {attempt_id} is not under a deadline marker"),
+                ));
+            }
+            let note = attempt.revoke_reason.clone().ok_or_else(|| {
+                refused(
+                    ErrorCode::InvalidRequest,
+                    format!("deadline attempt {attempt_id} has no reason"),
+                )
+            })?;
+            if !note.starts_with("transport: stage deadline exceeded") {
+                return Err(refused(
+                    ErrorCode::InvalidRequest,
+                    format!("deadline attempt {attempt_id} has an invalid reason"),
+                ));
+            }
+            let now = now_iso();
+            tx.execute(
+                "UPDATE attempts SET state = 'failed', fail_note = ?1, \
+                 updated_at = ?2, ended_at = ?2 WHERE attempt_id = ?3",
+                rusqlite::params![note, now, attempt_id],
+            )?;
+            crate::owned_herdr::request_attempt_cleanup_tx(&tx, attempt_id, &now)?;
+            release_attempt_reservation_tx(&tx, attempt_id, &now)?;
+            attempt_event(
+                &tx,
+                attempt_id,
+                &attempt.packet_id,
+                Some(AttemptState::Revoking),
+                AttemptState::Failed,
+                Some(&note),
             )?;
             tx.commit()?;
             Ok(())
