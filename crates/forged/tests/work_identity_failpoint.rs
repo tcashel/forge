@@ -142,6 +142,23 @@ fn atomic_epic_creation_replays_after_crash_without_beads() {
     env.set_bead_field("identity-epic-crash", "title", "Frozen epic identity");
     assert_eq!(env.forged(&["init"]).0, 0);
     let repo = env.repos.repo.to_string_lossy().into_owned();
+    let revision = env.bead_revision("identity-epic-crash");
+    let approval = env.execution_approval(
+        "epic",
+        "identity-epic-crash",
+        &repo,
+        "main",
+        Some("standard"),
+        Some("default"),
+        &revision,
+    );
+    let approval_path = env.root.join("identity-epic-crash-approval.json");
+    std::fs::write(
+        &approval_path,
+        serde_json::to_vec(&approval).expect("approval JSON"),
+    )
+    .expect("write approval");
+    let approval_arg = approval_path.to_string_lossy().into_owned();
     let args = [
         "epic",
         "start",
@@ -151,6 +168,14 @@ fn atomic_epic_creation_replays_after_crash_without_beads() {
         &repo,
         "--base-ref",
         "main",
+        "--profile",
+        "standard",
+        "--roster",
+        "default",
+        "--expected-bead-revision",
+        &revision,
+        "--approval",
+        &approval_arg,
     ];
     let fp = env.root.join("fp-work-identity-epic-bundle");
     std::fs::create_dir_all(&fp).expect("failpoint dir");
@@ -167,7 +192,7 @@ fn atomic_epic_creation_replays_after_crash_without_beads() {
 
     env.set_bd_show_unreachable(true);
     env.set_bd_list_unreachable(true);
-    let (code, replayed) = env.forged(&args);
+    let (code, replayed) = env.forged_without_test_approval(&args);
     assert_eq!(code, 0, "epic creation replay: {replayed}");
     assert_eq!(replayed["result"]["epicId"], json!("identity-epic-crash"));
     let ledger = env.ledger();
