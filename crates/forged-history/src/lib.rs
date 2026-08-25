@@ -29,9 +29,9 @@ pub use rebuild::REBUILD_STAGE_BATCH;
 pub use time::canonical_timestamp;
 pub use types::{
     EventRole, EventRow, HistoryFilter, HistoryStatus, IndexState, IngestOutcome, MetadataQuery,
-    NamedValue, PreparedEvent, RebuildProgress, SearchCursor, SearchMatch, SearchPage, SearchQuery,
-    SessionRow, SourceFamily, SourceFileState, SourceObservation, SourceStatus, TombstoneOutcome,
-    TombstoneScope, UsageFact, UsageRow,
+    NamedValue, PreparedEvent, RebuildProgress, RevisionRow, SearchCursor, SearchMatch, SearchPage,
+    SearchQuery, SessionRow, SourceFamily, SourceFileState, SourceObservation, SourceStatus,
+    TombstoneOutcome, TombstoneScope, UsageFact, UsageRow,
 };
 
 #[cfg(test)]

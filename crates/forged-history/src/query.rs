@@ -8,10 +8,10 @@ use sha2::{Digest, Sha256};
 
 use crate::actor::History;
 use crate::error::{internal, invalid, HistoryError};
-use crate::ingest::{hex_digest, SEARCH_CHUNK_TARGET_BYTES};
+use crate::ingest::hex_digest;
 use crate::types::{
-    checked_u64, EventRole, EventRow, HistoryFilter, MetadataQuery, SearchCursor, SearchMatch,
-    SearchPage, SearchQuery, SessionRow, SourceFamily, UsageRow,
+    checked_u64, EventRole, EventRow, HistoryFilter, MetadataQuery, RevisionRow, SearchCursor,
+    SearchMatch, SearchPage, SearchQuery, SessionRow, SourceFamily, UsageRow,
 };
 
 const DEFAULT_PAGE_SIZE: u32 = 50;
@@ -82,6 +82,34 @@ impl History {
             let mut statement = connection.prepare(&sql)?;
             let rows = statement
                 .query_map(params_from_iter(values.iter()), map_event_row)?
+                .collect::<rusqlite::Result<Vec<_>>>()?;
+            Ok(rows)
+        })
+    }
+
+    /// Return every retained committed revision in stable revision-id order.
+    pub fn revisions(&self, query: MetadataQuery) -> Result<Vec<RevisionRow>, HistoryError> {
+        let query = canonicalize_query(query)?;
+        self.submit(move |connection| {
+            let mut sql = String::from(
+                "SELECT r.revision_id, e.event_id, e.session_id, e.event_key,
+                        r.revision_no, r.occurred_at, r.role, r.model
+                   FROM history_event_revisions r
+                   JOIN history_events e ON e.event_id=r.event_id
+                   JOIN history_sessions s ON s.session_id=e.session_id
+                  WHERE r.visibility='committed'",
+            );
+            let mut values = Vec::new();
+            append_filters(&mut sql, &mut values, &query.filter, ModelColumn::Event);
+            if let Some(after) = query.after_id {
+                sql.push_str(" AND r.revision_id > ?");
+                values.push(Value::Integer(after));
+            }
+            sql.push_str(" ORDER BY r.revision_id LIMIT ?");
+            values.push(Value::Integer(i64::from(effective_limit(query.limit))));
+            let mut statement = connection.prepare(&sql)?;
+            let rows = statement
+                .query_map(params_from_iter(values.iter()), map_revision_row)?
                 .collect::<rusqlite::Result<Vec<_>>>()?;
             Ok(rows)
         })
@@ -261,9 +289,6 @@ impl History {
             for row in rows.into_iter().take(limit as usize) {
                 let length = usize::try_from(row.uncompressed_length)
                     .map_err(|_| internal("negative or oversized search chunk length"))?;
-                if length > SEARCH_CHUNK_TARGET_BYTES + 3 {
-                    return Err(internal("stored search chunk exceeds UTF-8 chunk bound"));
-                }
                 let decoded = zstd::bulk::decompress(&row.compressed, length)
                     .map_err(|error| internal(format!("decompressing search result: {error}")))?;
                 if decoded.len() != length || hex_digest(Sha256::digest(&decoded)) != row.sha256 {
@@ -398,6 +423,29 @@ fn map_event_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventRow> {
             )
         })?,
         revision_id: row.get(4)?,
+        occurred_at: row.get(5)?,
+        role: row
+            .get::<_, Option<String>>(6)?
+            .map(|value| EventRole::decode(6, &value))
+            .transpose()?,
+        model: row.get(7)?,
+    })
+}
+
+fn map_revision_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RevisionRow> {
+    let revision: i64 = row.get(4)?;
+    Ok(RevisionRow {
+        revision_id: row.get(0)?,
+        event_id: row.get(1)?,
+        session_id: row.get(2)?,
+        event_key: row.get(3)?,
+        revision: u32::try_from(revision).map_err(|error| {
+            rusqlite::Error::FromSqlConversionFailure(
+                4,
+                rusqlite::types::Type::Integer,
+                error.into(),
+            )
+        })?,
         occurred_at: row.get(5)?,
         role: row
             .get::<_, Option<String>>(6)?

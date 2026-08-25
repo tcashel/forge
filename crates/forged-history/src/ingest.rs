@@ -184,22 +184,13 @@ impl History {
     pub fn cleanup_staging(&self) -> Result<u64, HistoryError> {
         let mut removed = 0_u64;
         loop {
-            let next = self.submit(|connection| {
-                connection
-                    .query_row(
-                        "SELECT revision_id FROM history_event_revisions
-                          WHERE visibility='staging' ORDER BY revision_id LIMIT 1",
-                        [],
-                        |row| row.get::<_, i64>(0),
-                    )
-                    .optional()
-                    .map_err(Into::into)
-            })?;
+            let next = claim_next_cleanup_revision(self)?;
             let Some(revision_id) = next else {
                 break;
             };
-            cleanup_revision(self, revision_id)?;
-            removed = removed.saturating_add(1);
+            if cleanup_claimed_revision(self, revision_id)? {
+                removed = removed.saturating_add(1);
+            }
         }
         Ok(removed)
     }
@@ -241,9 +232,19 @@ impl History {
         run_id: &str,
         attempt_id: Option<i64>,
     ) -> Result<(), HistoryError> {
+        if revision_id <= 0 || run_id.is_empty() {
+            return Err(invalid(
+                "revision id and run id must be non-empty positive identities",
+            ));
+        }
+        let attempt_id = attempt_id
+            .filter(|attempt_id| *attempt_id > 0)
+            .ok_or_else(|| invalid("attempt id must be a positive identity"))?;
         let run_id = run_id.to_owned();
         self.submit(move |connection| {
-            connection.execute(
+            let transaction =
+                connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let inserted = transaction.execute(
                 "INSERT OR IGNORE INTO history_attempt_links(revision_id, run_id, attempt_id)
                  SELECT ?1, ?2, ?3
                   WHERE EXISTS (
@@ -252,6 +253,20 @@ impl History {
                   )",
                 params![revision_id, run_id, attempt_id],
             )?;
+            if inserted == 0 {
+                let linked: bool = transaction.query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM history_attempt_links
+                        WHERE revision_id=?1 AND run_id=?2 AND attempt_id=?3
+                     )",
+                    params![revision_id, run_id, attempt_id],
+                    |row| row.get(0),
+                )?;
+                if !linked {
+                    return Err(HistoryError::NotFound);
+                }
+            }
+            transaction.commit()?;
             Ok(())
         })
     }
@@ -324,7 +339,7 @@ impl IngestBuilder {
 
     /// Append one extracted UTF-8 fragment. One persistent chunker spans all
     /// calls, so fragment boundaries cannot split a search term.
-    pub fn push_text_fragment(&mut self, mut fragment: &str) -> Result<(), HistoryError> {
+    pub fn push_text_fragment(&mut self, fragment: &str) -> Result<(), HistoryError> {
         self.assert_writable()?;
         self.text_hasher.update(fragment.as_bytes());
         self.text_length = self
@@ -334,28 +349,12 @@ impl IngestBuilder {
                     .map_err(|_| invalid("text fragment length exceeds u64"))?,
             )
             .ok_or_else(|| invalid("logical search text length exceeds u64"))?;
-        while !fragment.is_empty() {
-            let capacity = SEARCH_CHUNK_TARGET_BYTES.saturating_sub(self.text_buffer.len());
-            if capacity == 0 {
-                self.seal_text_chunk()?;
-                continue;
-            }
-            let mut take = capacity.min(fragment.len());
-            while take > 0 && !fragment.is_char_boundary(take) {
-                take -= 1;
-            }
-            if take == 0 {
-                if self.text_buffer.is_empty() {
-                    let character = fragment.chars().next().expect("nonempty fragment");
-                    take = character.len_utf8();
-                } else {
-                    self.seal_text_chunk()?;
-                    continue;
-                }
-            }
-            self.text_buffer.push_str(&fragment[..take]);
-            fragment = &fragment[take..];
-            if self.text_buffer.len() >= SEARCH_CHUNK_TARGET_BYTES {
+        for character in fragment.chars() {
+            self.text_buffer.push(character);
+            // Whitespace is always a token boundary for unicode61. Waiting
+            // until one is observed keeps a token whole even when it crosses
+            // the target byte position or an input-fragment boundary.
+            if self.text_buffer.len() >= SEARCH_CHUNK_TARGET_BYTES && character.is_whitespace() {
                 self.seal_text_chunk()?;
             }
         }
@@ -412,18 +411,23 @@ impl IngestBuilder {
             &usage_sha256,
             self.usage_sequence,
         );
-        let event_key = self.prepared.native_event_key.clone().unwrap_or_else(|| {
-            format!(
-                "fallback/v1/{}/{}",
-                self.prepared.source_family.as_str(),
-                raw_sha256
-            )
-        });
+        let event_key = self
+            .prepared
+            .native_event_key
+            .clone()
+            .unwrap_or_else(|| fallback_event_key(&self.prepared, &raw_sha256));
 
         if let Some((revision_id, revision)) =
             find_replay(&self.history, &self.prepared, &event_key, &fingerprint)?
         {
-            cleanup_revision(&self.history, self.revision_id)?;
+            publish_replay_progress(
+                &self.history,
+                self.revision_id,
+                self.source_file_id,
+                revision_id,
+                &self.prepared,
+            )?;
+            cleanup_claimed_revision(&self.history, self.revision_id)?;
             self.finished = true;
             return Ok(IngestOutcome::Replayed {
                 revision_id,
@@ -460,7 +464,7 @@ impl IngestBuilder {
                 revision_id,
                 revision,
             } => {
-                cleanup_revision(&self.history, self.revision_id)?;
+                cleanup_claimed_revision(&self.history, self.revision_id)?;
                 self.finished = true;
                 Ok(IngestOutcome::Replayed {
                     revision_id,
@@ -494,6 +498,7 @@ impl IngestBuilder {
         let result = self.history.submit(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_staging_revision(&transaction, revision_id)?;
             for part in pending {
                 transaction.execute(
                     "INSERT INTO history_archive_blocks(
@@ -575,6 +580,7 @@ impl IngestBuilder {
         let result = self.history.submit(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_staging_revision(&transaction, revision_id)?;
             let (generation, _) = active_generation(&transaction)?
                 .ok_or_else(|| internal("history database has no active index generation"))?;
             transaction.execute(
@@ -632,6 +638,7 @@ impl IngestBuilder {
         let result = self.history.submit(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_staging_revision(&transaction, revision_id)?;
             for staged in pending {
                 let fact = staged.fact;
                 transaction.execute(
@@ -828,6 +835,38 @@ fn finish_fingerprint(
     hex_digest(hasher.finalize())
 }
 
+fn fallback_event_key(prepared: &PreparedEvent, raw_sha256: &str) -> String {
+    let mut coordinates = Sha256::new();
+    fingerprint_field(&mut coordinates, b"forged-history-fallback/v2");
+    fingerprint_field(&mut coordinates, prepared.source_family.as_str().as_bytes());
+    fingerprint_field(&mut coordinates, prepared.native_session_id.as_bytes());
+    fingerprint_field(&mut coordinates, prepared.occurred_at.as_bytes());
+    if let Some(observation) = &prepared.source_observation {
+        coordinates.update([1]);
+        fingerprint_field(
+            &mut coordinates,
+            observation.root_path.as_os_str().as_encoded_bytes(),
+        );
+        fingerprint_field(
+            &mut coordinates,
+            observation.file_path.as_os_str().as_encoded_bytes(),
+        );
+        fingerprint_option(&mut coordinates, observation.cursor.as_deref());
+    } else {
+        coordinates.update([0]);
+    }
+    fingerprint_u64(&mut coordinates, prepared.lineage.len() as u64);
+    for fact in &prepared.lineage {
+        fingerprint_field(&mut coordinates, fact.name.as_bytes());
+        fingerprint_field(&mut coordinates, fact.value.as_bytes());
+    }
+    format!(
+        "fallback/v2/{}/{}",
+        hex_digest(coordinates.finalize()),
+        raw_sha256
+    )
+}
+
 fn fingerprint_field(hasher: &mut Sha256, value: &[u8]) {
     fingerprint_u64(hasher, value.len() as u64);
     hasher.update(value);
@@ -906,6 +945,112 @@ fn find_replay(
     })
 }
 
+fn require_staging_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    revision_id: i64,
+) -> Result<(), HistoryError> {
+    let staging: bool = transaction.query_row(
+        "SELECT EXISTS(
+           SELECT 1 FROM history_event_revisions
+            WHERE revision_id=?1 AND visibility='staging'
+         )",
+        params![revision_id],
+        |row| row.get(0),
+    )?;
+    if staging {
+        Ok(())
+    } else {
+        Err(internal("staging revision no longer owns ingestion"))
+    }
+}
+
+fn claim_staging_revision(
+    transaction: &rusqlite::Transaction<'_>,
+    revision_id: i64,
+) -> Result<(), HistoryError> {
+    let claimed = transaction.execute(
+        "UPDATE history_event_revisions SET visibility='cleaning'
+          WHERE revision_id=?1 AND visibility='staging'",
+        params![revision_id],
+    )?;
+    if claimed == 1 {
+        Ok(())
+    } else {
+        Err(internal(
+            "staging revision lost cleanup ownership before replay publication",
+        ))
+    }
+}
+
+fn publish_observation(
+    transaction: &rusqlite::Transaction<'_>,
+    session_id: i64,
+    source_file_id: Option<i64>,
+    revision_id: i64,
+    observation: Option<&SourceObservation>,
+    now: &str,
+) -> Result<usize, HistoryError> {
+    let Some(source_file_id) = source_file_id else {
+        return Ok(0);
+    };
+    let mut rows = transaction.execute(
+        "INSERT INTO history_observations(
+           session_id, source_file_id, first_seen_at, last_seen_at
+         ) VALUES (?1, ?2, ?3, ?3)
+         ON CONFLICT(session_id, source_file_id) DO UPDATE SET
+           last_seen_at=excluded.last_seen_at",
+        params![session_id, source_file_id, now],
+    )?;
+    if let Some(cursor) = observation.and_then(|observation| observation.cursor.as_ref()) {
+        rows += transaction.execute(
+            "INSERT INTO history_source_cursors(
+               source_file_id, cursor_value, revision_id, updated_at
+             ) VALUES (?1, ?2, ?3, ?4)
+             ON CONFLICT(source_file_id) DO UPDATE SET
+               cursor_value=excluded.cursor_value,
+               revision_id=excluded.revision_id,
+               updated_at=excluded.updated_at",
+            params![source_file_id, cursor, revision_id, now],
+        )?;
+    }
+    Ok(rows)
+}
+
+fn publish_replay_progress(
+    history: &History,
+    staging_revision_id: i64,
+    source_file_id: Option<i64>,
+    replay_revision_id: i64,
+    prepared: &PreparedEvent,
+) -> Result<(), HistoryError> {
+    let observation = prepared.source_observation.clone();
+    history.submit(move |connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let session_id: i64 = transaction
+            .query_row(
+                "SELECT e.session_id
+                   FROM history_event_revisions r
+                   JOIN history_events e ON e.event_id=r.event_id
+                  WHERE r.revision_id=?1 AND r.visibility='committed'",
+                params![replay_revision_id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .ok_or(HistoryError::NotFound)?;
+        claim_staging_revision(&transaction, staging_revision_id)?;
+        publish_observation(
+            &transaction,
+            session_id,
+            source_file_id,
+            replay_revision_id,
+            observation.as_ref(),
+            &now_timestamp(),
+        )?;
+        transaction.commit()?;
+        Ok(())
+    })
+}
+
 fn ensure_revision_in_active_index(
     history: &History,
     revision_id: i64,
@@ -958,6 +1103,7 @@ fn ensure_revision_in_active_index(
             }
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            require_staging_revision(&transaction, revision_id)?;
             let still_active =
                 active_generation(&transaction)?.is_some_and(|(current, _)| current == generation);
             if !still_active {
@@ -1057,8 +1203,16 @@ fn finalize_revision(
              ON CONFLICT(host_id, source_family, native_session_id) DO UPDATE SET
                observed_cwd=COALESCE(excluded.observed_cwd, history_sessions.observed_cwd),
                repository_path=COALESCE(excluded.repository_path, history_sessions.repository_path),
-               started_at=COALESCE(history_sessions.started_at, excluded.started_at),
-               ended_at=COALESCE(excluded.ended_at, history_sessions.ended_at),
+               started_at=CASE
+                 WHEN history_sessions.started_at IS NULL THEN excluded.started_at
+                 WHEN excluded.started_at IS NULL THEN history_sessions.started_at
+                 ELSE min(history_sessions.started_at, excluded.started_at)
+               END,
+               ended_at=CASE
+                 WHEN history_sessions.ended_at IS NULL THEN excluded.ended_at
+                 WHEN excluded.ended_at IS NULL THEN history_sessions.ended_at
+                 ELSE max(history_sessions.ended_at, excluded.ended_at)
+               END,
                updated_at=excluded.updated_at",
             params![
                 host_id,
@@ -1081,6 +1235,14 @@ fn finalize_revision(
             ],
             |row| row.get(0),
         )?;
+        let stored_interval: (Option<String>, Option<String>) = transaction.query_row(
+            "SELECT started_at, ended_at FROM history_sessions WHERE session_id=?1",
+            params![session_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        if matches!(stored_interval, (Some(start), Some(end)) if start > end) {
+            return Err(invalid("merged session start must not follow session end"));
+        }
         rows_touched += transaction.execute(
             "INSERT INTO history_events(
                session_id, event_key, native_event_key, created_at, updated_at
@@ -1102,7 +1264,16 @@ fn finalize_revision(
             )
             .optional()?
         {
-            transaction.rollback()?;
+            claim_staging_revision(&transaction, revision_id)?;
+            publish_observation(
+                &transaction,
+                session_id,
+                source_file_id,
+                existing.0,
+                prepared.source_observation.as_ref(),
+                &now,
+            )?;
+            transaction.commit()?;
             return Ok(Finalization::Replayed {
                 revision_id: existing.0,
                 revision: u32::try_from(existing.1)
@@ -1116,7 +1287,7 @@ fn finalize_revision(
             params![event_id],
             |row| row.get(0),
         )?;
-        rows_touched += transaction.execute(
+        let published = transaction.execute(
             "UPDATE history_event_revisions
                 SET event_id=?1, revision_no=?2, fingerprint=?3,
                     raw_sha256=?4, raw_length=?5, visibility='committed',
@@ -1132,37 +1303,25 @@ fn finalize_revision(
                 revision_id,
             ],
         )?;
+        if published != 1 {
+            return Err(internal(
+                "staging revision lost publication ownership before commit",
+            ));
+        }
+        rows_touched += published;
         rows_touched += transaction.execute(
             "UPDATE history_events SET current_revision_id=?1, updated_at=?2
               WHERE event_id=?3",
             params![revision_id, now, event_id],
         )?;
-        if let Some(source_file_id) = source_file_id {
-            rows_touched += transaction.execute(
-                "INSERT INTO history_observations(
-                   session_id, source_file_id, first_seen_at, last_seen_at
-                 ) VALUES (?1, ?2, ?3, ?3)
-                 ON CONFLICT(session_id, source_file_id) DO UPDATE SET
-                   last_seen_at=excluded.last_seen_at",
-                params![session_id, source_file_id, now],
-            )?;
-            if let Some(cursor) = prepared
-                .source_observation
-                .as_ref()
-                .and_then(|observation| observation.cursor.as_ref())
-            {
-                rows_touched += transaction.execute(
-                    "INSERT INTO history_source_cursors(
-                       source_file_id, cursor_value, revision_id, updated_at
-                     ) VALUES (?1, ?2, ?3, ?4)
-                     ON CONFLICT(source_file_id) DO UPDATE SET
-                       cursor_value=excluded.cursor_value,
-                       revision_id=excluded.revision_id,
-                       updated_at=excluded.updated_at",
-                    params![source_file_id, cursor, revision_id, now],
-                )?;
-            }
-        }
+        rows_touched += publish_observation(
+            &transaction,
+            session_id,
+            source_file_id,
+            revision_id,
+            prepared.source_observation.as_ref(),
+            &now,
+        )?;
         if searchable {
             rows_touched += transaction.execute(
                 "DELETE FROM history_search_fences WHERE revision_id=?1",
@@ -1190,11 +1349,65 @@ fn finalize_revision(
     })
 }
 
-fn cleanup_revision(history: &History, revision_id: i64) -> Result<(), HistoryError> {
+fn claim_next_cleanup_revision(history: &History) -> Result<Option<i64>, HistoryError> {
+    history.submit(|connection| {
+        let transaction = connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+        let already_claimed = transaction
+            .query_row(
+                "SELECT revision_id FROM history_event_revisions
+                  WHERE visibility='cleaning' ORDER BY revision_id LIMIT 1",
+                [],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?;
+        let revision_id = if let Some(revision_id) = already_claimed {
+            Some(revision_id)
+        } else {
+            let candidate = transaction
+                .query_row(
+                    "SELECT revision_id FROM history_event_revisions
+                      WHERE visibility='staging' ORDER BY revision_id LIMIT 1",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )
+                .optional()?;
+            if let Some(revision_id) = candidate {
+                claim_staging_revision(&transaction, revision_id)?;
+            }
+            candidate
+        };
+        transaction.commit()?;
+        Ok(revision_id)
+    })
+}
+
+enum CleanupStep {
+    Missing,
+    Remaining,
+    Removed,
+}
+
+fn cleanup_claimed_revision(history: &History, revision_id: i64) -> Result<bool, HistoryError> {
     loop {
-        let remaining = history.submit(move |connection| {
+        let step = history.submit(move |connection| {
             let transaction =
                 connection.transaction_with_behavior(TransactionBehavior::Immediate)?;
+            let visibility = transaction
+                .query_row(
+                    "SELECT visibility FROM history_event_revisions WHERE revision_id=?1",
+                    params![revision_id],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            match visibility.as_deref() {
+                None => return Ok(CleanupStep::Missing),
+                Some("cleaning") => {}
+                Some(_) => {
+                    return Err(internal(
+                        "cleanup no longer owns the staging revision visibility fence",
+                    ))
+                }
+            }
             let chunk_ids = {
                 let mut statement = transaction.prepare(
                     "SELECT chunk_id FROM history_search_chunks
@@ -1257,17 +1470,26 @@ fn cleanup_revision(history: &History, revision_id: i64) -> Result<(), HistoryEr
                 |row| row.get(0),
             )?;
             if !still_has_children {
-                transaction.execute(
+                let removed = transaction.execute(
                     "DELETE FROM history_event_revisions
-                      WHERE revision_id=?1 AND visibility='staging'",
+                      WHERE revision_id=?1 AND visibility='cleaning'",
                     params![revision_id],
                 )?;
+                if removed != 1 {
+                    return Err(internal("cleanup lost its revision visibility fence"));
+                }
             }
             transaction.commit()?;
-            Ok(still_has_children)
+            Ok(if still_has_children {
+                CleanupStep::Remaining
+            } else {
+                CleanupStep::Removed
+            })
         })?;
-        if !remaining {
-            return Ok(());
+        match step {
+            CleanupStep::Missing => return Ok(false),
+            CleanupStep::Remaining => {}
+            CleanupStep::Removed => return Ok(true),
         }
     }
 }
@@ -1331,6 +1553,228 @@ mod tests {
             })
             .unwrap();
         assert_eq!(found.matches.len(), 1);
+    }
+
+    #[test]
+    fn lexical_terms_crossing_the_target_boundary_remain_searchable() {
+        let scratch = crate::test_scratch();
+        let history = History::open(&scratch.path().join("history/history.db")).unwrap();
+        let mut builder = history.begin_event(event("boundary")).unwrap();
+        builder.push_raw_part(Cursor::new(b"raw")).unwrap();
+        let text = format!(
+            "{} boundaryterm tail",
+            "x".repeat(SEARCH_CHUNK_TARGET_BYTES - 4)
+        );
+        builder.push_text_fragment(&text).unwrap();
+        builder.finish().unwrap();
+
+        let found = history
+            .search(SearchQuery {
+                expression: "boundaryterm".to_owned(),
+                filter: HistoryFilter::default(),
+                after: None,
+                limit: 10,
+            })
+            .unwrap();
+        assert_eq!(found.matches.len(), 1);
+    }
+
+    #[test]
+    fn keyless_events_use_source_coordinates_and_replay_publishes_cursor_progress() {
+        let scratch = crate::test_scratch();
+        let history = History::open(&scratch.path().join("history/history.db")).unwrap();
+        let observation = |cursor: &str| SourceObservation {
+            root_path: "/synthetic/codex".into(),
+            file_path: "/synthetic/codex/session.jsonl".into(),
+            cursor: Some(cursor.to_owned()),
+        };
+
+        for cursor in ["coordinate-1", "coordinate-2"] {
+            let mut prepared = event("unused");
+            prepared.native_event_key = None;
+            prepared.source_observation = Some(observation(cursor));
+            let mut builder = history.begin_event(prepared).unwrap();
+            builder.push_raw_part(Cursor::new(b"repeated raw")).unwrap();
+            builder.finish().unwrap();
+        }
+        assert_eq!(
+            history
+                .events(crate::types::MetadataQuery::default())
+                .unwrap()
+                .len(),
+            2
+        );
+
+        let mut first = event("native-replay");
+        first.source_observation = Some(observation("cursor-1"));
+        let mut builder = history.begin_event(first).unwrap();
+        builder.push_raw_part(Cursor::new(b"native raw")).unwrap();
+        let committed = builder.finish().unwrap();
+
+        let mut replay = event("native-replay");
+        replay.source_observation = Some(observation("cursor-2"));
+        let mut builder = history.begin_event(replay).unwrap();
+        builder.push_raw_part(Cursor::new(b"native raw")).unwrap();
+        assert!(matches!(
+            builder.finish().unwrap(),
+            IngestOutcome::Replayed { .. }
+        ));
+        let status = history
+            .source_status(
+                crate::types::SourceFamily::Codex,
+                std::path::Path::new("/synthetic/codex"),
+                std::path::Path::new("/synthetic/codex/session.jsonl"),
+            )
+            .unwrap()
+            .unwrap();
+        assert_eq!(status.cursor.as_deref(), Some("cursor-2"));
+        assert_eq!(status.cursor_revision_id, Some(committed.revision_id()));
+    }
+
+    #[test]
+    fn session_bounds_merge_earliest_start_and_latest_end() {
+        let scratch = crate::test_scratch();
+        let history = History::open(&scratch.path().join("history/history.db")).unwrap();
+        let mut later = event("later");
+        later.session_started_at = Some("2026-08-25T02:00:00Z".to_owned());
+        later.session_ended_at = Some("2026-08-25T03:00:00Z".to_owned());
+        let mut builder = history.begin_event(later).unwrap();
+        builder.push_raw_part(Cursor::new(b"later")).unwrap();
+        builder.finish().unwrap();
+
+        let mut wider = event("wider");
+        wider.session_started_at = Some("2026-08-25T01:00:00Z".to_owned());
+        wider.session_ended_at = Some("2026-08-25T04:00:00Z".to_owned());
+        let mut builder = history.begin_event(wider).unwrap();
+        builder.push_raw_part(Cursor::new(b"wider")).unwrap();
+        builder.finish().unwrap();
+
+        let session = history
+            .sessions(crate::types::MetadataQuery::default())
+            .unwrap()
+            .remove(0);
+        assert_eq!(
+            session.started_at.as_deref(),
+            Some("2026-08-25T01:00:00.000000000Z")
+        );
+        assert_eq!(
+            session.ended_at.as_deref(),
+            Some("2026-08-25T04:00:00.000000000Z")
+        );
+    }
+
+    #[test]
+    fn retained_revisions_are_paged_and_discoverable_after_reopen() {
+        let scratch = crate::test_scratch();
+        let path = scratch.path().join("history/history.db");
+        let history = History::open(&path).unwrap();
+        let mut first = history.begin_event(event("revisions")).unwrap();
+        first.push_raw_part(Cursor::new(b"raw")).unwrap();
+        let first_id = first.finish().unwrap().revision_id();
+        let mut changed = event("revisions");
+        changed.parser_version = "parser/v2".to_owned();
+        let mut second = history.begin_event(changed).unwrap();
+        second.push_raw_part(Cursor::new(b"raw")).unwrap();
+        let second_id = second.finish().unwrap().revision_id();
+        history.close().unwrap();
+
+        let history = History::open_existing(&path).unwrap().unwrap();
+        let first_page = history
+            .revisions(crate::types::MetadataQuery {
+                filter: HistoryFilter::default(),
+                after_id: None,
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(first_page[0].revision_id, first_id);
+        let second_page = history
+            .revisions(crate::types::MetadataQuery {
+                filter: HistoryFilter::default(),
+                after_id: Some(first_id),
+                limit: 1,
+            })
+            .unwrap();
+        assert_eq!(second_page[0].revision_id, second_id);
+        assert_eq!(
+            history
+                .events(crate::types::MetadataQuery::default())
+                .unwrap()[0]
+                .revision_id,
+            second_id
+        );
+    }
+
+    #[test]
+    fn attempt_links_validate_inputs_and_classify_noop_inserts() {
+        let scratch = crate::test_scratch();
+        let history = History::open(&scratch.path().join("history/history.db")).unwrap();
+        let mut builder = history.begin_event(event("attempt")).unwrap();
+        builder.push_raw_part(Cursor::new(b"raw")).unwrap();
+        let revision_id = builder.finish().unwrap().revision_id();
+
+        assert!(matches!(
+            history.link_attempt(revision_id, "run", None),
+            Err(HistoryError::Invalid { .. })
+        ));
+        assert_eq!(
+            history.link_attempt(revision_id + 999, "run", Some(1)),
+            Err(HistoryError::NotFound)
+        );
+        history.link_attempt(revision_id, "run", Some(1)).unwrap();
+        history.link_attempt(revision_id, "run", Some(1)).unwrap();
+        let count: i64 = history
+            .submit(move |connection| {
+                connection
+                    .query_row(
+                        "SELECT count(*) FROM history_attempt_links WHERE revision_id=?1",
+                        params![revision_id],
+                        |row| row.get(0),
+                    )
+                    .map_err(Into::into)
+            })
+            .unwrap();
+        assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn cleanup_and_publication_have_one_atomic_winner() {
+        let scratch = crate::test_scratch();
+        let path = scratch.path().join("history/history.db");
+        let publisher = History::open(&path).unwrap();
+        let cleaner = History::open_existing(&path).unwrap().unwrap();
+        let mut builder = publisher.begin_event(event("race")).unwrap();
+        builder.push_raw_part(Cursor::new(b"race bytes")).unwrap();
+        builder.push_text_fragment("race token").unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let publish_barrier = barrier.clone();
+        let publish = std::thread::spawn(move || {
+            publish_barrier.wait();
+            builder.finish()
+        });
+        let cleanup = std::thread::spawn(move || {
+            barrier.wait();
+            cleaner.cleanup_staging()
+        });
+        let publish = publish.join().unwrap();
+        let removed = cleanup.join().unwrap().unwrap();
+        match publish {
+            Ok(outcome) => {
+                assert_eq!(removed, 0);
+                let mut bytes = Vec::new();
+                publisher
+                    .write_revision_exact(outcome.revision_id(), &mut bytes)
+                    .unwrap();
+                assert_eq!(bytes, b"race bytes");
+            }
+            Err(_) => {
+                assert_eq!(removed, 1);
+                assert!(publisher
+                    .events(crate::types::MetadataQuery::default())
+                    .unwrap()
+                    .is_empty());
+            }
+        }
+        assert_eq!(publisher.status().unwrap().staging_revisions, 0);
     }
 
     #[test]

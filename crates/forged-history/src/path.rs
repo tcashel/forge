@@ -1,7 +1,9 @@
 //! Secure literal-path opening for the independent history database.
 
-use std::fs::{self, File, OpenOptions};
-use std::os::unix::fs::{DirBuilderExt, MetadataExt, OpenOptionsExt, PermissionsExt};
+use std::fs::{self, File};
+use std::os::fd::{AsRawFd, FromRawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::{DirBuilderExt, MetadataExt, PermissionsExt};
 use std::path::{Component, Path, PathBuf};
 
 use rusqlite::{Connection, OpenFlags};
@@ -30,12 +32,14 @@ impl FileIdentity {
 }
 
 /// A connection whose main file is still held and can be reverified before
-/// and after configuration. The held descriptor closes the check/reopen gap;
-/// SQLite never receives a URI flag, and `SQLITE_OPEN_NOFOLLOW` protects its
-/// independent open.
+/// and after configuration. A pinned directory walk opens the held descriptor,
+/// and SQLite's live HAS_MOVED control binds its independent pathname open to
+/// that descriptor before any configuration or migration write.
 pub(crate) struct SecureConnection {
     pub(crate) connection: Connection,
     path: PathBuf,
+    sqlite_path: PathBuf,
+    _directory: File,
     descriptor: File,
     identity: FileIdentity,
 }
@@ -49,7 +53,7 @@ impl SecureConnection {
             ))
         })?;
         validate_database_metadata(&self.path, &descriptor_metadata)?;
-        let path_metadata = fs::symlink_metadata(&self.path)
+        let path_metadata = fs::symlink_metadata(&self.sqlite_path)
             .map_err(|error| internal(format!("rechecking {}: {error}", self.path.display())))?;
         validate_database_metadata(&self.path, &path_metadata)?;
         if FileIdentity::of(&descriptor_metadata) != self.identity
@@ -60,26 +64,50 @@ impl SecureConnection {
                 self.path.display()
             )));
         }
-        let sqlite_path = self
+        self.verify_sqlite_file_unmoved()?;
+        let reported_sqlite_path = self
             .connection
             .path()
             .ok_or_else(|| internal("history SQLite connection has no main path"))?;
-        let expected = self.path.to_str().ok_or_else(|| {
+        let expected = self.sqlite_path.to_str().ok_or_else(|| {
             invalid(format!(
                 "history database path is not valid UTF-8: {}",
-                self.path.display()
+                self.sqlite_path.display()
             ))
         })?;
-        if sqlite_path != expected {
+        if reported_sqlite_path != expected {
             return Err(internal(format!(
-                "history SQLite path mismatch: expected {expected:?}, got {sqlite_path:?}"
+                "history SQLite path mismatch: expected {expected:?}, got {reported_sqlite_path:?}"
             )));
         }
         Ok(())
     }
 
-    pub(crate) fn into_connection(self) -> Connection {
-        self.connection
+    fn verify_sqlite_file_unmoved(&self) -> Result<(), HistoryError> {
+        let mut moved: libc::c_int = 0;
+        // SAFETY: `Connection::handle` is used only while this exclusively
+        // owned connection is idle, `main` is a static NUL-terminated schema
+        // name, and SQLite writes only the integer supplied for HAS_MOVED.
+        let result = unsafe {
+            rusqlite::ffi::sqlite3_file_control(
+                self.connection.handle(),
+                c"main".as_ptr(),
+                rusqlite::ffi::SQLITE_FCNTL_HAS_MOVED,
+                (&mut moved as *mut libc::c_int).cast(),
+            )
+        };
+        if result != rusqlite::ffi::SQLITE_OK {
+            return Err(internal(format!(
+                "SQLite could not verify live history file identity: result {result}"
+            )));
+        }
+        if moved != 0 {
+            return Err(internal(format!(
+                "SQLite history database file moved during open: {}",
+                self.path.display()
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -149,9 +177,13 @@ pub(crate) fn secure_open_inner(
     }
     validate_private_chain(operator_root, parent)?;
 
+    let directory = open_pinned_directory(parent, operator_root)?;
+    let file_name = path
+        .file_name()
+        .ok_or_else(|| invalid("history database path has no file name"))?;
     let descriptor = match mode {
-        OpenMode::Create => open_create_or_existing(&path)?,
-        OpenMode::Existing => match open_existing_file(&path) {
+        OpenMode::Create => open_create_or_existing_at(&directory, file_name, &path)?,
+        OpenMode::Existing => match open_existing_file_at(&directory, file_name) {
             Ok(file) => file,
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Err(error) => {
@@ -167,6 +199,7 @@ pub(crate) fn secure_open_inner(
         .map_err(|error| internal(format!("inspecting {}: {error}", path.display())))?;
     validate_database_metadata(&path, &descriptor_metadata)?;
     let identity = FileIdentity::of(&descriptor_metadata);
+    let sqlite_path = descriptor_rooted_path(&directory, file_name, &path)?;
 
     phase_hook(OpenPhase::BeforeSqlite);
     let flags = OpenFlags::SQLITE_OPEN_READ_WRITE
@@ -179,12 +212,14 @@ pub(crate) fn secure_open_inner(
         };
     // Deliberately omit SQLITE_OPEN_URI. A name beginning with `file:` is a
     // literal filename, including its `?` and `#` bytes.
-    let connection = Connection::open_with_flags(&path, flags)
+    let connection = Connection::open_with_flags(&sqlite_path, flags)
         .map_err(|error| internal(format!("opening SQLite {}: {error}", path.display())))?;
     phase_hook(OpenPhase::AfterSqlite);
     let secure = SecureConnection {
         connection,
         path,
+        sqlite_path,
+        _directory: directory,
         descriptor,
         identity,
     };
@@ -239,35 +274,106 @@ fn absolute_literal_path(path: &Path) -> Result<PathBuf, HistoryError> {
     Ok(absolute)
 }
 
-fn open_options() -> OpenOptions {
-    let mut options = OpenOptions::new();
-    options
-        .read(true)
-        .write(true)
-        .mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_CLOEXEC);
-    options
+fn open_existing_file_at(directory: &File, file_name: &std::ffi::OsStr) -> std::io::Result<File> {
+    open_file_at(
+        directory,
+        file_name,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+        0,
+    )
 }
 
-fn open_existing_file(path: &Path) -> std::io::Result<File> {
-    open_options().open(path)
-}
-
-fn open_create_or_existing(path: &Path) -> Result<File, HistoryError> {
-    match open_options().create_new(true).open(path) {
+fn open_create_or_existing_at(
+    directory: &File,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<File, HistoryError> {
+    match open_file_at(
+        directory,
+        file_name,
+        libc::O_RDWR | libc::O_NOFOLLOW | libc::O_CLOEXEC | libc::O_CREAT | libc::O_EXCL,
+        0o600,
+    ) {
         Ok(file) => Ok(file),
-        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => open_existing_file(path)
-            .map_err(|error| {
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            open_existing_file_at(directory, file_name).map_err(|error| {
                 internal(format!(
                     "opening existing history database {}: {error}",
-                    path.display()
+                    display_path.display()
                 ))
-            }),
+            })
+        }
         Err(error) => Err(internal(format!(
             "creating history database {}: {error}",
-            path.display()
+            display_path.display()
         ))),
     }
+}
+
+fn open_file_at(
+    directory: &File,
+    file_name: &std::ffi::OsStr,
+    flags: libc::c_int,
+    mode: libc::c_uint,
+) -> std::io::Result<File> {
+    let file_name = std::ffi::CString::new(file_name.as_bytes())
+        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "NUL in file name"))?;
+    // SAFETY: the directory descriptor and C string are valid for this call;
+    // a successful descriptor is immediately owned by `File` exactly once.
+    let descriptor =
+        unsafe { libc::openat(directory.as_raw_fd(), file_name.as_ptr(), flags, mode) };
+    if descriptor < 0 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: `openat` returned a fresh descriptor which is not otherwise owned.
+        Ok(unsafe { File::from_raw_fd(descriptor) })
+    }
+}
+
+fn open_pinned_directory(path: &Path, private_root: &Path) -> Result<File, HistoryError> {
+    let mut directory = File::open(Path::new("/"))
+        .map_err(|error| internal(format!("opening history filesystem root: {error}")))?;
+    let mut current = PathBuf::from("/");
+    for component in path.components() {
+        let Component::Normal(name) = component else {
+            continue;
+        };
+        current.push(name);
+        directory = open_file_at(
+            &directory,
+            name,
+            libc::O_RDONLY | libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_CLOEXEC,
+            0,
+        )
+        .map_err(|error| {
+            internal(format!(
+                "opening pinned history directory {}: {error}",
+                current.display()
+            ))
+        })?;
+        let metadata = directory.metadata().map_err(|error| {
+            internal(format!(
+                "inspecting pinned history directory {}: {error}",
+                current.display()
+            ))
+        })?;
+        validate_safe_ancestor(&current, &metadata)?;
+        if current.starts_with(private_root) {
+            validate_private_directory_metadata(&current, &metadata)?;
+        }
+    }
+    Ok(directory)
+}
+
+fn descriptor_rooted_path(
+    _directory: &File,
+    file_name: &std::ffi::OsStr,
+    display_path: &Path,
+) -> Result<PathBuf, HistoryError> {
+    if file_name.as_bytes().contains(&b'/') {
+        return Err(invalid("history database file name contains a separator"));
+    }
+    Ok(display_path.to_path_buf())
 }
 
 fn validate_existing_chain(path: &Path) -> Result<(), HistoryError> {
@@ -306,7 +412,7 @@ fn validate_existing_chain(path: &Path) -> Result<(), HistoryError> {
 
 fn validate_safe_ancestor(path: &Path, metadata: &fs::Metadata) -> Result<(), HistoryError> {
     let mode = metadata.mode();
-    let sticky_world_writable = mode & 0o002 != 0 && mode & libc::S_ISVTX as u32 != 0;
+    let sticky_world_writable = mode & 0o002 != 0 && mode & 0o1000 != 0;
     if mode & 0o022 != 0 && !sticky_world_writable {
         return Err(internal(format!(
             "refusing writable history ancestor: {}",
@@ -368,6 +474,19 @@ fn validate_private_directory(path: &Path) -> Result<(), HistoryError> {
     let metadata = fs::symlink_metadata(path)
         .map_err(|error| internal(format!("inspecting {}: {error}", path.display())))?;
     if metadata.file_type().is_symlink() || !metadata.is_dir() {
+        return Err(internal(format!(
+            "history database parent is not a directory: {}",
+            path.display()
+        )));
+    }
+    validate_private_directory_metadata(path, &metadata)
+}
+
+fn validate_private_directory_metadata(
+    path: &Path,
+    metadata: &fs::Metadata,
+) -> Result<(), HistoryError> {
+    if !metadata.is_dir() {
         return Err(internal(format!(
             "history database parent is not a directory: {}",
             path.display()
@@ -522,6 +641,33 @@ mod tests {
             });
             assert!(result.is_err(), "phase {phase:?}");
         }
+    }
+
+    #[test]
+    fn aba_substitution_of_sqlites_live_file_is_detected() {
+        let scratch = crate::test_scratch();
+        let parent = scratch.path().join("history");
+        fs::create_dir(&parent).unwrap();
+        fs::set_permissions(&parent, fs::Permissions::from_mode(0o700)).unwrap();
+        let path = parent.join("history.db");
+        File::create(&path).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let replacement = parent.join("replacement.db");
+        File::create(&replacement).unwrap();
+        fs::set_permissions(&replacement, fs::Permissions::from_mode(0o600)).unwrap();
+        let original = parent.join("original.db");
+
+        let result = secure_open_inner(&path, OpenMode::Existing, |phase| match phase {
+            OpenPhase::BeforeSqlite => {
+                fs::rename(&path, &original).unwrap();
+                fs::rename(&replacement, &path).unwrap();
+            }
+            OpenPhase::AfterSqlite => {
+                fs::rename(&path, &replacement).unwrap();
+                fs::rename(&original, &path).unwrap();
+            }
+        });
+        assert!(result.is_err());
     }
 
     #[test]

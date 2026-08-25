@@ -195,33 +195,34 @@ impl History {
         let reason = reason.to_owned();
         let now = now_timestamp();
         self.submit(move |connection| {
-            let existing = connection
-                .query_row(
+            let transaction =
+                connection.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
+            let inserted = transaction.execute(
+                "INSERT INTO history_purge_tombstones(
+                   scope, scope_key, sha256, reason, created_at
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)
+                 ON CONFLICT(scope, scope_key) DO NOTHING",
+                params![scope, scope_key, sha256, reason, now],
+            )?;
+            let outcome = if inserted == 1 {
+                TombstoneOutcome::Recorded
+            } else {
+                let (stored_sha, stored_reason): (String, String) = transaction.query_row(
                     "SELECT sha256, reason FROM history_purge_tombstones
                       WHERE scope=?1 AND scope_key=?2",
                     params![scope, scope_key],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-                )
-                .optional()?;
-            match existing {
-                Some((stored_sha, stored_reason))
-                    if stored_sha == sha256 && stored_reason == reason =>
-                {
-                    Ok(TombstoneOutcome::Replayed)
+                    |row| Ok((row.get(0)?, row.get(1)?)),
+                )?;
+                if stored_sha == sha256 && stored_reason == reason {
+                    TombstoneOutcome::Replayed
+                } else {
+                    return Err(invalid(
+                        "conflicting tombstone evidence for the same scope and key",
+                    ));
                 }
-                Some(_) => Err(invalid(
-                    "conflicting tombstone evidence for the same scope and key",
-                )),
-                None => {
-                    connection.execute(
-                        "INSERT INTO history_purge_tombstones(
-                           scope, scope_key, sha256, reason, created_at
-                         ) VALUES (?1, ?2, ?3, ?4, ?5)",
-                        params![scope, scope_key, sha256, reason, now],
-                    )?;
-                    Ok(TombstoneOutcome::Recorded)
-                }
-            }
+            };
+            transaction.commit()?;
+            Ok(outcome)
         })
     }
 
@@ -275,8 +276,9 @@ impl History {
             )?;
             let revisions =
                 count("SELECT count(*) FROM history_event_revisions WHERE visibility='committed'")?;
-            let staging_revisions =
-                count("SELECT count(*) FROM history_event_revisions WHERE visibility='staging'")?;
+            let staging_revisions = count(
+                "SELECT count(*) FROM history_event_revisions WHERE visibility!='committed'",
+            )?;
             Ok(HistoryStatus {
                 host_id,
                 corpus_epoch,
@@ -346,7 +348,7 @@ fn validate_closed_vocabularies(connection: &rusqlite::Connection) -> Result<(),
     for (sql, allowed, vocabulary) in [
         (
             "SELECT DISTINCT visibility FROM history_event_revisions",
-            &["staging", "committed"][..],
+            &["staging", "cleaning", "committed"][..],
             "revision visibility",
         ),
         (
@@ -402,6 +404,49 @@ mod tests {
         assert!(history
             .record_tombstone(TombstoneScope::Revision, "revision", "bad", "operator")
             .is_err());
+    }
+
+    #[test]
+    fn concurrent_identical_tombstones_are_recorded_then_replayed() {
+        let scratch = crate::test_scratch();
+        let path = scratch.path().join("history/history.db");
+        let first = History::open(&path).unwrap();
+        let second = History::open_existing(&path).unwrap().unwrap();
+        let barrier = std::sync::Arc::new(std::sync::Barrier::new(2));
+        let first_barrier = barrier.clone();
+        let first = std::thread::spawn(move || {
+            first_barrier.wait();
+            let outcome = first.record_tombstone(
+                TombstoneScope::Session,
+                "concurrent",
+                &"c".repeat(64),
+                "operator",
+            );
+            (first, outcome)
+        });
+        let second = std::thread::spawn(move || {
+            barrier.wait();
+            let outcome = second.record_tombstone(
+                TombstoneScope::Session,
+                "concurrent",
+                &"c".repeat(64),
+                "operator",
+            );
+            (second, outcome)
+        });
+        let (first, first_outcome) = first.join().unwrap();
+        let (second, second_outcome) = second.join().unwrap();
+        let mut outcomes = [first_outcome.unwrap(), second_outcome.unwrap()];
+        outcomes.sort_by_key(|outcome| match outcome {
+            TombstoneOutcome::Recorded => 0,
+            TombstoneOutcome::Replayed => 1,
+        });
+        assert_eq!(
+            outcomes,
+            [TombstoneOutcome::Recorded, TombstoneOutcome::Replayed]
+        );
+        first.close().unwrap();
+        second.close().unwrap();
     }
 
     #[test]

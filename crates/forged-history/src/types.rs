@@ -357,6 +357,27 @@ pub struct EventRow {
     pub model: Option<String>,
 }
 
+/// One retained committed event revision projection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RevisionRow {
+    /// Stable revision row id used for keyset pagination and exact readback.
+    pub revision_id: i64,
+    /// Owning stable event row id.
+    pub event_id: i64,
+    /// Owning stable session row id.
+    pub session_id: i64,
+    /// Effective native or deterministic fallback event key.
+    pub event_key: String,
+    /// One-based append-only revision number under the event.
+    pub revision: u32,
+    /// Canonical event timestamp for this retained revision.
+    pub occurred_at: String,
+    /// Normalized role for this retained revision.
+    pub role: Option<EventRole>,
+    /// Normalized model for this retained revision.
+    pub model: Option<String>,
+}
+
 /// One committed usage evidence row.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageRow {

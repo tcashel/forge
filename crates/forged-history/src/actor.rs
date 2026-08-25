@@ -8,7 +8,7 @@ use std::thread::JoinHandle;
 use rusqlite::Connection;
 
 use crate::error::{internal, HistoryError};
-use crate::path::{default_history_path, secure_open, OpenMode};
+use crate::path::{default_history_path, secure_open, OpenMode, SecureConnection};
 use crate::schema::configure_connection;
 
 pub(crate) type Job = Box<dyn FnOnce(&mut Connection) + Send>;
@@ -51,14 +51,14 @@ impl History {
         Self::start_writer(connection).map(Some)
     }
 
-    fn start_writer(connection: Connection) -> Result<Self, HistoryError> {
+    fn start_writer(secure: SecureConnection) -> Result<Self, HistoryError> {
         let (sender, receiver) = mpsc::channel::<Job>();
         let writer = std::thread::Builder::new()
             .name("forged-history-writer".to_owned())
             .spawn(move || {
-                let mut connection = connection;
+                let mut secure = secure;
                 while let Ok(job) = receiver.recv() {
-                    job(&mut connection);
+                    job(&mut secure.connection);
                 }
             })
             .map_err(|error| internal(format!("spawning history writer: {error}")))?;

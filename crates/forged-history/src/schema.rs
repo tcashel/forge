@@ -111,10 +111,10 @@ CREATE TABLE history_event_revisions (
   occurred_at       TEXT NOT NULL,
   role              TEXT CHECK (role IN ('system','developer','user','assistant','tool')),
   model             TEXT,
-  visibility        TEXT NOT NULL CHECK (visibility IN ('staging','committed')),
+  visibility        TEXT NOT NULL CHECK (visibility IN ('staging','cleaning','committed')),
   created_at        TEXT NOT NULL,
   committed_at      TEXT,
-  CHECK ((visibility = 'staging' AND event_id IS NULL AND revision_no IS NULL
+  CHECK ((visibility IN ('staging','cleaning') AND event_id IS NULL AND revision_no IS NULL
           AND fingerprint IS NULL AND committed_at IS NULL)
       OR (visibility = 'committed' AND event_id IS NOT NULL AND revision_no > 0
           AND fingerprint IS NOT NULL AND committed_at IS NOT NULL)),
@@ -258,7 +258,10 @@ CREATE TABLE history_purge_tombstones (
 
 pub(crate) fn configure_connection(
     mut secure: SecureConnection,
-) -> Result<Connection, HistoryError> {
+) -> Result<SecureConnection, HistoryError> {
+    // Verify the file actually opened by SQLite before any pragma, schema
+    // probe, migration, or other write can touch it.
+    secure.verify_identity()?;
     secure
         .connection
         .busy_timeout(Duration::from_millis(BUSY_TIMEOUT_MS))?;
@@ -281,7 +284,7 @@ pub(crate) fn configure_connection(
     migrate(&mut secure.connection)?;
     secure.verify_identity()?;
     validate_database_file_configuration(&secure.connection)?;
-    Ok(secure.into_connection())
+    Ok(secure)
 }
 
 fn refuse_foreign_database(connection: &Connection) -> Result<(), HistoryError> {
@@ -402,8 +405,9 @@ mod tests {
         let scratch = crate::test_scratch();
         let path = scratch.path().join("history/history.db");
         let secure = secure_open(&path, OpenMode::Create).unwrap().unwrap();
-        let connection = configure_connection(secure).unwrap();
-        let mut names = connection
+        let secure = configure_connection(secure).unwrap();
+        let mut names = secure
+            .connection
             .prepare(
                 "SELECT name FROM sqlite_schema
                   WHERE name LIKE 'history_%' AND type IN ('table','index','trigger')
@@ -441,7 +445,7 @@ mod tests {
         ] {
             assert!(names.iter().any(|name| name == required), "{required}");
         }
-        prove_fts_capabilities(&connection).unwrap();
+        prove_fts_capabilities(&secure.connection).unwrap();
     }
 
     #[test]
