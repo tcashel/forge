@@ -558,6 +558,397 @@ fn prepare_reviewed_rolling_plan(env: &TestEnv) -> usize {
 }
 
 #[test]
+fn rolling_epic_assures_the_exact_draft_pr_head_before_completion() {
+    let env = TestEnv::new("forged-rolling-assurance");
+    env.enable_dynamic_gh();
+    env.seed_epic("epic-assurance", &[("child-done", &env.spec, false)]);
+    env.set_bead_field("child-done", "status", "closed");
+    assert_eq!(env.forged(&["init"]).0, 0);
+
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-assurance",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--rolling",
+    ]);
+    assert_eq!(code, 0, "rolling start: {started}");
+    assert_eq!(
+        started["result"]["assurancePackage"]["protocolRef"]["name"],
+        json!("epic-assurance")
+    );
+    env.authorize_epic("epic-assurance");
+
+    let (code, integration) = env.forged(&["epic", "advance", "--epic", "epic-assurance"]);
+    assert_eq!(code, 0, "integration: {integration}");
+    let (code, draft) = env.forged(&["epic", "advance", "--epic", "epic-assurance"]);
+    assert_eq!(code, 0, "draft PR: {draft}");
+    assert_eq!(draft["result"]["progress"]["terminal"], json!(false));
+    assert!(draft["result"]["progress"]["draftPr"].is_object());
+
+    let (_, in_progress) = env.forged(&["epic", "status", "--epic", "epic-assurance"]);
+    assert!(in_progress["result"]["draftPr"].is_object());
+    assert!(in_progress["result"]["finalPr"].is_null());
+
+    let mut terminal = Value::Null;
+    for _ in 0..64 {
+        let (code, tick) = env.forged(&["epic", "advance", "--epic", "epic-assurance"]);
+        assert_eq!(code, 0, "assurance tick: {tick}");
+        if tick["result"]["stopped"]["assurance"].is_object() {
+            terminal = tick;
+            break;
+        }
+        terminal = tick;
+    }
+    assert!(
+        terminal["result"]["stopped"]["assurance"].is_object(),
+        "assurance did not converge: {terminal}"
+    );
+    let evidence = &terminal["result"]["stopped"]["assurance"]["evidence"];
+    assert_eq!(evidence["disposition"], json!("approved-clean"));
+    assert_eq!(evidence["gate"]["passed"], json!(true));
+    assert_eq!(evidence["terminalSha"], evidence["gate"]["headSha"]);
+    assert!(!evidence["reviewers"]
+        .as_array()
+        .expect("reviewer evidence")
+        .is_empty());
+    assert_eq!(evidence["draftPr"]["isDraft"], json!(true));
+
+    let branch = started["result"]["integrationBranch"]
+        .as_str()
+        .expect("integration branch");
+    let remote_sha = rev_parse(&env.repos.origin, branch);
+    assert_eq!(evidence["terminalSha"], json!(remote_sha));
+    let (_, completed) = env.forged(&["epic", "status", "--epic", "epic-assurance"]);
+    assert_eq!(completed["result"]["finalPr"]["number"], json!(7));
+    assert_eq!(
+        completed["result"]["assurance"]["terminalOutcome"],
+        json!("clean")
+    );
+    assert_ne!(
+        completed["result"]["assurance"]["integrationSha"], evidence["terminalSha"],
+        "the bounded Fix round must produce the head that ReGate approves"
+    );
+    let provider_log = env.provider_log();
+    assert!(
+        provider_log
+            .iter()
+            .any(|line| line.starts_with("epic-assurance-epic-assurance/remediation/0 start ")),
+        "assurance Fix packet: {provider_log:?}"
+    );
+    assert!(provider_log
+        .iter()
+        .all(|line| { !line.starts_with("epic-assurance-epic-assurance/implementation/") }));
+    assert_eq!(
+        std::fs::read_to_string(env.beads_dir.join("shim-state/epic-assurance.status"))
+            .expect("root status"),
+        "open",
+        "internal assurance must not mutate or resolve the root Bead"
+    );
+
+    let gh_calls = env.gh_calls();
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method POST")
+                && call.join(" ").contains("/pulls"))
+            .count(),
+        1,
+        "draft PR creation remains exactly once: {gh_calls:?}"
+    );
+    assert!(gh_calls.iter().any(|call| {
+        call.join(" ").contains("--method PATCH") && call.join(" ").contains("/pulls/7")
+    }));
+    assert!(gh_calls
+        .iter()
+        .all(|call| !call.iter().any(|arg| arg == "merge")));
+}
+
+#[test]
+fn three_submitted_rolling_epics_converge_below_capacity_with_one_isolated_crux() {
+    let env = TestEnv::new("forged-rolling-assurance-convergence");
+    env.enable_dynamic_gh();
+    set_admission(
+        &env,
+        json!({
+            "totalActive": 2,
+            "providerActive": 2,
+            "repositoryWriteActive": 1,
+            "epicFanout": 1,
+            "deferSeconds": 1,
+        }),
+    );
+    let epics = [
+        ("epic-assurance-a", "child-assurance-a"),
+        ("epic-assurance-b", "child-assurance-b"),
+        ("epic-assurance-c", "child-assurance-c"),
+    ];
+    for (epic, child) in epics {
+        env.seed_epic(epic, &[(child, &env.spec, false)]);
+        env.set_bead_field(child, "status", "closed");
+    }
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    for (epic, _) in epics {
+        let (code, started) = env.forged(&[
+            "epic",
+            "start",
+            "--epic",
+            epic,
+            "--repo",
+            &repo,
+            "--base-ref",
+            "main",
+            "--rolling",
+        ]);
+        assert_eq!(code, 0, "rolling start {epic}: {started}");
+    }
+
+    // Hold the first real review inside the one remaining admission slot.
+    // The competing siblings stay durable while the capacity fence is live.
+    env.set_scenario("reviewclaude", "wait-release", 1);
+    for (epic, _) in epics {
+        let (code, submitted) = env.forged(&["epic", "submit", "--epic", epic]);
+        assert_eq!(code, 0, "epic submit {epic}: {submitted}");
+        assert_eq!(submitted["result"]["submitted"], json!(true));
+    }
+    let mut review_started = false;
+    for _ in 0..600 {
+        review_started = env
+            .provider_log()
+            .iter()
+            .any(|line| line.contains("/review-1/0 start "));
+        if review_started {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(50));
+    }
+    assert!(
+        review_started,
+        "one submitted epic reached assurance review"
+    );
+    let ledger = env.ledger();
+    let deferred = ledger
+        .latest_admission_decisions(None, None)
+        .expect("admission decisions")
+        .into_iter()
+        .filter(|decision| decision.outcome == forged_types::AdmissionOutcome::Deferred)
+        .count();
+    ledger.close().expect("close ledger");
+    assert!(
+        deferred > 0,
+        "the below-N workload must exercise the durable capacity fence"
+    );
+
+    // The held round returns its ordinary finding. Its next review is the one
+    // CRUX; after that terminal input releases capacity for both siblings.
+    env.set_scenario("reviewclaude", "block", 1);
+    env.release_stage("reviewclaude");
+    let mut statuses = Vec::new();
+    for _ in 0..1_200 {
+        let (code, tick) = env.forged(&["supervise", "--once"]);
+        assert_eq!(code, 0, "supervisor tick: {tick}");
+        statuses = epics
+            .iter()
+            .map(|(epic, _)| {
+                let (code, status) = env.forged(&["epic", "status", "--epic", epic]);
+                assert_eq!(code, 0, "epic status {epic}: {status}");
+                status
+            })
+            .collect();
+        let complete = statuses
+            .iter()
+            .filter(|status| status["result"]["finalPr"].is_object())
+            .count();
+        let input_required = statuses
+            .iter()
+            .filter(|status| status["result"]["inputRequired"].is_object())
+            .count();
+        if complete == 2 && input_required == 1 {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(100));
+    }
+
+    let completed = statuses
+        .iter()
+        .filter(|status| status["result"]["finalPr"].is_object())
+        .collect::<Vec<_>>();
+    let blocked = statuses
+        .iter()
+        .filter(|status| status["result"]["inputRequired"].is_object())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        completed.len(),
+        2,
+        "clean siblings must converge: {statuses:?}"
+    );
+    assert_eq!(blocked.len(), 1, "only the CRUX epic stops: {statuses:?}");
+    for status in &completed {
+        let evidence = &status["result"]["assurance"]["completed"]["evidence"];
+        let branch = status["result"]["integrationBranch"]
+            .as_str()
+            .expect("integration branch");
+        assert_eq!(evidence["disposition"], json!("approved-clean"));
+        assert_eq!(evidence["terminalSha"], evidence["gate"]["headSha"]);
+        assert_eq!(
+            evidence["terminalSha"],
+            json!(rev_parse(
+                &env.repos.origin,
+                &format!("refs/heads/{branch}")
+            ))
+        );
+        assert_eq!(status["result"]["draftPr"]["isDraft"], json!(true));
+    }
+    let input = &blocked[0]["result"]["inputRequired"];
+    assert_eq!(input["code"], json!("assurance-run-stopped"));
+    assert_eq!(blocked[0]["result"]["finalPr"], Value::Null);
+    assert_eq!(blocked[0]["result"]["draftPr"]["isDraft"], json!(true));
+    assert_eq!(
+        input["evidence"]["protocolTerminal"]["specAmendmentProposed"]["amendment"]["evidence"],
+        json!("the frozen root excludes the required dependency mutation")
+    );
+
+    let pr_numbers = statuses
+        .iter()
+        .map(|status| {
+            status["result"]["draftPr"]["number"]
+                .as_u64()
+                .expect("one draft PR")
+        })
+        .collect::<std::collections::BTreeSet<_>>();
+    assert_eq!(pr_numbers.len(), 3, "one distinct draft PR per epic");
+    let gh_calls = env.gh_calls();
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method POST")
+                && call.join(" ").contains("/pulls"))
+            .count(),
+        3,
+        "each submitted epic creates exactly one draft PR: {gh_calls:?}"
+    );
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method PATCH")
+                && call.join(" ").contains("/pulls/"))
+            .count(),
+        2,
+        "only the two assured PRs receive terminal evidence: {gh_calls:?}"
+    );
+    assert!(gh_calls.iter().all(|call| {
+        !call.iter().any(|arg| arg == "merge") && !call.iter().any(|arg| arg == "ready")
+    }));
+}
+
+#[cfg(feature = "failpoints")]
+#[test]
+fn assurance_start_crash_recovers_one_run_and_one_draft_pr() {
+    let env = TestEnv::new("forged-rolling-assurance-start-crash");
+    env.enable_dynamic_gh();
+    env.seed_epic(
+        "epic-assurance-crash",
+        &[("child-assurance-crash", &env.spec, false)],
+    );
+    env.set_bead_field("child-assurance-crash", "status", "closed");
+    assert_eq!(env.forged(&["init"]).0, 0);
+    let repo = env.repos.repo.to_string_lossy().into_owned();
+    let (code, started) = env.forged(&[
+        "epic",
+        "start",
+        "--epic",
+        "epic-assurance-crash",
+        "--repo",
+        &repo,
+        "--base-ref",
+        "main",
+        "--rolling",
+    ]);
+    assert_eq!(code, 0, "rolling start: {started}");
+    env.authorize_epic("epic-assurance-crash");
+    assert_eq!(
+        env.forged(&["epic", "advance", "--epic", "epic-assurance-crash"])
+            .0,
+        0
+    );
+    let (code, draft) = env.forged(&["epic", "advance", "--epic", "epic-assurance-crash"]);
+    assert_eq!(code, 0, "draft PR: {draft}");
+    assert_eq!(draft["result"]["progress"]["terminal"], json!(false));
+
+    let mut crashed = env
+        .forged_cmd(&["epic", "advance", "--epic", "epic-assurance-crash"])
+        .env("FORGED_FAILPOINT", "epic.assurance.start.after")
+        .env("FORGED_FAILPOINT_MODE", "crash")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("assurance start child");
+    assert!(
+        !crashed.wait().expect("assurance start crash").success(),
+        "the process must abort after the durable assurance checkpoint"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.started")
+            .count(),
+        1
+    );
+    ledger.close().expect("close ledger");
+
+    let mut terminal = Value::Null;
+    for _ in 0..64 {
+        let (code, tick) = env.forged(&["epic", "advance", "--epic", "epic-assurance-crash"]);
+        assert_eq!(code, 0, "assurance recovery tick: {tick}");
+        terminal = tick;
+        if terminal["result"]["stopped"]["assurance"].is_object() {
+            break;
+        }
+    }
+    assert!(
+        terminal["result"]["stopped"]["assurance"].is_object(),
+        "recovered assurance did not converge: {terminal}"
+    );
+    let ledger = env.ledger();
+    assert_eq!(
+        ledger
+            .list_events(Some("epic-assurance-crash"), 0, 65_536)
+            .expect("epic events")
+            .iter()
+            .filter(|event| event.kind == "forged.epic.assurance.started")
+            .count(),
+        1,
+        "recovery reuses the durable assurance checkpoint"
+    );
+    assert!(ledger
+        .get_run("epic-assurance-crash-epic-assurance")
+        .is_ok_and(|run| run.state == forged_ledger::RunState::Stopped));
+    ledger.close().expect("close ledger");
+    let gh_calls = env.gh_calls();
+    assert_eq!(
+        gh_calls
+            .iter()
+            .filter(|call| call.join(" ").contains("--method POST")
+                && call.join(" ").contains("/pulls"))
+            .count(),
+        1,
+        "crash recovery must reuse the draft PR: {gh_calls:?}"
+    );
+    assert!(gh_calls
+        .iter()
+        .all(|call| !call.iter().any(|arg| arg == "merge")));
+}
+
+#[test]
 fn resolving_pre_cycle_planning_stop_never_opens_the_placeholder() {
     let env = TestEnv::new("forged-rolling-pre-cycle-resolve");
     reach_rolling_planning_boundary(&env);
